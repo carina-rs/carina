@@ -924,58 +924,52 @@ impl RootConfigSignature {
     }
 }
 
-/// Enum to represent either a module or a root configuration file signature
+/// Metadata for a classified directory or an unclassified source buffer.
 #[derive(Debug, Clone)]
 pub enum FileSignature {
     Module(ModuleSignature),
     RootConfig(RootConfigSignature),
+    /// Unclassified buffer: display file metadata without claiming module or root.
+    Unknown(RootConfigSignature),
 }
 
 impl FileSignature {
     /// Create from a parsed file
-    /// For directory-based modules (files with top-level arguments/attributes blocks),
-    /// the module name is derived from the directory name or file name.
+    /// Classification comes only from the loader-issued directory verdict.
     pub fn from_parsed_file<E>(
         parsed: &crate::parser::File<E>,
         file_name: &str,
         config: &crate::parser::ProviderContext,
     ) -> Self {
-        // Check for directory-based module (has top-level arguments or attribute_params)
-        if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
-            return FileSignature::Module(ModuleSignature::from_directory_module(
-                parsed, file_name, config,
-            ));
-        }
-
-        // Otherwise, treat as a root configuration file
-        FileSignature::RootConfig(RootConfigSignature::from_parsed_file(parsed, file_name))
+        Self::from_parsed_file_with_name(parsed, file_name, config)
     }
 
-    /// Create from a parsed file with a specific module name
-    /// Use this when you know the module name (e.g., from directory structure)
+    /// Build metadata from the loader-issued directory verdict. Unknown buffers
+    /// retain neutral file metadata; entry counts cannot establish a directory kind.
     pub fn from_parsed_file_with_name<E>(
         parsed: &crate::parser::File<E>,
         module_name: &str,
         config: &crate::parser::ProviderContext,
     ) -> Self {
-        // Check for directory-based module (has top-level arguments or attribute_params)
-        if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
-            return FileSignature::Module(ModuleSignature::from_directory_module(
-                parsed,
-                module_name,
-                config,
-            ));
+        use crate::config_loader::DirectoryVerdict;
+        match parsed.directory_verdict() {
+            DirectoryVerdict::ModuleTemplate(_) => Self::Module(
+                ModuleSignature::from_directory_module(parsed, module_name, config),
+            ),
+            DirectoryVerdict::Root(_) | DirectoryVerdict::NoEvidence(_) => {
+                Self::RootConfig(RootConfigSignature::from_parsed_file(parsed, module_name))
+            }
+            DirectoryVerdict::Unknown(_) => {
+                Self::Unknown(RootConfigSignature::from_parsed_file(parsed, module_name))
+            }
         }
-
-        // Otherwise, treat as a root configuration file
-        FileSignature::RootConfig(RootConfigSignature::from_parsed_file(parsed, module_name))
     }
 
     /// Display the signature
     pub fn display(&self) -> String {
         match self {
             FileSignature::Module(sig) => sig.display(),
-            FileSignature::RootConfig(sig) => sig.display(),
+            FileSignature::RootConfig(sig) | FileSignature::Unknown(sig) => sig.display(),
         }
     }
 }
@@ -2262,7 +2256,7 @@ mod tests {
 
     #[test]
     fn test_file_signature_from_directory_module() {
-        use crate::parser::{ProviderContext, parse};
+        use crate::parser::ProviderContext;
 
         // Directory-based module (top-level arguments/attributes)
         let input = r#"
@@ -2278,8 +2272,10 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(
-            input,
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("main.crn"), input).unwrap();
+        let parsed = crate::module_resolver::load_module_from_directory(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
@@ -2301,7 +2297,7 @@ mod tests {
 
     #[test]
     fn test_file_signature_from_root_config() {
-        use crate::parser::{ProviderContext, parse};
+        use crate::parser::ProviderContext;
 
         // Root config (no arguments/attributes, no module wrapper)
         let input = r#"
@@ -2315,8 +2311,10 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(
-            input,
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("main.crn"), input).unwrap();
+        let parsed = crate::module_resolver::load_module_from_directory(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();

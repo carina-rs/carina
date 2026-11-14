@@ -357,9 +357,8 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             resolve_modules(
-                parsed,
+                parsed.admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
-                session,
             )
             .expect("module resolution should succeed")
         },
@@ -588,9 +587,8 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             resolve_modules(
-                parsed,
+                parsed.admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(&root).unwrap(),
-                session,
             )
             .expect("nested module resolution should succeed")
         },
@@ -800,9 +798,8 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             resolve_modules(
-                parsed,
+                parsed.admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(&caller).unwrap(),
-                session,
             )
             .expect("module resolution should succeed")
         },

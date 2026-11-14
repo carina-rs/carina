@@ -125,9 +125,12 @@ fn expanded_resources(
     let path = ResolvedPath::new(dir).unwrap();
     let parsed = parse_directory(&path, &context)?;
     carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-        resolve_modules_with_providerless_config(parsed, &path, session, &SchemaRegistry::new())
-            .map(|file| file.resources)
-            .map_err(|error| error.to_string())
+        resolve_modules_with_providerless_config(
+            parsed.admit(&SchemaRegistry::new(), session),
+            &path,
+        )
+        .map(|file| file.resources)
+        .map_err(|error| error.to_string())
     })
 }
 
@@ -435,7 +438,10 @@ fn r5_bootstrap_phase_survives_providerless_module_resolution() {
         carina_core::config_loader::parse_directory_for_bootstrap(&path, &context).unwrap();
     let expanded =
         carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-            resolve_modules_with_providerless_config(loaded, &path, session, &SchemaRegistry::new())
+            resolve_modules_with_providerless_config(
+                loaded.admit(&SchemaRegistry::new(), session),
+                &path,
+            )
         })
         .unwrap();
     assert_eq!(expanded.resources.len(), 1);

@@ -4955,7 +4955,7 @@ impl SourceSpan {
             Rule::removed_block => "removed",
             Rule::import_state_block => "import",
             Rule::let_binding => "let",
-            Rule::provider_block => {
+            Rule::provider_block | Rule::provider_expr => {
                 let name = pair.clone().into_inner().next().expect("provider name");
                 return Self::from_preprocessed_range(
                     pair.as_span().start(),
@@ -7594,6 +7594,10 @@ where
     T: ValueKind,
     B: BindingAddress,
 {
+    pub fn directory_verdict(&self) -> &crate::config_loader::DirectoryVerdict {
+        self.parser_binding_metadata.syntax().directory_verdict()
+    }
+
     /// Populate fixture resources while keeping parser-owned metadata private.
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn with_resources_for_test(
@@ -10104,11 +10108,12 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn deferred_unbound_children_are_pending_with_origin() {
-        let parsed = crate::parser::parse(
-            "let upstream = upstream_state { source = '../upstream' }\n\
+        let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
-             }\n",
+             }\n";
+        let parsed = crate::parser::parse(
+            fixture_source,
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("deferred unbound loop parses");
@@ -10116,9 +10121,12 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
-                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                        parsed,
+                        fixture_source,
+                    )
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                    session,
                 )
                 .expect("deferred fixture crosses the module-resolution seam")
             },
@@ -10849,11 +10857,12 @@ mod substitute_placeholder_tests {
 
     #[test]
     fn unbound_deferred_target_requires_serialized_loop_kind() {
-        let parsed = crate::parser::parse(
-            "let upstream = upstream_state { source = '../upstream' }\n\
+        let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
-             }\n",
+             }\n";
+        let parsed = crate::parser::parse(
+            fixture_source,
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("deferred unbound loop parses");
@@ -10861,9 +10870,12 @@ mod substitute_placeholder_tests {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
-                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                        parsed,
+                        fixture_source,
+                    )
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                    session,
                 )
                 .expect("deferred fixture crosses the module-resolution seam")
             },

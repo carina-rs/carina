@@ -75,7 +75,7 @@ The following statements are valid at the top level of a `.crn` file:
 | `for` | Iterate to create multiple resources |
 | `if` | Conditionally create resources |
 | `fn` | Define a reusable function |
-| `require` | Assert a condition with an error message |
+| `require` | Validate module arguments with an error message |
 | `arguments` | Declare module input parameters |
 | `attributes` | Define module output values (for callers who bind the module with `let`) |
 | `exports` | Define values published to upstream-state consumers |
@@ -428,8 +428,8 @@ See [Expressions](/reference/dsl/expressions/) for details on function definitio
 
 ## Require Statement
 
-Assert conditions that must be true, with a custom error message if they fail.
-Inside a module, a condition can reference its declared arguments:
+Use `require` inside a module to validate its arguments, with a custom error
+message if the condition is false:
 
 ```crn
 arguments {
@@ -441,22 +441,25 @@ require length(subnets) > 0, 'At least one subnet must be specified'
 require cidr_block != '', 'CIDR block cannot be empty'
 ```
 
-In a configuration directory with no `arguments` or `attributes` blocks,
-`require` has no arguments in scope.
-Its condition must use literals, operators, and supported constraint functions
-(`len` and `length`). Root conditions cannot reference `let` bindings,
-resources, data sources, or module calls, including those in sibling files.
-Every root condition is decided during validation; a false condition prevents
-planning, saving a plan, and live apply. The CLI and language server report it
-at the condition's own file and position.
+A `require` outside a module is a validation error:
+`` `require` is only allowed inside a module ``. In a root configuration, the configuration
+validation step that checks declarations and expressions rejects each
+`require`, whether its condition is true or false. Parsing still checks the
+condition's syntax and parse-time restrictions; a parse error is reported
+before the placement check. After parsing succeeds, the root rejection
+replaces general expression inference inside the condition, and the condition
+is never evaluated. Configuration validation and the language server
+report the rejection at the `require` keyword with
+a range covering the authored statement, including declarations in sibling files.
 
-```crn
-require length('production') > 0, 'Environment label cannot be empty'
-```
+Loading configuration can retain the placement finding without reporting it.
+A command rejects the root `require` when it runs configuration validation;
+merely loading the files does not reject it. Whether validation runs can
+depend on the selected operation and the state being processed. Saved-plan
+apply follows the
+[saved-plan validation rules](/reference/dsl/modules/#when-constraints-run).
 
-A directory containing either module declaration block is treated as an
-uninstantiated template when validated directly, even if the block is empty.
-Its `require` conditions are not evaluated. Calling the directory as a module
-still requires at least one declared argument or output attribute.
+The [directory scope rules](/reference/dsl/modules/#root-configurations-and-module-templates)
+define roots, standalone templates, directories interpreted by entry point, and incomplete snapshots. A require-only directory without provider/backend evidence is a standalone template; its condition is not evaluated.
 
 The condition is a [validate expression](/reference/dsl/expressions/#validate-expressions) that supports comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), integer arithmetic (`+`, `-`, `*`, `/`, `%`), and logical operators (`&&`, `||`, `!`).

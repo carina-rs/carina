@@ -1175,13 +1175,19 @@ let instance = m { vpc_id = up.opaque }
 #[test]
 fn upstream_identity_is_checked_in_attribute_and_export_declarations() {
     let attribute_fixture = Fixture::module_with_upstream(
-        &[],
+        &[(
+            "main.crn",
+            r#"arguments { sg: aws.ec2.SecurityGroup.Id }
+attributes {
+  attr: aws.ec2.Vpc.Id = sg
+}
+"#,
+        )],
         &[(
             "main.crn",
             r#"let up = upstream_state { source = '../upstream' }
-attributes {
-  attr: aws.ec2.Vpc.Id = up.sg
-}
+let outputs = use { source = '../web_tier' }
+let instance = outputs { sg = up.sg }
 "#,
         )],
         &[(

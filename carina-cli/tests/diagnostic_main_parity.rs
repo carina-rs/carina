@@ -183,7 +183,11 @@ fn upstream_shapes_skip_attribute_parameter_values() {
         "attributes { field: String = up.names.bad index: String = up.names['bad'] }\n",
     );
     let (output, text) = validate(&dir.path().join("down"));
-    assert!(output.status.success(), "{text}");
+    assert!(!output.status.success(), "{text}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "Error: sibling.crn:1:1: attributes blocks are only valid inside module definitions, not in root configurations.\n  Note: directory is a root configuration because of the provider block at main.crn:1.\n"
+    );
     assert!(
         !text.contains("reads it as a struct") && !text.contains("does not fit"),
         "{text}"

@@ -847,9 +847,8 @@ fn binding_identity_collision_fixture() -> BindingIdentityCollisionFixture {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                parsed,
+                parsed.admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(&directory).unwrap(),
-                session,
             )
             .expect("multi-file collision fixture crosses root expansion")
         },

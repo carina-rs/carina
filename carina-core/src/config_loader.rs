@@ -302,8 +302,10 @@ pub struct AuthoredBindingView {
 }
 
 impl AuthoredBindingView {
-    pub(crate) fn from_directory_files(files: &[(PathBuf, DirectoryResolvedFile)]) -> Self {
-        let mut parsed = ParsedFile::default();
+    pub(crate) fn from_directory_files(
+        files: &[(PathBuf, DirectoryResolvedFile)],
+        mut parsed: ParsedFile,
+    ) -> Self {
         for (_, file) in files {
             merge_parsed_file(&mut parsed, file.parsed.clone());
         }
@@ -324,7 +326,10 @@ impl AuthoredBindingView {
         let files = vec![(source_file.to_path_buf(), source.to_string())];
         let parsed_files =
             parse_directory_files_located(&files, config).map_err(|located| *located.error)?;
-        Ok(Self::from_directory_files(&parsed_files))
+        Ok(Self::from_directory_files(
+            &parsed_files,
+            ParsedFile::default(),
+        ))
     }
 
     #[cfg(test)]
@@ -377,8 +382,9 @@ impl ModuleResolutionContext {
     }
 }
 
-/// Proof that a relative-binding file came from parsing the directory that a
-/// caller is intentionally treating as a root configuration.
+/// A complete relative-binding directory parse for direct entry. Its issued
+/// verdict may identify a root, a module template, or a directory without
+/// evidence; an incomplete buffer cannot inhabit this type.
 ///
 /// The wrapped file is private and there is no production constructor from a
 /// caller-built [`File`]. Read-only consumers can borrow it through
@@ -388,6 +394,7 @@ impl ModuleResolutionContext {
 pub struct RootDirectoryParse<E = crate::parser::ParsedExportParam> {
     parsed: File<E>,
     resolution: ResolutionContext,
+    verdict: CompleteDirectoryVerdict,
 }
 
 pub type ParsedRootDirectory = RootDirectoryParse<crate::parser::ParsedExportParam>;
@@ -434,77 +441,678 @@ impl<'a> InferredRootAnalysis<'a> {
             RootDirectoryParse {
                 parsed,
                 resolution: self.root.resolution,
+                verdict: self.root.verdict.clone(),
             },
             report,
         )
     }
 }
 
-/// Negative scope evidence minted only after directory discovery and a
-/// successful declaration parse of every source in that snapshot. A caller
-/// cannot obtain it from an isolated buffer or a caller-supplied source batch.
+/// A loader-owned directory admitted as resolver input with its judgement.
+/// Judgement, including bootstrap/metadata inference, already retains require
+/// placement findings; commands decide whether to publish or reject them.
+/// Only [`RootDirectoryParse::admit`] constructs this resolver input. Resolution consumes
+/// it to normalize references using imported signatures, then re-judges the
+/// resulting file before checking require placement.
+#[derive(Clone)]
+pub struct AdmittedRootDirectory<'a, E = crate::parser::ParsedExportParam> {
+    judged: crate::parser::retained::JudgedFile<'a, E, crate::parser::ParsedDeferredForPhase>,
+    resolution: ModuleResolutionContext,
+    context: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+}
+
+impl<'a, E> AdmittedRootDirectory<'a, E> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::parser::retained::JudgedFile<'a, E, crate::parser::ParsedDeferredForPhase>,
+        ModuleResolutionContext,
+        &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) {
+        (self.judged, self.resolution, self.context)
+    }
+}
+
+impl<E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder>> RootDirectoryParse<E> {
+    /// Admit the retained require scopes and judge this exact loader snapshot.
+    pub fn admit<'a>(
+        self,
+        schemas: &'a SchemaRegistry,
+        context: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> AdmittedRootDirectory<'a, E> {
+        let resolution = self.module_resolution_context();
+        AdmittedRootDirectory {
+            judged: crate::parser::retained::JudgedFile::new(
+                self.parsed,
+                schemas,
+                context.catalog(),
+            ),
+            resolution,
+            context,
+        }
+    }
+}
+
+/// The sole directory classification, issued from the readable sibling inventories.
+/// Authored root evidence is decisive even when the inventory is incomplete.
+/// Evidence witnesses have private constructors: callers can borrow and
+/// clone a verdict, but cannot manufacture a complete directory classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectoryVerdict<
+    Incomplete = (),
+    Template = ModuleTemplateDeclarations,
+    Neutral = DirectoryWithoutEvidence,
+> {
+    Unknown(Incomplete),
+    Root(RootDirectoryVerdict),
+    ModuleTemplate(Template),
+    /// A complete directory with neither root nor module evidence. Entry points
+    /// interpret it as a root when direct, and as a module when imported.
+    NoEvidence(Neutral),
+}
+
+/// The same verdict after all sibling inventories were read and parsed. The
+/// uninhabited Unknown payload makes incomplete CLI input unrepresentable.
+///
+/// ```compile_fail,E0308
+/// use carina_core::config_loader::{CompleteDirectoryVerdict, DirectoryVerdict};
+/// let _: CompleteDirectoryVerdict = DirectoryVerdict::Unknown(());
+/// ```
+pub type CompleteDirectoryVerdict = DirectoryVerdict<std::convert::Infallible>;
+
+/// An incomplete inventory may establish an authored root, but can establish
+/// neither a template nor absence of evidence.
+///
+/// ```compile_fail,E0308
+/// use carina_core::config_loader::{IncompleteDirectoryVerdict, CompleteDirectoryVerdict, DirectoryVerdict};
+/// fn cannot_promote(complete: CompleteDirectoryVerdict) -> IncompleteDirectoryVerdict {
+///     match complete {
+///         DirectoryVerdict::ModuleTemplate(module) => DirectoryVerdict::ModuleTemplate(module),
+///         _ => unreachable!(),
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::config_loader::{IncompleteDirectoryVerdict, DirectoryWithoutEvidence, DirectoryVerdict};
+/// fn cannot_mint_neutral(neutral: DirectoryWithoutEvidence) -> IncompleteDirectoryVerdict {
+///     DirectoryVerdict::NoEvidence(neutral)
+/// }
+/// ```
+pub type IncompleteDirectoryVerdict =
+    DirectoryVerdict<(), std::convert::Infallible, std::convert::Infallible>;
+
+impl IncompleteDirectoryVerdict {
+    fn for_retained_nodes(self) -> DirectoryVerdict {
+        match self {
+            Self::Unknown(()) => DirectoryVerdict::Unknown(()),
+            Self::Root(root) => DirectoryVerdict::Root(root),
+        }
+    }
+}
+
+impl Default for DirectoryVerdict {
+    fn default() -> Self {
+        Self::Unknown(())
+    }
+}
+
+impl CompleteDirectoryVerdict {
+    fn for_retained_nodes(&self) -> DirectoryVerdict {
+        match self.clone() {
+            Self::Root(root) => DirectoryVerdict::Root(root),
+            Self::ModuleTemplate(module) => DirectoryVerdict::ModuleTemplate(module),
+            Self::NoEvidence(directory) => DirectoryVerdict::NoEvidence(directory),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootDirectoryVerdict(std::sync::Arc<RootDeclarations>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RootDeclaration {
+    location: parser::DeclarationLocation,
+    file: crate::paths::PersistedPath,
+    utf16_columns: (u32, u32),
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CompleteDirectoryDeclarations(());
+enum FirstRootDeclaration {
+    Provider,
+    Backend,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendOwnership {
+    Sole,
+    Multiple,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootDeclarations {
+    Provider(RootDeclaration),
+    Backend {
+        backend: RootDeclaration,
+        ownership: BackendOwnership,
+    },
+    Both {
+        first: FirstRootDeclaration,
+        provider: RootDeclaration,
+        backend: RootDeclaration,
+        ownership: BackendOwnership,
+    },
+}
+impl RootDeclaration {
+    fn provider(&self) -> RootEvidence {
+        RootEvidence::Provider {
+            location: self.location.clone(),
+            file: self.file.clone(),
+            utf16_columns: self.utf16_columns,
+        }
+    }
+    fn backend(&self) -> RootEvidence {
+        RootEvidence::Backend {
+            location: self.location.clone(),
+            file: self.file.clone(),
+            utf16_columns: self.utf16_columns,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleTemplateDeclarations(std::sync::Arc<ModuleEvidence>);
+
+impl ModuleTemplateDeclarations {
+    pub fn evidence(&self) -> &ModuleEvidence {
+        &self.0
+    }
+    pub(crate) fn displayed_from(&self, root: &ResolvedPath) -> Self {
+        let mut evidence = self.evidence().clone();
+        let file = evidence
+            .file
+            .lexical_relative_to(root.persisted_path())
+            .unwrap_or_else(|| evidence.file.display().clone())
+            .into_source_path();
+        evidence.location = evidence.location.with_display_file(file);
+        Self(std::sync::Arc::new(evidence))
+    }
+}
+
+/// First authored module declaration, retained by the single directory issuer.
+/// The location and pinned path cannot be replaced independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleEvidence {
+    kind: ModuleEvidenceKind,
+    location: parser::DeclarationLocation,
+    file: crate::paths::PersistedPath,
+    utf16_columns: (u32, u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModuleEvidenceKind {
+    Arguments,
+    Attributes,
+    Require,
+}
+
+impl ModuleEvidence {
+    fn declaration(&self) -> &'static str {
+        match self.kind {
+            ModuleEvidenceKind::Arguments => "arguments block",
+            ModuleEvidenceKind::Attributes => "attributes block",
+            ModuleEvidenceKind::Require => "require statement",
+        }
+    }
+    pub fn file_locator(&self) -> &crate::paths::PersistedPath {
+        &self.file
+    }
+    pub fn location(&self) -> &parser::DeclarationLocation {
+        &self.location
+    }
+    pub fn utf16_columns(&self) -> (u32, u32) {
+        self.utf16_columns
+    }
+    pub fn related_message(&self) -> String {
+        format!(
+            "This {} makes the directory a module definition.",
+            self.declaration()
+        )
+    }
+    pub fn note(&self) -> String {
+        format!(
+            "directory is a module definition because of the {} at {}:{}.",
+            self.declaration(),
+            crate::paths::DisplayPath::for_diagnostics(self.location.file().path()),
+            self.location.span().start_line()
+        )
+    }
+}
+
+/// The shared renderer consumes evidence already owned by the verdict.
+pub trait DirectoryDeclarationEvidence {
+    fn file_locator(&self) -> &crate::paths::PersistedPath;
+    fn location(&self) -> &parser::DeclarationLocation;
+    fn utf16_columns(&self) -> (u32, u32);
+    fn related_message(&self) -> String;
+}
+
+impl DirectoryDeclarationEvidence for ModuleEvidence {
+    fn file_locator(&self) -> &crate::paths::PersistedPath {
+        self.file_locator()
+    }
+    fn location(&self) -> &parser::DeclarationLocation {
+        self.location()
+    }
+    fn utf16_columns(&self) -> (u32, u32) {
+        self.utf16_columns()
+    }
+    fn related_message(&self) -> String {
+        self.related_message()
+    }
+}
+impl DirectoryDeclarationEvidence for RootEvidence {
+    fn file_locator(&self) -> &crate::paths::PersistedPath {
+        self.file_locator()
+    }
+    fn location(&self) -> &parser::DeclarationLocation {
+        self.location()
+    }
+    fn utf16_columns(&self) -> (u32, u32) {
+        self.utf16_columns()
+    }
+    fn related_message(&self) -> String {
+        self.related_message().into()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryWithoutEvidence(());
+
+/// Every root verdict owns its authored evidence location. Direct entry of a
+/// directory without evidence is represented separately by `NoEvidence`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootEvidence {
+    Provider {
+        location: parser::DeclarationLocation,
+        file: crate::paths::PersistedPath,
+        utf16_columns: (u32, u32),
+    },
+    Backend {
+        location: parser::DeclarationLocation,
+        file: crate::paths::PersistedPath,
+        utf16_columns: (u32, u32),
+    },
+}
+
+impl<U, T, N> DirectoryVerdict<U, T, N> {
+    pub fn root(&self) -> Option<&RootDirectoryVerdict> {
+        match self {
+            Self::Root(root) => Some(root),
+            Self::Unknown(_) | Self::ModuleTemplate(_) | Self::NoEvidence(_) => None,
+        }
+    }
+}
+
+impl RootDirectoryVerdict {
+    /// Whether exactly one readable inventory declaration owns the backend.
+    pub fn has_sole_backend(&self) -> bool {
+        match self.0.as_ref() {
+            RootDeclarations::Provider(_) => false,
+            RootDeclarations::Backend {
+                backend: _,
+                ownership,
+            }
+            | RootDeclarations::Both {
+                first: _,
+                provider: _,
+                backend: _,
+                ownership,
+            } => *ownership == BackendOwnership::Sole,
+        }
+    }
+    pub fn evidence(&self) -> RootEvidence {
+        match self.0.as_ref() {
+            RootDeclarations::Provider(provider) => provider.provider(),
+            RootDeclarations::Backend {
+                backend,
+                ownership: _,
+            } => backend.backend(),
+            RootDeclarations::Both {
+                first,
+                provider,
+                backend,
+                ownership: _,
+            } => match first {
+                FirstRootDeclaration::Provider => provider.provider(),
+                FirstRootDeclaration::Backend => backend.backend(),
+            },
+        }
+    }
+    pub fn provider_evidence(&self) -> Option<RootEvidence> {
+        match self.0.as_ref() {
+            RootDeclarations::Provider(provider)
+            | RootDeclarations::Both {
+                first: _,
+                provider,
+                backend: _,
+                ownership: _,
+            } => Some(provider.provider()),
+            RootDeclarations::Backend {
+                backend: _,
+                ownership: _,
+            } => None,
+        }
+    }
+    pub fn backend_evidence(&self) -> Option<RootEvidence> {
+        match self.0.as_ref() {
+            RootDeclarations::Backend {
+                backend,
+                ownership: _,
+            }
+            | RootDeclarations::Both {
+                first: _,
+                provider: _,
+                backend,
+                ownership: _,
+            } => Some(backend.backend()),
+            RootDeclarations::Provider(_) => None,
+        }
+    }
+    /// The provider prohibition precedes the backend prohibition. This result
+    /// is nonempty by construction, independent of any mutable AST lists.
+    pub(crate) fn import_prohibitions(
+        &self,
+    ) -> (
+        crate::module_resolver::ModuleError,
+        Vec<crate::module_resolver::ModuleError>,
+    ) {
+        use crate::module_resolver::ModuleError;
+        match self.0.as_ref() {
+            RootDeclarations::Provider(provider) => (
+                ModuleError::ProviderInModule.with_root_evidence(provider.provider()),
+                vec![],
+            ),
+            RootDeclarations::Backend {
+                backend,
+                ownership: _,
+            } => (
+                ModuleError::BackendInModule.with_root_evidence(backend.backend()),
+                vec![],
+            ),
+            RootDeclarations::Both {
+                first: _,
+                provider,
+                backend,
+                ownership: _,
+            } => (
+                ModuleError::ProviderInModule.with_root_evidence(provider.provider()),
+                vec![ModuleError::BackendInModule.with_root_evidence(backend.backend())],
+            ),
+        }
+    }
+    pub fn format_message(&self, message: &str) -> String {
+        format!("{message}\nNote: {}", self.evidence().note())
+    }
+    pub fn lsp_message(&self, message: &str) -> String {
+        message.to_string()
+    }
+}
+
+impl RootEvidence {
+    /// Absolute logical source captured by directory discovery. Rendering never
+    /// resolves an authored relative label from the process working directory.
+    pub fn file_locator(&self) -> &crate::paths::PersistedPath {
+        match self {
+            Self::Provider {
+                file,
+                location: _,
+                utf16_columns: _,
+            }
+            | Self::Backend {
+                file,
+                location: _,
+                utf16_columns: _,
+            } => file,
+        }
+    }
+    pub fn location(&self) -> &parser::DeclarationLocation {
+        match self {
+            Self::Provider {
+                location,
+                file: _,
+                utf16_columns: _,
+            }
+            | Self::Backend {
+                location,
+                file: _,
+                utf16_columns: _,
+            } => location,
+        }
+    }
+    pub fn utf16_columns(&self) -> (u32, u32) {
+        match self {
+            Self::Provider {
+                utf16_columns,
+                location: _,
+                file: _,
+            }
+            | Self::Backend {
+                utf16_columns,
+                location: _,
+                file: _,
+            } => *utf16_columns,
+        }
+    }
+    pub fn related_message(&self) -> &'static str {
+        match self {
+            Self::Provider {
+                location: _,
+                file: _,
+                utf16_columns: _,
+            } => "This provider block makes the directory a root configuration.",
+            Self::Backend {
+                location: _,
+                file: _,
+                utf16_columns: _,
+            } => "This backend block makes the directory a root configuration.",
+        }
+    }
+    pub fn note(&self) -> String {
+        let located = |kind: &str, location: &parser::DeclarationLocation| {
+            format!(
+                "directory is a root configuration because of the {kind} block at {}:{}.",
+                crate::paths::DisplayPath::for_diagnostics(location.file().path()),
+                location.span().start_line()
+            )
+        };
+        match self {
+            Self::Provider {
+                location,
+                file: _,
+                utf16_columns: _,
+            } => located("provider", location),
+            Self::Backend {
+                location,
+                file: _,
+                utf16_columns: _,
+            } => located("backend", location),
+        }
+    }
+}
+
+/// Loader-owned admission installs the same verdict on the file, declarations
+/// and require nodes. There is no arbitrary RequireScope setter outside parsing.
+#[derive(Clone)]
+pub(crate) struct DirectoryRequireScope(DirectoryVerdict);
+impl DirectoryRequireScope {
+    pub(crate) fn into_parts(self) -> (DirectoryVerdict, parser::retained::RequireScope) {
+        use parser::retained::RequireScope;
+        let scope = match &self.0 {
+            DirectoryVerdict::Unknown(_) => RequireScope::Unknown,
+            // A neutral inventory has no require nodes: a require would itself
+            // supply module evidence. Keep the file's distinct verdict; this
+            // unused default scope grants no node a placement/evaluation verdict.
+            DirectoryVerdict::NoEvidence(_) => RequireScope::Unknown,
+            DirectoryVerdict::Root(root) => RequireScope::UnvalidatedDirectory(root.clone()),
+            DirectoryVerdict::ModuleTemplate(template) => {
+                RequireScope::ModuleTemplate(template.clone())
+            }
+        };
+        (self.0, scope)
+    }
+}
 
 fn mark_complete_directory_files(
     files: &mut [(PathBuf, DirectoryResolvedFile)],
     config: &ProviderContext,
-) {
-    let scope = CompleteDirectoryInventories {
+) -> CompleteDirectoryVerdict {
+    let verdict = DirectoryInventories {
+        completeness: CompleteInventory,
         inventories: files
             .iter()
-            .map(|(_, file)| file.parsed.parser_binding_metadata.syntax())
+            .map(|(_, file)| {
+                (
+                    file.parsed.parser_binding_metadata.syntax(),
+                    file.source.persisted_path(),
+                )
+            })
             .collect(),
     }
-    .require_scope();
+    .issue();
     for (_, file) in files {
-        crate::parser::retained::set_require_scope(&mut file.parsed, scope.clone());
+        crate::parser::retained::set_directory_require_scope(
+            &mut file.parsed,
+            DirectoryRequireScope(verdict.for_retained_nodes()),
+        );
         crate::parser::retained::judge_configuration(
             &mut file.parsed,
             &SchemaRegistry::new(),
             config,
         );
     }
+    verdict
 }
 
-/// Constructible only after every member of one sealed source snapshot has
-/// yielded a complete syntax inventory. Both semantic loading and recovery
-/// use this single issuer; recovery need not evaluate sibling values.
-struct CompleteDirectoryInventories<'a> {
-    inventories: Vec<&'a parser::SyntaxInventory>,
+/// One issuer for complete loading and partial editor snapshots. Its typed
+/// completeness determines what may be concluded when no root evidence exists.
+struct DirectoryInventories<'a, C> {
+    inventories: Vec<(&'a parser::SyntaxInventory, &'a crate::paths::PersistedPath)>,
+    completeness: C,
 }
-
-impl CompleteDirectoryInventories<'_> {
-    fn require_scope(self) -> crate::parser::retained::RequireScope {
-        use crate::parser::retained::RequireScope;
-        match require_scope_from_inventories(self.inventories) {
-            RequireScope::Unknown => {
-                RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
-            }
-            scope => scope,
+struct CompleteInventory;
+struct IncompleteInventory;
+trait InventoryCompleteness {
+    type Unknown;
+    type Template;
+    type Neutral;
+    fn without_root(
+        self,
+        evidence: Option<ModuleEvidence>,
+    ) -> DirectoryVerdict<Self::Unknown, Self::Template, Self::Neutral>;
+}
+impl InventoryCompleteness for CompleteInventory {
+    type Unknown = std::convert::Infallible;
+    type Template = ModuleTemplateDeclarations;
+    type Neutral = DirectoryWithoutEvidence;
+    fn without_root(self, evidence: Option<ModuleEvidence>) -> CompleteDirectoryVerdict {
+        match evidence {
+            Some(evidence) => DirectoryVerdict::ModuleTemplate(ModuleTemplateDeclarations(
+                std::sync::Arc::new(evidence),
+            )),
+            None => DirectoryVerdict::NoEvidence(DirectoryWithoutEvidence(())),
         }
     }
 }
+impl InventoryCompleteness for IncompleteInventory {
+    type Unknown = ();
+    type Template = std::convert::Infallible;
+    type Neutral = std::convert::Infallible;
+    fn without_root(self, _: Option<ModuleEvidence>) -> IncompleteDirectoryVerdict {
+        DirectoryVerdict::Unknown(())
+    }
+}
 
-fn require_scope_from_inventories<'a>(
-    inventories: impl IntoIterator<Item = &'a parser::SyntaxInventory>,
-) -> crate::parser::retained::RequireScope {
-    let mut blocks = parser::ModuleDeclarationBlocks::Absent;
-    let mut arguments = BTreeSet::new();
-    for inventory in inventories {
-        blocks = blocks.union(inventory.module_declaration_blocks());
-        for declaration in inventory.declarations() {
-            if declaration.detail().kind() == DeclarationKind::Argument {
-                arguments.insert(declaration.detail().name().to_owned());
+impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
+    fn issue(self) -> DirectoryVerdict<C::Unknown, C::Template, C::Neutral> {
+        use parser::ConfigurationBlock;
+        let mut provider = None;
+        let mut backend = None;
+        let mut first = FirstRootDeclaration::Provider;
+        let mut module_evidence = None;
+        let mut backend_count = 0;
+        for (inventory, file) in self.inventories {
+            for block in inventory.configuration_blocks() {
+                let module_declaration = |kind| ModuleEvidence {
+                    kind,
+                    location: block.location().clone(),
+                    file: file.clone(),
+                    utf16_columns: block.detail().utf16_columns(),
+                };
+                let root_declaration = || RootDeclaration {
+                    location: block.location().clone(),
+                    file: file.clone(),
+                    utf16_columns: block.detail().utf16_columns(),
+                };
+                match block.detail().kind() {
+                    ConfigurationBlock::Provider => {
+                        provider.get_or_insert_with(root_declaration);
+                    }
+                    ConfigurationBlock::Backend => {
+                        backend_count += 1;
+                        if provider.is_none() && backend.is_none() {
+                            first = FirstRootDeclaration::Backend;
+                        }
+                        backend.get_or_insert_with(root_declaration);
+                    }
+                    ConfigurationBlock::Arguments => {
+                        module_evidence.get_or_insert_with(|| {
+                            module_declaration(ModuleEvidenceKind::Arguments)
+                        });
+                    }
+                    ConfigurationBlock::Attributes => {
+                        module_evidence.get_or_insert_with(|| {
+                            module_declaration(ModuleEvidenceKind::Attributes)
+                        });
+                    }
+                    ConfigurationBlock::Require => {
+                        module_evidence
+                            .get_or_insert_with(|| module_declaration(ModuleEvidenceKind::Require));
+                    }
+                    ConfigurationBlock::State
+                    | ConfigurationBlock::UpstreamState
+                    | ConfigurationBlock::Exports => {}
+                }
             }
         }
+        let ownership = if backend_count == 1 {
+            BackendOwnership::Sole
+        } else {
+            BackendOwnership::Multiple
+        };
+        let declarations = match (provider, backend) {
+            (Some(provider), Some(backend)) => RootDeclarations::Both {
+                first,
+                provider,
+                backend,
+                ownership,
+            },
+            (Some(provider), None) => RootDeclarations::Provider(provider),
+            (None, Some(backend)) => RootDeclarations::Backend { backend, ownership },
+            (None, None) => return self.completeness.without_root(module_evidence),
+        };
+        DirectoryVerdict::Root(RootDirectoryVerdict(std::sync::Arc::new(declarations)))
     }
-    crate::parser::retained::RequireScope::for_declarations(arguments.into_iter(), blocks)
 }
 
 impl<E> RootDirectoryParse<E> {
-    fn with_resolution(parsed: File<E>, resolution: ResolutionContext) -> Self {
-        let mut root = Self { parsed, resolution };
+    fn with_resolution(
+        parsed: File<E>,
+        resolution: ResolutionContext,
+        verdict: CompleteDirectoryVerdict,
+    ) -> Self {
+        let mut root = Self {
+            parsed,
+            resolution,
+            verdict,
+        };
         let inputs = crate::input_rules::AuthoredInputs::for_directory(&root);
         root.parsed.attach_authored_inputs(inputs);
         root
@@ -522,6 +1130,10 @@ impl<E> RootDirectoryParse<E> {
         Ok(self)
     }
 
+    pub fn complete_directory_verdict(&self) -> CompleteDirectoryVerdict {
+        self.verdict.clone()
+    }
+
     pub fn parsed(&self) -> &File<E> {
         &self.parsed
     }
@@ -531,18 +1143,120 @@ impl<E> RootDirectoryParse<E> {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    /// Wrap test data without granting directory declaration completeness.
-    /// Directory-scoped guard tests must use a real directory loader.
-    pub fn from_parsed_for_test(mut parsed: File<E>) -> Self
+    /// Preserve an already-issued verdict, or load the fixture's real sibling
+    /// inventories. Synthetic AST-only tests may supply no authored blocks.
+    pub fn from_parsed_for_test(parsed: File<E>) -> Self
     where
         E: crate::parser::ExportParamLike,
     {
+        Self::from_test_fixture(parsed, None)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    /// Admit a source-backed unit fixture through a real sibling inventory,
+    /// preserving the AST's original labels and transformations.
+    pub fn from_parsed_source_for_test(parsed: File<E>, source: &str) -> Self
+    where
+        E: crate::parser::ExportParamLike,
+    {
+        Self::from_test_fixture(parsed, Some(source))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn from_test_fixture(parsed: File<E>, authored_source: Option<&str>) -> Self
+    where
+        E: crate::parser::ExportParamLike,
+    {
+        let issued = match parsed.directory_verdict().clone() {
+            DirectoryVerdict::Root(root) => Some(DirectoryVerdict::Root(root)),
+            DirectoryVerdict::ModuleTemplate(module) => {
+                Some(DirectoryVerdict::ModuleTemplate(module))
+            }
+            DirectoryVerdict::NoEvidence(directory) => {
+                Some(DirectoryVerdict::NoEvidence(directory))
+            }
+            DirectoryVerdict::Unknown(()) => None,
+        };
+        if let Some(verdict) = issued {
+            return Self::with_resolution(parsed, strict_resolution_context(), verdict);
+        }
+        let syntax = parsed.parser_binding_metadata.syntax();
+        let source = syntax
+            .configuration_blocks()
+            .first()
+            .map(|block| block.location())
+            .or_else(|| {
+                syntax
+                    .declarations()
+                    .first()
+                    .map(|declaration| declaration.location())
+            })
+            .map(|location| location.file().path());
+        if let Some(source) = source.filter(|source| source.is_file()) {
+            let directory = ResolvedPath::new(source.parent().expect("fixture parent")).unwrap();
+            return Self::from_parsed_in_directory_for_test(parsed, &directory);
+        }
+        if let Some(source) = authored_source {
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::write(fixture.path().join("main.crn"), source).unwrap();
+            return Self::from_parsed_in_directory_for_test(
+                parsed,
+                &ResolvedPath::new(fixture.path()).unwrap(),
+            );
+        }
+        assert!(
+            syntax.configuration_blocks().is_empty(),
+            "authored configuration blocks need a real sibling fixture; use from_parsed_in_directory_for_test"
+        );
+        // AST-only unit fixtures have no authored configuration declarations.
+        // Even this neutral authority comes from the ordinary directory issuer.
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            "// AST-only test fixture\n",
+        )
+        .unwrap();
+        Self::from_parsed_in_directory_for_test(parsed, &ResolvedPath::new(fixture.path()).unwrap())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    /// Pair test AST transformations with the real directory that authored them.
+    pub fn from_parsed_in_directory_for_test(mut parsed: File<E>, directory: &ResolvedPath) -> Self
+    where
+        E: crate::parser::ExportParamLike,
+    {
+        let inputs = DirectoryFiles::discover(directory, &SourceOverrides::new())
+            .unwrap()
+            .read_all(&SourceOverrides::new())
+            .unwrap();
+        let inventories = inputs
+            .sources
+            .iter()
+            .map(|(file, text)| {
+                (
+                    parser::parse_syntax_inventory(text, &file.source_label()).unwrap(),
+                    file.persisted_path(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let verdict = DirectoryInventories {
+            completeness: CompleteInventory,
+            inventories: inventories
+                .iter()
+                .map(|(inventory, file)| (inventory, *file))
+                .collect(),
+        }
+        .issue();
+        crate::parser::retained::set_directory_require_scope(
+            &mut parsed,
+            DirectoryRequireScope(verdict.for_retained_nodes()),
+        );
         crate::parser::retained::judge_configuration(
             &mut parsed,
             &SchemaRegistry::new(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
-        Self::with_resolution(parsed, strict_resolution_context())
+        Self::with_resolution(parsed, strict_resolution_context(), verdict)
     }
 }
 
@@ -844,31 +1558,74 @@ impl DirectoryBufferSnapshot {
         })
     }
 
-    fn require_scope(&self) -> crate::parser::retained::RequireScope {
-        let inventories = self
+    fn recover_backend_values(&self, parsed: &mut ParsedFile, config: &ProviderContext) {
+        if parsed.backend.is_none() {
+            return;
+        }
+        // Reuse the directory's ordinary seed fixed point. Unreadable or
+        // syntactically broken siblings cannot contribute values to recovery.
+        let sources = self
+            .sources
+            .iter()
+            .filter_map(|source| {
+                let text = source.text.as_ref()?;
+                parser::parse_syntax_inventory(text, &source.file.source_label()).ok()?;
+                Some((source.file.source_label(), text.to_string()))
+            })
+            .collect::<Vec<_>>();
+        if let Ok(files) = parse_directory_files(&sources, config)
+            && let Some((_, member)) = files.iter().find(|(_, member)| {
+                member.source.identity() == self.sources[self.member.index].file.identity()
+            })
+        {
+            parser::recover_backend_values(parsed, &member.parsed, config);
+        } else {
+            let source = parsed.clone();
+            parser::recover_backend_values(parsed, &source, config);
+        }
+    }
+
+    fn require_scope(&self) -> DirectoryRequireScope {
+        let inventories: Vec<_> = self
             .sources
             .iter()
             .map(|source| {
-                source.text.as_ref().and_then(|text| {
-                    parser::parse_syntax_inventory(text, &source.file.source_label()).ok()
-                })
+                source
+                    .text
+                    .as_ref()
+                    .and_then(|text| {
+                        parser::parse_syntax_inventory(text, &source.file.source_label()).ok()
+                    })
+                    .map(|inventory| (inventory, source.file.persisted_path()))
             })
-            .collect::<Vec<_>>();
-        if inventories.iter().all(Option::is_some) {
-            CompleteDirectoryInventories {
-                inventories: inventories.iter().filter_map(Option::as_ref).collect(),
+            .collect();
+        let readable = inventories
+            .iter()
+            .flatten()
+            .map(|(inventory, file)| (inventory, *file))
+            .collect();
+        let verdict = if inventories.iter().all(Option::is_some) {
+            DirectoryInventories {
+                inventories: readable,
+                completeness: CompleteInventory,
             }
-            .require_scope()
+            .issue()
+            .for_retained_nodes()
         } else {
-            require_scope_from_inventories(inventories.iter().filter_map(Option::as_ref))
-        }
+            DirectoryInventories {
+                inventories: readable,
+                completeness: IncompleteInventory,
+            }
+            .issue()
+            .for_retained_nodes()
+        };
+        DirectoryRequireScope(verdict)
     }
 }
 
 /// Judge the buffer parsed from the exact member text of this sealed snapshot.
-/// Incomplete syntax knowledge retains ordinary expression checks without a
-/// require verdict. A known module block proves template scope; only complete
-/// absence of module blocks admits directory evaluation.
+/// Readable authored root evidence decides Root even with unavailable siblings.
+/// Without it, incomplete knowledge defers placement and schema checks.
 pub fn load_buffer_configuration_in_directory<'a>(
     snapshot: DirectoryBufferSnapshot,
     schemas: &'a SchemaRegistry,
@@ -878,10 +1635,39 @@ pub fn load_buffer_configuration_in_directory<'a>(
     let member = &snapshot.sources[snapshot.member.index];
     debug_assert!(member.text.as_deref() == Some(snapshot.member.buffer.text.as_ref()));
     let mut parsed = snapshot.member.buffer.parsed().clone();
-    crate::parser::retained::set_require_scope(&mut parsed, scope);
+    snapshot.recover_backend_values(&mut parsed, config);
+    crate::parser::retained::set_directory_require_scope(&mut parsed, scope);
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
     }
+}
+
+/// Judge an isolated buffer without claiming knowledge of its siblings. Only
+/// authored root evidence can establish a verdict from this incomplete input.
+pub fn load_buffer_configuration_without_directory<'a>(
+    buffer: &ParsedSourceBuffer,
+    schemas: &'a SchemaRegistry,
+    config: &ProviderContext,
+) -> std::io::Result<BufferConfiguration<'a>> {
+    let file = ResolvedPath::new(buffer.file.path())?;
+    let verdict = DirectoryInventories {
+        inventories: vec![(
+            buffer.parsed.parser_binding_metadata.syntax(),
+            file.persisted_path(),
+        )],
+        completeness: IncompleteInventory,
+    }
+    .issue()
+    .for_retained_nodes();
+    let mut parsed = buffer.parsed().clone();
+    parser::recover_backend_values(&mut parsed, buffer.parsed(), config);
+    crate::parser::retained::set_directory_require_scope(
+        &mut parsed,
+        DirectoryRequireScope(verdict),
+    );
+    Ok(BufferConfiguration {
+        judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
+    })
 }
 
 impl LoadedConfig {
@@ -905,6 +1691,7 @@ impl LoadedConfig {
 #[derive(Debug, Clone)]
 pub struct DirectoryResolvedFile {
     parsed: ParsedFile,
+    source: ResolvedPath,
     /// Names present in this file before sibling bindings were seeded. The
     /// final parse's `variables` map contains sibling seed echoes, so this set
     /// is required to distinguish local value-let declarations from context.
@@ -919,6 +1706,45 @@ impl DirectoryResolvedFile {
 
     pub fn into_inner(self) -> ParsedFile {
         self.parsed
+    }
+}
+
+/// A complete parse and its single issued directory authority. The scope is
+/// carried independently of the members, including an empty directory.
+pub(crate) struct ParsedDirectoryFiles {
+    files: Vec<(PathBuf, DirectoryResolvedFile)>,
+    verdict: CompleteDirectoryVerdict,
+}
+impl ParsedDirectoryFiles {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CompleteDirectoryVerdict,
+        Vec<(PathBuf, DirectoryResolvedFile)>,
+    ) {
+        (self.verdict, self.files)
+    }
+
+    pub(crate) fn empty_assembly(&self) -> ParsedFile {
+        let mut parsed = ParsedFile::default();
+        crate::parser::retained::set_directory_require_scope(
+            &mut parsed,
+            DirectoryRequireScope(self.verdict.for_retained_nodes()),
+        );
+        parsed
+    }
+}
+impl std::ops::Deref for ParsedDirectoryFiles {
+    type Target = [(PathBuf, DirectoryResolvedFile)];
+    fn deref(&self) -> &Self::Target {
+        &self.files
+    }
+}
+impl IntoIterator for ParsedDirectoryFiles {
+    type Item = (PathBuf, DirectoryResolvedFile);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.files.into_iter()
     }
 }
 
@@ -1049,7 +1875,7 @@ impl DirectoryFiles {
         self.paths
     }
 
-    fn read_all(
+    pub(crate) fn read_all(
         self,
         overrides: &SourceOverrides,
     ) -> Result<DirectoryInputs, DirectorySourceReadFailure> {
@@ -1070,7 +1896,7 @@ impl DirectoryFiles {
 
 #[derive(Debug, thiserror::Error)]
 #[error("Failed to read {}: {error}", .file.display())]
-struct DirectorySourceReadFailure {
+pub(crate) struct DirectorySourceReadFailure {
     file: PathBuf,
     // Display includes the complete I/O diagnostic. DirectoryParseFailure
     // exposes the typed error without repeating it through Error::source.
@@ -1079,23 +1905,40 @@ struct DirectorySourceReadFailure {
 
 /// Only an unfiltered discovery followed by successful reads can construct
 /// these inputs. Successful parsing of all of them can mint completeness.
-struct DirectoryInputs {
+pub(crate) struct DirectoryInputs {
     sources: Vec<(ResolvedPath, String)>,
 }
 
+impl DirectorySourceReadFailure {
+    pub(crate) fn into_error(self) -> std::io::Error {
+        self.error
+    }
+}
+
 impl DirectoryInputs {
-    fn parse(
+    fn parse(&self, config: &ProviderContext) -> Result<ParsedDirectoryFiles, LocatedParseError> {
+        let first_label = self.sources.first().map(|(file, _)| file.source_label());
+        self.parse_from_root(
+            config,
+            first_label
+                .as_deref()
+                .and_then(Path::parent)
+                .unwrap_or_else(|| Path::new("")),
+        )
+    }
+
+    pub(crate) fn parse_from_root(
         &self,
         config: &ProviderContext,
-    ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
-        let inputs = self
-            .sources
-            .iter()
-            .map(|(file, source)| (file.source_label(), source.clone()))
-            .collect::<Vec<_>>();
-        let mut parsed = parse_directory_files_located(&inputs, config)?;
-        mark_complete_directory_files(&mut parsed, config);
-        Ok(parsed)
+        display_root: &Path,
+    ) -> Result<ParsedDirectoryFiles, LocatedParseError> {
+        let mut parsed =
+            parse_directory_files_located_from_root(&self.sources, config, display_root)?;
+        let verdict = mark_complete_directory_files(&mut parsed, config);
+        Ok(ParsedDirectoryFiles {
+            files: parsed,
+            verdict,
+        })
     }
 }
 
@@ -1209,7 +2052,11 @@ impl LoadedConfig {
         parser::resolve_resource_refs_in_context(&mut parsed, catalog, None, resolution)
             .map_err(|error| error.to_string())?;
         crate::parser::retained::judge_configuration(&mut parsed, schemas, catalog);
-        Ok(RootDirectoryParse::with_resolution(parsed, resolution))
+        Ok(RootDirectoryParse::with_resolution(
+            parsed,
+            resolution,
+            self.parsed.verdict.clone(),
+        ))
     }
 }
 
@@ -1367,16 +2214,19 @@ fn load_configuration_in_context(
                 return Err(ConfigurationLoadFailure::located(located, path));
             }
         };
-        let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
+        let verdict = parsed_files.verdict.clone();
+        let authored_bindings =
+            AuthoredBindingView::from_directory_files(&parsed_files, parsed_files.empty_assembly());
         let duplicate_declarations = find_duplicate_declarations(path, &parsed_files);
 
-        let empty_parsed = ParsedFile::default;
+        let empty_parsed = || parsed_files.empty_assembly();
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
         let mut parse_errors: Vec<ConfigurationLoadFailure> = Vec::new();
         let mut backend_file: Option<ResolvedPath> = None;
 
-        for ((file, resolved), (io_file, _)) in parsed_files.into_iter().zip(inputs.sources) {
+        for (file, resolved) in parsed_files {
+            let io_file = resolved.source.clone();
             let mut parsed = resolved.into_inner();
             let mut unresolved = parsed.clone();
             if let Err(e) = parser::resolve_resource_refs_with_backend_failure(
@@ -1478,7 +2328,7 @@ fn load_configuration_in_context(
         let inferred = crate::validation::inference::apply_inference(merged, schemas, config);
 
         Ok(LoadedConfig {
-            parsed: RootDirectoryParse::with_resolution(inferred, resolution),
+            parsed: RootDirectoryParse::with_resolution(inferred, resolution, verdict),
             authored_bindings,
             unresolved_parsed: UnresolvedConfigSnapshot::from_parsed(unresolved_merged),
             backend_file,
@@ -1594,9 +2444,6 @@ pub struct DirectoryParseResult {
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
     /// Exact source inputs used for the parse, including in-memory overrides.
     pub source_files: Vec<(ResolvedPath, String)>,
-    /// Source file that owns the backend when the directory has exactly one.
-    /// `None` means the directory has either zero or multiple backend blocks.
-    pub sole_backend_file: Option<PathBuf>,
     /// Per-file ASTs after directory seed resolution, retained for editor
     /// diagnostics that need the correctly classified value while anchoring a
     /// message in one authored file. Empty on non-diagnostic load paths.
@@ -1851,7 +2698,9 @@ fn parse_directory_with_overrides_impl(
             ));
         }
     };
-    let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
+    let verdict = parsed_files.verdict.clone();
+    let authored_bindings =
+        AuthoredBindingView::from_directory_files(&parsed_files, parsed_files.empty_assembly());
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
     let semantic_files = if resolution.is_diagnostics() {
         parsed_files
@@ -1878,6 +2727,8 @@ fn parse_directory_with_overrides_impl(
                         })
                     },
                 )?;
+                let source = semantic.clone();
+                parser::recover_backend_values(&mut semantic, &source, config);
                 Ok((path.clone(), semantic))
             })
             .collect::<Result<Vec<_>, DirectoryParseFailure>>()?
@@ -1885,20 +2736,9 @@ fn parse_directory_with_overrides_impl(
         Vec::new()
     };
 
-    let mut merged = ParsedFile::default();
-    let mut saw_backend = false;
-    let mut sole_backend_file = None;
-    for (file, resolved) in parsed_files {
-        let parsed = resolved.into_inner();
-        if parsed.backend.is_some() {
-            if saw_backend {
-                sole_backend_file = None;
-            } else {
-                saw_backend = true;
-                sole_backend_file = Some(file.clone());
-            }
-        }
-        merge_parsed_file(&mut merged, parsed);
+    let mut merged = parsed_files.empty_assembly();
+    for (_, resolved) in parsed_files {
+        merge_parsed_file(&mut merged, resolved.into_inner());
     }
 
     // Resolve cross-file references on the merged result
@@ -1906,6 +2746,10 @@ fn parse_directory_with_overrides_impl(
         parser::resolve_resource_refs_in_context(&mut merged, config, None, resolution);
     if let Err(error) = resolve_result {
         return Err(DirectoryParseFailure::from_parse_error(error));
+    }
+    if resolution.is_diagnostics() {
+        let source = merged.clone();
+        parser::recover_backend_values(&mut merged, &source, config);
     }
     // `finalize_provider_configs` is intentionally NOT called here. The
     // merged result is pre-module-expansion; deferred provider
@@ -1925,11 +2769,10 @@ fn parse_directory_with_overrides_impl(
         return Err(DirectoryParseFailure::from_parse_error(error));
     }
     Ok(DirectoryParseResult {
-        parsed: RootDirectoryParse::with_resolution(merged, resolution),
+        parsed: RootDirectoryParse::with_resolution(merged, resolution, verdict),
         authored_bindings,
         duplicate_declarations,
         source_files: inputs.sources,
-        sole_backend_file,
         semantic_files,
     })
 }
@@ -2147,14 +2990,35 @@ pub(crate) fn parse_directory_files_located(
         .first()
         .and_then(|(path, _)| path.parent())
         .unwrap_or_else(|| Path::new(""));
-    parse_directory_files_located_from_root(files, config, display_root)
+    let sources = files
+        .iter()
+        .map(|(path, source)| {
+            ResolvedPath::new(path)
+                .map(|path| (path, source.clone()))
+                .map_err(|error| {
+                    LocatedParseError::in_file(
+                        path,
+                        parser::ParseError::InternalError {
+                            expected: "source address".into(),
+                            context: error.to_string(),
+                        },
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    parse_directory_files_located_from_root(&sources, config, display_root)
 }
 
 pub(crate) fn parse_directory_files_located_from_root(
-    files: &[(PathBuf, String)],
+    sources: &[(ResolvedPath, String)],
     config: &ProviderContext,
     display_root: &Path,
 ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
+    let labels = sources
+        .iter()
+        .map(|(path, source)| (path.source_label(), source.clone()))
+        .collect::<Vec<_>>();
+    let files = labels.as_slice();
     let directory_functions = parser::top_level_user_functions_in_files(files, config)
         .map_err(LocatedParseError::directory_wide)?;
     let mut directory_module_parameters = HashSet::new();
@@ -2288,7 +3152,8 @@ pub(crate) fn parse_directory_files_located_from_root(
 
     // Pass 2: re-parse each file with the sibling-aware union seeded into `ctx`.
     let mut out = Vec::with_capacity(files.len());
-    for ((path, content), local_variable_names) in files.iter().zip(pass_1a_local_variables) {
+    for ((source, content), local_variable_names) in sources.iter().zip(pass_1a_local_variables) {
+        let path = &source.source_label();
         let mut parsed = parser::parse_with_directory_context(
             content,
             path,
@@ -2302,6 +3167,7 @@ pub(crate) fn parse_directory_files_located_from_root(
         out.push((
             path.clone(),
             DirectoryResolvedFile {
+                source: source.clone(),
                 parsed,
                 local_variable_names,
             },
@@ -2315,18 +3181,7 @@ pub(crate) fn parse_directory_files_located_from_root(
         .iter_names()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
-    let require_scope = crate::parser::retained::RequireScope::for_declarations(
-        merged
-            .arguments
-            .iter()
-            .map(|argument| argument.name.clone()),
-        merged
-            .parser_binding_metadata
-            .syntax()
-            .module_declaration_blocks(),
-    );
     for (_, file) in &mut out {
-        crate::parser::retained::set_require_scope(&mut file.parsed, require_scope.clone());
         crate::parser::retained::judge_configuration(
             &mut file.parsed,
             &SchemaRegistry::new(),
@@ -2557,6 +3412,138 @@ mod tests {
     use crate::resource::Value;
     use std::fs;
 
+    #[test]
+    fn inferred_root_analysis_preserves_the_issued_directory_verdict() {
+        for source in [
+            "backend local {}\narguments {}\nrequire true, 'private'\n",
+            "provider mock {}\n",
+            "arguments {}\n",
+            "attributes {}\n",
+            "require true, 'module guard'\n",
+            "let count = 1\n",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let file = directory.path().join("main.crn");
+            fs::write(&file, source).unwrap();
+            let path = ResolvedPath::new(directory.path()).unwrap();
+            let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+            let schemas = SchemaRegistry::new();
+            let root = load_configuration_with_config(&path, &config, &schemas)
+                .unwrap()
+                .parsed;
+            let verdict = root.complete_directory_verdict();
+            let retained = root.parsed().directory_verdict().clone();
+            fs::remove_file(file).unwrap();
+            let analysis = root.analysis().unwrap();
+            assert_eq!(analysis.tree().directory_verdict(), &retained);
+            crate::validation::deferred_types::with_session_for_test(&config, |session| {
+                let (resolved, _) = analysis.resolve_type_exprs_report(session);
+                assert_eq!(resolved.complete_directory_verdict(), verdict, "{source}");
+                assert_eq!(resolved.parsed().directory_verdict(), &retained, "{source}");
+                assert_eq!(
+                    resolved.expression_report().findings().len(),
+                    root.expression_report().findings().len(),
+                    "{source}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn round15_backend_cardinality_is_owned_by_the_verdict() {
+        let directory = tempfile::tempdir().unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let root = ResolvedPath::new(directory.path()).unwrap();
+        fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        fs::write(directory.path().join("backend.crn"), "backend local {}\n").unwrap();
+        let parsed =
+            parse_directory_with_overrides_and_diagnostics(&root, &context, &IndexMap::new())
+                .unwrap();
+        let verdict = parsed.parsed.complete_directory_verdict();
+        let root_verdict = verdict.root().unwrap();
+        assert!(root_verdict.has_sole_backend());
+        assert!(
+            root_verdict
+                .provider_evidence()
+                .unwrap()
+                .location()
+                .file()
+                .path()
+                .ends_with("providers.crn")
+        );
+        assert!(
+            root_verdict
+                .backend_evidence()
+                .unwrap()
+                .location()
+                .file()
+                .path()
+                .ends_with("backend.crn")
+        );
+        fs::write(directory.path().join("second.crn"), "backend local {}\n").unwrap();
+        let parsed =
+            parse_directory_with_overrides_and_diagnostics(&root, &context, &IndexMap::new())
+                .unwrap();
+        assert!(
+            !parsed
+                .parsed
+                .complete_directory_verdict()
+                .root()
+                .unwrap()
+                .has_sole_backend()
+        );
+    }
+
+    #[test]
+    fn incomplete_snapshots_can_only_establish_readable_root_evidence() {
+        for broken in [&b"let broken = [\n"[..], &b"\xff"[..]] {
+            for (declaration, is_root) in [
+                ("provider mock {}", true),
+                ("backend local { path = 'state.json' }", true),
+                ("arguments {}", false),
+                ("attributes {}", false),
+                ("require false, 'PRIVATE_GUARD'", false),
+                ("// no evidence", false),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let evidence = directory.path().join("evidence.crn");
+                fs::write(&evidence, format!("// authored evidence\n{declaration}\n")).unwrap();
+                fs::write(directory.path().join("broken.crn"), broken).unwrap();
+                let path = directory.path().join("unsaved.crn");
+                let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+                let buffer =
+                    ParsedSourceBuffer::parse("// unsaved buffer\n", &path, &context).unwrap();
+                let snapshot = DirectoryBufferSnapshot::capture(
+                    &ResolvedPath::new(directory.path()).unwrap(),
+                    buffer,
+                    &SourceOverrides::default(),
+                )
+                .unwrap();
+                let schemas = SchemaRegistry::new();
+                let configuration =
+                    load_buffer_configuration_in_directory(snapshot, &schemas, &context);
+                match configuration.parsed().directory_verdict() {
+                    DirectoryVerdict::Root(root) => {
+                        assert!(
+                            is_root,
+                            "module evidence cannot establish an incomplete verdict"
+                        );
+                        assert_eq!(root.evidence().file_locator().to_path_buf(), evidence);
+                        assert_eq!(root.evidence().location().span().start_line(), 2);
+                    }
+                    DirectoryVerdict::Unknown(()) => {
+                        assert!(!is_root, "readable root evidence is decisive")
+                    }
+                    DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::NoEvidence(_) => {
+                        panic!(
+                            "an incomplete inventory cannot establish a template or absence of evidence"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // macOS APFS rejects non-UTF-8 names.
     #[cfg(target_os = "linux")]
     #[test]
@@ -2578,9 +3565,13 @@ mod tests {
                 .unwrap();
 
         assert!(parsed.semantic_file(&main_path).is_some());
-        assert_eq!(
-            parsed.sole_backend_file.as_deref(),
-            Some(main_path.as_path())
+        assert!(
+            parsed
+                .parsed
+                .complete_directory_verdict()
+                .root()
+                .unwrap()
+                .has_sole_backend()
         );
         assert_eq!(
             parsed.source_files[0].0.identity(),
@@ -3453,10 +4444,8 @@ for account_id in orgs.accounts {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_with_providerless_config(
-                    config.parsed,
+                    config.parsed.admit(&SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(&dir).unwrap(),
-                    session,
-                    &SchemaRegistry::new(),
                 )
                 .expect("directory fixture crosses the module-resolution seam")
             },
@@ -3642,10 +4631,8 @@ let orgs = upstream_state {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_with_providerless_config(
-                    parsed,
+                    parsed.admit(&SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                    session,
-                    &SchemaRegistry::new(),
                 )
                 .map_err(Box::new)
             },
@@ -4254,6 +5241,7 @@ awscc.ec2.SecurityGroup {
                 (
                     temp.path().join(name),
                     DirectoryResolvedFile {
+                        source: ResolvedPath::new(temp.path().join(name)).unwrap(),
                         parsed,
                         local_variable_names,
                     },

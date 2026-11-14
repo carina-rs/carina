@@ -77,7 +77,8 @@ fn review_seam_expanded_admission_retains_instantiated_judgements() {
     );
     carina_core::validation::deferred_types::with_session_for_test(&catalog, |session| {
         let graph = carina_core::module_resolver::resolve_modules_with_providerless_config(
-            root, &path, session, &schemas,
+            root.admit(&schemas, session),
+            &path,
         )
         .unwrap();
         let configuration =

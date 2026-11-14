@@ -309,11 +309,12 @@ fn anonymous_deferred_collision_fixture() -> (
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         |session| {
-            let parsed = crate::parser::parse_file(
-                "let upstream = upstream_state { source = '../upstream' }\n\
+            let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
                  for value in upstream.values {\n\
                    mock.test.Child { identity_input = value }\n\
-                 }\n",
+                 }\n";
+            let parsed = crate::parser::parse_file(
+                fixture_source,
                 std::path::Path::new("main.crn"),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
@@ -322,9 +323,12 @@ fn anonymous_deferred_collision_fixture() -> (
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 |session| {
                     crate::module_resolver::resolve_modules_providerless(
-                        crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                        crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                            parsed,
+                            fixture_source,
+                        )
+                        .admit(&crate::schema::SchemaRegistry::new(), session),
                         &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                        session,
                     )
                     .map_err(Box::new)
                 },
@@ -8306,9 +8310,18 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed,
+                    r#"
+            let roles = for n in [0] {
+                mock.test.Thing { name = "role" }
+            }
+            let r0 = roles[0]
+            let consumer = mock.test.Thing { name = r0.identifier }
+        "#,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
             )
             .expect("reference alias fixture crosses the module-resolution seam")
         },

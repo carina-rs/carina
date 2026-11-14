@@ -55,7 +55,7 @@ impl ModuleInfoApp {
     pub fn new(signature: &FileSignature) -> Self {
         let (rows, title, is_module) = match signature {
             FileSignature::Module(sig) => (Self::build_module_rows(sig), sig.name.clone(), true),
-            FileSignature::RootConfig(sig) => {
+            FileSignature::RootConfig(sig) | FileSignature::Unknown(sig) => {
                 (Self::build_root_config_rows(sig), sig.name.clone(), false)
             }
         };

@@ -6714,7 +6714,14 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
                     policy,
                     None,
                 )
-                .await?;
+                .await
+                .map_err(AppError::from)
+                .map_err(|error| {
+                    error.with_upstream_source_locations(
+                        parsed.parser_binding_metadata.syntax().upstream_sources(),
+                        base_dir,
+                    )
+                })?;
                 let configs =
                     ResolvedProviderConfigs::resolve_with_remote(parsed, &remote_bindings, session)
                         .map_err(provider_config_resolution_error)?;
@@ -6751,7 +6758,14 @@ async fn load_and_resolve_plan_preview_provider_configs<E>(
                     UpstreamMissingStatePolicy::Lenient,
                     None,
                 )
-                .await?;
+                .await
+                .map_err(AppError::from)
+                .map_err(|error| {
+                    error.with_upstream_source_locations(
+                        parsed.parser_binding_metadata.syntax().upstream_sources(),
+                        base_dir,
+                    )
+                })?;
                 let configs = carina_core::parser::PlanPreviewProviderConfigs::resolve_with_remote(
                     parsed,
                     &remote_bindings,
@@ -6855,15 +6869,20 @@ async fn load_provider_referenced_upstream_states<E>(
             provider: required_by.provider,
             attribute: required_by.attribute,
             error: Box::new(
-                if required_by
+                (if required_by
                     .diagnostic_path
                     .as_ref()
                     .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
+                    && !matches!(&error, AppError::UpstreamSourceRejected(_))
                 {
                     AppError::Config(carina_core::resource::INSIDE_SECRET_MESSAGE.into())
                 } else {
                     error
-                },
+                })
+                .with_upstream_source_locations(
+                    parsed.parser_binding_metadata.syntax().upstream_sources(),
+                    base_dir,
+                ),
             ),
         })?;
         remote_bindings.extend(loaded);

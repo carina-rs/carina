@@ -123,7 +123,11 @@ fn expand_directory(root: &Path) -> carina_core::parser::ExpandedParsedFile {
     let config = context();
     TypeCheckSession::run(&config, |session| {
         let parsed = parse_directory(&path, session.catalog()).expect("directory parse");
-        resolve_modules_providerless(parsed, &path, session).expect("module expansion")
+        resolve_modules_providerless(
+            parsed.admit(&carina_core::schema::SchemaRegistry::new(), session),
+            &path,
+        )
+        .expect("module expansion")
     })
     .publish(&mut NoTypeErrors)
     .into_expanded(&carina_core::schema::SchemaRegistry::new(), &config)
@@ -156,7 +160,11 @@ fn module_private_bindings_do_not_enter_root_iterable_scope()
     let path = ResolvedPath::new(root.path()).unwrap();
     let expanded = TypeCheckSession::run(&context(), |session| {
         let parsed = parse_directory(&path, session.catalog()).unwrap();
-        resolve_modules_providerless(parsed, &path, session).unwrap()
+        resolve_modules_providerless(
+            parsed.admit(&carina_core::schema::SchemaRegistry::new(), session),
+            &path,
+        )
+        .unwrap()
     })
     .publish(&mut NoTypeErrors);
     let tree = AnalysisTree::try_from_file(&expanded)?;
@@ -669,7 +677,11 @@ fn module_argument_forwarding_preserves_reference_occurrences()
     let path = ResolvedPath::new(root.path()).unwrap();
     let expanded = TypeCheckSession::run(&config, |session| {
         let parsed = parse_directory(&path, session.catalog()).unwrap();
-        resolve_modules_providerless(parsed, &path, session).unwrap()
+        resolve_modules_providerless(
+            parsed.admit(&carina_core::schema::SchemaRegistry::new(), session),
+            &path,
+        )
+        .unwrap()
     })
     .publish(&mut NoTypeErrors)
     .into_expanded(&carina_core::schema::SchemaRegistry::new(), &config)

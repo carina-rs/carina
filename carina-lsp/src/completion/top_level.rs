@@ -449,15 +449,19 @@ impl CompletionProvider {
                     &self.schemas,
                 ),
         };
-        carina_core::config_loader::parse_directory_for_metadata(
+        match carina_core::module_resolver::load_module_with_diagnostics_and_schemas(
             &module_path,
             &provider_context,
-            &indexmap::IndexMap::new(),
             &self.schemas,
-        )
-        .ok()
-        .map(|directory| directory.into_parsed())
-        .filter(|parsed| !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty())
+            &module_path.source_label(),
+        ) {
+            Ok(module) => Some(module.parsed),
+            Err(carina_core::module_resolver::ModuleLoadError::Unavailable(_))
+            | Err(carina_core::module_resolver::ModuleLoadError::NotModule {
+                error: _,
+                imports: _,
+            }) => None,
+        }
     }
 
     pub(super) fn module_parameter_completions(
@@ -664,7 +668,7 @@ impl CompletionProvider {
         if let Some(path) = import_path.as_deref()
             && let Some(base) = base_path
             && let Ok(module_path) = base.join(path)
-            && let Some(parsed) =
+            && let Ok(parsed) =
                 carina_core::module_resolver::load_module(&module_path, provider_ctx)
             && !parsed.arguments.is_empty()
         {

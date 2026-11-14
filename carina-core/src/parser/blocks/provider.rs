@@ -226,10 +226,11 @@ pub(in crate::parser) fn parse_require_statement(
     preprocessed_file: &crate::parser::PreprocessedFile,
     _source_file: &std::path::Path,
 ) -> Result<RequireBlock, ParseError> {
+    let statement = ctx.declaration_location(&pair);
     let mut inner = pair.into_inner();
     let condition_pair = next_pair(&mut inner, "validate_expr", "require statement")?;
-    // Constraint diagnostics belong to the offending expression, not to the
-    // beginning of a potentially multi-line `require` statement.
+    // Module constraint diagnostics retain the condition span. Placement
+    // rejection uses the separately retained whole-statement location.
     let source_span = crate::parser::SourceSpan::from_pest(&condition_pair, preprocessed_file);
     let location = ctx.declaration_location(&condition_pair);
     let condition_id = ctx
@@ -247,6 +248,6 @@ pub(in crate::parser) fn parse_require_statement(
         crate::parser::ConstraintStringPosition::RequireMessage,
     )?;
     let declaration = RequireBlock::new_in_source(condition, error_message, source_span, location);
-    ctx.retain_require(condition_id, declaration.clone());
+    ctx.retain_require(condition_id, statement);
     Ok(declaration)
 }

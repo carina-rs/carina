@@ -132,10 +132,8 @@ fn module_instances_retain_substituted_judgements() {
     let directory = crate::config_loader::parse_directory(&path, &config).unwrap();
     let graph = deferred_types::with_session_for_test(&config, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            directory,
+            directory.admit(&SchemaRegistry::new(), session),
             &path,
-            session,
-            &SchemaRegistry::new(),
         )
     })
     .unwrap();
@@ -330,10 +328,8 @@ fn deferred_directive_consumes_judged_iterable_type() {
         crate::config_loader::load_configuration_with_config(&path, &config, &schemas).unwrap();
     let graph = deferred_types::with_session_for_test(&config, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            loaded.parsed,
+            loaded.parsed.admit(&schemas, session),
             &path,
-            session,
-            &schemas,
         )
     })
     .unwrap();
@@ -450,10 +446,8 @@ fn authored_expression_module_argument_substitution_cannot_erase_fallback() {
     .unwrap();
     let result = deferred_types::with_session_for_test(&config, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            loaded.parsed,
+            loaded.parsed.admit(&SchemaRegistry::new(), session),
             &path,
-            session,
-            &SchemaRegistry::new(),
         )
     });
     assert!(
@@ -857,7 +851,9 @@ fn empty_parsed() -> ParsedFile {
 
 #[test]
 fn anonymous_schema_error_groups_plain_and_deferred_template_resources() {
-    let parsed = crate::parser::parse(
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
         r#"
 mock.test.Thing { name = "one" }
 mock.test.Thing { name = "two" }
@@ -867,9 +863,14 @@ for item in upstream.items {
     mock.test.Thing { name = item.name }
 }
 "#,
+    )
+    .unwrap();
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
-    .expect("fixture parses");
+    .expect("fixture parses")
+    .into_parsed();
     assert_eq!(parsed.iter_top_level_resources().count(), 2);
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
 
@@ -3102,10 +3103,8 @@ mock.test.Consumer { name = shared }
     .expect("load module fixture");
     let parsed = crate::validation::deferred_types::with_session_for_test(&config, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            parsed.admit(&schemas, session),
             &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
-            session,
-            &schemas,
         )
         .expect("expand nested module")
     });
@@ -4121,76 +4120,76 @@ fn ref_type_mismatch_inside_for_body_is_rejected() {
     );
 }
 
+// The production API accepts only a module selected by the loader. Keep the
+// synthetic block payloads below focused on each prohibition after that boundary.
+fn imported_placement_fixture(parsed: ParsedFile) -> crate::module_resolver::LoadedModule {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("arguments.crn"),
+        "arguments { value: String }\n",
+    )
+    .unwrap();
+    let mut loaded = crate::module_resolver::load_module_with_diagnostics(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    loaded.parsed = parsed;
+    loaded
+}
+
+fn imported_root_block_error(
+    declarations: &str,
+    block_file: &str,
+    block: &str,
+) -> (String, std::path::PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("declarations.crn"), declarations).unwrap();
+    let evidence = directory.path().join(block_file);
+    std::fs::write(&evidence, block).unwrap();
+    let result = crate::module_resolver::load_module_with_diagnostics(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    (
+        result
+            .err()
+            .expect("root block must prohibit import")
+            .to_string(),
+        evidence,
+    )
+}
+
 #[test]
 fn provider_in_module_with_arguments_errors() {
-    let mut parsed = empty_parsed();
-    parsed.providers.push(crate::parser::ProviderConfig {
-        name: "awscc".to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    });
-    parsed.arguments.push(crate::parser::ArgumentParameter {
-        name: "vpc_cidr".to_string(),
-        static_type: local_type(TypeExpr::String),
-        default: None,
-        description: None,
-        validations: Vec::new(),
-    });
-
-    let result = validate_no_provider_in_module(&parsed);
-    assert!(result.is_err());
+    let (message, evidence) = imported_root_block_error(
+        "arguments { vpc_cidr: String }\n",
+        "providers.crn",
+        "provider awscc {}\n",
+    );
     assert_eq!(
-        result.unwrap_err(),
-        "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+        message,
+        format!(
+            "provider blocks are not allowed inside modules. Define providers at the root configuration level.\nNote: directory is a root configuration because of the provider block at {}:1.",
+            evidence.display()
+        )
     );
 }
 
 #[test]
 fn provider_in_module_with_attributes_errors() {
-    let mut parsed = empty_parsed();
-    parsed.providers.push(crate::parser::ProviderConfig {
-        name: "awscc".to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    });
-    parsed
-        .attribute_params
-        .push(crate::parser::AttributeParameter::dummy(
-            "vpc_id".to_string(),
-            Some(TypeExpr::String),
-            Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
-        ));
-
-    let result = validate_no_provider_in_module(&parsed);
-    assert!(result.is_err());
-}
-
-#[test]
-fn provider_without_module_markers_ok() {
-    let mut parsed = empty_parsed();
-    parsed.providers.push(crate::parser::ProviderConfig {
-        name: "awscc".to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    });
-
-    let result = validate_no_provider_in_module(&parsed);
-    assert!(result.is_ok());
+    let (message, evidence) = imported_root_block_error(
+        "attributes { vpc_id: String = 'dummy' }\n",
+        "providers.crn",
+        "provider awscc {}\n",
+    );
+    assert_eq!(
+        message,
+        format!(
+            "provider blocks are not allowed inside modules. Define providers at the root configuration level.\nNote: directory is a root configuration because of the provider block at {}:1.",
+            evidence.display()
+        )
+    );
 }
 
 #[test]
@@ -4204,7 +4203,7 @@ fn module_without_provider_ok() {
         validations: Vec::new(),
     });
 
-    let result = validate_no_provider_in_module(&parsed);
+    let result = validate_no_provider_in_module(&imported_placement_fixture(parsed));
     assert!(result.is_ok());
 }
 
@@ -4227,7 +4226,7 @@ fn moved_in_module_with_arguments_errors() {
     );
     parsed.arguments.push(argument_param("name"));
 
-    let result = validate_no_state_blocks_in_module(&parsed);
+    let result = validate_no_state_blocks_in_module(&imported_placement_fixture(parsed));
 
     assert_eq!(
         result.unwrap_err(),
@@ -4245,7 +4244,7 @@ fn removed_in_module_with_arguments_errors() {
     );
     parsed.arguments.push(argument_param("name"));
 
-    let result = validate_no_state_blocks_in_module(&parsed);
+    let result = validate_no_state_blocks_in_module(&imported_placement_fixture(parsed));
 
     assert!(result.is_err());
 }
@@ -4261,7 +4260,7 @@ fn import_in_module_with_arguments_errors() {
     );
     parsed.arguments.push(argument_param("name"));
 
-    let result = validate_no_state_blocks_in_module(&parsed);
+    let result = validate_no_state_blocks_in_module(&imported_placement_fixture(parsed));
 
     assert!(result.is_err());
 }
@@ -4283,33 +4282,9 @@ fn state_block_in_module_with_attributes_errors() {
             Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
         ));
 
-    let result = validate_no_state_blocks_in_module(&parsed);
+    let result = validate_no_state_blocks_in_module(&imported_placement_fixture(parsed));
 
     assert!(result.is_err());
-}
-
-#[test]
-fn state_blocks_without_module_markers_ok() {
-    let parsed = parse_state_blocks(
-        r#"moved {
-  from = mock.test.Resource 'old'
-  to = mock.test.Resource 'new'
-}
-
-removed {
-  from = mock.test.Resource 'legacy'
-}
-
-import {
-  to = mock.test.Resource 'existing'
-  id = 'resource-123'
-}
-"#,
-    );
-
-    let result = validate_no_state_blocks_in_module(&parsed);
-
-    assert!(result.is_ok());
 }
 
 #[test]
@@ -4317,62 +4292,41 @@ fn module_without_state_blocks_ok() {
     let mut parsed = empty_parsed();
     parsed.arguments.push(argument_param("name"));
 
-    let result = validate_no_state_blocks_in_module(&parsed);
+    let result = validate_no_state_blocks_in_module(&imported_placement_fixture(parsed));
 
     assert!(result.is_ok());
 }
 
 #[test]
 fn backend_in_module_with_arguments_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("name"));
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_backend_in_module(&parsed);
-
+    let (message, evidence) = imported_root_block_error(
+        "arguments { name: String }\n",
+        "backend.crn",
+        "backend local {}\n",
+    );
     assert_eq!(
-        result.unwrap_err(),
-        "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
+        message,
+        format!(
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.\nNote: directory is a root configuration because of the backend block at {}:1.",
+            evidence.display()
+        )
     );
 }
 
 #[test]
 fn backend_in_module_with_attributes_errors() {
-    let mut parsed = empty_parsed();
-    parsed
-        .attribute_params
-        .push(crate::parser::AttributeParameter::dummy(
-            "resource_id".to_string(),
-            Some(TypeExpr::String),
-            Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
-        ));
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_backend_in_module(&parsed);
-
-    assert!(result.is_err());
-}
-
-#[test]
-fn backend_without_module_markers_ok() {
-    let mut parsed = empty_parsed();
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_backend_in_module(&parsed);
-
-    assert!(result.is_ok());
+    let (message, evidence) = imported_root_block_error(
+        "attributes { resource_id: String = 'dummy' }\n",
+        "backend.crn",
+        "backend local {}\n",
+    );
+    assert_eq!(
+        message,
+        format!(
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.\nNote: directory is a root configuration because of the backend block at {}:1.",
+            evidence.display()
+        )
+    );
 }
 
 #[test]
@@ -4380,7 +4334,7 @@ fn module_without_backend_ok() {
     let mut parsed = empty_parsed();
     parsed.arguments.push(argument_param("name"));
 
-    let result = validate_no_backend_in_module(&parsed);
+    let result = validate_no_backend_in_module(&imported_placement_fixture(parsed));
 
     assert!(result.is_ok());
 }
@@ -4399,7 +4353,7 @@ fn upstream_state_in_module_with_arguments_errors() {
         parse_root_owned_declaration("let up = upstream_state { source = '../other' }\n");
     parsed.arguments.push(argument_param("name"));
 
-    let result = validate_no_upstream_states_in_module(&parsed);
+    let result = validate_no_upstream_states_in_module(&imported_placement_fixture(parsed));
 
     assert_eq!(
         result.unwrap_err(),
@@ -4419,18 +4373,9 @@ fn upstream_state_in_module_with_attributes_errors() {
             Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
         ));
 
-    let result = validate_no_upstream_states_in_module(&parsed);
+    let result = validate_no_upstream_states_in_module(&imported_placement_fixture(parsed));
 
     assert!(result.is_err());
-}
-
-#[test]
-fn upstream_state_without_module_markers_ok() {
-    let parsed = parse_root_owned_declaration("let up = upstream_state { source = '../other' }\n");
-
-    let result = validate_no_upstream_states_in_module(&parsed);
-
-    assert!(result.is_ok());
 }
 
 #[test]
@@ -4438,7 +4383,7 @@ fn module_without_upstream_state_ok() {
     let mut parsed = empty_parsed();
     parsed.arguments.push(argument_param("name"));
 
-    let result = validate_no_upstream_states_in_module(&parsed);
+    let result = validate_no_upstream_states_in_module(&imported_placement_fixture(parsed));
 
     assert!(result.is_ok());
 }
@@ -4448,7 +4393,7 @@ fn exports_in_module_with_arguments_errors() {
     let mut parsed = parse_root_owned_declaration("exports {\n  module_value = 'module'\n}\n");
     parsed.arguments.push(argument_param("name"));
 
-    let result = validate_no_exports_in_module(&parsed);
+    let result = validate_no_exports_in_module(&imported_placement_fixture(parsed));
 
     assert_eq!(
         result.unwrap_err(),
@@ -4467,18 +4412,9 @@ fn exports_in_module_with_attributes_errors() {
             Some(Value::Concrete(ConcreteValue::String("dummy".into()))),
         ));
 
-    let result = validate_no_exports_in_module(&parsed);
+    let result = validate_no_exports_in_module(&imported_placement_fixture(parsed));
 
     assert!(result.is_err());
-}
-
-#[test]
-fn exports_without_module_markers_ok() {
-    let parsed = parse_root_owned_declaration("exports {\n  root_value = 'root'\n}\n");
-
-    let result = validate_no_exports_in_module(&parsed);
-
-    assert!(result.is_ok());
 }
 
 #[test]
@@ -4486,12 +4422,22 @@ fn module_without_exports_ok() {
     let mut parsed = empty_parsed();
     parsed.arguments.push(argument_param("name"));
 
-    let result = validate_no_exports_in_module(&parsed);
+    let result = validate_no_exports_in_module(&imported_placement_fixture(parsed));
 
     assert!(result.is_ok());
 }
 
-// --- validate_no_arguments_in_root tests ---
+fn admitted_placement_directory(source: &str) -> crate::config_loader::ParsedRootDirectory {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+}
+
+// --- validate_no_module_declarations_in_root tests ---
 
 fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
     crate::parser::ArgumentParameter {
@@ -4503,66 +4449,112 @@ fn argument_param(name: &str) -> crate::parser::ArgumentParameter {
     }
 }
 
-fn provider(name: &str) -> crate::parser::ProviderConfig<ParserPlaceholder> {
-    crate::parser::ProviderConfig {
-        name: name.to_string(),
-        attributes: Default::default(),
-        default_tags: Default::default(),
-        source: None,
-        version: None,
-        revision: None,
-        unresolved_attributes: Default::default(),
-        binding: None,
-    }
-}
-
 #[test]
 fn arguments_with_backend_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("state_path"));
-    parsed.backend = Some(crate::parser::BackendConfig {
-        backend_type: "local".to_string(),
-        attributes: Default::default(),
-        attribute_spans: Default::default(),
-    });
-
-    let result = validate_no_arguments_in_root(&parsed);
+    let parsed = admitted_placement_directory(
+        "arguments { state_path: String }\nbackend local { path = 'state.json' }\n",
+    );
+    let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
     assert_eq!(
-        result.unwrap_err(),
-        "arguments blocks are only valid inside module definitions, not in root configurations."
+        error.detail().to_string(),
+        format!(
+            "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the backend block at {}:2.",
+            crate::paths::DisplayPath::for_diagnostics(
+                error
+                    .detail()
+                    .root_evidence()
+                    .unwrap()
+                    .location()
+                    .file()
+                    .path()
+            )
+        )
     );
 }
 
 #[test]
 fn arguments_with_provider_errors() {
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("vpc_cidr"));
-    parsed.providers.push(provider("aws"));
+    let parsed = admitted_placement_directory("arguments { vpc_cidr: String }\nprovider aws {}\n");
+    let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
+    assert_eq!(
+        error.detail().to_string(),
+        format!(
+            "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the provider block at {}:2.",
+            crate::paths::DisplayPath::for_diagnostics(
+                error
+                    .detail()
+                    .root_evidence()
+                    .unwrap()
+                    .location()
+                    .file()
+                    .path()
+            )
+        )
+    );
+}
 
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_err());
+#[test]
+fn authored_arguments_in_root_are_rejected_regardless_of_entries() {
+    for root in ["provider mock {}", "backend local { path = 'state.json' }"] {
+        for block in ["arguments {}", "arguments { n: Int = 1 }"] {
+            let parsed = admitted_placement_directory(&format!("{root}\n{block}\n"));
+            let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
+            assert_eq!(
+                error.detail().to_string(),
+                format!(
+                    "arguments blocks are only valid inside module definitions, not in root configurations.\nNote: directory is a root configuration because of the {} block at {}:1.",
+                    if root.starts_with("provider") {
+                        "provider"
+                    } else {
+                        "backend"
+                    },
+                    crate::paths::DisplayPath::for_diagnostics(
+                        error
+                            .detail()
+                            .root_evidence()
+                            .unwrap()
+                            .location()
+                            .file()
+                            .path()
+                    )
+                ),
+                "{root}; {block}"
+            );
+            assert!(
+                parsed
+                    .parsed()
+                    .directory_verdict()
+                    .root()
+                    .unwrap()
+                    .evidence()
+                    .location()
+                    .span()
+                    .start_line()
+                    > 0
+            );
+        }
+    }
 }
 
 #[test]
 fn arguments_alone_is_ok() {
-    // A directory with only `arguments` looks like a module the user
-    // is validating in isolation; we cannot prove it is a root, so
-    // do not flag it (issue #2198).
-    let mut parsed = empty_parsed();
-    parsed.arguments.push(argument_param("vpc_cidr"));
-
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_ok());
+    let parsed = admitted_placement_directory("arguments { vpc_cidr: String }\n");
+    assert!(matches!(
+        parsed.parsed().directory_verdict(),
+        crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
+    ));
+    assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_ok());
 }
 
 #[test]
-fn empty_arguments_in_root_ok() {
-    let parsed = empty_parsed();
-    let result = validate_no_arguments_in_root(&parsed);
-    assert!(result.is_ok());
+fn direct_directory_without_module_evidence_is_ok() {
+    let parsed = admitted_placement_directory("// No arguments block.\n");
+    assert!(matches!(
+        parsed.parsed().directory_verdict(),
+        crate::config_loader::DirectoryVerdict::NoEvidence(_)
+    ));
+    assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_ok());
 }
-
-// --- rendered_typecheck_result tests ---
 
 #[test]
 fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
@@ -11123,10 +11115,8 @@ fn module_argument_interpolation_cannot_bypass_substitution() {
     let result =
         deferred_types::with_session_for_test(&expression_validation_config(), |session| {
             crate::module_resolver::resolve_modules_with_providerless_config(
-                parsed,
+                parsed.admit(&SchemaRegistry::new(), session),
                 &path,
-                session,
-                &SchemaRegistry::new(),
             )
         });
     assert!(
@@ -11158,10 +11148,8 @@ fn instances_retain_each_authored_location() {
     let location = child.attribute_params[0].value_location().unwrap().clone();
     let graph = deferred_types::with_session_for_test(&expression_validation_config(), |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            parsed.admit(&SchemaRegistry::new(), session),
             &path,
-            session,
-            &SchemaRegistry::new(),
         )
     })
     .unwrap();

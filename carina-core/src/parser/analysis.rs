@@ -76,6 +76,36 @@ pub struct DeclarationLocation {
 }
 
 impl DeclarationLocation {
+    pub(crate) fn displayed_from(&self, root: &crate::paths::ResolvedPath) -> Self {
+        let label = if self.file.path().is_absolute() {
+            crate::paths::PersistedPath::new(self.file.path())
+                .ok()
+                .and_then(|file| file.lexical_relative_to(root.persisted_path()))
+                .map(crate::paths::DisplayPath::into_source_path)
+                .unwrap_or_else(|| self.file.path().to_path_buf())
+        } else {
+            self.file.path().to_path_buf()
+        };
+        let label = label
+            .strip_prefix(".")
+            .map(Path::to_path_buf)
+            .unwrap_or(label);
+        let label = if label.is_relative() && !label.starts_with("..") {
+            std::path::Path::new(".").join(label)
+        } else {
+            label
+        };
+        Self {
+            file: SourceFileId::new(label),
+            span: self.span,
+        }
+    }
+    pub(crate) fn with_display_file(&self, file: std::path::PathBuf) -> Self {
+        Self {
+            file: SourceFileId::new(file),
+            span: self.span,
+        }
+    }
     pub(in crate::parser) fn literal_string(
         pair: &pest::iterators::Pair<'_, Rule>,
         interpolation: Option<std::ops::Range<usize>>,
@@ -141,6 +171,7 @@ impl DeclarationLocation {
                 | Rule::type_expr
                 | Rule::attributes_param
                 | Rule::exports_param
+                | Rule::require_statement
                 | Rule::validate_expr
                 | Rule::for_expr
                 | Rule::if_expr
@@ -1773,8 +1804,6 @@ pub struct AnalysisTree<
     functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
-    module_definition: bool,
-    root_configuration: bool,
     backend_location: Option<&'a DeclarationLocation>,
 }
 
@@ -2155,7 +2184,7 @@ where
             syntax
                 .configuration_blocks()
                 .iter()
-                .filter(|block| *block.detail() == super::ConfigurationBlock::State)
+                .filter(|block| block.detail().kind() == super::ConfigurationBlock::State)
                 .count()
                 == file.state_blocks.len(),
             "state block declarations".into(),
@@ -2179,7 +2208,7 @@ where
                 .configuration_blocks()
                 .iter()
                 .rev()
-                .find(|block| *block.detail() == super::ConfigurationBlock::Backend)
+                .find(|block| block.detail().kind() == super::ConfigurationBlock::Backend)
                 .ok_or_else(|| {
                     AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
                         element: "backend declaration".to_string(),
@@ -2619,8 +2648,6 @@ where
             arguments: &file.arguments,
             functions: &file.user_functions,
             module_calls: &file.module_calls,
-            module_definition: !file.arguments.is_empty() || !file.attribute_params.is_empty(),
-            root_configuration: file.backend.is_some() || !file.providers.is_empty(),
             backend_location,
             binding_names: syntax
                 .binding_names()
@@ -2691,11 +2718,8 @@ where
             .expect("provider inventory validated at the analysis boundary")
     }
 
-    pub fn is_module_definition(&self) -> bool {
-        self.module_definition
-    }
-    pub fn is_root_configuration(&self) -> bool {
-        self.root_configuration
+    pub fn directory_verdict(&self) -> &crate::config_loader::DirectoryVerdict {
+        self.syntax.directory_verdict()
     }
     pub fn backend_location(&self) -> Option<&'a DeclarationLocation> {
         self.backend_location

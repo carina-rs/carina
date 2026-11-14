@@ -8,6 +8,57 @@ resources along with input parameters (`arguments`) and same-stack outputs
 (`attributes`). An output may be an ordinary value or a typed managed-resource
 handle.
 
+## Root Configurations and Module Templates
+
+Carina determines the declaration scope from the directory, including all sibling
+`.crn` files. With a complete inventory:
+
+| Evidence in the complete directory | Direct CLI, LSP, `module info` and TUI | Imported with `use` |
+| --- | --- | --- |
+| Any authored `provider` or `backend` block, including a provider instance bound with `let` | Root configuration | Rejected: provider/backend blocks belong to the root |
+| No root evidence, and an `arguments` block, `attributes` block, or `require` statement | Module template; empty blocks count | Module |
+| Neither root nor module evidence | Root configuration (`module info` displays File metadata) | Module |
+
+All sibling `.crn` files contribute to this verdict. Root configurations cannot
+declare `arguments`, `attributes`, or `require`; empty blocks are also rejected.
+Root outputs use `exports`. A template's `require` conditions remain unevaluated
+until a module call binds its arguments. A require-only directory is therefore
+a template when validated directly or opened in the language server.
+
+A directory is importable when it has at least one `.crn` file and no provider
+or backend block. Arguments and outputs are optional; entry counts do not
+change importability. Importing an existing directory with no `.crn` files
+reports `No .crn files found`. Imported modules and directly validated module templates cannot declare state
+blocks (`moved`, `import`, `removed`), `upstream_state`, or `exports`. Empty
+blocks count too. These declarations do not supply root evidence.
+
+A directory with no provider/backend can be applied directly as a root and also
+imported by another root, which would manage its resources twice.
+
+An `upstream_state` source must be a root configuration. A source with module
+evidence and no provider/backend is a module definition with no state to read,
+so Carina reports an error. Its note identifies the first `arguments` block,
+`attributes` block, or `require` statement that established the template; the
+language server attaches this location as related information. A source with
+neither kind of evidence is read as a root.
+
+Root evidence is decisive even when a sibling cannot be read or parsed: any
+readable authored provider/backend block, including one in an unsaved buffer,
+establishes a root. Without root evidence, an incomplete directory or an editor
+buffer without a directory snapshot remains unknown. Module evidence alone
+cannot settle an incomplete inventory. Under unknown, Carina defers placement
+and provider/backend schema checks; ordinary expression checks still run.
+This partial recovery is specific to the language server; CLI directory loads
+still report the sibling read or parse failure.
+`module info` displays neutral file metadata for an unknown snapshot.
+
+Each root-placement diagnostic carries the provider/backend evidence from the
+verdict. The CLI includes an indented note naming its file and line; the
+language server attaches that location as related information to the same
+diagnostic. The same evidence accompanies a prohibition when a root directory
+is imported. A provider prohibition cites the provider block; a backend
+prohibition cites the backend block, including when both are present.
+
 ## Block Roles at a Glance
 
 A directory of `.crn` files may contain three interface-like blocks. They share a similar surface — `name: Type = expr` — but play different roles, and the `=` part means something different in each:
@@ -44,7 +95,7 @@ cross a state boundary. Export an identity value such as
 
 ## Module Structure
 
-A module is a directory containing one or more `.crn` files that together declare `arguments` and `attributes` blocks. Carina merges every `.crn` file in the directory as peers; there is no privileged filename like `main.crn`.
+A module is an importable directory containing one or more `.crn` files. Its `arguments` and `attributes` blocks are optional. Carina merges every `.crn` file in the directory as peers; there is no privileged filename like `main.crn`.
 
 ```crn
 # modules/network/main.crn  (any filename works — main.crn is just convention)
@@ -157,15 +208,20 @@ reference every argument declared by the module. An undeclared name is an
 error during validation, even when one of the declared argument values is
 still unresolved.
 
-In a configuration directory with no `arguments` or `attributes` blocks, a
-`require` condition has no arguments in scope. It may use constants and
-supported constraint functions, but cannot reference directory `let` bindings
-or resources. Root requirements are always checked during validation. See
-[Require Statement](/reference/dsl/syntax/#require-statement).
-
-When validated directly, a directory containing either module declaration
-block keeps its `require` conditions unevaluated as a template, including
-when the block is empty.
+`require` is argument validation for modules. A `require` in a root
+configuration is a validation error, even if its condition is true. The
+[directory scope rules](#root-configurations-and-module-templates) determine
+whether the directory is a root or a template. Commands that run the
+configuration validation step, which checks declarations and expressions,
+reject it. Loading configuration can retain the finding without reporting
+it; commands that only load the files do not reject it for placement.
+Whether validation runs can depend on the selected operation and the state
+being processed. Syntax and parse-time
+checks still run first. After parsing succeeds, the rejection replaces general
+expression inference inside the condition; the condition is never evaluated.
+The rejection starts at the `require` keyword and covers the statement.
+This also applies to a root configuration loaded through `upstream_state`; the error retains the upstream
+file and position. See [Require Statement](/reference/dsl/syntax/#require-statement).
 
 ### When Constraints Run
 
@@ -184,12 +240,13 @@ Pending constraints remain attached to the module call and are checked again
 at later resolution boundaries. This matters when an update or replacement
 publishes a value that differs from the value available during planning.
 
-Saving a plan requires successful validation of root requirements. Saved-plan
-apply reloads current source to check backend drift. Plans that need secret
-verification also validate the current configuration, so both directory and
-module requirements must still pass. Plans without secrets apply the saved
-snapshot without rechecking the current source's requirements. Pending module
-constraints in that snapshot are still checked when their inputs resolve.
+Saving a plan validates the configuration and rejects any `require` outside
+a module. Saved-plan apply reloads current source to check backend drift.
+Plans that need secret verification also validate the current configuration,
+so it must still be valid and module constraints must pass. Plans without
+secrets apply the saved snapshot without rechecking the current source's
+constraints. Pending module constraints in that snapshot are still checked
+when their inputs resolve.
 Plans with an unsupported format version must be regenerated.
 
 Resource schema value constraints follow the same value-time rule. Carina

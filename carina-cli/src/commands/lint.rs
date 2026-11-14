@@ -14,11 +14,7 @@ use carina_core::parser::ProviderContext;
 
 use crate::error::AppError;
 use crate::module_walk::ModuleWalk;
-use crate::wiring::{
-    ProviderLoad, validate_no_backend_in_modules, validate_no_exports_in_modules,
-    validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
-    validate_no_upstream_states_in_modules,
-};
+use crate::wiring::{ProviderLoad, validate_module_boundaries};
 
 /// A lint warning with file, line, and message info.
 struct LintWarning {
@@ -309,11 +305,7 @@ fn lint_result(
         &provider_context.environment,
         &carina_core::schema::SchemaRegistry::new(),
     );
-    let mut module_boundary_findings = validate_no_provider_in_modules(&module_walk);
-    module_boundary_findings.extend(validate_no_state_blocks_in_modules(&module_walk));
-    module_boundary_findings.extend(validate_no_backend_in_modules(&module_walk));
-    module_boundary_findings.extend(validate_no_upstream_states_in_modules(&module_walk));
-    module_boundary_findings.extend(validate_no_exports_in_modules(&module_walk));
+    let module_boundary_findings = validate_module_boundaries(&module_walk);
 
     let (providers, provider_factory_error) = ProviderLoad::load_reporting(
         runtime,
@@ -334,6 +326,13 @@ fn lint_result(
                 .into_iter()
                 .map(|error| error.to_string())
                 .collect::<Vec<_>>();
+            if let Err(error) =
+                carina_core::validation::validate_no_module_declarations_in_root(parsed.parsed())
+            {
+                type_findings.push(crate::error::lint_error_message(
+                    &AppError::RootDeclaration(Box::new(error)),
+                ));
+            }
             if type_findings.is_empty()
                 && let Err(error) = carina_core::validation::validate_attribute_params_with_context(
                     &parsed.attribute_params,
@@ -370,13 +369,12 @@ fn lint_result(
             // suggestions return once the blocking finding is fixed.
             let mut parsed = if module_boundary_findings.is_empty() && type_findings.is_empty() {
                 let resolution = module_resolver::resolve_module_template_with_config(
-                    parsed, base_dir, catalog, schemas,
+                    parsed.admit(schemas, catalog),
+                    base_dir,
                 );
-                LintFile::Resolved(resolution.map_err(|e| {
-                    format!(
-                        "Module resolution error: {}",
-                        e.display_relative_to(&base_dir.source_label())
-                    )
+                LintFile::Resolved(resolution.map_err(|error| AppError::LintModuleResolution {
+                    error: Box::new(error),
+                    base: base_dir.source_label(),
                 })?)
             } else {
                 LintFile::Blocked(parsed)
@@ -420,7 +418,7 @@ fn lint_result(
                     // the finding itself retains the recursive module-path prefix.
                     file: base_dir.source_label(),
                     line: 1,
-                    message: finding.to_string(),
+                    message: crate::error::lint_error_message(&finding),
                 })
                 .collect();
             if let Some(boundary_errors) = export_handle_errors {

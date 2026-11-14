@@ -1170,6 +1170,87 @@ fn validation_finding_display(prefix: Option<&str>, finding: &impl std::fmt::Dis
     }
 }
 
+fn placement_finding_display(
+    finding: &carina_core::parser::Located<
+        carina_core::validation::ConfigurationPlacementDiagnostic,
+    >,
+    message: impl std::fmt::Display,
+) -> String {
+    let location = finding.location();
+    format!(
+        "{}:{}:{}: {message}",
+        carina_core::paths::DisplayPath::for_diagnostics(location.file().path()),
+        location.span().start_line(),
+        location.span().start_column()
+    )
+}
+
+fn root_require_rejection(
+    error: &carina_core::static_type::InferenceError,
+) -> Option<&carina_core::module_resolver::RequireOutsideModuleDiagnostic> {
+    use carina_core::static_type::InferenceError;
+    match error {
+        InferenceError::RequireOutsideModule(rejection) => Some(rejection),
+        InferenceError::InsideSecret {}
+        | InferenceError::SecretAssignmentMismatch { types: _ }
+        | InferenceError::MissingEvidence(_)
+        | InferenceError::UnknownType { reason: _ }
+        | InferenceError::HeterogeneousCollection { types: _ }
+        | InferenceError::IncompatibleCoalesceTypes { types: _ }
+        | InferenceError::InvalidIntegerArithmeticOperand {
+            op: _,
+            side: _,
+            actual: _,
+            operator_span: _,
+        }
+        | InferenceError::UnknownBinding { binding: _ }
+        | InferenceError::UnknownAttribute {
+            binding: _,
+            attribute: _,
+        }
+        | InferenceError::InvalidAccess {
+            base_type: _,
+            step: _,
+        }
+        | InferenceError::CyclicVirtualBinding { cycle: _ } => None,
+    }
+}
+
+fn expression_source_label(
+    finding: &carina_core::parser::Located<carina_core::static_type::InferenceError>,
+) -> String {
+    match root_require_rejection(finding.detail()) {
+        Some(_) => {
+            carina_core::paths::DisplayPath::for_diagnostics(finding.location().file().path())
+                .to_string()
+        }
+        None => finding.location().file().path().display().to_string(),
+    }
+}
+
+/// Terminal transport for a group containing root-placement findings.
+/// Its members retain their own diagnostics; it introduces no additional cause.
+#[derive(Debug)]
+pub struct RootPlacementErrors {
+    errors: Vec<AppError>,
+}
+impl RootPlacementErrors {
+    pub(crate) fn new(errors: Vec<AppError>) -> Self {
+        Self { errors }
+    }
+}
+impl std::fmt::Display for RootPlacementErrors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, error) in self.errors.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str("\n")?;
+            }
+            formatter.write_str(&format_error_with_source_chain(error))?;
+        }
+        Ok(())
+    }
+}
+
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -1179,10 +1260,25 @@ pub enum AppError {
     UpstreamReference(Box<UpstreamReferenceFailure>),
     #[error("{0}")]
     ModuleResolution(Box<ModuleResolutionFailure>),
+    #[error("{path}: {error}")]
+    ModuleImport {
+        path: carina_core::paths::DisplayPath,
+        error: std::sync::Arc<carina_core::module_resolver::ModuleError>,
+    },
+    /// Lint aborts expansion with the typed resolver failure and original path presentation.
+    #[error("Module resolution error: {}", error.display_relative_to(base))]
+    LintModuleResolution {
+        error: Box<carina_core::module_resolver::ModuleError>,
+        base: PathBuf,
+    },
     #[error("{0}")]
     UpstreamResolution(
         Box<carina_core::parser::Located<carina_core::upstream_exports::UpstreamResolveFailure>>,
     ),
+
+    /// A runtime source was rejected before its backend could be read.
+    #[error("{0}")]
+    UpstreamSourceRejected(Box<carina_core::upstream_exports::UpstreamModuleTemplateRejection>),
 
     #[error("{0}")]
     AttributePrefix(Box<carina_core::identifier::AttributePrefixError>),
@@ -1607,7 +1703,7 @@ pub enum AppError {
     #[error(transparent)]
     AnalysisInvariant(#[from] carina_core::parser::AnalysisTreeError),
 
-    #[error("{} at line {}\n{}", .0.location().file().path().display(), .0.location().span().start_line(), .0.detail())]
+    #[error("{} at line {}\n{}", expression_source_label(.0), .0.location().span().start_line(), .0.detail())]
     ExpressionType(Box<carina_core::parser::Located<carina_core::static_type::InferenceError>>),
 
     #[error("{0}")]
@@ -1636,6 +1732,18 @@ pub enum AppError {
     /// Validation errors (schema mismatch, invalid config, etc.)
     #[error("{0}")]
     Validation(String),
+
+    /// A misplaced root declaration retains the loader-issued evidence.
+    #[error("{}", placement_finding_display(.0, .0.detail()))]
+    RootDeclaration(
+        Box<
+            carina_core::parser::Located<carina_core::validation::ConfigurationPlacementDiagnostic>,
+        >,
+    ),
+
+    /// Multiple findings retain typed root evidence until final presentation.
+    #[error("{0}")]
+    RootPlacementGroup(Box<RootPlacementErrors>),
 
     /// Configuration errors (missing attributes, invalid paths, etc.)
     #[error("{0}")]
@@ -1915,6 +2023,324 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
     messages.join("\n")
 }
 
+/// Evidence stays typed through human rendering. Ordinary multiline messages
+/// retain their existing per-line error prefixes; declaration evidence is a note.
+pub use carina_core::module_resolver::DiagnosticLine as HumanErrorLine;
+
+fn prefix_first_message(lines: &mut [HumanErrorLine], prefix: &str) {
+    if let Some(HumanErrorLine::Message(message)) = lines.first_mut() {
+        message.insert_str(0, prefix);
+    }
+}
+
+pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
+    let mut lines = match error {
+        AppError::RootPlacementGroup(group) => {
+            return group.errors.iter().flat_map(human_error_lines).collect();
+        }
+        AppError::RootDeclaration(finding) => {
+            let mut lines = vec![HumanErrorLine::Message(placement_finding_display(
+                finding,
+                finding.detail().lsp_message(),
+            ))];
+            if let Some(evidence) = finding.detail().root_evidence() {
+                lines.push(HumanErrorLine::RootEvidence(evidence.clone()));
+            }
+            lines
+        }
+        AppError::ExpressionType(finding) => match root_require_rejection(finding.detail()) {
+            Some(rejection) => vec![
+                HumanErrorLine::Message(format!(
+                    "{} at line {}\n{}",
+                    expression_source_label(finding),
+                    finding.location().span().start_line(),
+                    rejection.lsp_message()
+                )),
+                HumanErrorLine::RootEvidence(rejection.root_evidence().clone()),
+            ],
+            None => vec![HumanErrorLine::Message(error.to_string())],
+        },
+        AppError::ModuleImport { path, error } => {
+            let mut lines = error.diagnostic_lines_relative_to(None);
+            prefix_first_message(&mut lines, &format!("{path}: "));
+            lines
+        }
+        AppError::LintModuleResolution { error, base } => {
+            let mut lines = error.diagnostic_lines_relative_to(Some(base));
+            prefix_first_message(&mut lines, "Module resolution error: ");
+            lines
+        }
+        AppError::ModuleResolution(failure) => {
+            let mut lines = failure
+                .error
+                .diagnostic_lines_relative_to(&failure.base.source_label());
+            if !failure.error.is_constraint() {
+                prefix_first_message(&mut lines, "Module resolution error: ");
+            }
+            lines
+        }
+        AppError::UpstreamResolution(finding) => {
+            let mut lines = finding.detail().diagnostic_lines();
+            if let Some(HumanErrorLine::Message(message)) = lines.first_mut() {
+                *message =
+                    carina_core::parser::Located::new(finding.location().clone(), message.as_str())
+                        .to_string();
+            }
+            lines
+        }
+        AppError::UpstreamSourceRejected(failure) => failure.diagnostic_lines(),
+        AppError::ProviderReferencedUpstream {
+            provider,
+            attribute,
+            error,
+        } => {
+            let mut lines = human_error_lines(error);
+            if let Some(HumanErrorLine::Message(message)) = lines.first_mut() {
+                message.push_str(&format!(
+                    "; required by provider '{provider}' attribute '{attribute}'"
+                ));
+            }
+            lines
+        }
+        AppError::SavedPlanSecretVerification(failure) => match failure.as_ref() {
+            SavedPlanSecretVerificationError::EvaluationUnavailable { replan, error } => {
+                let mut lines = human_error_lines(error);
+                prefix_first_message(
+                    &mut lines,
+                    &format!(
+                        "Saved-plan secret verification failed because the current configuration could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs: "
+                    ),
+                );
+                lines
+            }
+            SavedPlanSecretVerificationError::UnavailableSecret {
+                location: _,
+                replan: _,
+                error: _,
+            }
+            | SavedPlanSecretVerificationError::HashMismatch {
+                location: _,
+                replan: _,
+            }
+            | SavedPlanSecretVerificationError::ConfigurationChanged {
+                location: _,
+                replan: _,
+            }
+            | SavedPlanSecretVerificationError::SecretEvaluationUnavailable {
+                location: _,
+                replan: _,
+            }
+            | SavedPlanSecretVerificationError::OrphanVanished {
+                resource: _,
+                replan: _,
+            }
+            | SavedPlanSecretVerificationError::Serialization {
+                location: _,
+                replan: _,
+                error: _,
+            } => vec![HumanErrorLine::Message(error.to_string())],
+        },
+        AppError::ProviderTypeCheck(_)
+        | AppError::UpstreamReference(_)
+        | AppError::AttributePrefix(_)
+        | AppError::ProviderConfiguration(_)
+        | AppError::SavedPlanProviderConfiguration(_)
+        | AppError::ParameterReference {
+            prefix: _,
+            finding: _,
+        }
+        | AppError::ParameterValue {
+            prefix: _,
+            finding: _,
+        }
+        | AppError::UpstreamSource(_)
+        | AppError::ConfigurationLoad(_)
+        | AppError::ValidationFileRead { file: _, error: _ }
+        | AppError::InputFinding(_)
+        | AppError::InputPreparation(_)
+        | AppError::ResourceAdmission(_)
+        | AppError::Parse(_)
+        | AppError::AnalysisResolution(_)
+        | AppError::FinalProviderInput(_)
+        | AppError::UpstreamSnapshotChanged(_)
+        | AppError::UpstreamSourceResolution {
+            binding: _,
+            source_path: _,
+            error: _,
+        }
+        | AppError::TypeCheckDiagnostics(_)
+        | AppError::UpstreamExportAdmission(_)
+        | AppError::PlanPreparation(_)
+        | AppError::CommandInput(_)
+        | AppError::ExportBoundary(_)
+        | AppError::ValueResolution(_)
+        | AppError::Serialization(_)
+        | AppError::DeferredForExpansion(_)
+        | AppError::Init(_)
+        | AppError::UserDirs(_)
+        | AppError::UnverifiedOfficialProvider(_)
+        | AppError::TrustedLocalGrant(_)
+        | AppError::ResourceIdentity(_)
+        | AppError::CompositionSourceIdentity(_)
+        | AppError::InvalidStateBucketIdentity {
+            bucket_name: _,
+            error: _,
+        }
+        | AppError::InvalidStateBucketProviderIdentifier {
+            bucket_name: _,
+            error: _,
+        }
+        | AppError::PendingResourceIdentity(_)
+        | AppError::DestroyPlan(_)
+        | AppError::DeleteSchedule(_)
+        | AppError::ExpandedGraphResolution(_)
+        | AppError::ResolvedResource(_)
+        | AppError::ReplacementAdmission(_)
+        | AppError::CurrentMoveRouting(_)
+        | AppError::MoveSourceNotLoaded { from: _, to: _ }
+        | AppError::DetectedMoveConflict {
+            from: _,
+            to: _,
+            existing_from: _,
+            existing_to: _,
+        }
+        | AppError::ResolvedMove(_)
+        | AppError::BackendAttribute(_)
+        | AppError::UnlocatedBackend(_)
+        | AppError::UnsupportedBackend(_)
+        | AppError::Backend(_)
+        | AppError::StateForget(_)
+        | AppError::LockedStateReload(_)
+        | AppError::ResourceStateEncoding(_)
+        | AppError::PersistedDirectiveTargetMissingFromDesired { resource_id: _ }
+        | AppError::PersistedDirectiveTargetMissingFromLockedState { resource_id: _ }
+        | AppError::ProjectBackend(_)
+        | AppError::UpstreamStateSource(_)
+        | AppError::Provider(_)
+        | AppError::ReferencePreparation(_)
+        | AppError::PlanComparison(_)
+        | AppError::Comparison(_)
+        | AppError::AwsCredentials(_)
+        | AppError::ComparisonResolution(_)
+        | AppError::AnonymousIdentifierReconciliation(_)
+        | AppError::ModuleConstraint(_)
+        | AppError::DestroyDependencyAnalysis(_)
+        | AppError::ResolvedResourceOriginIndex(_)
+        | AppError::ProviderPreparation(_)
+        | AppError::ProviderConfigPreparation(_)
+        | AppError::EnumCanonicalization(_)
+        | AppError::ProviderConfigCanonicalization(_)
+        | AppError::SourceProviderKindMismatch {
+            configured: _,
+            loaded: _,
+            provider_source: _,
+        }
+        | AppError::SourceProviderTrustMismatch {
+            configured: _,
+            expected: _,
+            provider_source: _,
+        }
+        | AppError::ProviderAttributeResolution(_)
+        | AppError::ProviderInputResolution(_)
+        | AppError::ProviderConfigInvariant(_)
+        | AppError::SavedProviderConfig {
+            error: _,
+            replan_command: _,
+        }
+        | AppError::ValueWalk {
+            location: _,
+            error: _,
+        }
+        | AppError::StateBucketPreparation(_)
+        | AppError::StateBucketCreate(_)
+        | AppError::StateBucketSeed(_)
+        | AppError::LockConstraint(_)
+        | AppError::PlanImage(_)
+        | AppError::Tui(_)
+        | AppError::BindingUse(_)
+        | AppError::BindingUseReport(_)
+        | AppError::LeftoverPlaceholder(_)
+        | AppError::LeftoverPlaceholders(_)
+        | AppError::Expansion(_)
+        | AppError::ModuleCall(_)
+        | AppError::TypeResolution(_)
+        | AppError::AnalysisInvariant(_)
+        | AppError::DependsOn(_)
+        | AppError::Wait(_)
+        | AppError::DeferredPopulate(_)
+        | AppError::ProviderRouting(_)
+        | AppError::Validation(_)
+        | AppError::Config(_)
+        | AppError::ExecutionFailed(_)
+        | AppError::AnonymousIdentity(_)
+        | AppError::ApplyInputNotFound { path: _, error: _ }
+        | AppError::ApplyInputDanglingSymlink { path: _, error: _ }
+        | AppError::ApplyInputInspection { path: _, error: _ }
+        | AppError::InvalidPlanFile { path: _, error: _ }
+        | AppError::UnreadableJsonPlanFile { path: _, error: _ }
+        | AppError::PlanFileRead { path: _, error: _ }
+        | AppError::UnsupportedPlanVersion {
+            path: _,
+            found: _,
+            expected: _,
+            replan_command: _,
+        }
+        | AppError::CorruptPlanFile(_)
+        | AppError::SavedPlanSourceChanged {
+            source_path: _,
+            replan_command: _,
+        }
+        | AppError::SavedPlanSourceResolution(_)
+        | AppError::SavedPlanProviderEvidence(_)
+        | AppError::SavedPlanSchemaMismatch(_)
+        | AppError::SavedPlanProviderArtifactMismatch(_)
+        | AppError::SavedPlanProviderScopeMismatch(_)
+        | AppError::SavedPlanDirectiveChangesMismatch(_)
+        | AppError::PartialSuccess(_)
+        | AppError::Interrupted
+        | AppError::StateLockLost { error: _ } => vec![HumanErrorLine::Message(error.to_string())],
+    };
+    // Keep source-chain and replan rendering identical for every other error.
+    if !lines.iter().any(|line| {
+        matches!(
+            line,
+            HumanErrorLine::RootEvidence(_) | HumanErrorLine::ModuleEvidence(_)
+        )
+    }) {
+        return vec![HumanErrorLine::Message(format_error_with_source_chain(
+            error,
+        ))];
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        lines.push(HumanErrorLine::Message(cause.to_string()));
+        source = cause.source();
+    }
+    lines
+}
+
+pub(crate) fn has_directory_evidence_notes(error: &AppError) -> bool {
+    human_error_lines(error).iter().any(|line| {
+        matches!(
+            line,
+            HumanErrorLine::RootEvidence(_) | HumanErrorLine::ModuleEvidence(_)
+        )
+    })
+}
+
+/// Lint keeps its warning prefix while indenting typed evidence continuations.
+pub(crate) fn lint_error_message(error: &AppError) -> String {
+    human_error_lines(error)
+        .into_iter()
+        .map(|line| match line {
+            HumanErrorLine::Message(message) => message,
+            HumanErrorLine::RootEvidence(evidence) => format!("  Note: {}", evidence.note()),
+            HumanErrorLine::ModuleEvidence(evidence) => format!("  Note: {}", evidence.note()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl From<carina_core::resource::ResolvedResourceError> for AppError {
     fn from(error: carina_core::resource::ResolvedResourceError) -> Self {
         Self::ResolvedResource(Box::new(error))
@@ -1978,14 +2404,41 @@ impl From<crate::wiring::PlanPreparationError> for AppError {
     }
 }
 
+impl AppError {
+    pub(crate) fn with_upstream_source_locations<B: carina_core::resource::BindingAddress>(
+        self,
+        locations: &[carina_core::parser::Located<B>],
+        root: &carina_core::paths::ResolvedPath,
+    ) -> Self {
+        match self {
+            Self::UpstreamSourceRejected(rejection) => {
+                match locations
+                    .iter()
+                    .find(|source| source.detail().to_string() == rejection.binding())
+                {
+                    Some(source) => Self::UpstreamResolution(Box::new(
+                        rejection.at_call(source.location(), root),
+                    )),
+                    None => Self::UpstreamSourceRejected(rejection),
+                }
+            }
+            error => error,
+        }
+    }
+}
+
 impl From<carina_core::upstream_exports::UpstreamSourceLoadError> for AppError {
     fn from(error: carina_core::upstream_exports::UpstreamSourceLoadError) -> Self {
         match error {
             error @ carina_core::upstream_exports::UpstreamSourceLoadError::Configuration {
-                ..
+                binding: _,
+                message: _,
             } => Self::Config(error.to_string()),
             carina_core::upstream_exports::UpstreamSourceLoadError::Invariant(error) => {
                 error.into()
+            }
+            carina_core::upstream_exports::UpstreamSourceLoadError::Rejected(failure) => {
+                Self::UpstreamSourceRejected(failure)
             }
             carina_core::upstream_exports::UpstreamSourceLoadError::Expansion(error) => {
                 error.into()

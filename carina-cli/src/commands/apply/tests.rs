@@ -150,10 +150,9 @@ where
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed)
+                    .admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(&base_dir).unwrap(),
-                session,
-                &carina_core::schema::SchemaRegistry::new(),
             )
             .expect("test fixture crosses module resolution")
         },
@@ -1080,8 +1079,7 @@ fn record_with_builtin_mock_schemas(contents: PlanFileContents) -> PlanFile {
 
 #[test]
 fn current_plan_format_round_trip_includes_format_29_loop_provenance_and_deferred_targets() {
-    let parsed = carina_core::parser::parse_file(
-        r#"
+    let fixture_source = r#"
 let orgs = upstream_state { source = "../orgs" }
 
 for name in ["one"] {
@@ -1095,7 +1093,9 @@ let bound_items = for account_id in orgs.accounts {
 for account_id in orgs.accounts {
     mock.test.resource { name = account_id }
 }
-"#,
+"#;
+    let parsed = carina_core::parser::parse_file(
+        fixture_source,
         Path::new("main.crn"),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
@@ -1104,9 +1104,12 @@ for account_id in orgs.accounts {
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |session| {
             carina_core::module_resolver::resolve_modules_providerless(
-                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed,
+                    fixture_source,
+                )
+                .admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-                session,
             )
             .expect("cross the deferred-body resolution seam")
         },
@@ -5221,6 +5224,7 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
             source_dir: tmp.path(),
         },
         &source,
+        &[],
         cancel.clone(),
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
@@ -10384,9 +10388,11 @@ mod apply_deferred_for_parity {
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
-                    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                    carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                        parsed, source,
+                    )
+                    .admit(&carina_core::schema::SchemaRegistry::new(), session),
                     &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                    session,
                 )
                 .expect("cross the deferred-body resolution seam")
             },

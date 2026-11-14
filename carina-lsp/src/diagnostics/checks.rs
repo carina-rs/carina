@@ -382,57 +382,6 @@ impl SemanticLookup for ParsedExportParam {
     }
 }
 
-/// Locate the `source = '<expected>'` or `source = "<expected>"` line inside
-/// an `upstream_state { ... }` block whose value equals `expected`. Returns
-/// `(line, start_col, end_col)` in character columns, positioned over the
-/// inner value (quotes excluded).
-///
-/// Restricting to `upstream_state` blocks avoids false matches against
-/// `provider` / `module` blocks that also take a `source` attribute.
-fn contains_matching_function_call(value: &Value, matches_name: &impl Fn(&str) -> bool) -> bool {
-    match value {
-        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
-            matches_name(name)
-                || args.iter().any(|arg| {
-                    arg.value()
-                        .is_some_and(|value| contains_matching_function_call(value, matches_name))
-                })
-        }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
-            matches_name(&function.name)
-                || args.iter().any(|arg| {
-                    arg.value()
-                        .is_some_and(|value| contains_matching_function_call(value, matches_name))
-                })
-        }
-        Value::Concrete(ConcreteValue::List(items)) => items
-            .iter()
-            .any(|item| contains_matching_function_call(item, matches_name)),
-        Value::Concrete(ConcreteValue::Map(entries)) => entries
-            .values()
-            .any(|entry| contains_matching_function_call(entry, matches_name)),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(
-                part,
-                carina_core::resource::InterpolationPart::Expr(value)
-                    if contains_matching_function_call(value, matches_name)
-            )
-        }),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|value| contains_matching_function_call(value, matches_name))
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            contains_matching_function_call(value, matches_name)
-                || contains_matching_function_call(default, matches_name)
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            contains_matching_function_call(expression.lhs(), matches_name)
-                || contains_matching_function_call(expression.rhs(), matches_name)
-        }
-        _ => false,
-    }
-}
-
 /// Whether `deferred` was parsed from the editor's current document.
 /// `DeferredForExpression.file` is stamped with the full source path, so we
 /// compare by basename to the LSP-supplied `current_file_name`.
@@ -644,12 +593,16 @@ impl DiagnosticRun<'_> {
         carina_core::validation::configuration_placement_diagnostics(tree)
             .iter()
             .filter_map(|finding| {
-                render_merged(
+                let mut diagnostic = render_merged(
                     doc,
                     finding,
                     DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                )
+                    finding.detail().lsp_message(),
+                )?;
+                if let Some(evidence) = finding.detail().root_evidence() {
+                    super::attach_directory_evidence(&mut diagnostic, &evidence);
+                }
+                Some(diagnostic)
             })
             .collect()
     }
@@ -659,17 +612,13 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_backend_config(
         &self,
         doc: &Document,
-        merged: Option<&MergedParseResult>,
         tree: Option<&carina_core::parser::AnalysisTree<'_>>,
     ) -> Vec<Diagnostic> {
-        let (Some(merged), Some(tree)) = (merged, tree) else {
+        let Some(tree) = tree else {
             return Vec::new();
         };
-        // A duplicate backend has no single semantic owner. The parser
-        // inventory still supplies every declaration for placement checks.
-        if merged.directory.sole_backend_file.is_none() {
-            return Vec::new();
-        }
+        // Backend admission consumes the issued verdict, including cardinality
+        // from readable siblings during partial recovery.
         let Some(Err(findings)) = tree.admit_backend() else {
             return Vec::new();
         };
@@ -677,22 +626,6 @@ impl DiagnosticRun<'_> {
         let attribute_diagnostic =
             |finding: carina_core::parser::Located<BackendAttributeError>| {
                 let error = finding.detail();
-                // Directory resolution deliberately retains user-function calls
-                // that failed evaluation so other editor checks can continue.
-                // Suppress only those calls, including nested ones. A deferred
-                // builtin with unresolved arguments is still a genuine value-type
-                // mismatch and must remain visible, matching CLI validation.
-                if tree
-                    .backend_attribute_value(error.attribute())
-                    .is_some_and(|value| {
-                        contains_matching_function_call(value, &|name| {
-                            merged.directory.parsed.user_functions.contains_key(name)
-                        })
-                    })
-                {
-                    return None;
-                }
-
                 render_merged(doc, &finding, DiagnosticSeverity::ERROR, error.to_string())
             };
 
@@ -901,11 +834,13 @@ impl DiagnosticRun<'_> {
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
         let module_resolution =
-            carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
-                &result.directory.parsed,
+            carina_core::module_resolver::resolve_modules_with_all_import_diagnostics_and_overrides(
+                result
+                    .directory
+                    .parsed
+                    .clone()
+                    .admit(&self.schemas, self.provider_context),
                 base_path,
-                self.provider_context,
-                &self.schemas,
                 &covered_findings,
                 source_overrides,
             );
@@ -973,7 +908,7 @@ impl DiagnosticRun<'_> {
         if let Some(error) = residual.analysis_invariant() {
             return render_analysis_invariant(doc, error).into_iter().collect();
         }
-        let message = residual.display_relative_to(&base.source_label());
+        let message = residual.lsp_message_relative_to(&base.source_label());
         let element = residual.element_diagnostic();
         let mut diagnostics = element
             .and_then(|finding| {
@@ -1006,6 +941,11 @@ impl DiagnosticRun<'_> {
                     render_merged(doc, finding, DiagnosticSeverity::ERROR, message.clone())
                 }),
         );
+        if let Some(evidence) = residual.root_evidence() {
+            for diagnostic in &mut diagnostics {
+                super::attach_directory_evidence(diagnostic, evidence);
+            }
+        }
         diagnostics
     }
 
@@ -1083,11 +1023,9 @@ impl DiagnosticRun<'_> {
             )
             .ok()?;
         let module_resolution =
-            carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
-                &merged,
+            carina_core::module_resolver::resolve_modules_with_all_import_diagnostics_and_overrides(
+                merged.clone().admit(&self.schemas, self.provider_context),
                 base_path,
-                self.provider_context,
-                &self.schemas,
                 &[],
                 &carina_core::config_loader::SourceOverrides::from([(
                     doc.source_file().to_path_buf(),
@@ -1201,18 +1139,30 @@ impl DiagnosticRun<'_> {
         tree: &carina_core::parser::AnalysisTree<'_>,
         exports: &carina_core::upstream_exports::UpstreamExports,
         resolve_errors: &[carina_core::parser::Located<
-            carina_core::upstream_exports::UpstreamResolveError,
+            carina_core::upstream_exports::UpstreamResolveFailure,
         >],
     ) -> Vec<Diagnostic> {
         let mut diagnostics: Vec<_> = resolve_errors
             .iter()
             .filter_map(|finding| {
-                render_merged(
+                let mut diagnostic = render_merged(
                     doc,
                     finding,
                     DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                )
+                    finding.detail().lsp_message(),
+                )?;
+                if let Some((_, error)) = finding.detail().module_failure()
+                    && let Some(rejection) = error.root_cause().require_outside_module()
+                {
+                    super::attach_directory_evidence(
+                        &mut diagnostic,
+                        &rejection.detail().root_evidence(),
+                    );
+                }
+                if let Some(evidence) = finding.detail().module_evidence() {
+                    super::attach_directory_evidence(&mut diagnostic, evidence);
+                }
+                Some(diagnostic)
             })
             .collect();
         macro_rules! render_references {

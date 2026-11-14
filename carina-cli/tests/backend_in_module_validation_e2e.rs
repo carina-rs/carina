@@ -222,17 +222,20 @@ fn directly_validated_module_with_backend_reports_only_the_backend_rule() {
     assert_eq!(
         diagnostics.len(),
         1,
-        "the structural backend-in-module error must suppress secondary diagnostics: {diagnostics:#?}",
+        "root placement and its evidence must remain one diagnostic: {diagnostics:#?}",
     );
     assert!(
-        diagnostics[0].contains(RULE),
-        "the backend-in-module rule must win: {diagnostics:#?}",
+        diagnostics[0].contains(
+            "arguments blocks are only valid inside module definitions, not in root configurations."
+        ),
+        "the backend makes this directory a root: {diagnostics:#?}",
     );
     assert!(
-        diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.contains("arguments blocks are only valid")),
-        "the root-arguments rule must not double-report: {diagnostics:#?}",
+        diagnostics[0].contains(&format!(
+            "backend block at {}:1",
+            carina_core::paths::DisplayPath::for_diagnostics(temp.path().join("backend.crn"))
+        )),
+        "the same diagnostic must identify the root evidence: {diagnostics:#?}",
     );
 }
 

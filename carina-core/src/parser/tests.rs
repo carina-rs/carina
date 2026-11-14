@@ -1120,6 +1120,12 @@ fn integer_arithmetic_in_a_for_body_resolves_after_its_deferred_iterable() {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("deferred iterable fixture parses"),
+        r#"
+            let source = mock.test.Source {}
+            let children = for item in source.items {
+                mock.test.Target { count = item + 1 }
+            }
+            "#,
     );
     let template_count = parsed.deferred_for_expressions()[0]
         .template_resource()
@@ -1178,8 +1184,7 @@ fn deferred_for_projection_evaluates_nested_env_from_the_caller_snapshot() {
             names.join(",").into(),
         )]));
         let schemas = crate::schema::SchemaRegistry::new();
-        let parsed = parse(
-            r#"
+        let fixture_source = r#"
             let upstream = upstream_state { source = "../upstream" }
             let source = mock.test.Source {
                 list = split(",", env(upstream.variable))
@@ -1187,16 +1192,17 @@ fn deferred_for_projection_evaluates_nested_env_from_the_caller_snapshot() {
             let children = for item in source.list {
                 mock.test.Target { name = item }
             }
-            "#,
-            &context,
-        )
-        .expect("the environment lookup stays deferred until upstream is loaded");
+            "#;
+        let parsed = parse(fixture_source, &context)
+            .expect("the environment lookup stays deferred until upstream is loaded");
         crate::validation::deferred_types::with_session_for_test(&context, |session| {
             let mut expanded = crate::module_resolver::resolve_modules_with_providerless_config(
-                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                crate::config_loader::RootDirectoryParse::from_parsed_source_for_test(
+                    parsed,
+                    fixture_source,
+                )
+                .admit(&schemas, session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
-                &schemas,
             )
             .expect("fixture crosses module resolution")
             .into_expanded(&schemas, &context)
@@ -1291,7 +1297,10 @@ fn loop_directive_projection_evaluates_env_from_the_caller_snapshot() {
     });
 }
 
-fn cross_deferred_for_resolution_seam<E>(parsed: File<E>) -> ModuleResolvedFile<E::Absolute>
+fn cross_deferred_for_resolution_seam<E>(
+    parsed: File<E>,
+    source: &str,
+) -> ModuleResolvedFile<E::Absolute>
 where
     E: ResolveExportBindingPhase<ParserPlaceholder>,
 {
@@ -1299,10 +1308,11 @@ where
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_with_providerless_config(
-                crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed),
+                crate::config_loader::RootDirectoryParse::from_parsed_source_for_test(
+                    parsed, source,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
             )
             .expect("deferred fixture crosses the module-resolution seam")
         },
@@ -1690,6 +1700,7 @@ fn iter_all_resources_yields_direct_then_deferred() {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap(),
+        src,
     )
     .into_expanded(
         &crate::schema::SchemaRegistry::new(),
@@ -1722,7 +1733,8 @@ fn iter_all_resources_yields_direct_then_deferred() {
 
 #[test]
 fn resolved_resource_iterator_is_phase_exhaustive() {
-    let resolved = cross_deferred_for_resolution_seam(ParsedFile::default());
+    let resolved =
+        cross_deferred_for_resolution_seam(ParsedFile::default(), "// AST-only fixture\n");
 
     let kinds = resolved
         .iter_all_resources()
@@ -5601,7 +5613,7 @@ fn resolve_provider_attributes_with_remote_substitutes_upstream_refs() {
 
     // Build a `remote_bindings` shape mirroring what `load_upstream_states`
     // produces at plan/apply time.
-    let parsed = cross_deferred_for_resolution_seam(parsed);
+    let parsed = cross_deferred_for_resolution_seam(parsed, input);
     let mut mgmt_attrs: HashMap<String, crate::resource::ExpandedValue> = HashMap::new();
     mgmt_attrs.insert(
         "role_arn".to_string(),
@@ -5704,6 +5716,7 @@ fn resolve_provider_attributes_with_remote_rejects_unknown_refs() {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap(),
+        input,
     )
     .into_expanded(
         &crate::schema::SchemaRegistry::new(),
@@ -5757,10 +5770,9 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
                     &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                     &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
-                .unwrap(),
+                .unwrap()
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
             )
             .expect("provider config crosses the module-resolution seam")
         },
@@ -5811,10 +5823,9 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
                     &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                     &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
-                .unwrap(),
+                .unwrap()
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
             )
             .expect("provider config crosses the module-resolution seam")
         },
@@ -5848,7 +5859,7 @@ fn provider_default_tags_require_known_values_in_live_and_saved_configs() {
     ).unwrap();
     let remote: HashMap<String, HashMap<String, crate::resource::ExpandedValue>> = HashMap::new();
 
-    let parsed = cross_deferred_for_resolution_seam(parsed)
+    let parsed = cross_deferred_for_resolution_seam(parsed, "let mgmt = upstream_state { source = '../mgmt' }\nprovider aws { default_tags = { Owner = mgmt.owner } }")
         .into_expanded(
             &crate::schema::SchemaRegistry::new(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -9574,6 +9585,14 @@ fn deferred_unbound_target_round_trips() {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap(),
+        r#"
+        let orgs = upstream_state { source = "../orgs" }
+        for account_id in orgs.accounts {
+            awscc.sso.Assignment {
+                target_id = account_id
+            }
+        }
+    "#,
     );
 
     let target = parsed.deferred_for_expressions()[0].target();
@@ -9746,6 +9765,7 @@ fn parse_top_level_for_uses_last_segment_of_dotted_iterable() {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap(),
+        input,
     );
     // Deferred (upstream_state not resolved), so no concrete resources
     // but the deferred target should retain _accounts only as migration provenance.
@@ -16014,9 +16034,11 @@ fn bare_identifier_iterable_is_reported_as_undefined_not_string() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed, input,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
             )
             .expect_err("finalization must reject the bare undefined iterable")
         },
@@ -17253,9 +17275,8 @@ fn parse_directory_preserves_module_arg_dotted_string_literal() {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             resolve_modules(
-                parsed,
+                parsed.admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
-                session,
             )
             .expect("module expansion must succeed")
         },
@@ -21318,7 +21339,7 @@ mod loop_var_field_access_matrix {
             1,
             "loop deferred"
         );
-        let mut p = cross_deferred_for_resolution_seam(p)
+        let mut p = cross_deferred_for_resolution_seam(p, src)
             .into_expanded(
                 &crate::schema::SchemaRegistry::new(),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -21457,7 +21478,7 @@ mod loop_var_field_access_matrix {
         let mut remote = HashMap::new();
         remote.insert("up".to_string(), up);
 
-        let mut expanded = cross_deferred_for_resolution_seam(parsed)
+        let mut expanded = cross_deferred_for_resolution_seam(parsed, source)
             .into_expanded(
                 &crate::schema::SchemaRegistry::new(),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -21524,7 +21545,7 @@ mod loop_var_field_access_matrix {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .expect("parse deferred loop");
-        let mut parsed = cross_deferred_for_resolution_seam(parsed)
+        let mut parsed = cross_deferred_for_resolution_seam(parsed, src)
             .into_expanded(
                 &crate::schema::SchemaRegistry::new(),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -21572,6 +21593,7 @@ mod loop_var_field_access_matrix {
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .expect("parse deferred loop"),
+            src,
         );
         let mut parsed = parsed
             .into_expanded(

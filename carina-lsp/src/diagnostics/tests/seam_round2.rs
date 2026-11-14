@@ -223,7 +223,8 @@ fn round2_lsp_missing_expanded_report_selects_main_fallback() {
         let parsed = carina_core::config_loader::parse_directory(&path, &config).unwrap();
         carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
             let graph = carina_core::module_resolver::resolve_modules_with_providerless_config(
-                parsed, &path, session, &schemas,
+                parsed.admit(&schemas, session),
+                &path,
             )
             .unwrap();
             let configuration =

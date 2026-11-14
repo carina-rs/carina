@@ -44,7 +44,7 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
         .module_resolution_context()
 }
 
-fn assert_round4_empty_template(blocks: &str) {
+fn assert_empty_template(blocks: &str) {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("arguments.crn"), blocks).unwrap();
     fs::write(
@@ -59,39 +59,45 @@ fn assert_round4_empty_template(blocks: &str) {
         crate::config_loader::load_configuration_with_config(&path, &context, &schemas).unwrap();
     assert!(matches!(
         crate::parser::retained::require_scope(loaded.parsed.parsed()),
-        crate::parser::retained::RequireScope::ModuleTemplate { .. }
+        crate::parser::retained::RequireScope::ModuleTemplate(_)
     ));
     crate::validation::deferred_types::with_session_for_test(&context, |session| {
         for template in [false, true] {
             let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
             let result = if template {
-                super::resolve_module_template_with_config(parsed, &path, session, &schemas)
+                super::resolve_module_template_with_config(parsed.admit(&schemas, session), &path)
             } else {
-                super::resolve_modules_with_config(parsed, &path, session, &schemas)
+                super::resolve_modules_with_config(parsed.admit(&schemas, session), &path)
             };
             assert!(result.is_ok(), "{result:?}");
             let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
             let result = if template {
                 super::resolve_module_template_with_providerless_config(
-                    parsed, &path, session, &schemas,
+                    parsed.admit(&schemas, session),
+                    &path,
                 )
             } else {
-                super::resolve_modules_with_providerless_config(parsed, &path, session, &schemas)
+                super::resolve_modules_with_providerless_config(
+                    parsed.admit(&schemas, session),
+                    &path,
+                )
             };
             assert!(result.is_ok(), "{result:?}");
         }
         let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
         assert!(matches!(
-            super::resolve_modules_with_diagnostics(&parsed, &path, session, &schemas, &[]),
+            super::resolve_modules_with_diagnostics(
+                parsed.clone().admit(&schemas, session),
+                &path,
+                &[],
+            ),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
         assert!(matches!(
             super::resolve_modules_with_providerless_diagnostics(
-                &parsed,
+                parsed.clone().admit(&schemas, session),
                 &path,
-                session,
-                &schemas,
-                &[]
+                &[],
             ),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
@@ -112,29 +118,39 @@ fn assert_round4_empty_template(blocks: &str) {
         let configuration = crate::config_loader::load_buffer_configuration_in_directory(
             snapshot, &schemas, &context,
         );
-        assert!(matches!(
-            crate::parser::retained::require_scope(configuration.parsed()),
-            crate::parser::retained::RequireScope::ModuleTemplate { .. }
-        ));
+        assert_eq!(
+            matches!(
+                configuration.parsed().directory_verdict(),
+                crate::config_loader::DirectoryVerdict::Unknown(())
+            ),
+            broken
+        );
+        assert_eq!(
+            matches!(
+                configuration.parsed().directory_verdict(),
+                crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
+            ),
+            !broken
+        );
         assert!(configuration.judged().report().findings().is_empty());
     }
 }
 
 #[test]
-fn round4_empty_arguments_are_template_scope() {
-    assert_round4_empty_template("arguments {}\n");
+fn empty_arguments_are_template_scope() {
+    assert_empty_template("arguments {}\n");
 }
 #[test]
-fn round4_empty_attributes_are_template_scope() {
-    assert_round4_empty_template("attributes {}\n");
+fn empty_attributes_are_template_scope() {
+    assert_empty_template("attributes {}\n");
 }
 #[test]
-fn round4_both_empty_blocks_are_template_scope() {
-    assert_round4_empty_template("arguments {}\nattributes {}\n");
+fn both_empty_blocks_are_template_scope() {
+    assert_empty_template("arguments {}\nattributes {}\n");
 }
 
 #[test]
-fn round1_direct_template_scope_in_all_resolver_entry_points() {
+fn direct_template_scope_in_all_resolver_entry_points() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
         directory.path().join("arguments.crn"),
@@ -154,10 +170,14 @@ fn round1_direct_template_scope_in_all_resolver_entry_points() {
             let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
             let result = if template_api {
                 super::resolve_module_template_with_providerless_config(
-                    parsed, &path, session, &schemas,
+                    parsed.admit(&schemas, session),
+                    &path,
                 )
             } else {
-                super::resolve_modules_with_providerless_config(parsed, &path, session, &schemas)
+                super::resolve_modules_with_providerless_config(
+                    parsed.admit(&schemas, session),
+                    &path,
+                )
             };
             assert!(
                 result.is_ok(),
@@ -166,9 +186,9 @@ fn round1_direct_template_scope_in_all_resolver_entry_points() {
             );
             let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
             let result = if template_api {
-                super::resolve_module_template_with_config(parsed, &path, session, &schemas)
+                super::resolve_module_template_with_config(parsed.admit(&schemas, session), &path)
             } else {
-                super::resolve_modules_with_config(parsed, &path, session, &schemas)
+                super::resolve_modules_with_config(parsed.admit(&schemas, session), &path)
             };
             assert!(
                 result.is_ok(),
@@ -179,16 +199,18 @@ fn round1_direct_template_scope_in_all_resolver_entry_points() {
         let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
         assert!(matches!(
             super::resolve_modules_with_providerless_diagnostics(
-                &parsed,
+                parsed.clone().admit(&schemas, session),
                 &path,
-                session,
-                &schemas,
-                &[]
+                &[],
             ),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
         assert!(matches!(
-            super::resolve_modules_with_diagnostics(&parsed, &path, session, &schemas, &[]),
+            super::resolve_modules_with_diagnostics(
+                parsed.clone().admit(&schemas, session),
+                &path,
+                &[],
+            ),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
     });
@@ -213,9 +235,9 @@ fn resolve_modules(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(base_dir).unwrap(),
-                session,
             )
             .map_err(Box::new)
         },
@@ -224,7 +246,7 @@ fn resolve_modules(
 }
 
 #[test]
-fn root_require_directory_and_module_share_scope_evaluation() {
+fn root_require_directory_rejected_and_module_evaluated() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("checked")).unwrap();
     fs::write(
@@ -245,21 +267,16 @@ fn root_require_directory_and_module_share_scope_evaluation() {
     .unwrap();
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
-    for (condition, expected) in [
-        ("false", "require failed: root guard"),
-        ("n == 2", "unknown variable 'n' in constraint expression"),
-        (
-            "r.identifier != null",
-            "unknown variable 'r' in constraint expression",
-        ),
-        (
-            "missing == 2",
-            "unknown variable 'missing' in constraint expression",
-        ),
-        (
-            "env('unused') == 1",
-            "unknown function 'env' in constraint expression",
-        ),
+    for condition in [
+        "true",
+        "false",
+        "n == 2",
+        "r.identifier != null",
+        "missing == 2",
+        "env('unused') == 1",
+        "1.5 + 1 == 2",
+        "true && 1",
+        "1 / 0 == 0",
     ] {
         fs::write(
             directory.path().join("guards.crn"),
@@ -268,23 +285,30 @@ fn root_require_directory_and_module_share_scope_evaluation() {
         .unwrap();
         let parsed = crate::config_loader::parse_directory(&path, &config).unwrap();
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
-            let result = super::resolve_modules_providerless(parsed, &path, session);
+            let result = super::resolve_modules_providerless(
+                parsed.admit(&crate::schema::SchemaRegistry::new(), session),
+                &path,
+            );
             assert!(result.is_err(), "ignored root constraint: {condition}");
             let error = result.err().unwrap();
-            let ModuleError::DirectoryConstraint(diagnostic) = &error else {
+            let ModuleError::RequireOutsideModule(diagnostic) = &error else {
                 panic!("directory failure must retain its own owner: {error}");
             };
             assert!(diagnostic.location().file().path().ends_with("guards.crn"));
             assert_eq!(diagnostic.location().span().start_line(), 1);
-            assert_eq!(diagnostic.location().span().start_column(), 9);
-            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(diagnostic.location().span().start_column(), 1);
+            assert_eq!(
+                diagnostic.detail().to_string(),
+                format!(
+                    "`require` is only allowed inside a module\nNote: directory is a root configuration because of the backend block at {}:1.",
+                    crate::paths::DisplayPath::for_diagnostics(
+                        directory.path().join("providers.crn")
+                    )
+                )
+            );
         });
     }
-    fs::write(
-        directory.path().join("guards.crn"),
-        "require true, 'root guard'\n",
-    )
-    .unwrap();
+    fs::remove_file(directory.path().join("guards.crn")).unwrap();
     fs::write(
         directory.path().join("checked/guards.crn"),
         "require n == 3, 'module guard'\n",
@@ -292,9 +316,12 @@ fn root_require_directory_and_module_share_scope_evaluation() {
     .unwrap();
     let parsed = crate::config_loader::parse_directory(&path, &config).unwrap();
     crate::validation::deferred_types::with_session_for_test(&config, |session| {
-        let error = super::resolve_modules_providerless(parsed, &path, session)
-            .err()
-            .unwrap();
+        let error = super::resolve_modules_providerless(
+            parsed.admit(&crate::schema::SchemaRegistry::new(), session),
+            &path,
+        )
+        .err()
+        .unwrap();
         let ModuleError::Constraint(diagnostic) = error.root_cause() else {
             panic!("module failure must retain its call owner: {error}");
         };
@@ -316,10 +343,9 @@ fn resolve_modules_with_config(
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     crate::validation::deferred_types::with_session_for_test(config, |session| {
         super::resolve_modules_with_providerless_config(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                .admit(schemas, session),
             &crate::paths::ResolvedPath::new(base_dir).unwrap(),
-            session,
-            schemas,
         )
         .map_err(Box::new)
     })
@@ -422,13 +448,14 @@ impl ModuleResolutionFixture {
             .expect("fixture caller parses");
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
             resolve_upstream_modules_with_providerless_config(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed, &caller,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(
                     caller_file.parent().expect("caller file has a directory"),
                 )
                 .unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
                 &Default::default(),
             )
         })
@@ -1397,15 +1424,18 @@ let forwarded = inner { flag = flag }
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("standalone outer module parses");
-    let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
+    let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+        parsed,
+        outer_source,
+    );
     let result = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_with_providerless_diagnostics(
-                &parsed,
+                parsed
+                    .clone()
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(&outer_dir).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
                 &[],
             )
         },
@@ -5942,12 +5972,15 @@ fn test_load_module_rejects_backend_and_cleans_resolving_set() {
                     .load_module("module")
                     .expect_err("backend inside a module must be rejected");
                 assert!(
-                    matches!(&err, ModuleError::BackendInModule),
+                    matches!(err.root_cause(), ModuleError::BackendInModule),
                     "expected BackendInModule on attempt {attempt}, got {err:?}",
                 );
                 assert_eq!(
                     err.to_string(),
-                    "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+                    format!(
+                        "backend blocks are not allowed inside modules. Define the backend at the root configuration level.\nNote: directory is a root configuration because of the backend block at {}:1.",
+                        crate::paths::DisplayPath::for_diagnostics(module_dir.join("backend.crn"))
+                    ),
                     "unexpected resolver error on attempt {attempt}",
                 );
             }
@@ -9915,10 +9948,10 @@ let resources = for item in itmes {
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_with_providerless_config(
-                loaded.parsed,
+                loaded
+                    .parsed
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                session,
-                &crate::schema::SchemaRegistry::new(),
             )
             .expect_err("finalization must reject an undefined managed-resource iterable")
         },
@@ -9941,14 +9974,15 @@ let resources = for item in itmes {
 
 #[test]
 fn finalize_reports_every_undefined_iterable_for_managed_resource_bodies() {
-    let parsed = crate::parser::parse(
-        r#"let first = for item in frist_items {
+    let fixture_source = r#"let first = for item in frist_items {
   mock.test.resource { name = item }
 }
 let second = for item in secnd_items {
   mock.test.resource { name = item }
 }
-"#,
+"#;
+    let parsed = crate::parser::parse(
+        fixture_source,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("both undefined iterables remain deferred until finalization");
@@ -9957,9 +9991,12 @@ let second = for item in secnd_items {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed,
+                    fixture_source,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
             )
             .expect_err("finalization must reject both undefined iterables")
         },
@@ -11070,10 +11107,8 @@ fn anonymous_module_handle_output_resolves_after_instance_reconciliation() {
         assert_eq!(loaded.parsed.export_params.len(), 1);
         crate::validation::deferred_types::with_session_for_test(&context, |session| {
             super::resolve_modules_with_providerless_config(
-                loaded.parsed,
+                loaded.parsed.admit(&schemas, session),
                 &crate::paths::ResolvedPath::new(&fixture.root).unwrap(),
-                session,
-                &schemas,
             )
             .map_err(Box::new)
         })
@@ -11931,6 +11966,225 @@ let child = consumer_module { record = "record-id" }
 }
 
 #[test]
+fn root_require_template_apis_need_declaration_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    fs::write(directory.path().join("guards.crn"), "require true, 'x'\n").unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        for providerless in [false, true] {
+            let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+            let result = if providerless {
+                super::resolve_module_template_with_providerless_config(
+                    parsed.admit(&schemas, session),
+                    &base,
+                )
+            } else {
+                super::resolve_module_template_with_config(parsed.admit(&schemas, session), &base)
+            };
+            let error = result.expect_err("a template API cannot manufacture module declarations");
+            assert_eq!(
+                error.require_outside_module().unwrap().detail().to_string(),
+                format!(
+                    "`require` is only allowed inside a module\nNote: directory is a root configuration because of the backend block at {}:1.",
+                    crate::paths::DisplayPath::for_diagnostics(
+                        directory.path().join("backend.crn")
+                    )
+                )
+            );
+        }
+    });
+}
+
+#[test]
+fn root_require_has_only_the_expression_report_carrier() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("guards.crn"),
+        "require true, 'private'\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        for providerless in [false, true] {
+            let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+            let admitted = parsed.admit(&schemas, session);
+            let result = if providerless {
+                super::resolve_modules_with_providerless_diagnostics(admitted, &base, &[])
+            } else {
+                super::resolve_modules_with_diagnostics(admitted, &base, &[])
+            };
+            let super::ModuleResolutionDiagnosticResult::Expanded { graph } = result else {
+                panic!("a root rejection belongs only to the retained expression report");
+            };
+            let findings = graph.expression_report().findings();
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert!(matches!(
+                findings[0].detail(),
+                crate::static_type::InferenceError::RequireOutsideModule(_)
+            ));
+            assert_eq!(findings[0].location().span().start_column(), 1);
+        }
+    });
+}
+
+#[test]
+fn root_require_public_strict_resolvers_keep_admission_verdict() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("guards.crn"),
+        "require true, 'private'\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        for providerless in [false, true] {
+            let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+            let admitted = parsed.admit(&schemas, session);
+            let result = if providerless {
+                super::resolve_modules_with_providerless_config(admitted, &base)
+            } else {
+                super::resolve_modules_with_config(admitted, &base)
+            };
+            let error =
+                result.expect_err("public resolution must preserve the root require verdict");
+            let finding = error.require_outside_module().unwrap();
+            assert_eq!(
+                finding.detail().to_string(),
+                format!(
+                    "`require` is only allowed inside a module\nNote: directory is a root configuration because of the backend block at {}:1.",
+                    crate::paths::DisplayPath::for_diagnostics(
+                        directory.path().join("backend.crn")
+                    )
+                )
+            );
+            assert_eq!(
+                finding.location().file().path(),
+                directory.path().join("guards.crn")
+            );
+            assert_eq!(finding.location().span().start_line(), 1);
+            assert_eq!(finding.location().span().start_column(), 1);
+        }
+    });
+}
+
+#[test]
+fn module_require_diagnostic_keeps_direct_constraint_type_and_message() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("checked")).unwrap();
+    fs::write(
+        directory.path().join("main.crn"),
+        "let checked = use { source = './checked' }\nlet control = checked { n = 2 }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("checked/main.crn"),
+        "arguments { n: Int }\nrequire n == 3, 'module guard'\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+        let result =
+            super::resolve_modules_with_diagnostics(parsed.admit(&schemas, session), &base, &[]);
+        let super::ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors } = result
+        else {
+            panic!("the instantiated module require must fail");
+        };
+        assert!(errors.is_empty());
+        assert_eq!(findings.len(), 1);
+        let crate::validation::ModuleCallFindingMessage::Constraint(diagnostic) =
+            findings[0].message()
+        else {
+            panic!("expected a module constraint diagnostic");
+        };
+        let diagnostic: &ModuleConstraintDiagnostic = diagnostic;
+        assert_eq!(
+            diagnostic.to_string(),
+            "module 'checked' (call 'control'): arguments 'n': module guard (got n = 2)"
+        );
+        assert_eq!(findings[0].anchor().location().span().start_line(), 2);
+    });
+}
+
+#[test]
+fn expanded_complete_directory_keeps_its_own_verdict() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("child")).unwrap();
+    fs::write(
+        directory.path().join("child/main.crn"),
+        "arguments { n: Int }\nattributes { value: Int = n }\n",
+    )
+    .unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    fs::write(
+        directory.path().join("main.crn"),
+        "let child = use { source = './child' }\nlet result = child { n = 1 }\n",
+    )
+    .unwrap();
+    let fixture_source = "let child = use { source = './child' }\nlet result = child { n = 1 }\n";
+    let parsed = crate::parser::parse_file(
+        fixture_source,
+        &directory.path().join("main.crn"),
+        context.as_provider_context(),
+    )
+    .unwrap();
+    let root = crate::config_loader::RootDirectoryParse::from_parsed_source_for_test(
+        parsed,
+        fixture_source,
+    );
+    let schemas = crate::schema::SchemaRegistry::new();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        let expanded = super::resolve_modules_with_providerless_config(
+            root.admit(&schemas, session),
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            expanded.directory_verdict(),
+            crate::config_loader::DirectoryVerdict::NoEvidence(_)
+        ));
+    });
+}
+
+#[test]
+fn empty_directory_metadata_keeps_the_no_evidence_verdict() {
+    let directory = tempfile::tempdir().unwrap();
+    let context = LoadedProviderContext::empty_for_test();
+    let parsed = super::load_module_from_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        context.as_provider_context(),
+    )
+    .unwrap();
+    assert!(matches!(
+        parsed.directory_verdict(),
+        crate::config_loader::DirectoryVerdict::NoEvidence(_)
+    ));
+}
+
+#[test]
 fn module_if_audit_checks_functions_in_sibling_declaration_order() {
     use crate::parser::{DeferredIfCondition, DeferredValueIf};
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -11938,12 +12192,11 @@ fn module_if_audit_checks_functions_in_sibling_declaration_order() {
     let path = crate::paths::ResolvedPath::new(&root).unwrap();
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::config_loader::parse_directory(&path, &config).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
     crate::validation::deferred_types::with_session_for_test(&config, |session| {
         let mut expanded = crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            parsed.admit(&schemas, session),
             &path,
-            session,
-            &crate::schema::SchemaRegistry::new(),
         )
         .unwrap();
         let authored_condition = DeferredIfCondition::new(

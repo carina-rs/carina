@@ -959,7 +959,9 @@ fn provider_declaration(
 /// Parser-owned inventories survive directory merging and binding phase changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigurationBlock {
+    Require,
     Arguments,
+    Attributes,
     Provider,
     State,
     Backend,
@@ -967,25 +969,58 @@ pub enum ConfigurationBlock {
     Exports,
 }
 
-/// Parser-owned presence of module declarations, independent of their entries.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ModuleDeclarationBlocks {
-    #[default]
-    Absent,
-    Arguments,
-    Attributes,
-    Both,
+/// A declaration carries its directory's issued verdict through merging and
+/// module expansion; a parent root cannot reclassify a module's declarations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationBlockDeclaration {
+    kind: ConfigurationBlock,
+    utf16_columns: (u32, u32),
+    verdict: crate::config_loader::DirectoryVerdict,
 }
-
-impl ModuleDeclarationBlocks {
-    pub(crate) fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Absent, blocks) | (blocks, Self::Absent) => blocks,
-            (Self::Arguments, Self::Arguments) => Self::Arguments,
-            (Self::Attributes, Self::Attributes) => Self::Attributes,
-            _ => Self::Both,
+impl ConfigurationBlockDeclaration {
+    fn new(
+        kind: ConfigurationBlock,
+        location: &DeclarationLocation,
+        file: &super::PreprocessedFile,
+    ) -> Self {
+        let map = file.shared_position_map();
+        let column = |line: usize, scalar: usize| {
+            map.authored_source()
+                .lines()
+                .nth(line - 1)
+                .unwrap_or("")
+                .chars()
+                .take(scalar - 1)
+                .map(|c| c.len_utf16() as u32)
+                .sum()
+        };
+        let span = location.span();
+        Self {
+            kind,
+            utf16_columns: (
+                column(span.start_line(), span.start_column()),
+                column(span.end_line(), span.end_column()),
+            ),
+            verdict: Default::default(),
         }
     }
+    pub fn utf16_columns(&self) -> (u32, u32) {
+        self.utf16_columns
+    }
+    pub fn kind(&self) -> ConfigurationBlock {
+        self.kind
+    }
+    pub fn directory_verdict(&self) -> &crate::config_loader::DirectoryVerdict {
+        &self.verdict
+    }
+}
+
+/// Evaluation outcome retained by the loader's recovery tree. Only the
+/// evaluator can issue a failure; schema admission must not reinterpret it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackendValueState {
+    Ready,
+    EvaluationFailed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1001,9 +1036,10 @@ pub struct SyntaxInventory<
     attribute_keys: Vec<AttributeKeyLocation>,
     providers: Vec<Located<ProviderDeclaration>>,
     upstream_sources: Vec<Located<B>>,
-    configuration_blocks: Vec<Located<ConfigurationBlock>>,
-    module_declaration_blocks: ModuleDeclarationBlocks,
+    configuration_blocks: Vec<Located<ConfigurationBlockDeclaration>>,
+    directory_verdict: crate::config_loader::DirectoryVerdict,
     backend_keys: Vec<Located<super::AttributeKey>>,
+    backend_value_states: std::collections::HashMap<super::AttributeKey, BackendValueState>,
     anonymous_headers: Vec<DeclarationLocation>,
     loops: Vec<DeclarationLocation>,
     state_targets: Vec<DeclarationLocation>,
@@ -1019,8 +1055,9 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
             providers: Vec::new(),
             upstream_sources: Vec::new(),
             configuration_blocks: Vec::new(),
-            module_declaration_blocks: ModuleDeclarationBlocks::Absent,
+            directory_verdict: crate::config_loader::DirectoryVerdict::default(),
             backend_keys: Vec::new(),
+            backend_value_states: Default::default(),
             anonymous_headers: Vec::new(),
             loops: Vec::new(),
             state_targets: Vec::new(),
@@ -1044,11 +1081,34 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     ) {
         self.expressions.attach_binding_projections(values);
     }
-    pub fn configuration_blocks(&self) -> &[Located<ConfigurationBlock>] {
+    pub fn configuration_blocks(&self) -> &[Located<ConfigurationBlockDeclaration>] {
         &self.configuration_blocks
     }
-    pub(crate) fn module_declaration_blocks(&self) -> ModuleDeclarationBlocks {
-        self.module_declaration_blocks
+    pub fn directory_verdict(&self) -> &crate::config_loader::DirectoryVerdict {
+        &self.directory_verdict
+    }
+    pub(in crate::parser) fn install_directory_verdict(
+        &mut self,
+        admission: crate::config_loader::DirectoryRequireScope,
+    ) {
+        let (verdict, _) = admission.into_parts();
+        for block in &mut self.configuration_blocks {
+            block.detail_mut().verdict = verdict.clone();
+        }
+        self.directory_verdict = verdict;
+    }
+    pub(crate) fn backend_value_state(&self, key: &super::AttributeKey) -> BackendValueState {
+        self.backend_value_states
+            .get(key)
+            .copied()
+            .unwrap_or(BackendValueState::Ready)
+    }
+    pub(in crate::parser) fn record_backend_evaluation_failure(
+        &mut self,
+        key: super::AttributeKey,
+    ) {
+        self.backend_value_states
+            .insert(key, BackendValueState::EvaluationFailed);
     }
     pub(crate) fn backend_keys(&self) -> &[Located<super::AttributeKey>] {
         &self.backend_keys
@@ -1089,10 +1149,8 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
         self.providers.extend(other.providers);
         self.upstream_sources.extend(other.upstream_sources);
         self.configuration_blocks.extend(other.configuration_blocks);
-        self.module_declaration_blocks = self
-            .module_declaration_blocks
-            .union(other.module_declaration_blocks);
         self.backend_keys.extend(other.backend_keys);
+        self.backend_value_states.extend(other.backend_value_states);
         self.anonymous_headers.extend(other.anonymous_headers);
         self.loops.extend(other.loops);
         self.state_targets.extend(other.state_targets);
@@ -1109,8 +1167,9 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             attribute_keys: self.attribute_keys,
             providers: self.providers,
             configuration_blocks: self.configuration_blocks,
-            module_declaration_blocks: self.module_declaration_blocks,
+            directory_verdict: self.directory_verdict,
             backend_keys: self.backend_keys,
+            backend_value_states: self.backend_value_states,
             anonymous_headers: self.anonymous_headers,
             loops: self.loops,
             state_targets: self.state_targets,
@@ -1195,14 +1254,10 @@ impl SyntaxInventory {
             .filter(|pair| pair.as_rule() == Rule::statement)
         {
             let pair = statement.into_inner().next().expect("statement body");
-            out.module_declaration_blocks =
-                out.module_declaration_blocks.union(match pair.as_rule() {
-                    Rule::arguments_block => ModuleDeclarationBlocks::Arguments,
-                    Rule::attributes_block => ModuleDeclarationBlocks::Attributes,
-                    _ => ModuleDeclarationBlocks::Absent,
-                });
             let kind = match pair.as_rule() {
+                Rule::require_statement => Some(ConfigurationBlock::Require),
                 Rule::arguments_block => Some(ConfigurationBlock::Arguments),
+                Rule::attributes_block => Some(ConfigurationBlock::Attributes),
                 Rule::provider_block => Some(ConfigurationBlock::Provider),
                 Rule::moved_block | Rule::removed_block | Rule::import_state_block => {
                     Some(ConfigurationBlock::State)
@@ -1248,10 +1303,23 @@ impl SyntaxInventory {
                 _ => None,
             };
             if let Some(kind) = kind {
-                out.configuration_blocks.push(Located::new(
-                    DeclarationLocation::block_header_from_pair(&pair, file, source),
-                    kind,
-                ));
+                let location = match kind {
+                    ConfigurationBlock::Require => {
+                        DeclarationLocation::from_pair(&pair, file, source)
+                    }
+                    ConfigurationBlock::Arguments
+                    | ConfigurationBlock::Attributes
+                    | ConfigurationBlock::Provider
+                    | ConfigurationBlock::State
+                    | ConfigurationBlock::Backend
+                    | ConfigurationBlock::UpstreamState
+                    | ConfigurationBlock::Exports => {
+                        DeclarationLocation::block_header_from_pair(&pair, file, source)
+                    }
+                };
+                let declaration = ConfigurationBlockDeclaration::new(kind, &location, file);
+                out.configuration_blocks
+                    .push(Located::new(location, declaration));
             }
         }
         for pair in pairs.clone().flatten() {
@@ -1303,6 +1371,14 @@ impl SyntaxInventory {
                 .flatten()
                 .filter(|pair| pair.as_rule() == Rule::provider_expr)
             {
+                let location = DeclarationLocation::block_header_from_pair(&provider, file, source);
+                let declaration = ConfigurationBlockDeclaration::new(
+                    ConfigurationBlock::Provider,
+                    &location,
+                    file,
+                );
+                out.configuration_blocks
+                    .push(Located::new(location, declaration));
                 out.providers.push(provider_declaration(
                     provider,
                     Some(name.clone()),
@@ -1311,6 +1387,10 @@ impl SyntaxInventory {
                 ));
             }
         }
+        out.configuration_blocks.sort_by_key(|block| {
+            let span = block.location().span();
+            (span.start_line(), span.start_column())
+        });
         for pair in pairs.flatten() {
             if pair.as_rule() == Rule::let_binding {
                 let mut inner = pair.into_inner();

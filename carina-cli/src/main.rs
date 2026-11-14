@@ -819,7 +819,20 @@ fn render_app_error(
             }
         }
         _ => AppErrorRendering {
-            stderr: format_error_lines(color_mode, &error::format_error_with_source_chain(e)),
+            stderr: error::human_error_lines(e)
+                .into_iter()
+                .map(|line| match line {
+                    error::HumanErrorLine::RootEvidence(evidence) => {
+                        format!("  Note: {}\n", evidence.note())
+                    }
+                    error::HumanErrorLine::ModuleEvidence(evidence) => {
+                        format!("  Note: {}\n", evidence.note())
+                    }
+                    error::HumanErrorLine::Message(message) => {
+                        format_error_lines(color_mode, &message)
+                    }
+                })
+                .collect(),
             exit_code: 1,
         },
     }

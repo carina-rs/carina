@@ -338,7 +338,7 @@ fn round5_live_computed_parts_reach_authored_hook() {
 }
 
 #[test]
-fn round5_module_body_slots_keep_per_instance_authored_roots() {
+fn module_body_slots_keep_per_instance_authored_roots() {
     use crate::resource::AbsoluteBindingAddress;
     use crate::validation::admission::attributes::ResourceAttributeInputs;
     let directory = tempfile::tempdir().unwrap();
@@ -353,7 +353,7 @@ fn round5_module_body_slots_keep_per_instance_authored_roots() {
         ("exports.crn", "exports {}\n"),
         ("child/arguments.crn", "arguments { x: String }\n"),
         ("child/main.crn", "let body = mock.Sink { input = x }\n"),
-        ("child/exports.crn", "exports {}\n"),
+        ("child/exports.crn", "// no root exports in the module\n"),
     ] {
         std::fs::write(directory.path().join(file), source).unwrap();
     }
@@ -370,7 +370,8 @@ fn round5_module_body_slots_keep_per_instance_authored_roots() {
     let parsed = crate::config_loader::parse_directory(&path, &catalog).unwrap();
     with_session_for_test(&catalog, |session| {
         let expanded = crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed, &path, session, &schemas,
+            parsed.admit(&schemas, session),
+            &path,
         )
         .unwrap();
         let configuration =

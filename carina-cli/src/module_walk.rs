@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use carina_core::module_resolver::{self, LoadedModule};
+use carina_core::module_resolver::{self, LoadedModule, ModuleError, ModuleLoadError};
 use carina_core::paths::{CanonicalPath, DisplayPath, ResolvedPath};
 
 /// One successfully loaded module in the shared depth-first module walk.
@@ -31,6 +31,11 @@ impl LoadedModuleAtPath {
     }
 }
 
+pub(crate) struct RejectedModuleAtPath {
+    pub(crate) label: DisplayPath,
+    pub(crate) error: std::sync::Arc<ModuleError>,
+}
+
 /// Modules reachable from a root parse, in depth-first pre-order.
 ///
 /// This is the single recursive module-loading seam for static validation.
@@ -40,6 +45,7 @@ impl LoadedModuleAtPath {
 #[derive(Default)]
 pub(crate) struct ModuleWalk {
     modules: Vec<LoadedModuleAtPath>,
+    rejections: Vec<RejectedModuleAtPath>,
 }
 
 impl ModuleWalk {
@@ -62,12 +68,16 @@ impl ModuleWalk {
                 Path::new(&import.path),
                 &base_dir,
                 &mut visited,
-                &mut walk.modules,
+                &mut walk,
                 &context,
                 schemas,
             );
         }
         walk
+    }
+
+    pub(crate) fn rejections(&self) -> &[RejectedModuleAtPath] {
+        &self.rejections
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &LoadedModuleAtPath> {
@@ -80,7 +90,7 @@ fn visit_module(
     diagnostic_path: &Path,
     diagnostic_base: &ResolvedPath,
     visited: &mut HashSet<CanonicalPath>,
-    modules: &mut Vec<LoadedModuleAtPath>,
+    walk: &mut ModuleWalk,
     context: &carina_core::parser::ProviderContext,
     schemas: &carina_core::schema::SchemaRegistry,
 ) {
@@ -88,14 +98,42 @@ fn visit_module(
         return;
     }
 
-    let Some(loaded) =
-        module_resolver::load_module_with_diagnostics_and_schemas(module_path, context, schemas)
-    else {
-        return;
+    let imports = match module_resolver::load_module_with_diagnostics_and_schemas(
+        module_path,
+        context,
+        schemas,
+        &diagnostic_base.source_label(),
+    ) {
+        Ok(loaded) => {
+            let imports = loaded.parsed.uses.clone();
+            walk.modules.push(LoadedModuleAtPath {
+                diagnostic_path: diagnostic_path.to_path_buf(),
+                diagnostic_base: diagnostic_base.clone(),
+                module_path: module_path.clone(),
+                loaded,
+            });
+            imports
+        }
+        // Preserve the existing static walk policy for unreadable/broken
+        // modules. The strict resolver still reports these typed failures.
+        Err(ModuleLoadError::Unavailable(_)) => return,
+        Err(ModuleLoadError::NotModule { error, imports }) => {
+            walk.rejections.extend(
+                ModuleLoadError::NotModule {
+                    error,
+                    imports: Vec::new(),
+                }
+                .into_errors()
+                .into_iter()
+                .map(|error| RejectedModuleAtPath {
+                    label: DisplayPath::for_diagnostics_from(diagnostic_path, diagnostic_base),
+                    error: std::sync::Arc::new(error),
+                }),
+            );
+            imports
+        }
     };
-    let child_paths: Vec<_> = loaded
-        .parsed
-        .uses
+    let child_paths: Vec<_> = imports
         .iter()
         .filter_map(|import| {
             Some((
@@ -104,12 +142,6 @@ fn visit_module(
             ))
         })
         .collect();
-    modules.push(LoadedModuleAtPath {
-        diagnostic_path: diagnostic_path.to_path_buf(),
-        diagnostic_base: diagnostic_base.clone(),
-        module_path: module_path.clone(),
-        loaded,
-    });
 
     for (child_module_path, child_diagnostic_path) in child_paths {
         visit_module(
@@ -117,7 +149,7 @@ fn visit_module(
             &child_diagnostic_path,
             diagnostic_base,
             visited,
-            modules,
+            walk,
             context,
             schemas,
         );
@@ -176,5 +208,126 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["jump/../bad", "jump/../bad/child"]
         );
+    }
+}
+
+#[cfg(test)]
+mod unavailable_tests {
+    use super::*;
+    #[test]
+    fn unavailable_imports_are_explicitly_skipped_by_static_walk_and_signatures() {
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("arguments.crn"), "arguments {}\n").unwrap();
+        let environment = carina_core::EnvironmentSnapshot::empty();
+        let context = carina_core::parser::ProviderContext::new(environment.clone());
+        let parsed = carina_core::parser::parse_file(
+            "let child = use { source = './child' }\nlet call = child {}\n",
+            &directory.path().join("main.crn"),
+            &context,
+        )
+        .unwrap();
+        let path = ResolvedPath::new(directory.path()).unwrap();
+        for source in [b"let broken =\n".as_slice(), &[0xff]] {
+            std::fs::write(child.join("broken.crn"), source).unwrap();
+            let walk = ModuleWalk::load(
+                &parsed,
+                &path,
+                &environment,
+                &carina_core::schema::SchemaRegistry::new(),
+            );
+            assert_eq!(walk.iter().count(), 0);
+            assert!(walk.rejections().is_empty());
+            assert!(
+                module_resolver::load_resolved_module_signatures(&parsed, &path, &context)
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod rejected_import_tests {
+    use super::*;
+    #[test]
+    fn round15_every_rejected_import_is_rendered_once() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("not-a-directory.crn"), "// file\n").unwrap();
+        std::fs::create_dir(directory.path().join("empty")).unwrap();
+        let environment = carina_core::EnvironmentSnapshot::empty();
+        let context = carina_core::parser::ProviderContext::new(environment.clone());
+        let parsed = carina_core::parser::parse_file(
+            "let file = use { source = './not-a-directory.crn' }\nlet empty = use { source = './empty' }\n",
+            &directory.path().join("main.crn"), &context,
+        ).unwrap();
+        let walk = ModuleWalk::load(
+            &parsed,
+            &ResolvedPath::new(directory.path()).unwrap(),
+            &environment,
+            &carina_core::schema::SchemaRegistry::new(),
+        );
+        let errors = crate::wiring::validate_module_boundaries(&walk);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        let messages = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("not-a-directory.crn"))
+                .count(),
+            1,
+            "{messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("No .crn files"))
+                .count(),
+            1,
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn rejected_import_still_walks_its_nested_imports_without_exposing_placement_findings() {
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("child");
+        std::fs::create_dir_all(child.join("nested")).unwrap();
+        std::fs::write(child.join("arguments.crn"), "arguments {}\n").unwrap();
+        std::fs::write(child.join("providers.crn"), "provider mock {}\n").unwrap();
+        std::fs::write(
+            child.join("main.crn"),
+            "let nested = use { source = './nested' }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            child.join("nested/backend.crn"),
+            "backend local { path = 'state.json' }\n",
+        )
+        .unwrap();
+        let environment = carina_core::EnvironmentSnapshot::empty();
+        let context = carina_core::parser::ProviderContext::new(environment.clone());
+        let parsed = carina_core::parser::parse_file(
+            "let child = use { source = './child' }\n",
+            &directory.path().join("main.crn"),
+            &context,
+        )
+        .unwrap();
+        let walk = ModuleWalk::load(
+            &parsed,
+            &ResolvedPath::new(directory.path()).unwrap(),
+            &environment,
+            &carina_core::schema::SchemaRegistry::new(),
+        );
+        assert_eq!(walk.iter().count(), 0);
+        assert_eq!(walk.rejections().len(), 2);
+        assert!(matches!(
+            walk.rejections()[0].error.root_cause(),
+            ModuleError::ProviderInModule
+        ));
+        assert!(matches!(
+            walk.rejections()[1].error.root_cause(),
+            ModuleError::BackendInModule
+        ));
     }
 }

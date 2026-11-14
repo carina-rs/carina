@@ -193,6 +193,54 @@ fn render_analysis_resolution_error(
     }
 }
 
+/// An unknown directory grants no expanded-root readiness. Keep declared
+/// argument placeholders provisional while ordinary expression checks run;
+/// this does not mint template scope or exempt unknown requires from inference.
+fn parser_placeholder_boundary(
+    verdict: &carina_core::config_loader::DirectoryVerdict,
+) -> carina_core::parser::ParserPlaceholderBoundary {
+    use carina_core::config_loader::DirectoryVerdict;
+    use carina_core::parser::ParserPlaceholderBoundary;
+    match verdict {
+        DirectoryVerdict::Root(_) | DirectoryVerdict::NoEvidence(_) => {
+            ParserPlaceholderBoundary::ExpandedFile
+        }
+        DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::Unknown(_) => {
+            ParserPlaceholderBoundary::ModuleDefinition
+        }
+    }
+}
+
+/// The verdict supplies both the source and UTF-16 columns from its sealed
+/// snapshot, including unsaved siblings. Rendering never rereads evidence.
+fn attach_directory_evidence(
+    diagnostic: &mut Diagnostic,
+    evidence: &impl carina_core::config_loader::DirectoryDeclarationEvidence,
+) {
+    let location = evidence.location();
+    let (start, end) = evidence.utf16_columns();
+    let file = evidence.file_locator();
+    let Ok(uri) = tower_lsp::lsp_types::Url::from_file_path(file.to_path_buf()) else {
+        return;
+    };
+    // URL parsing removes dot segments while retaining percent-encoded OS bytes.
+    let Ok(uri) = tower_lsp::lsp_types::Url::parse(uri.as_str()) else {
+        return;
+    };
+    let span = location.span();
+    diagnostic.related_information =
+        Some(vec![tower_lsp::lsp_types::DiagnosticRelatedInformation {
+            location: tower_lsp::lsp_types::Location {
+                uri,
+                range: Range::new(
+                    Position::new((span.start_line() - 1) as u32, start),
+                    Position::new((span.end_line() - 1) as u32, end),
+                ),
+            },
+            message: evidence.related_message(),
+        }]);
+}
+
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
     // SourceSpan records parser-owned Unicode-scalar columns. Convert those
     // columns to UTF-16, including when a source view uses multibyte whitespace.
@@ -317,17 +365,6 @@ fn render_module_call_findings(
 ) -> Vec<Diagnostic> {
     findings
         .iter()
-        // Directory declarations publish through their retained expression
-        // report on both directory and buffer-only paths. This renderer owns
-        // the module-call carrier of constraint outcomes.
-        .filter(|finding| {
-            !matches!(
-                finding.message(),
-                carina_core::validation::ModuleCallFindingMessage::Constraint(
-                    carina_core::module_resolver::ConstraintDiagnostic::Directory(_)
-                )
-            )
-        })
         .flat_map(|finding| finding.diagnostics())
         .filter_map(|finding| {
             let mut diagnostic = render_merged(
@@ -607,14 +644,16 @@ impl DiagnosticRun<'_> {
     ) -> Result<
         (
             carina_core::upstream_exports::UpstreamExports<B>,
-            Vec<carina_core::parser::Located<carina_core::upstream_exports::UpstreamResolveError>>,
+            Vec<
+                carina_core::parser::Located<carina_core::upstream_exports::UpstreamResolveFailure>,
+            >,
         ),
         carina_core::parser::AnalysisTreeError,
     >
     where
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        carina_core::upstream_exports::resolve_upstream_exports_with_schemas_and_overrides(
+        carina_core::upstream_exports::resolve_upstream_exports_report_with_overrides(
             base,
             tree,
             self.provider_context,
@@ -684,6 +723,8 @@ impl DiagnosticRun<'_> {
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
         let buffer_parsed = doc.parsed();
+        // Validate the current AST before a cached parser snapshot can supply
+        // directory evidence. Recovery must not hide a malformed current view.
         let buffer_analysis =
             buffer_parsed.and_then(|parsed| analysis_tree(doc, parsed, &mut diagnostics));
         let pinned_base = current_file_path
@@ -706,6 +747,53 @@ impl DiagnosticRun<'_> {
         // keystrokes.
         let merged_attempt =
             base_path.map(|base| self.parse_merged_with_buffer(doc, current_file_name, base));
+        let overrides = carina_core::config_loader::SourceOverrides::from([(
+            doc.source_file().to_path_buf(),
+            text.clone(),
+        )]);
+        // A failed semantic parse can still have a complete declaration
+        // inventory. Admit that snapshot before any source-oriented consumer,
+        // then reuse its judged file for placement and expression reporting.
+        let recovery_configuration = match (
+            merged_attempt.as_ref(),
+            doc.parsed_buffer(),
+            buffer_analysis.as_ref(),
+        ) {
+            (Some(Ok(_)), _, _) | (_, None, _) | (_, _, None) => None,
+            (Some(Err(_)) | None, Some(buffer), Some(_)) => base_path
+                .and_then(|base| {
+                    carina_core::config_loader::DirectoryBufferSnapshot::capture(
+                        base,
+                        buffer.clone(),
+                        &overrides,
+                    )
+                    .ok()
+                })
+                .map(|snapshot| {
+                    carina_core::config_loader::load_buffer_configuration_in_directory(
+                        snapshot,
+                        &self.schemas,
+                        self.provider_context.catalog(),
+                    )
+                })
+                .or_else(|| {
+                    carina_core::config_loader::load_buffer_configuration_without_directory(
+                        buffer,
+                        &self.schemas,
+                        self.provider_context.catalog(),
+                    )
+                    .ok()
+                }),
+        };
+        let recovered_parsed = recovery_configuration
+            .as_ref()
+            .map(|configuration| configuration.parsed());
+        let buffer_parsed = recovered_parsed.or(buffer_parsed);
+        let buffer_analysis = if let Some(parsed) = recovered_parsed {
+            analysis_tree(doc, parsed, &mut diagnostics)
+        } else {
+            buffer_analysis
+        };
         let duplicates = match merged_attempt
             .as_ref()
             .and_then(|attempt| attempt.as_ref().ok())
@@ -823,10 +911,7 @@ impl DiagnosticRun<'_> {
         let merged = merged.filter(|_| merged_analysis.is_some());
         let current_parsed = current_parsed.filter(|_| current_analysis.is_some());
         let preferred_analysis = merged_analysis.as_ref().or(current_analysis.as_ref());
-        let overrides = carina_core::config_loader::SourceOverrides::from([(
-            doc.source_file().to_path_buf(),
-            text.clone(),
-        )]);
+
         // Module checks need declaration and upstream authority before their
         // single run. Both use the same sealed directory throughout analysis.
         let type_resolution = failed_directory_type_resolution.take().or_else(|| {
@@ -877,11 +962,7 @@ impl DiagnosticRun<'_> {
         }
         if let Some(boundary_file) = current_parsed {
             let boundary =
-                if carina_core::validation::is_module_definition(merged.unwrap_or(boundary_file)) {
-                    carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
-                } else {
-                    carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
-                };
+                parser_placeholder_boundary(merged.unwrap_or(boundary_file).directory_verdict());
             if let Some(merged) = merged {
                 diagnostics.extend(self.check_expansion_boundary(
                     doc,
@@ -1092,11 +1173,7 @@ impl DiagnosticRun<'_> {
             preferred_analysis,
         ) {
             diagnostics.extend(self.check_configuration_placement(doc, preferred_tree));
-            diagnostics.extend(self.check_backend_config(
-                doc,
-                merged_result.as_ref(),
-                merged_analysis.as_ref(),
-            ));
+            diagnostics.extend(self.check_backend_config(doc, preferred_analysis));
 
             // Check provider region
             diagnostics.extend(self.check_provider_region(
@@ -1137,11 +1214,7 @@ impl DiagnosticRun<'_> {
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
             let directive_boundary =
-                if carina_core::validation::is_module_definition(merged.unwrap_or(parsed)) {
-                    carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
-                } else {
-                    carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
-                };
+                parser_placeholder_boundary(merged.unwrap_or(parsed).directory_verdict());
             let directive_errors = if let Some(graph) = expanded_graph {
                 graph.directive_resolution_errors(
                     directive_boundary,
@@ -1186,40 +1259,37 @@ impl DiagnosticRun<'_> {
                 }
             }
             let pre_expansion_input = merged.unwrap_or(parsed);
-            let recovery_snapshot = if let (None, Some(base), Some(buffer)) =
-                (merged, base_path, doc.parsed_buffer())
-            {
-                carina_core::config_loader::DirectoryBufferSnapshot::capture(
-                    base,
-                    buffer.clone(),
-                    &overrides,
-                )
-                .ok()
-            } else {
-                None
-            };
-            let pre_expansion_configuration = if let Some(snapshot) = recovery_snapshot {
-                carina_core::config_loader::load_buffer_configuration_in_directory(
-                    snapshot,
-                    &self.schemas,
-                    self.provider_context.catalog(),
-                )
-            } else {
-                carina_core::config_loader::load_buffer_configuration(
-                    pre_expansion_input,
-                    &self.schemas,
-                    self.provider_context.catalog(),
-                )
-            };
+            let fallback_configuration;
+            let pre_expansion_configuration =
+                if let Some(configuration) = recovery_configuration.as_ref() {
+                    configuration
+                } else {
+                    fallback_configuration = carina_core::config_loader::load_buffer_configuration(
+                        pre_expansion_input,
+                        &self.schemas,
+                        self.provider_context.catalog(),
+                    );
+                    &fallback_configuration
+                };
             let expression_report = pre_expansion_configuration.judged().report();
             for finding in expression_report.findings() {
-                if let Some(diagnostic) = render_merged(
-                    doc,
-                    finding,
-                    DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                ) && !diagnostics.contains(&diagnostic)
+                let root = match finding.detail() {
+                    carina_core::static_type::InferenceError::RequireOutsideModule(root) => {
+                        Some(root)
+                    }
+                    _ => None,
+                };
+                let message =
+                    root.map_or_else(|| finding.detail().to_string(), |root| root.lsp_message());
+                if let Some(mut diagnostic) =
+                    render_merged(doc, finding, DiagnosticSeverity::ERROR, message)
                 {
+                    if let Some(root) = root {
+                        attach_directory_evidence(&mut diagnostic, &root.root_evidence());
+                    }
+                    if diagnostics.contains(&diagnostic) {
+                        continue;
+                    }
                     let owner = expression_report
                         .expression(finding.location())
                         .ok()
@@ -1723,6 +1793,12 @@ impl DiagnosticRun<'_> {
                             format!("Unknown resource type: {full_resource_type}"),
                         )
                     } else if !provider_loaded {
+                        match preferred_tree.directory_verdict() {
+                            carina_core::config_loader::DirectoryVerdict::Root(_)
+                            | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
+                            carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
+                            | carina_core::config_loader::DirectoryVerdict::Unknown(_) => continue,
+                        }
                         (
                             DiagnosticSeverity::ERROR,
                             format!(

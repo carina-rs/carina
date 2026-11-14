@@ -303,6 +303,9 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
         AppError::ExpressionType(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
+        AppError::RootDeclaration(finding) => {
+            Diagnostic::located(finding.detail().to_string(), finding.location())
+        }
         AppError::DependsOn(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
@@ -366,7 +369,7 @@ fn module_error_diagnostics(
                 ModuleErrorCallSource::Unavailable => None,
             };
             let mut diagnostics = match finding.error {
-                ModuleError::DirectoryConstraint(finding) => {
+                ModuleError::RequireOutsideModule(finding) => {
                     vec![Diagnostic::located(
                         finding.detail().to_string(),
                         finding.location(),
@@ -582,8 +585,20 @@ impl ValidateReport {
                     if matches!(error, AppError::Interrupted) {
                         continue;
                     }
-                    for line in format_error_with_source_chain(error).lines() {
-                        writeln!(stderr, "{prefix} {line}")?;
+                    for line in crate::error::human_error_lines(error) {
+                        match line {
+                            crate::error::HumanErrorLine::RootEvidence(evidence) => {
+                                writeln!(stderr, "  Note: {}", evidence.note())?
+                            }
+                            crate::error::HumanErrorLine::ModuleEvidence(evidence) => {
+                                writeln!(stderr, "  Note: {}", evidence.note())?
+                            }
+                            crate::error::HumanErrorLine::Message(message) => {
+                                for line in message.lines() {
+                                    writeln!(stderr, "{prefix} {line}")?;
+                                }
+                            }
+                        }
                     }
                 }
             }

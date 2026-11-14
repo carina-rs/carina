@@ -8,12 +8,11 @@ fn with_report(check: impl FnOnce(&ExpressionReport<crate::resource::AbsoluteBin
     let path = crate::paths::ResolvedPath::new(root).unwrap();
     let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::config_loader::parse_directory(&path, &context).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
     crate::validation::deferred_types::with_session_for_test(&context, |session| {
         let file = crate::module_resolver::resolve_modules_with_providerless_config(
-            parsed,
+            parsed.admit(&schemas, session),
             &path,
-            session,
-            &crate::schema::SchemaRegistry::new(),
         )
         .unwrap();
         check(file.expression_report());

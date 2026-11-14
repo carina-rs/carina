@@ -1254,7 +1254,8 @@ fn module_instances(condition: &str, rejudge: bool) {
     );
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         let mut parsed = crate::module_resolver::resolve_modules_with_providerless_config(
-            root, &path, session, &schemas,
+            root.admit(&schemas, session),
+            &path,
         )
         .unwrap();
         if rejudge {
@@ -1577,12 +1578,16 @@ fn seam_schema_block_aliases_keep_the_synthetic_authored_containers() {
 #[test]
 fn seam_deferred_loop_substitution_rebuilds_the_whole_slot() {
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let parsed = crate::parser::parse("let upstream = upstream_state { source = '../upstream' }\nfor value in upstream.values { mock.Test { input = [value] } }", &catalog).unwrap();
+    let fixture_source = "let upstream = upstream_state { source = '../upstream' }\nfor value in upstream.values { mock.Test { input = [value] } }";
+    let parsed = crate::parser::parse(fixture_source, &catalog).unwrap();
     let parsed = crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         crate::module_resolver::resolve_modules_providerless(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+            crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                parsed,
+                fixture_source,
+            )
+            .admit(&crate::schema::SchemaRegistry::new(), session),
             &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-            session,
         )
         .unwrap()
     })
@@ -2241,7 +2246,8 @@ fn review_seam_composition_computed_values_keep_main_checks() {
         );
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             let graph = crate::module_resolver::resolve_modules_with_providerless_config(
-                root, &path, session, &schemas,
+                root.admit(&schemas, session),
+                &path,
             )
             .unwrap();
             let configuration =

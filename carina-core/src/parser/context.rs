@@ -301,12 +301,9 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
     pub(super) fn retain_require(
         &self,
         id: super::retained::NodeId,
-        declaration: super::RequireBlock<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
+        statement: super::DeclarationLocation,
     ) {
-        self.authored_nodes.retain_require(id, declaration);
+        self.authored_nodes.retain_require(id, statement);
     }
 
     pub(super) fn evaluate_retained_expression(

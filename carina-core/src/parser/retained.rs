@@ -308,49 +308,26 @@ impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
 /// retained with every require node, and reused by all resolver entry points.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum RequireScope {
-    /// An isolated buffer cannot establish that sibling arguments are absent.
+    /// No complete directory verdict is available for this require node.
     #[default]
     Unknown,
-    /// Bootstrap/backend parsing retains complete declarations without
-    /// entering guard validation. Only the directory loader mints this proof.
-    UnvalidatedDirectory(crate::config_loader::CompleteDirectoryDeclarations),
-    Directory(crate::config_loader::CompleteDirectoryDeclarations),
-    ModuleTemplate {
-        arguments: Arc<[String]>,
-    },
+    /// Only the directory loader mints this declaration-completeness proof.
+    /// Any JudgedFile construction promotes it to Directory, including
+    /// bootstrap/metadata inference. Callers decide whether to publish findings.
+    UnvalidatedDirectory(crate::config_loader::RootDirectoryVerdict),
+    Directory(crate::config_loader::RootDirectoryVerdict),
+    ModuleTemplate(crate::config_loader::ModuleTemplateDeclarations),
     ModuleCall,
 }
 
-impl RequireScope {
-    pub(crate) fn for_declarations(
-        arguments: impl Iterator<Item = String>,
-        blocks: super::ModuleDeclarationBlocks,
-    ) -> Self {
-        let arguments = arguments.collect::<Vec<_>>();
-        if blocks == super::ModuleDeclarationBlocks::Absent {
-            Self::Unknown
-        } else {
-            Self::ModuleTemplate {
-                arguments: arguments.into(),
-            }
-        }
-    }
-}
-
-/// Parser-minted declaration identity and its immutable authored obligation.
-/// The exact value that suppresses ordinary value inference evaluates the
-/// condition; a public File.requires edit cannot remove that obligation.
-#[derive(Debug, Clone)]
+/// Parser-minted declaration identity and its scope evidence. The same node
+/// that suppresses child inference must reject a Directory declaration;
+/// a public File.requires edit cannot remove that obligation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RetainedRequireCondition {
     id: NodeId,
     scope: RequireScope,
-    declaration: super::RequireBlock<ParserPlaceholder, RelativeBindingName>,
-}
-
-impl PartialEq for RetainedRequireCondition {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.scope == other.scope
-    }
+    statement: DeclarationLocation,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -739,7 +716,7 @@ fn retain_require_nodes<P: ValueKind, B: BindingAddress>(
 }
 
 impl<B: BindingAddress> Expressions<B> {
-    pub(in crate::parser) fn set_require_scope(&mut self, scope: RequireScope) {
+    fn set_require_scope(&mut self, scope: RequireScope) {
         self.require_scope = Some(scope.clone());
         let mut memo = HashMap::new();
         let mut transform = |_: NodeId, current: Option<RetainedRequireCondition>| {
@@ -772,9 +749,6 @@ impl<B: BindingAddress> Expressions<B> {
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);
         self.arguments.extend(other.arguments);
-        if self.require_scope.is_none() {
-            self.require_scope = other.require_scope;
-        }
         Arc::make_mut(&mut self.projections).extend(Arc::unwrap_or_clone(other.projections));
         Arc::make_mut(&mut self.report).extend(Arc::unwrap_or_clone(other.report));
     }
@@ -895,20 +869,23 @@ impl<B: BindingAddress> Expressions<B> {
 /// A schema-judged configuration owns its file and report and borrows the
 /// caller's schema registry. Parsing alone cannot construct this type.
 /// Consumers borrow this bundle so the file and schemas stay paired.
+/// Admission and judgement are inseparable for the wrapped snapshot: every
+/// Directory require has a placement verdict. Reference normalization consumes
+/// this snapshot and re-judges the result before checking require placement.
 #[derive(Debug, Clone)]
 pub struct JudgedFile<'a, E, D, B: BindingAddress = RelativeBindingName> {
     file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &'a crate::schema::SchemaRegistry,
 }
 
-impl<E, D, B: BindingAddress> JudgedFile<'_, E, D, B> {
+impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     pub fn file(&self) -> &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         &self.file
     }
     pub fn report(&self) -> &ExpressionReport<B> {
         self.file.expression_report()
     }
-    pub fn schemas(&self) -> &crate::schema::SchemaRegistry {
+    pub fn schemas(&self) -> &'a crate::schema::SchemaRegistry {
         self.schemas
     }
     pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
@@ -942,16 +919,21 @@ impl<E, D, B: BindingAddress> super::File<E, ParserPlaceholder, ParserPlaceholde
     }
 }
 
-pub(crate) fn set_require_scope<E, D, B: BindingAddress>(
+pub(crate) fn set_directory_require_scope<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-    scope: RequireScope,
+    scope: crate::config_loader::DirectoryRequireScope,
 ) {
+    file.parser_binding_metadata
+        .syntax
+        .install_directory_verdict(scope.clone());
+    let (_, scope) = scope.into_parts();
     file.parser_binding_metadata
         .syntax
         .expressions_mut()
         .set_require_scope(scope);
 }
 
+#[cfg(test)]
 pub(crate) fn require_scope<E, D, B: BindingAddress>(
     file: &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> RequireScope {
@@ -963,41 +945,18 @@ pub(crate) fn require_scope<E, D, B: BindingAddress>(
         .unwrap_or_default()
 }
 
-/// Full analysis acquires the directory obligation together with its
+/// Full analysis acquires the root require rejection together with its
 /// inference exemption only when the loader proved declaration completeness.
 /// An isolated buffer stays unknown and retains ordinary expression checks.
-pub(crate) fn admit_require_scope<E, D, B: BindingAddress>(
+fn admit_require_scope<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) {
-    let module_blocks = file
-        .parser_binding_metadata
-        .syntax()
-        .module_declaration_blocks();
     let expressions = file.parser_binding_metadata.syntax.expressions_mut();
-    let scope = match expressions.require_scope.as_ref() {
-        Some(RequireScope::UnvalidatedDirectory(evidence)) => RequireScope::Directory(*evidence),
-        Some(_) => return,
-        None => RequireScope::for_declarations(
-            file.arguments.iter().map(|argument| argument.name.clone()),
-            module_blocks,
-        ),
+    let Some(RequireScope::UnvalidatedDirectory(evidence)) = expressions.require_scope.as_ref()
+    else {
+        return;
     };
-    expressions.set_require_scope(scope);
-}
-
-pub(crate) fn has_retained_requires<E, D, B: BindingAddress>(
-    file: &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-) -> bool {
-    fn contains<P: ValueKind, B: BindingAddress>(root: &ExprValue<P, B>) -> bool {
-        matches!(root.authored.kind, ExprKind::RequireCondition(_))
-            || root.authored.children.iter().any(contains)
-    }
-    file.parser_binding_metadata
-        .syntax()
-        .expressions()
-        .roots
-        .iter()
-        .any(contains)
+    expressions.set_require_scope(RequireScope::Directory(evidence.clone()));
 }
 
 pub(crate) fn judge_configuration<
@@ -1011,24 +970,6 @@ pub(crate) fn judge_configuration<
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    if file
-        .parser_binding_metadata
-        .syntax()
-        .expressions()
-        .require_scope
-        .is_none()
-    {
-        let scope = RequireScope::for_declarations(
-            file.arguments.iter().map(|argument| argument.name.clone()),
-            file.parser_binding_metadata
-                .syntax()
-                .module_declaration_blocks(),
-        );
-        file.parser_binding_metadata
-            .syntax
-            .expressions_mut()
-            .set_require_scope(scope);
-    }
     prepare_slots(file, schemas);
     let mut report = judge_expressions(file, schemas, config);
     for parameter in &file.export_params {
@@ -1142,10 +1083,10 @@ impl Expressions {
             retain_require_nodes(root, &mut memo, &mut |id, current| {
                 declarations
                     .get(&id)
-                    .map(|declaration| RetainedRequireCondition {
+                    .map(|statement| RetainedRequireCondition {
                         id,
                         scope: scope.clone(),
-                        declaration: declaration.clone(),
+                        statement: statement.clone(),
                     })
                     .or(current)
             });
@@ -1302,9 +1243,7 @@ impl ParseNodeKey {
 pub(in crate::parser) struct CapturedNodes {
     inventory: bool,
     nodes: HashMap<ParseNodeKey, ExprValue>,
-    requires: std::sync::RwLock<
-        HashMap<NodeId, super::RequireBlock<ParserPlaceholder, RelativeBindingName>>,
-    >,
+    requires: std::sync::RwLock<HashMap<NodeId, DeclarationLocation>>,
     resource_declarations: HashMap<NodeId, SlotDeclarationId>,
     values: std::sync::RwLock<HashMap<NodeId, Value<ParserPlaceholder, RelativeBindingName>>>,
     conditions: ConditionRecorder,
@@ -1315,15 +1254,11 @@ impl std::fmt::Debug for CapturedNodes {
     }
 }
 impl CapturedNodes {
-    pub(in crate::parser) fn retain_require(
-        &self,
-        id: NodeId,
-        declaration: super::RequireBlock<ParserPlaceholder, RelativeBindingName>,
-    ) {
+    pub(in crate::parser) fn retain_require(&self, id: NodeId, statement: DeclarationLocation) {
         self.requires
             .write()
             .expect("retained require declarations")
-            .insert(id, declaration);
+            .insert(id, statement);
     }
 
     fn condition_snapshot(&self) -> ConditionSnapshot {
@@ -3844,9 +3779,12 @@ mod judgement {
     }
 
     fn first_error(findings: &[Located<InferenceError>]) -> Option<super::super::ParseError> {
+        // Ordinary expression failures become ParseError. Require placement
+        // stays typed: diagnostic callers publish this report, while strict
+        // resolvers translate its placement verdicts into ModuleError.
         findings
             .iter()
-            .find(|finding| !matches!(finding.detail(), InferenceError::DirectoryConstraint(_)))
+            .find(|finding| !matches!(finding.detail(), InferenceError::RequireOutsideModule(_)))
             .map(|finding| {
                 super::super::ParseError::InvalidExpression {
                     line: finding.location().span().start_line(),
@@ -4091,15 +4029,19 @@ mod judgement {
             let outer_scope = self.scope;
             self.scope = scope;
             self.visiting.push(id);
-            let directory_require = match &root.kind {
-                ExprKind::RequireCondition(require)
-                    if matches!(require.scope, RequireScope::Directory(_)) =>
-                {
-                    Some(require.clone())
-                }
+            let rejected_require = match &root.kind {
+                ExprKind::RequireCondition(require) => match &require.scope {
+                    RequireScope::Directory(verdict)
+                    | RequireScope::UnvalidatedDirectory(verdict) => {
+                        Some((require.statement.clone(), verdict.clone()))
+                    }
+                    RequireScope::Unknown
+                    | RequireScope::ModuleTemplate(_)
+                    | RequireScope::ModuleCall => None,
+                },
                 _ => None,
             };
-            let mut children = if directory_require.is_some() {
+            let mut children = if rejected_require.is_some() {
                 Vec::new()
             } else {
                 root.children
@@ -4140,15 +4082,15 @@ mod judgement {
                     owner: FailureOwner::Boundary,
                 };
             }
-            let mut result = if let Some(require) = directory_require {
-                if let Some(diagnostic) =
-                    crate::module_resolver::evaluate_directory_require(&require.declaration)
-                {
-                    self.push_finding(
-                        root.location.authored.clone(),
-                        InferenceError::DirectoryConstraint(Box::new(diagnostic)),
-                    );
-                }
+            let mut result = if let Some((statement, verdict)) = rejected_require {
+                // A rejected declaration owns the sole diagnostic for its
+                // condition. Do not infer or evaluate any of its children.
+                self.push_finding(
+                    statement,
+                    InferenceError::RequireOutsideModule(Box::new(
+                        crate::module_resolver::RequireOutsideModuleDiagnostic::new(verdict),
+                    )),
+                );
                 declaration()
             } else {
                 self.infer(expression, &children)

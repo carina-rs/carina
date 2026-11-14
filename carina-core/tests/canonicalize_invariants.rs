@@ -117,9 +117,8 @@ fn parse_root_and_resolve(source: &str) -> carina_core::parser::ExpandedParsedFi
             )
             .expect("parse should succeed");
             carina_core::module_resolver::resolve_modules_providerless(
-                parsed,
+                parsed.admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
-                session,
             )
             .expect("module-resolution boundary should succeed")
         },

@@ -142,11 +142,12 @@ where
         &self,
     ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<LocatedBackendError>>>
     {
-        if self.is_module_definition() {
-            return None;
-        }
-        let backend = self.file().backend.as_ref()?;
-        Some(admit(backend).map_err(|error| {
+        let admitted = admit_directory_backend(
+            self.directory_verdict(),
+            self.file().backend.as_ref(),
+            self.syntax(),
+        )?;
+        Some(admitted.map_err(|error| {
             error
                 .into_unlocated()
                 .into_iter()
@@ -168,6 +169,50 @@ where
                 })
                 .collect()
         }))
+    }
+}
+
+/// Ownership and failed-value admission are shared by both source projections.
+fn admit_directory_backend<U, T, N, P: PlaceholderKind, B: BindingAddress>(
+    verdict: &crate::config_loader::DirectoryVerdict<U, T, N>,
+    backend: Option<&parser::BackendConfig<P, B>>,
+    syntax: &parser::SyntaxInventory<B>,
+) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError>> {
+    match verdict {
+        crate::config_loader::DirectoryVerdict::Root(root) if root.has_sole_backend() => {}
+        crate::config_loader::DirectoryVerdict::Root(_)
+        | crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
+        | crate::config_loader::DirectoryVerdict::NoEvidence(_)
+        | crate::config_loader::DirectoryVerdict::Unknown(_) => return None,
+    }
+    let backend = backend?;
+    let failed = |key: &AttributeKey| {
+        matches!(
+            syntax.backend_value_state(key),
+            parser::BackendValueState::EvaluationFailed
+        )
+    };
+    let checked = check(backend, failed);
+    // Recovery can report independent errors, but cannot issue a complete
+    // receipt while even one field's evaluation has failed.
+    if backend.attributes.keys().any(failed) && checked.is_ok() {
+        return None;
+    }
+    Some(checked.map(|builder| builder.admit_payload()))
+}
+
+impl<E> crate::config_loader::RootDirectoryParse<E> {
+    /// Preserve backend admission when an authored tree cannot seal.
+    pub fn admit_backend_unlocated(
+        &self,
+    ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<UnlocatedBackendError>>>
+    {
+        admit_directory_backend(
+            &self.complete_directory_verdict(),
+            self.backend.as_ref(),
+            self.parser_binding_metadata.syntax(),
+        )
+        .map(|result| result.map_err(BackendConfigError::into_unlocated))
     }
 }
 
@@ -353,6 +398,13 @@ impl AdmittedConfiguration<kind::BackendAttribute> {
 pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     config: &parser::BackendConfig<P, B>,
 ) -> Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError> {
+    check(config, |_| false).map(|builder| builder.admit_payload())
+}
+
+fn check<P: PlaceholderKind, B: BindingAddress>(
+    config: &parser::BackendConfig<P, B>,
+    failed: impl Fn(&AttributeKey) -> bool,
+) -> Result<ConfigurationBuilder<kind::BackendAttribute>, BackendConfigError> {
     let kind = match config.backend_type.as_str() {
         "s3" => BackendKind::S3,
         "local" => BackendKind::Local,
@@ -390,6 +442,9 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
                 });
                 continue;
             };
+            if failed(key) {
+                continue;
+            }
             let ty = destination.contract.attr();
             // The enum's actual namespace is intentional: backend regions do
             // not use provider-block aliases or depend on provider loading.
@@ -451,7 +506,7 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     if !errors.is_empty() {
         return Err(BackendConfigErrors::new(errors).into());
     }
-    Ok(aggregate.admit_payload())
+    Ok(aggregate)
 }
 
 #[cfg(test)]

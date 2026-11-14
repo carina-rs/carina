@@ -139,9 +139,11 @@ fn parse_loop_fixture(source: &str, file: &str) -> Vec<Resource> {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed, source,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-                session,
             )
             .expect("loop fixture crosses the module-resolution seam")
         },
@@ -1779,11 +1781,12 @@ fn diagnostic_sensitive_strings_preserve_plaintext_anonymous_identity() {
 
 #[test]
 fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
-    let parsed = crate::parser::parse(
-        r#"
+    let fixture_source = r#"
             let vpc = mock.test.resource { name = "network" }
             mock.test.Consumer { parent = vpc }
-        "#,
+        "#;
+    let parsed = crate::parser::parse(
+        fixture_source,
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("the parser must preserve the authored use for typed validation");
@@ -1791,9 +1794,12 @@ fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed,
+                    fixture_source,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
             )
             .expect("the fixture crosses module resolution before readiness validation")
         },
@@ -9427,9 +9433,8 @@ fn loop_conflict_suggestion_reserves_sibling_file_value_bindings() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                parsed,
+                parsed.admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                session,
             )
             .expect("directory fixture crosses the module-resolution seam")
         },

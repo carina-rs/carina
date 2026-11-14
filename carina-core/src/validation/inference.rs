@@ -2879,10 +2879,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         let parsed =
             crate::validation::deferred_types::with_session_for_test(&context, |session| {
                 crate::module_resolver::resolve_modules_with_providerless_config(
-                    parsed,
+                    parsed.admit(&schemas_with_vpc(), session),
                     &path,
-                    session,
-                    &schemas_with_vpc(),
                 )
             })
             .unwrap();

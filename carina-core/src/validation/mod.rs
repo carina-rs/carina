@@ -3003,7 +3003,7 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::DirectoryConstraint(_)
+            error @ (inference::InferenceError::RequireOutsideModule(_)
             | inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
@@ -5522,11 +5522,11 @@ fn resource_values_report<
     // availability cannot be decided until its resources are expanded into a
     // root configuration. Keep every other schema/type check below active for
     // modules; only defer this provider-availability diagnostic.
-    if !is_module_definition(parsed) {
-        all_errors.extend(group_anonymous_resource_schema_errors(
-            parsed
-                .iter_all_resources()
-                .filter_map(|resource| match resource {
+    match parsed.directory_verdict() {
+        crate::config_loader::DirectoryVerdict::Root(_)
+        | crate::config_loader::DirectoryVerdict::NoEvidence(_) => all_errors.extend(
+            group_anonymous_resource_schema_errors(parsed.iter_all_resources().filter_map(
+                |resource| match resource {
                     ResourceRef::Resource(resource) => {
                         anonymous_resource_schema_key(resource, registry, known_providers)
                     }
@@ -5536,8 +5536,11 @@ fn resource_values_report<
                         known_providers,
                     ),
                     ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
-                }),
-        ));
+                },
+            )),
+        ),
+        crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
+        | crate::config_loader::DirectoryVerdict::Unknown(_) => {}
     }
 
     // Classify per kind via the typed `ResourceRef` arms instead of
@@ -6248,7 +6251,7 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::DirectoryConstraint(_)
+            error @ (inference::InferenceError::RequireOutsideModule(_)
             | inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::MissingEvidence(_)
@@ -7032,7 +7035,7 @@ fn is_string_compatible_type_on_path<'a>(
     }
 }
 
-/// Check that a root configuration does not contain `arguments` blocks.
+/// Check that a root configuration does not contain module interface blocks.
 ///
 /// `arguments` is a module-input declaration: it belongs on the module side
 /// of a module boundary and is paired with `use` on the caller side. In a
@@ -7044,14 +7047,18 @@ fn is_string_compatible_type_on_path<'a>(
 /// the user is validating in isolation. We only flag the misplaced block
 /// when a `backend` or `provider` block is also present, since both are
 /// root-only constructs and unambiguously identify a root configuration.
-pub fn validate_no_arguments_in_root<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    let is_root = parsed.backend.is_some() || !parsed.providers.is_empty();
-    if !parsed.arguments.is_empty() && is_root {
-        return Err(
-            "arguments blocks are only valid inside module definitions, not in root configurations.".to_string(),
-        );
+/// Block presence, including empty arguments/attributes, uses the same
+/// declaration classification as require admission.
+pub fn validate_no_module_declarations_in_root<E>(
+    parsed: &crate::parser::File<E>,
+) -> Result<(), crate::parser::Located<ConfigurationPlacementDiagnostic>> {
+    match placement_diagnostics_for_inventory(parsed.parser_binding_metadata.syntax())
+        .into_iter()
+        .find(|finding| finding.detail().root_evidence().is_some())
+    {
+        Some(finding) => Err(finding),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn unknown_type_resolution_error(
@@ -7981,54 +7988,109 @@ pub fn resolve_export_static_type_for_consumer(
     }
 }
 
-/// Return whether a merged configuration directory is a module definition.
-///
-/// This is the classification used by the root-owned-block validators: a
-/// top-level `arguments` or `attributes` block marks the directory as a
-/// module whose provider configuration comes from its caller.
-#[must_use]
-pub fn is_module_definition<
-    E,
-    P: crate::resource::PlaceholderKind,
-    T: crate::resource::PlaceholderKind,
-    D,
-    B: BindingAddress,
->(
-    parsed: &crate::parser::File<E, P, T, D, B>,
-) -> bool {
-    !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty()
+/// The placement finding owns the issued root evidence; formatting never
+/// searches declarations or reclassifies a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationPlacementDiagnostic {
+    message: &'static str,
+    root: Option<crate::config_loader::RootDirectoryVerdict>,
+}
+impl ConfigurationPlacementDiagnostic {
+    pub fn root_evidence(&self) -> Option<crate::config_loader::RootEvidence> {
+        self.root.as_ref().map(|root| root.evidence())
+    }
+    pub fn lsp_message(&self) -> String {
+        self.root.as_ref().map_or_else(
+            || self.message.to_string(),
+            |root| root.lsp_message(self.message),
+        )
+    }
+}
+impl std::error::Error for ConfigurationPlacementDiagnostic {}
+impl std::fmt::Display for ConfigurationPlacementDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.root {
+            Some(root) => f.write_str(&root.format_message(self.message)),
+            None => f.write_str(self.message),
+        }
+    }
+}
+fn root_declaration_message(block: crate::parser::ConfigurationBlock) -> Option<&'static str> {
+    use crate::parser::ConfigurationBlock;
+    match block {
+        ConfigurationBlock::Arguments => Some(
+            "arguments blocks are only valid inside module definitions, not in root configurations.",
+        ),
+        ConfigurationBlock::Attributes => Some(
+            "attributes blocks are only valid inside module definitions, not in root configurations.",
+        ),
+        ConfigurationBlock::Require
+        | ConfigurationBlock::Provider
+        | ConfigurationBlock::State
+        | ConfigurationBlock::Backend
+        | ConfigurationBlock::UpstreamState
+        | ConfigurationBlock::Exports => None,
+    }
 }
 
-/// Report root-only blocks in modules and argument blocks in root configurations.
 pub fn configuration_placement_diagnostics<
     P: crate::resource::PlaceholderKind,
     T: crate::resource::PlaceholderKind,
     B: BindingAddress,
+    E: crate::parser::ExportParamLike<P, B>,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
 >(
-    tree: &crate::parser::AnalysisTree<'_, P, T, D, B>,
-) -> Vec<crate::parser::Located<&'static str>> {
+    tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
+) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
+    placement_diagnostics_for_inventory(tree.syntax())
+}
+
+fn placement_diagnostics_for_inventory<B: BindingAddress>(
+    syntax: &crate::parser::SyntaxInventory<B>,
+) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
+    use crate::config_loader::DirectoryVerdict;
     use crate::parser::ConfigurationBlock;
-    tree.syntax().configuration_blocks().iter().filter_map(|block| {
-        let message = match block.detail() {
-            ConfigurationBlock::Arguments if tree.is_root_configuration() => "arguments blocks are only valid inside module definitions, not in root configurations.",
-            ConfigurationBlock::Provider if tree.is_module_definition() => "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
-            ConfigurationBlock::State if tree.is_module_definition() => "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
-            ConfigurationBlock::Backend if tree.is_module_definition() => "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
-            ConfigurationBlock::UpstreamState if tree.is_module_definition() => "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
-            ConfigurationBlock::Exports if tree.is_module_definition() => "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
-            _ => return None,
+    syntax.configuration_blocks().iter().filter_map(|block| {
+        let (message, root) = match block.detail().directory_verdict() {
+            DirectoryVerdict::Root(root) => (root_declaration_message(block.detail().kind())?, Some(root.clone())),
+            DirectoryVerdict::ModuleTemplate(_) => {
+                let message = match block.detail().kind() {
+                    ConfigurationBlock::Provider | ConfigurationBlock::Backend => return None,
+                    ConfigurationBlock::State => "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+                    ConfigurationBlock::UpstreamState => "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+                    ConfigurationBlock::Exports => "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+                    ConfigurationBlock::Arguments | ConfigurationBlock::Attributes | ConfigurationBlock::Require => return None,
+                };
+                (message, None)
+            }
+            DirectoryVerdict::Unknown(_) | DirectoryVerdict::NoEvidence(_) => return None,
         };
-        Some(crate::parser::Located::new(block.location().clone(), message))
+        Some(crate::parser::Located::new(block.location().clone(), ConfigurationPlacementDiagnostic { message, root }))
     }).collect()
 }
 
 /// Check that a module file does not contain provider blocks.
 ///
 /// Provider configuration should only be defined at the root configuration level,
-/// not inside modules (files with `arguments` or `attributes` blocks).
-pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    if is_module_definition(parsed) && !parsed.providers.is_empty() {
+/// not inside explicitly imported modules. This is a module-use check, not
+/// a directory classifier; the loader witness establishes the module boundary.
+///
+/// ```compile_fail,E0308
+/// # fn root_file(file: &carina_core::parser::ParsedFile) {
+/// carina_core::validation::validate_no_provider_in_module(file).unwrap();
+/// # }
+/// ```
+pub fn validate_no_provider_in_module(
+    module: &crate::module_resolver::LoadedModule,
+) -> Result<(), String> {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::Provider)
+    {
         return Err(
             "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
         );
@@ -8039,11 +8101,18 @@ pub fn validate_no_provider_in_module<E>(parsed: &crate::parser::File<E>) -> Res
 /// Check that a module file does not contain state blocks.
 ///
 /// State changes should only be defined at the root configuration level, not
-/// inside modules (files with `arguments` or `attributes` blocks).
-pub fn validate_no_state_blocks_in_module<E>(
-    parsed: &crate::parser::File<E>,
+/// inside explicitly imported modules.
+pub fn validate_no_state_blocks_in_module(
+    module: &crate::module_resolver::LoadedModule,
 ) -> Result<(), String> {
-    if is_module_definition(parsed) && !parsed.state_blocks.is_empty() {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::State)
+    {
         return Err(
             "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.".to_string(),
         );
@@ -8054,9 +8123,18 @@ pub fn validate_no_state_blocks_in_module<E>(
 /// Check that a module file does not contain a backend block.
 ///
 /// Backend configuration should only be defined at the root configuration
-/// level, not inside modules (files with `arguments` or `attributes` blocks).
-pub fn validate_no_backend_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    if is_module_definition(parsed) && parsed.backend.is_some() {
+/// level, not inside explicitly imported modules.
+pub fn validate_no_backend_in_module(
+    module: &crate::module_resolver::LoadedModule,
+) -> Result<(), String> {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::Backend)
+    {
         return Err(
             "backend blocks are not allowed inside modules. Define the backend at the root configuration level.".to_string(),
         );
@@ -8067,12 +8145,18 @@ pub fn validate_no_backend_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
 /// Check that a module file does not contain upstream state declarations.
 ///
 /// Upstream state dependencies should only be defined at the root
-/// configuration level, not inside modules (files with `arguments` or
-/// `attributes` blocks).
-pub fn validate_no_upstream_states_in_module<E>(
-    parsed: &crate::parser::File<E>,
+/// configuration level, not inside explicitly imported modules.
+pub fn validate_no_upstream_states_in_module(
+    module: &crate::module_resolver::LoadedModule,
 ) -> Result<(), String> {
-    if is_module_definition(parsed) && !parsed.upstream_states.is_empty() {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::UpstreamState)
+    {
         return Err(
             "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.".to_string(),
         );
@@ -8083,9 +8167,18 @@ pub fn validate_no_upstream_states_in_module<E>(
 /// Check that a module file does not contain an exports block.
 ///
 /// State exports should only be defined at the root configuration level, not
-/// inside modules (files with `arguments` or `attributes` blocks).
-pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    if is_module_definition(parsed) && !parsed.export_params.is_empty() {
+/// inside explicitly imported modules.
+pub fn validate_no_exports_in_module(
+    module: &crate::module_resolver::LoadedModule,
+) -> Result<(), String> {
+    if module
+        .parsed
+        .parser_binding_metadata
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::Exports)
+    {
         return Err(
             "exports blocks are not allowed inside modules. Define exports at the root configuration level.".to_string(),
         );
@@ -8243,7 +8336,7 @@ pub enum ModuleCallFindingMessage {
     ReferenceType(Box<ModuleCallReferenceDiagnostic>),
     TypeResolution(Box<crate::parser::Located<TypeResolutionDiagnostic>>),
     AttributeReference(Box<CompositionAttributeRefError>),
-    Constraint(crate::module_resolver::ConstraintDiagnostic),
+    Constraint(Box<crate::module_resolver::ModuleConstraintDiagnostic>),
 }
 
 impl ModuleCallFindingMessage {
@@ -8645,12 +8738,7 @@ impl ModuleCallFinding {
                     ModuleCallFindingMessage::ReferenceType(error) => call
                         .argument_value_location(&error.identity.argument)
                         .unwrap_or_else(|| call.declaration_location()),
-                    ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::Directory(_),
-                    ) => unreachable!("directory findings have authored anchors"),
-                    ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(diagnostic),
-                    ) => match &diagnostic.kind {
+                    ModuleCallFindingMessage::Constraint(diagnostic) => match &diagnostic.kind {
                         crate::module_resolver::ModuleConstraintKind::ArgumentValidation {
                             argument,
                         } => call
@@ -9497,23 +9585,31 @@ impl ModuleCallChecker<'_> {
         // rejects the same declaration; its parser backstop is deduplicated
         // against this source-anchored finding.
         if let Some(mut module) = self.module_cache.get(&guard).cloned().or_else(|| {
-            crate::module_resolver::loader::load_module_with_overrides(
+            use crate::module_resolver::ModuleLoadError;
+            match crate::module_resolver::loader::load_module_with_overrides(
                 &module_dir,
                 self.provider_context.as_provider_context(),
                 &self.source_overrides,
-            )
-            .or_else(|| {
-                crate::module_resolver::loader::load_module_with_overrides(
-                    &module_dir,
-                    &ProviderContext::new(
-                        self.provider_context
-                            .as_provider_context()
-                            .environment
-                            .clone(),
-                    ),
-                    &self.source_overrides,
-                )
-            })
+            ) {
+                Ok(module) => Some(module),
+                Err(ModuleLoadError::NotModule { .. }) => None,
+                Err(ModuleLoadError::Unavailable(_)) => {
+                    match crate::module_resolver::loader::load_module_with_overrides(
+                        &module_dir,
+                        &ProviderContext::new(
+                            self.provider_context
+                                .as_provider_context()
+                                .environment
+                                .clone(),
+                        ),
+                        &self.source_overrides,
+                    ) {
+                        Ok(module) => Some(module),
+                        Err(ModuleLoadError::NotModule { .. }) => None,
+                        Err(ModuleLoadError::Unavailable(_)) => None,
+                    }
+                }
+            }
         }) {
             let resolution_errors = resolve_file_type_exprs(
                 &mut module,
@@ -9746,30 +9842,6 @@ impl ModuleCallChecker<'_> {
         compositions: &[crate::resource::LiveComposition<P>],
     ) {
         for report in reports {
-            let report = match report {
-                crate::module_resolver::ConstraintScopeReport::Directory(failures) => {
-                    for failure in failures {
-                        let anchor = ModuleCallFindingAnchor::new(failure.location().clone());
-                        let owner = ModuleCallFindingOwnerSource::Authored(anchor.clone());
-                        self.push_finding(ModuleCallFinding {
-                            kind: ModuleCallFindingKind::Constraint,
-                            owners: vec![ModuleCallFindingOwner {
-                                root: owner.clone(),
-                                immediate: owner,
-                            }],
-                            anchor,
-                            message: ModuleCallFindingMessage::Constraint(
-                                crate::module_resolver::ConstraintDiagnostic::Directory(
-                                    failure.detail().clone(),
-                                ),
-                            ),
-                            identity: None,
-                        });
-                    }
-                    continue;
-                }
-                crate::module_resolver::ConstraintScopeReport::ModuleCall(report) => report,
-            };
             for outcome in &report.outcomes {
                 let crate::module_resolver::ResolvedModuleConstraintStatus::Failed {
                     diagnostic,
@@ -9811,11 +9883,7 @@ impl ModuleCallChecker<'_> {
                     });
                 }
                 for owner in owners {
-                    let message = ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(
-                            diagnostic.clone(),
-                        ),
-                    );
+                    let message = ModuleCallFindingMessage::Constraint(diagnostic.clone());
                     match authored_argument {
                         true => self.push_finding(ModuleCallFinding::argument_value(
                             ModuleCallFindingKind::Constraint,

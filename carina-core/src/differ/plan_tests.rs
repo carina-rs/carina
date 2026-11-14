@@ -5561,8 +5561,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
     use crate::effect::Effect;
     use crate::wait::BindingPattern;
 
-    let parsed = crate::parser::parse_and_resolve(
-        r#"
+    let fixture_source = r#"
         provider aws {
             region = "us-east-1"
         }
@@ -5583,16 +5582,19 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
         let dist = aws.cloudfront.Distribution {
             cert_status = cert_issued.status
         }
-        "#,
-    )
-    .expect("parsed file should be valid");
+        "#;
+    let parsed =
+        crate::parser::parse_and_resolve(fixture_source).expect("parsed file should be valid");
     let parsed = crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             crate::module_resolver::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
+                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                    parsed,
+                    fixture_source,
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
-                session,
             )
             .expect("plan fixture crosses the module-resolution seam")
         },

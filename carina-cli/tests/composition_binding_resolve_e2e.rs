@@ -326,10 +326,8 @@ fn resolve_refs_for_plan_chains_through_virtual_in_multi_file_fixture() {
         &provider_context,
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                parsed,
+                parsed.admit(&SchemaRegistry::new(), session),
                 &project,
-                session,
-                &SchemaRegistry::new(),
             )
             .expect("module expansion should succeed")
         },

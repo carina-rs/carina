@@ -23,7 +23,10 @@
 //! points: `config_loader::LoadedConfig` for a loaded configuration root and
 //! `config_loader::DirectoryParseResult` for a directory parsed by editor
 //! diagnostics. Module directories validated standalone enter through the
-//! ordinary `resolve_modules*` APIs and intentionally behave as roots.
+//! ordinary `resolve_modules*` APIs and retain their uninstantiated template scope.
+//! These APIs consume `config_loader::AdmittedRootDirectory`, constructed by
+//! `RootDirectoryParse::admit` with its judgement, schemas, and typecheck context.
+//! A raw loader result cannot enter module resolution.
 
 mod deferred_if;
 mod error;
@@ -32,13 +35,12 @@ pub(crate) mod loader;
 mod resolver;
 mod signature;
 mod validation;
-pub(crate) use validation::evaluate_directory_require;
 
-pub use error::{ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
+pub use error::{DiagnosticLine, ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
 pub use loader::{
-    LoadedModule, derive_module_name, get_parsed_file, load_directory_module, load_module,
-    load_module_from_directory, load_module_with_diagnostics,
+    LoadedModule, ModuleLoadError, derive_module_name, get_parsed_file, load_directory_module,
+    load_module, load_module_from_directory, load_module_with_diagnostics,
     load_module_with_diagnostics_and_schemas,
 };
 pub(crate) use resolver::{
@@ -46,12 +48,13 @@ pub(crate) use resolver::{
     resolve_upstream_modules_with_providerless_config,
 };
 pub use resolver::{
-    ConstraintScopeReport, ModuleCallConstraintReport, ModuleCallConstraintReports,
-    ModuleResolutionDiagnosticResult, ResidualModuleResolutionDiagnostic,
-    ResidualModuleResolutionError, ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
+    ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
+    ResidualModuleResolutionDiagnostic, ResidualModuleResolutionError,
+    ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, ensure_expanded_root_graph, prepare_root_export_validation,
     resolve_module_template_with_config, resolve_module_template_with_providerless_config,
-    resolve_modules_providerless, resolve_modules_with_config, resolve_modules_with_diagnostics,
+    resolve_modules_providerless, resolve_modules_with_all_import_diagnostics_and_overrides,
+    resolve_modules_with_config, resolve_modules_with_diagnostics,
     resolve_modules_with_diagnostics_and_overrides, resolve_modules_with_providerless_config,
     resolve_modules_with_providerless_diagnostics,
 };
@@ -60,12 +63,12 @@ pub use signature::{
     load_resolved_module_signatures_with_overrides,
 };
 pub use validation::{
-    ConstraintDiagnostic, ConstraintEvaluation, ConstraintOrigin, ConstraintScopeOwner,
-    DirectoryConstraintDiagnostic, EvaluatedModuleConstraint, ModuleConstraintCall,
+    ConstraintEvaluation, ConstraintOrigin, EvaluatedModuleConstraint, ModuleConstraintCall,
     ModuleConstraintDiagnostic, ModuleConstraintFailure, ModuleConstraintKind,
     ModuleConstraintResolutionError, ModuleConstraintViolation, ModuleConstraints,
-    evaluate_constraint, evaluate_live_pending_constraints, evaluate_module_constraints,
-    evaluate_saved_pending_constraints, referenced_constraint_arguments,
+    RequireOutsideModuleDiagnostic, evaluate_constraint, evaluate_live_pending_constraints,
+    evaluate_module_constraints, evaluate_saved_pending_constraints,
+    referenced_constraint_arguments,
 };
 
 // Bring `pub(super)` helpers into mod.rs scope so the `tests` submodule (which

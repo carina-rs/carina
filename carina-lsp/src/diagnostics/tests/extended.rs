@@ -1591,9 +1591,7 @@ fn backend_schema_is_not_reported_for_a_module_definition() {
         .collect();
     assert_eq!(
         module_messages,
-        vec![
-            "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
-        ],
+        vec!["Unknown attribute 'typo' for backend type 's3'"],
         "module diagnostics: {module_diagnostics:#?}"
     );
 
@@ -1663,6 +1661,73 @@ fn failed_backend_user_function_does_not_emit_a_schema_type_mismatch() {
         "diagnostics: {diagnostics:#?}"
     );
     assert_backend_typo_is_diagnosed(sibling_source, backend_source);
+}
+
+#[test]
+fn failed_backend_builtins_are_not_admitted_from_recovery() {
+    let source = "backend s3 {\n  bucket = cidr_subnet('bad', 8, 1)\n  key = cidr_subnet('bad', 8, 1)\n  encrypt = 'yes'\n}\n";
+    let diagnostics =
+        backend_directory_diagnostics_with_sibling("let ordinary = 'value'\n", source);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("backend type 's3'"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            "Invalid attribute 'encrypt' for backend type 's3': Type mismatch: expected Bool, got String"
+        ],
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn failed_backend_interpolation_is_not_admitted_from_recovery() {
+    let source =
+        "backend s3 {\n  bucket = \"${cidr_subnet('bad', 8, 1)}\"\n  key = 'state.json'\n}\n";
+    let diagnostics =
+        backend_directory_diagnostics_with_sibling("let ordinary = 'value'\n", source);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("Invalid attribute 'bucket'")),
+        "{diagnostics:#?}"
+    );
+    assert_backend_typo_is_diagnosed("let ordinary = 'value'\n", source);
+}
+
+#[test]
+fn failed_backend_sibling_let_is_not_admitted_from_recovery() {
+    let sibling = "let b = cidr_subnet('bad', 8, 1)\n";
+    let source = "backend s3 {\n  bucket = b\n  key = 'state.json'\n}\n";
+    let diagnostics = backend_directory_diagnostics_with_sibling(sibling, source);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.message.contains("Invalid attribute 'bucket'")),
+        "{diagnostics:#?}"
+    );
+    assert_backend_typo_is_diagnosed(sibling, source);
+}
+
+#[test]
+fn failed_backend_builtin_keeps_independent_schema_errors() {
+    let source = "backend s3 {\n  bucket = cidr_subnet('bad', 8, 1)\n  key = 'state.json'\n  encrypt = 'yes'\n  typo = true\n}\n";
+    let diagnostics = backend_directory_diagnostics(source);
+    let messages: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("backend type 's3'"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            "Invalid attribute 'encrypt' for backend type 's3': Type mismatch: expected Bool, got String",
+            "Unknown attribute 'typo' for backend type 's3'",
+        ],
+        "diagnostics: {diagnostics:#?}"
+    );
 }
 
 #[test]
@@ -2953,8 +3018,8 @@ awscc.iam.role {
     assert!(
         diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("has no loaded schema")),
-        "the existing missing-schema diagnostic must still fire: {diagnostics:#?}"
+            .all(|diagnostic| !diagnostic.message.contains("has no loaded schema")),
+        "provider availability stays provisional without a directory: {diagnostics:#?}"
     );
     assert!(
         diagnostics.iter().all(|diagnostic| !diagnostic
@@ -4662,14 +4727,28 @@ awscc.ec2.Vpc {
             .contains("provider blocks are not allowed inside modules")
     });
     assert!(
-        provider_diag.is_some(),
-        "Should error about provider block in module. Got diagnostics: {:?}",
-        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        provider_diag.is_none(),
+        "the authored provider makes this buffer a root: {diagnostics:#?}"
     );
-    let diag = provider_diag.unwrap();
-    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(diag.range.start.line, 4);
-    assert_eq!(diag.range.start.character, 0);
+    let arguments_diag = diagnostics.iter().find(|d| d.message == "arguments blocks are only valid inside module definitions, not in root configurations.").expect("authored buffer root evidence enables placement checks");
+    assert_eq!(arguments_diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        arguments_diag.range.start,
+        tower_lsp::lsp_types::Position::new(0, 0)
+    );
+    let related = arguments_diag.related_information.as_ref().unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].message,
+        "This provider block makes the directory a root configuration."
+    );
+    assert_eq!(
+        related[0].location.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(4, 0),
+            tower_lsp::lsp_types::Position::new(4, 14)
+        )
+    );
 }
 
 #[test]
@@ -4700,18 +4779,20 @@ fn provider_in_module_with_sibling_arguments_emits_error() {
             .message
             .contains("provider blocks are not allowed inside modules")
     });
-    assert!(
-        provider_diag.is_some(),
-        "Should error when a sibling file marks the directory as a module. Got: {:?}",
-        diagnostics
-            .iter()
-            .map(|diagnostic| &diagnostic.message)
-            .collect::<Vec<_>>()
+    assert!(provider_diag.is_none(), "{diagnostics:#?}");
+    let arguments_path = base.join("arguments.crn");
+    let args = std::fs::read_to_string(&arguments_path).unwrap();
+    let args_diagnostics = engine.analyze(
+        &create_document_at(&args, arguments_path.clone()),
+        Some(&arguments_path),
     );
-    let diag = provider_diag.unwrap();
-    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(diag.range.start.line, 0);
-    assert_eq!(diag.range.start.character, 0);
+    let root = args_diagnostics.iter().find(|d| d.message == "arguments blocks are only valid inside module definitions, not in root configurations.").expect("the #3717 directory is a root because of its provider sibling");
+    assert_eq!(root.range.start, tower_lsp::lsp_types::Position::new(0, 0));
+    let related = root.related_information.as_ref().unwrap();
+    assert_eq!(
+        related[0].location.uri,
+        tower_lsp::lsp_types::Url::from_file_path(base.join("providers.crn")).unwrap()
+    );
 }
 
 #[test]
@@ -4791,17 +4872,9 @@ moved {
             .contains("state blocks (moved, removed, and import) are not allowed inside modules")
     });
     assert!(
-        state_block_diag.is_some(),
-        "Should error about a moved block in a module. Got diagnostics: {:?}",
-        diagnostics
-            .iter()
-            .map(|diagnostic| &diagnostic.message)
-            .collect::<Vec<_>>()
+        state_block_diag.is_none(),
+        "an unclassified buffer has no placement verdict: {diagnostics:#?}"
     );
-    let diag = state_block_diag.unwrap();
-    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(diag.range.start.line, 4);
-    assert_eq!(diag.range.start.character, 0);
 }
 
 #[test]
@@ -4966,7 +5039,7 @@ let up = upstream_state { source = './b' }
 
     assert_eq!(
         upstream_state_lines,
-        vec![4],
+        Vec::<u32>::new(),
         "the discarded declaration must not hide or receive the real module violation: {diagnostics:#?}",
     );
 }
@@ -4993,13 +5066,22 @@ backend local {
         d.message
             .contains("arguments blocks are only valid inside module definitions")
     });
-    assert!(
-        arguments_diag.is_some(),
-        "Should error about arguments block in root config. Got diagnostics: {:?}",
-        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    let arguments_diag =
+        arguments_diag.expect("an authored backend decides Root even without directory context");
+    assert_eq!(arguments_diag.severity, Some(DiagnosticSeverity::ERROR));
+    let related = arguments_diag.related_information.as_ref().unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].message,
+        "This backend block makes the directory a root configuration."
     );
-    let diag = arguments_diag.unwrap();
-    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        related[0].location.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(4, 0),
+            tower_lsp::lsp_types::Position::new(4, 7)
+        )
+    );
 }
 
 #[test]
@@ -6073,17 +6155,8 @@ fn error_when_provider_has_no_loaded_schema_for_file_configuration() {
         .iter()
         .find(|diagnostic| diagnostic.message == expected);
     assert!(
-        unavailable.is_some(),
-        "a provider absent from this file's loaded configuration should be distinguished from an unknown resource type. Got: {:?}",
-        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        unavailable.unwrap().severity,
-        Some(DiagnosticSeverity::ERROR)
-    );
-    assert!(
-        !unavailable.unwrap().message.contains("carina init"),
-        "a missing-schema diagnostic must not suggest initialization"
+        unavailable.is_none(),
+        "the buffer has no complete directory provider inventory: {diagnostics:#?}"
     );
 
     // And the old generic message should no longer fire for this case.
@@ -8775,10 +8848,8 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                 provider_context,
                 |session| {
                     carina_core::module_resolver::resolve_modules_with_diagnostics(
-                        &resolver_input,
+                        resolver_input.clone().admit(&engine.schemas, session),
                         &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                        session,
-                        &engine.schemas,
                         &[],
                     )
                 },
@@ -8789,10 +8860,8 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                 provider_context,
                 |session| {
                     carina_core::module_resolver::resolve_modules_with_providerless_diagnostics(
-                        &resolver_input,
+                        resolver_input.clone().admit(&engine.schemas, session),
                         &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
-                        session,
-                        &engine.schemas,
                         &[],
                     )
                 },
@@ -18308,4 +18377,312 @@ fn issue_4304_3a_cleanup_expanded_provider_locations_use_identity_across_files()
         );
         assert_eq!(diagnostics[0].range.start.line, 1);
     }
+}
+
+#[test]
+fn backend_schema_is_not_reported_for_a_module_definition_in_directory() {
+    let backend = "backend s3 {\n  bucket = \"state\"\n  key = \"state.json\"\n  typo = true\n}\n";
+    let fixture = tempfile::tempdir().unwrap();
+    let module = fixture.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(module.join("main.crn"), "arguments { name: String }\n").unwrap();
+    std::fs::write(module.join("backend.crn"), backend).unwrap();
+    let source =
+        "let component = use { source = './module' }\nlet call = component { name = 'test' }\n";
+    let path = fixture.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let module_diagnostics =
+        test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    let module_messages: Vec<_> = module_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .filter(|message| {
+            message.contains("backend blocks are not allowed inside modules")
+                || message.contains("Unknown attribute 'typo'")
+        })
+        .collect();
+    assert_eq!(
+        module_messages,
+        vec![
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
+        ],
+        "module diagnostics: {module_diagnostics:#?}"
+    );
+
+    let root_diagnostics = backend_directory_diagnostics(backend);
+    let root_messages: Vec<_> = root_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .filter(|message| {
+            message.contains("backend blocks are not allowed inside modules")
+                || message.contains("Unknown attribute 'typo'")
+        })
+        .collect();
+    assert_eq!(
+        root_messages,
+        vec!["Unknown attribute 'typo' for backend type 's3'"],
+        "root diagnostics: {root_diagnostics:#?}"
+    );
+}
+
+#[test]
+fn provider_in_module_emits_error_in_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("child")).unwrap();
+    std::fs::write(
+        tmp.path().join("child/main.crn"),
+        "arguments { vpc_cidr: String }\nprovider awscc { region = awscc.Region.ap_northeast_1 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("imports.crn"),
+        "let child = use { source = './child' }\n",
+    )
+    .unwrap();
+    let source = "// Providers are inherited from a module's caller.\n// This imported directory incorrectly declares its own.\n// Supply the argument at an anonymous call.\n// The diagnostic belongs to that call's header.\nchild { vpc_cidr = '10.0.0.0/16' }\n";
+    let path = tmp.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let engine = test_engine();
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+
+    let provider_diag = diagnostics.iter().find(|d| {
+        d.message
+            .contains("provider blocks are not allowed inside modules")
+    });
+    assert!(
+        provider_diag.is_some(),
+        "Should error about provider block in module. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let diag = provider_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diag.range.start.line, 4);
+    assert_eq!(diag.range.start.character, 0);
+}
+
+#[test]
+fn provider_in_module_with_sibling_arguments_emits_error_in_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().to_path_buf();
+    std::fs::create_dir(base.join("child")).unwrap();
+    std::fs::write(
+        base.join("child/arguments.crn"),
+        "arguments { name: String = 'test' }\n",
+    )
+    .unwrap();
+    std::fs::write(base.join("child/providers.crn"), "provider mock {}\n").unwrap();
+    std::fs::write(
+        base.join("imports.crn"),
+        "let child = use { source = './child' }\n",
+    )
+    .unwrap();
+    let source = "child {}\n";
+    let path = base.join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let engine = test_engine();
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+
+    let provider_diag = diagnostics.iter().find(|diagnostic| {
+        diagnostic
+            .message
+            .contains("provider blocks are not allowed inside modules")
+    });
+    assert!(
+        provider_diag.is_some(),
+        "Should error when a sibling file marks the directory as a module. Got: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    let diag = provider_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diag.range.start.line, 0);
+    assert_eq!(diag.range.start.character, 0);
+}
+
+#[test]
+fn moved_block_in_module_emits_error_in_directory() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"arguments {
+    name: String = "test"
+}
+
+moved {
+    from = mock.test.Resource 'old'
+    to = mock.test.Resource 'new'
+}"#,
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = doc.text();
+    std::fs::write(&path, &source).unwrap();
+    let doc = create_document_at(&source, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
+
+    let state_block_diag = diagnostics.iter().find(|diagnostic| {
+        diagnostic
+            .message
+            .contains("state blocks (moved, removed, and import) are not allowed inside modules")
+    });
+    assert!(
+        state_block_diag.is_some(),
+        "Should error about a moved block in a module. Got diagnostics: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
+    );
+    let diag = state_block_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diag.range.start.line, 4);
+    assert_eq!(diag.range.start.character, 0);
+}
+
+#[test]
+fn discarded_upstream_state_does_not_suppress_real_module_diagnostic_in_directory() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"let _ = upstream_state { source = './a' }
+arguments {
+    n: String = "x"
+}
+let up = upstream_state { source = './b' }
+"#,
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = doc.text();
+    std::fs::write(&path, &source).unwrap();
+    let doc = create_document_at(&source, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
+    let upstream_state_lines: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .message
+                .contains("upstream_state declarations are not allowed inside modules")
+        })
+        .map(|diagnostic| diagnostic.range.start.line)
+        .collect();
+
+    assert_eq!(
+        upstream_state_lines,
+        vec![4],
+        "the discarded declaration must not hide or receive the real module violation: {diagnostics:#?}",
+    );
+}
+
+#[test]
+fn arguments_with_backend_emits_error_in_directory() {
+    // Issue #2198. `arguments` is a module-input declaration. A `backend`
+    // block is root-only, so the combination is unambiguously a misplaced
+    // `arguments` block in a root configuration.
+    let engine = test_engine();
+    let doc = create_document(
+        r#"arguments {
+    state_path: String = "state.json"
+}
+
+backend local {
+    path = arguments.state_path
+}"#,
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = doc.text();
+    std::fs::write(&path, &source).unwrap();
+    let doc = create_document_at(&source, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
+
+    let arguments_diag = diagnostics.iter().find(|d| {
+        d.message
+            .contains("arguments blocks are only valid inside module definitions")
+    });
+    assert!(
+        arguments_diag.is_some(),
+        "Should error about arguments block in root config. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let diag = arguments_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn error_when_provider_has_no_loaded_schema_for_file_configuration_in_directory() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"awscc.iam.role {
+  role_name = 'test'
+}
+"#,
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    let source = doc.text();
+    std::fs::write(&path, &source).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+
+    let expected = "Provider 'awscc' has no loaded schema for this file: no provider block for it was found in this file's configuration.";
+    let unavailable = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message == expected);
+    assert!(
+        unavailable.is_some(),
+        "a provider absent from this file's loaded configuration should be distinguished from an unknown resource type. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        unavailable.unwrap().severity,
+        Some(DiagnosticSeverity::ERROR)
+    );
+    assert!(
+        !unavailable.unwrap().message.contains("carina init"),
+        "a missing-schema diagnostic must not suggest initialization"
+    );
+
+    // And the old generic message should no longer fire for this case.
+    let generic_unknown = diagnostics
+        .iter()
+        .find(|d| d.message == "Unknown resource type: awscc.iam.role");
+    assert!(
+        generic_unknown.is_none(),
+        "Should not emit generic 'Unknown resource type' when the provider is absent from the file's loaded configuration. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn missing_provider_schema_suppresses_attribute_derived_identity_conflict_in_directory() {
+    let engine = test_engine();
+    let source = r#"awscc.iam.role {
+  role_name = "one"
+}
+
+awscc.iam.role {
+  role_name = "two"
+}
+"#;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("has no loaded schema")),
+        "the existing missing-schema diagnostic must still fire: {diagnostics:#?}"
+    );
+    assert!(
+        diagnostics.iter().all(|diagnostic| !diagnostic
+            .message
+            .contains("identity is derived from mutable attributes")),
+        "a missing schema must not also produce the identity-basis diagnostic: {diagnostics:#?}"
+    );
 }

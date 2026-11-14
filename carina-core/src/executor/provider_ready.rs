@@ -2841,7 +2841,8 @@ mod provider_config_tests {
                 &provider_context,
                 |session| {
                     crate::module_resolver::resolve_modules_with_providerless_config(
-                        parsed, &path, session, &schemas,
+                        parsed.admit(&schemas, session),
+                        &path,
                     )
                 },
             )

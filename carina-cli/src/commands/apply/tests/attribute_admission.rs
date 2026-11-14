@@ -161,6 +161,7 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
                 source_dir: fixture.config_path(),
             },
             &source,
+            &[],
             fixture.cancel_token(),
             &fixture.observer_factory(),
             NonZeroUsize::new(1).unwrap(),
