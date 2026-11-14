@@ -72,13 +72,10 @@ fn select_admission_inputs<'r, 'a>(
         .authored_instance_key()
         .and_then(|key| authored_resources?.get(&key).copied());
     match authored.and_then(|source| {
-        ResourceAttributeInputs::from_resolved(source, values, report)
-            .inspect_err(|_| {
-                #[cfg(feature = "test-utils")]
-                replay_coverage::resolved_inputs_fell_back();
-            })
-            .ok()
-            .map(|inputs| (source, inputs))
+        let resolved = ResourceAttributeInputs::from_resolved(source, values, report);
+        #[cfg(feature = "test-utils")]
+        let resolved = resolved.inspect_err(|_| replay_coverage::resolved_inputs_fell_back());
+        resolved.ok().map(|inputs| (source, inputs))
     }) {
         Some(authored) => authored,
         // Main checks the expanded owner against its resolved values. Only

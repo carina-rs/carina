@@ -1,5 +1,31 @@
 use super::*;
 
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "admission must pair a slot with its own projection proof")]
+fn mismatched_slot_and_proof_panics_at_admission_boundary() {
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let schemas = SchemaRegistry::new();
+    let parsed = crate::parser::parse_and_resolve(
+        "let first = mock.Test { input = 'same' }\nlet second = mock.Test { input = 'same' }",
+    )
+    .unwrap();
+    let configuration =
+        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let resources = &configuration.judged().file().resources;
+    let first = resources[0].authored_slots.get("input").unwrap();
+    let second = resources[1].authored_slots.get("input").unwrap();
+    with_session_for_test(&catalog, |session| {
+        let proof = second
+            .projection()
+            .unwrap()
+            .knowledge(&KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        let _ = Candidate::validation_slot(first, proof, None, session);
+    });
+}
+
 #[test]
 fn round1_seam_materialization_reports_unmatched_attribute_names() {
     let parsed = crate::parser::parse_and_resolve("mock.Test { input = 'value' }").unwrap();

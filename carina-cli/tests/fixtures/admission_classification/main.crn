@@ -3,5 +3,5 @@ let child = choice {}
 let direct = mock.test.resource { name = 7 }
 let composed = mock.test.resource { name = child.output computed = 9 }
 let evaluated = mock.test.resource { name = upper("evaluated") }
-let generated = mock.test.resource { name_prefix = "generated-" }
 let protected = mock.test.resource { name = "protected" tags = { private = secret("fixture-secret") } }
+mock.test.resource { name = child.fallback_name }

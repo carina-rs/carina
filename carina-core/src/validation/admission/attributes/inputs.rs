@@ -325,22 +325,17 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         }
     }
 
-    pub(in crate::validation::admission) fn values(
-        &self,
-    ) -> impl Iterator<Item = (&str, &Value<ParserPlaceholder, B>)> {
+    fn values(&self) -> impl Iterator<Item = (&str, &Value<ParserPlaceholder, B>)> {
         self.inputs
             .iter()
             .map(|(name, input)| (name.as_str(), input.value()))
     }
 
-    pub(in crate::validation::admission) fn value(
-        &self,
-        name: &str,
-    ) -> Option<&Value<ParserPlaceholder, B>> {
+    fn value(&self, name: &str) -> Option<&Value<ParserPlaceholder, B>> {
         self.inputs.get(name).map(StoredInput::value)
     }
 
-    pub(in crate::validation::admission) fn classify<'a, S: ClassificationStage>(
+    fn classify<'a, S: ClassificationStage>(
         &'a self,
         context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
         failed: impl FnMut(&str, KnowledgeError<B>),
@@ -354,7 +349,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 
     /// Return a shared owner with the classifications borrowing its new values.
     /// Unchanged values keep their allocations and their existing proofs.
-    pub(in crate::validation::admission) fn materialize_and_classify<'a, S: ClassificationStage>(
+    fn materialize_and_classify<'a, S: ClassificationStage>(
         &'a mut self,
         values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
@@ -494,30 +489,24 @@ type ValidationDispatch<B> = for<'v> fn(
 ) -> Option<Value<ParserPlaceholder, B>>;
 
 /// Fixed evaluation policies for validation. Each mode uses admission's session.
+#[expect(
+    private_interfaces,
+    reason = "Only typed constructors may supply an evaluation payload"
+)]
 pub enum ValidationEvaluation<B: BindingAddress> {
     None,
-    Expanded(ExpandedEvaluation<B>),
-    RelativeStatic(RelativeStaticEvaluation<B>),
+    Expanded(EvaluationDispatch<B>),
+    RelativeStatic(EvaluationDispatch<B>),
 }
 
-/// Opaque dispatch for the absolute, expanded validation phase.
-pub struct ExpandedEvaluation<B: BindingAddress> {
+// The binding type selects the evaluator. Keeping the shared payload private
+// prevents callers from constructing or relabeling evaluation modes.
+struct EvaluationDispatch<B: BindingAddress> {
     dispatch: ValidationDispatch<B>,
 }
 
-/// Opaque dispatch for relative, static validation.
-pub struct RelativeStaticEvaluation<B: BindingAddress> {
-    dispatch: ValidationDispatch<B>,
-}
-
-impl<B: BindingAddress> Copy for ExpandedEvaluation<B> {}
-impl<B: BindingAddress> Clone for ExpandedEvaluation<B> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<B: BindingAddress> Copy for RelativeStaticEvaluation<B> {}
-impl<B: BindingAddress> Clone for RelativeStaticEvaluation<B> {
+impl<B: BindingAddress> Copy for EvaluationDispatch<B> {}
+impl<B: BindingAddress> Clone for EvaluationDispatch<B> {
     fn clone(&self) -> Self {
         *self
     }
@@ -531,7 +520,7 @@ impl<B: BindingAddress> Clone for ValidationEvaluation<B> {
 
 impl ValidationEvaluation<crate::resource::AbsoluteBindingAddress> {
     pub fn expanded() -> Self {
-        Self::Expanded(ExpandedEvaluation {
+        Self::Expanded(EvaluationDispatch {
             dispatch: crate::parser::evaluate_expanded_value_for_validation,
         })
     }
@@ -539,7 +528,7 @@ impl ValidationEvaluation<crate::resource::AbsoluteBindingAddress> {
 
 impl ValidationEvaluation<crate::resource::RelativeBindingName> {
     pub fn relative_static() -> Self {
-        Self::RelativeStatic(RelativeStaticEvaluation {
+        Self::RelativeStatic(EvaluationDispatch {
             dispatch: |proof, session| {
                 if matches!(proof, Classification::Known(_)) {
                     return None;
@@ -587,8 +576,9 @@ pub(super) fn with_classified_inputs<B: BindingAddress, R>(
     classification_tests::collect_injected_errors(&classified, &mut failed);
     let dispatch = match evaluation {
         ValidationEvaluation::None => return (judge(inputs, &classified), diagnostics),
-        ValidationEvaluation::Expanded(mode) => mode.dispatch,
-        ValidationEvaluation::RelativeStatic(mode) => mode.dispatch,
+        ValidationEvaluation::Expanded(mode) | ValidationEvaluation::RelativeStatic(mode) => {
+            mode.dispatch
+        }
     };
     let evaluated = classified
         .iter()

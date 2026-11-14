@@ -7,9 +7,8 @@ use crate::schema::{LeafPathSegment, SchemaKind, SchemaRegistry};
 mod inputs;
 use inputs::{AttributeInput, with_classified_inputs};
 pub use inputs::{
-    ClassificationDiagnostics, ExpandedEvaluation, RelativeStaticEvaluation,
-    ResourceAdmissionOutcome, ResourceAttributeInputs, ValidationEvaluation,
-    classification_preflight,
+    ClassificationDiagnostics, ResourceAdmissionOutcome, ResourceAttributeInputs,
+    ValidationEvaluation, classification_preflight,
 };
 
 /// A catalog descriptor requires a registered schema owner.
@@ -573,53 +572,7 @@ pub fn uses_resource_attribute_admission(kind: crate::parser::AnalysisItemKind) 
 }
 
 /// Admit every analysis item using the same destination-kind policy.
-///
-/// Classifications cannot be supplied independently of the consumed inputs.
-///
-/// ```compile_fail,E0308
-/// use carina_core::{binding_index::BindingIndex, parser::{AnalysisResourceRef, ParsedFile},
-///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
-///     schema::{OwnerBoundResourceSchema, SchemaRegistry}, validation::admission::{WalkCoverage,
-///         attributes::{ResourceAttributeInputs, resource_attribute_admissions}},
-///     validation::deferred_types::ProviderTypeCheckContext};
-/// fn old_call(resource: &AnalysisResourceRef<'_>, parsed: &ParsedFile,
-///     schema: OwnerBoundResourceSchema<'_>, classifications: &indexmap::IndexMap<String,
-///         Classification<'_, ParserPlaceholder, RelativeBindingName>>,
-///     quoted: &std::collections::HashSet<String>, inputs: &ResourceAttributeInputs<RelativeBindingName>,
-///     bindings: &BindingIndex<'_, RelativeBindingName>, session: &dyn ProviderTypeCheckContext,
-///     schemas: &SchemaRegistry, coverage: &mut WalkCoverage) {
-///     resource_attribute_admissions(resource, parsed, schema, classifications,
-///         quoted, inputs, bindings, session, schemas, coverage);
-/// }
-/// ```
-///
-/// A slot's classification and cursor are paired inside admission.
-///
-/// ```
-/// use carina_core::{binding_index::BindingIndex, parser::retained::JudgedSlot,
-///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
-///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
-/// fn paired<'a>(slot: &'a JudgedSlot<RelativeBindingName>,
-///     proof: Classification<'a, ParserPlaceholder, RelativeBindingName>,
-///     bindings: Option<&'a BindingIndex<'a, RelativeBindingName>>,
-///     provider: &'a dyn ProviderTypeCheckContext) {
-///     let _: Option<Candidate<ParserPlaceholder, RelativeBindingName>> = None;
-///     let _ = (slot, proof, bindings, provider);
-/// }
-/// ```
-///
-/// ```compile_fail,E0624
-/// use carina_core::{binding_index::BindingIndex, parser::retained::JudgedSlot,
-///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
-///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
-/// fn paired<'a>(slot: &'a JudgedSlot<RelativeBindingName>,
-///     proof: Classification<'a, ParserPlaceholder, RelativeBindingName>,
-///     bindings: Option<&'a BindingIndex<'a, RelativeBindingName>>,
-///     provider: &'a dyn ProviderTypeCheckContext) {
-///     let _: Option<Candidate<ParserPlaceholder, RelativeBindingName>> = None;
-///     let _ = Candidate::validation_slot(slot, proof, bindings, provider);
-/// }
-/// ```
+/// Classifications are built from the consumed inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn resource_attribute_admissions<
     B: BindingAddress,
@@ -1042,6 +995,72 @@ fn typed_resource_attribute_admissions<
         input,
     )
 }
+
+#[cfg(doctest)]
+/// The paired examples differ only in the argument supplied as the product.
+///
+/// ```
+/// use carina_core::{binding_index::BindingIndex, parser::{AnalysisResourceRef, ParsedFile},
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     schema::{OwnerBoundResourceSchema, SchemaRegistry}, validation::admission::{WalkCoverage,
+///         attributes::{ResourceAttributeInputs, ValidationEvaluation, resource_attribute_admissions}},
+///     validation::deferred_types::ProviderTypeCheckContext};
+/// fn caller(resource: &AnalysisResourceRef<'_>, parsed: &ParsedFile,
+///     schema: OwnerBoundResourceSchema<'_>, classifications: &indexmap::IndexMap<String,
+///         Classification<'_, ParserPlaceholder, RelativeBindingName>>,
+///     quoted: &std::collections::HashSet<String>, inputs: ResourceAttributeInputs<RelativeBindingName>,
+///     evaluation: ValidationEvaluation<RelativeBindingName>, bindings: &BindingIndex<'_, RelativeBindingName>,
+///     session: &dyn ProviderTypeCheckContext, schemas: &SchemaRegistry, coverage: &mut WalkCoverage) {
+///     let _ = resource_attribute_admissions(resource, parsed, schema, quoted,
+///         inputs, evaluation, bindings, session, schemas, coverage);
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::{binding_index::BindingIndex, parser::{AnalysisResourceRef, ParsedFile},
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     schema::{OwnerBoundResourceSchema, SchemaRegistry}, validation::admission::{WalkCoverage,
+///         attributes::{ResourceAttributeInputs, ValidationEvaluation, resource_attribute_admissions}},
+///     validation::deferred_types::ProviderTypeCheckContext};
+/// fn caller(resource: &AnalysisResourceRef<'_>, parsed: &ParsedFile,
+///     schema: OwnerBoundResourceSchema<'_>, classifications: &indexmap::IndexMap<String,
+///         Classification<'_, ParserPlaceholder, RelativeBindingName>>,
+///     quoted: &std::collections::HashSet<String>, inputs: ResourceAttributeInputs<RelativeBindingName>,
+///     evaluation: ValidationEvaluation<RelativeBindingName>, bindings: &BindingIndex<'_, RelativeBindingName>,
+///     session: &dyn ProviderTypeCheckContext, schemas: &SchemaRegistry, coverage: &mut WalkCoverage) {
+///     let _ = resource_attribute_admissions(resource, parsed, schema, quoted,
+///         classifications, evaluation, bindings, session, schemas, coverage);
+/// }
+/// ```
+///
+/// A slot's classification and cursor are paired inside admission.
+///
+/// ```
+/// use carina_core::{binding_index::BindingIndex, parser::retained::JudgedSlot,
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(slot: &'a JudgedSlot<RelativeBindingName>,
+///     proof: Classification<'a, ParserPlaceholder, RelativeBindingName>,
+///     bindings: Option<&'a BindingIndex<'a, RelativeBindingName>>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate<ParserPlaceholder, RelativeBindingName>> = None;
+///     let _ = (slot, proof, bindings, provider);
+/// }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::{binding_index::BindingIndex, parser::retained::JudgedSlot,
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(slot: &'a JudgedSlot<RelativeBindingName>,
+///     proof: Classification<'a, ParserPlaceholder, RelativeBindingName>,
+///     bindings: Option<&'a BindingIndex<'a, RelativeBindingName>>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate<ParserPlaceholder, RelativeBindingName>> = None;
+///     let _ = Candidate::validation_slot(slot, proof, bindings, provider);
+/// }
+/// ```
+fn resource_attribute_admission_api_pins() {}
 
 #[cfg(test)]
 mod review_tests {
