@@ -224,7 +224,13 @@ with HTTP 201. S3's `If-Match` fails when the object has been deleted.
 Carina verifies that an acknowledged mutation's commit remains on the branch
 with one compare request. A later commit on the same history is accepted;
 a competing history is an unexpected outcome. This check does not prevent
-later changes to the branch or file.
+later changes to the branch or file. Only the comparison's status and ahead/
+behind counts are parsed. Compare responses have their own **1 MiB** body
+limit, separate from the state size limit. If that limit is exceeded, Carina
+reports that the write was committed but could not be verified; it retains
+the acknowledged state SHA for the next save. A November 15, 2026 measurement
+across six commits adding 0.9–20 MB files returned 32,493 bytes: GitHub omitted
+their large patches, though smaller text diffs do include patches.
 
 When a renewal of an existing lease returns 201, Carina reports that the lock
 is no longer held and attempts to delete the recreated lease using its returned
@@ -240,10 +246,20 @@ between the ownership check and the state PUT. Removal of a recreated lease
 can also fail or race with another client, and does not undo a successor's
 work during that window.
 
-If the mutation response is lost, its 201/200 status and commit parent are
-also lost. Recovery by matching the exact requested bytes can establish the
-intended content, but cannot establish whether that PUT recreated a deleted
-path. This remaining deletion window is not equivalent to S3's `If-Match`.
+If a mutation times out, Carina returns the deadline error and remembers the
+uncertain write in memory. The next mutation in the same process resolves it
+with one Contents metadata read: a blob SHA matching the exact sent bytes is
+currently treated as our write, the prior SHA means it did not commit, and a
+different SHA is a conflict. An acquisition or renewal recovered this way
+recognizes its own lock UUID. Other lost replies can also be recovered within
+the original deadline. For a release or force-unlock with a lost reply, an
+absent lease or a different lock UUID confirms release and preserves any
+successor's lease.
+
+A lost mutation response also loses its 201/200 status and commit parent.
+Matching bytes cannot establish whether that PUT recreated a deleted path.
+The matching-bytes recovery policy remains under review; this deletion window
+is not equivalent to S3's `If-Match`.
 
 ### State history is kept
 

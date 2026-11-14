@@ -1,4 +1,4 @@
-use super::{GitHubError, GitHubRequest, GitHubResponse, GitHubTransport, MAX_BYTES, Method};
+use super::{BodyLimit, GitHubError, GitHubRequest, GitHubResponse, GitHubTransport, Method};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use std::collections::BTreeMap;
@@ -90,14 +90,9 @@ impl ReqwestTransport {
     }
 }
 
-pub(super) fn append_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), GitHubError> {
+fn append_chunk(body: &mut Vec<u8>, chunk: &[u8], limit: BodyLimit) -> Result<(), GitHubError> {
     let size = body.len().saturating_add(chunk.len());
-    if size > MAX_BYTES {
-        return Err(GitHubError::TooLarge {
-            size,
-            cap: MAX_BYTES,
-        });
-    }
+    limit.check(size)?;
     body.extend_from_slice(chunk);
     Ok(())
 }
@@ -110,6 +105,7 @@ impl GitHubTransport for ReqwestTransport {
         deadline: Instant,
     ) -> Result<GitHubResponse, GitHubError> {
         let method = request.method;
+        let limit = request.body_limit();
         let mut response = self
             .request(request, deadline)
             .send()
@@ -145,17 +141,12 @@ impl GitHubTransport for ReqwestTransport {
                 );
             }
         }
-        if let Some(size) = response.content_length()
-            && size > MAX_BYTES as u64
-        {
-            return Err(GitHubError::TooLarge {
-                size: usize::try_from(size).unwrap_or(usize::MAX),
-                cap: MAX_BYTES,
-            });
+        if let Some(size) = response.content_length() {
+            limit.check(usize::try_from(size).unwrap_or(usize::MAX))?;
         }
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
-            append_chunk(&mut body, &chunk)?;
+            append_chunk(&mut body, &chunk, limit)?;
         }
         body = self.response_body(method, status, body);
         Ok(GitHubResponse {
@@ -182,6 +173,7 @@ fn transport_error(error: reqwest::Error) -> GitHubError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::MAX_BYTES;
     use super::*;
 
     #[test]
@@ -252,12 +244,41 @@ mod tests {
 
     #[test]
     fn github_transport_stream_cap_stops_before_appending_overflow() {
-        let mut bytes = vec![0; MAX_BYTES - 1];
-        append_chunk(&mut bytes, &[0]).unwrap();
-        assert!(
-            matches!(append_chunk(&mut bytes,&[1]),Err(GitHubError::TooLarge {size,cap:MAX_BYTES}) if size==MAX_BYTES+1)
-        );
-        assert_eq!(bytes.len(), MAX_BYTES);
+        for limit in [BodyLimit::Contents, BodyLimit::Compare] {
+            let mut bytes = vec![0; limit.cap() - 1];
+            append_chunk(&mut bytes, &[0], limit).unwrap();
+            let error = append_chunk(&mut bytes, &[1], limit).unwrap_err();
+            match limit {
+                BodyLimit::Contents => assert!(
+                    matches!(error, GitHubError::TooLarge { size, cap: MAX_BYTES } if size == MAX_BYTES + 1)
+                ),
+                BodyLimit::Compare => assert!(
+                    matches!(error, GitHubError::CompareTooLarge { size, cap: super::super::MAX_COMPARE_BYTES } if size == super::super::MAX_COMPARE_BYTES + 1)
+                ),
+            }
+            assert_eq!(bytes.len(), limit.cap());
+        }
+    }
+
+    #[test]
+    fn github_round3_compare_limit_applies_only_to_the_compare_endpoint() {
+        for (path, cap) in [
+            (
+                "/repos/owner/repo/compare/sha...branch",
+                super::super::MAX_COMPARE_BYTES,
+            ),
+            ("/repos/owner/repo/contents/compare/state.json", MAX_BYTES),
+            ("/repos/owner/repo/contents/state.json", MAX_BYTES),
+        ] {
+            let request = GitHubRequest {
+                method: Method::Get,
+                path: path.into(),
+                reference: None,
+                accept: super::super::JSON_MEDIA_TYPE,
+                body: None,
+            };
+            assert_eq!(request.body_limit().cap(), cap, "{path}");
+        }
     }
 
     #[test]

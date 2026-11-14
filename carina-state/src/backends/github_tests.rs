@@ -45,6 +45,474 @@ struct Store {
 #[derive(Clone, Default)]
 struct Fake(Arc<Mutex<Store>>);
 
+/// Model a real deadline: optionally commit, then lose the reply until after
+/// the caller's absolute deadline. Cancellation must preserve the ambiguity.
+struct LostReply {
+    fake: Fake,
+    method: Method,
+    commit: bool,
+    path_fragment: &'static str,
+    armed: std::sync::atomic::AtomicBool,
+}
+impl LostReply {
+    fn new(fake: Fake, method: Method, commit: bool) -> Arc<Self> {
+        Arc::new(Self {
+            fake,
+            method,
+            commit,
+            path_fragment: "",
+            armed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+#[async_trait]
+impl GitHubTransport for LostReply {
+    async fn execute(
+        &self,
+        request: GitHubRequest,
+        deadline: Instant,
+    ) -> Result<GitHubResponse, GitHubError> {
+        if request.method == self.method
+            && request.path.contains(self.path_fragment)
+            && self.armed.swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            if self.commit {
+                self.fake.execute(request, deadline).await?;
+            }
+            tokio::time::sleep_until(deadline + Duration::from_secs(1)).await;
+            return Err(GitHubError::Deadline);
+        }
+        self.fake.execute(request, deadline).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round3_state_timeout_is_resolved_by_one_metadata_read_on_the_next_save() {
+    for committed in [false, true] {
+        for replacing in [false, true] {
+            let fake = Fake::default();
+            let transport = LostReply::new(fake.clone(), Method::Put, committed);
+            let backend = GitHubBackend::with_transport(settings(), transport.clone());
+            let mut state = StateFile::new();
+            if replacing {
+                backend.write_state(&state).await.unwrap();
+            }
+            backend.read_state().await.unwrap();
+            transport.arm();
+            state.serial = 1;
+            let start = Instant::now();
+            assert!(matches!(
+                backend.write_state(&state).await,
+                Err(BackendError::GitHub(GitHubError::Deadline))
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(30));
+            fake.0.lock().unwrap().requests.clear();
+            state.serial = 2;
+            backend.write_state(&state).await.unwrap();
+            let store = fake.0.lock().unwrap();
+            assert_eq!(
+                store
+                    .requests
+                    .iter()
+                    .filter(|r| r.method == Method::Get && r.path.ends_with("/contents/state.json"))
+                    .count(),
+                1
+            );
+            assert!(store.requests.iter().all(|r| r.accept != RAW_MEDIA_TYPE));
+            assert_eq!(
+                store.files["state.json"],
+                carina_core::utils::pretty_with_newline_bytes(&state).unwrap()
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round3_ambiguous_state_write_never_overwrites_a_different_winner() {
+    let fake = Fake::default();
+    let transport = LostReply::new(fake.clone(), Method::Put, true);
+    let backend = GitHubBackend::with_transport(settings(), transport.clone());
+    backend.read_state().await.unwrap();
+    transport.arm();
+    assert!(backend.write_state(&StateFile::new()).await.is_err());
+    fake.put("state.json", b"another writer".to_vec());
+    fake.0.lock().unwrap().requests.clear();
+    assert!(matches!(
+        backend.write_state(&StateFile::new()).await,
+        Err(BackendError::StateWriteConflict { .. })
+    ));
+    assert!(
+        fake.0
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|r| r.method == Method::Get)
+    );
+    assert_eq!(fake.bytes("state.json").unwrap(), b"another writer");
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round3_acquire_timeout_recovers_our_uuid_on_the_next_acquire() {
+    for takeover in [false, true] {
+        for committed in [false, true] {
+            let fake = Fake::default();
+            if takeover {
+                let expired = LockInfo::with_timeout("expired", -1);
+                fake.put("state.json.lock", serde_json::to_vec(&expired).unwrap());
+            }
+            let transport = LostReply::new(fake.clone(), Method::Put, committed);
+            let backend = GitHubBackend::with_transport(settings(), transport.clone());
+            transport.arm();
+            let start = Instant::now();
+            assert!(matches!(
+                backend.acquire_lock("apply").await,
+                Err(BackendError::GitHub(GitHubError::Deadline))
+            ));
+            assert_eq!(start.elapsed(), Duration::from_secs(30));
+            let sent = fake.bytes("state.json.lock");
+            fake.0.lock().unwrap().requests.clear();
+            let acquired = backend.acquire_lock("apply").await.unwrap();
+            if committed {
+                assert_eq!(serde_json::to_vec(&acquired).unwrap(), sent.unwrap());
+                assert!(
+                    fake.0
+                        .lock()
+                        .unwrap()
+                        .requests
+                        .iter()
+                        .all(|r| r.method == Method::Get)
+                );
+            }
+            backend.release_lock(&acquired).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round3_renew_timeout_recovers_on_the_next_acquire_or_renew() {
+    for acquire in [false, true] {
+        let fake = Fake::default();
+        let transport = LostReply::new(fake.clone(), Method::Put, true);
+        let backend = GitHubBackend::with_transport(settings(), transport.clone());
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        transport.arm();
+        assert!(matches!(
+            backend.renew_lock(&lock).await,
+            Err(BackendError::GitHub(GitHubError::Deadline))
+        ));
+        let recovered = if acquire {
+            backend.acquire_lock("apply").await.unwrap()
+        } else {
+            backend.renew_lock(&lock).await.unwrap()
+        };
+        assert_eq!(recovered.id(), lock.id());
+        backend.release_lock(&recovered).await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round3_compare_timeout_does_not_strand_acquire_or_release() {
+    for releasing in [false, true] {
+        let fake = Fake::default();
+        let transport = Arc::new(LostReply {
+            fake: fake.clone(),
+            method: Method::Get,
+            commit: true,
+            path_fragment: "/compare/",
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let backend = GitHubBackend::with_transport(settings(), transport.clone());
+        let lock = if releasing {
+            Some(backend.acquire_lock("apply").await.unwrap())
+        } else {
+            None
+        };
+        transport.arm();
+        let result = if let Some(lock) = &lock {
+            backend.release_lock(lock).await
+        } else {
+            backend.acquire_lock("apply").await.map(|_| ())
+        };
+        assert!(matches!(
+            result,
+            Err(BackendError::GitHub(GitHubError::Deadline))
+        ));
+        fake.0.lock().unwrap().requests.clear();
+        if let Some(lock) = &lock {
+            backend.release_lock(lock).await.unwrap();
+        } else {
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            assert_eq!(
+                fake.bytes("state.json.lock").unwrap(),
+                serde_json::to_vec(&lock).unwrap()
+            );
+        }
+        assert!(
+            fake.0
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .all(|r| r.method == Method::Get)
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round3_known_201_renewal_is_not_recovered_as_ours_after_compare_timeout() {
+    let fake = Fake::default();
+    let transport = Arc::new(LostReply {
+        fake: fake.clone(),
+        method: Method::Get,
+        commit: true,
+        path_fragment: "/compare/",
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let backend = GitHubBackend::with_transport(settings(), transport.clone());
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    fake.0.lock().unwrap().remove_before_mutation = true;
+    transport.arm();
+    assert!(matches!(
+        backend.renew_lock(&lock).await,
+        Err(BackendError::LockNotHeld(_)) | Err(BackendError::GitHub(GitHubError::Deadline))
+    ));
+    fake.0.lock().unwrap().requests.clear();
+    assert!(matches!(
+        backend.write_state_locked(&StateFile::new(), &lock).await,
+        Err(BackendError::LockNotHeld(_))
+    ));
+    assert!(matches!(
+        backend.renew_lock(&lock).await,
+        Err(BackendError::LockNotHeld(_))
+    ));
+    assert!(matches!(
+        backend.acquire_lock("apply").await,
+        Err(BackendError::Locked { .. })
+    ));
+    assert!(
+        fake.0
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .all(|r| r.method == Method::Get)
+    );
+    // As with any failed rollback, the known recreated lease remains available
+    // for explicit cleanup; it must never become a recovered acquisition.
+    backend.force_unlock(lock.id()).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round3_lost_reply_resurrection_keeps_the_existing_matching_bytes_policy() {
+    let fake = Fake::default();
+    let transport = LostReply::new(fake.clone(), Method::Put, true);
+    let backend = GitHubBackend::with_transport(settings(), transport.clone());
+    backend.write_state(&StateFile::new()).await.unwrap();
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    for lease in [false, true] {
+        fake.0.lock().unwrap().remove_before_mutation = true;
+        transport.arm();
+        let result = if lease {
+            backend.renew_lock(&lock).await.map(|_| ())
+        } else {
+            backend.write_state(&StateFile::new()).await
+        };
+        assert!(matches!(
+            result,
+            Err(BackendError::GitHub(GitHubError::Deadline))
+        ));
+        // Decision (b) is deliberately unchanged: a lost 201 is currently
+        // recovered by exact bytes, even if the path was recreated.
+        if lease {
+            backend.renew_lock(&lock).await.unwrap();
+        } else {
+            backend.write_state(&StateFile::new()).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round3_lost_delete_reply_is_recovered_without_deleting_a_successor() {
+    for force in [false, true] {
+        for successor in [false, true] {
+            for committed in [false, true] {
+                let fake = Fake::default();
+                let transport = LostReply::new(fake.clone(), Method::Delete, committed);
+                let backend = GitHubBackend::with_transport(settings(), transport.clone());
+                let lock = backend.acquire_lock("apply").await.unwrap();
+                transport.arm();
+                let result = if force {
+                    backend.force_unlock(lock.id()).await
+                } else {
+                    backend.release_lock(&lock).await
+                };
+                assert!(matches!(
+                    result,
+                    Err(BackendError::GitHub(GitHubError::Deadline))
+                ));
+                let replacement = LockInfo::new("successor");
+                if successor {
+                    fake.put("state.json.lock", serde_json::to_vec(&replacement).unwrap());
+                }
+                fake.0.lock().unwrap().requests.clear();
+                if force {
+                    backend.force_unlock(lock.id()).await.unwrap();
+                } else {
+                    backend.release_lock(&lock).await.unwrap();
+                }
+                if committed || successor {
+                    assert!(
+                        fake.0
+                            .lock()
+                            .unwrap()
+                            .requests
+                            .iter()
+                            .all(|r| r.method == Method::Get)
+                    );
+                }
+                assert_eq!(
+                    fake.bytes("state.json.lock"),
+                    successor.then(|| serde_json::to_vec(&replacement).unwrap())
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round3_lost_delete_transport_reply_recovers_in_the_same_call() {
+    for force in [false, true] {
+        for successor in [false, true] {
+            let fake = Fake::default();
+            let backend = fake.backend();
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            let replacement = LockInfo::new("successor");
+            {
+                let mut store = fake.0.lock().unwrap();
+                store.after_commit_error = Some(GitHubError::Transport {
+                    kind: "lost delete reply",
+                    source: reqwest::Client::new()
+                        .get("http://[invalid")
+                        .build()
+                        .unwrap_err(),
+                });
+                if successor {
+                    store.after_success = Some(serde_json::to_vec(&replacement).unwrap());
+                }
+            }
+            if force {
+                backend.force_unlock(lock.id()).await.unwrap();
+            } else {
+                backend.release_lock(&lock).await.unwrap();
+            }
+            assert_eq!(
+                fake.bytes("state.json.lock"),
+                successor.then(|| serde_json::to_vec(&replacement).unwrap())
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round3_committed_delete_rate_retry_accepts_absence_or_a_successor() {
+    for force in [false, true] {
+        for successor in [false, true] {
+            let fake = Fake::default();
+            let backend = fake.backend();
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            let replacement = LockInfo::new("successor");
+            {
+                let mut store = fake.0.lock().unwrap();
+                store.after_commit_response = Some(rate_limit(429, "retry-after", "0".into()));
+                if successor {
+                    store.after_success = Some(serde_json::to_vec(&replacement).unwrap());
+                }
+            }
+            if force {
+                backend.force_unlock(lock.id()).await.unwrap();
+            } else {
+                backend.release_lock(&lock).await.unwrap();
+            }
+            assert_eq!(
+                fake.bytes("state.json.lock"),
+                successor.then(|| serde_json::to_vec(&replacement).unwrap())
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round3_missing_sha_422_state_creator_race_is_typed() {
+    let fake = Fake::default();
+    let backend = fake.backend();
+    backend.read_state().await.unwrap();
+    fake.put("state.json", b"winning creator".to_vec());
+    assert!(matches!(
+        backend.write_state(&StateFile::new()).await,
+        Err(BackendError::StateWriteConflict { .. })
+    ));
+    assert_eq!(fake.bytes("state.json").unwrap(), b"winning creator");
+}
+
+#[tokio::test]
+async fn github_round3_other_422_validation_failures_remain_terminal_api_errors() {
+    for replacing in [false, true] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        if replacing {
+            backend.write_state(&StateFile::new()).await.unwrap();
+        }
+        backend.read_state().await.unwrap();
+        // Force a validation failure before the transport can commit anything.
+        let mut responses = VecDeque::new();
+        responses.push_back(reply(422, json!({"message":"file too large"})));
+        fake.0.lock().unwrap().responses = responses;
+        assert!(matches!(
+            backend.write_state(&StateFile::new()).await,
+            Err(BackendError::GitHub(GitHubError::Api { status: 422, .. }))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn github_round3_compare_has_an_independent_one_mib_limit_and_committed_error() {
+    for overflow in [false, true] {
+        let fake = Fake::default();
+        let backend = fake.backend();
+        let mut comparison = json!({"status":"identical","ahead_by":0,"behind_by":0,"base_commit":null,"files":[{"patch":""}]});
+        let padding =
+            1_048_576 + usize::from(overflow) - serde_json::to_vec(&comparison).unwrap().len();
+        comparison["files"][0]["patch"] = json!("x".repeat(padding));
+        fake.0.lock().unwrap().compare_response = Some(comparison);
+        let result = backend.write_state(&StateFile::new()).await;
+        if overflow {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                &error,
+                BackendError::GitHub(GitHubError::CompareTooLarge {
+                    size: 1_048_577,
+                    cap: MAX_COMPARE_BYTES
+                })
+            ));
+            let message = error.to_string();
+            assert!(
+                message.contains("committed") && message.contains("could not be verified"),
+                "{error:?}"
+            );
+            // The acknowledged SHA is still usable after verification fails.
+            let mut next = StateFile::new();
+            next.serial = 1;
+            backend.write_state(&next).await.unwrap();
+        } else {
+            result.unwrap();
+        }
+    }
+}
+
 fn blob(bytes: &[u8]) -> String {
     use sha1::{Digest, Sha1};
     let mut hash = Sha1::new();
@@ -522,14 +990,7 @@ async fn github_races_have_one_winner_and_typed_loser_for_409_and_422() {
         } else {
             b.unwrap_err()
         };
-        assert!(
-            matches!(
-                err,
-                BackendError::Locked { .. }
-                    | BackendError::GitHub(GitHubError::Api { status: 422, .. })
-            ),
-            "{err:?}"
-        );
+        assert!(matches!(err, BackendError::Locked { .. }), "{err:?}");
         assert!(fake.bytes("state.json.lock").is_some());
     }
 }
@@ -974,10 +1435,9 @@ async fn github_abandoned_and_cleanup_writes_preserve_preconditions_in_both_comp
         if old_first {
             transport.resume.notify_one();
             assert_eq!(receiver.await.unwrap().status, 200);
-            assert!(matches!(
-                backend.write_state_for_cleanup(&latest).await,
-                Err(BackendError::StateWriteConflict { .. })
-            ));
+            // The abandoned PUT's exact bytes are ours under decision (b)'s
+            // current policy. Cleanup resolves that intent before its save.
+            backend.write_state_for_cleanup(&latest).await.unwrap();
             assert_eq!(
                 fake.backend()
                     .read_state()
@@ -986,7 +1446,7 @@ async fn github_abandoned_and_cleanup_writes_preserve_preconditions_in_both_comp
                     .unwrap()
                     .into_state()
                     .serial,
-                1
+                2
             );
         } else {
             backend.write_state_for_cleanup(&latest).await.unwrap();
@@ -1548,26 +2008,22 @@ async fn github_round2_committed_rate_limit_retry_conflict_is_already_applied() 
 
 #[tokio::test]
 async fn github_round2_lost_acquire_response_recovers_our_exact_lease() {
-    for error in [
-        GitHubError::Transport {
-            kind: "lost response",
-            source: reqwest::Client::new()
-                .get("http://[invalid")
-                .build()
-                .unwrap_err(),
-        },
-        GitHubError::Deadline,
-    ] {
-        let fake = Fake::default();
-        fake.0.lock().unwrap().after_commit_error = Some(error);
-        let backend = fake.backend();
-        let acquired = backend.acquire_lock("apply").await.unwrap();
-        assert_eq!(
-            fake.bytes("state.json.lock").unwrap(),
-            serde_json::to_vec(&acquired).unwrap()
-        );
-        backend.release_lock(&acquired).await.unwrap();
-    }
+    let error = GitHubError::Transport {
+        kind: "lost response",
+        source: reqwest::Client::new()
+            .get("http://[invalid")
+            .build()
+            .unwrap_err(),
+    };
+    let fake = Fake::default();
+    fake.0.lock().unwrap().after_commit_error = Some(error);
+    let backend = fake.backend();
+    let acquired = backend.acquire_lock("apply").await.unwrap();
+    assert_eq!(
+        fake.bytes("state.json.lock").unwrap(),
+        serde_json::to_vec(&acquired).unwrap()
+    );
+    backend.release_lock(&acquired).await.unwrap();
 }
 
 #[tokio::test]
@@ -1790,11 +2246,23 @@ async fn github_round2_diagnostics_redact_queries_in_every_response_url_field() 
 #[tokio::test]
 async fn github_round2_acknowledged_blob_sha_must_match_the_exact_sent_bytes() {
     let fake = Fake::default();
+    let backend = fake.backend();
     fake.0.lock().unwrap().wrong_blob_sha = true;
     assert!(matches!(
-        fake.backend().write_state(&StateFile::new()).await,
+        backend.write_state(&StateFile::new()).await,
         Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
     ));
+    fake.0.lock().unwrap().wrong_blob_sha = false;
+    fake.0.lock().unwrap().requests.clear();
+    let mut state = StateFile::new();
+    state.serial = 1;
+    backend.write_state(&state).await.unwrap();
+    assert!(
+        fake.0.lock().unwrap().requests.iter().any(|request| {
+            request.method == Method::Get && request.path.ends_with("/contents/state.json")
+        }),
+        "a rejected acknowledgement must force a fresh precondition read"
+    );
 }
 
 #[tokio::test]
@@ -1872,16 +2340,13 @@ async fn github_round2_known_created_state_conflict_survives_compare_failure() {
 }
 
 #[tokio::test]
-async fn github_round2_compare_rejects_a_different_commit_parent() {
+async fn github_round3_compare_reads_only_the_three_reachability_fields() {
     let fake = Fake::default();
     fake.0.lock().unwrap().compare_response = Some(json!({
         "status":"identical", "ahead_by":0, "behind_by":0,
         "base_commit":{"sha":format!("{:040x}", 2), "parents":[{"sha":format!("{:040x}", 99)}]}
     }));
-    assert!(matches!(
-        fake.backend().write_state(&StateFile::new()).await,
-        Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
-    ));
+    fake.backend().write_state(&StateFile::new()).await.unwrap();
 }
 
 #[tokio::test]
