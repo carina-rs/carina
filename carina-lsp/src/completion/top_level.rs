@@ -4,7 +4,9 @@ use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
 };
 
+use crate::enclosing_block::{SchemaSelector, resource_binding_selectors};
 use carina_core::parser;
+use carina_core::schema::SchemaKind;
 
 use super::{CompletionProvider, DslSource};
 
@@ -47,6 +49,10 @@ impl CompletionProvider {
         // Avoid emitting a duplicate `let` when the line already has `let <name> =`.
         let after_let_binding =
             line_idx < lines.len() && is_after_let_binding(lines[line_idx], prefix_start);
+        let after_read = crate::enclosing_block::has_read_prefix(
+            &crate::lex::lex(text),
+            Position::new(position.line, prefix_start),
+        );
 
         let read_snippet = if after_let_binding {
             "read ${1:aws.s3.Bucket} {\n    name = \"${2:existing-resource}\"\n}"
@@ -229,11 +235,11 @@ impl CompletionProvider {
         }
 
         // Generate resource type completions from schemas
-        for (provider, resource_type, _kind, schema) in self.schemas.iter() {
-            let key = if provider.is_empty() {
-                resource_type.to_string()
-            } else {
-                format!("{}.{}", provider, resource_type)
+        for (provider, resource_type, kind, schema) in self.schemas.iter() {
+            let path = format!("{provider}.{resource_type}");
+            let key = match kind {
+                SchemaKind::Resource => path.clone(),
+                SchemaKind::DataSource => format!("read {path}"),
             };
             let description = schema
                 .as_schema()
@@ -242,7 +248,12 @@ impl CompletionProvider {
                 .to_string();
 
             // Build snippet with required attributes
-            let mut snippet = format!("{} {{\n", key);
+            let snippet_type = if kind == SchemaKind::DataSource && after_read {
+                &path
+            } else {
+                &key
+            };
+            let mut snippet = format!("{} {{\n", snippet_type);
             let mut tab_stop = 1;
             for attr in schema.effective_attributes() {
                 if attr.is_required() {
@@ -325,9 +336,9 @@ impl CompletionProvider {
     ///
     /// Returns `Vec<(name, rhs)>` where `rhs` is the trimmed text after `=`
     /// (e.g. `awscc.ec2.Vpc { ... }`, `upstream_state { ... }`, `import '...'`).
-    /// Callers classify the rhs themselves — `extract_resource_bindings` maps
-    /// it to a schema key, the for-iterable handler keys it into a detail
-    /// label, etc. Duplicates (same binding name appearing in the buffer
+    /// Callers classify non-resource rhs expressions themselves (module use,
+    /// for-iterable detail labels, etc.). Resource selectors instead come from
+    /// the shared header seam. Duplicates (same binding name appearing in the buffer
     /// and in a sibling `.crn`) are deduped, buffer-first.
     pub(super) fn extract_let_bindings(src: DslSource<'_>) -> Vec<(String, String)> {
         let text = src.merged_text();
@@ -341,21 +352,19 @@ impl CompletionProvider {
             .collect()
     }
 
-    /// Extract resource binding names and their resource types from `src`
-    /// (variables defined with `let binding_name = awscc.ec2.Vpc {`).
-    /// Returns `(binding_name, exact_type_path, syntax_kind)` entries.
+    /// Extract every binding and its optional, syntax-selected resource schema.
     /// See [`DslSource`] for buffer-vs-directory choice.
     pub(super) fn extract_resource_bindings(
         &self,
         src: DslSource<'_>,
-    ) -> Vec<(String, String, super::SchemaKind)> {
-        Self::extract_let_bindings(src)
+    ) -> Vec<(String, Option<SchemaSelector>)> {
+        resource_binding_selectors(src.merged_text())
             .into_iter()
-            .map(|(name, rhs)| {
-                let (path, kind) = self
-                    .extract_resource_type(&rhs)
-                    .unwrap_or_else(|| (String::new(), super::SchemaKind::Resource));
-                (name, path, kind)
+            .map(|(name, selector)| {
+                (
+                    name,
+                    selector.filter(|selector| self.lookup_schema(selector).is_some()),
+                )
             })
             .collect()
     }

@@ -1,14 +1,109 @@
 use carina_core::parser::ResourceTypePath;
-use carina_core::schema::SchemaKind;
+use carina_core::schema::{OwnerBoundResourceSchema, SchemaKind, SchemaRegistry};
 use tower_lsp::lsp_types::Position;
 
 use crate::lex::{LexKind, LexedDocument, lex};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SchemaSelector {
+    path: ResourceTypePath,
+    kind: SelectorKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SelectorKind {
+    Syntax(SchemaKind),
+    Kindless,
+}
+
+impl SchemaSelector {
+    /// Handles and Ref/annotation types carry a path but no syntax kind.
+    pub(crate) fn kindless(path: ResourceTypePath) -> Self {
+        Self {
+            path,
+            kind: SelectorKind::Kindless,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &ResourceTypePath {
+        &self.path
+    }
+
+    pub(crate) fn lookup<'a>(
+        &self,
+        schemas: &'a SchemaRegistry,
+    ) -> Option<OwnerBoundResourceSchema<'a>> {
+        if self.path.provider.is_empty() {
+            return None;
+        }
+        match self.kind {
+            SelectorKind::Syntax(kind) => {
+                schemas.get(&self.path.provider, &self.path.resource_type, kind)
+            }
+            SelectorKind::Kindless => {
+                schemas.get_kindless(&self.path.provider, &self.path.resource_type)
+            }
+        }
+    }
+}
+
 pub(crate) struct ResourceHeader {
-    pub(crate) resource_type: ResourceTypePath,
-    pub(crate) kind: SchemaKind,
+    pub(crate) selector: SchemaSelector,
     binding: Option<String>,
+    start_line: usize,
     is_block_header: bool,
+}
+
+fn walk_back_prefix(lexed: &LexedDocument, mut line: usize, prefix: &str) -> (String, usize) {
+    let expression_line = line;
+    let mut prefix = prefix.trim_end().to_string();
+    while prefix.is_empty() && line > 0 {
+        line -= 1;
+        let preceding = &lexed.lines()[line];
+        // A completed let RHS ends the preceding statement. In particular,
+        // masking its string literal must not turn `let role = 'admin'` into
+        // an unfinished `let role =` that captures the next anonymous resource.
+        let without_comments: String = preceding
+            .text()
+            .chars()
+            .zip(preceding.chars())
+            .map(|(ch, classified)| {
+                if classified.kind() == LexKind::Comment {
+                    ' '
+                } else {
+                    ch
+                }
+            })
+            .collect();
+        if let Some((_, rhs)) = crate::let_parse::parse_let_header(&without_comments)
+            && !rhs.trim().is_empty()
+            && strip_read(rhs.trim_end()).is_none()
+        {
+            return (String::new(), expression_line);
+        }
+        prefix = preceding.masked_code().as_str().trim_end().to_string();
+    }
+    (prefix, line)
+}
+
+fn strip_read(prefix: &str) -> Option<&str> {
+    prefix.strip_suffix("read").filter(|prefix| {
+        !prefix.ends_with(|ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.'))
+    })
+}
+
+/// Snippet insertion shares the header seam's treatment of `read` and trivia.
+pub(crate) fn has_read_prefix(lexed: &LexedDocument, position: Position) -> bool {
+    let line = position.line as usize;
+    let Some(code) = lexed.lines().get(line).map(|line| line.masked_code()) else {
+        return false;
+    };
+    let (prefix, _) = walk_back_prefix(
+        lexed,
+        line,
+        crate::position::line_prefix(code.as_str(), position.character),
+    );
+    strip_read(&prefix).is_some()
 }
 
 /// Parse the complete type-path token at the cursor (or before a block opener).
@@ -34,38 +129,77 @@ pub(crate) fn resource_header(lexed: &LexedDocument, position: Position) -> Opti
         return None;
     }
     let resource_type = ResourceTypePath::parse(token)?;
-    let mut before_type = code[..start].trim_end().to_string();
-    let mut previous_line = line_index;
-    while before_type.is_empty() && previous_line > 0 {
-        previous_line -= 1;
-        before_type = lexed.lines()[previous_line]
-            .masked_code()
-            .as_str()
-            .trim_end()
-            .to_string();
-    }
-    let (kind, before_expression) = match before_type
-        .strip_suffix("read")
-        .filter(|prefix| !prefix.ends_with(is_path_char))
-    {
-        Some(prefix) => (SchemaKind::DataSource, prefix),
-        None => (SchemaKind::Resource, &code[..start]),
+    let (before_type, previous_line) = walk_back_prefix(lexed, line_index, &code[..start]);
+    let (kind, before_expression, previous_line) = match strip_read(&before_type) {
+        Some(prefix) => {
+            let (prefix, line) = walk_back_prefix(lexed, previous_line, prefix);
+            (SchemaKind::DataSource, prefix, line)
+        }
+        None => (SchemaKind::Resource, before_type, previous_line),
     };
     let prefix = before_expression.rsplit(['{', '}', ',']).next()?.trim();
     let assignment = parse_let_assignment(prefix).filter(|a| a.expression.is_empty());
+    let is_block_header = prefix.is_empty() || assignment.is_some();
+    // Outside a resource header, a path (including nested annotation types)
+    // carries no kind. Only `read` or a managed header supplies a syntax kind.
+    let selector = if !is_block_header && kind == SchemaKind::Resource {
+        SchemaSelector::kindless(resource_type)
+    } else {
+        SchemaSelector {
+            path: resource_type,
+            kind: SelectorKind::Syntax(kind),
+        }
+    };
     Some(ResourceHeader {
-        resource_type,
-        kind,
+        selector,
         binding: assignment.as_ref().map(|a| a.binding.to_string()),
-        is_block_header: prefix.is_empty() || assignment.is_some(),
+        start_line: previous_line,
+        is_block_header,
     })
+}
+
+/// Scan bindings using the same header seam as hover and enclosing blocks.
+/// Associate selectors with declaration lines before deduplicating names
+/// buffer-first. An unsaved scalar binding therefore keeps its `None` selector
+/// instead of receiving the selector of a later on-disk declaration.
+pub(crate) fn resource_binding_selectors(text: &str) -> Vec<(String, Option<SchemaSelector>)> {
+    let lexed = lex(text);
+    let mut selectors = std::collections::HashMap::new();
+    for (line_index, line) in lexed.lines().iter().enumerate() {
+        let code = line.masked_code();
+        for (offset, _) in code.as_str().match_indices('{') {
+            let position = Position::new(
+                line_index as u32,
+                crate::position::byte_offset_to_char_offset(code.as_str(), offset),
+            );
+            if let Some(header) = resource_header(&lexed, position)
+                && header.is_block_header
+                && header.binding.is_some()
+            {
+                selectors
+                    .entry(header.start_line)
+                    .or_insert(header.selector);
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    lexed
+        .lines()
+        .iter()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            let code = line.masked_code();
+            let (name, _) = crate::let_parse::parse_let_header(code.as_str())?;
+            seen.insert(name.to_string())
+                .then(|| (name.to_string(), selectors.remove(&line_index)))
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum EnclosingBlock {
     Resource {
-        resource_type: String,
-        kind: SchemaKind,
+        selector: SchemaSelector,
         struct_path: StructPath,
         binding: Option<String>,
     },
@@ -110,8 +244,7 @@ struct LineSegment {
 
 enum BraceOpener {
     Resource {
-        resource_type: String,
-        kind: SchemaKind,
+        selector: SchemaSelector,
         binding: Option<String>,
     },
     Path(PathSegment),
@@ -243,14 +376,9 @@ pub(crate) fn enclosing_block(text: &str, position: Position) -> EnclosingBlock 
                                     continue;
                                 }
                                 BraceOpener::ControlFlow => continue,
-                                BraceOpener::Resource {
-                                    resource_type,
-                                    kind,
-                                    binding,
-                                } => {
+                                BraceOpener::Resource { selector, binding } => {
                                     return EnclosingBlock::Resource {
-                                        resource_type,
-                                        kind,
+                                        selector,
                                         struct_path: StructPath::Unresolvable,
                                         binding,
                                     };
@@ -269,14 +397,9 @@ pub(crate) fn enclosing_block(text: &str, position: Position) -> EnclosingBlock 
                         }
                     }
                     match classify_brace_opener(&segment, header.as_ref()) {
-                        BraceOpener::Resource {
-                            resource_type,
-                            kind,
-                            binding,
-                        } => {
+                        BraceOpener::Resource { selector, binding } => {
                             return EnclosingBlock::Resource {
-                                resource_type,
-                                kind,
+                                selector,
                                 struct_path: resource_struct_path(reverse_path),
                                 binding,
                             };
@@ -504,8 +627,7 @@ fn parse_list_attribute_segment(segment: &LineSegment) -> Option<PathSegment> {
 fn classify_brace_opener(segment: &LineSegment, header: Option<&ResourceHeader>) -> BraceOpener {
     if let Some(header) = header.filter(|header| header.is_block_header) {
         BraceOpener::Resource {
-            resource_type: header.resource_type.to_string(),
-            kind: header.kind,
+            selector: header.selector.clone(),
             binding: header.binding.clone(),
         }
     } else if is_else_segment(&segment.code) {

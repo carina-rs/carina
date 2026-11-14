@@ -654,8 +654,7 @@ fn shared_definition_fields_are_offered_only_on_the_writable_reference_path() {
     let provider = test_provider_with_shared_definition_paths();
 
     let writable = provider.struct_field_completions(
-        "test.shared.resource",
-        SchemaKind::Resource,
+        &managed_selector("test.shared.resource"),
         &["tags".to_string()],
     );
     assert_eq!(
@@ -667,8 +666,7 @@ fn shared_definition_fields_are_offered_only_on_the_writable_reference_path() {
     );
 
     let read_only = provider.struct_field_completions(
-        "test.shared.resource",
-        SchemaKind::Resource,
+        &managed_selector("test.shared.resource"),
         &["effective_tags".to_string()],
     );
     assert!(
@@ -776,10 +774,9 @@ security_group_ingress {
         matches!(
             context,
             CompletionContext::InsideStructBlock {
-                ref resource_type,
-                kind: SchemaKind::Resource,
+                ref selector,
                 ref attr_path,
-            } if resource_type == "awscc.ec2.SecurityGroup" && attr_path == &["security_group_ingress".to_string()]
+            } if selector == &managed_selector("awscc.ec2.SecurityGroup") && attr_path == &["security_group_ingress".to_string()]
         ),
         "Should detect InsideStructBlock context, got: {:?}",
         context

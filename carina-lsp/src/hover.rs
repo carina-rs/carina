@@ -4,16 +4,20 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::document::Document;
-use crate::enclosing_block::{EnclosingBlock, StructPath, enclosing_block, resource_header};
+use crate::enclosing_block::{
+    EnclosingBlock, SchemaSelector, StructPath, enclosing_block, resource_header,
+};
 use carina_core::builtins;
-use carina_core::parser::{ArgumentParameter, ResourceTypePath, display_string_literal};
+use carina_core::parser::{ArgumentParameter, display_string_literal};
 use carina_core::resource::{
     ConcreteValue, ParserPlaceholder, RelativeBindingName, Value as GenericValue,
 };
 use carina_core::schema::EffectiveSchemaNode;
 #[cfg(test)]
 use carina_core::schema::ResourceSchema;
-use carina_core::schema::{CompletionValue, SchemaKind, SchemaRegistry, ValidatedResourceSchema};
+#[cfg(test)]
+use carina_core::schema::SchemaKind;
+use carina_core::schema::{CompletionValue, SchemaRegistry, ValidatedResourceSchema};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -374,15 +378,12 @@ impl HoverProvider {
 
         match &enclosing_block {
             EnclosingBlock::Resource {
-                resource_type,
-                kind,
+                selector,
                 struct_path,
                 binding: _binding,
             } => match struct_path {
                 StructPath::Known(struct_path) => {
-                    if let Some(hover) =
-                        self.attribute_hover(&word, resource_type, *kind, struct_path)
-                    {
+                    if let Some(hover) = self.attribute_hover(&word, selector, struct_path) {
                         return Some(hover);
                     }
                 }
@@ -560,14 +561,10 @@ impl HoverProvider {
 
     fn resource_type_hover(&self, word: &str, text: &str, position: Position) -> Option<Hover> {
         let header = resource_header(&crate::lex::lex(text), position)?;
-        if header.resource_type.to_string() != word {
+        if header.selector.path().to_string() != word {
             return None;
         }
-        let schema = self.schemas.get(
-            &header.resource_type.provider,
-            &header.resource_type.resource_type,
-            header.kind,
-        )?;
+        let schema = header.selector.lookup(&self.schemas)?;
         self.schema_hover(word, schema.schema())
     }
 
@@ -638,18 +635,14 @@ impl HoverProvider {
     fn attribute_hover(
         &self,
         word: &str,
-        resource_type: &str,
-        kind: SchemaKind,
+        selector: &SchemaSelector,
         struct_path: &[String],
     ) -> Option<Hover> {
         // When we know the enclosing resource, only its schema is authoritative.
         // Falling back to a global scan would return a lookalike attribute from
         // an unrelated schema (nondeterministic via HashMap iteration order) —
         // see #1988.
-        let path = ResourceTypePath::parse(resource_type)?;
-        let schema = self
-            .schemas
-            .get(&path.provider, &path.resource_type, kind)?;
+        let schema = selector.lookup(&self.schemas)?;
         let mut path = struct_path.to_vec();
         path.push(word.to_string());
         let attribute = schema.effective_node_at_authored_path(&path)?;
@@ -833,9 +826,11 @@ mod tests {
                 .unwrap(),
         );
         let provider = super::HoverProvider::new(std::sync::Arc::new(schemas), vec![]);
+        let header =
+            resource_header(&crate::lex::lex("gcp.Cloud {"), Position::new(0, 10)).unwrap();
         assert!(
             provider
-                .attribute_hover("region", "gcp.Cloud", SchemaKind::Resource, &[])
+                .attribute_hover("region", &header.selector, &[])
                 .is_none()
         );
     }

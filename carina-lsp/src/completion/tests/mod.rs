@@ -5,11 +5,28 @@ use crate::document::Document;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::ProviderFactory;
 use carina_core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, StructField, legacy_validator,
+    AttributeSchema, AttributeType, ResourceSchema, SchemaKind, StructField, legacy_validator,
 };
 
 mod basic;
 mod extended;
+
+fn schema_selector(path: &str, kind: SchemaKind) -> Option<SchemaSelector> {
+    let prefix = match kind {
+        SchemaKind::Resource => "",
+        SchemaKind::DataSource => "read ",
+    };
+    let text = format!("{prefix}{path} {{");
+    crate::enclosing_block::resource_header(
+        &crate::lex::lex(&text),
+        Position::new(0, text.len() as u32 - 1),
+    )
+    .map(|header| header.selector)
+}
+
+fn managed_selector(path: &str) -> SchemaSelector {
+    schema_selector(path, SchemaKind::Resource).expect("qualified resource path")
+}
 
 fn schema_selection_completions(source: &str) -> Vec<CompletionItem> {
     let cursor = source.find('|').unwrap();
@@ -128,7 +145,7 @@ fn schema_selection_exact_path_completion() {
         !items.iter().any(|item| item.label == "endpoint_only"),
         "{items:?}"
     );
-    // Exercise extract_resource_type as well as the enclosing-block walk.
+    // Exercise binding selectors as well as the enclosing-block walk.
     let items = schema_selection_completions(
         "let x = mock.ec2.VpcEndpointMissing {}\nlet v = mock.ec2.Vpc {\n  shared = x.|\n}",
     );
@@ -196,12 +213,12 @@ fn loaded_schema_lookup_rejects_cross_provider_identity_mismatch() {
     );
     let provider = CompletionProvider::new(Arc::new(schemas), vec!["gcp".into()], vec![], vec![]);
     assert!(
-        provider
-            .lookup_schema("Cloud", SchemaKind::Resource)
+        schema_selector("Cloud", SchemaKind::Resource)
+            .and_then(|selector| provider.lookup_schema(&selector))
             .is_none()
     );
     let schema = provider
-        .lookup_schema("gcp.Cloud", SchemaKind::Resource)
+        .lookup_schema(&schema_selector("gcp.Cloud", SchemaKind::Resource).unwrap())
         .expect("registered schema must retain its owner");
     assert_eq!(schema.owner(), "gcp");
     let sink = schema.as_schema().attributes()["region"].attr_type();
@@ -225,15 +242,26 @@ fn qualified_schema_lookup_retains_the_registered_owner_and_kind() {
         schemas.insert("gcp", schema.validate().unwrap());
         let provider = CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
         assert_eq!(
-            provider.lookup_schema("gcp.Cloud", kind).unwrap().owner(),
+            provider
+                .lookup_schema(&schema_selector("gcp.Cloud", kind).unwrap())
+                .unwrap()
+                .owner(),
             "gcp"
         );
-        assert!(provider.lookup_schema("Cloud", kind).is_none());
+        assert!(
+            schema_selector("Cloud", kind)
+                .and_then(|selector| provider.lookup_schema(&selector))
+                .is_none()
+        );
         let other_kind = match kind {
             SchemaKind::Resource => SchemaKind::DataSource,
             SchemaKind::DataSource => SchemaKind::Resource,
         };
-        assert!(provider.lookup_schema("gcp.Cloud", other_kind).is_none());
+        assert!(
+            provider
+                .lookup_schema(&schema_selector("gcp.Cloud", other_kind).unwrap())
+                .is_none()
+        );
     }
 }
 
@@ -245,13 +273,13 @@ fn unqualified_schema_lookup_does_not_choose_between_owners() {
     }
     let provider = CompletionProvider::new(Arc::new(schemas), vec![], vec![], vec![]);
     assert!(
-        provider
-            .lookup_schema("Cloud", SchemaKind::Resource)
+        schema_selector("Cloud", SchemaKind::Resource)
+            .and_then(|selector| provider.lookup_schema(&selector))
             .is_none()
     );
     assert_eq!(
         provider
-            .lookup_schema("gcp.Cloud", SchemaKind::Resource)
+            .lookup_schema(&schema_selector("gcp.Cloud", SchemaKind::Resource).unwrap())
             .unwrap()
             .owner(),
         "gcp"
