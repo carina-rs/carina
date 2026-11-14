@@ -90,6 +90,9 @@ fn push_predicate<P: AsRef<PatternSpec>>(
     match predicate {
         InputPredicate::Present => text.push_str("must be present"),
         InputPredicate::Absent => text.push_str("must be absent"),
+        InputPredicate::Secret => {
+            text.push_str("must be a secret value (for example `secret(...)` or `decrypt(...)`)")
+        }
         InputPredicate::Equals(literal) => {
             text.push_str("must equal ");
             literal.push_to(text);

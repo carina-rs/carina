@@ -105,12 +105,10 @@ impl StateBackend for LockLossBackend {
         self.inner.force_unlock(lock_id).await
     }
 
-    async fn bucket_exists(&self) -> BackendResult<bool> {
-        self.inner.bucket_exists().await
-    }
-
-    async fn create_bucket(&self) -> BackendResult<()> {
-        self.inner.create_bucket().await
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        self.inner.storage_readiness().await
     }
 }
 

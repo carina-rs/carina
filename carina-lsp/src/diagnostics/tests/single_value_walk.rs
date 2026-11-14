@@ -7,7 +7,7 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
     ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
-use tower_lsp::lsp_types::{Position, Range};
+use tower_lsp::lsp_types::{NumberOrString, Position, Range};
 
 struct WalkFactory(
     ValidatedResourceSchema,
@@ -404,6 +404,122 @@ fn create_only_input_rules_produce_lsp_warnings() {
         diagnostics[0].message,
         "test.test.Widget.bucket: name [test.not_ipv4]: must not have IPv4 dotted-quad form (rejected if this resource is created)"
     );
+}
+
+fn secret_predicate_engine() -> DiagnosticEngine {
+    use carina_core::schema::{
+        InputCondition, InputLiteral, InputPath, InputPredicate, InputRule, InputRuleCode,
+        InputRuleScope,
+    };
+    let mut engine = engine_with_schema(
+        ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("value", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("output", AttributeType::string()).build(),
+            )
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("value").unwrap(),
+                    InputRuleCode::new("value.secret").unwrap(),
+                    InputPredicate::Secret,
+                )
+                .with_condition(InputCondition::Equals {
+                    path: InputPath::new("type").unwrap(),
+                    literal: InputLiteral::String("secure_string".into()),
+                }),
+            ),
+    );
+    let mut context = (*engine.provider_context).clone();
+    context.decryptor = Some(Arc::new(|_, _| Ok("DO-NOT-PRINT".into())));
+    engine.provider_context = DiagnosticProviderContext::Loaded(
+        carina_core::parser::LoadedProviderContext::for_test(context),
+    );
+    engine
+}
+
+#[test]
+fn secret_predicate_lsp_rejects_plaintext_and_accepts_secret_values_in_a_directory() {
+    let engine = secret_predicate_engine();
+    for (expression, violates) in [
+        ("'DO-NOT-PRINT'", true),
+        ("plain", true),
+        ("secret('DO-NOT-PRINT')", false),
+        ("protected", false),
+        ("\"p-${secret('DO-NOT-PRINT')}\"", false),
+        ("decrypt('ciphertext')", false),
+    ] {
+        let main = format!(
+            "let example = test.test.Widget {{ type = 'secure_string' value = {expression} }}\n"
+        );
+        let diagnostics = directory_diagnostics(
+            &engine,
+            &[
+                ("main.crn", &main),
+                ("backend.crn", "backend local { path = 'state.json' }\n"),
+                (
+                    "values.crn",
+                    "let plain = 'DO-NOT-PRINT'\nlet protected = secret('DO-NOT-PRINT')\n",
+                ),
+            ],
+            "main.crn",
+        );
+        let findings = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                matches!(&diagnostic.code, Some(NumberOrString::String(code)) if code == "value.secret")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("DO-NOT-PRINT")),
+            "{expression}: {diagnostics:#?}"
+        );
+        if violates {
+            assert_eq!(findings.len(), 1, "{expression}: {diagnostics:#?}");
+            assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(
+                findings[0].message,
+                "test.test.Widget.example: value [value.secret]: must be a secret value (for example `secret(...)` or `decrypt(...)`) when type equals \"secure_string\""
+            );
+        } else {
+            assert!(findings.is_empty(), "{expression}: {diagnostics:#?}");
+        }
+    }
+}
+
+#[test]
+fn secret_predicate_lsp_defers_public_pending_values_in_a_directory() {
+    let engine = secret_predicate_engine();
+    for expression in [
+        "upstream.output",
+        "\"${secret('a')}-${upstream.output}\"",
+        "upstream.output ?? secret('fallback')",
+    ] {
+        let main = format!(
+            "let example = test.test.Widget {{ type = 'secure_string' value = {expression} }}\n"
+        );
+        let diagnostics = directory_diagnostics(
+            &engine,
+            &[
+                ("main.crn", &main),
+                ("backend.crn", "backend local { path = 'state.json' }\n"),
+                (
+                    "upstream.crn",
+                    "let upstream = test.test.Widget { type = 'string' value = 'seed' }\n",
+                ),
+            ],
+            "main.crn",
+        );
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                !matches!(&diagnostic.code, Some(NumberOrString::String(code)) if code == "value.secret")
+            }),
+            "{expression}: {diagnostics:#?}"
+        );
+    }
 }
 
 #[test]

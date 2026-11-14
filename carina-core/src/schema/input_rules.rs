@@ -37,6 +37,8 @@ pub enum InputRuleError {
     ProviderPopulatedPath,
     #[error("input input path must have a String-based type")]
     NonStringPath,
+    #[error("secret input rules require a plain String path")]
+    SecretRequiresPlainStringPath,
     #[error("input map-key target must name a map with String-based keys")]
     NonStringKeyMapPath,
     #[error("duplicate input rule target and code")]
@@ -467,6 +469,9 @@ pub enum InputPredicate<P> {
     Present,
     Absent,
     Equals(InputLiteral),
+    /// Requires the target node's protection scope to be Secret, independently
+    /// of its payload. Admitted only on scalar String Value targets.
+    Secret,
     Length {
         min: Option<u64>,
         max: Option<u64>,
@@ -496,6 +501,7 @@ impl<P> InputPredicate<P> {
             Self::Present => InputViolationReason::Present,
             Self::Absent => InputViolationReason::Absent,
             Self::Equals(literal) => InputViolationReason::Equals(literal.clone()),
+            Self::Secret => InputViolationReason::Secret,
             Self::Length { min: _, max: _ } => InputViolationReason::Length,
             Self::AllowedChars(_) => InputViolationReason::AllowedChars,
             Self::FirstChar(_) => InputViolationReason::FirstChar,
@@ -641,6 +647,7 @@ pub enum InputViolationReason {
     Present,
     Absent,
     Equals(InputLiteral),
+    Secret,
     EvaluationFailed,
     Length,
     AllowedChars,
@@ -748,6 +755,7 @@ impl InputRule<Draft> {
             InputPredicate::Present => InputPredicate::Present,
             InputPredicate::Absent => InputPredicate::Absent,
             InputPredicate::Equals(literal) => InputPredicate::Equals(literal),
+            InputPredicate::Secret => InputPredicate::Secret,
             InputPredicate::Length { min, max } => InputPredicate::Length { min, max },
             InputPredicate::AllowedChars(set) => InputPredicate::AllowedChars(set),
             InputPredicate::FirstChar(set) => InputPredicate::FirstChar(set),
@@ -843,7 +851,25 @@ pub(super) fn validate_rule_collection<'a, R: PatternForm>(
                 InputRuleTarget::Value(_) => match rule.predicate() {
                     InputPredicate::Present | InputPredicate::Absent => Ok(()),
                     InputPredicate::Equals(literal) => admit_literal(ty, literal, defs),
-                    _ => {
+                    InputPredicate::Secret => {
+                        if matches!(&ty.kind, AttrTypeKind::String { .. }) {
+                            Ok(())
+                        } else {
+                            Err(InputRuleError::SecretRequiresPlainStringPath)
+                        }
+                    }
+                    InputPredicate::Length { .. }
+                    | InputPredicate::AllowedChars(_)
+                    | InputPredicate::FirstChar(_)
+                    | InputPredicate::LastChar(_)
+                    | InputPredicate::NoSubstring(_)
+                    | InputPredicate::NoPrefix(_)
+                    | InputPredicate::ForbiddenPrefix { .. }
+                    | InputPredicate::NoSuffix(_)
+                    | InputPredicate::NoAdjacent { .. }
+                    | InputPredicate::NotIpv4
+                    | InputPredicate::Matches(_)
+                    | InputPredicate::NotMatches(_) => {
                         if string_based(ty, defs, &mut HashSet::new()) {
                             Ok(())
                         } else {
@@ -859,8 +885,20 @@ pub(super) fn validate_rule_collection<'a, R: PatternForm>(
                     match rule.predicate() {
                         InputPredicate::Present
                         | InputPredicate::Absent
-                        | InputPredicate::Equals(_) => Err(InputRuleError::IncompatiblePredicate),
-                        _ => Ok(()),
+                        | InputPredicate::Equals(_)
+                        | InputPredicate::Secret => Err(InputRuleError::IncompatiblePredicate),
+                        InputPredicate::Length { .. }
+                        | InputPredicate::AllowedChars(_)
+                        | InputPredicate::FirstChar(_)
+                        | InputPredicate::LastChar(_)
+                        | InputPredicate::NoSubstring(_)
+                        | InputPredicate::NoPrefix(_)
+                        | InputPredicate::ForbiddenPrefix { .. }
+                        | InputPredicate::NoSuffix(_)
+                        | InputPredicate::NoAdjacent { .. }
+                        | InputPredicate::NotIpv4
+                        | InputPredicate::Matches(_)
+                        | InputPredicate::NotMatches(_) => Ok(()),
                     }
                 }
             }
@@ -1096,6 +1134,107 @@ fn string_based<R: PatternForm>(
         | AttrTypeKind::List { .. }
         | AttrTypeKind::Map { .. }
         | AttrTypeKind::Struct { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod secret_predicate_tests {
+    use super::*;
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
+
+    fn rule(target: InputRuleTarget) -> InputRule {
+        InputRule::new(
+            InputRuleScope::EveryWrite,
+            target,
+            InputRuleCode::new("value.secret").unwrap(),
+            InputPredicate::Secret,
+        )
+    }
+
+    #[test]
+    fn secret_predicate_admission_accepts_scalar_string_value_targets() {
+        for ty in [
+            AttributeType::string(),
+            AttributeType::refined_string(None, None, Some((Some(1), Some(100))), None),
+            AttributeType::ref_("Text"),
+        ] {
+            let admitted = ResourceSchema::new("test.Secret")
+                .with_def("Text", AttributeType::string())
+                .attribute(AttributeSchema::optional("value", ty).build())
+                .input_rule(rule(InputRuleTarget::Value(
+                    InputPath::new("value").unwrap(),
+                )))
+                .validate()
+                .expect("Secret is admitted on scalar String Value targets");
+            assert_eq!(
+                admitted.as_schema().input_rules()[0].predicate(),
+                &InputPredicate::Secret
+            );
+        }
+    }
+
+    #[test]
+    fn secret_predicate_admission_rejects_targets_without_plain_string_type() {
+        for ty in [
+            AttributeType::list(AttributeType::string()),
+            AttributeType::map(AttributeType::string()),
+            AttributeType::bool(),
+            AttributeType::int(),
+            AttributeType::float(),
+            AttributeType::duration(),
+            AttributeType::ref_("NonText"),
+            AttributeType::reference(
+                TypeIdentity::new(Some("test"), ["secret"], "Reference"),
+                None,
+                None,
+            ),
+            AttributeType::enum_(
+                TypeIdentity::new(Some("test"), ["secret"], "Enum"),
+                Some(vec!["x".into()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+            AttributeType::union(vec![
+                AttributeType::string(),
+                AttributeType::refined_string(None, None, Some((Some(1), None)), None),
+            ]),
+        ] {
+            let errors = ResourceSchema::new("test.Secret")
+                .with_def("NonText", AttributeType::int())
+                .attribute(AttributeSchema::optional("value", ty).build())
+                .input_rule(rule(InputRuleTarget::Value(
+                    InputPath::new("value").unwrap(),
+                )))
+                .validate()
+                .expect_err("Secret requires a plain String target");
+            assert!(
+                errors
+                    .input_rule_errors()
+                    .any(|(_, error)| *error == InputRuleError::SecretRequiresPlainStringPath),
+                "{errors}"
+            );
+        }
+    }
+
+    #[test]
+    fn secret_predicate_admission_rejects_map_keys_targets() {
+        let errors = ResourceSchema::new("test.Secret")
+            .attribute(
+                AttributeSchema::optional("value", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .input_rule(rule(InputRuleTarget::MapKeys(
+                InputPath::new("value").unwrap(),
+            )))
+            .validate()
+            .expect_err("keys cannot carry the target node's secret evidence");
+        assert!(
+            errors
+                .input_rule_errors()
+                .any(|(_, error)| *error == InputRuleError::IncompatiblePredicate),
+            "{errors}"
+        );
     }
 }
 

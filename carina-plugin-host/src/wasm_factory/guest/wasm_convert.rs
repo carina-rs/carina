@@ -2772,6 +2772,56 @@ mod tests {
     }
 
     #[test]
+    fn host_provider_schema_decode_rejects_unknown_input_predicate_kind_without_dropping_rule() {
+        let mut resource = proto_resource(
+            "test.FuturePredicate",
+            [("value".into(), proto_attr("value", proto_string()))],
+        );
+        resource.input_rules.push(proto::InputRule {
+            scope: proto::InputRuleScope::EveryWrite,
+            target: proto::InputRuleTarget::Value("value".into()),
+            code: "value.present".into(),
+            condition: proto::InputCondition::Always,
+            predicate: proto::InputPredicate::Present,
+        });
+        let mut json = serde_json::to_value(proto::ProviderSchemaEnvelope {
+            resources: vec![resource],
+            reference_forms: Vec::new(),
+            assignability_edges: Vec::new(),
+        })
+        .unwrap();
+
+        // Exercise the same protocol conversion and admission as schemas() before
+        // replacing only the predicate kind with one this host does not know.
+        let admitted =
+            json_to_provider_schema(&json.to_string(), CoreValidatedConfigSchema::default())
+                .expect("the known predicate fixture must admit its rule");
+        assert_eq!(admitted.resources().len(), 1);
+        let rules = admitted.resources()[0].as_schema().input_rules();
+        assert_eq!(rules.len(), 1);
+        assert!(matches!(
+            rules[0].predicate(),
+            carina_core::schema::InputPredicate::Present
+        ));
+
+        json["resources"][0]["input_rules"][0]["predicate"] =
+            serde_json::json!({"kind": "future_kind_not_known"});
+        let error =
+            json_to_provider_schema(&json.to_string(), CoreValidatedConfigSchema::default())
+                .expect_err("an unknown predicate must reject the entire provider schema");
+        let SchemaDecodeError::JsonParse(source) = &error else {
+            panic!("unknown predicate must fail JSON decoding, got {error:?}");
+        };
+        assert!(source.is::<serde_json::Error>());
+        let rendered = render_error_chain(&error);
+        assert!(rendered.contains("schema JSON parse error"), "{rendered}");
+        assert!(
+            rendered.contains("unknown variant `future_kind_not_known`"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn sdk_json_host_round_trip_property_covers_portable_defaults() {
         let cases = vec![
             (

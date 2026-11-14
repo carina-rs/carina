@@ -7,6 +7,152 @@ use carina_core::{EnvironmentSnapshot, TestUserDirs};
 use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
 use std::sync::{Arc, OnceLock};
 
+/// A confirmed storage failure; every state or lock operation is forbidden.
+#[cfg(test)]
+pub(crate) struct UnavailableStorageBackend {
+    message: &'static str,
+    readiness_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl UnavailableStorageBackend {
+    pub(crate) fn new(message: &'static str) -> Self {
+        Self {
+            message,
+            readiness_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn readiness_calls(&self) -> usize {
+        self.readiness_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl carina_state::StateBackend for UnavailableStorageBackend {
+    async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {
+        panic!("unavailable storage must not be read")
+    }
+
+    async fn read_state_bytes(
+        &self,
+    ) -> carina_state::BackendResult<Option<carina_state::RawState>> {
+        panic!("unavailable storage bytes must not be read")
+    }
+
+    async fn write_state(&self, _: &carina_state::StateFile) -> carina_state::BackendResult<()> {
+        panic!("unavailable storage must not be written")
+    }
+
+    async fn write_state_locked(
+        &self,
+        _: &carina_state::StateFile,
+        _: &carina_state::LockInfo,
+    ) -> carina_state::BackendResult<()> {
+        panic!("unavailable storage must not be written under a lock")
+    }
+
+    async fn acquire_lock(&self, _: &str) -> carina_state::BackendResult<carina_state::LockInfo> {
+        panic!("unavailable storage must not be locked")
+    }
+
+    async fn release_lock(&self, _: &carina_state::LockInfo) -> carina_state::BackendResult<()> {
+        panic!("unavailable storage must not release a lock")
+    }
+
+    async fn renew_lock(
+        &self,
+        _: &carina_state::LockInfo,
+    ) -> carina_state::BackendResult<carina_state::LockInfo> {
+        panic!("unavailable storage must not renew a lock")
+    }
+
+    async fn force_unlock(&self, _: &str) -> carina_state::BackendResult<()> {
+        panic!("unavailable storage must not be force-unlocked")
+    }
+
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        self.readiness_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(carina_state::StorageReadiness::Unavailable(
+            carina_state::StorageUnavailable::new(carina_state::BackendError::Configuration(
+                self.message.into(),
+            )),
+        ))
+    }
+}
+
+/// Obtain a real S3 readiness capability over an in-process HTTP service.
+/// The returned request log makes bucket creation and public-access blocking
+/// observable without granting a test double its own provisioning method.
+#[cfg(test)]
+pub(crate) async fn missing_s3_backend(
+    auto_create: bool,
+) -> (
+    Box<dyn carina_state::StateBackend>,
+    Arc<std::sync::Mutex<Vec<winterbaume_core::MockRequest>>>,
+) {
+    let raw = parsed_fixture(&format!(
+        "backend s3 {{ bucket = \"state-bucket\" key = \"state.json\" auto_create = {auto_create} }}"
+    ));
+    let config = carina_state::BackendConfig::try_from(raw.backend.as_ref().unwrap()).unwrap();
+    missing_s3_backend_with_settings(config.as_s3().unwrap()).await
+}
+
+#[cfg(test)]
+pub(crate) async fn missing_s3_backend_with_settings(
+    settings: &carina_state::S3BackendSettings,
+) -> (
+    Box<dyn carina_state::StateBackend>,
+    Arc<std::sync::Mutex<Vec<winterbaume_core::MockRequest>>>,
+) {
+    use winterbaume_core::{MockAws, MockRequest, MockResponse, MockService};
+
+    struct MissingBucketService {
+        requests: Arc<std::sync::Mutex<Vec<MockRequest>>>,
+    }
+
+    impl MockService for MissingBucketService {
+        fn service_name(&self) -> &str {
+            "s3"
+        }
+
+        fn url_patterns(&self) -> Vec<&str> {
+            vec!["s3.", "s3-"]
+        }
+
+        fn handle(
+            &self,
+            request: MockRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MockResponse> + Send + '_>>
+        {
+            Box::pin(async move {
+                let status = if request.method == "HEAD" { 404 } else { 200 };
+                self.requests.lock().unwrap().push(request);
+                MockResponse::xml(status, "")
+            })
+        }
+    }
+
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mock = MockAws::builder()
+        .with_service(MissingBucketService {
+            requests: Arc::clone(&requests),
+        })
+        .build();
+    let sdk_config = mock.sdk_config("us-east-1").await;
+    let backend = carina_state::s3_backend_for_test(
+        aws_sdk_s3::Client::new(&sdk_config),
+        settings,
+        "us-east-1".to_owned(),
+    );
+    (backend, requests)
+}
+
 /// Presentation fixtures often omit provider schemas. Give those resource
 /// types an explicit coexistence policy; keep any schema supplied by the test.
 #[cfg(test)]

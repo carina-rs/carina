@@ -718,6 +718,55 @@ impl RawState {
     }
 }
 
+/// Whether state storage is ready, can be provisioned by S3, or needs an
+/// external action. Only the S3 backend can issue a provisioning capability.
+#[derive(Debug)]
+pub enum StorageReadiness {
+    Ready,
+    Provisionable(crate::backends::S3Bootstrap),
+    Unavailable(StorageUnavailable),
+}
+
+impl StorageReadiness {
+    /// Discard provisioning authority while retaining read-only metadata.
+    pub fn into_status(self) -> StorageReadinessStatus {
+        match self {
+            Self::Ready => StorageReadinessStatus::Ready,
+            Self::Provisionable(bootstrap) => {
+                StorageReadinessStatus::Provisionable(bootstrap.into_info())
+            }
+            Self::Unavailable(unavailable) => StorageReadinessStatus::Unavailable(unavailable),
+        }
+    }
+}
+
+/// Read-only readiness information. S3 metadata has no creation operation and
+/// cannot be converted back into a provisioning capability.
+#[derive(Debug)]
+pub enum StorageReadinessStatus {
+    Ready,
+    Provisionable(crate::backends::S3BootstrapInfo),
+    Unavailable(StorageUnavailable),
+}
+
+/// Storage the backend cannot provision. Retains the original diagnostic
+/// without granting any creation authority.
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub struct StorageUnavailable {
+    error: BackendError,
+}
+
+impl StorageUnavailable {
+    pub fn new(error: BackendError) -> Self {
+        Self { error }
+    }
+
+    pub fn into_error(self) -> BackendError {
+        self.error
+    }
+}
+
 /// Trait for state storage backends
 ///
 /// This trait defines the interface for storing and retrieving state files,
@@ -806,30 +855,13 @@ pub trait StateBackend: Send + Sync {
     /// This is an administrative operation that should be used with caution
     async fn force_unlock(&self, lock_id: &str) -> BackendResult<()>;
 
-    /// Check if the backend storage (bucket) exists
-    async fn bucket_exists(&self) -> BackendResult<bool>;
-
-    /// Create the backend storage (bucket) with appropriate settings
+    /// Inspect storage without creating it.
     ///
-    /// This creates the bucket with:
-    /// - Server-side encryption (AES256)
-    /// - Public access blocked
-    async fn create_bucket(&self) -> BackendResult<()>;
-
-    /// Provider name for this backend's storage resource (e.g., "aws" for S3)
-    fn provider_name(&self) -> Option<&str> {
-        None
-    }
-
-    /// Resource type of the storage resource (e.g., "s3.Bucket")
-    fn resource_type(&self) -> Option<&str> {
-        None
-    }
-
-    /// DSL resource definition for auto-generating bootstrap code
-    fn resource_definition(&self, _name: &str) -> Option<String> {
-        None
-    }
+    /// Return `Err` when the inspection itself fails, for example because of an
+    /// API, transport, or authentication failure. Return `Unavailable` when the
+    /// inspection confirms that storage is absent or unusable and Carina cannot
+    /// create it. Only S3 returns `Provisionable`.
+    async fn storage_readiness(&self) -> BackendResult<StorageReadiness>;
 }
 
 /// Read published exports through the version-independent exports decoder.
@@ -861,6 +893,34 @@ mod tests {
     use super::*;
     use crate::backend_config::{BackendConfig, BackendConfigError};
     use crate::lock::LockInfo;
+
+    #[test]
+    fn storage_readiness_status_preserves_ready_and_unavailable() {
+        match StorageReadiness::Ready.into_status() {
+            StorageReadinessStatus::Ready => {}
+            StorageReadinessStatus::Provisionable(_) => panic!("ready storage cannot provision"),
+            StorageReadinessStatus::Unavailable(error) => panic!("storage is ready: {error}"),
+        }
+
+        let unavailable = StorageUnavailable::new(BackendError::Configuration(
+            "Create the repository and branch before using this backend".to_owned(),
+        ));
+        match StorageReadiness::Unavailable(unavailable).into_status() {
+            StorageReadinessStatus::Ready => panic!("unavailable storage cannot become ready"),
+            StorageReadinessStatus::Provisionable(_) => {
+                panic!("unavailable storage cannot gain provisioning authority")
+            }
+            StorageReadinessStatus::Unavailable(unavailable) => {
+                let BackendError::Configuration(message) = unavailable.into_error() else {
+                    panic!("unavailable storage must retain the original error type")
+                };
+                assert_eq!(
+                    message,
+                    "Create the repository and branch before using this backend"
+                );
+            }
+        }
+    }
 
     #[test]
     fn round3_upstream_read_preserves_legacy_identity_classification() {
