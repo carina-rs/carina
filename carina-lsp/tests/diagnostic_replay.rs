@@ -668,3 +668,59 @@ fn replay_comparison_checks_every_completed_run() {
         serde_json::json!(["main.crn"])
     );
 }
+
+#[test]
+fn replay_parent_rejects_a_worker_that_runs_zero_tests() {
+    let fixture = tempfile::tempdir().unwrap();
+    let output = fixture.path().join("run-00");
+    let home = fixture.path().join("home");
+    std::fs::create_dir_all(home.join("tmp")).unwrap();
+    let result = std::panic::catch_unwind(|| {
+        replay::process::worker(
+            "__replay_missing_worker_test__",
+            &fixture.path().join("manifest.json"),
+            &output,
+            &home,
+            std::time::Duration::from_secs(30),
+            false,
+        )
+    });
+    assert!(
+        std::fs::read_to_string(output.join("stdout.log"))
+            .unwrap()
+            .contains("running 0 tests")
+    );
+    assert!(
+        result.is_err(),
+        "a successful exit without a replay must fail the parent"
+    );
+}
+
+#[test]
+fn replay_verifies_the_copied_corpus_independently_of_the_source_worktree() {
+    use std::process::Command;
+    let fixture = control();
+    for args in [vec!["init", "--quiet"], vec!["add", "*.crn", "module"]] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let output = tempfile::tempdir().unwrap();
+    let manifest = replay::manifest::Manifest::freeze_repository(fixture.path(), output.path());
+    let copied = manifest.root.join("main.crn");
+    let original = std::fs::read(&copied).unwrap();
+    std::fs::write(
+        fixture.path().join("main.crn"),
+        "# local edit after freezing\n",
+    )
+    .unwrap();
+    manifest.verify();
+    assert_eq!(std::fs::read(&copied).unwrap(), original);
+    std::fs::write(copied, "# changed replay input\n").unwrap();
+    assert!(std::panic::catch_unwind(|| manifest.verify()).is_err());
+}

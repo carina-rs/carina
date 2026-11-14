@@ -34,7 +34,7 @@ pub mod artifacts;
 #[path = "replay/manifest.rs"]
 pub mod manifest;
 #[path = "replay/process.rs"]
-mod process;
+pub mod process;
 
 use carina_core::{UserDirs, parser::ProviderContext, provider::ProviderFactory};
 use carina_lsp::admission_coverage::with_admission_coverage;
@@ -445,18 +445,53 @@ pub fn compare_runs(
     let [reference, second, remaining @ ..] = outputs else {
         return None;
     };
+    Some(compare_paths(
+        reference, second, remaining, corpus, documents,
+    ))
+}
+
+fn compare_paths(
+    reference: &Path,
+    second: &Path,
+    remaining: &[PathBuf],
+    corpus: &str,
+    documents: &[&PathBuf],
+) -> Comparison {
     let varying_documents = documents
         .iter()
         .filter(|document| {
             let name = format!("{}/{}.diagnostics.json", corpus, document.to_string_lossy());
             let reference = std::fs::read(reference.join(&name)).unwrap();
             std::iter::once(second)
-                .chain(remaining)
+                .chain(remaining.iter().map(PathBuf::as_path))
                 .any(|output| std::fs::read(output.join(&name)).unwrap() != reference)
         })
         .map(|document| (*document).clone())
         .collect();
-    Some(Comparison { varying_documents })
+    Comparison { varying_documents }
+}
+
+// Only coverage can finish without a comparison. Determinism carries two
+// mandatory completed workers independently of the number of additional runs.
+enum GateResult {
+    Coverage(process::CompletedWorker),
+    Determinism {
+        first: process::CompletedWorker,
+        second: process::CompletedWorker,
+        remaining: Vec<process::CompletedWorker>,
+        comparison: Comparison,
+    },
+}
+
+fn run_pair<F>(iterations: [usize; 2], run: &F) -> [process::CompletedWorker; 2]
+where
+    F: Fn(usize) -> process::CompletedWorker + Sync,
+{
+    std::thread::scope(|scope| {
+        iterations
+            .map(|iteration| scope.spawn(move || run(iteration)))
+            .map(|worker| worker.join().unwrap())
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -522,28 +557,22 @@ fn run_gate(test: &str, gate: Gate) {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        let repetitions: usize = match gate {
-            Gate::RepositoryShard(_) | Gate::Infra => 8,
-            Gate::RepositoryCoverage => 1,
-        };
-        let mut durations = Vec::new();
         // Warm shared compiled artifacts in one process, then bound concurrency
         // to two workers. All repetitions remain separate OS processes.
         let run = |iteration| {
             let worker_output = output.join(format!("run-{iteration:02}"));
             let infra = matches!(gate, Gate::Infra);
-            let seconds = process::worker(
+            let worker = process::worker(
                 test,
                 &manifest_path,
                 &worker_output,
                 &manifest.replay_home,
                 Duration::from_secs(if infra { 1800 } else { 900 }),
                 infra,
-            )
-            .as_secs_f64();
+            );
             if infra && iteration > 0 {
                 let metrics: Value = serde_json::from_slice(
-                    &std::fs::read(worker_output.join("metrics.json")).unwrap(),
+                    &std::fs::read(worker.output().join("metrics.json")).unwrap(),
                 )
                 .unwrap();
                 assert!(
@@ -555,48 +584,84 @@ fn run_gate(test: &str, gate: Gate) {
                     "warm replay must reuse published compiled modules"
                 );
             }
-            seconds
+            worker
         };
-        durations.push(run(0));
-        for pair in (1..repetitions).collect::<Vec<_>>().chunks(2) {
-            std::thread::scope(|scope| {
-                let workers = pair
-                    .iter()
-                    .map(|iteration| scope.spawn(|| run(*iteration)))
-                    .collect::<Vec<_>>();
-                for worker in workers {
-                    durations.push(worker.join().unwrap());
-                }
-            });
-        }
         let documents = manifest.selected_documents();
-        let outputs = (0..repetitions)
-            .map(|iteration| output.join(format!("run-{iteration:02}")))
+        let result = match gate {
+            Gate::RepositoryCoverage => GateResult::Coverage(run(0)),
+            Gate::RepositoryShard(_) | Gate::Infra => {
+                let first = run(0);
+                let [second, third] = run_pair([1, 2], &run);
+                let mut remaining = vec![third];
+                for pair in [[3, 4], [5, 6]] {
+                    remaining.extend(run_pair(pair, &run));
+                }
+                remaining.push(run(7));
+                let outputs = remaining
+                    .iter()
+                    .map(|worker| worker.output().to_path_buf())
+                    .collect::<Vec<_>>();
+                let comparison = compare_paths(
+                    first.output(),
+                    second.output(),
+                    &outputs,
+                    &manifest.corpus,
+                    &documents,
+                );
+                GateResult::Determinism {
+                    first,
+                    second,
+                    remaining,
+                    comparison,
+                }
+            }
+        };
+        let (workers, comparison) = match &result {
+            GateResult::Coverage(worker) => (vec![worker], None),
+            GateResult::Determinism {
+                first,
+                second,
+                remaining,
+                comparison,
+            } => (
+                std::iter::once(first)
+                    .chain(std::iter::once(second))
+                    .chain(remaining)
+                    .collect(),
+                Some(comparison),
+            ),
+        };
+        let repetitions = workers.len();
+        let durations = workers
+            .iter()
+            .map(|worker| worker.elapsed().as_secs_f64())
             .collect::<Vec<_>>();
-        let comparison = compare_runs(&outputs, &manifest.corpus, &documents);
         let worker_seconds_total: f64 = durations.iter().sum();
         write_json(
             &output.join("summary.json"),
             &json!({"processes":repetitions,"documents":documents.len(),"corpus_documents":manifest.documents.len(),"shard":manifest.shard,"comparison":comparison,"process_seconds":durations,"worker_seconds_total":worker_seconds_total,"gate_seconds":gate_start.elapsed().as_secs_f64()}),
         );
-        if let Some(comparison) = comparison {
-            assert!(
-                comparison.varying_documents.is_empty(),
-                "{} documents vary across {repetitions} LSP processes; evidence: {}",
-                comparison.varying_documents.len(),
-                output.display()
-            );
-            eprintln!(
-                "LSP replay: {repetitions} processes, {} documents, zero differences, {:.3}s total",
-                documents.len(),
-                gate_start.elapsed().as_secs_f64()
-            );
-        } else {
-            eprintln!(
-                "LSP coverage: {} documents, {:.3}s total",
-                documents.len(),
-                gate_start.elapsed().as_secs_f64()
-            );
+        match result {
+            GateResult::Determinism { comparison, .. } => {
+                assert!(
+                    comparison.varying_documents.is_empty(),
+                    "{} documents vary across {repetitions} LSP processes; evidence: {}",
+                    comparison.varying_documents.len(),
+                    output.display()
+                );
+                eprintln!(
+                    "LSP replay: {repetitions} processes, {} documents, zero differences, {:.3}s total",
+                    documents.len(),
+                    gate_start.elapsed().as_secs_f64()
+                );
+            }
+            GateResult::Coverage(_) => {
+                eprintln!(
+                    "LSP coverage: {} documents, {:.3}s total",
+                    documents.len(),
+                    gate_start.elapsed().as_secs_f64()
+                );
+            }
         }
     });
     if let Err(panic) = result {

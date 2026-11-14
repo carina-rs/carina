@@ -128,9 +128,9 @@ impl Manifest {
         let documents = tracked_documents(repo);
         let root = output.join("corpus");
         std::fs::create_dir(&root).expect("repository replay requires a fresh corpus directory");
-        // Production discovery and document analysis see an actual disk tree,
-        // containing only tracked working-tree files. Untracked installs and
-        // sibling documents cannot affect provider loading or diagnostics.
+        // Copy all tracked files: analysis may read non-.crn inputs. An isolated
+        // disk tree excludes untracked installs and sibling documents.
+        // CARINA_LSP_REPLAY_OUTPUT must be a fresh directory.
         for relative in tracked_files(repo) {
             let source = repo.join(&relative);
             if source.is_file() {
@@ -147,16 +147,6 @@ impl Manifest {
             None,
         );
         manifest.freeze();
-        let source_inputs = manifest
-            .inputs
-            .iter()
-            .filter_map(|(path, hash)| {
-                path.strip_prefix(&manifest.root)
-                    .ok()
-                    .map(|relative| (existing_locator(&repo.join(relative)), hash.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        manifest.inputs.extend(source_inputs);
         manifest.verify();
         manifest
     }

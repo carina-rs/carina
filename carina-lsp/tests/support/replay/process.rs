@@ -1,10 +1,37 @@
-use std::path::Path;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const CHILD: &str = "CARINA_LSP_REPLAY_CHILD";
 pub const MANIFEST: &str = "CARINA_LSP_REPLAY_MANIFEST";
 pub const WORKER_OUTPUT: &str = "CARINA_LSP_REPLAY_WORKER_OUTPUT";
+
+#[derive(Deserialize)]
+enum CompletedStage {
+    #[serde(rename = "complete")]
+    Complete,
+}
+
+#[derive(Deserialize)]
+struct CompletedRecord {
+    stage: CompletedStage,
+}
+
+pub struct CompletedWorker {
+    output: PathBuf,
+    elapsed: Duration,
+}
+
+impl CompletedWorker {
+    pub fn output(&self) -> &Path {
+        &self.output
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+}
 
 pub fn worker(
     test: &str,
@@ -13,8 +40,8 @@ pub fn worker(
     home: &Path,
     timeout: Duration,
     ignored: bool,
-) -> Duration {
-    std::fs::create_dir_all(output).unwrap();
+) -> CompletedWorker {
+    std::fs::create_dir(output).expect("replay worker output must be fresh");
     let stdout = std::fs::File::create(output.join("stdout.log")).unwrap();
     let stderr = std::fs::File::create(output.join("stderr.log")).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -57,5 +84,22 @@ pub fn worker(
         "LSP replay worker failed ({status}); evidence: {}",
         output.display()
     );
-    start.elapsed()
+    let record = std::fs::read(output.join("stage.json")).unwrap_or_else(|error| {
+        panic!(
+            "LSP replay worker did not complete: {error}; evidence: {}",
+            output.display()
+        )
+    });
+    let CompletedRecord {
+        stage: CompletedStage::Complete,
+    } = serde_json::from_slice(&record).unwrap_or_else(|error| {
+        panic!(
+            "LSP replay worker did not complete: {error}; evidence: {}",
+            output.display()
+        )
+    });
+    CompletedWorker {
+        output: output.to_path_buf(),
+        elapsed: start.elapsed(),
+    }
 }

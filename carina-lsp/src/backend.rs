@@ -868,7 +868,6 @@ pub async fn reload_provider_states(
     };
 
     let mut by_dir = HashMap::new();
-    let empty = ProviderState::empty(environment.clone());
     let mut total_schemas = 0;
     // Track whether any dir was freshly rebuilt (or whether the set of
     // known dirs changed). When every dir was reused and the import map
@@ -937,7 +936,6 @@ pub async fn reload_provider_states(
         // attached to the workspace even when no provider directories remain.
         states.by_dir = by_dir;
         states.import_map = import_map;
-        states.empty = empty;
     }
 
     warnings.sort_by(|a, b| (&a.directory, &a.provider).cmp(&(&b.directory, &b.provider)));
