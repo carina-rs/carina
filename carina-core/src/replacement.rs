@@ -18,7 +18,7 @@ use crate::schema::{SchemaKind, SchemaRegistry, UniqueNameSpec};
 
 #[path = "replacement/dependent.rs"]
 mod dependent;
-pub use dependent::{Dependent, Dependents, EmptyDependents};
+pub use dependent::{Dependent, Dependents, DependentsDecodeError, EmptyDependents};
 
 pub(crate) type CreateFirstRequirements = HashMap<ResolvedResourceId, BTreeSet<Dependent>>;
 
@@ -475,9 +475,7 @@ pub(crate) fn create_first_requirements<S, P: PlanValueKind>(
                 requirements
                     .entry(dependency)
                     .or_default()
-                    .insert(Dependent::new(ResolvedResourceId::new(
-                        effect.resource_id().clone(),
-                    )));
+                    .insert(Dependent::new(effect.scheduler_id()));
             }
         }
     }
@@ -508,22 +506,23 @@ fn cycle_promotions<S: Clone, P: PlanValueKind>(
             {
                 continue;
             }
-            dependents.extend(
-                edges
-                    .get(&delete)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .filter(|&candidate| {
-                        admitted.effects[candidate].resource_id() != target.as_inner()
-                            && dependency_reaches(&edges, candidate, create)
-                    })
-                    .map(|index| {
-                        Dependent::new(ResolvedResourceId::new(
-                            admitted.effects[index].resource_id().clone(),
-                        ))
-                    }),
-            );
+            let candidates: BTreeSet<_> = edges
+                .get(&delete)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&candidate| {
+                    admitted.effects[candidate].resource_id() != target.as_inner()
+                        && dependency_reaches(&edges, candidate, create)
+                })
+                .map(|index| Dependent::new(admitted.effects[index].scheduler_id()))
+                .collect();
+            if candidates.is_empty() {
+                // Preserve promotion for every reaching delete, including
+                // cycles whose only candidate is the target itself.
+                dependents.insert(Dependent::new(target.clone()));
+            }
+            dependents.extend(candidates);
         }
         if let Ok(dependents) = Dependents::try_from(dependents) {
             promotions.push((target.clone(), dependents));
@@ -1680,9 +1679,14 @@ mod tests {
     }
 
     #[test]
-    fn issue_4418_cycle_promotion_collects_all_consumers_without_self_fallback() {
+    fn issue_4418_cycle_promotion_collects_all_consumers_and_preserves_self_fallback() {
         use crate::resource::{DataSource, ResolvedDataSource};
-        let request = fixture(false);
+        let mut request = fixture(false);
+        let mut deposed = request.deletes[0].clone();
+        deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+        deposed.identifier = crate::effect::fixture_applied_identifier("deposed-id");
+        request.deletes =
+            NonEmptyDeletes::try_new(vec![request.deletes[0].clone(), deposed.clone()]).unwrap();
         let target = request.target().resolved_id();
         let lookup = |identity| Effect::Read {
             resource: ResolvedDataSource::from_resolved_parts(
@@ -1696,11 +1700,13 @@ mod tests {
             request.deletes[0].to_delete_effect(),
             lookup("z"),
             lookup("a"),
+            deposed.to_delete_effect(),
         ];
         let checked = resolve_replacement(request, &registry(UniqueNameSpec::Coexisting)).unwrap();
         let mut scheduling = ReplacementScheduling::default();
         scheduling.insert(checked.into_scheduling(), &effects, 0);
         scheduling.gate_barriers.insert(1, HashSet::from([2, 3]));
+        scheduling.gate_barriers.insert(4, HashSet::from([2, 3]));
         let mut admitted = AdmittedReplacementEffects {
             effects,
             scheduling,
@@ -1711,7 +1717,7 @@ mod tests {
         assert_eq!(
             promotions,
             vec![(
-                target,
+                target.clone(),
                 Dependents::try_from_iter([
                     Dependent::new(ResolvedResourceId::with_identity("test.Lookup", "a")),
                     Dependent::new(ResolvedResourceId::with_identity("test.Lookup", "z")),
@@ -1723,9 +1729,31 @@ mod tests {
             .scheduling
             .gate_barriers
             .insert(1, HashSet::from([0]));
-        assert!(
-            cycle_promotions(&admitted).is_empty(),
-            "a target cannot invent itself as a dependent"
+        admitted
+            .scheduling
+            .gate_barriers
+            .insert(4, HashSet::from([0]));
+        assert_eq!(
+            cycle_promotions(&admitted),
+            vec![(target.clone(), Dependent::new(target.clone()).into())],
+            "a self-only delete-to-create cycle must still be promoted"
+        );
+        admitted
+            .scheduling
+            .gate_barriers
+            .insert(1, HashSet::from([2, 3]));
+        assert_eq!(
+            cycle_promotions(&admitted),
+            vec![(
+                target.clone(),
+                Dependents::try_from_iter([
+                    Dependent::new(target),
+                    Dependent::new(ResolvedResourceId::with_identity("test.Lookup", "a")),
+                    Dependent::new(ResolvedResourceId::with_identity("test.Lookup", "z")),
+                ])
+                .unwrap()
+            )],
+            "each reaching delete contributes its reasons, including the self-only fallback"
         );
     }
 

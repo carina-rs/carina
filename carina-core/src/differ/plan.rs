@@ -1814,7 +1814,9 @@ fn promote_referenced_replaces_to_cbd(
             let Some(pending) = pending_replaces.get(dependency) else {
                 continue;
             };
-            if dependent == Dependent::new(pending.replacement.target().resolved_id()) {
+            if pending.replacement.is_create_first()
+                || dependent == Dependent::new(pending.replacement.target().resolved_id())
+            {
                 continue;
             }
             promote
@@ -1850,6 +1852,9 @@ fn mark_pending_create_before_destroy(
     registry: &SchemaRegistry,
     dependents: Dependents,
 ) -> Result<(), CreateBeforeDestroyError> {
+    if pending.replacement.is_create_first() {
+        return Ok(());
+    }
     let request = pending
         .replacement
         .clone()

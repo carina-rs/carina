@@ -27,13 +27,22 @@ impl Dependent {
 
 /// A non-empty ordered set. The existing non-empty owner retains the canonical
 /// sorted, deduplicated sequence; no API exposes mutable sequence access.
+/// Decoding requires that sequence to already be strictly increasing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "BTreeSet<Dependent>", into = "Vec<Dependent>")]
+#[serde(try_from = "Vec<Dependent>", into = "Vec<Dependent>")]
 pub struct Dependents(NonEmptyVec<Dependent>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("empty ordered set of replacement dependents")]
 pub struct EmptyDependents;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DependentsDecodeError {
+    #[error(transparent)]
+    Empty(#[from] EmptyDependents),
+    #[error("replacement dependents must be strictly increasing by system identity")]
+    NotStrictlyIncreasing,
+}
 
 impl Dependents {
     pub fn try_from_iter(
@@ -91,6 +100,22 @@ impl TryFrom<BTreeSet<Dependent>> for Dependents {
     }
 }
 
+impl TryFrom<Vec<Dependent>> for Dependents {
+    type Error = DependentsDecodeError;
+
+    fn try_from(dependents: Vec<Dependent>) -> Result<Self, Self::Error> {
+        let dependents = NonEmptyVec::from_vec(dependents).ok_or(EmptyDependents)?;
+        if dependents
+            .as_slice()
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(DependentsDecodeError::NotStrictlyIncreasing);
+        }
+        Ok(Self(dependents))
+    }
+}
+
 impl From<Dependents> for Vec<Dependent> {
     fn from(dependents: Dependents) -> Self {
         dependents.0.into_vec()
@@ -131,12 +156,45 @@ mod tests {
         let encoded = serde_json::to_value(&set).unwrap();
         assert_eq!(serde_json::from_value::<Dependents>(encoded).unwrap(), set);
         assert_eq!(Dependents::try_from_iter([]), Err(EmptyDependents));
+        assert_eq!(
+            Dependents::try_from(Vec::<Dependent>::new()),
+            Err(DependentsDecodeError::Empty(EmptyDependents))
+        );
         let error = serde_json::from_str::<Dependents>("[]").unwrap_err();
         assert_eq!(error.classify(), serde_json::error::Category::Data);
         assert!(error.to_string().contains(&EmptyDependents.to_string()));
         assert!(
             serde_json::from_str::<Dependents>(r#""binding-name""#).is_err(),
             "there is no legacy string decoder"
+        );
+    }
+
+    #[test]
+    fn issue_4418_decode_rejects_duplicate_dependents() {
+        let a = dependent("a", None);
+        let input = vec![a.clone(), a];
+        let wire = serde_json::to_value(&input).unwrap();
+        let error = serde_json::from_value::<Dependents>(wire)
+            .expect_err("duplicate dependents must be rejected, not deduplicated");
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+        assert!(error.to_string().contains("strictly increasing"), "{error}");
+        assert_eq!(
+            Dependents::try_from(input),
+            Err(DependentsDecodeError::NotStrictlyIncreasing)
+        );
+    }
+
+    #[test]
+    fn issue_4418_decode_rejects_unsorted_dependents() {
+        let input = vec![dependent("z", None), dependent("a", None)];
+        let wire = serde_json::to_value(&input).unwrap();
+        let error = serde_json::from_value::<Dependents>(wire)
+            .expect_err("unsorted dependents must be rejected, not reordered");
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+        assert!(error.to_string().contains("strictly increasing"), "{error}");
+        assert_eq!(
+            Dependents::try_from(input),
+            Err(DependentsDecodeError::NotStrictlyIncreasing)
         );
     }
 
