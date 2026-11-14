@@ -118,6 +118,15 @@ impl<'d> StaticSourceMode<'d> for JudgeSourceMode<'d> {
         let Some(converted) = &data.converted else {
             return Ok(StaticSourceData::Borrowed(data));
         };
+        let declaration = declaration
+            .ok_or_else(|| MissingEvidence::new("static conversion destination declaration"))?;
+        // This use owns target/destination legality even when its source's
+        // ordinary twin delegates to the value walk (including read-only runs).
+        let mut verdict = converted.compute_destination(declaration, self.defs, config);
+        if verdict.outcome().is_err() {
+            self.records.push((converted.clone(), verdict));
+            return Err(JudgeSourceError::Conversion);
+        }
         let twin = converted.source().for_sink(sink, config);
         let context = if converted.is_bare() {
             AdmissionContext::Assignment
@@ -144,28 +153,28 @@ impl<'d> StaticSourceMode<'d> for JudgeSourceMode<'d> {
                 && twin.concrete()
                 && !twin.requires_declared_assignment())
         {
-            return Ok(StaticSourceData::WalkOwned);
+            self.records.push((converted.clone(), verdict));
+            // A handle still needs precisely the twin's ordinary type and
+            // bare-handle diagnostics. Only conversion source checking abstains.
+            return Ok(if converted.source().structural_source {
+                StaticSourceData::Borrowed(&converted.source().data)
+            } else {
+                StaticSourceData::WalkOwned
+            });
         }
-        let declaration = declaration
-            .ok_or_else(|| MissingEvidence::new("static conversion destination declaration"))?;
-        let mut verdict = match converted.compute(declaration, self.defs, config) {
-            conversion::ComputedSource::Judged(verdict) => *verdict,
-            // Target and destination were checked; the twin supplies no static
-            // scalar source. The walk's slot value check owns the source side.
-            conversion::ComputedSource::WalkOwned => {
-                return Ok(StaticSourceData::WalkOwned);
-            }
-        };
-        let outcome = verdict.outcome.clone();
-        verdict.set_binding_receipt(Arc::new(StaticSourceReceipt {
-            expected: sink.clone(),
-            result: outcome
-                .as_ref()
-                .map(|_| ExpressionAdmission::ValueCheck)
-                .map_err(|_error| JudgeSourceError::Conversion),
-        }));
+        verdict = verdict.with_source(
+            converted.source(),
+            &conversion::ConversionContext {
+                catalog: config,
+                reference: crate::validation::admission::ReferenceSource::Unchecked,
+            },
+            conversion::SourceKnowledge::StaticOnly,
+        );
+        let outcome = verdict.outcome();
+        let walk_owned = verdict.source_is_walk_owned();
         self.records.push((converted.clone(), verdict));
         match outcome {
+            Ok(_) if walk_owned => Ok(StaticSourceData::WalkOwned),
             Ok(ty) => {
                 let mut projected = declared(Ok(ty), data.concrete());
                 projected.data_mut().diagnostic_scope = data.diagnostic_scope;
@@ -185,8 +194,8 @@ impl<'d> StaticSourceMode<'d> for JudgeSourceMode<'d> {
             declaration.ok_or_else(|| MissingEvidence::new("static source child destination"))?;
         let declaration =
             crate::schema::value_validation::resolve_assignment_declaration(declaration, self.defs)
-                .map_err(|error| InferenceError::UnknownType {
-                    reason: error.to_string(),
+                .map_err(|error| InferenceError::SchemaResolution {
+                    error: Box::new(error),
                 })?;
         let selected = match child {
             StaticChild::Union(index) => {
@@ -300,19 +309,84 @@ pub(super) fn admit_judged_resource_source(
         &mut mode,
         Some(declaration),
     );
-    let mut records = mode.records.into_iter();
-    let Some((source, verdict)) = records.next() else {
-        return ResourceSourceAdmission::WalkOwned(match result {
+    let mut checked_source = false;
+    for (source, verdict) in mode.records {
+        checked_source |= !verdict.source_is_walk_owned() || verdict.outcome().is_err();
+        findings.append_static(source.record(verdict));
+    }
+    if checked_source {
+        ResourceSourceAdmission::JudgedStatically(result)
+    } else {
+        ResourceSourceAdmission::WalkOwned(match result {
             Ok(admission) => Ok(admission),
             Err(JudgeSourceError::Ordinary(error)) => Err(error),
             Err(JudgeSourceError::Conversion) => {
                 Err(MissingEvidence::new("static conversion verdict evidence").into())
             }
-        });
-    };
-    findings.append_static(source.record(verdict));
-    for (source, verdict) in records {
-        findings.append_static(source.record(verdict));
+        })
     }
-    ResourceSourceAdmission::JudgedStatically(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn r16_static_sink_resolution_keeps_the_typed_error_source() {
+        let expression = JudgedExpr::build(
+            declared(
+                Ok(TypeExpr::DottedUnresolved(
+                    crate::parser::ResourceTypePath::new("absent", "Type"),
+                )),
+                true,
+            )
+            .data,
+            conversion::flow::JudgementEdges::Leaf,
+        );
+        let mut config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        config.custom_types =
+            crate::parser::ProviderCustomTypes::loaded(Default::default(), Box::new(|_, _| Ok(())));
+        let error = admit_ordinary_with_context(
+            expression.ordinary().unwrap(),
+            &TypeExpr::String,
+            AdmissionContext::Assignment,
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .source()
+                .and_then(
+                    |cause| cause.downcast_ref::<crate::static_type::StaticTypeResolutionError>()
+                )
+                .is_some(),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn r16_static_child_resolution_keeps_the_typed_error_source() {
+        let defs = Default::default();
+        let mode = JudgeSourceMode {
+            defs: &defs,
+            records: Vec::new(),
+        };
+        let declaration = crate::schema::CompiledAttributeType::ref_("absent");
+        let error = mode
+            .child(Some(&declaration), StaticChild::List)
+            .unwrap_err();
+        match error {
+            JudgeSourceError::Ordinary(error) => assert!(
+                error
+                    .source()
+                    .and_then(|cause| cause.downcast_ref::<Box<crate::schema::TypeError>>())
+                    .is_some(),
+                "{error:?}"
+            ),
+            JudgeSourceError::Conversion => {
+                panic!("ordinary schema lookup must not be conversion finding")
+            }
+        }
+    }
 }

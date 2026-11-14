@@ -427,17 +427,18 @@ fn conversion_discarded_union_rejects_ambiguous_identity() {
 }
 
 #[test]
-fn r11_report_only_slot_reads_a_static_verdict_or_fails_closed() {
+fn r16_report_only_slot_reads_recorded_destination_then_checks_the_source() {
     let catalog = super::tests::catalog();
     let mut schemas = schema();
     schemas.insert(
         "mock",
         ResourceSchema::new("Source")
             .attribute(AttributeSchema::optional("output", named()).build())
+            .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
             .validate()
             .unwrap(),
     );
-    for (operand, expected) in [("'ok'", 0), ("p.output", 1)] {
+    for (operand, expected) in [("'ok'", 0), ("p.output", 0), ("p.count", 1)] {
         let parsed = crate::parser::parse_file(
         &format!("let p = mock.Source {{}}\nlet sink = mock.Sink {{ target = {operand} as mock.Name }}"),
         Path::new("b1.crn"),
@@ -498,6 +499,12 @@ fn r11_report_only_slot_reads_a_static_verdict_or_fails_closed() {
                 expected,
                 "{conversions:?}"
             );
+            if expected == 1 {
+                assert_eq!(
+                    conversion_errors(&conversions)[0].kind(),
+                    ConversionErrorKind::ScalarKind
+                );
+            }
             assert!(
                 !crate::test_utils::render_presented_for_test(&conversions)
                     .contains("bug in carina")

@@ -142,7 +142,7 @@ pub enum NotInferableReason {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum InferenceError {
     #[error(transparent)]
     DirectoryConstraint(Box<crate::module_resolver::DirectoryConstraintDiagnostic>),
@@ -156,6 +156,16 @@ pub enum InferenceError {
     MissingEvidence(#[from] crate::parser::retained::MissingEvidence),
     #[error("{reason}", reason = crate::provider_text::DiagnosticText::new(reason))]
     UnknownType { reason: String },
+    #[error("schema declaration resolution failed")]
+    SchemaResolution {
+        #[source]
+        error: Box<crate::schema::TypeError>,
+    },
+    #[error("type resolution failed")]
+    TypeResolution {
+        #[source]
+        error: StaticTypeResolutionError,
+    },
     #[error("collection element types disagree: `{}` vs `{}`", crate::provider_text::DiagnosticText::new(types.expected()), crate::provider_text::DiagnosticText::new(types.actual()))]
     HeterogeneousCollection {
         types: crate::schema::MismatchTypeNames,
@@ -198,7 +208,7 @@ impl crate::resource::InsideSecret for InferenceError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum InferenceIssue {
     #[error(transparent)]
     Failed(InferenceError),

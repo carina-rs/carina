@@ -552,9 +552,6 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             >,
     {
         for resource in tree.project_resources() {
-            if self.ordinary_failure().is_some() {
-                continue;
-            }
             let carrying = match resource.authored_slots() {
                 Some(slots) => slots.carries_conversion(judged.report()),
                 None => Ok(false),

@@ -3911,9 +3911,6 @@ mod judgement {
         result: Result<ExpressionAdmission, static_admission::JudgeSourceError>,
     }
     impl StaticSourceReceipt {
-        pub(in crate::parser::retained) fn matches(&self, expected: &TypeExpr) -> bool {
-            &self.expected == expected
-        }
         pub(crate) fn binding_result(&self, expected: &TypeExpr) -> Result<(), InferenceError> {
             if expected != &self.expected {
                 return Err(MissingEvidence::new("static source receipt destination").into());
@@ -3949,12 +3946,7 @@ mod judgement {
                     Some(receipt) => {
                         BindingDiagnosticOwner::JudgedConversion(Arc::new(receipt.clone()))
                     }
-                    None => match expected
-                        .and_then(|expected| self.converted.as_ref()?.binding_receipt(expected))
-                    {
-                        Some(receipt) => BindingDiagnosticOwner::JudgedConversion(receipt),
-                        None => BindingDiagnosticOwner::WalkOwnedConversion,
-                    },
+                    None => BindingDiagnosticOwner::WalkOwnedConversion,
                 };
             };
             let ordinary = OrdinaryJudgedExpr {
@@ -4231,18 +4223,13 @@ mod judgement {
         if expression.is_value_dependent() {
             return Ok(mode.value_check());
         }
-        let sink = crate::validation::resolve_type_expr(sink, config).map_err(|error| {
-            InferenceError::UnknownType {
-                reason: error.to_string(),
-            }
-        })?;
+        let sink = crate::validation::resolve_type_expr(sink, config)
+            .map_err(|error| InferenceError::TypeResolution { error })?;
         let sink = &sink;
         let resolved_actual = ty
             .map(|ty| crate::validation::resolve_type_expr(ty, config))
             .transpose()
-            .map_err(|error| InferenceError::UnknownType {
-                reason: error.to_string(),
-            })?;
+            .map_err(|error| InferenceError::TypeResolution { error })?;
         let ty = resolved_actual.as_ref();
         if context == AdmissionContext::Resource
             && matches!(kind, Some(InferredKind::Reference(_)))

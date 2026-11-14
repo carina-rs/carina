@@ -1210,7 +1210,10 @@ where
                         }),
                     ))
                 }
-                Ok(crate::parser::retained::TypeProjection::Available(_)) | Err(_) => {
+                Err(missing) => ExportStaticType::Inferred(StaticType::Unchecked(
+                    InferredUncheckedReason::InferenceFailed(missing.clone().into()),
+                )),
+                Ok(crate::parser::retained::TypeProjection::Available(_)) => {
                     match (&parameter.static_type, &parameter.value) {
                         (
                             Some(type_expr @ (TypeExpr::Ref(_) | TypeExpr::DottedUnresolved(_))),
@@ -1475,6 +1478,39 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn r16_missing_export_judgement_is_a_typed_error() {
+        let mut parsed = crate::parser::parse_and_resolve("let x = 1\n").unwrap();
+        parsed
+            .export_params
+            .push(crate::parser::ParsedExportParam::new_in_source(
+                "unregistered".into(),
+                Some(TypeExpr::String),
+                Some(crate::parser::BoundaryExpression::Value(Value::Concrete(
+                    crate::resource::ConcreteValue::String("ok".into()),
+                ))),
+                crate::parser::SourceSpan::dummy(),
+                crate::parser::ModuleCallId::test_dummy_in("unregistered.crn")
+                    .declaration_location()
+                    .clone(),
+            ));
+        let inferred = apply_inference(
+            parsed,
+            &SchemaRegistry::new(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert!(
+            matches!(
+                inferred.export_params[0].static_type,
+                ExportStaticType::Inferred(StaticType::Unchecked(
+                    InferredUncheckedReason::InferenceFailed(InferenceError::MissingEvidence(_))
+                ))
+            ),
+            "{:?}",
+            inferred.export_params[0].static_type
+        );
+    }
 
     #[test]
     fn r5c_metadata_export_projection_has_no_type_for_a_carried_value() {

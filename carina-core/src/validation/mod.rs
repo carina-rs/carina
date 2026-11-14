@@ -2996,7 +2996,7 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress, E: InsideSecret>(
 /// A statically-known postfix access error shared by CLI validation and LSP
 /// diagnostics. Keeping the inference/error selection here prevents editor
 /// callers from silently treating a new inference error variant as success.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DeferredAccessTypeError {
     InvalidAccess {
         error: inference::InferenceError,
@@ -3067,7 +3067,7 @@ impl DeferredAccessTypeError {
 /// use carina_core::validation::IntegerArithmeticTypeFinding;
 /// fn fabricate(finding: IntegerArithmeticTypeFinding) { let span = finding.operator_span(); }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IntegerArithmeticTypeFinding {
     error: DeferredAccessTypeError,
 }
@@ -3200,6 +3200,8 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }
+            | inference::InferenceError::SchemaResolution { .. }
+            | inference::InferenceError::TypeResolution { .. }
             | inference::InferenceError::UnknownType { .. }),
         )) => return Err(DeferredAccessTypeError::InvalidAccess { error }),
         // Dynamic result types and unavailable authorities cannot be checked
@@ -6577,6 +6579,8 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         }
         Err(crate::static_type::InferenceIssue::Failed(
             inference::InferenceError::UnknownType { .. }
+            | inference::InferenceError::SchemaResolution { .. }
+            | inference::InferenceError::TypeResolution { .. }
             | inference::InferenceError::UnknownBinding { .. }
             | inference::InferenceError::UnknownAttribute { .. }
             | inference::InferenceError::InvalidAccess { .. }

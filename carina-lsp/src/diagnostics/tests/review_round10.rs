@@ -95,9 +95,8 @@ fn r10_provider_finalization_observes_unsaved_imported_module_values() {
 }
 
 #[test]
-fn r10_reinstanced_omitted_slots_keep_source_evidence_in_the_lsp_fallback() {
+fn r16_reinstanced_omitted_sources_keep_the_twins_ordinary_gate() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
-    use carina_core::validation::admission::attributes::{ResourceAttributeInputs, SlotPrechecks};
     let mut schemas = SchemaRegistry::new();
     schemas.insert("mock", ResourceSchema::new("Source").validate().unwrap());
     schemas.insert(
@@ -122,65 +121,86 @@ fn r10_reinstanced_omitted_slots_keep_source_evidence_in_the_lsp_fallback() {
     for module in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
-        let body = "let p = mock.Source {}\nlet sinks = for n in ['a', 'b'] { mock.Sink { attr = p as mock.Name } }\n";
-        let source = if module {
+        if module {
             std::fs::create_dir(directory.path().join("child")).unwrap();
-            std::fs::write(
-                directory.path().join("child/main.crn"),
-                format!("arguments {{ unused: String = 'ok' }}\n{body}"),
-            )
-            .unwrap();
-            "let child = use { source = './child' }\nlet first = child {}\nlet second = child {}\n"
-        } else {
-            body
-        };
-        let path = directory.path().join("main.crn");
-        std::fs::write(&path, source).unwrap();
-        let document = create_document_at(source, path.clone());
-        let measured = engine.with_run_for_test(|run| {
-            let doc = document.for_diagnostics().unwrap();
-            let base = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
-            let merged = run.parse_and_resolve_merged_with_buffer(&doc, Some("main.crn"), &base).unwrap();
-            let source_configuration = carina_core::config_loader::load_buffer_configuration(merged.directory.parsed.parsed(), &run.schemas, run.provider_context.catalog());
-            let source_tree = carina_core::parser::AnalysisTree::try_from_file(source_configuration.judged().file()).unwrap();
-            let source_map = authored_validation_resources(&source_tree);
-            let buffer_tree = carina_core::parser::AnalysisTree::try_from_file(doc.parsed().unwrap()).unwrap();
-            let mut selections = Vec::new();
-            for resource in buffer_tree.project_resources().filter(|resource| resource.authored_slot("attr").is_ok()) {
-                let values = resource.attributes().into_owned();
-                let (_, inputs) = select_admission_inputs(resource, Some(&source_map), &values, source_configuration.judged().report(), SlotPrechecks::Unreported);
-                selections.push(serde_json::json!({"resource":resource.id().to_string(), "value_present":values.contains_key("attr"), "fallback":inputs.authored_evidence().is_err()}));
-            }
-            let checks::MergedModuleResolution::Expanded { graph } = &merged.module_resolution else { panic!("the production resolver did not expand this fixture"); };
-            let expanded_configuration = carina_core::config_loader::load_buffer_configuration(graph.as_ref(), &run.schemas, run.provider_context.catalog());
-            let judged = expanded_configuration.judged();
-            let expanded_tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
-            let mut rows = Vec::new();
-            for resource in expanded_tree.project_resources().filter(|resource|resource.authored_slot("attr").is_ok()) {
-                let values = resource.attributes().into_owned();
-                let for_resource = ResourceAttributeInputs::for_resource(resource, judged.report()).is_ok();
-                let slot = resource.authored_slot("attr").unwrap();
-                let cursor = slot.cursor();
-                let cursor_carries = cursor.as_ref().ok().map(|cursor|cursor.node().judgement().ordinary().is_err());
-                // Exercise the report-only constructor on the same real
-                // expanded resource; do not invent a missing source report.
-                let fallback = ResourceAttributeInputs::from_report(resource, &values, judged.report());
-                assert!(fallback.authored_evidence().is_err());
-                rows.push(serde_json::json!({"resource":resource.id().to_string(), "runtime_value_present":values.contains_key("attr"), "projection_present":slot.projection().is_some(), "for_resource_succeeded":for_resource, "cursor_carries":cursor_carries, "cursor_error":cursor.err().map(|error|error.to_string())}));
-            }
-            assert_eq!(rows.len(), if module {4} else {2});
-            assert!(rows.iter().all(|row|row["runtime_value_present"]==false && row["for_resource_succeeded"]==true && row["cursor_carries"]==true), "{rows:?}");
-            serde_json::json!({"buffer_selections":selections,"expanded_slots":rows})
-        });
-        let diagnostics =
-            crate::test_support::Diagnostics::from_schemas(directory.path(), schemas.clone())
-                .analyze(&document, Some(&path));
-        println!("R10-FALLBACK {}", serde_json::json!({"module":module,"source":source,"body":body,"evidence":measured,"lsp":diagnostics}).to_string().replace(directory.path().to_str().unwrap(), "<fixture>"));
-        assert!(
-            diagnostics
+        }
+        let mut observations = Vec::new();
+        for converted in [false, true] {
+            let operand = if converted { "p as mock.Name" } else { "p" };
+            let body = format!(
+                "let p = mock.Source {{}}\nlet sinks = for n in ['a', 'b'] {{ mock.Sink {{ attr = {operand} }} }}\n"
+            );
+            let source = if module {
+                std::fs::write(
+                    directory.path().join("child/main.crn"),
+                    format!("arguments {{ unused: String = 'ok' }}\n{body}"),
+                )
+                .unwrap();
+                "let child = use { source = './child' }\nlet first = child {}\nlet second = child {}\n".to_owned()
+            } else {
+                body.clone()
+            };
+            let path = directory.path().join("main.crn");
+            std::fs::write(&path, &source).unwrap();
+            let document = create_document_at(&source, path.clone());
+            let resolution = engine.with_run_for_test(|run| {
+                let doc = document.for_diagnostics().unwrap();
+                let base = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+                let merged = run
+                    .parse_and_resolve_merged_with_buffer(&doc, Some("main.crn"), &base)
+                    .unwrap();
+                match &merged.module_resolution {
+                    checks::MergedModuleResolution::Unowned { errors } => errors
+                        .iter()
+                        .map(|error| error.display_relative_to(directory.path()))
+                        .collect::<Vec<_>>(),
+                    checks::MergedModuleResolution::ConstraintFailed { findings, errors } => {
+                        panic!(
+                            "unexpected constraint failure: {findings:?}; {:?}",
+                            errors
+                                .iter()
+                                .map(|error| error.display_relative_to(directory.path()))
+                                .collect::<Vec<_>>()
+                        )
+                    }
+                    checks::MergedModuleResolution::Unanalyzed => {
+                        panic!("unexpected analysis failure: {:?}", merged.analysis_errors)
+                    }
+                    checks::MergedModuleResolution::Expanded { .. } => {
+                        panic!("the ordinary resource-handle precheck must prevent this expansion")
+                    }
+                }
+            });
+            // The new twin precheck reports the resource handle before expansion.
+            // This former fallback reproducer can no longer reach an admitting walk.
+            assert!(
+                resolution
+                    .iter()
+                    .any(|message| message.contains("expected mock.Name, got mock.Source")),
+                "{resolution:?}"
+            );
+            let diagnostics =
+                crate::test_support::Diagnostics::from_schemas(directory.path(), schemas.clone())
+                    .analyze(&document, Some(&path));
+            println!("R16-OMITTED {}", serde_json::json!({"module":module,"converted":converted,"source":source,"body":body,"resolution":resolution,"lsp":diagnostics}).to_string().replace(directory.path().to_str().unwrap(), "<fixture>"));
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| !diagnostic.message.contains("conversion")
+                        && !diagnostic.message.contains("bug in carina")),
+                "{diagnostics:?}"
+            );
+            let errors = diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)),
-            "{diagnostics:?}"
+                .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                .map(|diagnostic| (diagnostic.message.clone(), diagnostic.code.clone()))
+                .collect::<Vec<_>>();
+            assert!(!errors.is_empty(), "{diagnostics:?}");
+            observations.push((resolution, errors));
+        }
+        assert_eq!(
+            observations[1], observations[0],
+            "module={module}: the as form must preserve the ordinary twin's gate"
         );
     }
 }

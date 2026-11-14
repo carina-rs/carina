@@ -241,9 +241,18 @@ macro_rules! omitted_attribute_case {
             let json = fixture.validate();
             assert_eq!(json["status"], "error", "{source}\n{json}");
             let errors = json["errors"].as_array().unwrap();
-            assert_eq!(errors.len(), 1, "{json}");
-            assert_eq!(errors[0]["message"], BARE_RESOURCE, "{json}");
-            assert!(errors[0]["code"].is_null(), "{json}");
+            assert_eq!(
+                errors
+                    .iter()
+                    .map(|finding| finding["message"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["expected mock.Name, got mock.Source", BARE_RESOURCE],
+                "{json}",
+            );
+            assert!(
+                errors.iter().all(|finding| finding["code"].is_null()),
+                "{json}"
+            );
         }
 
         #[tokio::test]
@@ -678,7 +687,7 @@ async fn r9_json_plan_cannot_save_a_resource_with_an_omitted_attribute() {
 }
 
 #[test]
-fn r9_cross_file_converted_structural_alias_has_only_the_ordinary_operand_error() {
+fn r9_cross_file_converted_structural_alias_has_only_the_twins_ordinary_errors() {
     let fixture = Fixture::new(Shape::Sibling);
     let a = "let p = mock.Source { output = 'ok' }\nlet q = p as mock.Name\n";
     let b = "mock.OmittedSink { attr = { b = q } }\n";
@@ -686,15 +695,22 @@ fn r9_cross_file_converted_structural_alias_has_only_the_ordinary_operand_error(
     std::fs::write(fixture.document_path(), b).unwrap();
     let json = fixture.validate();
     let errors = json["errors"].as_array().unwrap();
-    assert_eq!(errors.len(), 1, "{json}");
+    assert_eq!(errors.len(), 2, "{json}");
+    assert_eq!(
+        errors[0]["message"], "expected mock.Name, got mock.Source",
+        "{json}"
+    );
     assert!(
-        errors[0]["message"]
+        errors[1]["message"]
             .as_str()
             .unwrap()
             .contains("'q' is a resource, not a value"),
         "{json}"
     );
-    assert!(errors[0]["code"].is_null(), "{json}");
+    assert!(
+        errors.iter().all(|finding| finding["code"].is_null()),
+        "{json}"
+    );
     for (file, source) in [("a.crn", a), ("b.crn", b)] {
         let diagnostics = fixture.lsp_at(fixture.directory.path().join(file), source.into());
         assert!(

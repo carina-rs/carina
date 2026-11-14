@@ -953,7 +953,7 @@ pub enum Admission<
 }
 
 /// Reference lookup failures retain their original structured information.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum AdmissionReferenceError {
     #[error("{0}")]
     Authored(Box<crate::validation::ReferenceFinding>),

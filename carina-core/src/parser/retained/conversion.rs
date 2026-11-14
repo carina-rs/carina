@@ -4,7 +4,7 @@ pub(crate) mod diagnostic;
 pub(crate) mod flow;
 mod static_source;
 pub(in crate::parser::retained) use static_source::{
-    ComputedSource, ConversionTypeJudgement, StaticVerdict,
+    ConversionTypeJudgement, SourceKnowledge, StaticVerdict,
 };
 
 use super::*;
@@ -736,10 +736,11 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                         verdict: match source.conversion_type_judgement() {
                             Some(record) => match record.owner(declaration) {
                                 static_source::StaticOwner::JudgedStatically(verdict) => verdict
-                                    .consume::<K>(
+                                    .resume::<K>(
                                         path,
                                         static_source::SourceKnowledge::at(checked, source),
-                                        static_source::VerdictOrigin::Judge,
+                                        source,
+                                        &context,
                                     ),
                                 static_source::StaticOwner::WalkOwned => {
                                     ConversionVerdict::unchecked(source, carried)
@@ -855,7 +856,7 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                     .check_walk(source, declaration, defs, &context, knowledge)
                     .consume::<K>(path, knowledge, static_source::VerdictOrigin::Walk),
                 StaticOwner::JudgedStatically(verdict) => {
-                    verdict.consume::<K>(path, knowledge, static_source::VerdictOrigin::Judge)
+                    verdict.resume::<K>(path, knowledge, source, &context)
                 }
                 StaticOwner::Missing(error) => {
                     return Ok(rejected(&usage, declaration, error, false));

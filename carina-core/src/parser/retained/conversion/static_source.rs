@@ -1,9 +1,10 @@
 //! Static source legality shared by the Judge and authored destination walk.
 //! These are completed judgements, not obligations or a list of uses to visit.
 use super::*;
+use crate::parser::ResolvedSchemaType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SourceKnowledge {
+pub(in crate::parser::retained) enum SourceKnowledge {
     StaticOnly,
     Known,
     Deferred,
@@ -35,36 +36,77 @@ impl DeclarationAddress {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum SourceCheck {
-    Static,
-    ValueCheck,
-}
-
-pub(in crate::parser::retained) enum ComputedSource {
-    Judged(Box<StaticVerdict>),
+    Judged(Result<(), ConversionError>),
     WalkOwned,
 }
 
 #[derive(Debug, Clone)]
+struct MatchedDestination {
+    target: ResolvedSchemaType,
+    selected: CompiledAttributeType,
+}
+
+#[derive(Debug, Clone)]
 pub(in crate::parser::retained) struct StaticVerdict {
-    pub(in crate::parser::retained) outcome: Result<TypeExpr, ConversionError>,
+    destination: Result<MatchedDestination, ConversionError>,
     pub(super) matched_destination: bool,
     union_destination: bool,
     site: ConversionSite,
     secret: bool,
-    binding: Option<Arc<StaticSourceReceipt>>,
     declaration: DeclarationAddress,
     resolved: DeclarationAddress,
     members: Arc<[(DeclarationAddress, bool)]>,
     source_check: SourceCheck,
 }
 impl StaticVerdict {
-    pub(in crate::parser::retained) fn set_binding_receipt(
-        &mut self,
-        receipt: Arc<StaticSourceReceipt>,
-    ) {
-        self.binding = Some(receipt);
+    pub(in crate::parser::retained) fn outcome(&self) -> Result<TypeExpr, ConversionError> {
+        let destination = self.destination.as_ref().map_err(Clone::clone)?;
+        match &self.source_check {
+            SourceCheck::Judged(Err(error)) => Err(error.clone()),
+            SourceCheck::Judged(Ok(())) | SourceCheck::WalkOwned => Ok(TypeExpr::SchemaType {
+                owned: destination.target.clone(),
+            }),
+        }
+    }
+    pub(in crate::parser::retained) fn source_is_walk_owned(&self) -> bool {
+        matches!(self.source_check, SourceCheck::WalkOwned)
+    }
+    pub(in crate::parser::retained) fn with_source(
+        mut self,
+        source: &JudgedExpr,
+        context: &ConversionContext<'_>,
+        knowledge: SourceKnowledge,
+    ) -> Self {
+        if let Ok(destination) = &self.destination {
+            self.source_check = judge_source(
+                &self.site,
+                source,
+                destination,
+                context,
+                knowledge,
+                self.union_destination,
+            );
+        }
+        self
+    }
+    /// A Judge-owned destination is never resolved or selected a second time.
+    /// Only the source relation deferred by that Judge use can run here.
+    pub(super) fn resume<K: DestinationKind>(
+        mut self,
+        path: &LeafPath,
+        knowledge: SourceKnowledge,
+        source: &JudgedExpr,
+        context: &ConversionContext<'_>,
+    ) -> ConversionVerdict {
+        let origin = if self.destination.is_ok() && self.source_is_walk_owned() {
+            self = self.with_source(source, context, knowledge);
+            VerdictOrigin::Walk
+        } else {
+            VerdictOrigin::Judge
+        };
+        self.consume::<K>(path, knowledge, origin)
     }
     pub(super) fn consume<K: DestinationKind>(
         mut self,
@@ -72,16 +114,16 @@ impl StaticVerdict {
         knowledge: SourceKnowledge,
         mut origin: VerdictOrigin,
     ) -> ConversionVerdict {
-        if self.outcome.is_ok()
+        if self.outcome().is_ok()
             && let Err(error) =
                 deferred_union_check(&self.site, self.secret, self.union_destination, knowledge)
         {
-            self.outcome = Err(error);
+            self.source_check = SourceCheck::Judged(Err(error));
             // This Current-value verdict was not produced by the static Judge.
             origin = VerdictOrigin::Walk;
         }
         let discarded = knowledge == SourceKnowledge::Discarded;
-        let decision = match self.outcome {
+        let decision = match self.outcome() {
             Ok(_) => {
                 let mut findings = if discarded {
                     AssignmentFindings::default()
@@ -114,15 +156,15 @@ impl StaticVerdict {
         let mut verdict = self.clone();
         if let Some(selected) = member {
             verdict.matched_destination = selected;
-            if !selected && verdict.outcome.is_ok() {
-                verdict.outcome = Err(ConversionError::new(
+            if !selected && verdict.outcome().is_ok() {
+                verdict.destination = Err(ConversionError::new(
                     Kind::Destination,
                     &self.site.location,
                     "conversion destination must have exactly one matching type identity",
                 )
                 .owned_by(self.site.node));
                 if self.secret {
-                    verdict.outcome = verdict.outcome.map_err(InsideSecret::inside_secret);
+                    verdict.destination = verdict.destination.map_err(InsideSecret::inside_secret);
                 }
             }
         }
@@ -152,7 +194,6 @@ struct RecordedStaticVerdicts {
     // Completed results on this Convert, keyed by the consuming declaration's
     // stamp. No syntax/value correspondence; never enumerated for diagnostics.
     declarations: std::collections::HashMap<DeclarationAddress, RecordedStaticVerdict>,
-    bindings: Vec<Arc<StaticSourceReceipt>>,
 }
 #[derive(Debug)]
 struct RecordedStaticVerdict {
@@ -161,9 +202,6 @@ struct RecordedStaticVerdict {
 }
 impl RecordedStaticVerdicts {
     fn insert(&mut self, verdict: StaticVerdict) {
-        if let Some(binding) = &verdict.binding {
-            self.bindings.push(binding.clone());
-        }
         let verdict = Arc::new(verdict);
         for address in [verdict.declaration, verdict.resolved] {
             self.declarations.insert(
@@ -218,15 +256,15 @@ impl ConversionTypeJudgement {
         context: &ConversionContext<'_>,
         knowledge: SourceKnowledge,
     ) -> StaticVerdict {
-        judge_conversion(
+        judge_destination(
             &self.site,
             &self.target,
             source,
             declaration,
             defs,
-            context,
-            knowledge,
+            context.catalog,
         )
+        .with_source(source, context, knowledge)
     }
     pub(super) fn owner(&self, declaration: &CompiledAttributeType) -> StaticOwner {
         match &*self
@@ -254,58 +292,30 @@ impl ConversionTypeJudgement {
     pub(in crate::parser::retained) fn is_bare(&self) -> bool {
         self.bare
     }
-    pub(in crate::parser::retained) fn binding_receipt(
-        &self,
-        expected: &TypeExpr,
-    ) -> Option<Arc<StaticSourceReceipt>> {
-        match &*self
-            .authority
-            .lock()
-            .expect("conversion static judgement lock")
-        {
-            StaticAuthority::WalkOwned => None,
-            StaticAuthority::JudgedStatically(verdicts) => verdicts
-                .bindings
-                .iter()
-                .find(|receipt| receipt.matches(expected))
-                .cloned(),
-        }
-    }
     pub(in crate::parser::retained) fn source(&self) -> &JudgedExpr {
         &self.source
     }
-    pub(in crate::parser::retained) fn compute(
+    pub(in crate::parser::retained) fn compute_destination(
         &self,
         declaration: &CompiledAttributeType,
         defs: &std::collections::BTreeMap<String, CompiledAttributeType>,
         config: &crate::parser::ProviderContext,
-    ) -> ComputedSource {
-        let verdict = judge_conversion(
+    ) -> StaticVerdict {
+        judge_destination(
             &self.site,
             &self.target,
             &self.source,
             declaration,
             defs,
-            &ConversionContext {
-                catalog: config,
-                reference: crate::validation::admission::ReferenceSource::Unchecked,
-            },
-            SourceKnowledge::StaticOnly,
-        );
-        match (&verdict.outcome, verdict.source_check) {
-            (Ok(_), SourceCheck::ValueCheck) => ComputedSource::WalkOwned,
-            (Ok(_), SourceCheck::Static)
-            | (Err(_), SourceCheck::Static | SourceCheck::ValueCheck) => {
-                ComputedSource::Judged(Box::new(verdict))
-            }
-        }
+            config,
+        )
     }
     pub(in crate::parser::retained) fn record(
         &self,
         verdict: StaticVerdict,
     ) -> crate::ConversionChannel {
         let mut findings = crate::ConversionChannel::default();
-        if let Err(error) = &verdict.outcome
+        if let Err(error) = verdict.outcome()
             && self.reported.set(error.clone()).is_ok()
         {
             findings = std::iter::once(error.clone()).collect();
@@ -363,29 +373,45 @@ fn static_error(
     }
 }
 
-pub(super) fn judge_conversion(
+fn judge_destination(
     site: &ConversionSite,
     path: &ConversionTypePath,
     source: &JudgedExpr,
     declaration: &CompiledAttributeType,
     defs: &std::collections::BTreeMap<String, CompiledAttributeType>,
-    context: &ConversionContext<'_>,
-    knowledge: SourceKnowledge,
+    config: &crate::parser::ProviderContext,
 ) -> StaticVerdict {
-    let config = context.catalog;
     let mut matched_destination = false;
     let mut union_destination = false;
     let mut resolved_address = DeclarationAddress::of(declaration);
     let mut probes = Vec::new();
-    let mut source_check = SourceCheck::Static;
-    let outcome = (|| {
-        let target = diagnostic::resolve_target(path, &site.location, config)
-            .map_err(|error| error.owned_by(site.node))?;
-        let resolved =
-            crate::schema::value_validation::resolve_assignment_declaration(declaration, defs)
-                .map_err(|cause| ConversionError::destination(&site.location, site.node, cause))?;
+    let mut selected_address = None;
+    let resolved =
+        crate::schema::value_validation::resolve_assignment_declaration(declaration, defs);
+    // Cache all consumption stamps even when the target/identity is rejected.
+    // A union probe then reads that Judge failure rather than inventing a miss.
+    if let Ok(resolved) = &resolved {
         resolved_address = DeclarationAddress::of(resolved);
         union_destination = matches!(resolved.kind(), AttrTypeKind::Union(_));
+        if let Some(members) = crate::schema::union_members_with_defs(resolved, defs) {
+            for (index, member) in members.iter().enumerate() {
+                if let Some(member) = member {
+                    let canonical = DeclarationAddress::of(member.as_attr());
+                    probes.push((canonical, canonical));
+                    if let crate::schema::RawShape::Union(raw) = resolved.raw_shape()
+                        && let Some(raw) = raw.get(index)
+                    {
+                        probes.push((DeclarationAddress::of(raw), canonical));
+                    }
+                }
+            }
+        }
+    }
+    let destination = (|| {
+        let target = diagnostic::resolve_target(path, &site.location, config)
+            .map_err(|error| error.owned_by(site.node))?;
+        let resolved = resolved
+            .map_err(|cause| ConversionError::destination(&site.location, site.node, cause))?;
         let selected = destination(resolved, &target, defs).map_err(|kind| {
             static_error(
                 site,
@@ -395,21 +421,47 @@ pub(super) fn judge_conversion(
             )
         })?;
         matched_destination = true;
-        if let Some(members) = crate::schema::union_members_with_defs(resolved, defs) {
-            for (index, member) in members.iter().enumerate() {
-                if let Some(member) = member {
-                    let selected = std::ptr::eq(member.as_attr(), selected);
-                    probes.push((DeclarationAddress::of(member.as_attr()), selected));
-                    // Preserve the raw wrapper's consumption stamp too. Identity
-                    // selection above uses the definition-aware member only.
-                    if let crate::schema::RawShape::Union(raw) = resolved.raw_shape()
-                        && let Some(raw) = raw.get(index)
-                    {
-                        probes.push((DeclarationAddress::of(raw), selected));
-                    }
-                }
-            }
+        selected_address = Some(DeclarationAddress::of(selected));
+        Ok(MatchedDestination {
+            target,
+            selected: selected.clone(),
+        })
+    })()
+    .map_err(|error: ConversionError| {
+        if site.parsing.secret || source.diagnostic_is_secret() {
+            error.inside_secret()
+        } else {
+            error
         }
+    });
+    StaticVerdict {
+        destination,
+        matched_destination,
+        union_destination,
+        site: site.clone(),
+        secret: site.parsing.secret || source.diagnostic_is_secret(),
+        declaration: DeclarationAddress::of(declaration),
+        resolved: resolved_address,
+        members: probes
+            .into_iter()
+            .map(|(address, canonical)| (address, Some(canonical) == selected_address))
+            .collect(),
+        source_check: SourceCheck::WalkOwned,
+    }
+}
+
+fn judge_source(
+    site: &ConversionSite,
+    source: &JudgedExpr,
+    destination: &MatchedDestination,
+    context: &ConversionContext<'_>,
+    knowledge: SourceKnowledge,
+    union_destination: bool,
+) -> SourceCheck {
+    let selected = &destination.selected;
+    let config = context.catalog;
+    let mut static_source = true;
+    let result = (|| {
         let discarded = knowledge == SourceKnowledge::Discarded;
         let check_deferred = || {
             deferred_union_check(
@@ -471,7 +523,7 @@ pub(super) fn judge_conversion(
                     ));
                 }
                 ScalarKindCheck::NoStaticJudgement => {
-                    source_check = SourceCheck::ValueCheck;
+                    static_source = false;
                     check_deferred()?;
                 }
             }
@@ -487,7 +539,7 @@ pub(super) fn judge_conversion(
                 }
             }
         };
-        Ok(TypeExpr::SchemaType { owned: target })
+        Ok(())
     })()
     .map_err(|error: ConversionError| {
         if site.parsing.secret || source.diagnostic_is_secret() {
@@ -496,16 +548,9 @@ pub(super) fn judge_conversion(
             error
         }
     });
-    StaticVerdict {
-        outcome,
-        matched_destination,
-        union_destination,
-        site: site.clone(),
-        secret: site.parsing.secret || source.diagnostic_is_secret(),
-        binding: None,
-        declaration: DeclarationAddress::of(declaration),
-        resolved: resolved_address,
-        members: probes.into(),
-        source_check,
+    match result {
+        Err(error) => SourceCheck::Judged(Err(error)),
+        Ok(()) if static_source => SourceCheck::Judged(Ok(())),
+        Ok(()) => SourceCheck::WalkOwned,
     }
 }
