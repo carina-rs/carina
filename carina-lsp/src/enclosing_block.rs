@@ -55,35 +55,39 @@ pub(crate) struct ResourceHeader {
 }
 
 fn walk_back_prefix(lexed: &LexedDocument, mut line: usize, prefix: &str) -> (String, usize) {
+    let prefix = prefix.trim_end();
+    if !prefix.is_empty() {
+        return (prefix.to_string(), line);
+    }
     let expression_line = line;
-    let mut prefix = prefix.trim_end().to_string();
-    while prefix.is_empty() && line > 0 {
+    while line > 0 {
         line -= 1;
         let preceding = &lexed.lines()[line];
-        // A completed let RHS ends the preceding statement. In particular,
-        // masking its string literal must not turn `let role = 'admin'` into
-        // an unfinished `let role =` that captures the next anonymous resource.
-        let without_comments: String = preceding
+        let last_significant = preceding
             .text()
-            .chars()
+            .char_indices()
             .zip(preceding.chars())
-            .map(|(ch, classified)| {
-                if classified.kind() == LexKind::Comment {
-                    ' '
-                } else {
-                    ch
-                }
+            .filter(|((_, ch), classified)| {
+                !ch.is_whitespace() && classified.kind() != LexKind::Comment
             })
-            .collect();
-        if let Some((_, rhs)) = crate::let_parse::parse_let_header(&without_comments)
-            && !rhs.trim().is_empty()
-            && strip_read(rhs.trim_end()).is_none()
+            .last();
+        // Skip only raw blank/comment-only lines. Masked strings and heredocs
+        // are statement boundaries, including a literal after `let x =`.
+        let Some(((byte, ch), classified)) = last_significant else {
+            continue;
+        };
+        let code = preceding.masked_code();
+        let code = code.as_str().trim_end();
+        if classified.kind() == LexKind::Code
+            && crate::position::char_len(&preceding.text()[..byte + ch.len_utf8()])
+                == crate::position::char_len(code)
+            && (code.ends_with(['=', ':']) || strip_read(code).is_some())
         {
-            return (String::new(), expression_line);
+            return (code.to_string(), line);
         }
-        prefix = preceding.masked_code().as_str().trim_end().to_string();
+        break;
     }
-    (prefix, line)
+    (String::new(), expression_line)
 }
 
 fn strip_read(prefix: &str) -> Option<&str> {
@@ -92,23 +96,43 @@ fn strip_read(prefix: &str) -> Option<&str> {
     })
 }
 
-/// Snippet insertion shares the header seam's treatment of `read` and trivia.
-pub(crate) fn has_read_prefix(lexed: &LexedDocument, position: Position) -> bool {
+pub(crate) struct ResourceExpressionPrefix {
+    pub(crate) before_expression: String,
+    pub(crate) read_start: Option<Position>,
+    start_line: usize,
+}
+
+/// Snippet insertion and header selection share the same continuation rule.
+pub(crate) fn resource_expression_prefix(
+    lexed: &LexedDocument,
+    position: Position,
+) -> Option<ResourceExpressionPrefix> {
     let line = position.line as usize;
-    let Some(code) = lexed.lines().get(line).map(|line| line.masked_code()) else {
-        return false;
-    };
-    let (prefix, _) = walk_back_prefix(
+    let code = lexed.lines().get(line)?.masked_code();
+    let (prefix, line) = walk_back_prefix(
         lexed,
         line,
         crate::position::line_prefix(code.as_str(), position.character),
     );
-    strip_read(&prefix).is_some()
+    let (before_expression, start_line, read_start) = match strip_read(&prefix) {
+        Some(before_read) => {
+            let read_start = Position::new(line as u32, crate::position::char_len(&prefix) - 4);
+            let (prefix, line) = walk_back_prefix(lexed, line, before_read);
+            (prefix, line, Some(read_start))
+        }
+        None => (prefix, line, None),
+    };
+    Some(ResourceExpressionPrefix {
+        before_expression,
+        read_start,
+        start_line,
+    })
 }
 
 /// Parse the complete type-path token at the cursor (or before a block opener).
-/// Only the preceding code token `read` selects a data source; masked trivia may
-/// span physical lines. Schema registration never affects this syntax decision.
+/// Only the preceding code token `read` selects a data source. Across physical
+/// lines, only raw trivia and explicit continuation tokens may join a header.
+/// Schema registration never affects this syntax decision.
 pub(crate) fn resource_header(lexed: &LexedDocument, position: Position) -> Option<ResourceHeader> {
     let line_index = position.line as usize;
     let code = lexed.lines().get(line_index)?.masked_code();
@@ -129,17 +153,23 @@ pub(crate) fn resource_header(lexed: &LexedDocument, position: Position) -> Opti
         return None;
     }
     let resource_type = ResourceTypePath::parse(token)?;
-    let (before_type, previous_line) = walk_back_prefix(lexed, line_index, &code[..start]);
-    let (kind, before_expression, previous_line) = match strip_read(&before_type) {
-        Some(prefix) => {
-            let (prefix, line) = walk_back_prefix(lexed, previous_line, prefix);
-            (SchemaKind::DataSource, prefix, line)
-        }
-        None => (SchemaKind::Resource, before_type, previous_line),
+    let expression_prefix = resource_expression_prefix(
+        lexed,
+        Position::new(position.line, crate::position::char_len(&code[..start])),
+    )?;
+    let kind = if expression_prefix.read_start.is_some() {
+        SchemaKind::DataSource
+    } else {
+        SchemaKind::Resource
     };
-    let prefix = before_expression.rsplit(['{', '}', ',']).next()?.trim();
+    let prefix = expression_prefix
+        .before_expression
+        .rsplit(['{', '}', ','])
+        .next()?
+        .trim();
     let assignment = parse_let_assignment(prefix).filter(|a| a.expression.is_empty());
-    let is_block_header = prefix.is_empty() || assignment.is_some();
+    let is_block_header =
+        (prefix.is_empty() || assignment.is_some()) && code[end..].trim_start().starts_with('{');
     // Outside a resource header, a path (including nested annotation types)
     // carries no kind. Only `read` or a managed header supplies a syntax kind.
     let selector = if !is_block_header && kind == SchemaKind::Resource {
@@ -153,7 +183,7 @@ pub(crate) fn resource_header(lexed: &LexedDocument, position: Position) -> Opti
     Some(ResourceHeader {
         selector,
         binding: assignment.as_ref().map(|a| a.binding.to_string()),
-        start_line: previous_line,
+        start_line: expression_prefix.start_line,
         is_block_header,
     })
 }
@@ -275,6 +305,47 @@ struct LetAssignment<'a> {
 struct PathSegment {
     name: String,
     syntax: SegmentSyntax,
+}
+
+/// Whether the innermost open code brace is a for/if/else expression body.
+pub(crate) fn in_control_flow_body(lexed: &LexedDocument, position: Position) -> bool {
+    let mut depth = 0;
+    for (line_index, line) in lexed
+        .lines()
+        .iter()
+        .enumerate()
+        .take(position.line as usize + 1)
+        .rev()
+    {
+        let chars: Vec<_> = line.text().chars().collect();
+        let limit = if line_index == position.line as usize {
+            crate::position::utf16_offset_to_char_offset(line.text(), position.character)
+                .unwrap_or(chars.len())
+        } else {
+            chars.len()
+        };
+        for index in (0..limit).rev() {
+            if line.chars()[index].kind() != LexKind::Code {
+                continue;
+            }
+            match chars[index] {
+                '}' => depth += 1,
+                '{' if depth > 0 => depth -= 1,
+                '{' => {
+                    let segment = scan_line_segment(
+                        &chars,
+                        line.chars(),
+                        index,
+                        SegmentScanMode::BeforeOpener,
+                    );
+                    return is_control_flow_segment(&segment.block_code)
+                        || is_else_segment(&segment.code);
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Classify the block enclosing `position` with one lexer-aware backwards walk.

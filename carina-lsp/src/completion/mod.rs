@@ -7,7 +7,7 @@ mod values;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use dsl_source::DslSource;
+pub(crate) use dsl_source::{DslSource, DslSourceStorage};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -630,6 +630,9 @@ impl CompletionProvider {
             if in_upstream_state_block {
                 return CompletionContext::InsideUpstreamStateBlock;
             }
+            if crate::enclosing_block::in_control_flow_body(&crate::lex::lex(text), position) {
+                return CompletionContext::TopLevel;
+            }
             return CompletionContext::None;
         }
 
@@ -1172,7 +1175,7 @@ fn resolve_upstream_state_source(
     base_path: Option<&carina_core::paths::ResolvedPath>,
     binding: &str,
 ) -> Option<String> {
-    let mut src_buf = String::new();
+    let mut src_buf = DslSourceStorage::default();
     let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
     collect_upstream_state_bindings(src).get(binding).cloned()
 }

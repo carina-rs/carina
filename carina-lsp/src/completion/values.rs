@@ -24,7 +24,9 @@ use carina_core::upstream_exports::{UpstreamExportEntry, UpstreamExportType};
 
 use crate::enclosing_block::SchemaSelector;
 
-use super::{AttributeValueTarget, CompletionProvider, DslSource, UpstreamDepth2Match};
+use super::{
+    AttributeValueTarget, CompletionProvider, DslSource, DslSourceStorage, UpstreamDepth2Match,
+};
 
 /// How far up the directory tree to walk when suggesting upstream_state sources.
 const UPSTREAM_SOURCE_MAX_UP: usize = 6;
@@ -341,7 +343,7 @@ impl CompletionProvider {
         let call_binding = segments[0];
         let output_name = segments[1];
 
-        let mut merged = String::new();
+        let mut merged = DslSourceStorage::default();
         let source = DslSource::resolve_directory(text, base_path, &mut merged);
         let (_, rhs) = Self::extract_let_bindings(source)
             .into_iter()
@@ -483,7 +485,7 @@ impl CompletionProvider {
         // choice explicit at the call site — see `dsl_source.rs`. The
         // sibling read happens exactly once; the same `src` is reused
         // across every helper below.
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         let schema_target = match target {
             AttributeValueTarget::SchemaAttribute {
@@ -1319,7 +1321,7 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let already_present = self.depends_on_elements_before_cursor(text, position);
 
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         let raw = self.in_scope_binding_completions_with_src(
             src,
@@ -1439,7 +1441,7 @@ impl CompletionProvider {
         base_path: Option<&carina_core::paths::ResolvedPath>,
         mode: InScopeBindingMode<'_>,
     ) -> Vec<CompletionItem> {
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         self.in_scope_binding_completions_with_src(src, mode)
     }
@@ -1526,7 +1528,7 @@ impl CompletionProvider {
         text: &str,
         base_path: Option<&carina_core::paths::ResolvedPath>,
     ) {
-        let mut storage = String::new();
+        let mut storage = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut storage);
         let structural = self.structural_resource_binding_names(src);
         items.retain(|item| !structural.contains(&item.label));
@@ -1910,7 +1912,7 @@ impl CompletionProvider {
             base_path,
             provider_ctx,
         ));
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         for (name, type_hint) in self.extract_argument_parameters(src) {
             let Some(declared) =
@@ -1947,7 +1949,7 @@ impl CompletionProvider {
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         let upstream_sources = super::collect_upstream_state_bindings(src);
         let mut exports_cache: std::collections::HashMap<
@@ -1998,7 +2000,7 @@ impl CompletionProvider {
         base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         for (binding_name, selector) in self.extract_resource_bindings(src) {
             let Some(selector) = selector else { continue };
@@ -2043,7 +2045,7 @@ impl CompletionProvider {
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         let resource_bindings = self.structural_resource_binding_names(src);
         for (binding_name, rhs) in Self::extract_let_bindings(src) {

@@ -482,3 +482,260 @@ fn shared_type_name_completions_have_distinct_kinds() {
         assert_eq!(edit.new_text, snippet);
     }
 }
+
+fn assert_anonymous_vpc_after(preceding: &str) {
+    let source = format!("{preceding}\nmock.ec2.Vpc {{\n  shared = 'x'\n}}\n");
+    let fixture = Fixture::new(&source, "exports {}\n");
+    let items = fixture.complete(
+        "main.crn",
+        &format!("{preceding}\nmock.ec2.Vpc {{\n  |\n}}\n"),
+    );
+    assert!(labels(&items).contains(&"managed_only"), "{items:?}");
+    let hover = fixture
+        .hover("main.crn", &source.replace("shared", "sha|red"), true)
+        .expect("anonymous resource attribute hover");
+    assert!(hover.contains("Managed VPC"), "{hover}");
+
+    let items = fixture.complete("exports.crn", "attributes {\n  value = s.|\n}\n");
+    assert!(!labels(&items).contains(&"s.managed_only"), "{items:?}");
+}
+
+#[test]
+fn walk_back_stops_after_multiline_list() {
+    assert_anonymous_vpc_after("let cidrs = [\n  '10.0.0.0/16',\n]");
+}
+
+#[test]
+fn walk_back_stops_after_multiline_call() {
+    assert_anonymous_vpc_after("let x = join(\n  ['a', 'b'],\n  ','\n)");
+}
+
+#[test]
+fn walk_back_stops_after_multiline_arithmetic() {
+    assert_anonymous_vpc_after("let n =\n  1 + 2");
+}
+
+#[test]
+fn walk_back_attribute_hover_after_completed_multiline_rhs() {
+    let fixture = Fixture::new("", "exports {}\n");
+    for preceding in [
+        "let cidrs = [\n  '10.0.0.0/16',\n]",
+        "let x = join(\n  ['a', 'b'],\n  ','\n)",
+        "let n =\n  1 + 2",
+    ] {
+        let hover = fixture
+            .hover(
+                "main.crn",
+                &format!("{preceding}\nmock.ec2.Vpc {{\n  sha|red = 'x'\n}}\n"),
+                true,
+            )
+            .expect("anonymous resource attribute hover");
+        assert!(hover.contains("Managed VPC"), "{hover}");
+    }
+}
+
+#[test]
+fn walk_back_stops_after_string_rhs_line() {
+    assert_anonymous_vpc_after("let s =\n  'abc'");
+}
+
+#[test]
+fn walk_back_stops_after_heredoc_rhs() {
+    assert_anonymous_vpc_after("let s =\n  <<EOT\nx\nEOT");
+}
+
+#[test]
+fn walk_back_stops_after_same_line_string_rhs() {
+    assert_anonymous_vpc_after("let s = 'abc'");
+}
+
+#[test]
+fn walk_back_read_is_word_bounded() {
+    for preceding in ["thread", "foo.read", "unread", "_read"] {
+        assert_anonymous_vpc_after(preceding);
+    }
+}
+
+fn assert_sibling_binding_survives(buffer: &str) {
+    let fixture = Fixture::new("", "exports {}\n");
+    fixture.write("vpc.crn", "let v = mock.ec2.Vpc {}\n");
+    let items = fixture.complete(
+        "main.crn",
+        &format!("{buffer}\nattributes {{\n  value = v.|\n}}\n"),
+    );
+    let labels = labels(&items);
+    assert!(labels.contains(&"v.managed_only"), "{labels:?}");
+    assert!(!labels.contains(&"v.lookup_only"), "{labels:?}");
+}
+
+#[test]
+fn binding_scan_lexes_unterminated_string_per_file() {
+    assert_sibling_binding_survives("let broken = '");
+}
+
+#[test]
+fn binding_scan_lexes_unterminated_comment_per_file() {
+    assert_sibling_binding_survives("/*");
+}
+
+#[test]
+fn binding_scan_lexes_unterminated_heredoc_per_file() {
+    assert_sibling_binding_survives("let broken = <<EOT");
+}
+
+#[test]
+fn binding_scan_lexes_each_sibling_separately() {
+    let fixture = Fixture::new("", "exports {}\n");
+    fixture.write("broken.crn", "/*");
+    fixture.write("vpc.crn", "let v = mock.ec2.Vpc {}\n");
+    let items = fixture.complete("main.crn", "attributes {\n  value = v.|\n}\n");
+    assert!(
+        labels(&items).contains(&"v.managed_only"),
+        "{:?}",
+        labels(&items)
+    );
+}
+
+#[test]
+fn binding_scan_walk_back_stops_at_file_boundary() {
+    let fixture = Fixture::new("", "exports {}\n");
+    fixture.write("a.crn", "let s =\n");
+    fixture.write("b.crn", "mock.ec2.Vpc {}\n");
+    let items = fixture.complete("main.crn", "attributes {\n  value = s.|\n}\n");
+    assert!(
+        !labels(&items).contains(&"s.managed_only"),
+        "{:?}",
+        labels(&items)
+    );
+}
+
+fn completed_image_source(marked: &str, wrapped: bool, after_read: bool) -> String {
+    let fixture = Fixture::new("", "exports {}\n");
+    let items = fixture.complete("main.crn", marked);
+    let item = items
+        .iter()
+        .find(|item| item.label == "read mock.compute.Image")
+        .expect("data-source type completion");
+    if after_read {
+        assert_eq!(item.filter_text.as_deref(), Some("mock.compute.Image"));
+    }
+    let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+        panic!("expected snippet edit: {item:?}")
+    };
+    let expected_start = if wrapped {
+        "let ${1:name} = read mock.compute.Image {"
+    } else if after_read {
+        "mock.compute.Image {"
+    } else {
+        "read mock.compute.Image {"
+    };
+    assert!(edit.new_text.starts_with(expected_start), "{edit:?}");
+    let source = marked.replacen('|', "", 1);
+    let mut edits = vec![edit.clone()];
+    edits.extend(item.additional_text_edits.iter().flatten().cloned());
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+    let mut expanded = source.clone();
+    for edit in edits {
+        let start = carina_lsp::position::position_to_byte_offset(&source, edit.range.start);
+        let end = carina_lsp::position::position_to_byte_offset(&source, edit.range.end);
+        let replacement = edit
+            .new_text
+            .replace("${1:name}", "img")
+            .replace("${1}", "'linux'")
+            .replace("${2}", "'linux'");
+        expanded.replace_range(start..end, &replacement);
+    }
+    let parsed = carina_core::parser::parse_file(
+        &expanded,
+        std::path::Path::new("main.crn"),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    );
+    assert!(parsed.is_ok(), "{expanded}: {parsed:?}");
+    expanded
+}
+
+#[test]
+fn data_source_type_at_file_top_level_wraps_binding() {
+    completed_image_source("mock.|", true, false);
+}
+
+#[test]
+fn data_source_type_after_let_is_bare_expression() {
+    completed_image_source("let img = mock.|", false, false);
+}
+
+#[test]
+fn data_source_type_in_for_body_is_bare_expression() {
+    completed_image_source("let imgs = for x in ['linux'] {\n  mock.|\n}", false, false);
+}
+
+#[test]
+fn data_source_type_in_if_body_is_bare_expression() {
+    completed_image_source("let img = if true {\n  mock.|\n}", false, false);
+}
+
+#[test]
+fn data_source_type_after_top_level_read_wraps_binding() {
+    completed_image_source("read mock.|", true, true);
+}
+
+#[test]
+fn typed_read_keeps_path_filter_range() {
+    let fixture = Fixture::new("", "exports {}\n");
+    for (marked, start) in [
+        ("read mock.|", Position::new(0, 5)),
+        ("read // lookup\n  mock.|", Position::new(1, 2)),
+    ] {
+        let items = fixture.complete("main.crn", marked);
+        let item = items
+            .iter()
+            .find(|item| item.label == "read mock.compute.Image")
+            .unwrap();
+        let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+            panic!("expected snippet edit")
+        };
+        assert_eq!(edit.range.start, start);
+        assert_eq!(item.filter_text.as_deref(), Some("mock.compute.Image"));
+        completed_image_source(marked, true, true);
+    }
+}
+
+#[test]
+fn data_source_type_after_bound_read_filters_by_path() {
+    completed_image_source("let img = read mock.|", false, true);
+}
+
+#[test]
+fn data_source_type_after_read_in_for_body_filters_by_path() {
+    completed_image_source(
+        "let imgs = for x in ['linux'] {\n  read mock.|\n}",
+        false,
+        true,
+    );
+}
+
+#[test]
+fn data_source_type_after_read_in_if_body_filters_by_path() {
+    completed_image_source("let img = if true {\n  read mock.|\n}", false, true);
+}
+
+#[test]
+fn typed_read_offers_only_data_source_types() {
+    let fixture = Fixture::new("", "exports {}\n");
+    for marked in [
+        "read mock.|",
+        "let img = read mock.|",
+        "for x in ['linux'] {\n  read mock.|\n}",
+        "if true {\n  read mock.|\n}",
+    ] {
+        let items = fixture.complete("main.crn", marked);
+        assert_eq!(items.len(), 2, "{marked}: {:?}", labels(&items));
+        assert!(
+            items
+                .iter()
+                .all(|item| item.label.starts_with("read mock.")),
+            "{:?}",
+            labels(&items)
+        );
+    }
+}

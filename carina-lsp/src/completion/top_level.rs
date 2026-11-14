@@ -8,7 +8,7 @@ use crate::enclosing_block::{SchemaSelector, resource_binding_selectors};
 use carina_core::parser;
 use carina_core::schema::SchemaKind;
 
-use super::{CompletionProvider, DslSource};
+use super::{CompletionProvider, DslSource, DslSourceStorage};
 
 impl CompletionProvider {
     pub(super) fn top_level_completions(
@@ -46,19 +46,29 @@ impl CompletionProvider {
             end: position,
         };
 
-        // Avoid emitting a duplicate `let` when the line already has `let <name> =`.
-        let after_let_binding =
-            line_idx < lines.len() && is_after_let_binding(lines[line_idx], prefix_start);
-        let after_read = crate::enclosing_block::has_read_prefix(
-            &crate::lex::lex(text),
+        let lexed = crate::lex::lex(text);
+        let expression_prefix = crate::enclosing_block::resource_expression_prefix(
+            &lexed,
             Position::new(position.line, prefix_start),
         );
-
-        let read_snippet = if after_let_binding {
-            "read ${1:aws.s3.Bucket} {\n    name = \"${2:existing-resource}\"\n}"
-        } else {
-            "let ${1:name} = read ${2:aws.s3.Bucket} {\n    name = \"${3:existing-resource}\"\n}"
-        };
+        let after_let_binding = expression_prefix.as_ref().is_some_and(|prefix| {
+            is_after_let_binding(
+                &prefix.before_expression,
+                crate::position::char_len(&prefix.before_expression),
+            )
+        });
+        let read_start = expression_prefix.and_then(|prefix| prefix.read_start);
+        let after_read = read_start.is_some();
+        let expression_position =
+            after_let_binding || crate::enclosing_block::in_control_flow_body(&lexed, position);
+        let first_tab_stop = if expression_position { 1 } else { 2 };
+        let read_snippet = wrap_read_snippet(
+            &format!(
+                "read ${{{first_tab_stop}:aws.s3.Bucket}} {{\n    name = \"${{{}:existing-resource}}\"\n}}",
+                first_tab_stop + 1,
+            ),
+            expression_position,
+        );
         let let_use_snippet = if after_let_binding {
             "use {\n    source = '${1:./modules/name}'\n}"
         } else {
@@ -207,7 +217,7 @@ impl CompletionProvider {
         // let-binding scan here and any `find_module_import_path`
         // fallback inside `build_module_call_snippet` share the same
         // merged text (#2446).
-        let mut storage = String::new();
+        let mut storage = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut storage);
         let merged = src.merged_text();
         for (binding, after_eq) in Self::extract_let_bindings(src) {
@@ -236,6 +246,9 @@ impl CompletionProvider {
 
         // Generate resource type completions from schemas
         for (provider, resource_type, kind, schema) in self.schemas.iter() {
+            if after_read && kind != SchemaKind::DataSource {
+                continue;
+            }
             let path = format!("{provider}.{resource_type}");
             let key = match kind {
                 SchemaKind::Resource => path.clone(),
@@ -248,13 +261,17 @@ impl CompletionProvider {
                 .to_string();
 
             // Build snippet with required attributes
-            let snippet_type = if kind == SchemaKind::DataSource && after_read {
+            let snippet_type = if after_read && expression_position {
                 &path
             } else {
                 &key
             };
             let mut snippet = format!("{} {{\n", snippet_type);
-            let mut tab_stop = 1;
+            let mut tab_stop = if kind == SchemaKind::DataSource {
+                first_tab_stop
+            } else {
+                1
+            };
             for attr in schema.effective_attributes() {
                 if attr.is_required() {
                     snippet.push_str(&format!("    {} = ${{{}}}\n", attr.name(), tab_stop));
@@ -262,18 +279,39 @@ impl CompletionProvider {
                 }
             }
             snippet.push('}');
+            if kind == SchemaKind::DataSource {
+                snippet = wrap_read_snippet(&snippet, expression_position);
+            }
+
+            // Keep filtering scoped to the path the client is matching. A
+            // top-level wrapper replaces the earlier `read` in a separate edit.
+            let additional_text_edits = read_start.filter(|_| !expression_position).map(|start| {
+                vec![TextEdit {
+                    range: Range {
+                        start,
+                        end: replacement_range.start,
+                    },
+                    new_text: String::new(),
+                }]
+            });
 
             completions.push(CompletionItem {
                 label: key.clone(),
+                filter_text: after_read.then_some(path),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
                     new_text: snippet,
                 })),
+                additional_text_edits,
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some(description),
                 ..Default::default()
             });
+        }
+
+        if after_read {
+            completions.retain(|item| item.kind == Some(CompletionItemKind::CLASS));
         }
 
         completions
@@ -358,8 +396,10 @@ impl CompletionProvider {
         &self,
         src: DslSource<'_>,
     ) -> Vec<(String, Option<SchemaSelector>)> {
-        resource_binding_selectors(src.merged_text())
-            .into_iter()
+        let mut seen = std::collections::HashSet::new();
+        src.file_texts()
+            .flat_map(resource_binding_selectors)
+            .filter(|(name, _)| seen.insert(name.clone()))
             .map(|(name, selector)| {
                 (
                     name,
@@ -575,7 +615,7 @@ impl CompletionProvider {
         if let Some(path) = find_let_use_source(module_name, text) {
             return Some(path);
         }
-        let mut storage = String::new();
+        let mut storage = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut storage);
         find_let_use_source(module_name, src.merged_text())
     }
@@ -628,6 +668,14 @@ impl CompletionProvider {
 
         // Fallback: simple scaffold
         format!("{} {{\n  ${{1}}\n}}", binding)
+    }
+}
+
+fn wrap_read_snippet(snippet: &str, expression_position: bool) -> String {
+    if expression_position {
+        snippet.to_string()
+    } else {
+        format!("let ${{1:name}} = {snippet}")
     }
 }
 
