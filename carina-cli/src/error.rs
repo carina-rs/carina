@@ -1615,8 +1615,8 @@ pub enum AppError {
         Box<carina_core::parser::Located<carina_core::validation::depends_on::DependsOnDiagnostic>>,
     ),
     #[error("{0}")]
-    UnknownDirective(
-        Box<carina_core::parser::Located<carina_core::validation::UnknownDirectiveKey>>,
+    ResourceDirective(
+        Box<carina_core::parser::Located<carina_core::validation::ResourceDirectiveFinding>>,
     ),
     #[error("{0}")]
     Wait(Box<carina_core::parser::Located<carina_core::validation::wait::WaitDiagnostic>>),

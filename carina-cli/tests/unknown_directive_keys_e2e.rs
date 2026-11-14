@@ -44,14 +44,201 @@ fn engine() -> DiagnosticEngine {
 
 fn lsp(directory: &Path, name: &str) -> Vec<tower_lsp::lsp_types::Diagnostic> {
     let path = directory.join(name);
+    lsp_buffer(directory, name, std::fs::read_to_string(&path).unwrap())
+}
+
+fn lsp_buffer(
+    directory: &Path,
+    name: &str,
+    source: String,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    let path = directory.join(name);
     let document = Document::new_with_path(
-        std::fs::read_to_string(&path).unwrap(),
+        source,
         path.clone(),
         Arc::new(ProviderContext::new(
             carina_core::EnvironmentSnapshot::empty(),
         )),
     );
     engine().analyze(&document, Some(&path))
+}
+
+#[test]
+fn non_assignment_directive_entries_have_identical_cli_and_lsp_findings() {
+    for (entry, width) in [
+        ("prevent_destroy {}", 15),
+        ("unsupported {}", 11),
+        ("let x = 1", 9),
+    ] {
+        let directory = fixture();
+        std::fs::write(directory.path().join("resources.crn"), format!("mock.test.resource {{\n  name = 'example'\n  directives {{\n    {entry}\n  }}\n}}\n")).unwrap();
+        let message = "Directive entries must be 'key = value' assignments";
+        let human = validate(directory.path(), false);
+        let json = validate(directory.path(), true);
+        assert_eq!(human.status.code(), Some(1), "{entry}: {human:?}");
+        assert_eq!(json.status.code(), Some(1), "{entry}: {json:?}");
+        let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+        let errors = report["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{entry}: {report:#}");
+        assert_eq!(errors[0]["message"], message);
+        assert_eq!(errors[0]["location"]["file"], "resources.crn");
+        assert_eq!(
+            errors[0]["location"]["range"],
+            serde_json::json!({"start":{"line":4,"column":5}, "end":{"line":4,"column":5+width}})
+        );
+        assert!(
+            String::from_utf8(human.stderr)
+                .unwrap()
+                .contains(&format!("resources.crn:4:5: {message}"))
+        );
+        let diagnostics = lsp(directory.path(), "resources.crn");
+        assert_eq!(diagnostics.len(), 1, "{entry}: {diagnostics:#?}");
+        assert_eq!(diagnostics[0].message, message);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(3, 4), Position::new(3, 4 + width))
+        );
+        for name in ["main.crn", "providers.crn"] {
+            assert!(lsp(directory.path(), name).is_empty(), "{entry}: {name}");
+        }
+    }
+}
+
+#[test]
+fn duplicate_directives_collect_unknown_keys_in_both_blocks_in_cli_and_lsp() {
+    let directory = fixture();
+    std::fs::write(directory.path().join("resources.crn"), "mock.test.resource {\n  name = 'example'\n  directives { prevent_destory = true }\n  directives { provder = absent }\n}\n").unwrap();
+    let human = validate(directory.path(), false);
+    let json = validate(directory.path(), true);
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    assert_eq!(json.status.code(), Some(1), "{json:?}");
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let errors = report["errors"].as_array().unwrap();
+    let diagnostics = lsp(directory.path(), "resources.crn");
+    assert_eq!(errors.len(), 3, "{report:#}");
+    assert_eq!(diagnostics.len(), 3, "{diagnostics:#?}");
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    for (message, line, column, width) in [
+        (
+            "Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?",
+            3,
+            16,
+            15,
+        ),
+        (
+            "Duplicate attribute 'directives' (first defined on line 3)",
+            4,
+            3,
+            10,
+        ),
+        (
+            "Unknown directive 'provder', did you mean 'provider'?",
+            4,
+            16,
+            7,
+        ),
+    ] {
+        let error = errors
+            .iter()
+            .find(|error| error["message"] == message)
+            .unwrap();
+        assert_eq!(
+            error["location"]["range"],
+            serde_json::json!({"start":{"line":line,"column":column}, "end":{"line":line,"column":column+width}})
+        );
+        assert!(stderr.contains(&format!("resources.crn:{line}:{column}: {message}")));
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == message)
+            .unwrap();
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostic.range,
+            Range::new(
+                Position::new(line - 1, column - 1),
+                Position::new(line - 1, column + width - 1)
+            )
+        );
+    }
+}
+
+#[test]
+fn duplicate_let_and_directives_are_both_reported_in_the_unsaved_lsp_buffer() {
+    let directory = fixture();
+    let source = "let repeated = 1\nlet repeated = 2\nmock.test.resource {\n  name = 'example'\n  directives {}\n  directives {}\n}\n";
+    let diagnostics = lsp_buffer(directory.path(), "resources.crn", source.into());
+    for (prefix, line, column, width) in [
+        ("duplicate binding 'repeated'", 1, 4, 8),
+        ("Duplicate attribute 'directives'", 5, 2, 10),
+    ] {
+        let matching: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.starts_with(prefix))
+            .collect();
+        assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            matching[0].range,
+            Range::new(
+                Position::new(line, column),
+                Position::new(line, column + width)
+            )
+        );
+    }
+}
+
+#[test]
+fn duplicate_let_does_not_hide_collected_directive_findings_in_cli() {
+    let directory = fixture();
+    std::fs::write(directory.path().join("resources.crn"), "let repeated = 1\nlet repeated = 2\nmock.test.resource {\n  name = 'example'\n  directives {}\n  directives { provder = absent }\n}\n").unwrap();
+    let output = validate(directory.path(), true);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for prefix in [
+        "Duplicate attribute 'directives'",
+        "Unknown directive 'provder'",
+    ] {
+        let matching: Vec<_> = report["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|error| error["message"].as_str().unwrap().starts_with(prefix))
+            .collect();
+        assert_eq!(matching.len(), 1, "{report:#}");
+        assert_eq!(matching[0]["location"]["file"], "resources.crn");
+    }
+}
+
+#[test]
+fn duplicate_directives_in_a_sibling_keep_the_require_scope_complete() {
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("resources.crn"),
+        "mock.test.resource {\n  name = 'example'\n  directives {}\n  directives {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "require false, 'root guard'\n",
+    )
+    .unwrap();
+    let diagnostics = lsp(directory.path(), "main.crn");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == "require failed: root guard"),
+        "{diagnostics:#?}"
+    );
+    let output = validate(directory.path(), true);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|error| error["message"] == "require failed: root guard"),
+        "{report:#}"
+    );
 }
 
 #[test]

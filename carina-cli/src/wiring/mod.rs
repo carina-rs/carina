@@ -982,32 +982,51 @@ pub(crate) fn failed_validate_configuration(
                 carina_core::config_loader::find_crn_files_in_dir(path).unwrap_or_default()
             };
             for file in files {
-                if let Ok(source) = file.read_to_string()
-                    && let Ok(mut parsed) = carina_core::parser::parse_file(
-                        &source,
-                        &file.source_label(),
-                        session.catalog(),
-                    )
-                {
-                    parser_warnings.extend(parsed.warnings.iter().cloned().map(|mut warning| {
-                        warning
-                            .file
-                            .get_or_insert_with(|| file.source_label().display().to_string());
-                        warning
-                    }));
-                    errors.extend(
-                        validation::unknown_directive_keys(parsed.parser_binding_metadata.syntax())
-                            .into_iter()
-                            .map(|finding| AppError::UnknownDirective(Box::new(finding))),
-                    );
-                    match validation::resolve_file_type_exprs(&mut parsed, session) {
-                        Ok(findings) => errors.extend(
-                            findings
-                                .into_iter()
-                                .map(|finding| AppError::TypeResolution(Box::new(finding))),
-                        ),
-                        Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+                let Ok(source) = file.read_to_string() else {
+                    continue;
+                };
+                let mut parsed = match carina_core::parser::parse_file(
+                    &source,
+                    &file.source_label(),
+                    session.catalog(),
+                ) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        // Syntax findings survive value failures such as a
+                        // duplicate let, just as they do in editor buffers.
+                        if let Ok(syntax) = carina_core::parser::parse_syntax_inventory(
+                            &source,
+                            &file.source_label(),
+                        ) {
+                            errors.extend(
+                                validation::resource_directive_findings(&syntax)
+                                    .into_iter()
+                                    .map(|finding| AppError::ResourceDirective(Box::new(finding))),
+                            );
+                        }
+                        continue;
                     }
+                };
+                parser_warnings.extend(parsed.warnings.iter().cloned().map(|mut warning| {
+                    warning
+                        .file
+                        .get_or_insert_with(|| file.source_label().display().to_string());
+                    warning
+                }));
+                errors.extend(
+                    validation::resource_directive_findings(
+                        parsed.parser_binding_metadata.syntax(),
+                    )
+                    .into_iter()
+                    .map(|finding| AppError::ResourceDirective(Box::new(finding))),
+                );
+                match validation::resolve_file_type_exprs(&mut parsed, session) {
+                    Ok(findings) => errors.extend(
+                        findings
+                            .into_iter()
+                            .map(|finding| AppError::TypeResolution(Box::new(finding))),
+                    ),
+                    Err(error) => errors.push(AppError::AnalysisInvariant(error)),
                 }
             }
             (errors, parser_warnings)

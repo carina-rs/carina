@@ -1,7 +1,7 @@
 //! Syntax-owned element provenance. Every location is minted from a grammar pair.
 use pest::iterators::{Pair, Pairs};
 
-use super::resource_body::{BlockContent, BlockContents, ResourceBody};
+use super::resource_body::{BlockContent, BlockContents, DirectiveEntry, ResourceBody};
 use super::{DeclarationLocation, Located, PreprocessedFile, Rule};
 use crate::resource::ResourceDirective;
 use std::{
@@ -383,7 +383,16 @@ fn collect_keys(
         let pair = match content {
             BlockContent::Ordinary(pair) => pair,
             BlockContent::Directives(block) => {
-                for attribute in block.attributes() {
+                // Runtime parsing keeps the first block, so its element
+                // provenance must also come only from that block.
+                if block.duplicate().is_some() {
+                    continue;
+                }
+                for entry in block.entries() {
+                    let attribute = match entry {
+                        DirectiveEntry::Attribute(attribute) => attribute,
+                        DirectiveEntry::Invalid(_) => continue,
+                    };
                     let mut parts = attribute.into_inner();
                     let name = parts.next().expect("directive key");
                     let key = super::extract_key_string(name.clone());
@@ -1004,6 +1013,12 @@ impl ModuleDeclarationBlocks {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DirectiveSyntaxIssue {
+    InvalidEntry,
+    DuplicateBlock { first_line: usize },
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxInventory<
     B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
 > {
@@ -1020,6 +1035,7 @@ pub struct SyntaxInventory<
     module_declaration_blocks: ModuleDeclarationBlocks,
     backend_keys: Vec<Located<super::AttributeKey>>,
     directive_keys: Vec<Located<super::AttributeKey>>,
+    directive_issues: Vec<Located<DirectiveSyntaxIssue>>,
     anonymous_headers: Vec<DeclarationLocation>,
     loops: Vec<DeclarationLocation>,
     state_targets: Vec<DeclarationLocation>,
@@ -1038,6 +1054,7 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
             module_declaration_blocks: ModuleDeclarationBlocks::Absent,
             backend_keys: Vec::new(),
             directive_keys: Vec::new(),
+            directive_issues: Vec::new(),
             anonymous_headers: Vec::new(),
             loops: Vec::new(),
             state_targets: Vec::new(),
@@ -1072,6 +1089,9 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     }
     pub(crate) fn directive_keys(&self) -> &[Located<super::AttributeKey>] {
         &self.directive_keys
+    }
+    pub(crate) fn directive_issues(&self) -> &[Located<DirectiveSyntaxIssue>] {
+        &self.directive_issues
     }
     pub(crate) fn anonymous_headers(&self) -> &[DeclarationLocation] {
         &self.anonymous_headers
@@ -1114,6 +1134,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             .union(other.module_declaration_blocks);
         self.backend_keys.extend(other.backend_keys);
         self.directive_keys.extend(other.directive_keys);
+        self.directive_issues.extend(other.directive_issues);
         self.anonymous_headers.extend(other.anonymous_headers);
         self.loops.extend(other.loops);
         self.state_targets.extend(other.state_targets);
@@ -1133,6 +1154,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             module_declaration_blocks: self.module_declaration_blocks,
             backend_keys: self.backend_keys,
             directive_keys: self.directive_keys,
+            directive_issues: self.directive_issues,
             anonymous_headers: self.anonymous_headers,
             loops: self.loops,
             state_targets: self.state_targets,
@@ -1162,7 +1184,7 @@ impl SyntaxInventory {
         pairs: Pairs<'_, Rule>,
         file: &PreprocessedFile,
         source: &Path,
-    ) -> Result<Self, super::ParseError> {
+    ) -> Self {
         let expressions = super::retained::Expressions::from_pairs(pairs.clone(), file, source);
         let declarations = declaration_inventory(pairs.clone(), file, source);
         use crate::validation::{
@@ -1292,14 +1314,32 @@ impl SyntaxInventory {
             let (_, contents) = body.into_parts();
             for content in contents {
                 if let BlockContent::Directives(block) = content {
-                    block
-                        .ensure_unique(|pair| DeclarationLocation::from_pair(pair, file, source))?;
-                    for attribute in block.attributes() {
-                        let key = attribute.into_inner().next().expect("directive key");
-                        out.directive_keys.push(Located::new(
-                            DeclarationLocation::from_pair(&key, file, source),
-                            super::AttributeKey::literal_in_file(key, file),
+                    if let Some((name, first)) = block.duplicate() {
+                        out.directive_issues.push(Located::new(
+                            DeclarationLocation::from_pair(name, file, source),
+                            DirectiveSyntaxIssue::DuplicateBlock {
+                                first_line: DeclarationLocation::from_pair(first, file, source)
+                                    .span()
+                                    .start_line(),
+                            },
                         ));
+                    }
+                    for entry in block.entries() {
+                        match entry {
+                            DirectiveEntry::Attribute(attribute) => {
+                                let key = attribute.into_inner().next().expect("directive key");
+                                out.directive_keys.push(Located::new(
+                                    DeclarationLocation::from_pair(&key, file, source),
+                                    super::AttributeKey::literal_in_file(key, file),
+                                ));
+                            }
+                            DirectiveEntry::Invalid(entry) => {
+                                out.directive_issues.push(Located::new(
+                                    DeclarationLocation::from_pair(&entry, file, source),
+                                    DirectiveSyntaxIssue::InvalidEntry,
+                                ))
+                            }
+                        }
                     }
                 }
             }
@@ -1370,6 +1410,6 @@ impl SyntaxInventory {
                 }
             }
         }
-        Ok(out)
+        out
     }
 }

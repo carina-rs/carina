@@ -2,7 +2,98 @@ use std::path::Path;
 
 use carina_core::parser::{ProviderContext, parse_file, parse_syntax_inventory};
 use carina_core::resource::{ConcreteValue, Value};
-use carina_core::validation::unknown_directive_keys;
+use carina_core::validation::resource_directive_findings;
+
+#[test]
+fn non_assignment_directive_entries_are_all_located_without_evaluation() {
+    let source = "mock.test.resource {\n  directives {\n    prevent_destroy {}\n    unsupported {}\n    let x = absent\n    force_delte = true\n  }\n}\n";
+    let parsed = parse_file(
+        source,
+        Path::new("resources.crn"),
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .expect("invalid entries are collected without evaluating their contents");
+    let findings = resource_directive_findings(parsed.parser_binding_metadata.syntax());
+    assert_eq!(findings.len(), 4, "{findings:?}");
+    for (finding, (line, width)) in findings.iter().zip([(3, 15), (4, 11), (5, 14)]) {
+        assert_eq!(
+            finding.detail().to_string(),
+            "Directive entries must be 'key = value' assignments"
+        );
+        assert_eq!(finding.location().file().path(), Path::new("resources.crn"));
+        let span = finding.location().span();
+        assert_eq!((span.start_line(), span.start_column()), (line, 5));
+        assert_eq!((span.end_line(), span.end_column()), (line, 5 + width));
+    }
+    assert!(
+        findings[3]
+            .detail()
+            .to_string()
+            .contains("Unknown directive 'force_delte'")
+    );
+}
+
+#[test]
+fn invalid_directive_entries_in_unevaluated_resources_are_collected() {
+    let source = "let empty = for n in [] {\n  mock.test.resource { directives { let x = absent } }\n}\nlet hidden = if false {\n  mock.test.resource { directives { prevent_destroy {} } }\n}\n";
+    let syntax = parse_syntax_inventory(source, Path::new("resources.crn")).unwrap();
+    let findings = resource_directive_findings(&syntax);
+    assert_eq!(findings.len(), 2, "{findings:?}");
+    assert_eq!(findings[0].location().span().start_line(), 2);
+    assert_eq!(findings[1].location().span().start_line(), 5);
+}
+
+#[test]
+fn duplicate_directives_preserve_keys_in_both_blocks_and_declaration_inventory() {
+    let source = "let repeated = 1\nlet repeated = 2\nmock.test.resource {\n  directives { force_delte = true }\n  directives { provder = absent }\n}\n";
+    let syntax = parse_syntax_inventory(source, Path::new("resources.crn"))
+        .expect("duplicate directives must not invalidate the inventory");
+    let findings = resource_directive_findings(&syntax);
+    assert_eq!(findings.len(), 3, "{findings:?}");
+    assert!(findings.iter().any(|finding| {
+        finding
+            .detail()
+            .to_string()
+            .contains("Unknown directive 'force_delte'")
+    }));
+    assert!(findings.iter().any(|finding| {
+        finding
+            .detail()
+            .to_string()
+            .contains("Unknown directive 'provder'")
+    }));
+    let duplicate = findings
+        .iter()
+        .find(|finding| {
+            finding
+                .detail()
+                .to_string()
+                .starts_with("Duplicate attribute 'directives'")
+        })
+        .unwrap();
+    assert_eq!(
+        duplicate.detail().to_string(),
+        "Duplicate attribute 'directives' (first defined on line 4)"
+    );
+    let span = duplicate.location().span();
+    assert_eq!(
+        (
+            span.start_line(),
+            span.start_column(),
+            span.end_line(),
+            span.end_column()
+        ),
+        (5, 3, 5, 13)
+    );
+    assert_eq!(
+        carina_core::config_loader::find_duplicate_declarations_in_source(
+            source,
+            Path::new("resources.crn")
+        )
+        .len(),
+        1
+    );
+}
 
 #[test]
 fn unknown_directive_keys_use_shared_suggestions_at_each_authored_key() {
@@ -23,7 +114,7 @@ fn unknown_directive_keys_use_shared_suggestions_at_each_authored_key() {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("unknown keys must not abort parsing");
-        let findings = unknown_directive_keys(parsed.parser_binding_metadata.syntax());
+        let findings = resource_directive_findings(parsed.parser_binding_metadata.syntax());
         assert_eq!(findings.len(), 1, "{key}: {findings:?}");
         let expected = match suggestion {
             Some(name) => format!("Unknown directive '{key}', did you mean '{name}'?"),
@@ -55,7 +146,7 @@ mock.test.resource {
 }
 "#;
     let syntax = parse_syntax_inventory(source, Path::new("resources.crn")).unwrap();
-    let findings = unknown_directive_keys(&syntax);
+    let findings = resource_directive_findings(&syntax);
     let messages: Vec<_> = findings
         .iter()
         .map(|finding| finding.detail().to_string())
@@ -115,7 +206,7 @@ mock.test.resource {
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    assert!(unknown_directive_keys(parsed.parser_binding_metadata.syntax()).is_empty());
+    assert!(resource_directive_findings(parsed.parser_binding_metadata.syntax()).is_empty());
     let child = &parsed.resources[1];
     assert!(!child.dependencies.depends_on.is_empty());
     assert!(!child.attributes.contains_key("depends_on"));

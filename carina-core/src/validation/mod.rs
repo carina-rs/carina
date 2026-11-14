@@ -9,7 +9,7 @@ pub mod deferred_populate;
 pub mod deferred_types;
 pub mod depends_on;
 mod directive_keys;
-pub use directive_keys::{UnknownDirectiveKey, unknown_directive_keys};
+pub use directive_keys::{ResourceDirectiveFinding, resource_directive_findings};
 mod parameter_findings;
 pub mod routing;
 pub mod typecheck;

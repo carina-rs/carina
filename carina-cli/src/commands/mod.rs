@@ -640,7 +640,7 @@ pub(crate) fn validate_and_resolve_report_inner(
         &mut warnings,
         &mut directive_errors,
     );
-    // Key errors are independent of value/type validation. Merge them only
+    // Directive findings are independent of value/type validation. Merge them only
     // after that pass so they cannot trigger an early return hiding findings.
     let result = if directive_errors.is_empty() {
         result
@@ -694,9 +694,9 @@ fn validate_and_resolve_configuration(
                 .map(|module| module.loaded().parsed.parser_binding_metadata.syntax()),
         ) {
             directive_errors.extend(
-                carina_core::validation::unknown_directive_keys(syntax)
+                carina_core::validation::resource_directive_findings(syntax)
                     .into_iter()
-                    .map(|finding| AppError::UnknownDirective(Box::new(finding))),
+                    .map(|finding| AppError::ResourceDirective(Box::new(finding))),
             );
         }
     }

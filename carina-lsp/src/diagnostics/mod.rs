@@ -662,10 +662,17 @@ impl DiagnosticRun<'_> {
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
         let buffer_parsed = doc.parsed();
-        if let Some(parsed) = buffer_parsed {
-            for finding in carina_core::validation::unknown_directive_keys(
-                parsed.parser_binding_metadata.syntax(),
-            ) {
+        // Duplicate declarations can prevent runtime parsing while leaving a
+        // complete syntax inventory. Keep directive diagnostics in that case.
+        let recovered_syntax = buffer_parsed
+            .is_none()
+            .then(|| carina_core::parser::parse_syntax_inventory(&text, doc.source_file()).ok())
+            .flatten();
+        let buffer_syntax = buffer_parsed
+            .map(|parsed| parsed.parser_binding_metadata.syntax())
+            .or(recovered_syntax.as_ref());
+        if let Some(syntax) = buffer_syntax {
+            for finding in carina_core::validation::resource_directive_findings(syntax) {
                 if let Some(diagnostic) = render_merged(
                     doc,
                     &finding,

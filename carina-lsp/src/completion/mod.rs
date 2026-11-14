@@ -19,6 +19,7 @@ use crate::enclosing_block::{
     EnclosingBlock, ResourceTypePatterns, StructPath, cursor_line_segment, enclosing_block,
 };
 use carina_core::paths::ResolvedPath;
+use carina_core::resource::ResourceDirective;
 use carina_core::schema::{
     CompiledAttributeType as AttributeType, CompletionValue, OwnerBoundResourceSchema, SchemaKind,
     SchemaRegistry, Shape, ValidatedResourceSchema,
@@ -453,7 +454,8 @@ impl CompletionProvider {
         // attribute — short-circuit before the struct router runs (#2873).
         let directives_context = match resource_block {
             Some((resource_type, StructPath::Known(struct_path), binding))
-                if struct_path.first().map(String::as_str) == Some("directives") =>
+                if struct_path.len() == 1
+                    && struct_path.first().map(String::as_str) == Some("directives") =>
             {
                 Some((resource_type, binding))
             }
@@ -468,15 +470,18 @@ impl CompletionProvider {
                 && !after_eq[open..].contains(']')
             {
                 let attr_name = self.extract_attr_name(prefix);
-                if attr_name == "depends_on" {
-                    return CompletionContext::InsideDirectivesDependsOnList {
-                        current_binding: directives_binding.cloned(),
-                    };
-                }
-                if attr_name == "ignore_changes" {
-                    return CompletionContext::InsideDirectivesIgnoreChangesList {
-                        resource_type: directives_resource_type.to_string(),
-                    };
+                match ResourceDirective::from_name(&attr_name) {
+                    Some(ResourceDirective::DependsOn) => {
+                        return CompletionContext::InsideDirectivesDependsOnList {
+                            current_binding: directives_binding.cloned(),
+                        };
+                    }
+                    Some(ResourceDirective::IgnoreChanges) => {
+                        return CompletionContext::InsideDirectivesIgnoreChangesList {
+                            resource_type: directives_resource_type.to_string(),
+                        };
+                    }
+                    _ => {}
                 }
             }
             // Cursor inside `directives { provider = | }` (#2191 Phase 5).
@@ -484,7 +489,7 @@ impl CompletionProvider {
             // of a `let <name> = provider <kind> { ... }` instance.
             if prefix.contains('=') {
                 let attr_name = self.extract_attr_name(prefix);
-                if attr_name == "provider" {
+                if ResourceDirective::from_name(&attr_name) == Some(ResourceDirective::Provider) {
                     return CompletionContext::InsideDirectivesProviderValue;
                 }
             }
@@ -683,7 +688,8 @@ impl CompletionProvider {
     /// Extract attribute name from a line prefix like "    enable_dns_hostnames = "
     fn extract_attr_name(&self, prefix: &str) -> String {
         let before_eq = prefix.split('=').next().unwrap_or("").trim();
-        before_eq.to_string()
+        carina_core::parser::decode_attribute_key(before_eq)
+            .unwrap_or_else(|| before_eq.to_string())
     }
 
     fn struct_field_completions(

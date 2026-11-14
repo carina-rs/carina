@@ -503,7 +503,6 @@ impl ResidualModuleResolutionError {
                 | ParseError::InvalidResourceType(_)
                 | ParseError::DuplicateModule(_)
                 | ParseError::DuplicateBinding { name: _, line: _ }
-                | ParseError::DuplicateDirectives { first_line: _ }
                 | ParseError::UndefinedIdentifier {
                     name: _,
                     line: _,

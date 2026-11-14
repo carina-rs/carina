@@ -2721,6 +2721,71 @@ fn directives_block_completion_includes_all_six_keys() {
 }
 
 #[test]
+fn directive_value_completions_decode_quoted_keys() {
+    let provider = test_provider_single_attr();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("providers.crn"),
+        "let alternate = provider test {}\n",
+    )
+    .unwrap();
+    for (key, value, expected) in [
+        ("depends_on", "[]", "role"),
+        ("ignore_changes", "[]", "attr"),
+        ("provider", "", "alternate"),
+    ] {
+        let mut baseline = None;
+        for quote in ["", "'", "\""] {
+            let source = format!(
+                "let alternate = provider test {{}}\nlet role = test.foo.bar {{ attr = 'r' }}\nlet bucket = test.foo.bar {{\n  directives {{\n    {quote}{key}{quote} = {value}\n  }}\n}}\n"
+            );
+            let column = 4 + quote.len() * 2 + key.len() + 3 + usize::from(value == "[]");
+            let context = provider.get_completion_context(&source, Position::new(4, column as u32));
+            let expected_context = match key {
+                "depends_on" => {
+                    matches!(context, CompletionContext::InsideDirectivesDependsOnList { current_binding: Some(ref binding) } if binding == "bucket")
+                }
+                "ignore_changes" => matches!(
+                    context,
+                    CompletionContext::InsideDirectivesIgnoreChangesList { .. }
+                ),
+                "provider" => matches!(context, CompletionContext::InsideDirectivesProviderValue),
+                _ => unreachable!(),
+            };
+            assert!(expected_context, "{quote}{key}{quote}: {context:?}");
+            let completions = provider.complete_for_test(
+                &create_document(&source),
+                Position::new(4, column as u32),
+                Some(directory.path()),
+            );
+            let labels: Vec<_> = completions.iter().map(|item| item.label.clone()).collect();
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "{quote}{key}{quote}: {labels:?}"
+            );
+            if let Some(baseline) = &baseline {
+                assert_eq!(&labels, baseline, "{quote}{key}{quote}");
+            } else {
+                baseline = Some(labels);
+            }
+        }
+    }
+}
+
+#[test]
+fn directive_completions_require_a_direct_child_of_the_directives_block() {
+    let provider = test_provider_single_attr();
+    let doc = create_document("test.foo.bar {\n  directives {\n    foo {\n      \n    }\n  }\n}\n");
+    let completions = provider.complete_for_test(&doc, Position::new(3, 6), None);
+    for (key, _) in carina_core::resource::ResourceDirective::ALL {
+        assert!(
+            !completions.iter().any(|item| item.label == *key),
+            "nested block offered directive {key}: {completions:?}"
+        );
+    }
+}
+
+#[test]
 fn directives_ignore_changes_completion_offers_writable_attribute_paths() {
     let provider = test_provider_with_nested_structs();
     let doc = create_document(

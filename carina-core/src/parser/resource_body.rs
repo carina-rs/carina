@@ -2,7 +2,7 @@
 
 use pest::iterators::{Pair, Pairs};
 
-use super::{DeclarationLocation, ParseError, Rule};
+use super::Rule;
 
 pub(super) struct ResourceBody<'i> {
     resource_type: Pair<'i, Rule>,
@@ -89,6 +89,7 @@ impl<'i> Iterator for BlockContents<'i> {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct ResourceDirectives<'i> {
     name: Pair<'i, Rule>,
     contents: Pairs<'i, Rule>,
@@ -96,33 +97,34 @@ pub(super) struct ResourceDirectives<'i> {
 }
 
 impl<'i> ResourceDirectives<'i> {
-    pub(super) fn ensure_unique(
-        &self,
-        locate: impl Fn(&Pair<'i, Rule>) -> DeclarationLocation,
-    ) -> Result<(), ParseError> {
-        if let Some(first) = &self.first {
-            let location = locate(&self.name);
-            return Err(ParseError::DuplicateDirectives {
-                first_line: locate(first).span().start_line(),
+    pub(super) fn duplicate(&self) -> Option<(&Pair<'i, Rule>, &Pair<'i, Rule>)> {
+        self.first.as_ref().map(|first| (&self.name, first))
+    }
+
+    /// Every child must be handled explicitly, including malformed entries.
+    pub(super) fn entries(self) -> impl Iterator<Item = DirectiveEntry<'i>> {
+        self.contents.map(|pair| {
+            let entry = if pair.as_rule() == Rule::block_content {
+                pair.into_inner().next().expect("directive content")
+            } else {
+                pair
+            };
+            match entry.as_rule() {
+                Rule::attribute => DirectiveEntry::Attribute(entry),
+                Rule::nested_block => DirectiveEntry::Invalid(
+                    entry
+                        .into_inner()
+                        .next()
+                        .expect("invalid directive block name"),
+                ),
+                _ => DirectiveEntry::Invalid(entry),
             }
-            .at(&location));
-        }
-        Ok(())
+        })
     }
+}
 
-    pub(super) fn into_contents(self) -> Pairs<'i, Rule> {
-        self.contents
-    }
-
-    pub(super) fn attributes(self) -> impl Iterator<Item = Pair<'i, Rule>> {
-        self.contents
-            .map(|pair| {
-                if pair.as_rule() == Rule::block_content {
-                    pair.into_inner().next().expect("directive content")
-                } else {
-                    pair
-                }
-            })
-            .filter(|pair| pair.as_rule() == Rule::attribute)
-    }
+pub(super) enum DirectiveEntry<'i> {
+    Attribute(Pair<'i, Rule>),
+    /// The block name or complete non-assignment entry to diagnose.
+    Invalid(Pair<'i, Rule>),
 }

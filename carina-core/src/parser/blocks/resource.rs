@@ -10,7 +10,9 @@ use crate::parser::context::{
     ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
 };
 use crate::parser::error::ParseError;
-use crate::parser::resource_body::{BlockContent, BlockContents, ResourceBody};
+use crate::parser::resource_body::{
+    BlockContent, BlockContents, DirectiveEntry, ResourceBody, ResourceDirectives,
+};
 use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{BoundDeferredTarget, Rule};
 use crate::parser::{
@@ -238,11 +240,14 @@ fn parse_block_contents_with_quoted(
         let content_pair = match content {
             BlockContent::Ordinary(pair) => pair,
             BlockContent::Directives(block) => {
-                block.ensure_unique(|pair| local_ctx.declaration_location(pair))?;
-                let contents = block.into_contents();
-                check_directives_depends_on_elements(contents.clone())?;
-                check_directives_provider_value(contents.clone())?;
-                directives = Some(parse_directives(contents, &local_ctx)?);
+                // Keep the first block, including when it is empty. The
+                // inventory reports duplicates and inspects every block;
+                // later blocks cannot overwrite or evaluate runtime settings.
+                if directives.is_none() {
+                    check_directives_depends_on_elements(block.clone())?;
+                    check_directives_provider_value(block.clone())?;
+                    directives = Some(parse_directives(block, &local_ctx)?);
+                }
                 continue;
             }
         };
@@ -505,22 +510,17 @@ pub(crate) fn parse_read_resource_expr(
 }
 
 fn parse_directives(
-    pairs: pest::iterators::Pairs<Rule>,
+    block: ResourceDirectives<'_>,
     ctx: &ParseContext,
 ) -> Result<ParsedDirectives, ParseError> {
     let mut parsed_directives = ParsedDirectives::default();
 
-    for content_pair in pairs {
-        let attr = match content_pair.as_rule() {
-            Rule::block_content => {
-                first_inner(content_pair, "block content item", "directives block")?
-            }
-            Rule::attribute => content_pair,
-            _ => continue,
+    for entry in block.entries() {
+        let attr = match entry {
+            DirectiveEntry::Attribute(attribute) => attribute,
+            // The inventory retains every malformed entry for validation.
+            DirectiveEntry::Invalid(_) => continue,
         };
-        if attr.as_rule() != Rule::attribute {
-            continue;
-        }
 
         let mut attr_inner = attr.into_inner();
         let key = extract_key_string(next_pair(
@@ -775,20 +775,12 @@ fn eval_as_binding_name(
 /// reject any `depends_on = [...]` element that is a string literal — bare
 /// binding identifiers and string literals collapse to the same `Value`
 /// later, so this is the only place we can tell `[role]` from `["role"]`.
-fn check_directives_depends_on_elements(
-    directives_inner: pest::iterators::Pairs<Rule>,
-) -> Result<(), ParseError> {
-    for content_pair in directives_inner {
-        let attr = match content_pair.as_rule() {
-            Rule::block_content => {
-                first_inner(content_pair, "block content item", "block content")?
-            }
-            Rule::attribute => content_pair,
-            _ => continue,
+fn check_directives_depends_on_elements(block: ResourceDirectives<'_>) -> Result<(), ParseError> {
+    for entry in block.entries() {
+        let attr = match entry {
+            DirectiveEntry::Attribute(attribute) => attribute,
+            DirectiveEntry::Invalid(_) => continue,
         };
-        if attr.as_rule() != Rule::attribute {
-            continue;
-        }
         let mut attr_inner = attr.into_inner();
         let key_pair = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
         if ResourceDirective::from_name(&extract_key_string(key_pair)?)
@@ -828,20 +820,12 @@ fn check_directives_depends_on_elements(
 
 /// Reject `provider = "<string>"` at the pest layer, where a quoted literal
 /// remains distinguishable from a bare binding identifier.
-fn check_directives_provider_value(
-    directives_inner: pest::iterators::Pairs<Rule>,
-) -> Result<(), ParseError> {
-    for content_pair in directives_inner {
-        let attr = match content_pair.as_rule() {
-            Rule::block_content => {
-                first_inner(content_pair, "block content item", "block content")?
-            }
-            Rule::attribute => content_pair,
-            _ => continue,
+fn check_directives_provider_value(block: ResourceDirectives<'_>) -> Result<(), ParseError> {
+    for entry in block.entries() {
+        let attr = match entry {
+            DirectiveEntry::Attribute(attribute) => attribute,
+            DirectiveEntry::Invalid(_) => continue,
         };
-        if attr.as_rule() != Rule::attribute {
-            continue;
-        }
         let mut attr_inner = attr.into_inner();
         let key_pair = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
         if ResourceDirective::from_name(&extract_key_string(key_pair)?)
@@ -939,8 +923,10 @@ mod tests {
             )
             .unwrap();
             assert!(
-                crate::validation::unknown_directive_keys(parsed.parser_binding_metadata.syntax())
-                    .is_empty()
+                crate::validation::resource_directive_findings(
+                    parsed.parser_binding_metadata.syntax()
+                )
+                .is_empty()
             );
             let child = &parsed.resources[1];
             let mut lifecycle_count = 0;
@@ -968,26 +954,40 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_directives_are_errors_at_the_second_block_name() {
+    fn duplicate_directives_keep_the_first_block_and_collect_the_second_name() {
         for header in [
             "mock.test.resource",
             "let named = mock.test.resource",
             "let observed = read mock.test.resource",
         ] {
             let source = format!(
-                "{header} {{\n  directives {{ prevent_destroy = true }}\n  directives {{ force_delete = true }}\n}}\n"
+                "{header} {{\n  directives {{ prevent_destroy = true }}\n  directives {{ prevent_destroy = false force_delete = absent }}\n}}\n"
             );
-            let error = parse_file(
+            let parsed = parse_file(
                 &source,
                 Path::new("resources.crn"),
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
-            .expect_err("a second directives block must never overwrite the first");
+            .expect("duplicate blocks are collected without evaluating the second block");
+            let findings = crate::validation::resource_directive_findings(
+                parsed.parser_binding_metadata.syntax(),
+            );
+            assert_eq!(findings.len(), 1, "{findings:?}");
             assert_eq!(
-                error.diagnostic_message(),
+                findings[0].detail().to_string(),
                 "Duplicate attribute 'directives' (first defined on line 2)"
             );
-            let location = error.element_diagnostic().unwrap().location();
+            let directives = if header.contains("read ") {
+                &parsed.data_sources[0].directives
+            } else {
+                &parsed.resources[0].directives
+            };
+            let mut values = Vec::new();
+            directives
+                .clone()
+                .map_expressions(|expression| values.push(expression.value().clone()));
+            assert_eq!(values, [Value::Concrete(ConcreteValue::Bool(true))]);
+            let location = findings[0].location();
             assert_eq!(location.file().path(), Path::new("resources.crn"));
             assert_eq!(
                 (location.span().start_line(), location.span().start_column()),
@@ -1006,17 +1006,21 @@ mod tests {
             let source = format!(
                 "{wrapper} {{\n  mock.test.resource {{\n    directives {{}}\n    directives {{}}\n  }}\n}}\n"
             );
-            let error = parse_file(
+            let parsed = parse_file(
                 &source,
                 Path::new("resources.crn"),
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
-            .expect_err("duplicate blocks are invalid even when their resource is not evaluated");
+            .expect("duplicate blocks must not abort the inventory");
+            let findings = crate::validation::resource_directive_findings(
+                parsed.parser_binding_metadata.syntax(),
+            );
+            assert_eq!(findings.len(), 1, "{findings:?}");
             assert_eq!(
-                error.diagnostic_message(),
+                findings[0].detail().to_string(),
                 "Duplicate attribute 'directives' (first defined on line 3)"
             );
-            let location = error.element_diagnostic().unwrap().location();
+            let location = findings[0].location();
             assert_eq!(
                 (location.span().start_line(), location.span().start_column()),
                 (4, 5)

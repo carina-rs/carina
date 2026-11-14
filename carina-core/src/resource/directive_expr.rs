@@ -36,7 +36,7 @@ macro_rules! resource_directives {
                 $((stringify!($key), Self::$other)),+
             ];
 
-            pub(crate) fn from_name(key: &str) -> Option<Self> {
+            pub fn from_name(key: &str) -> Option<Self> {
                 Self::ALL.iter().find_map(|(name, directive)| (*name == key).then_some(*directive))
             }
 

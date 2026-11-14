@@ -333,9 +333,6 @@ pub enum ParseError {
     #[error("Duplicate binding at line {line}: {name}")]
     DuplicateBinding { name: String, line: usize },
 
-    #[error("Duplicate attribute 'directives' (first defined on line {first_line})")]
-    DuplicateDirectives { first_line: usize },
-
     #[error("{}", format_undefined_identifier(name, suggestion.as_deref(), in_scope))]
     UndefinedIdentifier {
         name: String,
