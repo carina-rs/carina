@@ -36,7 +36,9 @@ pub mod manifest;
 #[path = "replay/process.rs"]
 pub mod process;
 
-use carina_core::{UserDirs, parser::ProviderContext, provider::ProviderFactory};
+use carina_core::{
+    EnvironmentSnapshot, UserDirs, parser::ProviderContext, provider::ProviderFactory,
+};
 use carina_lsp::admission_coverage::with_admission_coverage;
 use carina_lsp::backend::{
     FactoryBuilder, ProviderStates, analyze_document, reload_provider_states,
@@ -45,7 +47,7 @@ use carina_lsp::document::Document;
 use carina_lsp::factories::{build_factories_with_loader, install_prober};
 use carina_plugin_host::{WasmLoadNotice, WasmLoadNoticeSink, WasmProviderFactory};
 use manifest::Manifest;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -226,8 +228,9 @@ fn replay_once(manifest: &Manifest, output: &Path) {
     );
     manifest.verify();
     let start = Instant::now();
-    let environment = manifest.environment();
-    let cache_before = (manifest.corpus == "infra").then(|| cache_inventory(&manifest.replay_home));
+    let environment = EnvironmentSnapshot::empty();
+    let infra = matches!(manifest.gate, Gate::Infra);
+    let cache_before = infra.then(|| cache_inventory(&manifest.replay_home));
     let loads = Arc::new(Mutex::new(Loads::default()));
     let builder: FactoryBuilder = Arc::new({
         let loads = Arc::clone(&loads);
@@ -372,7 +375,7 @@ fn replay_once(manifest: &Manifest, output: &Path) {
     }
     let analysis_seconds = analysis_start.elapsed().as_secs_f64();
     let loads = loads.lock().unwrap();
-    let cache_after = (manifest.corpus == "infra").then(|| cache_inventory(&manifest.replay_home));
+    let cache_after = infra.then(|| cache_inventory(&manifest.replay_home));
     // Timing/revision/provider metadata is deliberately outside diagnostic equality.
     write_json(
         &output.join("metrics.json"),
@@ -398,12 +401,10 @@ fn replay_once(manifest: &Manifest, output: &Path) {
         &output.join("stage.json"),
         &json!({"stage":"coverage_guard"}),
     );
-    let mode = if manifest.shard.is_some() {
-        CoverageMode::AnyAdmission
-    } else if manifest.corpus == "repo" {
-        CoverageMode::BothPaths
-    } else {
-        CoverageMode::AllSchemas
+    let mode = match manifest.gate {
+        Gate::RepositoryShard(_) => CoverageMode::AnyAdmission,
+        Gate::RepositoryCoverage => CoverageMode::BothPaths,
+        Gate::Infra => CoverageMode::AllSchemas,
     };
     validate_coverage(&coverage, mode).expect("admission coverage guard");
     assert_eq!(
@@ -411,7 +412,7 @@ fn replay_once(manifest: &Manifest, output: &Path) {
         "compiled cache writes failed; see metrics.json"
     );
     assert!(
-        manifest.corpus == "repo" || !load_errors,
+        !infra || !load_errors,
         "offline provider load errors; see metrics.json"
     );
     let teardown = Instant::now();
@@ -436,21 +437,7 @@ pub struct Comparison {
     varying_documents: Vec<PathBuf>,
 }
 
-/// A verdict can only be constructed after comparing at least two completed runs.
-pub fn compare_runs(
-    outputs: &[PathBuf],
-    corpus: &str,
-    documents: &[&PathBuf],
-) -> Option<Comparison> {
-    let [reference, second, remaining @ ..] = outputs else {
-        return None;
-    };
-    Some(compare_paths(
-        reference, second, remaining, corpus, documents,
-    ))
-}
-
-fn compare_paths(
+pub fn compare_paths(
     reference: &Path,
     second: &Path,
     remaining: &[PathBuf],
@@ -494,8 +481,9 @@ where
     })
 }
 
-#[derive(Clone, Copy)]
-enum Gate {
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gate {
     RepositoryShard(usize),
     RepositoryCoverage,
     Infra,
@@ -547,6 +535,7 @@ fn run_gate(test: &str, gate: Gate) {
             ),
             Gate::Infra => Manifest::freeze_infra(output),
         };
+        manifest.gate = gate;
         if let Gate::RepositoryShard(index) = gate {
             manifest.shard = Some((index, SHARDS));
         }

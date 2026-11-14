@@ -8,7 +8,7 @@ use carina_lsp::backend::{
 };
 use carina_lsp::document::Document;
 use carina_lsp::factories::{build_factories, install_prober};
-use replay::CoverageMode;
+use replay::{CoverageMode, Gate};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -57,13 +57,6 @@ fn replay_rejects_zero_admission() {
         replay::validate_coverage(&AdmissionCoverage::default(), CoverageMode::AnyAdmission)
             .is_err()
     );
-}
-
-#[test]
-fn replay_single_process_has_no_determinism_result() {
-    let output = tempfile::tempdir().unwrap();
-    let document = "main.crn".into();
-    assert!(replay::compare_runs(&[output.path().to_path_buf()], "repo", &[&document]).is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -417,14 +410,14 @@ fn replay_manifest_rejects_changed_missing_and_new_sibling_inputs() {
     let root = replay::manifest::existing_locator(fixture.path());
     let mut manifest = Manifest::new(
         root.clone(),
-        "repo",
+        Gate::RepositoryCoverage,
         vec!["main.crn".into()],
         root.join("home"),
         None,
     );
     manifest.freeze_inputs();
     manifest.verify();
-    assert!(manifest.environment().get("AWS_REGION").is_none());
+    assert!(EnvironmentSnapshot::empty().get("AWS_REGION").is_none());
     let original = std::fs::read(root.join("main.crn")).unwrap();
     std::fs::write(root.join("main.crn"), "# changed\n").unwrap();
     assert!(std::panic::catch_unwind(|| manifest.verify()).is_err());
@@ -469,7 +462,7 @@ fn replay_shards_partition_every_tracked_directory_once() {
     let documents = replay::manifest::tracked_documents(root);
     let mut manifest = replay::manifest::Manifest::new(
         root.to_path_buf(),
-        "repo",
+        Gate::RepositoryCoverage,
         documents.clone(),
         root.join("unused"),
         None,
@@ -507,7 +500,7 @@ fn replay_manifest_leaves_provider_rejection_to_production_construction() {
     .unwrap();
     let mut manifest = replay::manifest::Manifest::new(
         root.clone(),
-        "infra",
+        Gate::Infra,
         vec!["main.crn".into()],
         root.join("home"),
         Some(root.clone()),
@@ -624,7 +617,7 @@ fn replay_fingerprint_observes_the_same_projected_artifact_as_factory_loading() 
     };
     let manifest = replay::manifest::Manifest::new(
         fixture.path().to_path_buf(),
-        "infra",
+        Gate::Infra,
         vec!["main.crn".into()],
         fixture.path().join("home"),
         Some(artifacts.path().to_path_buf()),
@@ -656,13 +649,25 @@ fn replay_comparison_checks_every_completed_run() {
         std::fs::create_dir_all(output.join("repo")).unwrap();
         std::fs::write(output.join("repo/main.crn.diagnostics.json"), b"[]").unwrap();
     }
-    let comparison = replay::compare_runs(&outputs, "repo", &[&document]).unwrap();
+    let comparison = replay::compare_paths(
+        &outputs[0],
+        &outputs[1],
+        &outputs[2..],
+        "repo",
+        &[&document],
+    );
     assert_eq!(
         serde_json::to_value(comparison).unwrap()["varying_documents"],
         serde_json::json!([])
     );
     std::fs::write(outputs[2].join("repo/main.crn.diagnostics.json"), b"[{}]").unwrap();
-    let comparison = replay::compare_runs(&outputs, "repo", &[&document]).unwrap();
+    let comparison = replay::compare_paths(
+        &outputs[0],
+        &outputs[1],
+        &outputs[2..],
+        "repo",
+        &[&document],
+    );
     assert_eq!(
         serde_json::to_value(comparison).unwrap()["varying_documents"],
         serde_json::json!(["main.crn"])

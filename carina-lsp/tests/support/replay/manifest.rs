@@ -1,4 +1,4 @@
-use super::artifacts;
+use super::{Gate, artifacts};
 use carina_core::{
     EnvironmentSnapshot,
     parser::ProviderContext,
@@ -18,7 +18,7 @@ pub struct Manifest {
     pub documents: Vec<PathBuf>,
     pub inputs: BTreeMap<PathBuf, String>,
     pub exclusions: Vec<PathBuf>,
-    pub environment: BTreeMap<String, String>,
+    pub gate: Gate,
     pub replay_home: PathBuf,
     pub artifacts: Option<PathBuf>,
     pub revision: String,
@@ -80,14 +80,6 @@ impl Manifest {
             .collect()
     }
 
-    pub fn environment(&self) -> EnvironmentSnapshot {
-        EnvironmentSnapshot::new(
-            self.environment
-                .iter()
-                .map(|(key, value)| (key.clone(), value.into())),
-        )
-    }
-
     pub fn scope(&self) -> DiscoveryScope {
         DiscoveryScope::replay(
             &self.root,
@@ -103,18 +95,22 @@ impl Manifest {
 
     pub fn new(
         root: PathBuf,
-        corpus: &str,
+        gate: Gate,
         documents: Vec<PathBuf>,
         replay_home: PathBuf,
         artifacts: Option<PathBuf>,
     ) -> Self {
         Self {
             root,
-            corpus: corpus.into(),
+            corpus: match gate {
+                Gate::RepositoryShard(_) | Gate::RepositoryCoverage => "repo",
+                Gate::Infra => "infra",
+            }
+            .into(),
             documents,
             inputs: BTreeMap::new(),
             exclusions: vec![replay_home.clone()],
-            environment: BTreeMap::new(),
+            gate,
             replay_home,
             artifacts,
             revision: "fixture".into(),
@@ -141,7 +137,7 @@ impl Manifest {
         }
         let mut manifest = Self::new(
             existing_locator(&root),
-            "repo",
+            Gate::RepositoryCoverage,
             documents,
             output.join("home"),
             None,
@@ -165,7 +161,7 @@ impl Manifest {
             .unwrap_or_else(|| output.join("home"));
         let mut manifest = Self::new(
             root.clone(),
-            "infra",
+            Gate::Infra,
             infra_documents(&root),
             home,
             Some(artifacts),
@@ -200,7 +196,7 @@ impl Manifest {
             .compiled_wasm_cache_dir()
             .to_path_buf();
         std::fs::create_dir_all(&cache).unwrap();
-        if self.corpus == "infra" {
+        if matches!(self.gate, Gate::Infra) {
             let probe =
                 tempfile::NamedTempFile::new_in(&cache).expect("compiled cache must be writable");
             probe.as_file().sync_all().unwrap();
@@ -294,11 +290,11 @@ impl Manifest {
         scan(
             &self.root,
             &scope,
-            &self.environment(),
+            &EnvironmentSnapshot::empty(),
             &mut visited,
             &mut paths,
         );
-        let context = ProviderContext::new(self.environment());
+        let context = ProviderContext::new(EnvironmentSnapshot::empty());
         let mut artifacts = BTreeSet::new();
         for path in paths
             .iter()

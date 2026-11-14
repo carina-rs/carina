@@ -88,132 +88,143 @@ pub fn build_factories(
     build_factories_with_loader(user_dirs, providers, grants, &load_wasm_factory)
 }
 
-/// The sole construction seam: resolution, verification, trust and provenance
-/// remain in `build_factories_with_loader`, before the loader sees any bytes.
-pub type VerifiedFactoryLoader = dyn for<'a> Fn(
-        carina_provider_resolver::VerifiedLoad,
-        &'a carina_core::UserDirs,
-        &'a mut carina_plugin_host::WasmLoadNoticeSink,
+#[cfg(feature = "test-utils")]
+pub use loader::{VerifiedFactoryLoader, build_factories_with_loader, load_wasm_factory};
+#[cfg(not(feature = "test-utils"))]
+pub(crate) use loader::{build_factories_with_loader, load_wasm_factory};
+
+mod loader {
+    use super::*;
+
+    /// The sole construction seam: resolution, verification, trust and provenance
+    /// remain in `build_factories_with_loader`, before the loader sees any bytes.
+    pub type VerifiedFactoryLoader = dyn for<'a> Fn(
+            carina_provider_resolver::VerifiedLoad,
+            &'a carina_core::UserDirs,
+            &'a mut carina_plugin_host::WasmLoadNoticeSink,
+        ) -> carina_core::provider::BoxFuture<
+            'a,
+            Result<Box<dyn ProviderFactory>, carina_plugin_host::WasmProviderLoadError>,
+        > + Send
+        + Sync;
+
+    pub fn load_wasm_factory<'a>(
+        verified: carina_provider_resolver::VerifiedLoad,
+        user_dirs: &'a carina_core::UserDirs,
+        notices: &'a mut carina_plugin_host::WasmLoadNoticeSink,
     ) -> carina_core::provider::BoxFuture<
         'a,
         Result<Box<dyn ProviderFactory>, carina_plugin_host::WasmProviderLoadError>,
-    > + Send
-    + Sync;
-
-pub fn load_wasm_factory<'a>(
-    verified: carina_provider_resolver::VerifiedLoad,
-    user_dirs: &'a carina_core::UserDirs,
-    notices: &'a mut carina_plugin_host::WasmLoadNoticeSink,
-) -> carina_core::provider::BoxFuture<
-    'a,
-    Result<Box<dyn ProviderFactory>, carina_plugin_host::WasmProviderLoadError>,
-> {
-    Box::pin(async move {
-        carina_plugin_host::WasmProviderFactory::from_bytes(verified, user_dirs, notices)
-            .await
-            .map(|factory| Box::new(factory) as Box<dyn ProviderFactory>)
-    })
-}
-
-fn wasm_notice_sink() -> carina_plugin_host::WasmLoadNoticeSink {
-    carina_plugin_host::WasmLoadNoticeSink::new(move |notice| {
-        if matches!(
-            notice,
-            carina_plugin_host::WasmLoadNotice::ValidationRebuilt(_)
-        ) {
-            log::warn!(target: "carina_plugin_host::wasm_factory", "{notice}");
-        } else {
-            eprintln!("{notice}");
-        }
-    })
-}
-
-pub fn build_factories_with_loader(
-    user_dirs: Result<&carina_core::UserDirs, &str>,
-    providers: &[(PathBuf, ProviderConfig)],
-    grants: &carina_provider_resolver::TrustedLocalGrants,
-    loader: &VerifiedFactoryLoader,
-) -> FactoryBuildResult {
-    let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
-    let mut errors: HashMap<String, String> = HashMap::new();
-    let mut fingerprint: Vec<(String, crate::backend::ProviderInstallFingerprint)> =
-        Vec::with_capacity(providers.len());
-
-    for (source_dir, config) in providers {
-        let project = match carina_core::paths::ResolvedPath::new(source_dir) {
-            Ok(project) => project,
-            Err(error) => {
-                errors.insert(config.name.clone(), error.to_string());
-                continue;
-            }
-        };
-        fingerprint.push((
-            config.name.clone(),
-            carina_provider_resolver::provider_artifact_fingerprint(
-                &project,
-                config,
-                &mut |notice| eprintln!("{notice}"),
-            ),
-        ));
-        let installed = match resolve_install(&project, config) {
-            Ok(installed) => installed,
-            Err(rejection) => {
-                // Named instances inherit the kind default's source. Their
-                // missing source is deliberate. The source-less default mock
-                // is also deliberate: it selects Carina's built-in provider.
-                // Every other rejection is a diagnostic produced directly
-                // from this one resolution.
-                let uses_builtin_mock =
-                    carina_provider_mock::uses_builtin_provider(std::iter::once(config), |_| false);
-                if !uses_builtin_mock
-                    && (config.is_default() || rejection != InstallRejection::MissingSource)
-                {
-                    errors.insert(config.name.clone(), rejection.to_string());
-                }
-                continue;
-            }
-        };
-        let user_dirs = match user_dirs {
-            Ok(user_dirs) => user_dirs,
-            Err(error) => {
-                errors.insert(
-                    config.name.clone(),
-                    format!(
-                        "Could not resolve user directories required to load provider '{}': {error}",
-                        config.name
-                    ),
-                );
-                continue;
-            }
-        };
-
-        let mut notices = wasm_notice_sink();
-        match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(installed.load_with(
-                user_dirs,
-                grants,
-                &mut |notice| eprintln!("{notice}"),
-                |verified| loader(verified, user_dirs, &mut notices),
-            ))
-        }) {
-            Ok(factory) => {
-                log::info!(
-                    target: "carina_lsp",
-                    "LSP: loaded provider '{}' from {}",
-                    config.name,
-                    installed.path().display()
-                );
-                factories.push(factory);
-            }
-            Err(error) => {
-                // Final LSP-diagnostic boundary. The structured host chain is
-                // rendered first and resolver provenance follows it.
-                errors.insert(config.name.clone(), error.to_string());
-            }
-        }
+    > {
+        Box::pin(async move {
+            carina_plugin_host::WasmProviderFactory::from_bytes(verified, user_dirs, notices)
+                .await
+                .map(|factory| Box::new(factory) as Box<dyn ProviderFactory>)
+        })
     }
 
-    (factories, errors, fingerprint)
+    fn wasm_notice_sink() -> carina_plugin_host::WasmLoadNoticeSink {
+        carina_plugin_host::WasmLoadNoticeSink::new(move |notice| {
+            if matches!(
+                notice,
+                carina_plugin_host::WasmLoadNotice::ValidationRebuilt(_)
+            ) {
+                log::warn!(target: "carina_plugin_host::wasm_factory", "{notice}");
+            } else {
+                eprintln!("{notice}");
+            }
+        })
+    }
+
+    pub fn build_factories_with_loader(
+        user_dirs: Result<&carina_core::UserDirs, &str>,
+        providers: &[(PathBuf, ProviderConfig)],
+        grants: &carina_provider_resolver::TrustedLocalGrants,
+        loader: &VerifiedFactoryLoader,
+    ) -> FactoryBuildResult {
+        let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
+        let mut errors: HashMap<String, String> = HashMap::new();
+        let mut fingerprint: Vec<(String, crate::backend::ProviderInstallFingerprint)> =
+            Vec::with_capacity(providers.len());
+
+        for (source_dir, config) in providers {
+            let project = match carina_core::paths::ResolvedPath::new(source_dir) {
+                Ok(project) => project,
+                Err(error) => {
+                    errors.insert(config.name.clone(), error.to_string());
+                    continue;
+                }
+            };
+            fingerprint.push((
+                config.name.clone(),
+                carina_provider_resolver::provider_artifact_fingerprint(
+                    &project,
+                    config,
+                    &mut |notice| eprintln!("{notice}"),
+                ),
+            ));
+            let installed = match resolve_install(&project, config) {
+                Ok(installed) => installed,
+                Err(rejection) => {
+                    // Named instances inherit the kind default's source. Their
+                    // missing source is deliberate. The source-less default mock
+                    // is also deliberate: it selects Carina's built-in provider.
+                    // Every other rejection is a diagnostic produced directly
+                    // from this one resolution.
+                    let uses_builtin_mock = carina_provider_mock::uses_builtin_provider(
+                        std::iter::once(config),
+                        |_| false,
+                    );
+                    if !uses_builtin_mock
+                        && (config.is_default() || rejection != InstallRejection::MissingSource)
+                    {
+                        errors.insert(config.name.clone(), rejection.to_string());
+                    }
+                    continue;
+                }
+            };
+            let user_dirs = match user_dirs {
+                Ok(user_dirs) => user_dirs,
+                Err(error) => {
+                    errors.insert(
+                        config.name.clone(),
+                        format!(
+                            "Could not resolve user directories required to load provider '{}': {error}",
+                            config.name
+                        ),
+                    );
+                    continue;
+                }
+            };
+
+            let mut notices = wasm_notice_sink();
+            match tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(installed.load_with(
+                    user_dirs,
+                    grants,
+                    &mut |notice| eprintln!("{notice}"),
+                    |verified| loader(verified, user_dirs, &mut notices),
+                ))
+            }) {
+                Ok(factory) => {
+                    log::info!(
+                        target: "carina_lsp",
+                        "LSP: loaded provider '{}' from {}",
+                        config.name,
+                        installed.path().display()
+                    );
+                    factories.push(factory);
+                }
+                Err(error) => {
+                    // Final LSP-diagnostic boundary. The structured host chain is
+                    // rendered first and resolver provenance follows it.
+                    errors.insert(config.name.clone(), error.to_string());
+                }
+            }
+        }
+
+        (factories, errors, fingerprint)
+    }
 }
 
 pub fn trusted_local_grants_from_env(
