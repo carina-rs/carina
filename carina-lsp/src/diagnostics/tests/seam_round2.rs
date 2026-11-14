@@ -1,7 +1,6 @@
 use super::*;
 
 fn check_report_selection(with_empty_map: bool) {
-    use carina_core::resource::knowledge::KnowledgeContext;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
     use carina_core::validation::admission::attributes::{
         ResourceAttributeInputs, resource_attribute_admissions,
@@ -44,25 +43,26 @@ fn check_report_selection(with_empty_map: bool) {
     assert_eq!(missing.slots()[0].attribute(), "input");
     let bindings =
         carina_core::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
-    let admit = |inputs: &ResourceAttributeInputs<_>| {
-        let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
-            panic!("{error}")
-        });
+    let admit = |inputs: ResourceAttributeInputs<_>| {
         let mut coverage = Default::default();
         let errors =
             carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
-                let report = resource_attribute_admissions(
-                    selected,
-                    judged.file(),
-                    selected.schema(&schemas).unwrap(),
-                    &classified,
-                    selected.quoted_string_attrs(),
-                    inputs,
-                    &bindings,
-                    session,
-                    &schemas,
-                    &mut coverage,
-                );
+                let report = {
+                    let outcome = resource_attribute_admissions(
+                        selected,
+                        judged.file(),
+                        selected.schema(&schemas).unwrap(),
+                        selected.quoted_string_attrs(),
+                        inputs,
+                        carina_core::validation::admission::attributes::ValidationEvaluation::None,
+                        &bindings,
+                        session,
+                        &schemas,
+                        &mut coverage,
+                    );
+                    assert!(outcome.classification_diagnostics.0.is_empty());
+                    outcome.values
+                };
                 report
                     .errors()
                     .chain(report.symbolic_errors().map(|(_, _, error)| error))
@@ -71,8 +71,8 @@ fn check_report_selection(with_empty_map: bool) {
             });
         (errors, coverage)
     };
-    let (errors, coverage) = admit(&inputs);
-    let (expected, _) = admit(&ResourceAttributeInputs::from_report(
+    let (errors, coverage) = admit(inputs);
+    let (expected, _) = admit(ResourceAttributeInputs::from_report(
         resource,
         &values,
         judged.report(),
@@ -100,7 +100,6 @@ fn round3_lsp_empty_authored_map_selects_report_inputs() {
 
 #[test]
 fn round5_source_resource_missing_from_report_is_explicitly_unreached() {
-    use carina_core::resource::knowledge::KnowledgeContext;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let mut schemas = SchemaRegistry::new();
@@ -146,9 +145,6 @@ fn round5_source_resource_missing_from_report_is_explicitly_unreached() {
         .authored_evidence()
         .expect_err("source syntax without a matching report is explicitly unavailable");
     assert_eq!(missing.slots().len(), 1);
-    let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
-        panic!("{error}")
-    });
     let bindings = carina_core::binding_index::BindingIndex::from_parsed(
         sealed.judged().file(),
         &schemas,
@@ -156,18 +152,23 @@ fn round5_source_resource_missing_from_report_is_explicitly_unreached() {
     );
     let mut coverage = Default::default();
     carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
-        let report = carina_core::validation::admission::attributes::resource_attribute_admissions(
-            selected,
-            sealed.judged().file(),
-            selected.schema(&schemas).unwrap(),
-            &classified,
-            selected.quoted_string_attrs(),
-            &inputs,
-            &bindings,
-            session,
-            &schemas,
-            &mut coverage,
-        );
+        let report = {
+            let outcome =
+                carina_core::validation::admission::attributes::resource_attribute_admissions(
+                    selected,
+                    sealed.judged().file(),
+                    selected.schema(&schemas).unwrap(),
+                    selected.quoted_string_attrs(),
+                    inputs,
+                    carina_core::validation::admission::attributes::ValidationEvaluation::None,
+                    &bindings,
+                    session,
+                    &schemas,
+                    &mut coverage,
+                );
+            assert!(outcome.classification_diagnostics.0.is_empty());
+            outcome.values
+        };
         assert_eq!(
             report.errors().count() + report.symbolic_errors().count(),
             1,
@@ -316,7 +317,6 @@ fn round6_report_fallback_records_the_matched_authored_slots() {
 
 #[test]
 fn round7_report_fallback_checks_expanded_resource_with_authored_unreached_slots() {
-    use carina_core::resource::knowledge::KnowledgeContext;
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
     use carina_core::validation::admission::attributes::{
         ResourceAttributeInputs, resource_attribute_admissions,
@@ -361,25 +361,26 @@ fn round7_report_fallback_checks_expanded_resource_with_authored_unreached_slots
     let (selected, inputs) = select_admission_inputs(rref, Some(&map), &values, judged.report());
     let bindings =
         carina_core::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
-    let admit = |resource, inputs: &ResourceAttributeInputs<_>| {
-        let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
-            panic!("{error}")
-        });
+    let admit = |resource, inputs: ResourceAttributeInputs<_>| {
         let mut coverage = Default::default();
         let errors =
             carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
-                let report = resource_attribute_admissions(
-                    resource,
-                    judged.file(),
-                    rref.schema(&schemas).unwrap(),
-                    &classified,
-                    rref.quoted_string_attrs(),
-                    inputs,
-                    &bindings,
-                    session,
-                    &schemas,
-                    &mut coverage,
-                );
+                let report = {
+                    let outcome = resource_attribute_admissions(
+                        resource,
+                        judged.file(),
+                        rref.schema(&schemas).unwrap(),
+                        rref.quoted_string_attrs(),
+                        inputs,
+                        carina_core::validation::admission::attributes::ValidationEvaluation::None,
+                        &bindings,
+                        session,
+                        &schemas,
+                        &mut coverage,
+                    );
+                    assert!(outcome.classification_diagnostics.0.is_empty());
+                    outcome.values
+                };
                 report
                     .errors()
                     .map(ToString::to_string)
@@ -392,22 +393,22 @@ fn round7_report_fallback_checks_expanded_resource_with_authored_unreached_slots
             });
         (errors, coverage)
     };
-    let (expected, _) = admit(rref, &main_inputs);
-    assert!(
-        !expected.is_empty(),
-        "main reports the arithmetic type mismatch"
-    );
-    let (actual, coverage) = admit(selected, &inputs);
-    assert_eq!(
-        actual, expected,
-        "fallback diagnostics must use the expanded resource"
-    );
-    assert!(std::ptr::eq(selected, rref));
     let source_slots = source_inputs.authored_evidence().unwrap_err().slots();
     assert_eq!(
         inputs.authored_evidence().unwrap_err().slots(),
         source_slots
     );
+    let (expected, _) = admit(rref, main_inputs);
+    assert!(
+        !expected.is_empty(),
+        "main reports the arithmetic type mismatch"
+    );
+    let (actual, coverage) = admit(selected, inputs);
+    assert_eq!(
+        actual, expected,
+        "fallback diagnostics must use the expanded resource"
+    );
+    assert!(std::ptr::eq(selected, rref));
     let missing = judged
         .report()
         .completeness_report(&coverage)

@@ -1,0 +1,1 @@
+let nested = mock.test.resource { name = "nested" }

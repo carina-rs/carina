@@ -1,6 +1,6 @@
 #[cfg(feature = "test-utils")]
 use crate::admission_coverage::{
-    self as replay_coverage, ExpandedDeclineReason, Path as AdmissionPath,
+    self as replay_coverage, ExpandedDeclineReason, Path as AdmissionPath, classification_preflight,
 };
 
 mod buffer;
@@ -33,8 +33,13 @@ use carina_core::resource::{
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
 use carina_core::validation::DeferredAccessTypeError;
+#[cfg(not(feature = "test-utils"))]
+use carina_core::validation::admission::attributes::classification_preflight;
 #[cfg(test)]
 use carina_core::validation::admission::attributes::uses_resource_attribute_admission;
+use carina_core::validation::admission::attributes::{
+    ClassificationDiagnostics, ValidationEvaluation, resource_attribute_admissions,
+};
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -68,9 +73,10 @@ fn select_admission_inputs<'r, 'a>(
         .authored_instance_key()
         .and_then(|key| authored_resources?.get(&key).copied());
     match authored.and_then(|source| {
-        ResourceAttributeInputs::from_resolved(source, values, report)
-            .ok()
-            .map(|inputs| (source, inputs))
+        let resolved = ResourceAttributeInputs::from_resolved(source, values, report);
+        #[cfg(feature = "test-utils")]
+        let resolved = resolved.inspect_err(|_| replay_coverage::resolved_inputs_fell_back());
+        resolved.ok().map(|inputs| (source, inputs))
     }) {
         Some(authored) => authored,
         // Main checks the expanded owner against its resolved values. Only
@@ -395,6 +401,31 @@ struct DiagnosticValidationInputs<'a> {
         carina_core::binding_index::ResolvedBindings<ParserPlaceholder, RelativeBindingName>,
 }
 
+fn render_classification_diagnostics(
+    doc: &Document,
+    resource: &carina_core::parser::AnalysisResourceRef<'_>,
+    diagnostics: ClassificationDiagnostics<RelativeBindingName>,
+) -> Vec<Diagnostic> {
+    diagnostics
+        .0
+        .into_iter()
+        .filter_map(|(name, error)| {
+            let finding = carina_core::parser::Located::new(
+                resource
+                    .attribute_value_location(&name, &carina_core::schema::FieldPath::new())
+                    .clone(),
+                error.to_string(),
+            );
+            render_merged(
+                doc,
+                &finding,
+                DiagnosticSeverity::ERROR,
+                finding.detail().clone(),
+            )
+        })
+        .collect()
+}
+
 /// Expanded values and their binding authority stay in the absolute phase.
 /// Authored values are used separately for source positions and lexical checks.
 type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
@@ -444,25 +475,6 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             replay_coverage::declined(ExpandedDeclineReason::MissingReport);
             return None;
         };
-        let mut classified = inputs.classify(
-            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-            |_, _| {},
-        );
-        let evaluated = classified
-            .iter()
-            .filter_map(|(name, proof)| {
-                carina_core::parser::evaluate_expanded_value_for_validation(proof, session)
-                    .filter(|value| inputs.value(name).is_some_and(|source| source != value))
-                    .map(|value| (name.clone(), value))
-            })
-            .collect::<IndexMap<_, _>>();
-        let mut evaluated_inputs = inputs.clone();
-        let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
-            &evaluated,
-            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-            |_, _| {},
-        );
-        classified.extend(updated);
         #[cfg(feature = "test-utils")]
         replay_coverage::reached(AdmissionPath::Expanded);
         Some(
@@ -470,14 +482,15 @@ impl ExpandedDiagnosticValidationInputs<'_> {
                 resource,
                 self.configuration.file(),
                 schema,
-                &classified,
                 resource.quoted_string_attrs(),
-                evaluated_inputs,
+                inputs,
+                ValidationEvaluation::expanded(),
                 &self.binding_index,
                 session,
                 schemas,
                 &mut self.coverage,
-            ),
+            )
+            .values,
         )
     }
 }
@@ -1793,59 +1806,6 @@ impl DiagnosticRun<'_> {
                         &resolved_attrs,
                         expression_report,
                     );
-                    let knowledge_context =
-                        carina_core::resource::knowledge::KnowledgeContext::validation();
-                    let mut classification_error =
-                        |name: &str,
-                         error: carina_core::resource::knowledge::KnowledgeError<
-                            carina_core::resource::RelativeBindingName,
-                        >| {
-                            let finding = carina_core::parser::Located::new(
-                                rref.attribute_value_location(
-                                    name,
-                                    &carina_core::schema::FieldPath::new(),
-                                )
-                                .clone(),
-                                error.to_string(),
-                            );
-                            diagnostics.extend(render_merged(
-                                doc,
-                                &finding,
-                                DiagnosticSeverity::ERROR,
-                                finding.detail().clone(),
-                            ));
-                        };
-                    let mut classified_attrs =
-                        inputs.classify(&knowledge_context, &mut classification_error);
-                    // Reuse each authored classification. Fully known inputs
-                    // already contain their value; only a newly evaluated
-                    // candidate needs its own classification.
-                    let evaluated_attrs = classified_attrs
-                        .iter()
-                        .filter_map(|(name, knowledge)| {
-                            if matches!(
-                                knowledge,
-                                carina_core::resource::knowledge::Classification::Known(_)
-                            ) {
-                                return None;
-                            }
-                            carina_core::parser::evaluate_static_value_for_validation(
-                                knowledge,
-                                self.provider_context.catalog(),
-                            )
-                            .filter(|value| {
-                                inputs.value(name).is_some_and(|source| source != value)
-                            })
-                            .map(|value| (name.clone(), value))
-                        })
-                        .collect::<IndexMap<_, _>>();
-                    let mut evaluated_inputs = inputs.clone();
-                    let (evaluated_inputs, updated) = evaluated_inputs.materialize_and_classify(
-                        &evaluated_attrs,
-                        &knowledge_context,
-                        classification_error,
-                    );
-                    classified_attrs.extend(updated);
                     // Expansion supplies the binding authority for composition
                     // exports. Select that input before admitting attributes;
                     // the authored tree below supplies only rendering locations.
@@ -1856,23 +1816,50 @@ impl DiagnosticRun<'_> {
                             })
                         })
                     });
-                    let mut value_validation = expanded_validation_inputs.as_mut()
+                    let expanded = expanded_validation_inputs
+                        .as_mut()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| {
-                            let result = inputs.resource_admissions(resource_id, self.provider_context);
+                            let result =
+                                inputs.resource_admissions(resource_id, self.provider_context);
                             #[cfg(feature = "test-utils")]
                             if result.is_none() {
                                 replay_coverage::declined_outcome(true);
                             }
                             result
-                        })
-                        .unwrap_or_else(|| {
+                        });
+                    let (mut value_validation, classification_diagnostics) = match expanded {
+                        Some(values) => {
+                            let diagnostics = classification_preflight(
+                                &inputs,
+                                ValidationEvaluation::relative_static(),
+                                self.provider_context,
+                            );
+                            (values, diagnostics)
+                        }
+                        None => {
                             #[cfg(feature = "test-utils")]
                             replay_coverage::reached(AdmissionPath::Relative);
-                            carina_core::validation::admission::attributes::resource_attribute_admissions(
-                                admission_resource, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, evaluated_inputs, &binding_index, self.provider_context, &self.schemas, &mut authored_coverage,
-                            )
-                        });
+                            let outcome = resource_attribute_admissions(
+                                admission_resource,
+                                parsed,
+                                validated_schema,
+                                resource_quoted_string_attrs,
+                                inputs,
+                                ValidationEvaluation::relative_static(),
+                                &binding_index,
+                                self.provider_context,
+                                &self.schemas,
+                                &mut authored_coverage,
+                            );
+                            (outcome.values, outcome.classification_diagnostics)
+                        }
+                    };
+                    diagnostics.extend(render_classification_diagnostics(
+                        doc,
+                        rref,
+                        classification_diagnostics,
+                    ));
                     // Attribute rendering consumes its report entries. Preserve
                     // core's diagnostic ownership before taking those entries.
                     let resource_diagnostic_errors = value_validation

@@ -9,6 +9,11 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod classification_tests;
+#[cfg(test)]
+mod ordering_tests;
+
 /// Keep supplied keys and values, taking matched slots' order from their owner.
 /// Canonical aliases share the authored slot's occurrence and instance. Names
 /// outside that inventory retain their producer's order and report-only handling.
@@ -56,9 +61,7 @@ where
 
 /// Producer-owned attribute projections and their authored authority.
 ///
-/// Classify `values()` after producing/evaluating these inputs. Admission only
-/// borrows the resulting pairing; it never replaces a slot's projection.
-#[derive(Clone)]
+/// Admission consumes this product and classifies its stored projections.
 pub struct ResourceAttributeInputs<B: BindingAddress> {
     owner: ResourceId,
     report: Option<Arc<crate::parser::retained::ExpressionReport<B>>>,
@@ -322,17 +325,17 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         }
     }
 
-    pub fn values(&self) -> impl Iterator<Item = (&str, &Value<ParserPlaceholder, B>)> {
+    fn values(&self) -> impl Iterator<Item = (&str, &Value<ParserPlaceholder, B>)> {
         self.inputs
             .iter()
             .map(|(name, input)| (name.as_str(), input.value()))
     }
 
-    pub fn value(&self, name: &str) -> Option<&Value<ParserPlaceholder, B>> {
+    fn value(&self, name: &str) -> Option<&Value<ParserPlaceholder, B>> {
         self.inputs.get(name).map(StoredInput::value)
     }
 
-    pub fn classify<'a, S: ClassificationStage>(
+    fn classify<'a, S: ClassificationStage>(
         &'a self,
         context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
         failed: impl FnMut(&str, KnowledgeError<B>),
@@ -346,7 +349,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 
     /// Return a shared owner with the classifications borrowing its new values.
     /// Unchanged values keep their allocations and their existing proofs.
-    pub fn materialize_and_classify<'a, S: ClassificationStage>(
+    fn materialize_and_classify<'a, S: ClassificationStage>(
         &'a mut self,
         values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
@@ -379,7 +382,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     /// Called where evaluation produces new projections. Unchanged slots share
     /// their allocations, so existing classifications still name that value.
     #[cfg(test)]
-    pub(crate) fn materialize(
+    pub(in crate::validation::admission) fn materialize(
         &mut self,
         values: &IndexMap<String, Value<ParserPlaceholder, B>>,
     ) -> Result<(), MissingEvidence> {
@@ -392,6 +395,15 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         }
         self.apply_materializations(values);
         Ok(())
+    }
+
+    fn fork(&self) -> Self {
+        Self {
+            owner: self.owner.clone(),
+            report: self.report.clone(),
+            inputs: self.inputs.clone(),
+            evidence: self.evidence.clone(),
+        }
     }
 
     fn unmatched_materializations(
@@ -469,4 +481,121 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             StoredInput::Reported(_) => Ok(AttributeInput::Reported),
         }
     }
+}
+
+type ValidationDispatch<B> = for<'v> fn(
+    &Classification<'v, ParserPlaceholder, B>,
+    &dyn ProviderTypeCheckContext,
+) -> Option<Value<ParserPlaceholder, B>>;
+
+/// Fixed evaluation policies for validation. Each mode uses admission's session.
+#[expect(
+    private_interfaces,
+    reason = "Only typed constructors may supply an evaluation payload"
+)]
+pub enum ValidationEvaluation<B: BindingAddress> {
+    None,
+    Expanded(EvaluationDispatch<B>),
+    RelativeStatic(EvaluationDispatch<B>),
+}
+
+// The binding type selects the evaluator. Keeping the shared payload private
+// prevents callers from constructing or relabeling evaluation modes.
+struct EvaluationDispatch<B: BindingAddress> {
+    dispatch: ValidationDispatch<B>,
+}
+
+impl<B: BindingAddress> Copy for EvaluationDispatch<B> {}
+impl<B: BindingAddress> Clone for EvaluationDispatch<B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<B: BindingAddress> Copy for ValidationEvaluation<B> {}
+impl<B: BindingAddress> Clone for ValidationEvaluation<B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl ValidationEvaluation<crate::resource::AbsoluteBindingAddress> {
+    pub fn expanded() -> Self {
+        Self::Expanded(EvaluationDispatch {
+            dispatch: crate::parser::evaluate_expanded_value_for_validation,
+        })
+    }
+}
+
+impl ValidationEvaluation<crate::resource::RelativeBindingName> {
+    pub fn relative_static() -> Self {
+        Self::RelativeStatic(EvaluationDispatch {
+            dispatch: |proof, session| {
+                if matches!(proof, Classification::Known(_)) {
+                    return None;
+                }
+                crate::parser::evaluate_static_value_for_validation(proof, session.catalog())
+            },
+        })
+    }
+}
+
+/// Classification failures in initial-pass, then changed-pass order.
+#[derive(Debug)]
+pub struct ClassificationDiagnostics<B: BindingAddress>(pub Vec<(String, KnowledgeError<B>)>);
+
+/// Owned findings and classification failures from the consumed product.
+#[derive(Debug)]
+pub struct ResourceAdmissionOutcome<B: BindingAddress> {
+    pub values: crate::schema::ResourceValueValidation,
+    pub classification_diagnostics: ClassificationDiagnostics<B>,
+}
+
+/// Run classification and evaluation without admitting values or recording coverage.
+pub fn classification_preflight<B: BindingAddress>(
+    inputs: &ResourceAttributeInputs<B>,
+    evaluation: ValidationEvaluation<B>,
+    session: &dyn ProviderTypeCheckContext,
+) -> ClassificationDiagnostics<B> {
+    with_classified_inputs(inputs, evaluation, session, |_, _| ()).1
+}
+
+pub(super) fn with_classified_inputs<B: BindingAddress, R>(
+    inputs: &ResourceAttributeInputs<B>,
+    evaluation: ValidationEvaluation<B>,
+    session: &dyn ProviderTypeCheckContext,
+    judge: impl for<'x> FnOnce(
+        &'x ResourceAttributeInputs<B>,
+        &'x IndexMap<String, Classification<'x, ParserPlaceholder, B>>,
+    ) -> R,
+) -> (R, ClassificationDiagnostics<B>) {
+    let mut diagnostics = ClassificationDiagnostics(Vec::new());
+    let mut failed = |name: &str, error| diagnostics.0.push((name.to_owned(), error));
+    let context = KnowledgeContext::validation();
+    let mut classified = inputs.classify(&context, &mut failed);
+    #[cfg(test)]
+    classification_tests::collect_injected_errors(&classified, &mut failed);
+    // The binding type selects the evaluator through its typed constructor.
+    let dispatch = match evaluation {
+        ValidationEvaluation::None => return (judge(inputs, &classified), diagnostics),
+        ValidationEvaluation::Expanded(mode) | ValidationEvaluation::RelativeStatic(mode) => {
+            mode.dispatch
+        }
+    };
+    let evaluated = classified
+        .iter()
+        .filter_map(|(name, proof)| {
+            dispatch(proof, session)
+                .filter(|value| inputs.value(name).is_some_and(|source| source != value))
+                .map(|value| (name.clone(), value))
+        })
+        .collect();
+    // Initial proofs borrow the original owner. Only changed projections get
+    // new allocations; unchanged proofs also belong to this shared fork.
+    let mut evaluated_inputs = inputs.fork();
+    let (evaluated_inputs, updated) =
+        evaluated_inputs.materialize_and_classify(&evaluated, &context, &mut failed);
+    #[cfg(test)]
+    classification_tests::collect_injected_errors(&updated, &mut failed);
+    classified.extend(updated);
+    (judge(evaluated_inputs, &classified), diagnostics)
 }

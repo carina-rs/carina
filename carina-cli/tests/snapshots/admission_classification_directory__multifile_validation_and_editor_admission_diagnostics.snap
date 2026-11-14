@@ -1,0 +1,235 @@
+---
+source: carina-cli/tests/admission_classification_directory.rs
+expression: "serde_json::to_string_pretty(&records).unwrap()"
+---
+[
+  {
+    "mode": "text",
+    "status": 1,
+    "stderr": "Error: mock.test.resource.direct: Type mismatch: expected String, got Int\nError: mock.test.resource.composed: Type mismatch: expected String, got Int\n",
+    "stdout": "Validating...\n"
+  },
+  {
+    "mode": "json",
+    "status": 1,
+    "stderr": "",
+    "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Type mismatch: expected String, got Int\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 35\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 39\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Type mismatch: expected String, got Int\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 57\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 65\n          }\n        }\n      }\n    }\n  ],\n  \"warnings\": [\n    {\n      \"message\": \"Unused let binding 'direct'\",\n      \"severity\": \"warning\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 5\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 11\n          }\n        }\n      },\n      \"type\": \"unused_binding\"\n    },\n    {\n      \"message\": \"Unused let binding 'composed'\",\n      \"severity\": \"warning\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 5\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 13\n          }\n        }\n      },\n      \"type\": \"unused_binding\"\n    },\n    {\n      \"message\": \"Unused let binding 'evaluated'\",\n      \"severity\": \"warning\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 5\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 14\n          }\n        }\n      },\n      \"type\": \"unused_binding\"\n    },\n    {\n      \"message\": \"Unused let binding 'protected'\",\n      \"severity\": \"warning\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 6,\n            \"column\": 5\n          },\n          \"end\": {\n            \"line\": 6,\n            \"column\": 14\n          }\n        }\n      },\n      \"type\": \"unused_binding\"\n    }\n  ]\n}\n"
+  },
+  {
+    "coverage": {
+      "classification_preflight_ran": 1,
+      "expanded": {
+        "reached_admission": 2,
+        "skipped_missing_schema": {}
+      },
+      "expanded_declined_fell_back": {
+        "missing_resource": 1
+      },
+      "expanded_declined_skipped_module_resource": {},
+      "relative": {
+        "reached_admission": 4,
+        "skipped_missing_schema": {}
+      },
+      "resolved_inputs_fell_back": 0
+    },
+    "diagnostics": [
+      {
+        "message": "Type mismatch: expected String, got Int",
+        "range": {
+          "end": {
+            "character": 38,
+            "line": 2
+          },
+          "start": {
+            "character": 34,
+            "line": 2
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Type mismatch: expected String, got Int",
+        "range": {
+          "end": {
+            "character": 64,
+            "line": 3
+          },
+          "start": {
+            "character": 56,
+            "line": 3
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Unused let binding 'direct'. Consider using an anonymous resource instead.",
+        "range": {
+          "end": {
+            "character": 10,
+            "line": 2
+          },
+          "start": {
+            "character": 4,
+            "line": 2
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Unused let binding 'composed'. Consider using an anonymous resource instead.",
+        "range": {
+          "end": {
+            "character": 12,
+            "line": 3
+          },
+          "start": {
+            "character": 4,
+            "line": 3
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Unused let binding 'evaluated'. Consider using an anonymous resource instead.",
+        "range": {
+          "end": {
+            "character": 13,
+            "line": 4
+          },
+          "start": {
+            "character": 4,
+            "line": 4
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      },
+      {
+        "message": "Unused let binding 'protected'. Consider using an anonymous resource instead.",
+        "range": {
+          "end": {
+            "character": 13,
+            "line": 5
+          },
+          "start": {
+            "character": 4,
+            "line": 5
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      }
+    ],
+    "document": "main.crn"
+  },
+  {
+    "coverage": {
+      "classification_preflight_ran": 0,
+      "expanded": {
+        "reached_admission": 1,
+        "skipped_missing_schema": {}
+      },
+      "expanded_declined_fell_back": {},
+      "expanded_declined_skipped_module_resource": {},
+      "relative": {
+        "reached_admission": 0,
+        "skipped_missing_schema": {}
+      },
+      "resolved_inputs_fell_back": 0
+    },
+    "diagnostics": [],
+    "document": "exports.crn"
+  },
+  {
+    "coverage": {
+      "classification_preflight_ran": 0,
+      "expanded": {
+        "reached_admission": 1,
+        "skipped_missing_schema": {}
+      },
+      "expanded_declined_fell_back": {},
+      "expanded_declined_skipped_module_resource": {},
+      "relative": {
+        "reached_admission": 0,
+        "skipped_missing_schema": {}
+      },
+      "resolved_inputs_fell_back": 0
+    },
+    "diagnostics": [],
+    "document": "providers.crn"
+  },
+  {
+    "coverage": {
+      "classification_preflight_ran": 0,
+      "expanded": {
+        "reached_admission": 1,
+        "skipped_missing_schema": {}
+      },
+      "expanded_declined_fell_back": {},
+      "expanded_declined_skipped_module_resource": {},
+      "relative": {
+        "reached_admission": 0,
+        "skipped_missing_schema": {}
+      },
+      "resolved_inputs_fell_back": 0
+    },
+    "diagnostics": [],
+    "document": "backend.crn"
+  },
+  {
+    "coverage": {
+      "classification_preflight_ran": 0,
+      "expanded": {
+        "reached_admission": 0,
+        "skipped_missing_schema": {}
+      },
+      "expanded_declined_fell_back": {},
+      "expanded_declined_skipped_module_resource": {},
+      "relative": {
+        "reached_admission": 1,
+        "skipped_missing_schema": {}
+      },
+      "resolved_inputs_fell_back": 0
+    },
+    "diagnostics": [
+      {
+        "message": "Unused let binding 'nested'. Consider using an anonymous resource instead.",
+        "range": {
+          "end": {
+            "character": 10,
+            "line": 0
+          },
+          "start": {
+            "character": 4,
+            "line": 0
+          }
+        },
+        "severity": 2,
+        "source": "carina"
+      }
+    ],
+    "document": "module/main.crn"
+  },
+  {
+    "coverage": {
+      "classification_preflight_ran": 0,
+      "expanded": {
+        "reached_admission": 0,
+        "skipped_missing_schema": {}
+      },
+      "expanded_declined_fell_back": {},
+      "expanded_declined_skipped_module_resource": {},
+      "relative": {
+        "reached_admission": 0,
+        "skipped_missing_schema": {}
+      },
+      "resolved_inputs_fell_back": 0
+    },
+    "diagnostics": [],
+    "document": "module/attributes.crn"
+  }
+]
