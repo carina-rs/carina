@@ -86,8 +86,6 @@ impl ReplacementLineage {
     ) -> Option<Dependents> {
         // `owns` includes the direct row and all its routes. Union every owned
         // source even when a direct entry is present.
-        #[allow(clippy::iter_over_hash_type)]
-        // keyed rebuild: dependent membership is an identity-ordered set
         let dependents = requirements
             .iter()
             .filter(|(required, _)| self.owns(target, required))
