@@ -152,7 +152,6 @@ fn module_fixture() -> Fixture {
         "let img = read mock.compute.Image { filter = 'linux' }\n",
     );
     fixture.write("local/attributes.crn", "attributes { r = img }\n");
-    fixture.write("local/providers.crn", "provider mock {}\n");
     fixture
 }
 
