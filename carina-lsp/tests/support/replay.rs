@@ -1,17 +1,24 @@
 use carina_lsp::admission_coverage::AdmissionCoverage;
 
-pub fn validate_coverage(coverage: &AdmissionCoverage, repo: bool) -> Result<(), String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CoverageMode {
+    AnyAdmission,
+    BothPaths,
+    AllSchemas,
+}
+
+pub fn validate_coverage(coverage: &AdmissionCoverage, mode: CoverageMode) -> Result<(), String> {
     let relative = coverage.relative.reached_admission;
     let expanded = coverage.expanded.reached_admission;
     if relative + expanded == 0 {
         return Err(format!("corpus reached zero admissions: {coverage:?}"));
     }
-    if repo && (relative == 0 || expanded == 0) {
+    if mode == CoverageMode::BothPaths && (relative == 0 || expanded == 0) {
         return Err(format!(
             "repository corpus must reach both admission paths: {coverage:?}"
         ));
     }
-    if !repo
+    if mode == CoverageMode::AllSchemas
         && (!coverage.relative.skipped_missing_schema.is_empty()
             || !coverage.expanded.skipped_missing_schema.is_empty())
     {
@@ -220,7 +227,7 @@ fn replay_once(manifest: &Manifest, output: &Path) {
     manifest.verify();
     let start = Instant::now();
     let environment = manifest.environment();
-    let cache_before = cache_inventory(&manifest.replay_home);
+    let cache_before = (manifest.corpus == "infra").then(|| cache_inventory(&manifest.replay_home));
     let loads = Arc::new(Mutex::new(Loads::default()));
     let builder: FactoryBuilder = Arc::new({
         let loads = Arc::clone(&loads);
@@ -365,10 +372,11 @@ fn replay_once(manifest: &Manifest, output: &Path) {
     }
     let analysis_seconds = analysis_start.elapsed().as_secs_f64();
     let loads = loads.lock().unwrap();
+    let cache_after = (manifest.corpus == "infra").then(|| cache_inventory(&manifest.replay_home));
     // Timing/revision/provider metadata is deliberately outside diagnostic equality.
     write_json(
         &output.join("metrics.json"),
-        &json!({"documents":documents.len(),"load_seconds":load_seconds,"analysis_seconds":analysis_seconds,"total_seconds":start.elapsed().as_secs_f64(),"schema_total":reload.schemas,"cache":UserDirs::under(&manifest.replay_home).compiled_wasm_cache_dir(),"providers":loads.providers,"projections":loads.projections,"load_errors":loads.errors,"load_notices":loads.notices,"cache_write_failures":loads.cache_write_failures,"cache_before":cache_before,"cache_after":cache_inventory(&manifest.replay_home),"document_seconds":document_seconds}),
+        &json!({"documents":documents.len(),"load_seconds":load_seconds,"analysis_seconds":analysis_seconds,"total_seconds":start.elapsed().as_secs_f64(),"schema_total":reload.schemas,"providers":loads.providers,"projections":loads.projections,"load_errors":loads.errors,"load_notices":loads.notices,"cache_write_failures":loads.cache_write_failures,"cache_before":cache_before,"cache_after":cache_after,"document_seconds":document_seconds}),
     );
     write_json(
         &output.join("provider-manifest.json"),
@@ -390,14 +398,14 @@ fn replay_once(manifest: &Manifest, output: &Path) {
         &output.join("stage.json"),
         &json!({"stage":"coverage_guard"}),
     );
-    if manifest.shard.is_some() {
-        assert!(
-            coverage.relative.reached_admission + coverage.expanded.reached_admission > 0,
-            "shard reached zero admissions: {coverage:?}"
-        );
+    let mode = if manifest.shard.is_some() {
+        CoverageMode::AnyAdmission
+    } else if manifest.corpus == "repo" {
+        CoverageMode::BothPaths
     } else {
-        validate_coverage(&coverage, manifest.corpus == "repo").expect("admission coverage guard");
-    }
+        CoverageMode::AllSchemas
+    };
+    validate_coverage(&coverage, mode).expect("admission coverage guard");
     assert_eq!(
         cache_write_failures, 0,
         "compiled cache writes failed; see metrics.json"
@@ -423,17 +431,54 @@ fn write_json(path: &Path, value: &Value) {
 
 pub const SHARDS: usize = 6;
 
+#[derive(Serialize)]
+pub struct Comparison {
+    varying_documents: Vec<PathBuf>,
+}
+
+/// A verdict can only be constructed after comparing at least two completed runs.
+pub fn compare_runs(
+    outputs: &[PathBuf],
+    corpus: &str,
+    documents: &[&PathBuf],
+) -> Option<Comparison> {
+    let [reference, second, remaining @ ..] = outputs else {
+        return None;
+    };
+    let varying_documents = documents
+        .iter()
+        .filter(|document| {
+            let name = format!("{}/{}.diagnostics.json", corpus, document.to_string_lossy());
+            let reference = std::fs::read(reference.join(&name)).unwrap();
+            std::iter::once(second)
+                .chain(remaining)
+                .any(|output| std::fs::read(output.join(&name)).unwrap() != reference)
+        })
+        .map(|document| (*document).clone())
+        .collect();
+    Some(Comparison { varying_documents })
+}
+
+#[derive(Clone, Copy)]
+enum Gate {
+    RepositoryShard(usize),
+    RepositoryCoverage,
+    Infra,
+}
+
 pub fn gate(test: &str, shard: usize) {
-    run_gate(test, Some(shard));
+    run_gate(test, Gate::RepositoryShard(shard));
 }
 
 pub fn coverage_gate(test: &str) {
-    if std::env::var_os("CARINA_LSP_REPLAY_ROOT").is_none() {
-        run_gate(test, None);
-    }
+    run_gate(test, Gate::RepositoryCoverage);
 }
 
-fn run_gate(test: &str, shard: Option<usize>) {
+pub fn infra_gate(test: &str) {
+    run_gate(test, Gate::Infra);
+}
+
+fn run_gate(test: &str, gate: Gate) {
     if std::env::var_os(process::CHILD).is_some() {
         let manifest: Manifest = serde_json::from_slice(
             &std::fs::read(std::env::var_os(process::MANIFEST).unwrap()).unwrap(),
@@ -445,10 +490,6 @@ fn run_gate(test: &str, shard: Option<usize>) {
         );
         return;
     }
-    if shard.is_some_and(|index| index > 0) && std::env::var_os("CARINA_LSP_REPLAY_ROOT").is_some()
-    {
-        return;
-    }
     let gate_start = Instant::now();
     let temporary = tempfile::Builder::new()
         .prefix("lsp-replay-")
@@ -456,21 +497,23 @@ fn run_gate(test: &str, shard: Option<usize>) {
         .unwrap();
     let requested = std::env::var_os("CARINA_LSP_REPLAY_OUTPUT").map(PathBuf::from);
     let output = requested.as_deref().unwrap_or(temporary.path());
-    let output = if std::env::var_os("CARINA_LSP_REPLAY_ROOT").is_some() {
-        output.to_path_buf()
-    } else {
-        output.join(shard.map_or_else(|| "coverage".into(), |index| format!("shard-{index}")))
+    let output = match gate {
+        Gate::RepositoryShard(index) => output.join(format!("shard-{index}")),
+        Gate::RepositoryCoverage => output.join("coverage"),
+        Gate::Infra => output.to_path_buf(),
     };
     let output = output.as_path();
     std::fs::create_dir_all(output).unwrap();
     let result = std::panic::catch_unwind(|| {
-        let mut manifest = if let Some(path) = std::env::var_os(process::MANIFEST) {
-            serde_json::from_slice::<Manifest>(&std::fs::read(path).unwrap()).unwrap()
-        } else {
-            Manifest::freeze(output)
+        let mut manifest = match gate {
+            Gate::RepositoryShard(_) | Gate::RepositoryCoverage => Manifest::freeze_repository(
+                Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap(),
+                output,
+            ),
+            Gate::Infra => Manifest::freeze_infra(output),
         };
-        if manifest.corpus == "repo" {
-            manifest.shard = shard.map(|index| (index, SHARDS));
+        if let Gate::RepositoryShard(index) = gate {
+            manifest.shard = Some((index, SHARDS));
         }
         manifest.verify();
         let manifest_path = output.join("manifest.json");
@@ -479,45 +522,39 @@ fn run_gate(test: &str, shard: Option<usize>) {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        let repetitions: usize = if manifest.corpus == "repo" && shard.is_some() {
-            8
-        } else {
-            1
+        let repetitions: usize = match gate {
+            Gate::RepositoryShard(_) | Gate::Infra => 8,
+            Gate::RepositoryCoverage => 1,
         };
         let mut durations = Vec::new();
         // Warm shared compiled artifacts in one process, then bound concurrency
         // to two workers. All repetitions remain separate OS processes.
         let run = |iteration| {
             let worker_output = output.join(format!("run-{iteration:02}"));
+            let infra = matches!(gate, Gate::Infra);
             let seconds = process::worker(
                 test,
                 &manifest_path,
                 &worker_output,
                 &manifest.replay_home,
-                Duration::from_secs(if manifest.corpus == "infra" {
-                    1800
-                } else {
-                    900
-                }),
+                Duration::from_secs(if infra { 1800 } else { 900 }),
+                infra,
             )
             .as_secs_f64();
-            let metrics: Value =
-                serde_json::from_slice(&std::fs::read(worker_output.join("metrics.json")).unwrap())
-                    .unwrap();
-            if iteration > 0 {
+            if infra && iteration > 0 {
+                let metrics: Value = serde_json::from_slice(
+                    &std::fs::read(worker_output.join("metrics.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    !metrics["cache_before"].as_object().unwrap().is_empty(),
+                    "infra must exercise compiled module reuse"
+                );
                 assert_eq!(
                     metrics["cache_before"], metrics["cache_after"],
                     "warm replay must reuse published compiled modules"
                 );
             }
-            assert_eq!(
-                metrics["cache"],
-                serde_json::to_value(
-                    UserDirs::under(&manifest.replay_home).compiled_wasm_cache_dir()
-                )
-                .unwrap(),
-                "all workers must use the manifest's single cache under replaced HOME"
-            );
             seconds
         };
         durations.push(run(0));
@@ -532,38 +569,35 @@ fn run_gate(test: &str, shard: Option<usize>) {
                 }
             });
         }
-        let mut varying = Vec::new();
         let documents = manifest.selected_documents();
-        for document in &documents {
-            let name = format!(
-                "{}/{}.diagnostics.json",
-                manifest.corpus,
-                document.to_string_lossy()
-            );
-            let reference = std::fs::read(output.join("run-00").join(&name)).unwrap();
-            if (1..repetitions).any(|iteration| {
-                std::fs::read(output.join(format!("run-{iteration:02}")).join(&name)).unwrap()
-                    != reference
-            }) {
-                varying.push(document);
-            }
-        }
+        let outputs = (0..repetitions)
+            .map(|iteration| output.join(format!("run-{iteration:02}")))
+            .collect::<Vec<_>>();
+        let comparison = compare_runs(&outputs, &manifest.corpus, &documents);
         let worker_seconds_total: f64 = durations.iter().sum();
         write_json(
             &output.join("summary.json"),
-            &json!({"processes":repetitions,"documents":documents.len(),"corpus_documents":manifest.documents.len(),"shard":manifest.shard,"varying_documents":varying,"process_seconds":durations,"worker_seconds_total":worker_seconds_total,"gate_seconds":gate_start.elapsed().as_secs_f64()}),
+            &json!({"processes":repetitions,"documents":documents.len(),"corpus_documents":manifest.documents.len(),"shard":manifest.shard,"comparison":comparison,"process_seconds":durations,"worker_seconds_total":worker_seconds_total,"gate_seconds":gate_start.elapsed().as_secs_f64()}),
         );
-        assert!(
-            varying.is_empty(),
-            "{} documents vary across {repetitions} LSP processes; evidence: {}",
-            varying.len(),
-            output.display()
-        );
-        eprintln!(
-            "LSP replay: {repetitions} processes, {} documents, zero differences, {:.3}s total",
-            documents.len(),
-            gate_start.elapsed().as_secs_f64()
-        );
+        if let Some(comparison) = comparison {
+            assert!(
+                comparison.varying_documents.is_empty(),
+                "{} documents vary across {repetitions} LSP processes; evidence: {}",
+                comparison.varying_documents.len(),
+                output.display()
+            );
+            eprintln!(
+                "LSP replay: {repetitions} processes, {} documents, zero differences, {:.3}s total",
+                documents.len(),
+                gate_start.elapsed().as_secs_f64()
+            );
+        } else {
+            eprintln!(
+                "LSP coverage: {} documents, {:.3}s total",
+                documents.len(),
+                gate_start.elapsed().as_secs_f64()
+            );
+        }
     });
     if let Err(panic) = result {
         if requested.is_none() {

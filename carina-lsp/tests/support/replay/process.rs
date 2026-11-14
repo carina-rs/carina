@@ -12,12 +12,17 @@ pub fn worker(
     output: &Path,
     home: &Path,
     timeout: Duration,
+    ignored: bool,
 ) -> Duration {
     std::fs::create_dir_all(output).unwrap();
     let stdout = std::fs::File::create(output.join("stdout.log")).unwrap();
     let stderr = std::fs::File::create(output.join("stderr.log")).unwrap();
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test, "--nocapture"])
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", test, "--nocapture"]);
+    if ignored {
+        command.arg("--ignored");
+    }
+    let mut child = command
         .env(CHILD, "1")
         .env(MANIFEST, manifest)
         .env(WORKER_OUTPUT, output)

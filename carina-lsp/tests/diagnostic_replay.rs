@@ -8,6 +8,7 @@ use carina_lsp::backend::{
 };
 use carina_lsp::document::Document;
 use carina_lsp::factories::{build_factories, install_prober};
+use replay::CoverageMode;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -52,7 +53,75 @@ fn analyze(
 
 #[test]
 fn replay_rejects_zero_admission() {
-    assert!(replay::validate_coverage(&AdmissionCoverage::default(), false).is_err());
+    assert!(
+        replay::validate_coverage(&AdmissionCoverage::default(), CoverageMode::AnyAdmission)
+            .is_err()
+    );
+}
+
+#[test]
+fn replay_single_process_has_no_determinism_result() {
+    let output = tempfile::tempdir().unwrap();
+    let document = "main.crn".into();
+    assert!(replay::compare_runs(&[output.path().to_path_buf()], "repo", &[&document]).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_repository_corpus_excludes_untracked_sources_and_provider_installs() {
+    use std::process::Command;
+    let fixture = control();
+    for args in [vec!["init", "--quiet"], vec!["add", "*.crn", "module"]] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(fixture.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(fixture.path().join("untracked.crn"), "provider absent {}\n").unwrap();
+    let installed = fixture.path().join(".carina/providers");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(installed.join("mock.wasm"), b"untracked provider").unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let manifest = replay::manifest::Manifest::freeze_repository(fixture.path(), output.path());
+    assert!(!manifest.root.join("untracked.crn").exists());
+    assert!(!manifest.root.join(".carina/providers").exists());
+    let baseline = control();
+    let expected = states(baseline.path()).await;
+    let actual = states(&manifest.root).await;
+    let (expected_diagnostics, expected_coverage) =
+        analyze(&expected, &baseline.path().join("main.crn"));
+    let (actual_diagnostics, actual_coverage) = analyze(&actual, &manifest.root.join("main.crn"));
+    assert_eq!(
+        replay::document_json(
+            "repo/main.crn",
+            &actual_diagnostics,
+            &actual_coverage,
+            &[(manifest.root.clone(), "$CORPUS")]
+        ),
+        replay::document_json(
+            "repo/main.crn",
+            &expected_diagnostics,
+            &expected_coverage,
+            &[(baseline.path().to_path_buf(), "$CORPUS")]
+        ),
+    );
+    let other_output = tempfile::tempdir().unwrap();
+    let other = replay::manifest::Manifest::freeze_repository(fixture.path(), other_output.path());
+    assert_ne!(manifest.replay_home, other.replay_home);
+}
+
+#[test]
+fn replay_shards_accept_any_admission_without_requiring_all_schemas() {
+    let mut coverage = AdmissionCoverage::default();
+    coverage.relative.reached_admission = 1;
+    coverage
+        .expanded
+        .skipped_missing_schema
+        .insert("unavailable".into(), 1);
+    assert!(replay::validate_coverage(&coverage, CoverageMode::AnyAdmission).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -68,7 +137,7 @@ async fn replay_observes_both_admission_paths() {
         coverage.expanded.reached_admission > 0,
         "{coverage:?}; {diagnostics:?}"
     );
-    replay::validate_coverage(&coverage, true).unwrap();
+    replay::validate_coverage(&coverage, CoverageMode::BothPaths).unwrap();
 }
 
 #[test]
@@ -80,14 +149,14 @@ fn replay_tracked_corpus_is_process_deterministic() {
 fn replay_requires_each_repository_path_and_each_infra_provider() {
     let mut coverage = AdmissionCoverage::default();
     coverage.relative.reached_admission = 1;
-    assert!(replay::validate_coverage(&coverage, true).is_err());
+    assert!(replay::validate_coverage(&coverage, CoverageMode::BothPaths).is_err());
     coverage.expanded.reached_admission = 1;
-    assert!(replay::validate_coverage(&coverage, true).is_ok());
+    assert!(replay::validate_coverage(&coverage, CoverageMode::BothPaths).is_ok());
     coverage
         .expanded
         .skipped_missing_schema
         .insert("unavailable".into(), 1);
-    assert!(replay::validate_coverage(&coverage, false).is_err());
+    assert!(replay::validate_coverage(&coverage, CoverageMode::AllSchemas).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -298,39 +367,61 @@ async fn replay_discovery_scope_is_relative_to_workspace_and_shared_by_both_scan
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_discovery_scope_survives_removing_and_readding_the_last_provider() {
+    use carina_lsp::workspace::DiscoveryScope;
+    let fixture = control();
+    let root = fixture.path();
+    std::fs::create_dir_all(root.join("target/hidden")).unwrap();
+    std::fs::write(
+        root.join("target/hidden/providers.crn"),
+        "provider absent {}\n",
+    )
+    .unwrap();
+    let scope = DiscoveryScope::replay(root, vec![], &[]).unwrap();
+    let providers = tokio::sync::RwLock::new(
+        ProviderStates::new(EnvironmentSnapshot::empty()).with_replay_discovery(scope),
+    );
+    let builder: FactoryBuilder = Arc::new(|_| (vec![], Default::default(), vec![]));
+    assert_eq!(
+        reload_provider_states(root, &builder, None, &providers)
+            .await
+            .directories,
+        1
+    );
+    let declaration = root.join("providers.crn");
+    let original = std::fs::read(&declaration).unwrap();
+    std::fs::remove_file(&declaration).unwrap();
+    let empty = reload_provider_states(root, &builder, None, &providers).await;
+    assert!(empty.reloaded);
+    assert_eq!(empty.directories, 0);
+    assert_eq!(
+        reload_provider_states(root, &builder, None, &providers)
+            .await
+            .directories,
+        0
+    );
+    std::fs::write(declaration, original).unwrap();
+    assert_eq!(
+        reload_provider_states(root, &builder, None, &providers)
+            .await
+            .directories,
+        1
+    );
+}
+
 #[test]
 fn replay_manifest_rejects_changed_missing_and_new_sibling_inputs() {
-    use replay::manifest::{Manifest, sha256};
-    use std::collections::BTreeMap;
+    use replay::manifest::Manifest;
     let fixture = control();
     let root = replay::manifest::existing_locator(fixture.path());
-    let mut inputs = BTreeMap::new();
-    for name in [
-        "main.crn",
-        "providers.crn",
-        "exports.crn",
-        "backend.crn",
-        "module/main.crn",
-        "module/attributes.crn",
-    ] {
-        let path = root.join(name);
-        inputs.insert(path.clone(), sha256(&path));
-    }
-    let mut manifest = Manifest {
-        format: "carina-lsp-replay-input-v1".into(),
-        root: root.clone(),
-        corpus: "repo".into(),
-        documents: vec!["main.crn".into()],
-        inputs,
-        exclusions: vec![],
-        environment: BTreeMap::new(),
-        replay_home: root.join("home"),
-        artifacts: None,
-        revision: "fixture".into(),
-        shard: None,
-        inventory: None,
-        dependency_roots: Vec::new(),
-    };
+    let mut manifest = Manifest::new(
+        root.clone(),
+        "repo",
+        vec!["main.crn".into()],
+        root.join("home"),
+        None,
+    );
     manifest.freeze_inputs();
     manifest.verify();
     assert!(manifest.environment().get("AWS_REGION").is_none());
@@ -376,21 +467,13 @@ fn replay_shards_partition_every_tracked_directory_once() {
     use std::collections::{BTreeMap, BTreeSet};
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let documents = replay::manifest::tracked_documents(root);
-    let mut manifest = replay::manifest::Manifest {
-        format: "carina-lsp-replay-input-v1".into(),
-        root: root.to_path_buf(),
-        corpus: "repo".into(),
-        documents: documents.clone(),
-        inputs: BTreeMap::new(),
-        exclusions: vec![],
-        environment: BTreeMap::new(),
-        replay_home: root.join("unused"),
-        artifacts: None,
-        revision: "fixture".into(),
-        shard: None,
-        inventory: None,
-        dependency_roots: vec![],
-    };
+    let mut manifest = replay::manifest::Manifest::new(
+        root.to_path_buf(),
+        "repo",
+        documents.clone(),
+        root.join("unused"),
+        None,
+    );
     let mut seen = BTreeSet::new();
     let mut directory_owners = BTreeMap::new();
     for index in 0..replay::SHARDS {
@@ -415,7 +498,6 @@ fn replay_tracked_corpus_reaches_both_admission_paths() {
 
 #[test]
 fn replay_manifest_leaves_provider_rejection_to_production_construction() {
-    use std::collections::BTreeMap;
     let fixture = control();
     let root = replay::manifest::existing_locator(fixture.path());
     std::fs::write(
@@ -423,21 +505,13 @@ fn replay_manifest_leaves_provider_rejection_to_production_construction() {
         "provider mock {}\nprovider absent { source = 'example/absent' }\n",
     )
     .unwrap();
-    let mut manifest = replay::manifest::Manifest {
-        format: "carina-lsp-replay-input-v1".into(),
-        root: root.clone(),
-        corpus: "infra".into(),
-        documents: vec!["main.crn".into()],
-        inputs: BTreeMap::new(),
-        exclusions: vec![],
-        environment: BTreeMap::new(),
-        replay_home: root.join("home"),
-        artifacts: Some(root.clone()),
-        revision: "fixture".into(),
-        shard: None,
-        inventory: None,
-        dependency_roots: vec![],
-    };
+    let mut manifest = replay::manifest::Manifest::new(
+        root.clone(),
+        "infra",
+        vec!["main.crn".into()],
+        root.join("home"),
+        Some(root.clone()),
+    );
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| manifest.freeze_inputs())).is_ok(),
         "the shared builder must own rejection policy and render its load error into replay evidence"
@@ -534,7 +608,6 @@ fn replay_prunes_aliases_of_build_output_and_rejects_aliased_targets() {
 
 #[test]
 fn replay_fingerprint_observes_the_same_projected_artifact_as_factory_loading() {
-    use std::collections::BTreeMap;
     let fixture = control();
     let artifacts = tempfile::tempdir().unwrap();
     let artifact = artifacts.path().join("aws.wasm");
@@ -549,21 +622,13 @@ fn replay_fingerprint_observes_the_same_projected_artifact_as_factory_loading() 
         unresolved_attributes: Default::default(),
         binding: None,
     };
-    let manifest = replay::manifest::Manifest {
-        format: "carina-lsp-replay-input-v1".into(),
-        root: fixture.path().to_path_buf(),
-        corpus: "infra".into(),
-        documents: vec!["main.crn".into()],
-        inputs: BTreeMap::new(),
-        exclusions: vec![],
-        environment: BTreeMap::new(),
-        replay_home: fixture.path().join("home"),
-        artifacts: Some(artifacts.path().to_path_buf()),
-        revision: "fixture".into(),
-        shard: None,
-        inventory: None,
-        dependency_roots: vec![],
-    };
+    let manifest = replay::manifest::Manifest::new(
+        fixture.path().to_path_buf(),
+        "infra",
+        vec!["main.crn".into()],
+        fixture.path().join("home"),
+        Some(artifacts.path().to_path_buf()),
+    );
     let prober = replay::provider_prober(&manifest);
     let before = prober(fixture.path(), &config).unwrap();
     assert!(
@@ -572,4 +637,34 @@ fn replay_fingerprint_observes_the_same_projected_artifact_as_factory_loading() 
     );
     std::fs::write(artifact, b"replacement with different metadata").unwrap();
     assert_ne!(before, prober(fixture.path(), &config).unwrap());
+}
+
+#[test]
+#[ignore = "requires an offline infra corpus and installed provider artifacts"]
+fn replay_infra_corpus_is_process_deterministic() {
+    replay::infra_gate("replay_infra_corpus_is_process_deterministic");
+}
+
+#[test]
+fn replay_comparison_checks_every_completed_run() {
+    let fixture = tempfile::tempdir().unwrap();
+    let outputs = (0..3)
+        .map(|index| fixture.path().join(format!("run-{index}")))
+        .collect::<Vec<_>>();
+    let document = "main.crn".into();
+    for output in &outputs {
+        std::fs::create_dir_all(output.join("repo")).unwrap();
+        std::fs::write(output.join("repo/main.crn.diagnostics.json"), b"[]").unwrap();
+    }
+    let comparison = replay::compare_runs(&outputs, "repo", &[&document]).unwrap();
+    assert_eq!(
+        serde_json::to_value(comparison).unwrap()["varying_documents"],
+        serde_json::json!([])
+    );
+    std::fs::write(outputs[2].join("repo/main.crn.diagnostics.json"), b"[{}]").unwrap();
+    let comparison = replay::compare_runs(&outputs, "repo", &[&document]).unwrap();
+    assert_eq!(
+        serde_json::to_value(comparison).unwrap()["varying_documents"],
+        serde_json::json!(["main.crn"])
+    );
 }

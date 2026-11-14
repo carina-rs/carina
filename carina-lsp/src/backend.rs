@@ -58,6 +58,10 @@ struct ProviderState {
 }
 
 impl ProviderState {
+    fn empty(environment: carina_core::EnvironmentSnapshot) -> Self {
+        Self::new(vec![], HashMap::new(), vec![], None, vec![], environment)
+    }
+
     fn new(
         factories: Vec<Box<dyn ProviderFactory>>,
         mut provider_errors: HashMap<String, String>,
@@ -225,14 +229,7 @@ impl ProviderStates {
             discovery_scope: workspace::DiscoveryScope::default(),
             by_dir: HashMap::new(),
             import_map: HashMap::new(),
-            empty: ProviderState::new(
-                vec![],
-                HashMap::new(),
-                vec![],
-                None,
-                vec![],
-                environment.clone(),
-            ),
+            empty: ProviderState::empty(environment.clone()),
             environment,
         }
     }
@@ -870,21 +867,8 @@ pub async fn reload_provider_states(
         )
     };
 
-    if dir_providers.is_empty() {
-        let dropped_any = !old_states.is_empty();
-        let mut states = ProviderStates::new(environment);
-        states.discovery_scope = scope;
-        states.import_map = import_map.clone();
-        *providers.write().await = states;
-        return ProviderReload {
-            reloaded: dropped_any,
-            import_map_changed: old_import_map != import_map,
-            ..Default::default()
-        };
-    }
-
-    let mut states = ProviderStates::new(environment.clone());
-    states.discovery_scope = scope;
+    let mut by_dir = HashMap::new();
+    let empty = ProviderState::empty(environment.clone());
     let mut total_schemas = 0;
     // Track whether any dir was freshly rebuilt (or whether the set of
     // known dirs changed). When every dir was reused and the import map
@@ -904,7 +888,7 @@ pub async fn reload_provider_states(
             && configs_match(&existing.configs, &dir_configs)
         {
             total_schemas += existing.schema_count();
-            states.by_dir.insert(identity, existing);
+            by_dir.insert(identity, existing);
             continue;
         }
 
@@ -935,7 +919,7 @@ pub async fn reload_provider_states(
             environment.clone(),
         );
         total_schemas += state.schema_count();
-        states.by_dir.insert(identity, state);
+        by_dir.insert(identity, state);
     }
 
     // `old_states` was drained by `remove()` above; anything left is a
@@ -946,9 +930,15 @@ pub async fn reload_provider_states(
     // `ProviderState` applies to module files; republish diagnostics in
     // that case even when factories were all reused.
     let import_map_changed = old_import_map != import_map;
-    states.import_map = import_map;
-    let dir_count = states.by_dir.len();
-    *providers.write().await = states;
+    let dir_count = by_dir.len();
+    {
+        let mut states = providers.write().await;
+        // Reload only the provider data. Environment and discovery scope stay
+        // attached to the workspace even when no provider directories remain.
+        states.by_dir = by_dir;
+        states.import_map = import_map;
+        states.empty = empty;
+    }
 
     warnings.sort_by(|a, b| (&a.directory, &a.provider).cmp(&(&b.directory, &b.provider)));
     ProviderReload {

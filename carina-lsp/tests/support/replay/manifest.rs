@@ -13,7 +13,6 @@ use std::process::Command;
 
 #[derive(Serialize, Deserialize)]
 pub struct Manifest {
-    pub format: String,
     pub root: PathBuf,
     pub corpus: String,
     pub documents: Vec<PathBuf>,
@@ -23,11 +22,8 @@ pub struct Manifest {
     pub replay_home: PathBuf,
     pub artifacts: Option<PathBuf>,
     pub revision: String,
-    #[serde(default)]
     pub shard: Option<(usize, usize)>,
-    #[serde(default)]
-    pub inventory: Option<Vec<PathBuf>>,
-    #[serde(default)]
+    pub inventory: Vec<PathBuf>,
     pub dependency_roots: Vec<PathBuf>,
 }
 
@@ -105,96 +101,151 @@ impl Manifest {
         .unwrap()
     }
 
-    pub fn freeze(output: &Path) -> Self {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let root = existing_locator(
-            &std::env::var_os("CARINA_LSP_REPLAY_ROOT")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| repo.to_path_buf()),
-        );
-        let infra = PathIdentity::new(&root) != PathIdentity::new(repo);
-        let artifacts = std::env::var_os("CARINA_LSP_REPLAY_PROVIDERS")
-            .map(|path| existing_locator(Path::new(&path)));
-        assert!(
-            !infra || artifacts.is_some(),
-            "infra requires CARINA_LSP_REPLAY_PROVIDERS"
-        );
-        let replay_home = std::env::var_os("CARINA_LSP_REPLAY_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(
-                    std::env::var_os("CARINA_TEST_HOME")
-                        .expect("run under nextest or supply CARINA_LSP_REPLAY_HOME"),
-                )
-                .join("lsp-replay-home")
-            });
-        std::fs::create_dir_all(replay_home.join("tmp")).unwrap();
-        let cache = carina_core::UserDirs::under(&replay_home)
-            .compiled_wasm_cache_dir()
-            .to_path_buf();
-        std::fs::create_dir_all(&cache).unwrap();
-        let probe =
-            tempfile::NamedTempFile::new_in(&cache).expect("compiled cache must be writable");
-        probe.as_file().sync_all().unwrap();
-        let documents = if infra {
-            infra_documents(&root)
-        } else {
-            tracked_documents(&root)
-        };
-        assert!(!documents.is_empty(), "corpus has no documents");
-        let mut manifest = Self {
-            format: "carina-lsp-replay-input-v1".into(),
+    pub fn new(
+        root: PathBuf,
+        corpus: &str,
+        documents: Vec<PathBuf>,
+        replay_home: PathBuf,
+        artifacts: Option<PathBuf>,
+    ) -> Self {
+        Self {
             root,
-            corpus: if infra { "infra" } else { "repo" }.into(),
+            corpus: corpus.into(),
             documents,
             inputs: BTreeMap::new(),
-            exclusions: vec![output.to_path_buf(), replay_home.clone()],
+            exclusions: vec![replay_home.clone()],
             environment: BTreeMap::new(),
             replay_home,
             artifacts,
+            revision: "fixture".into(),
             shard: None,
-            inventory: None,
+            inventory: Vec::new(),
             dependency_roots: Vec::new(),
-            revision: String::from_utf8(
-                Command::new("git")
-                    .args(["rev-parse", "HEAD"])
-                    .current_dir(repo)
-                    .output()
-                    .unwrap()
-                    .stdout,
-            )
-            .unwrap()
-            .trim()
-            .into(),
-        };
-        if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
-            let target = PathBuf::from(target);
-            manifest.exclusions.push(if target.is_absolute() {
-                target
-            } else {
-                repo.join(target)
-            });
         }
-        // Trust records are explicit inputs, copied into the isolated replay home.
+    }
+
+    pub fn freeze_repository(repo: &Path, output: &Path) -> Self {
+        let documents = tracked_documents(repo);
+        let root = output.join("corpus");
+        std::fs::create_dir(&root).expect("repository replay requires a fresh corpus directory");
+        // Production discovery and document analysis see an actual disk tree,
+        // containing only tracked working-tree files. Untracked installs and
+        // sibling documents cannot affect provider loading or diagnostics.
+        for relative in tracked_files(repo) {
+            let source = repo.join(&relative);
+            if source.is_file() {
+                let destination = root.join(&relative);
+                std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+                std::fs::copy(&source, &destination).unwrap();
+            }
+        }
+        let mut manifest = Self::new(
+            existing_locator(&root),
+            "repo",
+            documents,
+            output.join("home"),
+            None,
+        );
+        manifest.freeze();
+        let source_inputs = manifest
+            .inputs
+            .iter()
+            .filter_map(|(path, hash)| {
+                path.strip_prefix(&manifest.root)
+                    .ok()
+                    .map(|relative| (existing_locator(&repo.join(relative)), hash.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        manifest.inputs.extend(source_inputs);
+        manifest.verify();
+        manifest
+    }
+
+    pub fn freeze_infra(output: &Path) -> Self {
+        let root = existing_locator(Path::new(
+            &std::env::var_os("CARINA_LSP_REPLAY_ROOT")
+                .expect("infra requires CARINA_LSP_REPLAY_ROOT"),
+        ));
+        let artifacts = existing_locator(Path::new(
+            &std::env::var_os("CARINA_LSP_REPLAY_PROVIDERS")
+                .expect("infra requires CARINA_LSP_REPLAY_PROVIDERS"),
+        ));
+        let home = std::env::var_os("CARINA_LSP_REPLAY_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| output.join("home"));
+        let mut manifest = Self::new(
+            root.clone(),
+            "infra",
+            infra_documents(&root),
+            home,
+            Some(artifacts),
+        );
+        manifest.exclusions.push(output.to_path_buf());
+        // Trust records are explicit inputs, copied into the isolated infra home.
         if let Some(trust) = std::env::var_os("CARINA_LSP_REPLAY_TRUST") {
             copy_trust(
                 Path::new(&trust),
                 &manifest.replay_home.join(".carina/trust"),
             );
         }
-        manifest.freeze_inputs();
-        let inputs = identities(manifest.inputs.keys());
-        for document in &manifest.documents {
+        manifest.freeze();
+        manifest
+    }
+
+    fn freeze(&mut self) {
+        self.revision = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .into();
+        assert!(!self.documents.is_empty(), "corpus has no documents");
+        std::fs::create_dir_all(self.replay_home.join("tmp")).unwrap();
+        let cache = carina_core::UserDirs::under(&self.replay_home)
+            .compiled_wasm_cache_dir()
+            .to_path_buf();
+        std::fs::create_dir_all(&cache).unwrap();
+        if self.corpus == "infra" {
+            let probe =
+                tempfile::NamedTempFile::new_in(&cache).expect("compiled cache must be writable");
+            probe.as_file().sync_all().unwrap();
+        }
+        if let Some(target) = std::env::var_os("CARGO_TARGET_DIR") {
+            let target = PathBuf::from(target);
+            let target = if target.is_absolute() {
+                target
+            } else {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .unwrap()
+                    .join(target)
+            };
+            // Nextest keeps isolated replay corpora underneath CARGO_TARGET_DIR.
+            // Excluding an ancestor would prune every document in that corpus.
+            if !PathIdentity::new(&self.root)
+                .ancestors()
+                .any(|ancestor| ancestor == PathIdentity::new(&target))
+            {
+                self.exclusions.push(target);
+            }
+        }
+        self.freeze_inputs();
+        let inputs = identities(self.inputs.keys());
+        for document in &self.documents {
             assert!(
                 inputs.contains(
-                    &CanonicalPath::new(manifest.root.join(document))
+                    &CanonicalPath::new(self.root.join(document))
                         .expect("missing tracked document")
                 ),
                 "missing tracked input {}",
                 document.display()
             );
         }
-        manifest
     }
 
     pub fn freeze_inputs(&mut self) {
@@ -213,35 +264,21 @@ impl Manifest {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        self.inventory = Some(self.inventory());
+        self.inventory = self.inventory();
     }
 
     pub fn verify(&self) {
-        if let Some(inventory) = &self.inventory {
+        assert_eq!(
+            identities(&self.inventory),
+            identities(&self.inventory()),
+            "disk replay input inventory changed during sweep"
+        );
+        for (path, expected) in &self.inputs {
             assert_eq!(
-                identities(inventory),
-                identities(&self.inventory()),
-                "disk replay input inventory changed during sweep"
-            );
-            for (path, expected) in &self.inputs {
-                assert_eq!(
-                    *expected,
-                    sha256(path),
-                    "disk replay input changed: {}",
-                    path.display()
-                );
-            }
-        } else {
-            assert_eq!(
-                self.inputs
-                    .iter()
-                    .map(|(path, hash)| (CanonicalPath::new(path).unwrap(), hash))
-                    .collect::<BTreeMap<_, _>>(),
-                self.disk_inputs()
-                    .iter()
-                    .map(|(path, hash)| (CanonicalPath::new(path).unwrap(), hash))
-                    .collect::<BTreeMap<_, _>>(),
-                "disk replay inputs changed during sweep"
+                *expected,
+                sha256(path),
+                "disk replay input changed: {}",
+                path.display()
             );
         }
     }
@@ -323,8 +360,15 @@ impl Manifest {
 }
 
 pub fn tracked_documents(root: &Path) -> Vec<PathBuf> {
+    tracked_files(root)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "crn"))
+        .collect()
+}
+
+fn tracked_files(root: &Path) -> Vec<PathBuf> {
     let output = Command::new("git")
-        .args(["ls-files", "-z", "--", "*.crn"])
+        .args(["ls-files", "-z"])
         .current_dir(root)
         .output()
         .unwrap();
