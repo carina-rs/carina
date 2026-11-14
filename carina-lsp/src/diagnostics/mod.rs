@@ -662,6 +662,20 @@ impl DiagnosticRun<'_> {
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
         let buffer_parsed = doc.parsed();
+        if let Some(parsed) = buffer_parsed {
+            for finding in carina_core::validation::unknown_directive_keys(
+                parsed.parser_binding_metadata.syntax(),
+            ) {
+                if let Some(diagnostic) = render_merged(
+                    doc,
+                    &finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().to_string(),
+                ) {
+                    diagnostics.push(diagnostic);
+                }
+            }
+        }
         let buffer_analysis =
             buffer_parsed.and_then(|parsed| analysis_tree(doc, parsed, &mut diagnostics));
         let pinned_base = current_file_path

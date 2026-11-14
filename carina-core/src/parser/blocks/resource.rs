@@ -19,8 +19,8 @@ use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in
 use crate::resource::{
     AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
     AuthoredDirectives as Directives, DiagnosticSourceLocations, DirectiveExpr, LoopElementOrigin,
-    LoopProvenance, ParsedIgnorePath, ParsedIgnorePathSegment, RelativeBindingName, ResourceId,
-    ResourceIdentity, UnexpandedDependencyFields,
+    LoopProvenance, ParsedIgnorePath, ParsedIgnorePathSegment, RelativeBindingName,
+    ResourceDirective, ResourceId, ResourceIdentity, UnexpandedDependencyFields,
 };
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -530,20 +530,24 @@ fn parse_directives(
         let value_pair = next_pair(&mut attr_inner, "attribute value", "directives block")?;
         let line = value_pair.line_col().0;
 
-        if let Some(directive) = key.lifecycle_directive() {
-            let source = ctx.directive_value_source_span(&value_pair);
-            let value = parse_expression(value_pair, ctx)?
-                .projection()
-                .expect("materialized parser expression")
-                .clone();
-            parsed_directives
-                .directives
-                .set(directive, DirectiveExpr::new(value, source));
+        let Some(directive) = ResourceDirective::from_key(&key) else {
+            // SyntaxInventory retains unknown keys and their locations for
+            // collected validation; do not evaluate their unused values.
             continue;
-        }
+        };
 
-        match key {
-            key if key.matches("ignore_changes") => {
+        match directive {
+            ResourceDirective::Lifecycle(directive) => {
+                let source = ctx.directive_value_source_span(&value_pair);
+                let value = parse_expression(value_pair, ctx)?
+                    .projection()
+                    .expect("materialized parser expression")
+                    .clone();
+                parsed_directives
+                    .directives
+                    .set(directive, DirectiveExpr::new(value, source));
+            }
+            ResourceDirective::IgnoreChanges => {
                 let primary =
                     crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
                         ParseError::InvalidExpression {
@@ -571,7 +575,7 @@ fn parse_directives(
                     .map(|element| parse_ignore_change_path(element, ctx))
                     .collect::<Result<Vec<_>, _>>()?;
             }
-            key if key.matches("depends_on") => {
+            ResourceDirective::DependsOn => {
                 let primary =
                     crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
                         ParseError::InvalidExpression {
@@ -607,7 +611,7 @@ fn parse_directives(
                 parsed_directives.directives.depends_on_diagnostic_sources =
                     DiagnosticSourceLocations::authored(ctx.source_file(), source_lines);
             }
-            key if key.matches("provider") => {
+            ResourceDirective::Provider => {
                 let eval = parse_expression_eval(value_pair, ctx)?;
                 parsed_directives.directives.provider_instance = Some(eval_as_binding_name(
                     eval,
@@ -616,7 +620,6 @@ fn parse_directives(
                     BindingNameUse::Provider,
                 )?);
             }
-            _ => {}
         }
     }
 

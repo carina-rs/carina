@@ -621,6 +621,7 @@ pub(crate) fn validate_and_resolve_report_inner(
     name_resolution: ConfigNameResolution,
 ) -> ConfigurationValidation<ResolvedConfig> {
     let mut warnings = Vec::new();
+    let mut directive_errors = Vec::new();
     let mut authored_inputs = carina_core::input_rules::AuthoredInputs::for_directory_in_session(
         &parsed,
         enriched_context,
@@ -637,7 +638,20 @@ pub(crate) fn validate_and_resolve_report_inner(
         name_resolution,
         &mut authored_inputs,
         &mut warnings,
+        &mut directive_errors,
     );
+    // Key errors are independent of value/type validation. Merge them only
+    // after that pass so they cannot trigger an early return hiding findings.
+    let result = if directive_errors.is_empty() {
+        result
+    } else {
+        let mut errors = match result {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.into_vec(),
+        };
+        errors.extend(directive_errors);
+        Err(non_empty_validation_failure(errors))
+    };
     ConfigurationValidation {
         result,
         authored_inputs,
@@ -658,6 +672,7 @@ fn validate_and_resolve_configuration(
     name_resolution: ConfigNameResolution,
     authored_inputs: &mut carina_core::input_rules::AuthoredInputs,
     warnings: &mut Vec<ConfigurationWarning>,
+    directive_errors: &mut Vec<AppError>,
 ) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
@@ -672,6 +687,19 @@ fn validate_and_resolve_configuration(
         &enriched_context.catalog().environment,
         ctx.schemas(),
     );
+    if !skip_resource_validation {
+        for syntax in std::iter::once(parsed.parser_binding_metadata.syntax()).chain(
+            module_walk
+                .iter()
+                .map(|module| module.loaded().parsed.parser_binding_metadata.syntax()),
+        ) {
+            directive_errors.extend(
+                carina_core::validation::unknown_directive_keys(syntax)
+                    .into_iter()
+                    .map(|finding| AppError::UnknownDirective(Box::new(finding))),
+            );
+        }
+    }
 
     let mut errors: Vec<AppError> = Vec::new();
     if !skip_resource_validation {

@@ -995,6 +995,11 @@ pub(crate) fn failed_validate_configuration(
                             .get_or_insert_with(|| file.source_label().display().to_string());
                         warning
                     }));
+                    errors.extend(
+                        validation::unknown_directive_keys(parsed.parser_binding_metadata.syntax())
+                            .into_iter()
+                            .map(|finding| AppError::UnknownDirective(Box::new(finding))),
+                    );
                     match validation::resolve_file_type_exprs(&mut parsed, session) {
                         Ok(findings) => errors.extend(
                             findings

@@ -1004,6 +1004,7 @@ pub struct SyntaxInventory<
     configuration_blocks: Vec<Located<ConfigurationBlock>>,
     module_declaration_blocks: ModuleDeclarationBlocks,
     backend_keys: Vec<Located<super::AttributeKey>>,
+    directive_keys: Vec<Located<super::AttributeKey>>,
     anonymous_headers: Vec<DeclarationLocation>,
     loops: Vec<DeclarationLocation>,
     state_targets: Vec<DeclarationLocation>,
@@ -1021,6 +1022,7 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
             configuration_blocks: Vec::new(),
             module_declaration_blocks: ModuleDeclarationBlocks::Absent,
             backend_keys: Vec::new(),
+            directive_keys: Vec::new(),
             anonymous_headers: Vec::new(),
             loops: Vec::new(),
             state_targets: Vec::new(),
@@ -1052,6 +1054,9 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     }
     pub(crate) fn backend_keys(&self) -> &[Located<super::AttributeKey>] {
         &self.backend_keys
+    }
+    pub(crate) fn directive_keys(&self) -> &[Located<super::AttributeKey>] {
+        &self.directive_keys
     }
     pub(crate) fn anonymous_headers(&self) -> &[DeclarationLocation] {
         &self.anonymous_headers
@@ -1093,6 +1098,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             .module_declaration_blocks
             .union(other.module_declaration_blocks);
         self.backend_keys.extend(other.backend_keys);
+        self.directive_keys.extend(other.directive_keys);
         self.anonymous_headers.extend(other.anonymous_headers);
         self.loops.extend(other.loops);
         self.state_targets.extend(other.state_targets);
@@ -1111,6 +1117,7 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             configuration_blocks: self.configuration_blocks,
             module_declaration_blocks: self.module_declaration_blocks,
             backend_keys: self.backend_keys,
+            directive_keys: self.directive_keys,
             anonymous_headers: self.anonymous_headers,
             loops: self.loops,
             state_targets: self.state_targets,
@@ -1266,6 +1273,37 @@ impl SyntaxInventory {
             }
         }
         let mut attributes = ElementLocations::default();
+        for resource in pairs.clone().flatten().filter(|pair| {
+            matches!(
+                pair.as_rule(),
+                Rule::resource_expr | Rule::anonymous_resource | Rule::read_resource_expr
+            )
+        }) {
+            for content in resource
+                .into_inner()
+                .filter(|pair| pair.as_rule() == Rule::block_content)
+            {
+                let block = content.into_inner().next().expect("resource content");
+                if block.as_rule() != Rule::nested_block {
+                    continue;
+                }
+                let mut parts = block.into_inner();
+                let name = parts.next().expect("nested block name");
+                if name.as_str() != "directives" {
+                    continue;
+                }
+                for content in parts {
+                    let attribute = content.into_inner().next().expect("directive content");
+                    if attribute.as_rule() == Rule::attribute {
+                        let key = attribute.into_inner().next().expect("directive key");
+                        out.directive_keys.push(Located::new(
+                            DeclarationLocation::from_pair(&key, file, source),
+                            super::AttributeKey::authored_in_file(key, file),
+                        ));
+                    }
+                }
+            }
+        }
         for parameter in pairs
             .clone()
             .flatten()

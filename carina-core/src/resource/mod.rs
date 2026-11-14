@@ -21,7 +21,7 @@ pub(crate) use dependencies::{
     retain_deferred_iterable_dependencies,
 };
 pub(crate) mod directive_expr;
-pub(crate) use directive_expr::Substituted;
+pub(crate) use directive_expr::{ResourceDirective, Substituted};
 mod enum_value;
 mod ignore_changes;
 pub mod knowledge;

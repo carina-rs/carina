@@ -4,11 +4,11 @@ use super::*;
 use crate::resource::ValueKind;
 use std::convert::Infallible;
 
-// The directive names and typed assignment API have one definition. Every
-// transformation below goes through Directives::try_map, which exhaustively
-// moves the resource fields across value and binding phases.
-macro_rules! lifecycle_directives {
-    ($($variant:ident => $field:ident),+ $(,)?) => {
+// The directive names, parser dispatch and typed assignment API have one
+// definition. Every transformation below goes through Directives::try_map,
+// which exhaustively moves resource fields across value and binding phases.
+macro_rules! resource_directives {
+    ($($variant:ident => $field:ident),+; $($other:ident => $key:ident),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum LifecycleDirective { $($variant),+ }
 
@@ -17,8 +17,26 @@ macro_rules! lifecycle_directives {
                 match self { $(Self::$variant => stringify!($field)),+ }
             }
 
-            pub(crate) fn from_name(name: &str) -> Option<Self> {
+            #[cfg(test)]
+            fn from_name(name: &str) -> Option<Self> {
                 match name { $(stringify!($field) => Some(Self::$variant),)+ _ => None }
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum ResourceDirective {
+            Lifecycle(LifecycleDirective),
+            $($other),+
+        }
+
+        impl ResourceDirective {
+            pub(crate) const ALL: &'static [(&'static str, Self)] = &[
+                $((stringify!($field), Self::Lifecycle(LifecycleDirective::$variant)),)+
+                $((stringify!($key), Self::$other)),+
+            ];
+
+            pub(crate) fn from_key(key: &crate::parser::AttributeKey) -> Option<Self> {
+                Self::ALL.iter().find_map(|(name, directive)| key.matches(name).then_some(*directive))
             }
         }
 
@@ -30,10 +48,13 @@ macro_rules! lifecycle_directives {
     };
 }
 
-lifecycle_directives! {
+resource_directives! {
     ForceDelete => force_delete,
     CreateBeforeDestroy => create_before_destroy,
-    PreventDestroy => prevent_destroy,
+    PreventDestroy => prevent_destroy;
+    IgnoreChanges => ignore_changes,
+    DependsOn => depends_on,
+    Provider => provider,
 }
 
 mod resolved_phase {
