@@ -10834,19 +10834,7 @@ pub(crate) fn narrow_type_expr(
             TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path) => match seg {
                 PathSegment::Field { name } => {
                     let schemas = schemas?;
-                    let schema = schemas
-                        .get(
-                            &path.provider,
-                            &path.resource_type,
-                            crate::schema::SchemaKind::Resource,
-                        )
-                        .or_else(|| {
-                            schemas.get(
-                                &path.provider,
-                                &path.resource_type,
-                                crate::schema::SchemaKind::DataSource,
-                            )
-                        })?;
+                    let schema = schemas.get_kindless(&path.provider, &path.resource_type)?;
                     let schema = schema.as_schema();
                     let attribute = schema.attributes.get(name)?;
                     inference::attribute_type_to_type_expr(&attribute.attr_type, &path.provider)

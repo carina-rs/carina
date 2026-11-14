@@ -7,7 +7,7 @@ mod values;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use dsl_source::DslSource;
+pub(crate) use dsl_source::{DslSource, DslSourceStorage};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,27 +16,24 @@ use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, Position
 
 use crate::document::Document;
 use crate::enclosing_block::{
-    EnclosingBlock, ResourceTypePatterns, StructPath, cursor_line_segment, enclosing_block,
+    EnclosingBlock, SchemaSelector, StructPath, cursor_line_segment, enclosing_block,
 };
 use carina_core::paths::ResolvedPath;
 use carina_core::schema::{
-    CompiledAttributeType as AttributeType, CompletionValue, OwnerBoundResourceSchema, SchemaKind,
-    SchemaRegistry, Shape, ValidatedResourceSchema,
+    CompiledAttributeType as AttributeType, CompletionValue, SchemaRegistry, Shape,
+    ValidatedResourceSchema,
 };
 
 pub struct CompletionProvider {
     schemas: Arc<SchemaRegistry>,
     provider_names: Vec<String>,
     region_completions_data: Vec<CompletionValue>,
-    /// Resource type patterns sorted longest-first for matching.
-    /// Each pattern is `"<provider>.<resource_type>"` for both Managed and DataSource entries.
-    resource_type_patterns: ResourceTypePatterns,
     /// Custom type names from provider validators (e.g., "arn", "vpc_id")
     custom_type_names: Vec<String>,
 }
 
 struct StructFieldValueTarget<'a> {
-    resource_type: &'a str,
+    selector: &'a SchemaSelector,
     attribute_path: &'a [String],
     field_name: &'a str,
 }
@@ -66,50 +63,12 @@ impl CompletionProvider {
         region_completions_data: Vec<CompletionValue>,
         custom_type_names: Vec<String>,
     ) -> Self {
-        let resource_type_patterns = ResourceTypePatterns::from_schemas(&schemas);
-
         Self {
             schemas,
             provider_names,
             region_completions_data,
-            resource_type_patterns,
             custom_type_names,
         }
-    }
-
-    /// Look up a schema by `"<provider>.<resource_type>"` key, trying Managed first.
-    /// Unqualified keys must identify a unique registered owner.
-    pub(super) fn lookup_schema(&self, key: &str) -> Option<OwnerBoundResourceSchema<'_>> {
-        let (provider, resource_type) = match key.split_once('.') {
-            Some(parts) => parts,
-            None => {
-                for kind in [SchemaKind::Resource, SchemaKind::DataSource] {
-                    let mut owners =
-                        self.schemas
-                            .iter()
-                            .filter_map(|(owner, ty, entry_kind, _)| {
-                                (!owner.is_empty() && ty == key && entry_kind == kind)
-                                    .then_some(owner)
-                            });
-                    if let Some(owner) = owners.next() {
-                        if owners.next().is_some() {
-                            return None;
-                        }
-                        return self.schemas.get(owner, key, kind);
-                    }
-                }
-                return None;
-            }
-        };
-        if provider.is_empty() {
-            return None;
-        }
-        self.schemas
-            .get(provider, resource_type, SchemaKind::Resource)
-            .or_else(|| {
-                self.schemas
-                    .get(provider, resource_type, SchemaKind::DataSource)
-            })
     }
 
     pub fn complete(
@@ -206,8 +165,8 @@ impl CompletionProvider {
             CompletionContext::TopLevel => {
                 self.top_level_completions(position, &text, base_path, provider_ctx.catalog())
             }
-            CompletionContext::InsideResourceBlock { resource_type } => {
-                self.attribute_completions_for_type(&resource_type)
+            CompletionContext::InsideResourceBlock { selector } => {
+                self.attribute_completions_for_type(&selector)
             }
             CompletionContext::InsideUpstreamStateBlock => self.upstream_state_block_completions(),
             CompletionContext::InsideUseBlock => self.use_block_completions(),
@@ -246,17 +205,17 @@ impl CompletionProvider {
                 provider_ctx,
             ),
             CompletionContext::InsideStructBlock {
-                resource_type,
+                selector,
                 attr_path,
-            } => self.struct_field_completions(&resource_type, &attr_path),
+            } => self.struct_field_completions(&selector, &attr_path),
             CompletionContext::AfterEqualsInStruct {
-                resource_type,
+                selector,
                 attr_path,
                 field_name,
                 current_binding,
             } => self.value_completions_for_struct_field(
                 StructFieldValueTarget {
-                    resource_type: &resource_type,
+                    selector: &selector,
                     attribute_path: &attr_path,
                     field_name: &field_name,
                 },
@@ -273,8 +232,8 @@ impl CompletionProvider {
                     position,
                     base_path,
                 ),
-            CompletionContext::InsideDirectivesIgnoreChangesList { resource_type } => {
-                self.directives_ignore_changes_completions(&resource_type)
+            CompletionContext::InsideDirectivesIgnoreChangesList { selector } => {
+                self.directives_ignore_changes_completions(&selector)
             }
             CompletionContext::InsideDirectivesProviderValue => {
                 self.directives_provider_completions(provider_ctx, base_path)
@@ -311,7 +270,7 @@ impl CompletionProvider {
 
         let current_line = lines[line_idx];
         let prefix = crate::position::line_prefix(current_line, position.character);
-        let block_context = enclosing_block(text, position, &self.resource_type_patterns);
+        let block_context = enclosing_block(text, position);
 
         // `for <pat> in <HERE>`: offer in-scope bindings. Detected before the
         // block-context walk because a `for` header sits at brace_depth 0 and
@@ -441,10 +400,10 @@ impl CompletionProvider {
 
         let resource_block = match &block_context {
             EnclosingBlock::Resource {
-                resource_type,
+                selector,
                 struct_path,
                 binding,
-            } => Some((resource_type.as_str(), struct_path, binding.as_ref())),
+            } => Some((selector, struct_path, binding.as_ref())),
             EnclosingBlock::ModuleCall { .. } => None,
             EnclosingBlock::Other => None,
         };
@@ -452,16 +411,16 @@ impl CompletionProvider {
         // `directives { ... }` is the meta-arg block, not a struct
         // attribute — short-circuit before the struct router runs (#2873).
         let directives_context = match resource_block {
-            Some((resource_type, StructPath::Known(struct_path), binding))
+            Some((selector, StructPath::Known(struct_path), binding))
                 if struct_path.first().map(String::as_str) == Some("directives") =>
             {
-                Some((resource_type, binding))
+                Some((selector, binding))
             }
             Some((_, StructPath::Known(_), _)) | Some((_, StructPath::Unresolvable, _)) | None => {
                 None
             }
         };
-        if let Some((directives_resource_type, directives_binding)) = directives_context {
+        if let Some((selector, directives_binding)) = directives_context {
             // Cursor inside `depends_on = [...]` → list-element completion.
             if let Some(after_eq) = prefix.split('=').next_back()
                 && let Some(open) = after_eq.rfind('[')
@@ -475,7 +434,7 @@ impl CompletionProvider {
                 }
                 if attr_name == "ignore_changes" {
                     return CompletionContext::InsideDirectivesIgnoreChangesList {
-                        resource_type: directives_resource_type.to_string(),
+                        selector: selector.clone(),
                     };
                 }
             }
@@ -495,7 +454,7 @@ impl CompletionProvider {
         }
 
         match resource_block {
-            Some((enclosing_resource_type, StructPath::Known(struct_path), current_binding))
+            Some((selector, StructPath::Known(struct_path), current_binding))
                 if !struct_path.is_empty() =>
             {
                 let current_segment = cursor_line_segment(text, position);
@@ -504,7 +463,7 @@ impl CompletionProvider {
                     if !after_eq.starts_with('"') || after_eq == "\"" {
                         let field_name = self.extract_attr_name(&current_segment);
                         return CompletionContext::AfterEqualsInStruct {
-                            resource_type: enclosing_resource_type.to_string(),
+                            selector: selector.clone(),
                             attr_path: struct_path.to_vec(),
                             field_name,
                             current_binding: current_binding.cloned(),
@@ -512,7 +471,7 @@ impl CompletionProvider {
                     }
                 }
                 return CompletionContext::InsideStructBlock {
-                    resource_type: enclosing_resource_type.to_string(),
+                    selector: selector.clone(),
                     attr_path: struct_path.to_vec(),
                 };
             }
@@ -593,7 +552,7 @@ impl CompletionProvider {
         let current_segment = cursor_line_segment(text, position);
         match &block_context {
             EnclosingBlock::Resource {
-                resource_type,
+                selector,
                 struct_path,
                 binding,
             } => match struct_path {
@@ -603,7 +562,7 @@ impl CompletionProvider {
                         if !after_eq.starts_with('"') || after_eq == "\"" {
                             return CompletionContext::AfterEquals {
                                 target: AttributeValueTarget::SchemaAttribute {
-                                    resource_type: resource_type.clone(),
+                                    selector: selector.clone(),
                                     attr_name: self.extract_attr_name(&current_segment),
                                 },
                                 current_binding: binding.clone(),
@@ -611,7 +570,7 @@ impl CompletionProvider {
                         }
                     }
                     return CompletionContext::InsideResourceBlock {
-                        resource_type: resource_type.clone(),
+                        selector: selector.clone(),
                     };
                 }
                 StructPath::Unresolvable => {
@@ -664,20 +623,13 @@ impl CompletionProvider {
             if in_upstream_state_block {
                 return CompletionContext::InsideUpstreamStateBlock;
             }
+            if crate::enclosing_block::in_control_flow_body(&crate::lex::lex(text), position) {
+                return CompletionContext::TopLevel;
+            }
             return CompletionContext::None;
         }
 
         CompletionContext::TopLevel
-    }
-
-    /// Extract resource type from a line like "aws.ec2.Vpc {" or "let x = aws.ec2.Vpc {"
-    /// Returns the resource type (e.g., "aws.ec2.Vpc") for schema lookups
-    pub(super) fn extract_resource_type(&self, line: &str) -> Option<String> {
-        let trimmed = line.trim();
-
-        self.resource_type_patterns
-            .find_in(trimmed)
-            .map(str::to_string)
     }
 
     /// Extract attribute name from a line prefix like "    enable_dns_hostnames = "
@@ -688,7 +640,7 @@ impl CompletionProvider {
 
     fn struct_field_completions(
         &self,
-        resource_type: &str,
+        selector: &SchemaSelector,
         attr_path: &[String],
     ) -> Vec<CompletionItem> {
         let trigger_suggest = Command {
@@ -697,7 +649,7 @@ impl CompletionProvider {
             arguments: None,
         };
 
-        if let Some(schema) = self.lookup_schema(resource_type) {
+        if let Some(schema) = selector.lookup(&self.schemas) {
             // Try struct field completions first
             if let Some(resolved) = schema.effective_node_at_authored_path(attr_path)
                 && !resolved.is_read_only()
@@ -803,13 +755,13 @@ impl CompletionProvider {
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let StructFieldValueTarget {
-            resource_type,
+            selector,
             attribute_path: attr_path,
             field_name,
         } = target;
         let mut completions = Vec::new();
         let mut field_is_enum = false;
-        if let Some(schema) = self.lookup_schema(resource_type)
+        if let Some(schema) = selector.lookup(&self.schemas)
             && let Some(resolved) = schema.effective_node_at_authored_path(attr_path)
             && !resolved.is_read_only()
         {
@@ -824,8 +776,12 @@ impl CompletionProvider {
                 )
                 .enum_identity()
                 .is_some();
-                completions
-                    .extend(self.completions_for_type(field.field_type(), Some(resource_type)));
+                completions.extend(
+                    self.completions_for_type(
+                        field.field_type(),
+                        Some(&selector.path().to_string()),
+                    ),
+                );
                 completions.extend(
                     self.resource_ref_completions_for_type(
                         schema.assignment_sink(
@@ -859,7 +815,7 @@ impl CompletionProvider {
 #[derive(Debug)]
 enum AttributeValueTarget {
     SchemaAttribute {
-        resource_type: String,
+        selector: SchemaSelector,
         attr_name: String,
     },
     Unresolvable,
@@ -870,7 +826,7 @@ enum AttributeValueTarget {
 enum CompletionContext {
     TopLevel,
     InsideResourceBlock {
-        resource_type: String,
+        selector: SchemaSelector,
     },
     InsideUpstreamStateBlock,
     InsideUseBlock,
@@ -902,11 +858,11 @@ enum CompletionContext {
         arg_name: String,
     },
     InsideStructBlock {
-        resource_type: String,
+        selector: SchemaSelector,
         attr_path: Vec<String>,
     },
     AfterEqualsInStruct {
-        resource_type: String,
+        selector: SchemaSelector,
         attr_path: Vec<String>,
         field_name: String,
         /// Name of the enclosing `let <binding> = <resource> { ... }` if any.
@@ -933,7 +889,7 @@ enum CompletionContext {
     },
     /// Cursor is inside `directives { ignore_changes = [|] }`.
     InsideDirectivesIgnoreChangesList {
-        resource_type: String,
+        selector: SchemaSelector,
     },
     /// Cursor is inside `directives { provider = | }` (carina#2191
     /// Phase 5). Suggests every named provider instance binding
@@ -1212,7 +1168,7 @@ fn resolve_upstream_state_source(
     base_path: Option<&carina_core::paths::ResolvedPath>,
     binding: &str,
 ) -> Option<String> {
-    let mut src_buf = String::new();
+    let mut src_buf = DslSourceStorage::default();
     let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
     collect_upstream_state_bindings(src).get(binding).cloned()
 }

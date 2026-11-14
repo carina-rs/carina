@@ -15994,6 +15994,18 @@ impl SchemaRegistry {
             })
     }
 
+    /// Resolve a type path carrying no [`SchemaKind`] (handles/Ref types),
+    /// trying the managed schema first, then the data source.
+    /// #4425 tracks removing this guess.
+    pub fn get_kindless(
+        &self,
+        provider: &str,
+        resource_type: &str,
+    ) -> Option<OwnerBoundResourceSchema<'_>> {
+        self.get(provider, resource_type, SchemaKind::Resource)
+            .or_else(|| self.get(provider, resource_type, SchemaKind::DataSource))
+    }
+
     /// Look up the `Managed` schema for a given [`Resource`].
     pub fn get_for<S, P: crate::resource::ValueKind, B: crate::resource::BindingAddress, D>(
         &self,
