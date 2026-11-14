@@ -1,0 +1,4 @@
+let direct = mock.test.resource { name = "direct" }
+let choice = use { source = "./module" }
+let child = choice {}
+let consumer = mock.test.resource { name = child.output }
