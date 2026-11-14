@@ -279,10 +279,7 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
             let resource = tree.resources().next().unwrap();
             let values = resource.attributes().into_owned();
             let inputs = ResourceAttributeInputs::from_report(resource, &values, judged.report());
-            let classified = inputs.classify(
-                &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                |_, _| {},
-            );
+
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
             let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
             carina_core::validation::deferred_types::with_session_for_test(&catalog, |session| {
@@ -290,13 +287,14 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                     resource,
                     parsed: judged.file(),
                     schema: resource.schema(&schemas).unwrap(),
-                    attributes: &classified,
+
                     quoted: resource.quoted_string_attrs(),
-                    inputs: &inputs,
+                    inputs,
+                    evaluation: carina_core::validation::admission::attributes::ValidationEvaluation::None,
                     bindings: &bindings,
                     session,
                     schemas: &schemas,
-                });
+                }).values;
                 ordinary.push(
                     findings
                         .errors()

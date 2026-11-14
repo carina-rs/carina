@@ -217,6 +217,8 @@ pub mod configuration;
 pub mod final_input;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::check_conversion_pending_discharge;
 
 #[cfg(test)]
 mod conversion_review_tests;
@@ -823,9 +825,7 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
     }
 
     /// Candidate, knowledge and authored cursor are sealed from one slot.
-    /// The classification must borrow this slot's projection allocation;
-    /// an equal value from another slot or generation is not its proof.
-    pub fn validation_slot<'a>(
+    fn validation_slot<'a>(
         slot: &'a crate::parser::retained::JudgedSlot<B>,
         proof: crate::resource::knowledge::Classification<
             'a,
@@ -842,14 +842,11 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
         AdmissionErrors,
     > {
         let value = crate::resource::knowledge::ClassifiedRef::from(&proof).diagnostic_value();
-        if !slot
-            .projection()
-            .is_some_and(|projection| std::ptr::eq(projection, value))
-        {
-            return Err(seam_constraint(
-                crate::parser::retained::MissingEvidence::new("slot/projection proof pairing"),
-            ));
-        }
+        debug_assert!(
+            slot.projection()
+                .is_some_and(|projection| std::ptr::eq(projection, value)),
+            "admission must pair a slot with its own projection proof"
+        );
         let cursor = crate::parser::retained::AuthoredCursor::authored(
             slot.cursor().map_err(seam_constraint)?,
         );

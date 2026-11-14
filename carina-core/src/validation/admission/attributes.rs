@@ -6,8 +6,11 @@ use crate::resource::ResourceId;
 use crate::schema::{LeafPathSegment, SchemaKind, SchemaRegistry};
 
 mod inputs;
-use inputs::AttributeInput;
-pub use inputs::{ResourceAttributeInputs, SlotPrechecks};
+use inputs::{AttributeInput, with_classified_inputs};
+pub use inputs::{
+    ClassificationDiagnostics, ResourceAdmissionOutcome, ResourceAttributeInputs, SlotPrechecks,
+    ValidationEvaluation, classification_preflight,
+};
 
 /// A catalog descriptor requires a registered schema owner.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -690,12 +693,9 @@ where
         &'a crate::parser::AnalysisResourceRef<'file, ParserPlaceholder, ParserPlaceholder, D, B>,
     pub parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     pub schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    pub attributes: &'a indexmap::IndexMap<
-        String,
-        crate::resource::knowledge::Classification<'a, ParserPlaceholder, B>,
-    >,
     pub quoted: &'a std::collections::HashSet<String>,
-    pub inputs: &'a ResourceAttributeInputs<B>,
+    pub inputs: ResourceAttributeInputs<B>,
+    pub evaluation: ValidationEvaluation<B>,
     pub bindings: &'a BindingIndex<'a, B>,
     pub session: &'a dyn ProviderTypeCheckContext,
     pub schemas: &'a SchemaRegistry,
@@ -751,7 +751,7 @@ impl ResourceAdmissionPass for TemplateResource {
 pub(in crate::validation) fn resource_template_preflight_admissions<E, D, B: BindingAddress>(
     request: ResourceAdmissionRequest<'_, '_, E, D, B>,
     coverage: &mut WalkCoverage,
-) -> crate::schema::ResourceValueValidation
+) -> ResourceAdmissionOutcome<B>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
@@ -760,7 +760,7 @@ where
 fn resource_admissions_for_pass<Pass: ResourceAdmissionPass, E, D, B: BindingAddress>(
     request: ResourceAdmissionRequest<'_, '_, E, D, B>,
     coverage: &mut WalkCoverage,
-) -> crate::schema::ResourceValueValidation
+) -> ResourceAdmissionOutcome<B>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
@@ -768,34 +768,42 @@ where
         resource,
         parsed,
         schema,
-        attributes,
         quoted,
         inputs,
+        evaluation,
         bindings,
         session,
         schemas,
     } = request;
-    if let Err(missing) = inputs.authored_evidence() {
-        coverage.no_authored_evidence(missing);
+    let (values, classification_diagnostics) =
+        with_classified_inputs(&inputs, evaluation, session, |inputs, attributes| {
+            if let Err(missing) = inputs.authored_evidence() {
+                coverage.no_authored_evidence(missing);
+            }
+            let missing = inputs.prepare_missing::<Pass>(inputs.report(parsed.expression_report()));
+            let visits = std::cell::RefCell::new(std::mem::take(coverage));
+            let findings = if uses_resource_attribute_admission(resource.kind()) {
+                typed_resource_attribute_admissions::<Pass, kind::ResourceAttribute, _, _, _>(
+                    resource, parsed, schema, attributes, quoted, inputs, bindings, session,
+                    schemas, &visits,
+                )
+            } else {
+                typed_resource_attribute_admissions::<Pass, kind::DataSourceAttribute, _, _, _>(
+                    resource, parsed, schema, attributes, quoted, inputs, bindings, session,
+                    schemas, &visits,
+                )
+            };
+            *coverage = visits.into_inner();
+            missing.finish(findings, coverage)
+        });
+    ResourceAdmissionOutcome {
+        values,
+        classification_diagnostics,
     }
-    let missing = inputs.prepare_missing::<Pass>(inputs.report(parsed.expression_report()));
-    let visits = std::cell::RefCell::new(std::mem::take(coverage));
-    let findings = if uses_resource_attribute_admission(resource.kind()) {
-        typed_resource_attribute_admissions::<Pass, kind::ResourceAttribute, _, _, _>(
-            resource, parsed, schema, attributes, quoted, inputs, bindings, session, schemas,
-            &visits,
-        )
-    } else {
-        typed_resource_attribute_admissions::<Pass, kind::DataSourceAttribute, _, _, _>(
-            resource, parsed, schema, attributes, quoted, inputs, bindings, session, schemas,
-            &visits,
-        )
-    };
-    *coverage = visits.into_inner();
-    missing.finish(findings, coverage)
 }
 
 /// Admit every analysis item using the same destination-kind policy.
+/// Classifications are built from the consumed inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn resource_attribute_admissions<
     B: BindingAddress,
@@ -821,25 +829,22 @@ pub fn resource_attribute_admissions<
         B,
     >,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &indexmap::IndexMap<
-        String,
-        crate::resource::knowledge::Classification<'_, crate::resource::ParserPlaceholder, B>,
-    >,
     quoted: &std::collections::HashSet<String>,
-    inputs: &ResourceAttributeInputs<B>,
+    inputs: ResourceAttributeInputs<B>,
+    evaluation: ValidationEvaluation<B>,
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
     coverage: &mut WalkCoverage,
-) -> crate::schema::ResourceValueValidation {
+) -> ResourceAdmissionOutcome<B> {
     resource_admissions_for_pass::<LiveResource, _, _, _>(
         ResourceAdmissionRequest {
             resource,
             parsed,
             schema,
-            attributes,
             quoted,
             inputs,
+            evaluation,
             bindings,
             session,
             schemas,
@@ -1286,15 +1291,14 @@ fn unrendered_resource_admissions<Pass: ResourceAdmissionPass, E, D, B: BindingA
         })
         .with_prechecks(prechecks);
     inputs.scope = crate::schema::value_validation::AssignmentScope::ClaimedValues;
-    let attributes = inputs.classify(&KnowledgeContext::validation(), |_, _| {});
     resource_admissions_for_pass::<Pass, E, D, B>(
         ResourceAdmissionRequest {
             resource,
             parsed: judged.file(),
             schema,
-            attributes: &attributes,
             quoted: resource.quoted_string_attrs(),
-            inputs: &inputs,
+            inputs,
+            evaluation: ValidationEvaluation::None,
             bindings,
             session,
             schemas: judged.schemas(),
@@ -1302,6 +1306,72 @@ fn unrendered_resource_admissions<Pass: ResourceAdmissionPass, E, D, B: BindingA
         coverage,
     );
 }
+
+#[cfg(doctest)]
+/// The paired examples differ only in the argument supplied as the product.
+///
+/// ```
+/// use carina_core::{binding_index::BindingIndex, parser::{AnalysisResourceRef, ParsedFile},
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     schema::{OwnerBoundResourceSchema, SchemaRegistry}, validation::admission::{WalkCoverage,
+///         attributes::{ResourceAttributeInputs, ValidationEvaluation, resource_attribute_admissions}},
+///     validation::deferred_types::ProviderTypeCheckContext};
+/// fn caller(resource: &AnalysisResourceRef<'_>, parsed: &ParsedFile,
+///     schema: OwnerBoundResourceSchema<'_>, classifications: &indexmap::IndexMap<String,
+///         Classification<'_, ParserPlaceholder, RelativeBindingName>>,
+///     quoted: &std::collections::HashSet<String>, inputs: ResourceAttributeInputs<RelativeBindingName>,
+///     evaluation: ValidationEvaluation<RelativeBindingName>, bindings: &BindingIndex<'_, RelativeBindingName>,
+///     session: &dyn ProviderTypeCheckContext, schemas: &SchemaRegistry, coverage: &mut WalkCoverage) {
+///     let _ = resource_attribute_admissions(resource, parsed, schema, quoted,
+///         inputs, evaluation, bindings, session, schemas, coverage);
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::{binding_index::BindingIndex, parser::{AnalysisResourceRef, ParsedFile},
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     schema::{OwnerBoundResourceSchema, SchemaRegistry}, validation::admission::{WalkCoverage,
+///         attributes::{ResourceAttributeInputs, ValidationEvaluation, resource_attribute_admissions}},
+///     validation::deferred_types::ProviderTypeCheckContext};
+/// fn caller(resource: &AnalysisResourceRef<'_>, parsed: &ParsedFile,
+///     schema: OwnerBoundResourceSchema<'_>, classifications: &indexmap::IndexMap<String,
+///         Classification<'_, ParserPlaceholder, RelativeBindingName>>,
+///     quoted: &std::collections::HashSet<String>, inputs: ResourceAttributeInputs<RelativeBindingName>,
+///     evaluation: ValidationEvaluation<RelativeBindingName>, bindings: &BindingIndex<'_, RelativeBindingName>,
+///     session: &dyn ProviderTypeCheckContext, schemas: &SchemaRegistry, coverage: &mut WalkCoverage) {
+///     let _ = resource_attribute_admissions(resource, parsed, schema, quoted,
+///         classifications, evaluation, bindings, session, schemas, coverage);
+/// }
+/// ```
+///
+/// A slot's classification and cursor are paired inside admission.
+///
+/// ```
+/// use carina_core::{binding_index::BindingIndex, parser::retained::JudgedSlot,
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(slot: &'a JudgedSlot<RelativeBindingName>,
+///     proof: Classification<'a, ParserPlaceholder, RelativeBindingName>,
+///     bindings: Option<&'a BindingIndex<'a, RelativeBindingName>>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate<ParserPlaceholder, RelativeBindingName>> = None;
+///     let _ = (slot, proof, bindings, provider);
+/// }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use carina_core::{binding_index::BindingIndex, parser::retained::JudgedSlot,
+///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
+///     validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn paired<'a>(slot: &'a JudgedSlot<RelativeBindingName>,
+///     proof: Classification<'a, ParserPlaceholder, RelativeBindingName>,
+///     bindings: Option<&'a BindingIndex<'a, RelativeBindingName>>,
+///     provider: &'a dyn ProviderTypeCheckContext) {
+///     let _: Option<Candidate<ParserPlaceholder, RelativeBindingName>> = None;
+///     let _ = Candidate::validation_slot(slot, proof, bindings, provider);
+/// }
+/// ```
+fn resource_attribute_admission_api_pins() {}
 
 #[cfg(test)]
 mod review_tests {

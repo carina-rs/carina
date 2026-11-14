@@ -55,7 +55,10 @@ use carina_core::value::{
     redact_secrets_in_resource_using_evaluated, redact_secrets_in_state,
     redact_secrets_in_state_using_persisted, redact_secrets_in_state_using_resource,
 };
-use carina_state::{LegacyDependencyClassification, ResolvedReadBackend, ResourceState, StateFile};
+use carina_state::{
+    LegacyDependencyClassification, ResolvedReadBackend, ResourceState, S3BootstrapInfo, StateFile,
+    StorageReadinessStatus,
+};
 
 use super::{BackendLockRequirement, ReadBackendWarningPolicy, resolve_backend_for_read};
 use crate::DetailLevel;
@@ -1206,7 +1209,8 @@ impl PlanFile {
 /// Format 43 requires explicit schema-pattern modes. Format 44 records v13
 /// schema fingerprints and separate identity/member constraint layers. Format 45
 /// retains quoted condition literals, require messages, and wait RHS strings
-/// so decoding can reject interpolation.
+/// so decoding can reject interpolation. Format 46 stores non-empty dependent
+/// sets ordered by system-assigned resource/deferred effect identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -2157,7 +2161,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 45;
+    pub const CURRENT_VERSION: u32 = 46;
 
     #[cfg(test)]
     pub(crate) fn decode_for_test(self) -> DecodedPlanFile {
@@ -5735,6 +5739,215 @@ pub(crate) fn detect_state_drift(
     }
 }
 
+fn plan_s3_storage_bootstrap(
+    storage: S3BootstrapInfo,
+    has_bucket_resource: bool,
+    use_locked_backend: bool,
+) -> Result<Option<S3BootstrapInfo>, AppError> {
+    if use_locked_backend {
+        return Err(AppError::Config(
+            "Locked backend recorded in carina-backend.lock no longer exists. \
+             Restore the old state backend or revert backend.crn to match the lock before \
+             planning this migration."
+                .to_string(),
+        ));
+    }
+    if has_bucket_resource {
+        return Ok(None);
+    }
+    storage
+        .check_auto_create()
+        .map_err(|disabled| AppError::Config(disabled.to_string()))?;
+    Ok(Some(storage))
+}
+
+/// Gate plan's state read on readiness before resolving operation providers.
+async fn load_plan_storage(
+    readiness: StorageReadinessStatus,
+    read_state: impl std::future::Future<
+        Output = carina_state::BackendResult<Option<carina_state::LoadedState>>,
+    >,
+    resources: &[Resource],
+    use_locked_backend: bool,
+) -> Result<(Option<StateFile>, Option<S3BootstrapInfo>), AppError> {
+    let mut state_file: Option<StateFile> = None;
+    let state_bucket_bootstrap = match readiness {
+        StorageReadinessStatus::Ready => {
+            // Plan keeps schema migrations in memory; mutation paths persist
+            // them under the state lock.
+            state_file = read_state
+                .await
+                .map_err(AppError::Backend)?
+                .map(|loaded| loaded.into_state());
+            None
+        }
+        StorageReadinessStatus::Provisionable(storage) => {
+            let bucket_name = storage.settings().bucket();
+            let backend_resource_type = storage.resource_type();
+            #[rustfmt::skip]
+            let has_bucket_resource = resources.iter().any(|r| { // allow: direct — plan-time reconciliation
+                r.id.resource_type == backend_resource_type
+                    && r.attributes
+                        .get("bucket")
+                        .is_some_and(|v| matches!(v, Value::Concrete(ConcreteValue::String(s)) if s.expose_plaintext() == bucket_name))
+            });
+            plan_s3_storage_bootstrap(storage, has_bucket_resource, use_locked_backend)?
+        }
+        StorageReadinessStatus::Unavailable(unavailable) => {
+            return Err(AppError::Backend(unavailable.into_error()));
+        }
+    };
+
+    Ok((state_file, state_bucket_bootstrap))
+}
+
+#[cfg(test)]
+mod storage_readiness_tests {
+    use super::*;
+    use carina_state::StateBackend;
+
+    #[tokio::test]
+    async fn storage_readiness_unavailable_stops_plan_before_state_read() {
+        for migration_pending in [false, true] {
+            let message = "state storage requires an external repair";
+            let backend = crate::test_support::UnavailableStorageBackend::new(message);
+
+            // run_plan_using resolves its opaque read capability itself. This
+            // is the command's readiness match, before any operation provider
+            // resolution; the read future panics if it is polled.
+            let error = load_plan_storage(
+                backend.storage_readiness().await.unwrap().into_status(),
+                backend.read_state(),
+                &[],
+                migration_pending,
+            )
+            .await
+            .expect_err("confirmed unavailability must abort plan");
+
+            let AppError::Backend(carina_state::BackendError::Configuration(original)) = error
+            else {
+                panic!("unavailability must preserve the backend configuration error")
+            };
+            assert_eq!(original, message);
+        }
+    }
+
+    async fn missing_storage(auto_create: bool) -> S3BootstrapInfo {
+        let (backend, _) = crate::test_support::missing_s3_backend(auto_create).await;
+        match backend.storage_readiness().await.unwrap().into_status() {
+            StorageReadinessStatus::Ready => panic!("fixture bucket must be missing"),
+            StorageReadinessStatus::Provisionable(storage) => storage,
+            StorageReadinessStatus::Unavailable(error) => {
+                panic!("S3 storage must be provisionable: {error}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_bootstrap_plan_preserves_auto_create_policy() {
+        for auto_create in [true, false] {
+            let storage = missing_storage(auto_create).await;
+            assert!(
+                plan_s3_storage_bootstrap(storage.clone(), true, false)
+                    .unwrap()
+                    .is_none(),
+                "a declared bucket bootstraps even when auto-create is disabled"
+            );
+            let result = plan_s3_storage_bootstrap(storage, false, false);
+            if auto_create {
+                assert_eq!(result.unwrap().unwrap().settings().bucket(), "state-bucket");
+            } else {
+                let error = result.unwrap_err();
+                let AppError::Config(message) = error else {
+                    panic!("disabled auto-create must retain its configuration error")
+                };
+                assert_eq!(
+                    message,
+                    "Backend bucket 'state-bucket' not found and auto_create is disabled"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_auto_create_environment_diagnostic_and_precedence() {
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+            "STATE_BUCKET".into(),
+            "private-bucket-name".into(),
+        )]));
+        let mut parsed = carina_core::parser::parse_file(
+            "backend s3 { bucket = env('STATE_BUCKET') key = 'state.json' auto_create = false }",
+            Path::new("backend.crn"),
+            &context,
+        )
+        .unwrap();
+        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
+        let config =
+            carina_state::BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
+        let (backend, requests) =
+            crate::test_support::missing_s3_backend_with_settings(config.as_s3().unwrap()).await;
+        let StorageReadinessStatus::Provisionable(storage) =
+            backend.storage_readiness().await.unwrap().into_status()
+        else {
+            panic!("fixture bucket must be missing")
+        };
+
+        let policy_error = plan_s3_storage_bootstrap(storage.clone(), false, false).unwrap_err();
+        assert!(matches!(&policy_error, AppError::Config(_)));
+        assert_eq!(
+            policy_error.to_string(),
+            "Backend bucket value from env() not found and auto_create is disabled"
+        );
+        assert!(
+            plan_s3_storage_bootstrap(storage.clone(), true, false)
+                .unwrap()
+                .is_none()
+        );
+        for has_bucket_resource in [true, false] {
+            let error =
+                plan_s3_storage_bootstrap(storage.clone(), has_bucket_resource, true).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "Locked backend recorded in carina-backend.lock no longer exists. \
+                 Restore the old state backend or revert backend.crn to match the lock before \
+                 planning this migration."
+            );
+        }
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["HEAD"]
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_readiness_missing_locked_backend_keeps_migration_error() {
+        for auto_create in [true, false] {
+            for has_bucket_resource in [true, false] {
+                let error = plan_s3_storage_bootstrap(
+                    missing_storage(auto_create).await,
+                    has_bucket_resource,
+                    true,
+                )
+                .unwrap_err();
+                let AppError::Config(message) = error else {
+                    panic!("missing locked storage must retain its configuration error")
+                };
+                assert_eq!(
+                    message,
+                    "Locked backend recorded in carina-backend.lock no longer exists. \
+                     Restore the old state backend or revert backend.crn to match the lock before \
+                     planning this migration."
+                );
+            }
+        }
+    }
+}
+
 /// Test-only rendezvous between `plan`'s T0 state read and its T1
 /// re-read. Production builds never set the env var, so this is a
 /// no-op (one failed `getenv`); when set by the drift e2e test it is a
@@ -5910,71 +6123,16 @@ pub(crate) async fn run_plan_using(
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
-    let mut will_create_state_bucket = false;
-    let mut state_bucket_name = String::new();
-    let mut state_file: Option<StateFile> = None;
-
-    {
-        let config = plan_backend.selected_config();
-        let bucket_exists = plan_backend
-            .bucket_exists()
+    let (mut state_file, state_bucket_bootstrap) = load_plan_storage(
+        plan_backend
+            .storage_readiness()
             .await
-            .map_err(AppError::Backend)?;
-
-        if bucket_exists {
-            // Try to load state from backend. `plan` is read-only and
-            // already warns when an in-memory migration was applied,
-            // so it drops the migration token via `into_state()` —
-            // carina#3315 routes persistence through the lock-held
-            // `apply` / `destroy` / `state refresh` paths.
-            state_file = plan_backend
-                .read_state()
-                .await
-                .map_err(AppError::Backend)?
-                .map(|loaded| loaded.into_state());
-        } else if use_locked_backend {
-            return Err(AppError::Config(
-                "Locked backend recorded in carina-backend.lock no longer exists. \
-                 Restore the old state backend or revert backend.crn to match the lock before \
-                 planning this migration."
-                    .to_string(),
-            ));
-        } else {
-            // Check if there's a matching s3_bucket resource defined
-            let settings = config
-                .as_s3()
-                .ok_or("Backend does not manage an S3 bucket")?;
-            let bucket_name = settings.bucket().to_string();
-
-            let backend_resource_type = plan_backend
-                .resource_type()
-                .ok_or("Backend does not specify a resource type")?;
-            #[rustfmt::skip]
-            let has_bucket_resource = parsed.resources.iter().any(|r| { // allow: direct — plan-time reconciliation
-                r.id.resource_type == backend_resource_type
-                    && r.attributes
-                        .get("bucket")
-                        .is_some_and(|v| matches!(v, Value::Concrete(ConcreteValue::String(s)) if s.expose_plaintext() == bucket_name))
-            });
-
-            if !has_bucket_resource {
-                let auto_create = settings.auto_create();
-
-                if auto_create {
-                    will_create_state_bucket = true;
-                    state_bucket_name = bucket_name;
-                } else {
-                    let bucket = match settings.bucket_diagnostic_literal() {
-                        Some(bucket) => format!("'{bucket}'"),
-                        None => "value from env()".to_string(),
-                    };
-                    return Err(AppError::Config(format!(
-                        "Backend bucket {bucket} not found and auto_create is disabled"
-                    )));
-                }
-            }
-        }
-    }
+            .map_err(AppError::Backend)?,
+        plan_backend.read_state(),
+        &parsed.resources,
+        use_locked_backend,
+    )
+    .await?;
 
     // T0 fingerprint; see `StateSnapshot` for the TOCTOU rationale.
     let state_snapshot_t0 = StateSnapshot::capture(state_file.as_ref());
@@ -5983,13 +6141,10 @@ pub(crate) async fn run_plan_using(
     }
 
     // Show bootstrap plan if needed
-    if will_create_state_bucket {
-        let backend_provider = plan_backend
-            .provider_name()
-            .ok_or("Backend does not specify a provider name")?;
-        let backend_resource_type = plan_backend
-            .resource_type()
-            .ok_or("Backend does not specify a resource type")?;
+    if let Some(storage) = state_bucket_bootstrap {
+        let backend_provider = storage.provider_name();
+        let backend_resource_type = storage.resource_type();
+        let state_bucket_name = storage.settings().bucket();
         progress_sink.line("Bootstrap Plan:".cyan(color_mode).bold(color_mode));
         progress_sink.line(format!(
             "  {} {} (state bucket)",

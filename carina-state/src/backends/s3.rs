@@ -11,8 +11,11 @@ use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use thiserror::Error;
 
-use crate::backend::{AwsError, BackendError, BackendResult, RawState, StateBackend};
+use crate::backend::{
+    AwsError, BackendError, BackendResult, RawState, StateBackend, StorageReadiness,
+};
 use crate::backend_config::S3BackendSettings;
 use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
@@ -53,16 +56,11 @@ fn cleanup_operation_config() -> aws_sdk_s3::config::Builder {
 pub struct S3Backend {
     /// S3 client
     client: Client,
-    /// Bucket name
-    bucket: String,
-    /// Object key for the state file
-    key: String,
     /// AWS region
     region: String,
-    /// Whether to encrypt the state file (default: true)
-    encrypt: bool,
-    /// Whether to auto-create the bucket if it doesn't exist (default: true)
-    auto_create: bool,
+    /// Admitted storage settings, including the auto-create policy and
+    /// diagnostic provenance of the bucket name.
+    settings: S3BackendSettings,
     /// Tracks the first in-memory state-schema migration observed by
     /// `read_state` on this backend instance (carina#3283). See the
     /// equivalent field on `LocalBackend` for the rationale.
@@ -73,6 +71,157 @@ pub struct S3Backend {
     /// not change it. A stale value is safe: S3 rejects it and the writer
     /// refreshes via HEAD.
     state_etag: Mutex<CachedStateEtag>,
+}
+
+/// Metadata for S3 bootstrap, with no storage-creation authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3BootstrapInfo {
+    settings: S3BackendSettings,
+}
+
+impl S3BootstrapInfo {
+    pub fn settings(&self) -> &S3BackendSettings {
+        &self.settings
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        S3_BACKEND_PROVIDER_NAME
+    }
+
+    pub fn resource_type(&self) -> &'static str {
+        S3_BACKEND_RESOURCE_TYPE
+    }
+
+    pub fn resource_definition(&self) -> String {
+        format_state_bucket_definition(self.settings.bucket())
+    }
+
+    /// Check the policy for a read-only bootstrap preview, without granting
+    /// storage-creation authority.
+    pub fn check_auto_create(&self) -> Result<(), S3AutoCreateDisabled> {
+        if self.settings.auto_create() {
+            Ok(())
+        } else {
+            Err(S3AutoCreateDisabled::new(&self.settings))
+        }
+    }
+}
+
+/// Missing S3 storage that may be bootstrapped by a declared resource.
+/// Automatic creation additionally requires the declared backend policy.
+pub struct S3Bootstrap {
+    client: Client,
+    region: String,
+    info: S3BootstrapInfo,
+}
+
+impl std::fmt::Debug for S3Bootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Bootstrap")
+            .field("info", &self.info)
+            .finish()
+    }
+}
+
+/// Authority to create S3 storage, issued only when auto-create is enabled.
+#[derive(Debug)]
+pub struct S3AutoCreate {
+    bootstrap: S3Bootstrap,
+}
+
+/// The backend policy forbids automatic creation of its missing S3 bucket.
+#[derive(Debug, PartialEq, Eq, Error)]
+#[error("Backend bucket {bucket} not found and auto_create is disabled")]
+pub struct S3AutoCreateDisabled {
+    bucket: String,
+}
+
+impl S3AutoCreateDisabled {
+    fn new(settings: &S3BackendSettings) -> Self {
+        let bucket = match settings.bucket_diagnostic_literal() {
+            Some(bucket) => format!("'{bucket}'"),
+            None => "value from env()".to_owned(),
+        };
+        Self { bucket }
+    }
+}
+
+impl S3Bootstrap {
+    fn new(backend: &S3Backend) -> Self {
+        Self {
+            client: backend.client.clone(),
+            region: backend.region.clone(),
+            info: S3BootstrapInfo {
+                settings: backend.settings.clone(),
+            },
+        }
+    }
+
+    pub fn info(&self) -> &S3BootstrapInfo {
+        &self.info
+    }
+
+    pub(crate) fn into_info(self) -> S3BootstrapInfo {
+        self.info
+    }
+
+    /// Consume bootstrap metadata to authorize automatic bucket creation.
+    pub fn auto_create(self) -> Result<S3AutoCreate, S3AutoCreateDisabled> {
+        self.info.check_auto_create()?;
+        Ok(S3AutoCreate { bootstrap: self })
+    }
+}
+
+impl S3AutoCreate {
+    /// Consume the capability to create the bucket and block public access.
+    pub async fn create(self) -> BackendResult<()> {
+        let S3Bootstrap {
+            client,
+            region,
+            info,
+        } = self.bootstrap;
+        let bucket = info.settings.bucket();
+        // Create bucket with location constraint if not us-east-1
+        let mut create_request = client.create_bucket().bucket(bucket);
+
+        if region != "us-east-1" {
+            use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+
+            let constraint = BucketLocationConstraint::from(region.as_str());
+            let config = CreateBucketConfiguration::builder()
+                .location_constraint(constraint)
+                .build();
+            create_request = create_request.create_bucket_configuration(config);
+        }
+
+        create_request.send().await.map_err(|e| {
+            BackendError::Aws(Box::new(
+                AwsError::from_sdk_error("s3.CreateBucket", e).bucket(bucket),
+            ))
+        })?;
+
+        // Block public access
+        let public_access_block = PublicAccessBlockConfiguration::builder()
+            .block_public_acls(true)
+            .block_public_policy(true)
+            .ignore_public_acls(true)
+            .restrict_public_buckets(true)
+            .build();
+
+        client
+            .put_public_access_block()
+            .bucket(bucket)
+            .public_access_block_configuration(public_access_block)
+            .send()
+            .await
+            .map_err(|e| {
+                BackendError::Aws(Box::new(
+                    AwsError::from_sdk_error("s3.PutPublicAccessBlock", e).bucket(bucket),
+                ))
+            })?;
+
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -129,11 +278,8 @@ impl S3Backend {
     pub(crate) fn from_client(client: Client, config: &S3BackendSettings, region: String) -> Self {
         Self {
             client,
-            bucket: config.bucket().to_owned(),
-            key: config.key().to_owned(),
             region,
-            encrypt: config.encrypt(),
-            auto_create: config.auto_create(),
+            settings: config.clone(),
             migration_logged: OnceLock::new(),
             state_etag: Mutex::new(CachedStateEtag::Unknown),
         }
@@ -141,7 +287,7 @@ impl S3Backend {
 
     /// Get the lock file key (state key + ".lock")
     fn lock_key(&self) -> String {
-        format!("{}.lock", self.key)
+        format!("{}.lock", self.settings.key())
     }
 
     /// Read the lock file from S3
@@ -149,7 +295,7 @@ impl S3Backend {
         let result = self
             .client
             .get_object()
-            .bucket(&self.bucket)
+            .bucket(self.settings.bucket())
             .key(self.lock_key())
             .send()
             .await;
@@ -159,7 +305,7 @@ impl S3Backend {
                 let etag = output.e_tag().map(ToOwned::to_owned).ok_or_else(|| {
                     BackendError::Configuration(format!(
                         "Lock object {}/{} missing ETag",
-                        self.bucket,
+                        self.settings.bucket(),
                         self.lock_key()
                     ))
                 })?;
@@ -180,7 +326,7 @@ impl S3Backend {
                 } else {
                     Err(BackendError::Aws(Box::new(
                         AwsError::from_sdk_error("s3.GetObject", err)
-                            .bucket(&self.bucket)
+                            .bucket(self.settings.bucket())
                             .key(self.lock_key()),
                     )))
                 }
@@ -197,7 +343,7 @@ impl S3Backend {
             let result = self
                 .client
                 .get_object()
-                .bucket(&self.bucket)
+                .bucket(self.settings.bucket())
                 .key(self.lock_key())
                 .customize()
                 .config_override(cleanup_operation_config())
@@ -209,7 +355,7 @@ impl S3Backend {
                     let etag = output.e_tag().map(ToOwned::to_owned).ok_or_else(|| {
                         BackendError::Configuration(format!(
                             "Lock object {}/{} missing ETag",
-                            self.bucket,
+                            self.settings.bucket(),
                             self.lock_key()
                         ))
                     })?;
@@ -225,7 +371,7 @@ impl S3Backend {
                 Err(err) if is_not_found_error(&err) => Ok(None),
                 Err(err) => Err(BackendError::Aws(Box::new(
                     AwsError::from_sdk_error("s3.GetObject", err)
-                        .bucket(&self.bucket)
+                        .bucket(self.settings.bucket())
                         .key(self.lock_key()),
                 ))),
             }
@@ -276,15 +422,19 @@ impl S3Backend {
     }
 
     fn state_location(&self) -> String {
-        format!("s3://{}/{}", self.bucket, self.key.trim_start_matches('/'))
+        format!(
+            "s3://{}/{}",
+            self.settings.bucket(),
+            self.settings.key().trim_start_matches('/')
+        )
     }
 
     async fn get_state_object(&self) -> BackendResult<Option<(Vec<u8>, Option<String>)>> {
         let result = self
             .client
             .get_object()
-            .bucket(&self.bucket)
-            .key(&self.key)
+            .bucket(self.settings.bucket())
+            .key(self.settings.key())
             .send()
             .await;
 
@@ -301,8 +451,8 @@ impl S3Backend {
             Err(error) if is_not_found_error(&error) => Ok(None),
             Err(error) => Err(BackendError::Aws(Box::new(
                 AwsError::from_sdk_error("s3.GetObject", error)
-                    .bucket(&self.bucket)
-                    .key(&self.key),
+                    .bucket(self.settings.bucket())
+                    .key(self.settings.key()),
             ))),
         }
     }
@@ -315,8 +465,8 @@ impl S3Backend {
             let request = self
                 .client
                 .head_object()
-                .bucket(&self.bucket)
-                .key(&self.key);
+                .bucket(self.settings.bucket())
+                .key(self.settings.key());
             let result = match operation {
                 StateWriteOperation::Normal => request.send().await,
                 StateWriteOperation::Cleanup => {
@@ -333,7 +483,8 @@ impl S3Backend {
                     let etag = output.e_tag().map(ToOwned::to_owned).ok_or_else(|| {
                         BackendError::Configuration(format!(
                             "State object {}/{} missing ETag",
-                            self.bucket, self.key
+                            self.settings.bucket(),
+                            self.settings.key()
                         ))
                     })?;
                     Ok(CachedStateEtag::Etag(etag))
@@ -341,8 +492,8 @@ impl S3Backend {
                 Err(error) if is_not_found_error(&error) => Ok(CachedStateEtag::Absent),
                 Err(error) => Err(BackendError::Aws(Box::new(
                     AwsError::from_sdk_error("s3.HeadObject", error)
-                        .bucket(&self.bucket)
-                        .key(&self.key),
+                        .bucket(self.settings.bucket())
+                        .key(self.settings.key()),
                 ))),
             }
         };
@@ -366,12 +517,12 @@ impl S3Backend {
             let mut request = self
                 .client
                 .put_object()
-                .bucket(&self.bucket)
-                .key(&self.key)
+                .bucket(self.settings.bucket())
+                .key(self.settings.key())
                 .body(ByteStream::from(body))
                 .content_type("application/json");
 
-            if self.encrypt {
+            if self.settings.encrypt() {
                 request = request.server_side_encryption(ServerSideEncryption::Aes256);
             }
             request = match current_etag {
@@ -397,7 +548,8 @@ impl S3Backend {
                     .ok_or_else(|| {
                         BackendError::Configuration(format!(
                             "State object {}/{} PUT response missing ETag",
-                            self.bucket, self.key
+                            self.settings.bucket(),
+                            self.settings.key()
                         ))
                     }),
                 Err(error) if is_conditional_write_conflict(&error) => {
@@ -405,8 +557,8 @@ impl S3Backend {
                 }
                 Err(error) => Err(BackendError::Aws(Box::new(
                     AwsError::from_sdk_error("s3.PutObject", error)
-                        .bucket(&self.bucket)
-                        .key(&self.key),
+                        .bucket(self.settings.bucket())
+                        .key(self.settings.key()),
                 ))),
             }
         };
@@ -518,13 +670,13 @@ impl S3Backend {
             let mut request = self
                 .client
                 .put_object()
-                .bucket(&self.bucket)
+                .bucket(self.settings.bucket())
                 .key(self.lock_key())
                 .body(ByteStream::from(body))
                 .content_type("application/json")
                 .if_match(etag);
 
-            if self.encrypt {
+            if self.settings.encrypt() {
                 request = request.server_side_encryption(ServerSideEncryption::Aes256);
             }
 
@@ -538,7 +690,7 @@ impl S3Backend {
                 Err(err) if is_conditional_write_conflict(&err) => Ok(false),
                 Err(err) => Err(BackendError::Aws(Box::new(
                     AwsError::from_sdk_error("s3.PutObject", err)
-                        .bucket(&self.bucket)
+                        .bucket(self.settings.bucket())
                         .key(self.lock_key()),
                 ))),
             }
@@ -567,12 +719,12 @@ impl S3Backend {
         let mut request = self
             .client
             .put_object()
-            .bucket(&self.bucket)
+            .bucket(self.settings.bucket())
             .key(self.lock_key())
             .body(ByteStream::from(body))
             .content_type("application/json");
 
-        if self.encrypt {
+        if self.settings.encrypt() {
             request = request.server_side_encryption(ServerSideEncryption::Aes256);
         }
 
@@ -589,7 +741,7 @@ impl S3Backend {
             Err(err) if is_conditional_write_conflict(&err) => Ok(false),
             Err(err) => Err(BackendError::Aws(Box::new(
                 AwsError::from_sdk_error("s3.PutObject", err)
-                    .bucket(&self.bucket)
+                    .bucket(self.settings.bucket())
                     .key(self.lock_key()),
             ))),
         }
@@ -600,14 +752,14 @@ impl S3Backend {
         let lock_key = self.lock_key();
         self.client
             .delete_object()
-            .bucket(&self.bucket)
+            .bucket(self.settings.bucket())
             .key(&lock_key)
             .send()
             .await
             .map_err(|e| {
                 BackendError::Aws(Box::new(
                     AwsError::from_sdk_error("s3.DeleteObject", e)
-                        .bucket(&self.bucket)
+                        .bucket(self.settings.bucket())
                         .key(&lock_key),
                 ))
             })?;
@@ -620,7 +772,7 @@ impl S3Backend {
         self.with_cleanup_operation_timeout("s3.DeleteObject", async {
             self.client
                 .delete_object()
-                .bucket(&self.bucket)
+                .bucket(self.settings.bucket())
                 .key(&lock_key)
                 .customize()
                 .config_override(cleanup_operation_config())
@@ -629,7 +781,7 @@ impl S3Backend {
                 .map_err(|err| {
                     BackendError::Aws(Box::new(
                         AwsError::from_sdk_error("s3.DeleteObject", err)
-                            .bucket(&self.bucket)
+                            .bucket(self.settings.bucket())
                             .key(&lock_key),
                     ))
                 })?;
@@ -640,12 +792,26 @@ impl S3Backend {
 
     /// Get the bucket name
     pub fn bucket_name(&self) -> &str {
-        &self.bucket
+        self.settings.bucket()
     }
 
-    /// Get whether auto_create is enabled
-    pub fn auto_create_enabled(&self) -> bool {
-        self.auto_create
+    // Keep existing in-process test setup on the S3-only typed creation path.
+    #[cfg(test)]
+    pub(super) async fn create_bucket(&self) -> BackendResult<()> {
+        S3Bootstrap::new(self)
+            .auto_create()
+            .map_err(|error| BackendError::configuration(error.to_string()))?
+            .create()
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn bucket_exists(&self) -> BackendResult<bool> {
+        match self.storage_readiness().await? {
+            StorageReadiness::Ready => Ok(true),
+            StorageReadiness::Provisionable(_) => Ok(false),
+            StorageReadiness::Unavailable(unavailable) => Err(unavailable.into_error()),
+        }
     }
 }
 
@@ -840,76 +1006,31 @@ impl StateBackend for S3Backend {
         self.delete_lock().await
     }
 
-    async fn bucket_exists(&self) -> BackendResult<bool> {
-        let result = self.client.head_bucket().bucket(&self.bucket).send().await;
+    async fn storage_readiness(&self) -> BackendResult<StorageReadiness> {
+        let result = self
+            .client
+            .head_bucket()
+            .bucket(self.settings.bucket())
+            .send()
+            .await;
 
         match result {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(StorageReadiness::Ready),
             Err(err) => {
                 if is_missing_head_bucket_response(&err) {
-                    Ok(false)
+                    // Missing S3 storage remains provisionable even when
+                    // auto-create is disabled: an authored bucket resource
+                    // may still be created by the provider. The CLI applies
+                    // that policy after checking for a matching declaration.
+                    Ok(StorageReadiness::Provisionable(S3Bootstrap::new(self)))
                 } else {
                     Err(BackendError::Aws(Box::new(
-                        AwsError::from_sdk_error("s3.HeadBucket", err).bucket(&self.bucket),
+                        AwsError::from_sdk_error("s3.HeadBucket", err)
+                            .bucket(self.settings.bucket()),
                     )))
                 }
             }
         }
-    }
-
-    fn provider_name(&self) -> Option<&str> {
-        Some(S3_BACKEND_PROVIDER_NAME)
-    }
-
-    fn resource_type(&self) -> Option<&str> {
-        Some(S3_BACKEND_RESOURCE_TYPE)
-    }
-
-    fn resource_definition(&self, name: &str) -> Option<String> {
-        Some(format_state_bucket_definition(name))
-    }
-
-    async fn create_bucket(&self) -> BackendResult<()> {
-        // Create bucket with location constraint if not us-east-1
-        let mut create_request = self.client.create_bucket().bucket(&self.bucket);
-
-        if self.region != "us-east-1" {
-            use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
-
-            let constraint = BucketLocationConstraint::from(self.region.as_str());
-            let config = CreateBucketConfiguration::builder()
-                .location_constraint(constraint)
-                .build();
-            create_request = create_request.create_bucket_configuration(config);
-        }
-
-        create_request.send().await.map_err(|e| {
-            BackendError::Aws(Box::new(
-                AwsError::from_sdk_error("s3.CreateBucket", e).bucket(&self.bucket),
-            ))
-        })?;
-
-        // Block public access
-        let public_access_block = PublicAccessBlockConfiguration::builder()
-            .block_public_acls(true)
-            .block_public_policy(true)
-            .ignore_public_acls(true)
-            .restrict_public_buckets(true)
-            .build();
-
-        self.client
-            .put_public_access_block()
-            .bucket(&self.bucket)
-            .public_access_block_configuration(public_access_block)
-            .send()
-            .await
-            .map_err(|e| {
-                BackendError::Aws(Box::new(
-                    AwsError::from_sdk_error("s3.PutPublicAccessBlock", e).bucket(&self.bucket),
-                ))
-            })?;
-
-        Ok(())
     }
 }
 
@@ -999,7 +1120,7 @@ where
 ///
 /// When no raw response is attached at all — a connection/dispatch
 /// failure rather than a service response — there is no evidence the
-/// bucket was reported absent, so this returns `false` and `bucket_exists`
+/// bucket was reported absent, so this returns `false` and `storage_readiness`
 /// surfaces the underlying error.
 fn is_missing_head_bucket_response(err: &aws_sdk_s3::error::SdkError<HeadBucketError>) -> bool {
     err.raw_response()

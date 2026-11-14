@@ -472,10 +472,6 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                         judged.report(),
                     )
                     .map(|inputs| {
-                        let classified = inputs.classify(
-                            &crate::resource::knowledge::KnowledgeContext::validation(),
-                            |_, _| {},
-                        );
                         let resource_subject = match &subject {
                             FindingSubject::Module(_) => subject.clone(),
                             FindingSubject::Root => resource
@@ -494,17 +490,18 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                         };
                         Some(self.coverage.in_subject(resource_subject, |coverage| {
                             let request = super::admission::attributes::ResourceAdmissionRequest {
-                                resource, parsed: judged.file(), schema, attributes: &classified,
-                                quoted: resource.quoted_string_attrs(), inputs: &inputs,
+                                resource, parsed: judged.file(), schema,
+                                quoted: resource.quoted_string_attrs(), inputs,
+                                evaluation: super::admission::attributes::ValidationEvaluation::None,
                                 bindings, session, schemas: judged.schemas(),
                             };
                             match &boundary {
                                 AdmissionBoundary::Live => super::admission::attributes::resource_attribute_admissions(
-                                    request.resource, request.parsed, request.schema, request.attributes,
-                                    request.quoted, request.inputs, request.bindings, request.session, request.schemas, coverage,
+                                    request.resource, request.parsed, request.schema,
+                                    request.quoted, request.inputs, request.evaluation, request.bindings, request.session, request.schemas, coverage,
                                 ),
                                 AdmissionBoundary::Preflight => super::admission::attributes::resource_template_preflight_admissions(request, coverage),
-                            }
+                            }.values
                         }))
                     })
                 }
@@ -661,7 +658,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
     pub fn admit_resource<X, D, B: BindingAddress>(
         &mut self,
         request: super::admission::attributes::ResourceAdmissionRequest<'_, '_, X, D, B>,
-    ) -> crate::schema::ResourceValueValidation
+    ) -> super::admission::attributes::ResourceAdmissionOutcome<B>
     where
         D: crate::parser::DeferredForPhaseTraversal<
                 crate::resource::ParserPlaceholder,
@@ -675,9 +672,9 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                 request.resource,
                 request.parsed,
                 request.schema,
-                request.attributes,
                 request.quoted,
                 request.inputs,
+                request.evaluation,
                 request.bindings,
                 request.session,
                 request.schemas,

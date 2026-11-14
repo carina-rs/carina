@@ -6,6 +6,122 @@ use carina_core::schema::{
     InputRuleScope,
 };
 
+fn secret_predicate_schemas() -> SchemaRegistry {
+    single_schema_map(
+        ResourceSchema::new("test.SecretInput")
+            .attribute(AttributeSchema::optional("type", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("value", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("output", AttributeType::string()).build(),
+            )
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("value").unwrap(),
+                    InputRuleCode::new("value.secret").unwrap(),
+                    InputPredicate::Secret,
+                )
+                .with_condition(InputCondition::Equals {
+                    path: InputPath::new("type").unwrap(),
+                    literal: InputLiteral::String("secure_string".into()),
+                }),
+            ),
+    )
+}
+
+fn secret_predicate_fixture(kind: &str, value: &str) -> TempDir {
+    let main = format!(
+        "let upstream = test.test.SecretInput {{ type = 'string' value = 'seed' }}\nlet example = test.test.SecretInput {{\n type = '{kind}'\n {value}\n}}\n"
+    );
+    write_fixture(&[
+        ("main.crn", &main),
+        ("providers.crn", "provider test {}\n"),
+        ("backend.crn", "backend local { path = 'state.json' }\n"),
+        (
+            "values.crn",
+            "let plain = 'DO-NOT-PRINT'\nlet protected = secret('DO-NOT-PRINT')\n",
+        ),
+        ("exports.crn", "exports { kind = example.type }\n"),
+    ])
+}
+
+#[test]
+fn secret_predicate_cli_validate_and_lsp_agree_on_known_values() {
+    let expected = "test.test.SecretInput.example: value [value.secret]: must be a secret value (for example `secret(...)` or `decrypt(...)`) when type equals \"secure_string\"";
+    // This mock provider has no decryptor; decrypt()-produced secrets are
+    // covered in carina-core/src/input_rules/evidence_tests.rs.
+    for (kind, expression, violates) in [
+        ("secure_string", "value = 'DO-NOT-PRINT'", true),
+        ("secure_string", "value = plain", true),
+        ("secure_string", "value = secret('DO-NOT-PRINT')", false),
+        ("secure_string", "value = protected", false),
+        (
+            "secure_string",
+            "value = \"p-${secret('DO-NOT-PRINT')}\"",
+            false,
+        ),
+        ("string", "value = 'DO-NOT-PRINT'", false),
+        ("string_list", "value = 'DO-NOT-PRINT'", false),
+        ("secure_string", "", false),
+    ] {
+        let fixture = secret_predicate_fixture(kind, expression);
+        let schemas = secret_predicate_schemas();
+        let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+            Default::default(),
+        );
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert!(cli.input_warnings.is_empty());
+        if violates {
+            assert_eq!(
+                cli.errors.len(),
+                1,
+                "{kind}: {expression}: {:?}",
+                cli.errors
+            );
+            assert!(
+                cli.errors[0].to_string().contains(expected),
+                "{:?}",
+                cli.errors
+            );
+            assert_eq!(lsp.len(), 1, "{kind}: {expression}: {lsp:#?}");
+            assert_eq!(lsp[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert_eq!(lsp[0].message, expected);
+            assert!(!cli.errors[0].to_string().contains("DO-NOT-PRINT"));
+            assert!(!lsp[0].message.contains("DO-NOT-PRINT"));
+        } else {
+            assert!(
+                cli.errors.is_empty(),
+                "{kind}: {expression}: {:?}",
+                cli.errors
+            );
+            assert!(lsp.is_empty(), "{kind}: {expression}: {lsp:#?}");
+        }
+    }
+}
+
+#[test]
+fn secret_predicate_cli_validate_and_lsp_leave_public_pending_values_for_plan() {
+    for expression in [
+        "value = upstream.output",
+        "value = \"${secret('a')}-${upstream.output}\"",
+        "value = upstream.output ?? secret('fallback')",
+    ] {
+        let fixture = secret_predicate_fixture("secure_string", expression);
+        let schemas = secret_predicate_schemas();
+        let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+            Default::default(),
+        );
+        assert!(cli.errors.is_empty(), "{expression}: {:?}", cli.errors);
+        assert!(cli.input_warnings.is_empty(), "{expression}");
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert!(lsp.is_empty(), "{expression}: {lsp:#?}");
+    }
+}
+
 #[test]
 fn review_4327_long_requirement_is_identical_in_declaration_clients_and_plan() {
     use carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES;

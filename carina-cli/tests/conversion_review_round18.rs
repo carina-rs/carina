@@ -175,13 +175,12 @@ async fn r18_no_as_type_resolution_keeps_mains_cause_text() {
 
 async fn nested(case: &str, target: &str) {
     let mut observations = Vec::new();
-    for converted in [false, true] {
+    for (form, operand) in [
+        ("plain_reference", "p.name".to_owned()),
+        ("plain_literal", "7".to_owned()),
+        ("as", format!("p.name as {target}")),
+    ] {
         let fixture = Fixture::new();
-        let operand = if converted {
-            format!("p.name as {target}")
-        } else {
-            "p.name".into()
-        };
         let query = match case {
             "alias" => {
                 format!("read mock.AliasedQuery {{ rule {{ condition {{ name = {operand} }} }} }}")
@@ -193,17 +192,38 @@ async fn nested(case: &str, target: &str) {
             other => panic!("unknown measurement case {other}"),
         };
         let source = format!("let p = mock.test.resource {{ name = 'stored' }}\nlet q = {query}\n");
-        observations.push(
-            observe(
-                &fixture,
-                &format!("{case}/{target}/{}", if converted { "as" } else { "plain" }),
-                &source,
-                true,
-            )
-            .await,
+        observations
+            .push(observe(&fixture, &format!("{case}/{target}/{form}"), &source, true).await);
+    }
+    for plain in &observations[..2] {
+        assert_eq!(plain["validate"]["status"], "error", "{observations:#?}");
+        assert_eq!(conversion_count(&plain["validate"]), 0, "{observations:#?}");
+        assert_eq!(lsp_conversion_count(&plain["lsp"]), 0, "{observations:#?}");
+        assert!(
+            plain["lsp"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Type mismatch: expected mock.Name")),
+            "{observations:#?}"
+        );
+        assert_eq!(plain["plan"]["ok"], false, "{observations:#?}");
+        assert!(
+            plain["plan"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("expected mock.Name"),
+            "{observations:#?}"
+        );
+        assert_eq!(
+            plain["read_only_gate"]["result"]["ok"], true,
+            "{observations:#?}"
         );
     }
-    let converted = &observations[1];
+    let converted = &observations[2];
     assert_eq!(
         conversion_count(&converted["validate"]),
         1,
@@ -215,11 +235,13 @@ async fn nested(case: &str, target: &str) {
         "{observations:#?}"
     );
     assert_eq!(converted["plan"]["ok"], false, "{observations:#?}");
-    // A successful public read-only validation gate would allow a command to
-    // dispatch this query. These native schemas have no binary-command factory.
+    // carina#4448: https://github.com/carina-rs/carina/issues/4448
+    // Nested alias/union uses follow the plain twins through main's read-only
+    // gate. Canonical converted fields are already Judge-owned and block it.
     assert_eq!(
-        converted["read_only_gate"]["result"]["ok"], false,
-        "the rejected conversion must block the read-only dispatch gate: {observations:#?}"
+        converted["read_only_gate"]["result"]["ok"],
+        case != "canonical",
+        "{observations:#?}"
     );
 }
 
@@ -232,12 +254,12 @@ macro_rules! nested_case {
     };
 }
 nested_case!(
-    r18_nested_alias_unknown_target_blocks_read_only_dispatch,
+    r18_nested_alias_unknown_target_follows_plain_twins_through_read_only_gate,
     "alias",
     "mock.DoesNotExist"
 );
 nested_case!(
-    r18_nested_alias_wrong_identity_blocks_read_only_dispatch,
+    r18_nested_alias_wrong_identity_follows_plain_twins_through_read_only_gate,
     "alias",
     "mock.Other"
 );
@@ -252,12 +274,12 @@ nested_case!(
     "mock.Other"
 );
 nested_case!(
-    r18_union_unknown_target_blocks_read_only_dispatch,
+    r18_union_unknown_target_follows_plain_twins_through_read_only_gate,
     "union",
     "mock.DoesNotExist"
 );
 nested_case!(
-    r18_union_wrong_identity_blocks_read_only_dispatch,
+    r18_union_wrong_identity_follows_plain_twins_through_read_only_gate,
     "union",
     "mock.Other"
 );

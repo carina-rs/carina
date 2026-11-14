@@ -104,23 +104,23 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         for resource in tree.resources() {
             let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
-            let classified = inputs.classify(
-                &crate::resource::knowledge::KnowledgeContext::validation(),
-                |_, _| {},
-            );
-            let mut report = validation.admit_resource(
-                crate::validation::admission::attributes::ResourceAdmissionRequest {
-                    resource,
-                    parsed: judged.file(),
-                    schema: resource.schema(&schemas).unwrap(),
-                    attributes: &classified,
-                    quoted: resource.quoted_string_attrs(),
-                    inputs: &inputs,
-                    bindings: &bindings,
-                    session,
-                    schemas: &schemas,
-                },
-            );
+            let mut report = validation
+                .admit_resource(
+                    crate::validation::admission::attributes::ResourceAdmissionRequest {
+                        resource,
+                        parsed: judged.file(),
+                        schema: resource.schema(&schemas).unwrap(),
+
+                        quoted: resource.quoted_string_attrs(),
+                        inputs,
+                        evaluation:
+                            crate::validation::admission::attributes::ValidationEvaluation::None,
+                        bindings: &bindings,
+                        session,
+                        schemas: &schemas,
+                    },
+                )
+                .values;
             assert_eq!(report.errors().count(), 0, "conversion leaked into errors");
             assert_eq!(
                 report.symbolic_errors().count(),
@@ -460,28 +460,28 @@ fn r16_report_only_slot_reads_recorded_destination_then_checks_the_source() {
             &values,
             judged.report(),
         );
-        let classified = inputs.classify(
-            &crate::resource::knowledge::KnowledgeContext::validation(),
-            |_, _| {},
-        );
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             let mut validation: crate::validation::ConversionValidation =
                 crate::validation::ConversionValidation::new(judged.report());
-            let report = validation.admit_resource(
-                crate::validation::admission::attributes::ResourceAdmissionRequest {
-                    resource,
-                    parsed: judged.file(),
-                    schema: resource.schema(&schemas).unwrap(),
-                    attributes: &classified,
-                    quoted: resource.quoted_string_attrs(),
-                    inputs: &inputs,
-                    bindings: &bindings,
-                    session,
-                    schemas: &schemas,
-                },
-            );
+            let report = validation
+                .admit_resource(
+                    crate::validation::admission::attributes::ResourceAdmissionRequest {
+                        resource,
+                        parsed: judged.file(),
+                        schema: resource.schema(&schemas).unwrap(),
+
+                        quoted: resource.quoted_string_attrs(),
+                        inputs,
+                        evaluation:
+                            crate::validation::admission::attributes::ValidationEvaluation::None,
+                        bindings: &bindings,
+                        session,
+                        schemas: &schemas,
+                    },
+                )
+                .values;
             assert_eq!(report.errors().count(), 0, "{report:?}");
             assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
             crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
@@ -532,12 +532,8 @@ fn r11_stale_projection_can_only_reuse_an_already_recorded_static_verdict() {
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
-        let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
-        let classified = inputs.classify(
-            &crate::resource::knowledge::KnowledgeContext::validation(),
-            |_, _| {},
-        );
         for instantiate in [false, true] {
+            let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
             let mut changed = judged.file().clone();
             if instantiate {
                 changed.resources[0] = changed.resources[0].instantiate();
@@ -559,14 +555,15 @@ fn r11_stale_projection_can_only_reuse_an_already_recorded_static_verdict() {
                         resource,
                         parsed: &changed,
                         schema: resource.schema(&schemas).unwrap(),
-                        attributes: &classified,
+
                         quoted: resource.quoted_string_attrs(),
-                        inputs: &inputs,
+                        inputs,
+                        evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
                         bindings: &bindings,
                         session,
                         schemas: &schemas,
                     },
-                );
+                ).values;
                 assert_eq!(
                     findings.errors().count(),
                     usize::from(!converted),
@@ -656,21 +653,26 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                 let inputs =
                     ResourceAttributeInputs::from_resolved(resource, &values, judged.report())
                         .unwrap();
-                let classified = inputs.classify(
-                    &crate::resource::knowledge::KnowledgeContext::validation(),
-                    |_, _| {},
-                );
                 assert!(match projection {
                     Projection::Pending => matches!(
-                        classified["target"],
+                        values["target"]
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                            .unwrap()
+                            .into_classification(),
                         crate::resource::knowledge::Classification::Pending(_)
                     ),
                     Projection::Failed => matches!(
-                        classified["target"],
+                        values["target"]
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                            .unwrap()
+                            .into_classification(),
                         crate::resource::knowledge::Classification::Failed(_)
                     ),
                     Projection::Scalar => matches!(
-                        classified["target"],
+                        values["target"]
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                            .unwrap()
+                            .into_classification(),
                         crate::resource::knowledge::Classification::Known(_)
                     ),
                 });
@@ -687,14 +689,15 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                             resource,
                             parsed: judged.file(),
                             schema: resource.schema(&schemas).unwrap(),
-                            attributes: &classified,
+
                             quoted: resource.quoted_string_attrs(),
-                            inputs: &inputs,
+                            inputs,
+                            evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
                             bindings: &bindings,
                             session,
                             schemas: &schemas,
                         },
-                    );
+                    ).values;
                     assert_eq!(
                         findings.errors().count(),
                         usize::from(!matches!(projection, Projection::Pending)),
@@ -789,35 +792,38 @@ fn r9_syntax_with_values(
         judged.report(),
     )
     .unwrap();
-    let classified = inputs.classify(
-        &crate::resource::knowledge::KnowledgeContext::validation(),
-        |_, _| {},
-    );
     match projection {
         R9Projection::Pending => assert!(matches!(
-            classified["target"],
+            values["target"]
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .unwrap()
+                .into_classification(),
             crate::resource::knowledge::Classification::Pending(_)
         )),
-        R9Projection::Absent => assert!(classified.is_empty()),
+        R9Projection::Absent => assert!(values.is_empty()),
     }
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     let mut run: crate::validation::ConversionValidation =
         crate::validation::ConversionValidation::new(judged.report());
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        let findings = run.admit_resource(
-            crate::validation::admission::attributes::ResourceAdmissionRequest {
-                resource,
-                parsed: judged.file(),
-                schema: resource.schema(&schemas).unwrap(),
-                attributes: &classified,
-                quoted: resource.quoted_string_attrs(),
-                inputs: &inputs,
-                bindings: &bindings,
-                session,
-                schemas: &schemas,
-            },
-        );
+        let findings = run
+            .admit_resource(
+                crate::validation::admission::attributes::ResourceAdmissionRequest {
+                    resource,
+                    parsed: judged.file(),
+                    schema: resource.schema(&schemas).unwrap(),
+
+                    quoted: resource.quoted_string_attrs(),
+                    inputs,
+                    evaluation:
+                        crate::validation::admission::attributes::ValidationEvaluation::None,
+                    bindings: &bindings,
+                    session,
+                    schemas: &schemas,
+                },
+            )
+            .values;
         assert_eq!(findings.errors().count(), 0, "{findings:?}");
     });
     run.complete().into_presented()
@@ -1014,28 +1020,28 @@ fn r5b_pending_transport_requires_a_shape_compatible_destination() {
         )]);
         let inputs =
             ResourceAttributeInputs::from_resolved(resource, &values, judged.report()).unwrap();
-        let classified = inputs.classify(
-            &crate::resource::knowledge::KnowledgeContext::validation(),
-            |_, _| {},
-        );
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         let mut run: crate::validation::ConversionValidation =
             crate::validation::ConversionValidation::new(judged.report());
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-            let findings = run.admit_resource(
-                crate::validation::admission::attributes::ResourceAdmissionRequest {
-                    resource,
-                    parsed: judged.file(),
-                    schema: resource.schema(&schemas).unwrap(),
-                    attributes: &classified,
-                    quoted: resource.quoted_string_attrs(),
-                    inputs: &inputs,
-                    bindings: &bindings,
-                    session,
-                    schemas: &schemas,
-                },
-            );
+            let findings = run
+                .admit_resource(
+                    crate::validation::admission::attributes::ResourceAdmissionRequest {
+                        resource,
+                        parsed: judged.file(),
+                        schema: resource.schema(&schemas).unwrap(),
+
+                        quoted: resource.quoted_string_attrs(),
+                        inputs,
+                        evaluation:
+                            crate::validation::admission::attributes::ValidationEvaluation::None,
+                        bindings: &bindings,
+                        session,
+                        schemas: &schemas,
+                    },
+                )
+                .values;
             assert_eq!(
                 findings.errors().count(),
                 0,
@@ -1389,23 +1395,20 @@ fn r11_alias_uses_each_read_their_recorded_static_verdict() {
                 } else {
                     ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap()
                 };
-                let classified = inputs.classify(
-                    &crate::resource::knowledge::KnowledgeContext::validation(),
-                    |_, _| {},
-                );
                 let report = validation.admit_resource(
                     crate::validation::admission::attributes::ResourceAdmissionRequest {
                         resource,
                         parsed: judged.file(),
                         schema: resource.schema(&schemas).unwrap(),
-                        attributes: &classified,
+
                         quoted: resource.quoted_string_attrs(),
-                        inputs: &inputs,
+                        inputs,
+                        evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
                         bindings: &bindings,
                         session,
                         schemas: &schemas,
                     },
-                );
+                ).values;
                 assert_eq!(report.errors().count(), 0, "{report:?}");
                 assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
             }
@@ -1723,35 +1726,37 @@ fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
                 judged.report(),
             )
             .unwrap();
-        let classified = inputs.classify(
-            &crate::resource::knowledge::KnowledgeContext::validation(),
-            |_, _| {},
-        );
         assert!(matches!(
-            classified["target"],
+            values["target"]
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .unwrap()
+                .into_classification(),
             crate::resource::knowledge::Classification::Pending(_)
         ));
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         let mut run: crate::validation::ConversionValidation =
             crate::validation::ConversionValidation::new(judged.report());
-        let ordinary =
-            crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let ordinary = crate::validation::deferred_types::with_session_for_test(
+            &catalog,
+            |session| {
                 let result = run.admit_resource(
                     crate::validation::admission::attributes::ResourceAdmissionRequest {
                         resource,
                         parsed: judged.file(),
                         schema: resource.schema(&schemas).unwrap(),
-                        attributes: &classified,
+
                         quoted: resource.quoted_string_attrs(),
-                        inputs: &inputs,
+                        inputs,
+                        evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
                         bindings: &bindings,
                         session,
                         schemas: &schemas,
                     },
-                );
+                ).values;
                 result.errors().map(ToString::to_string).collect::<Vec<_>>()
-            });
+            },
+        );
         let presented = run.complete().into_presented();
         println!(
             "R10-PENDING converted={converted}: source={expression}; judge={:?}; ordinary={ordinary:?}; presented={presented:?}",

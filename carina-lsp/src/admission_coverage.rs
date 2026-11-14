@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
+use carina_core::resource::BindingAddress;
+use carina_core::validation::admission::attributes::{
+    ClassificationDiagnostics, ResourceAttributeInputs, ValidationEvaluation,
+};
+use carina_core::validation::deferred_types::ProviderTypeCheckContext;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmissionPathCoverage {
     pub reached_admission: u64,
@@ -22,8 +28,10 @@ pub enum ExpandedDeclineReason {
 pub struct AdmissionCoverage {
     pub relative: AdmissionPathCoverage,
     pub expanded: AdmissionPathCoverage,
+    pub classification_preflight_ran: u64,
     pub expanded_declined_fell_back: BTreeMap<ExpandedDeclineReason, u64>,
     pub expanded_declined_skipped_module_resource: BTreeMap<ExpandedDeclineReason, u64>,
+    pub resolved_inputs_fell_back: u64,
 }
 
 pub fn with_admission_coverage<T>(analyze: impl FnOnce() -> T) -> (T, AdmissionCoverage) {
@@ -85,6 +93,23 @@ pub(crate) fn missing_schema(path: Path, provider: &str) {
 
 pub(crate) fn declined(reason: ExpandedDeclineReason) {
     update(|observation| observation.decline = Some(reason));
+}
+
+pub(crate) fn resolved_inputs_fell_back() {
+    update(|observation| observation.coverage.resolved_inputs_fell_back += 1);
+}
+
+// Count the actual call, so bypassing preflight also bypasses its observation.
+pub(crate) fn classification_preflight<B: BindingAddress>(
+    inputs: &ResourceAttributeInputs<B>,
+    evaluation: ValidationEvaluation<B>,
+    session: &dyn ProviderTypeCheckContext,
+) -> ClassificationDiagnostics<B> {
+    let diagnostics = carina_core::validation::admission::attributes::classification_preflight(
+        inputs, evaluation, session,
+    );
+    update(|observation| observation.coverage.classification_preflight_ran += 1);
+    diagnostics
 }
 
 pub(crate) fn declined_outcome(fell_back: bool) {

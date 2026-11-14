@@ -200,7 +200,7 @@ struct PortEndpoint {
     endpoint: RouteEndpoint,
     other_primary: f32,
     other_secondary: f32,
-    stable_key: String,
+    other_id: GraphNodeId,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -226,28 +226,15 @@ impl Layout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Variant order defines the layout ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum LayoutVertexId {
-    Real(GraphNodeId),
     Dummy {
         from: GraphNodeId,
         to: GraphNodeId,
         column: usize,
     },
-}
-
-impl LayoutVertexId {
-    fn stable_key(&self) -> String {
-        work::visit();
-        match self {
-            Self::Real(id) => format!("real:{}", id.stable_key()),
-            Self::Dummy { from, to, column } => format!(
-                "dummy:{}:{}:{column:020}",
-                from.stable_key(),
-                to.stable_key()
-            ),
-        }
-    }
+    Real(GraphNodeId),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -441,7 +428,7 @@ pub(crate) fn layout_graph(model: &GraphModel) -> Layout {
         left.column
             .cmp(&right.column)
             .then_with(|| left.y.total_cmp(&right.y))
-            .then_with(|| left.id.stable_key().cmp(&right.id.stable_key()))
+            .then_with(|| left.id.cmp(&right.id))
     });
 
     let edge_routes = build_edge_routes(
@@ -817,7 +804,7 @@ fn expand_long_edges(model: &GraphModel, layering: &Layering) -> ExpandedGraph {
             is_reference: edge.is_reference,
         });
     }
-    routes.sort_by_key(|route| (route.from.stable_key(), route.to.stable_key()));
+    routes.sort_by_key(|route| (route.from.clone(), route.to.clone()));
 
     ExpandedGraph {
         columns,
@@ -1028,7 +1015,7 @@ fn graph_layering(model: &GraphModel) -> Layering {
         })
         .collect();
     let mut references = model.reference_edges.clone();
-    references.sort_by_key(|edge| (edge.from.stable_key(), edge.to.stable_key()));
+    references.sort_by_key(|edge| (edge.from.clone(), edge.to.clone()));
     // Ordering constraints are already present in `accepted`. Add references
     // deterministically only while the constraint graph remains acyclic.
     for edge in &references {
@@ -1075,7 +1062,7 @@ fn graph_layering(model: &GraphModel) -> Layering {
     }
     layering
         .edges
-        .sort_by_key(|edge| (edge.actual_from.stable_key(), edge.actual_to.stable_key()));
+        .sort_by_key(|edge| (edge.actual_from.clone(), edge.actual_to.clone()));
     layering
 }
 
@@ -1137,7 +1124,7 @@ fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<Gr
     // keyed rebuild: adjacency lists are independently sorted and deduplicated
     for targets in outgoing.values_mut() {
         work::visit();
-        targets.sort_by_key(|(id, _)| id.stable_key());
+        targets.sort_by(|(left, _), (right, _)| left.cmp(right));
         targets.dedup();
     }
 
@@ -1150,13 +1137,6 @@ fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<Gr
         .map(|(id, _)| {
             work::visit();
             id.clone()
-        })
-        .collect();
-    let node_by_key: HashMap<_, _> = node_ids
-        .iter()
-        .map(|id| {
-            work::visit();
-            (layout_node_sort_key(model, id), id.clone())
         })
         .collect();
     let mut ready: BTreeSet<_> = ready_nodes
@@ -1175,9 +1155,8 @@ fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<Gr
         })
         .collect();
     let mut processed = HashSet::new();
-    while let Some(key) = ready.pop_first() {
+    while let Some((_, _, id)) = ready.pop_first() {
         work::visit();
-        let id = node_by_key[&key].clone();
         if !processed.insert(id.clone()) {
             continue;
         }
@@ -1204,25 +1183,25 @@ fn longest_path_layers(model: &GraphModel, edges: &[OrientedEdge]) -> HashMap<Gr
     layers
 }
 
-fn layout_node_sort_key(model: &GraphModel, id: &GraphNodeId) -> (String, String, String) {
+fn layout_node_sort_key(model: &GraphModel, id: &GraphNodeId) -> (String, String, GraphNodeId) {
     work::visit();
     model.node(id).map_or_else(
-        || (String::new(), String::new(), id.stable_key()),
-        |node| {
-            (
-                node.resource_type.clone(),
-                node.label.clone(),
-                id.stable_key(),
-            )
-        },
+        || (String::new(), String::new(), id.clone()),
+        |node| (node.resource_type.clone(), node.label.clone(), id.clone()),
     )
 }
 
-fn layout_vertex_sort_key(model: &GraphModel, id: &LayoutVertexId) -> (String, String, String) {
+fn layout_vertex_sort_key(
+    model: &GraphModel,
+    id: &LayoutVertexId,
+) -> (String, String, LayoutVertexId) {
     work::visit();
     match id {
-        LayoutVertexId::Real(id) => layout_node_sort_key(model, id),
-        LayoutVertexId::Dummy { .. } => (String::new(), String::new(), id.stable_key()),
+        LayoutVertexId::Real(id) => {
+            let (resource_type, label, id) = layout_node_sort_key(model, id);
+            (resource_type, label, LayoutVertexId::Real(id))
+        }
+        LayoutVertexId::Dummy { .. } => (String::new(), String::new(), id.clone()),
     }
 }
 
@@ -1241,7 +1220,7 @@ fn reduce_crossings(model: &GraphModel, bands: &[BandId], expanded: &mut Expande
     }
     for neighbors in predecessors.values_mut().chain(successors.values_mut()) {
         work::visit();
-        neighbors.sort_by_key(LayoutVertexId::stable_key);
+        neighbors.sort();
         neighbors.dedup();
     }
 
@@ -1428,7 +1407,7 @@ fn edges_by_column_pair(expanded: &ExpandedGraph) -> Vec<Vec<(LayoutVertexId, La
     }
     for edges in &mut pairs {
         work::visit();
-        edges.sort_by_key(|(left, right)| (left.stable_key(), right.stable_key()));
+        edges.sort();
         edges.dedup();
     }
     pairs
@@ -1689,7 +1668,7 @@ fn relax_coordinates(
     // keyed rebuild: neighbor lists are independently sorted and deduplicated
     for adjacent in neighbors.values_mut() {
         work::visit();
-        adjacent.sort_by_key(LayoutVertexId::stable_key);
+        adjacent.sort();
         adjacent.dedup();
     }
     let vertex_index: HashMap<_, _> = vertices
@@ -1961,17 +1940,17 @@ fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId,
                 card_side(from_rect, *start),
                 RouteEndpoint::Start,
                 *to_rect,
-                route.to.stable_key(),
+                route.to.clone(),
             ),
             (
                 route.to.clone(),
                 card_side(to_rect, *end),
                 RouteEndpoint::End,
                 *from_rect,
-                route.from.stable_key(),
+                route.from.clone(),
             ),
         ];
-        for (card, side, endpoint, other, other_key) in endpoints {
+        for (card, side, endpoint, other, other_id) in endpoints {
             work::visit();
             let Some(side) = side else {
                 continue;
@@ -1989,7 +1968,7 @@ fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId,
                 endpoint,
                 other_primary,
                 other_secondary,
-                stable_key: other_key,
+                other_id,
             });
         }
     }
@@ -2006,7 +1985,7 @@ fn spread_card_ports(routes: &mut [EdgeRoute], node_rects: &HashMap<GraphNodeId,
             left.other_primary
                 .total_cmp(&right.other_primary)
                 .then_with(|| left.other_secondary.total_cmp(&right.other_secondary))
-                .then_with(|| left.stable_key.cmp(&right.stable_key))
+                .then_with(|| left.other_id.cmp(&right.other_id))
                 .then_with(|| left.route_index.cmp(&right.route_index))
         });
 
@@ -2983,6 +2962,96 @@ mod tests {
     }
 
     #[test]
+    fn layout_vertex_keys_preserve_order() {
+        let dummy = |from, to, column| LayoutVertexId::Dummy {
+            from: GraphNodeId::Effect(from),
+            to: GraphNodeId::Effect(to),
+            column,
+        };
+        let real = LayoutVertexId::Real(GraphNodeId::Effect(0));
+        let mut ids = [
+            real.clone(),
+            dummy(1, 0, 0),
+            dummy(0, 2, 0),
+            dummy(0, 1, 10),
+            dummy(0, 1, 2),
+        ];
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                dummy(0, 1, 2),
+                dummy(0, 1, 10),
+                dummy(0, 2, 0),
+                dummy(1, 0, 0),
+                real.clone(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unchanged_nodes_with_distinct_provider_instances_are_both_laid_out() {
+        let start = resource("start", &[]);
+        let connector = |instance: &str| {
+            ResolvedResource::from_resolved_parts(
+                Resource::from_id(ResourceId::with_provider_identity(
+                    "test",
+                    "Widget",
+                    "test_widget_166e04b3",
+                    Some(instance.to_owned()),
+                ))
+                .into_value_snapshot(),
+                std::iter::once(start.resolved_id()).collect(),
+                Default::default(),
+            )
+        };
+        let alpha = connector("alpha");
+        let beta = connector("beta");
+        let alpha_id = GraphNodeId::Unchanged(alpha.resolved_id());
+        let beta_id = GraphNodeId::Unchanged(beta.resolved_id());
+        let finish = ResolvedResource::from_resolved_parts(
+            resource("finish", &[]).as_inner().clone(),
+            [alpha.resolved_id(), beta.resolved_id()]
+                .into_iter()
+                .collect(),
+            Default::default(),
+        );
+        let desired = vec![start.clone(), alpha, beta, finish.clone()];
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(start));
+        plan.add(Effect::Create(finish));
+        let model = model_for(&plan, &desired, None);
+
+        assert_eq!(model.nodes.len(), 4);
+        let alpha_node = model.node(&alpha_id).expect("alpha unchanged connector");
+        let beta_node = model.node(&beta_id).expect("beta unchanged connector");
+        assert_eq!(alpha_node.label, beta_node.label);
+        assert_eq!(alpha_node.resource_type, beta_node.resource_type);
+        assert_eq!(
+            model
+                .reference_edges
+                .iter()
+                .map(|edge| (edge.from.clone(), edge.to.clone()))
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                (GraphNodeId::Effect(0), alpha_id.clone()),
+                (GraphNodeId::Effect(0), beta_id.clone()),
+                (alpha_id.clone(), GraphNodeId::Effect(1)),
+                (beta_id.clone(), GraphNodeId::Effect(1)),
+            ])
+        );
+
+        // Exercise the real layering, placement and routing path: neither
+        // connector may disappear when their display labels are identical.
+        let layout = layout_graph(&model);
+
+        assert_eq!(layout.nodes.len(), 4);
+        let alpha_rect = layout.node(&alpha_id).expect("alpha card");
+        let beta_rect = layout.node(&beta_id).expect("beta card");
+        assert_ne!((alpha_rect.x, alpha_rect.y), (beta_rect.x, beta_rect.y));
+    }
+
+    #[test]
     fn unchanged_connector_does_not_serialize_independent_changed_effects() {
         let a = resource("a", &[]);
         let connector = resource("connector", &["a"]);
@@ -3566,7 +3635,7 @@ mod tests {
             // a hub has growing fan-out, and reverse chain insertion repeatedly
             // searches a growing accepted path in the original implementation.
             let mut ids: Vec<_> = model.nodes.iter().map(|node| node.id.clone()).collect();
-            ids.sort_by_key(GraphNodeId::stable_key);
+            ids.sort();
             model.ordering_edges.clear();
             model.reference_edges = if fixture == GrowthFixture::ReferenceHub {
                 ids[1..]
@@ -3622,8 +3691,9 @@ mod tests {
             };
             let (small, small_phases) = measure(500);
             let (large, large_phases) = measure(1500);
-            // Count actual loop/callback visits, sorting comparisons, character
-            // scans, DFS/Fenwick steps and swap attempts throughout layout_graph:
+            // Count actual loop/callback visits, sorting comparisons only where the
+            // comparator or sort key records a visit, character scans, DFS/Fenwick steps
+            // and swap attempts throughout layout_graph:
             // layering, edge expansion, crossing reduction, placement, coordinate
             // relaxation, route construction and port spreading. Guard each phase
             // as well as the total so linear work cannot mask a quadratic phase.
@@ -3831,13 +3901,13 @@ mod tests {
         #[allow(clippy::iter_over_hash_type)]
         // keyed rebuild: test adjacency lists are independently sorted and deduplicated
         for targets in accepted.values_mut() {
-            targets.sort_by_key(GraphNodeId::stable_key);
+            targets.sort();
             targets.dedup();
         }
 
         let visible: HashSet<_> = model.nodes.iter().map(|node| node.id.clone()).collect();
         let mut references = model.reference_edges.clone();
-        references.sort_by_key(|edge| (edge.from.stable_key(), edge.to.stable_key()));
+        references.sort_by_key(|edge| (edge.from.clone(), edge.to.clone()));
         // Ordering constraints are already present in `accepted`. Add references
         // deterministically only while the constraint graph remains acyclic.
         for edge in &references {
@@ -3849,7 +3919,7 @@ mod tests {
             }
             let targets = accepted.entry(edge.from.clone()).or_default();
             targets.push(edge.to.clone());
-            targets.sort_by_key(GraphNodeId::stable_key);
+            targets.sort();
             targets.dedup();
             constraint_edges.push(OrientedEdge {
                 actual_from: edge.from.clone(),
@@ -3886,7 +3956,7 @@ mod tests {
         }
         layering
             .edges
-            .sort_by_key(|edge| (edge.actual_from.stable_key(), edge.actual_to.stable_key()));
+            .sort_by_key(|edge| (edge.actual_from.clone(), edge.actual_to.clone()));
         layering
     }
 

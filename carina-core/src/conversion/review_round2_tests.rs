@@ -257,24 +257,23 @@ fn r5b_sibling_driver_does_not_repeat_a_completed_conversion_validator() {
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
-    let classified = inputs.classify(
-        &crate::resource::knowledge::KnowledgeContext::validation(),
-        |_, _| {},
-    );
     let mut run: crate::validation::ConversionValidation =
         crate::validation::ConversionValidation::new(judged.report());
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        let report = run.admit_resource(ResourceAdmissionRequest {
-            resource,
-            parsed: judged.file(),
-            schema: resource.schema(&schemas).unwrap(),
-            attributes: &classified,
-            quoted: resource.quoted_string_attrs(),
-            inputs: &inputs,
-            bindings: &bindings,
-            session,
-            schemas: &schemas,
-        });
+        let report = run
+            .admit_resource(ResourceAdmissionRequest {
+                resource,
+                parsed: judged.file(),
+                schema: resource.schema(&schemas).unwrap(),
+
+                quoted: resource.quoted_string_attrs(),
+                inputs,
+                evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
+                bindings: &bindings,
+                session,
+                schemas: &schemas,
+            })
+            .values;
         assert_eq!(report.errors().count(), 0, "{report:?}");
         let after = calls.load(Ordering::SeqCst);
         assert!(

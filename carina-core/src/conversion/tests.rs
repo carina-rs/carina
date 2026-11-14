@@ -5,19 +5,17 @@
 //! test result, rather than a panic while assembling retained syntax.
 
 use super::*;
-use crate::binding_index::{BindingIndex, ResolvedBindings};
+use crate::binding_index::BindingIndex;
 use crate::parser::ProviderContext;
 use crate::parser::{
     DeferredForPhaseTraversal, ExportParamLike, File, IdentifiedCustomTypeDeclaration,
     OwnedTypeIdentity, ProviderCustomTypes,
 };
-use crate::resource::knowledge::KnowledgeContext;
 use crate::resource::{AbsoluteBindingAddress, ConcreteValue, ParserPlaceholder, Value};
 use crate::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StringIdentityLayer,
     StringMemberConstraints, StructField, TypeIdentity,
 };
-use crate::validation::admission::{Candidate, admit};
 use crate::validation::deferred_types::with_session_for_test;
 use crate::validation::{
     ConversionValidation, OrdinaryFinding, PresentedFinding, PresentedFindings,
@@ -1103,100 +1101,11 @@ fn check_pending_discharge(at_apply: Option<(&str, bool)>) -> TestResult {
 }
 
 fn check_pending_discharge_in(fixture: Fixture, at_apply: Option<(&str, bool)>) -> TestResult {
-    let source = "let producer = mock.Source {}\nlet converted = producer.output as mock.Name\nlet sink = mock.Sink { target = converted }";
-    let parsed = crate::parser::parse_file(source, Path::new("conversion.crn"), &fixture.catalog)
-        .map_err(|error| format!("normal parse rejected authored source: {error}"))?
-        .resolve_root_for_test();
-    let configuration = crate::config_loader::load_buffer_configuration(
-        &parsed,
-        &fixture.schemas,
+    crate::validation::admission::check_conversion_pending_discharge(
         &fixture.catalog,
-    );
-    let judged = configuration.judged();
-    let tree =
-        crate::parser::AnalysisTree::try_from_file(judged.file()).map_err(|e| e.to_string())?;
-    let sink = tree
-        .resources()
-        .find(|resource| resource.binding() == Some("sink"))
-        .ok_or("parsed sink is missing")?;
-    let slot = sink.authored_slot("target").map_err(|e| e.to_string())?;
-    let value = slot
-        .projection()
-        .ok_or("parsed target projection is missing")?;
-    let proof = value
-        .knowledge(&KnowledgeContext::validation())
-        .map_err(|e| e.to_string())?
-        .into_classification();
-    let bindings = BindingIndex::from_parsed(judged.file(), &fixture.schemas, &fixture.catalog);
-    let destination = fixture
-        .schemas
-        .resource_attribute_destination(sink.id(), "target", &fixture.catalog)
-        .map_err(|e| e.to_string())?;
-    with_session_for_test(&fixture.catalog, |session| {
-        let (candidate, context) =
-            Candidate::validation_slot(slot, proof, Some(&bindings), session)
-                .map_err(|e| format!("slot admission: {:?}", finding(&e)))?;
-        let admission = admit(&destination, candidate, &context)
-            .map_err(|e| format!("expected pending conversion admission: {:?}", finding(&e)))?;
-        let pending = match admission {
-            crate::validation::admission::Admission::Pending(pending) => pending,
-            crate::validation::admission::Admission::Ready(placed) => {
-                return Err(format!(
-                    "unknown operand was placed before apply: {placed:?}"
-                ));
-            }
-        };
-        let obligation = pending.local_obligation();
-        assert!(
-            obligation.is_some(),
-            "conversion did not retain its NeedsLocal obligation: {pending:?}"
-        );
-        assert_eq!(
-            obligation.map(|local| local.paths()),
-            Some(
-                &[crate::schema::LeafPath::from_segments([
-                    crate::schema::LeafPathSegment::StructField("target".into()),
-                ])][..]
-            )
-        );
-        if let Some((text, accepted)) = at_apply {
-            let mut resolved = ResolvedBindings::default();
-            resolved.set(
-                "producer",
-                std::collections::HashMap::from([(
-                    "output".into(),
-                    Value::Concrete(ConcreteValue::String(text.into())),
-                )]),
-                crate::binding_index::BindingValueSource::Local,
-            );
-            let actual = crate::resolver::resolve_ref_value(
-                &Value::root_resource_ref("producer", "output", vec![]),
-                &resolved,
-                session,
-            )
-            .map_err(|error| error.to_string())?;
-            let resource = crate::resource::Resource::with_provider("mock", "Sink", "sink", None)
-                .with_attribute("target", actual);
-            let placed = crate::validation::admission::attributes::admit_apply_resource(
-                &resource,
-                None,
-                fixture.schemas.get_for(&resource).unwrap(),
-                &resolved,
-                session,
-            );
-            assert_eq!(placed.is_ok(), accepted, "apply value {text:?}: {placed:?}");
-            if placed.is_ok() {
-                let value = crate::resolver::resolve_ref_value(
-                    &resource.attributes["target"],
-                    &resolved,
-                    session,
-                )
-                .map_err(|error| error.to_string())?;
-                assert_eq!(&value, &Value::Concrete(ConcreteValue::String(text.into())));
-            }
-        }
-        Ok(())
-    })
+        &fixture.schemas,
+        at_apply,
+    )
 }
 
 #[test]
