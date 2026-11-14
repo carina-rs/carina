@@ -802,13 +802,9 @@ validated_config.provider_plan())
     // Backend protection covers every persisted generation, including rows
     // whose removed current instance no longer has any attributes.
     let mut protected_row_keys: HashSet<StateRowKey> = HashSet::new();
-    if let (Some(state), Some(backend_rt), Some(bucket_name)) = (
-        state_file.as_ref(),
-        backend.resource_type(),
-        protected_bucket.as_deref(),
-    ) {
+    if let (Some(state), Some(bucket_name)) = (state_file.as_ref(), protected_bucket.as_deref()) {
         for row in state.resources() {
-            if row.resource_type == backend_rt
+            if row.resource_type == carina_state::backends::S3_BACKEND_RESOURCE_TYPE
                 && (row
                     .persisted_attributes()
                     .into_iter()
@@ -869,8 +865,8 @@ validated_config.provider_plan())
             }
 
             // Protect the persisted backend bucket even if its configured name changed.
-            let configured_backend_bucket = backend.resource_type()
-                == Some(r.id.resource_type.as_str())
+            let configured_backend_bucket = r.id.resource_type
+                == carina_state::backends::S3_BACKEND_RESOURCE_TYPE
                 && protected_bucket.as_deref().is_some_and(|bucket_name| {
                     matches!(r.get_attr("bucket"), Some(Value::Concrete(ConcreteValue::String(name)))
                         if name.expose_plaintext() == bucket_name)
@@ -2960,61 +2956,7 @@ mod tests {
     #[tokio::test]
     async fn removed_backend_bucket_with_deposed_generation_is_protected_in_both_refresh_modes() {
         use carina_provider_mock::{MockBehavior, MockObservations, MockScope};
-        use carina_state::{BackendResult, DeposedInstance, DeposedKey, LoadedState, RawState};
-
-        // Exercise S3 bucket protection while keeping state I/O local.
-        struct StateBucketBackend(Box<dyn StateBackend>);
-
-        #[async_trait::async_trait]
-        impl StateBackend for StateBucketBackend {
-            async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
-                self.0.read_state().await
-            }
-
-            async fn read_state_bytes(&self) -> BackendResult<Option<RawState>> {
-                self.0.read_state_bytes().await
-            }
-
-            async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
-                self.0.write_state(state).await
-            }
-
-            async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
-                self.0.acquire_lock(operation).await
-            }
-
-            async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
-                self.0.release_lock(lock).await
-            }
-
-            async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
-                self.0.renew_lock(lock).await
-            }
-
-            async fn write_state_locked(
-                &self,
-                state: &StateFile,
-                lock: &LockInfo,
-            ) -> BackendResult<()> {
-                self.0.write_state_locked(state, lock).await
-            }
-
-            async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
-                self.0.force_unlock(lock_id).await
-            }
-
-            async fn bucket_exists(&self) -> BackendResult<bool> {
-                self.0.bucket_exists().await
-            }
-
-            async fn create_bucket(&self) -> BackendResult<()> {
-                self.0.create_bucket().await
-            }
-
-            fn resource_type(&self) -> Option<&str> {
-                Some("s3.Bucket")
-            }
-        }
+        use carina_state::{DeposedInstance, DeposedKey};
 
         for (deposed_identifier, deposed_bucket) in [
             ("backend-state-bucket", None),
@@ -3045,9 +2987,8 @@ mod tests {
                 )
                 .unwrap();
                 let project = carina_core::paths::ResolvedPath::new(config_path).unwrap();
-                let backend: Arc<dyn StateBackend> = Arc::new(StateBucketBackend(
-                    crate::commands::local_backend_for_test(dir.path().join("state.json")),
-                ));
+                let backend: Arc<dyn StateBackend> =
+                    crate::commands::local_backend_for_test(dir.path().join("state.json")).into();
                 let mut row = carina_state::ResourceState::try_applied(
                     "s3.Bucket",
                     "state",

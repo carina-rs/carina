@@ -468,12 +468,8 @@ mod tests {
             Ok(())
         }
 
-        async fn bucket_exists(&self) -> BackendResult<bool> {
-            Ok(true)
-        }
-
-        async fn create_bucket(&self) -> BackendResult<()> {
-            Ok(())
+        async fn storage_readiness(&self) -> BackendResult<crate::StorageReadiness> {
+            Ok(crate::StorageReadiness::Ready)
         }
     }
 

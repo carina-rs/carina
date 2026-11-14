@@ -7,6 +7,63 @@ use carina_core::{EnvironmentSnapshot, TestUserDirs};
 use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
 use std::sync::{Arc, OnceLock};
 
+/// Obtain a real S3 readiness capability over an in-process HTTP service.
+/// The returned request log makes bucket creation and public-access blocking
+/// observable without granting a test double its own provisioning method.
+#[cfg(test)]
+pub(crate) async fn missing_s3_backend(
+    auto_create: bool,
+) -> (
+    Box<dyn carina_state::StateBackend>,
+    Arc<std::sync::Mutex<Vec<winterbaume_core::MockRequest>>>,
+) {
+    use winterbaume_core::{MockAws, MockRequest, MockResponse, MockService};
+
+    struct MissingBucketService {
+        requests: Arc<std::sync::Mutex<Vec<MockRequest>>>,
+    }
+
+    impl MockService for MissingBucketService {
+        fn service_name(&self) -> &str {
+            "s3"
+        }
+
+        fn url_patterns(&self) -> Vec<&str> {
+            vec!["s3.", "s3-"]
+        }
+
+        fn handle(
+            &self,
+            request: MockRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MockResponse> + Send + '_>>
+        {
+            Box::pin(async move {
+                let status = if request.method == "HEAD" { 404 } else { 200 };
+                self.requests.lock().unwrap().push(request);
+                MockResponse::xml(status, "")
+            })
+        }
+    }
+
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mock = MockAws::builder()
+        .with_service(MissingBucketService {
+            requests: Arc::clone(&requests),
+        })
+        .build();
+    let sdk_config = mock.sdk_config("us-east-1").await;
+    let raw = parsed_fixture(&format!(
+        "backend s3 {{ bucket = \"state-bucket\" key = \"state.json\" auto_create = {auto_create} }}"
+    ));
+    let config = carina_state::BackendConfig::try_from(raw.backend.as_ref().unwrap()).unwrap();
+    let backend = carina_state::s3_backend_for_test(
+        aws_sdk_s3::Client::new(&sdk_config),
+        config.as_s3().unwrap(),
+        "us-east-1".to_owned(),
+    );
+    (backend, requests)
+}
+
 /// Presentation fixtures often omit provider schemas. Give those resource
 /// types an explicit coexistence policy; keep any schema supplied by the test.
 #[cfg(test)]

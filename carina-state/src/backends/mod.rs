@@ -7,7 +7,7 @@ mod s3_winterbaume_tests;
 mod url;
 
 pub use local::LocalBackend;
-pub use s3::S3Backend;
+pub use s3::{S3Backend, S3Bootstrap, S3BootstrapInfo};
 pub use url::{
     LocalStateFile, StateUrl, load_encoded_published_exports_from_url, load_local_state_file,
     load_state_from_url,
@@ -23,7 +23,7 @@ use crate::backend_selection::ConfiguredBackend;
 pub(crate) const S3_BACKEND_PROVIDER_NAME: &str = "aws";
 
 /// Resource type used to surface the state bucket in Carina state.
-pub(crate) const S3_BACKEND_RESOURCE_TYPE: &str = "s3.Bucket";
+pub const S3_BACKEND_RESOURCE_TYPE: &str = "s3.Bucket";
 
 /// Create the backend named by an opaque, operation-specific selection token.
 ///
@@ -53,6 +53,17 @@ pub(crate) async fn create_explicit_backend(
 #[cfg(any(test, feature = "test-utils"))]
 pub fn local_backend_for_test(state_path: impl Into<std::path::PathBuf>) -> Box<dyn StateBackend> {
     Box::new(LocalBackend::with_path(state_path.into()))
+}
+
+/// Inject an in-process S3 client while retaining the production readiness
+/// and provisioning path. No provisioning capability is constructed by tests.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn s3_backend_for_test(
+    client: aws_sdk_s3::Client,
+    settings: &crate::S3BackendSettings,
+    region: String,
+) -> Box<dyn StateBackend> {
+    Box::new(S3Backend::from_client(client, settings, region))
 }
 
 /// Resolve a local backend's state file path, anchoring a relative

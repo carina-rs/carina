@@ -78,7 +78,8 @@ pub use refresh::{
 // Re-export main types for convenience
 pub use backend::{
     BackendError, BackendResult, InvalidResourceIdentityError, LOCAL_BACKEND_TYPE, RawState,
-    S3_BACKEND_TYPE, StateBackend, read_published_exports,
+    S3_BACKEND_TYPE, StateBackend, StorageReadiness, StorageReadinessStatus, StorageUnavailable,
+    read_published_exports,
 };
 pub use backend_config::{
     BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors,
@@ -91,12 +92,12 @@ pub use backend_selection::{
     MutationBackendSelection, ReadBackendOrigin, ReadBackendSelection, ResolvedReadBackend,
     VerifiedMutationBackendSelection, inspect_backend_drift,
 };
-#[cfg(any(test, feature = "test-utils"))]
-pub use backends::local_backend_for_test;
 pub use backends::{
-    LocalBackend, LocalStateFile, StateUrl, anchored_local_path,
+    LocalBackend, LocalStateFile, S3Bootstrap, S3BootstrapInfo, StateUrl, anchored_local_path,
     load_encoded_published_exports_from_url, load_local_state_file, load_state_from_url,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use backends::{local_backend_for_test, s3_backend_for_test};
 pub use heartbeat::{HeartbeatGuard, LockHeartbeat, LockLost, LockedStateWriter};
 pub use lock::LockInfo;
 pub use state::{

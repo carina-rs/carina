@@ -2546,20 +2546,10 @@ impl StateBackend for MockBackend {
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    fn resource_type(&self) -> Option<&str> {
-        None
-    }
-    fn provider_name(&self) -> Option<&str> {
-        None
-    }
-    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
-        None
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 
@@ -2667,20 +2657,10 @@ impl StateBackend for LockTrackingBackend {
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    fn resource_type(&self) -> Option<&str> {
-        None
-    }
-    fn provider_name(&self) -> Option<&str> {
-        None
-    }
-    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
-        None
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 
@@ -2804,20 +2784,10 @@ impl StateBackend for RefreshTestBackend {
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    fn resource_type(&self) -> Option<&str> {
-        None
-    }
-    fn provider_name(&self) -> Option<&str> {
-        None
-    }
-    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
-        None
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 
@@ -5255,20 +5225,10 @@ impl StateBackend for CapturingBackend {
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        Ok(())
-    }
-    fn resource_type(&self) -> Option<&str> {
-        None
-    }
-    fn provider_name(&self) -> Option<&str> {
-        None
-    }
-    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
-        None
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 

@@ -14,7 +14,7 @@ use carina_core::resource::{
 };
 use thiserror::Error;
 
-use crate::backend::{BackendError, BackendResult};
+use crate::backend::{BackendError, BackendResult, StorageReadinessStatus};
 use crate::backend_config::{BackendConfig, S3BackendSettings};
 use crate::backend_lock::BackendLock;
 use crate::backends::{S3_BACKEND_PROVIDER_NAME, S3_BACKEND_RESOURCE_TYPE, StateUrl};
@@ -185,16 +185,8 @@ impl ResolvedReadBackend {
         crate::backend::read_published_exports(self.backend.as_ref()).await
     }
 
-    pub async fn bucket_exists(&self) -> BackendResult<bool> {
-        self.backend.bucket_exists().await
-    }
-
-    pub fn provider_name(&self) -> Option<&str> {
-        self.backend.provider_name()
-    }
-
-    pub fn resource_type(&self) -> Option<&str> {
-        self.backend.resource_type()
+    pub async fn storage_readiness(&self) -> BackendResult<StorageReadinessStatus> {
+        Ok(self.backend.storage_readiness().await?.into_status())
     }
 
     pub fn selected_config(&self) -> &BackendConfig {
@@ -610,6 +602,12 @@ mod tests {
         )
         .unwrap();
         let resolved = selected.resolve_with_drift_warning(|_| {}).await.unwrap();
+
+        match resolved.storage_readiness().await.unwrap() {
+            StorageReadinessStatus::Ready => {}
+            StorageReadinessStatus::Provisionable(_) => panic!("local storage cannot provision S3"),
+            StorageReadinessStatus::Unavailable(error) => panic!("local storage is ready: {error}"),
+        }
 
         let BackendConfig::Local(settings) = resolved.selected_config() else {
             panic!("read must select the old local backend")

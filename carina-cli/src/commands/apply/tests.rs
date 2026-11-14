@@ -7514,9 +7514,7 @@ fn bootstrap_test_backend() -> (tempfile::TempDir, Box<dyn StateBackend>) {
 }
 
 #[derive(Default)]
-struct BootstrapWriteFailureBackend {
-    create_calls: AtomicUsize,
-}
+struct BootstrapWriteFailureBackend {}
 
 #[async_trait::async_trait]
 impl StateBackend for BootstrapWriteFailureBackend {
@@ -7570,13 +7568,10 @@ impl StateBackend for BootstrapWriteFailureBackend {
         ))
     }
 
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        self.create_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 
@@ -12386,7 +12381,7 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
 
 #[tokio::test]
 async fn auto_create_backend_bucket_does_not_require_provider_schema() {
-    let backend = BootstrapWriteFailureBackend::default();
+    let (backend, requests) = crate::test_support::missing_s3_backend(true).await;
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "other",
@@ -12401,13 +12396,20 @@ async fn auto_create_backend_bucket_does_not_require_provider_schema() {
             )
             .is_none()
     );
-    create_auto_bootstrap_bucket(&backend).await.unwrap();
-    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+    let bootstrap = match backend.storage_readiness().await.unwrap() {
+        StorageReadiness::Ready => panic!("fixture bucket must be missing"),
+        StorageReadiness::Provisionable(bootstrap) => bootstrap,
+        StorageReadiness::Unavailable(error) => panic!("S3 storage must be provisionable: {error}"),
+    };
+    create_auto_bootstrap_bucket(bootstrap).await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.iter().filter(|r| r.method == "PUT").count(), 2);
+    assert!(requests.iter().any(|r| r.uri.contains("publicAccessBlock")));
 }
 
 #[tokio::test]
 async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
-    let backend = BootstrapWriteFailureBackend::default();
+    let (backend, requests) = crate::test_support::missing_s3_backend(true).await;
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
@@ -12424,8 +12426,15 @@ async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
             .validate()
             .unwrap(),
     );
-    create_auto_bootstrap_bucket(&backend).await.unwrap();
-    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+    let bootstrap = match backend.storage_readiness().await.unwrap() {
+        StorageReadiness::Ready => panic!("fixture bucket must be missing"),
+        StorageReadiness::Provisionable(bootstrap) => bootstrap,
+        StorageReadiness::Unavailable(error) => panic!("S3 storage must be provisionable: {error}"),
+    };
+    create_auto_bootstrap_bucket(bootstrap).await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.iter().filter(|r| r.method == "PUT").count(), 2);
+    assert!(requests.iter().any(|r| r.uri.contains("publicAccessBlock")));
 }
 
 #[path = "tests/issue_4283.rs"]

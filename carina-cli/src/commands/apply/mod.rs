@@ -38,7 +38,7 @@ use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::upstream_exports::AdmittedRemoteBindings;
 use carina_core::value::{RenderedKey, render_value};
-use carina_state::{LockInfo, RowBasis, StateBackend, StateFile};
+use carina_state::{LockInfo, RowBasis, S3Bootstrap, StateBackend, StateFile, StorageReadiness};
 
 #[cfg(test)]
 use carina_core::parser::ProviderConfig;
@@ -301,8 +301,8 @@ async fn prepare_bootstrap_permit(
         })
 }
 
-async fn create_auto_bootstrap_bucket(backend: &dyn StateBackend) -> Result<(), AppError> {
-    backend.create_bucket().await.map_err(AppError::Backend)
+async fn create_auto_bootstrap_bucket(bootstrap: S3Bootstrap) -> Result<(), AppError> {
+    bootstrap.create().await.map_err(AppError::Backend)
 }
 
 async fn create_checked_bootstrap_resource(
@@ -1985,15 +1985,19 @@ async fn run_apply_with_observer_factory(
         .map_err(AppError::Backend)?
         .into();
 
-    // Handle bootstrap if S3 backend is configured
-    let s3_bootstrap = verified_backend
-        .s3_settings()
-        .map(|settings| (settings.bucket().to_owned(), settings.auto_create()));
-    if let Some((bucket_name, auto_create)) = s3_bootstrap {
-        // Check if bucket exists (bootstrap detection)
-        let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
-
-        if !bucket_exists {
+    match backend
+        .storage_readiness()
+        .await
+        .map_err(AppError::Backend)?
+    {
+        StorageReadiness::Ready => {}
+        StorageReadiness::Unavailable(unavailable) => {
+            return Err(AppError::Backend(unavailable.into_error()));
+        }
+        StorageReadiness::Provisionable(bootstrap) => {
+            let storage = bootstrap.info().clone();
+            let bucket_name = storage.settings().bucket().to_owned();
+            let auto_create = storage.settings().auto_create();
             println!(
                 "{}",
                 "State bucket not found. Running bootstrap..."
@@ -2002,9 +2006,7 @@ async fn run_apply_with_observer_factory(
             );
 
             // Check if there's a bucket resource defined with matching name
-            let backend_resource_type = backend
-                .resource_type()
-                .ok_or("Backend does not specify a resource type")?;
+            let backend_resource_type = storage.resource_type();
             if let Some(bucket_resource) = validated_config
                 .resources()
                 .parsed()
@@ -2017,9 +2019,7 @@ async fn run_apply_with_observer_factory(
                 );
 
                 // Create the bucket resource using the factory pattern
-                let backend_provider_name = backend
-                    .provider_name()
-                    .ok_or("Backend does not specify a provider name")?;
+                let backend_provider_name = storage.provider_name();
                 // This is the only pre-lock path that constructs a provider.
                 // Resolve its attributes here; every other apply path waits
                 // for the post-reconciliation lock-held resolution below.
@@ -2073,19 +2073,15 @@ async fn run_apply_with_observer_factory(
                         "Auto-creating state bucket: {}",
                         bucket_name.cyan(color_mode)
                     );
-                    create_auto_bootstrap_bucket(backend.as_ref()).await?;
+                    create_auto_bootstrap_bucket(bootstrap).await?;
                     println!("  {} Created state bucket", "✓".green(color_mode));
 
-                    let backend_provider_name = backend
-                        .provider_name()
-                        .ok_or("Backend does not specify a provider name")?;
+                    let backend_provider_name = storage.provider_name();
 
                     // Append resource definition to backend file
                     let target_file = backend_file.as_ref().unwrap_or(project);
 
-                    let resource_code = backend
-                        .resource_definition(&bucket_name)
-                        .ok_or("Backend does not support resource definition generation")?;
+                    let resource_code = storage.resource_definition();
 
                     append_bootstrap_resource(target_file, &resource_code)?;
                     println!(
@@ -2115,9 +2111,7 @@ async fn run_apply_with_observer_factory(
                     )?;
                     let parsed = validated_config.resources().parsed();
 
-                    let backend_resource_type = backend
-                        .resource_type()
-                        .ok_or("Backend does not specify a resource type")?;
+                    let backend_resource_type = storage.resource_type();
                     let bucket_resource_name = parsed
                         .find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
                         .and_then(|r| r.id.identity().cloned())

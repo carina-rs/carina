@@ -12,7 +12,9 @@ use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::backend::{AwsError, BackendError, BackendResult, RawState, StateBackend};
+use crate::backend::{
+    AwsError, BackendError, BackendResult, RawState, StateBackend, StorageReadiness,
+};
 use crate::backend_config::S3BackendSettings;
 use crate::lock::LockInfo;
 use crate::state::{self, LoadedState, MigrationInfo, StateFile, log_state_migration_once};
@@ -61,8 +63,9 @@ pub struct S3Backend {
     region: String,
     /// Whether to encrypt the state file (default: true)
     encrypt: bool,
-    /// Whether to auto-create the bucket if it doesn't exist (default: true)
-    auto_create: bool,
+    /// Admitted storage settings, including the auto-create policy and
+    /// diagnostic provenance of the bucket name.
+    settings: S3BackendSettings,
     /// Tracks the first in-memory state-schema migration observed by
     /// `read_state` on this backend instance (carina#3283). See the
     /// equivalent field on `LocalBackend` for the rationale.
@@ -73,6 +76,106 @@ pub struct S3Backend {
     /// not change it. A stale value is safe: S3 rejects it and the writer
     /// refreshes via HEAD.
     state_etag: Mutex<CachedStateEtag>,
+}
+
+/// Metadata for S3 bootstrap, with no storage-creation authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3BootstrapInfo {
+    settings: S3BackendSettings,
+}
+
+impl S3BootstrapInfo {
+    pub fn settings(&self) -> &S3BackendSettings {
+        &self.settings
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        S3_BACKEND_PROVIDER_NAME
+    }
+
+    pub fn resource_type(&self) -> &'static str {
+        S3_BACKEND_RESOURCE_TYPE
+    }
+
+    pub fn resource_definition(&self) -> String {
+        format_state_bucket_definition(self.settings.bucket())
+    }
+}
+
+/// Authority to create this S3 backend's storage. Private fields and a
+/// constructor private to the S3 implementation prevent other backends and
+/// external test doubles from inventing a creation operation.
+#[derive(Debug)]
+pub struct S3Bootstrap {
+    client: Client,
+    region: String,
+    info: S3BootstrapInfo,
+}
+
+impl S3Bootstrap {
+    fn new(backend: &S3Backend) -> Self {
+        Self {
+            client: backend.client.clone(),
+            region: backend.region.clone(),
+            info: S3BootstrapInfo {
+                settings: backend.settings.clone(),
+            },
+        }
+    }
+
+    pub fn info(&self) -> &S3BootstrapInfo {
+        &self.info
+    }
+
+    pub(crate) fn into_info(self) -> S3BootstrapInfo {
+        self.info
+    }
+
+    /// Consume the capability to create the bucket and block public access.
+    /// The caller decides whether auto-create policy permits this operation.
+    pub async fn create(self) -> BackendResult<()> {
+        let bucket = self.info.settings.bucket();
+        // Create bucket with location constraint if not us-east-1
+        let mut create_request = self.client.create_bucket().bucket(bucket);
+
+        if self.region != "us-east-1" {
+            use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+
+            let constraint = BucketLocationConstraint::from(self.region.as_str());
+            let config = CreateBucketConfiguration::builder()
+                .location_constraint(constraint)
+                .build();
+            create_request = create_request.create_bucket_configuration(config);
+        }
+
+        create_request.send().await.map_err(|e| {
+            BackendError::Aws(Box::new(
+                AwsError::from_sdk_error("s3.CreateBucket", e).bucket(bucket),
+            ))
+        })?;
+
+        // Block public access
+        let public_access_block = PublicAccessBlockConfiguration::builder()
+            .block_public_acls(true)
+            .block_public_policy(true)
+            .ignore_public_acls(true)
+            .restrict_public_buckets(true)
+            .build();
+
+        self.client
+            .put_public_access_block()
+            .bucket(bucket)
+            .public_access_block_configuration(public_access_block)
+            .send()
+            .await
+            .map_err(|e| {
+                BackendError::Aws(Box::new(
+                    AwsError::from_sdk_error("s3.PutPublicAccessBlock", e).bucket(bucket),
+                ))
+            })?;
+
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -133,7 +236,7 @@ impl S3Backend {
             key: config.key().to_owned(),
             region,
             encrypt: config.encrypt(),
-            auto_create: config.auto_create(),
+            settings: config.clone(),
             migration_logged: OnceLock::new(),
             state_etag: Mutex::new(CachedStateEtag::Unknown),
         }
@@ -645,7 +748,22 @@ impl S3Backend {
 
     /// Get whether auto_create is enabled
     pub fn auto_create_enabled(&self) -> bool {
-        self.auto_create
+        self.settings.auto_create()
+    }
+
+    // Keep existing in-process test setup on the S3-only typed creation path.
+    #[cfg(test)]
+    pub(super) async fn create_bucket(&self) -> BackendResult<()> {
+        S3Bootstrap::new(self).create().await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn bucket_exists(&self) -> BackendResult<bool> {
+        match self.storage_readiness().await? {
+            StorageReadiness::Ready => Ok(true),
+            StorageReadiness::Provisionable(_) => Ok(false),
+            StorageReadiness::Unavailable(unavailable) => Err(unavailable.into_error()),
+        }
     }
 }
 
@@ -840,14 +958,18 @@ impl StateBackend for S3Backend {
         self.delete_lock().await
     }
 
-    async fn bucket_exists(&self) -> BackendResult<bool> {
+    async fn storage_readiness(&self) -> BackendResult<StorageReadiness> {
         let result = self.client.head_bucket().bucket(&self.bucket).send().await;
 
         match result {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(StorageReadiness::Ready),
             Err(err) => {
                 if is_missing_head_bucket_response(&err) {
-                    Ok(false)
+                    // Missing S3 storage remains provisionable even when
+                    // auto-create is disabled: an authored bucket resource
+                    // may still be created by the provider. The CLI applies
+                    // that policy after checking for a matching declaration.
+                    Ok(StorageReadiness::Provisionable(S3Bootstrap::new(self)))
                 } else {
                     Err(BackendError::Aws(Box::new(
                         AwsError::from_sdk_error("s3.HeadBucket", err).bucket(&self.bucket),
@@ -855,61 +977,6 @@ impl StateBackend for S3Backend {
                 }
             }
         }
-    }
-
-    fn provider_name(&self) -> Option<&str> {
-        Some(S3_BACKEND_PROVIDER_NAME)
-    }
-
-    fn resource_type(&self) -> Option<&str> {
-        Some(S3_BACKEND_RESOURCE_TYPE)
-    }
-
-    fn resource_definition(&self, name: &str) -> Option<String> {
-        Some(format_state_bucket_definition(name))
-    }
-
-    async fn create_bucket(&self) -> BackendResult<()> {
-        // Create bucket with location constraint if not us-east-1
-        let mut create_request = self.client.create_bucket().bucket(&self.bucket);
-
-        if self.region != "us-east-1" {
-            use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
-
-            let constraint = BucketLocationConstraint::from(self.region.as_str());
-            let config = CreateBucketConfiguration::builder()
-                .location_constraint(constraint)
-                .build();
-            create_request = create_request.create_bucket_configuration(config);
-        }
-
-        create_request.send().await.map_err(|e| {
-            BackendError::Aws(Box::new(
-                AwsError::from_sdk_error("s3.CreateBucket", e).bucket(&self.bucket),
-            ))
-        })?;
-
-        // Block public access
-        let public_access_block = PublicAccessBlockConfiguration::builder()
-            .block_public_acls(true)
-            .block_public_policy(true)
-            .ignore_public_acls(true)
-            .restrict_public_buckets(true)
-            .build();
-
-        self.client
-            .put_public_access_block()
-            .bucket(&self.bucket)
-            .public_access_block_configuration(public_access_block)
-            .send()
-            .await
-            .map_err(|e| {
-                BackendError::Aws(Box::new(
-                    AwsError::from_sdk_error("s3.PutPublicAccessBlock", e).bucket(&self.bucket),
-                ))
-            })?;
-
-        Ok(())
     }
 }
 
