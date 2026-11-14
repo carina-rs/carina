@@ -33,22 +33,12 @@ pub struct PlanImageInput<'a> {
     pub summary: &'a PlanChangeSummary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Variant order defines the layout ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum GraphNodeId {
     Effect(usize),
-    Unchanged(ResolvedResourceId),
     CollapsedModule(EphemeralId),
-}
-
-impl GraphNodeId {
-    pub(crate) fn stable_key(&self) -> String {
-        super::layout::work::visit();
-        match self {
-            Self::Effect(index) => format!("effect:{index:020}"),
-            Self::Unchanged(id) => format!("unchanged:{id}"),
-            Self::CollapsedModule(id) => format!("module:{}", id.inner()),
-        }
-    }
+    Unchanged(ResolvedResourceId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -953,41 +943,41 @@ fn outer_module(
         .filter(|info| identity.is_address_descendant_of(info.id.inner().identity()))
         .cloned()
         .collect();
-    candidates.sort_by_key(|info| {
-        (
-            info.id.inner().identity_str().split('.').count(),
-            info.id.inner().identity_str().to_string(),
-        )
-    });
+    candidates.sort_by_key(outer_module_sort_key);
     candidates.into_iter().next()
 }
 
-fn module_info_sort_key(module: &ModuleInfo) -> (String, String, String) {
+fn outer_module_sort_key(info: &ModuleInfo) -> (usize, String, EphemeralId) {
     (
-        module.label.clone(),
-        module.source_path.clone().unwrap_or_default(),
-        module.id.inner().to_string(),
+        info.id.inner().identity_str().split('.').count(),
+        info.id.inner().identity_str().to_string(),
+        info.id.clone(),
     )
 }
 
-fn node_sort_key(node: &GraphNode) -> (String, String, String, String) {
+fn module_info_sort_key(module: &ModuleInfo) -> (String, String, EphemeralId) {
     (
-        node.module
-            .as_ref()
-            .map(|id| id.inner().to_string())
-            .unwrap_or_default(),
+        module.label.clone(),
+        module.source_path.clone().unwrap_or_default(),
+        module.id.clone(),
+    )
+}
+
+fn node_sort_key(node: &GraphNode) -> (Option<EphemeralId>, String, String, GraphNodeId) {
+    (
+        node.module.clone(),
         node.resource_type.clone(),
         node.label.clone(),
-        node.id.stable_key(),
+        node.id.clone(),
     )
 }
 
 fn sort_logical_edges(edges: &mut [LogicalEdge]) {
-    edges.sort_by_key(|edge| (edge.dependency.stable_key(), edge.dependent.stable_key()));
+    edges.sort_by_key(|edge| (edge.dependency.clone(), edge.dependent.clone()));
 }
 
 fn sort_ordering_edges(edges: &mut [GraphEdge]) {
-    edges.sort_by_key(|edge| (edge.from.stable_key(), edge.to.stable_key()));
+    edges.sort_by_key(|edge| (edge.from.clone(), edge.to.clone()));
 }
 
 fn adjacency<'a>(
@@ -1000,7 +990,7 @@ fn adjacency<'a>(
     #[allow(clippy::iter_over_hash_type)]
     // keyed rebuild: adjacency lists are independently sorted and deduplicated
     for next in adjacency.values_mut() {
-        next.sort_by_key(GraphNodeId::stable_key);
+        next.sort();
         next.dedup();
     }
     adjacency
@@ -1070,7 +1060,7 @@ fn attach_blast_radius(
 }
 
 fn sort_and_dedup_blast_sources(sources: &mut Vec<BlastSource>) {
-    sources.sort_by_key(|source| (source.kind, source.label.clone(), source.id.stable_key()));
+    sources.sort_by_key(|source| (source.kind, source.label.clone(), source.id.clone()));
     sources.dedup_by(|left, right| left.id == right.id);
 }
 
@@ -1160,6 +1150,120 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn graph_node_keys_preserve_provider_instances_and_variant_order() {
+        let alpha = ResolvedResourceId::with_provider_identity(
+            "test",
+            "Widget",
+            "test_widget_166e04b3",
+            Some("alpha".to_owned()),
+        );
+        let beta = ResolvedResourceId::with_provider_identity(
+            "test",
+            "Widget",
+            "test_widget_166e04b3",
+            Some("beta".to_owned()),
+        );
+        let alpha_module = GraphNodeId::CollapsedModule(EphemeralId::new(alpha.clone()));
+        let beta_module = GraphNodeId::CollapsedModule(EphemeralId::new(beta.clone()));
+        let alpha = GraphNodeId::Unchanged(alpha);
+        let beta = GraphNodeId::Unchanged(beta);
+        assert_ne!(alpha, beta);
+
+        let ids: std::collections::BTreeSet<_> = [
+            beta.clone(),
+            GraphNodeId::Effect(10),
+            beta_module.clone(),
+            alpha.clone(),
+            GraphNodeId::Effect(2),
+            alpha_module.clone(),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            ids.into_iter().collect::<Vec<_>>(),
+            vec![
+                GraphNodeId::Effect(2),
+                GraphNodeId::Effect(10),
+                alpha_module,
+                beta_module,
+                alpha,
+                beta,
+            ]
+        );
+    }
+
+    fn module_infos_with_provider_instances() -> [ModuleInfo; 2] {
+        ["alpha", "beta"].map(|provider_instance| ModuleInfo {
+            id: EphemeralId::new(ResolvedResourceId::with_provider_identity(
+                "test",
+                "Module",
+                "network",
+                Some(provider_instance.to_owned()),
+            )),
+            label: "network".to_owned(),
+            source_path: Some("./network".to_owned()),
+        })
+    }
+
+    #[test]
+    fn module_info_sort_keys_preserve_provider_instances() {
+        let [alpha, beta] = module_infos_with_provider_instances();
+
+        assert_ne!(module_info_sort_key(&alpha), module_info_sort_key(&beta));
+        assert_eq!(
+            module_info_sort_key(&alpha).cmp(&module_info_sort_key(&beta)),
+            alpha.id.cmp(&beta.id),
+        );
+    }
+
+    #[test]
+    fn node_sort_keys_preserve_module_provider_instances_and_none_first() {
+        let [alpha, beta] = module_infos_with_provider_instances();
+        let mut node = GraphNode {
+            id: GraphNodeId::Effect(0),
+            label: "resource".to_owned(),
+            resource_type: "test.Widget".to_owned(),
+            anonymous_discriminator: None,
+            kind: EffectKind::Create,
+            attribute_names: Vec::new(),
+            note: None,
+            module: None,
+            affected_by: Vec::new(),
+        };
+        let ungrouped_key = node_sort_key(&node);
+        node.module = Some(alpha.id);
+        let alpha_key = node_sort_key(&node);
+        node.module = Some(beta.id);
+        let beta_key = node_sort_key(&node);
+
+        assert!(ungrouped_key < alpha_key);
+        assert!(alpha_key < beta_key);
+    }
+
+    #[test]
+    fn outer_module_order_preserves_provider_instances() {
+        let [alpha, beta] = module_infos_with_provider_instances();
+        assert_ne!(outer_module_sort_key(&alpha), outer_module_sort_key(&beta));
+
+        let expected = alpha.id.clone().min(beta.id.clone());
+        let resource_id = ResourceId::with_identity("test.Widget", "network.resource");
+        for infos in [[alpha.clone(), beta.clone()], [beta, alpha]] {
+            let catalog = infos
+                .into_iter()
+                .map(|info| (info.id.clone(), info))
+                .collect();
+
+            assert_eq!(
+                outer_module(&resource_id, None, None, &catalog)
+                    .expect("matching outer module")
+                    .id,
+                expected,
+            );
+        }
+    }
 
     fn absolute_binding(name: impl Into<String>) -> carina_core::resource::AbsoluteBindingAddress {
         carina_core::resource::absolute_binding_address_for_test(name)

@@ -91,7 +91,7 @@ impl PersistentId {
 /// [`LiveComposition::ephemeral_id`](super::LiveComposition::ephemeral_id) or
 /// via [`EphemeralId::new`] when you already have the id and know it
 /// came from a composition.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct EphemeralId(ResolvedResourceId);
 
