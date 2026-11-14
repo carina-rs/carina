@@ -130,7 +130,7 @@ impl WalkCoverage {
         self.unavailable.extend(other.unavailable);
         self.work += other.work;
         #[allow(clippy::iter_over_hash_type)]
-        // commutative: per-key generations use maxima, set unions, and independent sums
+        // commutative: bump keeps a per-key maximum, so merge order cannot change the result
         for (identity, generation) in other.generations {
             self.bump(identity, generation);
         }
