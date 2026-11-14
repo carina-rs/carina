@@ -316,7 +316,11 @@ fn select_s3_bucket_bootstrap(
     if let Some(resource) = bucket_resource {
         Ok(S3BucketBootstrap::Declared(resource))
     } else {
-        Ok(S3BucketBootstrap::AutoCreate(bootstrap.auto_create()?))
+        Ok(S3BucketBootstrap::AutoCreate(
+            bootstrap
+                .auto_create()
+                .map_err(|disabled| AppError::Config(disabled.to_string()))?,
+        ))
     }
 }
 

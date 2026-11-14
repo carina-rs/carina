@@ -5754,7 +5754,9 @@ fn plan_s3_storage_bootstrap(
     if has_bucket_resource {
         return Ok(None);
     }
-    storage.check_auto_create()?;
+    storage
+        .check_auto_create()
+        .map_err(|disabled| AppError::Config(disabled.to_string()))?;
     Ok(Some(storage))
 }
 

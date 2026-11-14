@@ -855,9 +855,12 @@ pub trait StateBackend: Send + Sync {
     /// This is an administrative operation that should be used with caution
     async fn force_unlock(&self, lock_id: &str) -> BackendResult<()>;
 
-    /// Inspect storage without creating it. Backends that cannot provision
-    /// their storage return `Ready` or `Unavailable`, never an unsupported
-    /// creation operation.
+    /// Inspect storage without creating it.
+    ///
+    /// Return `Err` when the inspection itself fails, for example because of an
+    /// API, transport, or authentication failure. Return `Unavailable` when the
+    /// inspection confirms that storage is absent or unusable and Carina cannot
+    /// create it. Only S3 returns `Provisionable`.
     async fn storage_readiness(&self) -> BackendResult<StorageReadiness>;
 }
 
