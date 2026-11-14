@@ -49,10 +49,9 @@ use carina_core::parser::{
 use super::{DriftCommand, verify_for_mutation};
 use crate::DetailLevel;
 use crate::commands::plan::{
-    CheckExportsPreApplyInput, LivePlanFileValues, PlanFile, PlanFileDecodeError,
-    PreparedPlanIdentityData, ReloadedPlanFile, ResolvedProviderInputs, SavedDataSourceValue,
-    UpstreamMissingStatePolicy, collect_historical_display_attributes,
-    load_and_resolve_provider_configs, prepare_plan_identity_and_provider_inputs,
+    CheckExportsPreApplyInput, LivePlanFileValues, PlanFile, PlanFileDecodeError, ReloadedPlanFile,
+    ResolvedProviderInputs, SavedDataSourceValue, UpstreamMissingStatePolicy,
+    collect_historical_display_attributes, load_and_resolve_provider_configs,
 };
 use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
@@ -188,6 +187,7 @@ fn saved_plan_secret_preparation_error(
     match source {
         error @ (AppError::SavedPlanProviderScopeMismatch(_)
         | AppError::SavedPlanSecretVerification(_)
+        | AppError::SavedProviderConfig { .. }
         | AppError::ValueWalk { .. }) => error,
         error => saved_plan_secret_evaluation_error(error, apply_target),
     }
@@ -3385,20 +3385,16 @@ async fn prepare_saved_plan_secret_candidates(
 ) -> Result<PreparedSavedPlanSecretCandidates, AppError> {
     let color_mode = validated_config.context().runtime().color_mode();
     let mut candidate_state = state_file.clone();
-    let PreparedPlanIdentityData {
-        provider_inputs,
-        state_blocks,
-    } = prepare_plan_identity_and_provider_inputs(
+    let (current_candidates, state_blocks) = saved_plan::prepare_current_candidates(
         &mut validated_config,
         &mut candidate_state,
         base_dir,
         provider_context,
-        UpstreamMissingStatePolicy::Strict,
     )
     .await?;
 
     let (verified_inputs, remote_bindings) =
-        pending_plan.verify_provider_inputs(provider_inputs, apply_target)?;
+        pending_plan.verify_provider_inputs(current_candidates, apply_target)?;
 
     // Reuse the exact I/O-free prelude the plan path uses. `candidate_state`
     // is the identity-reconciled state view produced above; the current-state

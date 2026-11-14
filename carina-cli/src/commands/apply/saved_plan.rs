@@ -5,7 +5,7 @@ use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
 use carina_core::input_rules::{InputAdmissionFailure, InputCheckedPlan, InputTypeContext};
 use carina_core::parser::{
-    ExpandedInferredExportParam as InferredExportParam, ResolvedProviderConfigs,
+    ExpandedInferredExportParam as InferredExportParam, ProviderContext, ResolvedProviderConfigs,
     SavedProviderConfigs,
 };
 type ExecutableSavedPlan = carina_core::saved_replay::AdmittedSavedPlanReplay;
@@ -18,9 +18,11 @@ use carina_state::{RefreshRows, RefreshableCurrent, ResourceState, StateFile};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
-    DecodedPlanFile, MovedOrigins, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
-    RecordedProviderScopes, ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs,
-    SavedPlanResource, UnresolvedReloadedPlanFile, UpstreamSource, recorded_provider_artifacts,
+    DecodedPlanFile, MovedOrigins, PlanSchemaReferences, PlanWaitBinding, PreparedPlanIdentityData,
+    RecordedProviderArtifact, RecordedProviderScopes, ReloadedCurrentStateEntry, ReloadedPlanFile,
+    ResolvedProviderInputs, SavedPlanResource, UnresolvedReloadedPlanFile,
+    UpstreamMissingStatePolicy, UpstreamSource, prepare_plan_identity_and_provider_inputs,
+    recorded_provider_artifacts,
 };
 use crate::error::{
     AppError, SavedPlanProviderArtifactDifference, SavedPlanProviderArtifactMismatchError,
@@ -28,7 +30,7 @@ use crate::error::{
 };
 use crate::wiring::{
     CheckedSavedPlanInputs, CompleteProviderLoad, ExpandedCanonicalResources, SavedPlanReplayMoves,
-    ValidatedConfig, WiringContext,
+    StateBlockResolution, ValidatedConfig, WiringContext,
 };
 
 pub(super) type PlannedSecretHashes = HashMap<ResourceId, PersistedAttributes>;
@@ -541,6 +543,37 @@ pub(super) struct SavedPlanSecretCandidates {
     provider_inputs: VerifiedSavedPlanProviderInputs,
 }
 
+/// Current source values are candidates for hash verification, never
+/// construction configuration. Only verification can unwrap them.
+pub(super) struct SavedPlanCurrentCandidates {
+    inputs: ResolvedProviderInputs,
+}
+
+pub(super) async fn prepare_current_candidates(
+    validated: &mut ValidatedConfig,
+    state_file: &mut Option<StateFile>,
+    base_dir: &ResolvedPath,
+    provider_context: &ProviderContext,
+) -> Result<(SavedPlanCurrentCandidates, StateBlockResolution), AppError> {
+    let PreparedPlanIdentityData {
+        provider_inputs,
+        state_blocks,
+    } = prepare_plan_identity_and_provider_inputs(
+        validated,
+        state_file,
+        base_dir,
+        provider_context,
+        UpstreamMissingStatePolicy::Strict,
+    )
+    .await?;
+    Ok((
+        SavedPlanCurrentCandidates {
+            inputs: provider_inputs,
+        },
+        state_blocks,
+    ))
+}
+
 /// Only recorded values whose secret hashes have been verified can initialize
 /// saved-plan providers or normalizers. Construction takes this owner rather
 /// than the current source inputs.
@@ -667,7 +700,7 @@ pub(crate) struct SchemaCheckedPendingPlanFile {
 impl SchemaCheckedPendingPlanFile {
     pub(super) fn verify_provider_inputs(
         &self,
-        inputs: ResolvedProviderInputs,
+        candidates: SavedPlanCurrentCandidates,
         apply_target: ApplyTarget<'_>,
     ) -> Result<
         (
@@ -676,6 +709,7 @@ impl SchemaCheckedPendingPlanFile {
         ),
         AppError,
     > {
+        let SavedPlanCurrentCandidates { inputs } = candidates;
         let (configs, remote_bindings) = inputs.into_parts();
         let fresh = SavedProviderConfigs::from(&configs);
         let saved = self
@@ -2449,7 +2483,10 @@ mod tests {
                 .await
                 .unwrap();
                 let (verified, _remote_bindings) = pending
-                    .verify_provider_inputs(inputs, apply_target())
+                    .verify_provider_inputs(
+                        super::SavedPlanCurrentCandidates { inputs },
+                        apply_target(),
+                    )
                     .unwrap();
                 assert!(
                     received.lock().unwrap().is_empty(),

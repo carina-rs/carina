@@ -12740,3 +12740,50 @@ fn saved_plan_walk_failure_retains_its_source_instead_of_reporting_unavailable()
         expected
     );
 }
+
+#[test]
+fn saved_plan_provider_config_conversion_error_keeps_its_diagnostic_during_secret_preparation() {
+    let saved = deserialize_saved_provider_configs(vec![ProviderConfig {
+        name: "mock".into(),
+        attributes: [("region", root_resource_ref("mgmt", "region"))]
+            .into_iter()
+            .collect(),
+        default_tags: Default::default(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: Default::default(),
+        binding: None,
+    }]);
+    let error = ResolvedProviderConfigs::try_from(saved).unwrap_err();
+    let target = ApplyTarget::SavedPlan {
+        plan_file: Path::new("plan.json"),
+        source_dir: Path::new("infra"),
+    };
+    let replan = target.replan_command().to_string();
+    let direct = AppError::SavedProviderConfig {
+        error,
+        replan_command: replan.clone(),
+    };
+    let expected = crate::error::format_error_with_source_chain(&direct);
+    assert_eq!(
+        expected.lines().next(),
+        Some("Invalid provider config in saved plan")
+    );
+    assert_eq!(
+        expected.lines().last(),
+        Some(format!("Re-run `{replan}` to create a new plan.").as_str())
+    );
+    let prepared = saved_plan_secret_preparation_error(direct, target);
+    let rendered = crate::error::format_error_with_source_chain(&prepared);
+    assert!(
+        matches!(&prepared, AppError::SavedProviderConfig { .. }),
+        "{rendered}"
+    );
+    assert_eq!(rendered, expected);
+    assert!(!rendered.contains("could not be evaluated"));
+    assert!(
+        std::error::Error::source(&prepared)
+            .is_some_and(|source| source.is::<carina_core::parser::ProviderConfigInvariantError>())
+    );
+}
