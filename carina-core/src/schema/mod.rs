@@ -8182,6 +8182,22 @@ impl From<crate::parser::CustomTypeValidationError> for TypeError {
 }
 
 impl TypeError {
+    /// Use the resource attribute suggestion policy for every declaration owner.
+    pub(crate) fn unknown_attribute(name: &str, primary: &[&str], aliases: &[&str]) -> Self {
+        let id_attribute = format!("{name}_id");
+        let suggestion = if primary.contains(&id_attribute.as_str())
+            || aliases.contains(&id_attribute.as_str())
+        {
+            Some(id_attribute)
+        } else {
+            suggest_similar_name(name, primary, aliases)
+        };
+        Self::UnknownAttribute {
+            name: name.to_owned(),
+            suggestion,
+        }
+    }
+
     fn value_out_of_range(value: DiagnosticNumber, bounds: NumericRangeBounds) -> Self {
         Self::ValueOutOfRange {
             value,
@@ -15982,6 +15998,18 @@ impl SchemaRegistry {
             })
     }
 
+    /// Resolve a type path carrying no [`SchemaKind`] (handles/Ref types),
+    /// trying the managed schema first, then the data source.
+    /// #4425 tracks removing this guess.
+    pub fn get_kindless(
+        &self,
+        provider: &str,
+        resource_type: &str,
+    ) -> Option<OwnerBoundResourceSchema<'_>> {
+        self.get(provider, resource_type, SchemaKind::Resource)
+            .or_else(|| self.get(provider, resource_type, SchemaKind::DataSource))
+    }
+
     /// Look up the `Managed` schema for a given [`Resource`].
     pub fn get_for<S, P: crate::resource::ValueKind, B: crate::resource::BindingAddress, D>(
         &self,
@@ -16641,18 +16669,9 @@ impl PatternResourceSchema<Compiled> {
                 if let Some(admit) = admission.unknown {
                     report.attributes.insert(name.clone(), admit(name, value));
                 }
-                let id_attribute = format!("{name}_id");
-                let suggestion = if known.contains(&id_attribute.as_str())
-                    || aliases.contains(&id_attribute.as_str())
-                {
-                    Some(id_attribute)
-                } else {
-                    suggest_similar_name(name, &known, &aliases)
-                };
-                report.errors.push(TypeError::UnknownAttribute {
-                    name: name.clone(),
-                    suggestion,
-                });
+                report
+                    .errors
+                    .push(TypeError::unknown_attribute(name, &known, &aliases));
             }
         }
 

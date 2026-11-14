@@ -523,6 +523,7 @@ pub struct DiagnosticEngine {
     provider_names: Vec<String>,
     known_provider_names: HashSet<String>,
     factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+    configuration_factories: Vec<Box<dyn ProviderFactory>>,
     /// Providers that failed to load: name -> error reason.
     provider_errors: HashMap<String, String>,
     /// Cached provider context with custom type validators from schemas.
@@ -2512,6 +2513,7 @@ impl DiagnosticEngine {
             provider_names: Vec::new(),
             known_provider_names: HashSet::new(),
             factories: Arc::new(Vec::new()),
+            configuration_factories: Vec::new(),
             provider_errors: HashMap::new(),
             provider_context: DiagnosticProviderContext::Unloaded(Arc::new(
                 carina_core::parser::ProviderContext::new(environment),
@@ -2535,6 +2537,7 @@ impl DiagnosticEngine {
             provider_names,
             known_provider_names,
             factories,
+            configuration_factories: Vec::new(),
             provider_errors: HashMap::new(),
             provider_context,
         }
@@ -2542,6 +2545,13 @@ impl DiagnosticEngine {
 
     pub fn schema_count(&self) -> usize {
         self.schemas.len()
+    }
+
+    /// Host-owned resources retain their catalog; configuration still needs
+    /// the native factory's declaration and semantic admission hook.
+    pub(crate) fn with_configuration_factory(mut self, factory: Box<dyn ProviderFactory>) -> Self {
+        self.configuration_factories.push(factory);
+        self
     }
 
     pub fn with_provider_errors(mut self, errors: HashMap<String, String>) -> Self {

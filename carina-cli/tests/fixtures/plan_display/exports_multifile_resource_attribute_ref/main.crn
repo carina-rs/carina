@@ -1,5 +1,4 @@
 provider mock {
-  region = 'test'
 }
 
 let foo = use { source = './usecase' }

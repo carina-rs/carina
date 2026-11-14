@@ -476,6 +476,13 @@ pub struct DiagnosticLocation {
 }
 
 impl DiagnosticLocation {
+    #[cfg(feature = "test-utils")]
+    pub fn recording_iterable_location(&self) -> Option<&super::DeclarationLocation> {
+        self.iterable
+            .elements()
+            .get(super::elements::ElementKind::Iterable)
+    }
+
     fn new(file: Option<String>, line: usize) -> Self {
         Self {
             iterable: Default::default(),

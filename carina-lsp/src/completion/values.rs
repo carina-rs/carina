@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
 };
 
 use carina_core::builtins;
-use carina_core::parser::{TypeExpr, snake_to_pascal};
+use carina_core::parser::{ResourceTypePath, TypeExpr, snake_to_pascal};
 use carina_core::paths::{CanonicalPath, ResolvedPath};
 use carina_core::provider_text::DiagnosticText;
 use carina_core::resource::EnumValueResolver;
@@ -22,7 +22,11 @@ use carina_core::static_type::{
 };
 use carina_core::upstream_exports::{UpstreamExportEntry, UpstreamExportType};
 
-use super::{AttributeValueTarget, CompletionProvider, DslSource, UpstreamDepth2Match};
+use crate::enclosing_block::SchemaSelector;
+
+use super::{
+    AttributeValueTarget, CompletionProvider, DslSource, DslSourceStorage, UpstreamDepth2Match,
+};
 
 /// How far up the directory tree to walk when suggesting upstream_state sources.
 const UPSTREAM_SOURCE_MAX_UP: usize = 6;
@@ -251,7 +255,7 @@ fn type_expr_source_is_assignable_to(
 /// Context when the user has typed `binding_name.` after `=`.
 struct BindingDotContext {
     binding_name: String,
-    resource_type: String,
+    selector: SchemaSelector,
 }
 
 /// Caller mode for [`CompletionProvider::in_scope_binding_completions`].
@@ -339,12 +343,15 @@ impl CompletionProvider {
         let call_binding = segments[0];
         let output_name = segments[1];
 
-        let mut merged = String::new();
+        let mut merged = DslSourceStorage::default();
         let source = DslSource::resolve_directory(text, base_path, &mut merged);
         let (_, rhs) = Self::extract_let_bindings(source)
             .into_iter()
             .find(|(binding, _)| binding == call_binding)?;
-        if self.extract_resource_type(&rhs).is_some() {
+        if self
+            .structural_resource_binding_names(source)
+            .contains(call_binding)
+        {
             return None;
         }
         let call_expression = rhs
@@ -357,19 +364,17 @@ impl CompletionProvider {
             .attribute_params
             .iter()
             .find(|attribute| attribute.name == output_name)?;
-        let resource_type = output
+        let selector = output
             .value
             .as_ref()
             .and_then(carina_core::parser::BoundaryExpression::handle)
-            .map(|handle| handle.resource_type().to_string())
+            .map(|handle| SchemaSelector::kindless(handle.resource_type().clone()))
             .or_else(|| match output.static_type.as_ref() {
-                Some(TypeExpr::Ref(path)) => Some(path.to_string()),
-                Some(TypeExpr::DottedUnresolved(path))
-                    if self.lookup_schema(&path.to_string()).is_some() =>
-                {
-                    Some(path.to_string())
+                Some(TypeExpr::Ref(path)) => Some(SchemaSelector::kindless(path.clone())),
+                Some(TypeExpr::DottedUnresolved(path)) => {
+                    let selector = SchemaSelector::kindless(path.clone());
+                    selector.lookup(&self.schemas).map(|_| selector)
                 }
-                Some(TypeExpr::DottedUnresolved(_)) => None,
                 Some(
                     TypeExpr::String
                     | TypeExpr::Bool
@@ -390,14 +395,14 @@ impl CompletionProvider {
         let start_character = crate::position::byte_offset_to_char_offset(prefix, token_start);
         Some(self.binding_attribute_completions(
             &format!("{call_binding}.{output_name}"),
-            &resource_type,
+            &selector,
             Range::new(Position::new(position.line, start_character), position),
         ))
     }
 
     pub(super) fn attribute_completions_for_type(
         &self,
-        resource_type: &str,
+        selector: &SchemaSelector,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
@@ -409,7 +414,7 @@ impl CompletionProvider {
         };
 
         // Get schema for specific resource type
-        if let Some(schema) = self.lookup_schema(resource_type) {
+        if let Some(schema) = selector.lookup(&self.schemas) {
             for attr in schema.effective_attributes().filter(|a| !a.is_read_only()) {
                 let detail = attr.description().map(str::to_owned);
                 let required_marker = if attr.is_required() {
@@ -482,19 +487,19 @@ impl CompletionProvider {
         // choice explicit at the call site — see `dsl_source.rs`. The
         // sibling read happens exactly once; the same `src` is reused
         // across every helper below.
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         let schema_target = match target {
             AttributeValueTarget::SchemaAttribute {
-                resource_type,
+                selector,
                 attr_name,
-            } => self.lookup_schema(resource_type).and_then(|schema| {
+            } => selector.lookup(&self.schemas).and_then(|schema| {
                 schema
                     .schema()
                     .as_schema()
                     .attributes()
                     .get(attr_name)
-                    .map(|attribute| (resource_type.as_str(), schema, attribute))
+                    .map(|attribute| (selector, schema, attribute))
             }),
             AttributeValueTarget::Unresolvable => None,
         };
@@ -506,7 +511,7 @@ impl CompletionProvider {
         {
             return self.binding_attribute_completions(
                 &dot_binding.binding_name,
-                &dot_binding.resource_type,
+                &dot_binding.selector,
                 ref_edit_range,
             );
         }
@@ -548,14 +553,12 @@ impl CompletionProvider {
         // for upstream bindings and intentionally omitted.
         if let Some((_, schema, attr_schema)) = schema_target {
             if let Some(target_name) = Self::extract_custom_type_name(attr_schema.attr_type()) {
-                for (binding_name, binding_resource_type) in &self.extract_resource_bindings(src) {
-                    if binding_resource_type.is_empty() {
-                        continue;
-                    }
+                for (binding_name, selector) in self.extract_resource_bindings(src) {
+                    let Some(selector) = selector else { continue };
                     if current_binding.is_some_and(|cb| cb == binding_name) {
                         continue;
                     }
-                    if let Some(binding_schema) = self.lookup_schema(binding_resource_type) {
+                    if let Some(binding_schema) = selector.lookup(&self.schemas) {
                         for binding_attr in
                             binding_schema.schema().as_schema().attributes().values()
                         {
@@ -738,7 +741,7 @@ impl CompletionProvider {
         }
 
         // Look up the attribute type from schema
-        if let Some((resource_type, schema, attr_schema)) = schema_target {
+        if let Some((selector, schema, attr_schema)) = schema_target {
             // Struct types: offer `{ }` snippet only, no built-in functions.
             // Use `Shape` (Ref-peeled) so a Ref-typed struct attribute
             // (cyclic-CFN case) also gets the snippet (same bug class as
@@ -788,8 +791,12 @@ impl CompletionProvider {
                 return completions;
             }
             // Fall back to type-based completions
-            completions
-                .extend(self.completions_for_type(attr_schema.attr_type(), Some(resource_type)));
+            completions.extend(
+                self.completions_for_type(
+                    attr_schema.attr_type(),
+                    Some(&selector.path().to_string()),
+                ),
+            );
             return completions;
         }
 
@@ -838,15 +845,17 @@ impl CompletionProvider {
             return None;
         }
 
-        for (binding_name, binding_resource_type) in &self.extract_resource_bindings(src) {
-            if binding_name == candidate_binding && !binding_resource_type.is_empty() {
+        for (binding_name, selector) in self.extract_resource_bindings(src) {
+            if binding_name == candidate_binding
+                && let Some(selector) = selector
+            {
                 // Skip self-references
                 if current_binding.is_some_and(|cb| cb == binding_name) {
                     return None;
                 }
                 return Some(BindingDotContext {
                     binding_name: binding_name.clone(),
-                    resource_type: binding_resource_type.clone(),
+                    selector,
                 });
             }
         }
@@ -859,11 +868,11 @@ impl CompletionProvider {
     fn binding_attribute_completions(
         &self,
         binding_name: &str,
-        binding_resource_type: &str,
+        selector: &SchemaSelector,
         edit_range: Range,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
-        if let Some(schema) = self.lookup_schema(binding_resource_type) {
+        if let Some(schema) = selector.lookup(&self.schemas) {
             for attr in schema.schema().as_schema().attributes().values() {
                 let full_ref = format!("{}.{}", binding_name, attr.name());
                 completions.push(CompletionItem {
@@ -1206,7 +1215,7 @@ impl CompletionProvider {
     /// Schema-authored path candidates for `ignore_changes = [|]`.
     pub(super) fn directives_ignore_changes_completions(
         &self,
-        resource_type: &str,
+        selector: &SchemaSelector,
     ) -> Vec<CompletionItem> {
         fn push_nested_paths(
             value_type: EffectiveType<'_>,
@@ -1249,7 +1258,7 @@ impl CompletionProvider {
             }
         }
 
-        let Some(schema) = self.lookup_schema(resource_type) else {
+        let Some(schema) = selector.lookup(&self.schemas) else {
             return Vec::new();
         };
         let mut labels = std::collections::BTreeSet::new();
@@ -1316,7 +1325,7 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let already_present = self.depends_on_elements_before_cursor(text, position);
 
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         let raw = self.in_scope_binding_completions_with_src(
             src,
@@ -1436,7 +1445,7 @@ impl CompletionProvider {
         base_path: Option<&carina_core::paths::ResolvedPath>,
         mode: InScopeBindingMode<'_>,
     ) -> Vec<CompletionItem> {
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         self.in_scope_binding_completions_with_src(src, mode)
     }
@@ -1513,7 +1522,7 @@ impl CompletionProvider {
     ) -> std::collections::HashSet<String> {
         self.extract_resource_bindings(src)
             .into_iter()
-            .filter_map(|(name, resource_type)| (!resource_type.is_empty()).then_some(name))
+            .filter_map(|(name, selector)| selector.map(|_| name))
             .collect()
     }
 
@@ -1523,7 +1532,7 @@ impl CompletionProvider {
         text: &str,
         base_path: Option<&carina_core::paths::ResolvedPath>,
     ) {
-        let mut storage = String::new();
+        let mut storage = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut storage);
         let structural = self.structural_resource_binding_names(src);
         items.retain(|item| !structural.contains(&item.label));
@@ -1907,7 +1916,7 @@ impl CompletionProvider {
             base_path,
             provider_ctx,
         ));
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         for (name, type_hint) in self.extract_argument_parameters(src) {
             let Some(declared) =
@@ -1944,7 +1953,7 @@ impl CompletionProvider {
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
         let upstream_sources = super::collect_upstream_state_bindings(src);
         let mut exports_cache: std::collections::HashMap<
@@ -1997,13 +2006,11 @@ impl CompletionProvider {
         base_path: Option<&carina_core::paths::ResolvedPath>,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
-        for (binding_name, resource_type) in self.extract_resource_bindings(src) {
-            if resource_type.is_empty() {
-                continue;
-            }
-            let Some(schema) = self.lookup_schema(&resource_type) else {
+        for (binding_name, selector) in self.extract_resource_bindings(src) {
+            let Some(selector) = selector else { continue };
+            let Some(schema) = selector.lookup(&self.schemas) else {
                 continue;
             };
             for attr in schema.schema().as_schema().attributes().values() {
@@ -2044,13 +2051,14 @@ impl CompletionProvider {
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Vec<CompletionItem> {
         let mut items: Vec<CompletionItem> = Vec::new();
-        let mut src_buf = String::new();
+        let mut src_buf = DslSourceStorage::default();
         let src = DslSource::resolve_directory(text, base_path, &mut src_buf);
+        let resource_bindings = self.structural_resource_binding_names(src);
         for (binding_name, rhs) in Self::extract_let_bindings(src) {
             // Resource bindings are handled by
             // `resource_ref_completions_for_type`; skip them so the
             // two helpers don't double-emit.
-            if self.extract_resource_type(&rhs).is_some() {
+            if resource_bindings.contains(&binding_name) {
                 continue;
             }
             let header = format!(
@@ -2290,22 +2298,29 @@ impl CompletionProvider {
             })
             .collect();
 
-        // Resource types from schemas
-        let resource = self
-            .schemas
-            .iter()
-            .map(move |(provider, resource_type, _kind, schema)| {
-                let key = if provider.is_empty() {
-                    resource_type.to_string()
-                } else {
-                    format!("{}.{}", provider, resource_type)
-                };
-                let description = schema
-                    .as_schema()
-                    .description()
-                    .unwrap_or("Resource reference");
-                type_completion_item(key, format!("{} reference", description), replacement_range)
-            });
+        // Annotation paths carry no kind. Resolve each path once using core's
+        // rule, including the description when both schema kinds are admitted.
+        let mut seen_paths = std::collections::HashSet::new();
+        let resource =
+            self.schemas
+                .iter()
+                .filter_map(move |(provider, resource_type, _kind, _schema)| {
+                    if !seen_paths.insert((provider, resource_type)) {
+                        return None;
+                    }
+                    let selector =
+                        SchemaSelector::kindless(ResourceTypePath::new(provider, resource_type));
+                    let schema = selector.lookup(&self.schemas)?;
+                    let description = schema
+                        .as_schema()
+                        .description()
+                        .unwrap_or("Resource reference");
+                    Some(type_completion_item(
+                        selector.path().to_string(),
+                        format!("{} reference", description),
+                        replacement_range,
+                    ))
+                });
 
         basic.chain(generic).chain(custom).chain(resource).collect()
     }

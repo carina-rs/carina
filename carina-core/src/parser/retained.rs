@@ -4345,18 +4345,7 @@ mod judgement {
                 if let TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path) = &current
                     && self
                         .schemas
-                        .get(
-                            &path.provider,
-                            &path.resource_type,
-                            crate::schema::SchemaKind::Resource,
-                        )
-                        .or_else(|| {
-                            self.schemas.get(
-                                &path.provider,
-                                &path.resource_type,
-                                crate::schema::SchemaKind::DataSource,
-                            )
-                        })
+                        .get_kindless(&path.provider, &path.resource_type)
                         .is_none()
                 {
                     return Err(InferenceIssue::NotInferable(

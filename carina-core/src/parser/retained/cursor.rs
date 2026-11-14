@@ -36,6 +36,11 @@ pub struct SlotDeclarationId {
     ordinal: usize,
 }
 impl SlotDeclarationId {
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn recording_source(&self) -> (&crate::parser::SourceFileId, usize) {
+        (&self.file, self.ordinal)
+    }
+
     pub(super) fn new(file: &crate::parser::SourceFileId, ordinal: usize) -> Self {
         Self {
             file: file.clone(),

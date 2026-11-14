@@ -3201,10 +3201,9 @@ fn wiring_context_constructs_factories_and_schemas_once() {
         &parsed.providers,
     );
 
-    assert!(
-        ctx.factories().is_empty(),
-        "Should have no factories when none are provided"
-    );
+    assert!(ctx.factories().is_empty());
+    assert_eq!(ctx.configuration_factories().len(), 1);
+    assert_eq!(ctx.configuration_factories()[0].name(), "mock");
     assert!(
         ctx.schemas().has_managed("mock", "test.resource")
             && ctx.schemas().has_managed("mock", "compute.Instance")

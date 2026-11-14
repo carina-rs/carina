@@ -2844,7 +2844,7 @@ async fn apply_provider_loading_remains_all_strict_for_tag_only_upstreams() {
     assert!(message.contains("no state found"), "{message}");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
     let user_dirs = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
@@ -2860,11 +2860,13 @@ async fn apply_verifies_backend_before_loading_bootstrap_provider_upstreams() {
     std::fs::write(
         downstream.join("main.crn"),
         r#"
-            provider mock { target = mgmt.target }
+            provider mock { source = 'file://mock.wasm' reference_table = mgmt.target }
             let mgmt = upstream_state { source = "../upstream" }
         "#,
     )
     .unwrap();
+
+    crate::test_support::install_mock_wasm(&downstream);
 
     let error = run_apply_with_observer_factory(
         &user_dirs,
@@ -5137,12 +5139,12 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
         provider_configs: deserialize_saved_provider_configs(vec![ProviderConfig {
             name: "mock".to_string(),
             attributes: (IndexMap::<String, _>::from([(
-                "region".to_string(),
+                "target".to_string(),
                 root_resource_ref("mgmt", "region"),
             )]))
             .into(),
             default_tags: Default::default(),
-            source: None,
+            source: Some("file://in-process-test.wasm".parse().unwrap()),
             version: None,
             revision: None,
             unresolved_attributes: Default::default(),
@@ -5165,7 +5167,23 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
         sorted_explicit_destroy_dependencies: Vec::new(),
         legacy_dependency_classification: None,
     };
-    let plan_file = record_with_test_context(contents);
+    let loading_configs = contents
+        .provider_configs
+        .as_provider_configs()
+        .iter()
+        .map(carina_core::parser::ProviderConfig::loading_projection)
+        .collect::<Vec<_>>();
+    let context = ValidatedConfig::from_factories_for_test_with_provider_phase(
+        fixture.runtime(),
+        (),
+        vec![Box::new(
+            crate::test_support::ConfigurableMockFactory::with_string_setting("target"),
+        )],
+        &loading_configs,
+    );
+    let plan_file = contents
+        .record_for_test(&context, Vec::new())
+        .expect("test provider evidence");
     let plan_path = tmp.path().join("unresolved-provider-config.plan.json");
     std::fs::write(
         &plan_path,
@@ -5176,11 +5194,24 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
         &std::fs::read(&plan_path).expect("read saved plan after serialization"),
     )
     .expect("saved plan must round-trip through its on-disk representation");
-    let observer_factory = fixture.observer_factory();
-
-    let error = run_apply_from_plan_locked(
+    let source = ResolvedPath::new(tmp.path()).unwrap();
+    let providers = ProviderLoad::for_test_with_provider_phase(
         fixture.runtime(),
-        inspected_saved_plan(plan_file),
+        crate::wiring::LoadedProviderFactory::for_test(vec![Box::new(
+            crate::test_support::ConfigurableMockFactory::with_string_setting("target"),
+        )]),
+        &loading_configs,
+    )
+    .into_complete()
+    .unwrap();
+    let bound =
+        ProviderBoundPlanFile::for_test(inspected_saved_plan(plan_file), providers, &source)
+            .unwrap();
+    let observer_factory = fixture.observer_factory();
+    let cancel = fixture.cancel_token();
+    let outcome = run_apply_from_plan_locked_owned(
+        fixture.runtime().color_mode(),
+        bound,
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
         fixture.backend_handle(),
@@ -5189,13 +5220,21 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
             plan_file: &plan_path,
             source_dir: tmp.path(),
         },
-        fixture.cancel_token(),
+        &source,
+        cancel.clone(),
         &observer_factory,
         NonZeroUsize::new(1).unwrap(),
         false,
     )
+    .await;
+    let error = finish_lock_command(
+        fixture.runtime().color_mode(),
+        fixture.backend_handle().as_ref(),
+        outcome,
+        &cancel,
+    )
     .await
-    .expect_err("saved plan with unresolved provider config must be rejected");
+    .expect_err("unresolved provider configuration must not reach execution");
 
     assert!(
         matches!(&error, AppError::SavedProviderConfig { .. }),
@@ -12683,5 +12722,68 @@ fn saved_plan_walk_failure_retains_its_source_instead_of_reporting_unavailable()
         std::error::Error::source(&error)
             .is_some_and(|source| source.is::<carina_core::value_walk::WalkError>())
     );
-    assert!(!error.to_string().contains("could not be evaluated"));
+    let expected = "Value traversal failed while verifying mock.test.resource.example.token\nvalue traversal rejected by its algebra";
+    assert_eq!(
+        crate::error::format_error_with_source_chain(&error),
+        expected
+    );
+    let prepared = saved_plan_secret_preparation_error(
+        error,
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: Path::new("."),
+        },
+    );
+    assert!(matches!(&prepared, AppError::ValueWalk { .. }));
+    assert_eq!(
+        crate::error::format_error_with_source_chain(&prepared),
+        expected
+    );
+}
+
+#[test]
+fn saved_plan_provider_config_conversion_error_keeps_its_diagnostic_during_secret_preparation() {
+    let saved = deserialize_saved_provider_configs(vec![ProviderConfig {
+        name: "mock".into(),
+        attributes: [("region", root_resource_ref("mgmt", "region"))]
+            .into_iter()
+            .collect(),
+        default_tags: Default::default(),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: Default::default(),
+        binding: None,
+    }]);
+    let error = ResolvedProviderConfigs::try_from(saved).unwrap_err();
+    let target = ApplyTarget::SavedPlan {
+        plan_file: Path::new("plan.json"),
+        source_dir: Path::new("infra"),
+    };
+    let replan = target.replan_command().to_string();
+    let direct = AppError::SavedProviderConfig {
+        error,
+        replan_command: replan.clone(),
+    };
+    let expected = crate::error::format_error_with_source_chain(&direct);
+    assert_eq!(
+        expected.lines().next(),
+        Some("Invalid provider config in saved plan")
+    );
+    assert_eq!(
+        expected.lines().last(),
+        Some(format!("Re-run `{replan}` to create a new plan.").as_str())
+    );
+    let prepared = saved_plan_secret_preparation_error(direct, target);
+    let rendered = crate::error::format_error_with_source_chain(&prepared);
+    assert!(
+        matches!(&prepared, AppError::SavedProviderConfig { .. }),
+        "{rendered}"
+    );
+    assert_eq!(rendered, expected);
+    assert!(!rendered.contains("could not be evaluated"));
+    assert!(
+        std::error::Error::source(&prepared)
+            .is_some_and(|source| source.is::<carina_core::parser::ProviderConfigInvariantError>())
+    );
 }

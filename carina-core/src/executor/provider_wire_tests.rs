@@ -420,7 +420,11 @@ impl ProviderFactory for ConfigFactory {
     fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
         ValidatedProviderSchemaWitness::new(
             self.schemas(),
-            ValidatedConfigSchema::validate(BTreeMap::new()).unwrap(),
+            ValidatedConfigSchema::validate(BTreeMap::from([(
+                "extra".into(),
+                crate::schema::AttributeType::map(crate::schema::AttributeType::duration()),
+            )]))
+            .unwrap(),
             Default::default(),
             Vec::new(),
         )

@@ -1,0 +1,23 @@
+probe.Declared { name = "literal" }
+probe.Declared { name = a.name }
+probe.Declared { name = unknown_b.name }
+probe.Chained { name = b.name }
+probe.CreateOnly { name = "legacy-literal" }
+probe.CreateOnly { name = b.name }
+probe.CreateOnly { name = unknown_b.name }
+probe.Mutable { name = "simhash-literal" }
+probe.Declared { name_prefix = "fixed-prefix" }
+
+for name in ["loop-first", "loop-second"] {
+  probe.Declared { name = name }
+}
+
+let child = use { source = "./child" }
+let instance = child { name = "module-bound" }
+child { name = "module-anonymous" }
+
+let secrets = probe.Secrets {
+  literal = secret("literal-secret")
+  known = secret(b.name)
+  unknown = secret(unknown_b.name)
+}

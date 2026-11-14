@@ -99,11 +99,19 @@ impl ProviderState {
             environment,
         ));
         let schemas = loaded_providers.schemas().schemas_arc();
-        let diagnostic_engine = DiagnosticEngine::new_with_known_providers(
+        let mut diagnostic_engine = DiagnosticEngine::new_with_known_providers(
             loaded_providers,
             provider_names.clone(),
             known_provider_names,
         );
+        if use_builtin_mock {
+            diagnostic_engine = diagnostic_engine.with_configuration_factory(Box::new(
+                carina_provider_mock::ConfiguredBuiltinMock::new(
+                    Default::default(),
+                    carina_provider_mock::MockScope::memory(),
+                ),
+            ));
+        }
         // Extract custom type names from provider schemas for completion.
         // The structured identities render to their dotted display form
         // (`aws.iam.Role.Arn`, `Ipv4Cidr`), which is also the spelling a

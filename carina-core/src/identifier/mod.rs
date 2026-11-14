@@ -492,12 +492,17 @@ fn anonymous_identity_basis(inputs: &AnonymousIdentityInputs) -> AnonymousIdenti
     }
 }
 
-fn encode_count(hasher: &mut Sha256, count: usize) {
+#[cfg(not(feature = "test-utils"))]
+type IdentityHasher = Sha256;
+#[cfg(feature = "test-utils")]
+type IdentityHasher = crate::identity_recording::RecordingSha256;
+
+fn encode_count(hasher: &mut IdentityHasher, count: usize) {
     let count = u64::try_from(count).expect("identity encoding count fits in u64");
     hasher.update(count.to_le_bytes());
 }
 
-fn encode_length_prefixed(hasher: &mut Sha256, value: &[u8]) {
+fn encode_length_prefixed(hasher: &mut IdentityHasher, value: &[u8]) {
     encode_count(hasher, value.len());
     hasher.update(value);
 }
@@ -518,7 +523,11 @@ fn hash_declared_identity_inputs(
     provider_identity: &BTreeMap<String, String>,
     identity: &CompleteIdentityValues,
 ) -> u32 {
-    let mut hasher = Sha256::new();
+    let hasher = Sha256::new();
+    #[cfg(not(feature = "test-utils"))]
+    let mut hasher = hasher;
+    #[cfg(feature = "test-utils")]
+    let mut hasher = crate::identity_recording::RecordingSha256::new(hasher, "declared-identity");
     encode_length_prefixed(&mut hasher, b"carina-anonymous-identity-v1");
     encode_count(&mut hasher, provider_identity.len());
     for (key, value) in provider_identity {
@@ -2095,10 +2104,16 @@ pub(crate) fn compute_simhash<K: std::fmt::Display>(
 ) -> SimHash {
     use std::hash::{Hash, Hasher};
 
+    #[cfg(feature = "test-utils")]
+    let recording = crate::identity_recording::begin_simhash(attributes.len());
     let mut v = [0i32; 64];
     for (key, value) in attributes {
         let feature = format!("{}={}", key, value);
-        let mut hasher = std::hash::DefaultHasher::new();
+        let hasher = std::hash::DefaultHasher::new();
+        #[cfg(not(feature = "test-utils"))]
+        let mut hasher = hasher;
+        #[cfg(feature = "test-utils")]
+        let mut hasher = crate::identity_recording::RecordingHasher::new(hasher, "simhash-feature");
         feature.hash(&mut hasher);
         let hash = hasher.finish();
         for (i, count) in v.iter_mut().enumerate() {
@@ -2114,6 +2129,10 @@ pub(crate) fn compute_simhash<K: std::fmt::Display>(
         if *count > 0 {
             result |= 1 << i;
         }
+    }
+    #[cfg(feature = "test-utils")]
+    if let Some(recording) = recording {
+        recording.finish("simhash", &result.to_le_bytes());
     }
     SimHash(result)
 }
@@ -2593,6 +2612,8 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
             }
         }
 
+        #[cfg(feature = "test-utils")]
+        let _recording_context = crate::identity_recording::resource_context(resource);
         let hash_values = anonymous_identity_inputs(resource, schema.schema());
         let hash_suffix = match &hash_values {
             AnonymousIdentityInputs::DeclaredIdentity(IdentityValues::Complete(values)) => {
@@ -2618,7 +2639,12 @@ pub fn compute_anonymous_identifiers_with_provider_configs<
             AnonymousIdentityInputs::CreateOnly(values) => {
                 // Preserve the legacy create-only encoding exactly for
                 // resource types that declare no identity paths.
-                let mut hasher = std::hash::DefaultHasher::new();
+                let hasher = std::hash::DefaultHasher::new();
+                #[cfg(not(feature = "test-utils"))]
+                let mut hasher = hasher;
+                #[cfg(feature = "test-utils")]
+                let mut hasher =
+                    crate::identity_recording::RecordingHasher::new(hasher, "create-only");
                 for (key, value) in &identity_values {
                     key.hash(&mut hasher);
                     value.hash(&mut hasher);

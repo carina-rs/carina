@@ -393,6 +393,53 @@ pub struct RootDirectoryParse<E = crate::parser::ParsedExportParam> {
 pub type ParsedRootDirectory = RootDirectoryParse<crate::parser::ParsedExportParam>;
 pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExportParam>;
 
+/// One sealed root snapshot with the directory authority for resolving its copy.
+pub struct InferredRootAnalysis<'a> {
+    root: &'a InferredRootDirectory,
+    tree: parser::AnalysisTree<
+        'a,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        parser::ParsedDeferredForPhase,
+        crate::resource::RelativeBindingName,
+        parser::InferredExportParam,
+    >,
+}
+
+impl<'a> InferredRootAnalysis<'a> {
+    pub fn tree(
+        &self,
+    ) -> &parser::AnalysisTree<
+        'a,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        parser::ParsedDeferredForPhase,
+        crate::resource::RelativeBindingName,
+        parser::InferredExportParam,
+    > {
+        &self.tree
+    }
+
+    /// Resolve this snapshot's declarations without rebuilding its analysis.
+    pub fn resolve_type_exprs_report(
+        self,
+        config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> (
+        InferredRootDirectory,
+        crate::validation::FileTypeResolutionReport,
+    ) {
+        let (parsed, report) =
+            crate::validation::resolve_file_type_exprs_from_analysis(&self.tree, config, None);
+        (
+            RootDirectoryParse {
+                parsed,
+                resolution: self.root.resolution,
+            },
+            report,
+        )
+    }
+}
+
 /// Negative scope evidence minted only after directory discovery and a
 /// successful declaration parse of every source in that snapshot. A caller
 /// cannot obtain it from an isolated buffer or a caller-supplied source batch.
@@ -500,6 +547,13 @@ impl<E> RootDirectoryParse<E> {
 }
 
 impl RootDirectoryParse<crate::parser::InferredExportParam> {
+    pub fn analysis(&self) -> Result<InferredRootAnalysis<'_>, parser::AnalysisTreeError> {
+        Ok(InferredRootAnalysis {
+            root: self,
+            tree: parser::AnalysisTree::try_from_file(&self.parsed)?,
+        })
+    }
+
     /// Retry export inference with the provider schemas loaded for this root.
     pub fn retry_unchecked_export_inference(
         &mut self,

@@ -392,11 +392,13 @@ where
 ///
 /// Each resource is assigned to exactly one parent (or is a root). When a
 /// resource depends on multiple resources in the plan, it is placed under the
-/// shallowest (most ancestral) dependency. Ties are broken by
-/// (resource_type, binding_name) for determinism.
+/// shallowest (most ancestral) dependency. Ties are broken by the total order
+/// (resource_type, binding_name, effect_index). The index is the effect's
+/// position in the plan, preserved when saving and loading it, and distinguishes
+/// effects for different generations of the same binding.
 ///
 /// Returns (roots, dependents) where roots are sorted and each parent's
-/// children are sorted by (resource_type, binding_name).
+/// children are sorted by the same total effect order.
 pub fn build_single_parent_tree<S, V: crate::resource::PlanValueKind>(
     plan: &Plan<S, V>,
     graph: &DependencyGraph,
@@ -405,6 +407,23 @@ pub fn build_single_parent_tree<S, V: crate::resource::PlanValueKind>(
     let effect_deps = &graph.effect_deps;
     let effect_bindings = &graph.effect_bindings;
     let effect_types = &graph.effect_types;
+
+    let compare_effects = |a: &usize, b: &usize| {
+        let sort_key = |idx: &usize| {
+            (
+                effect_types
+                    .get(idx)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                effect_bindings
+                    .get(idx)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                *idx,
+            )
+        };
+        sort_key(a).cmp(&sort_key(b))
+    };
 
     // Step 1: Build the full reverse dependency map (all parents)
     let mut all_dependents: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -427,13 +446,7 @@ pub fn build_single_parent_tree<S, V: crate::resource::PlanValueKind>(
             initial_roots.push(*idx);
         }
     }
-    initial_roots.sort();
-
-    let sort_key = |idx: &usize| -> (String, String) {
-        let rtype = effect_types.get(idx).cloned().unwrap_or_default();
-        let binding = effect_bindings.get(idx).cloned().unwrap_or_default();
-        (rtype, binding)
-    };
+    initial_roots.sort_by(compare_effects);
 
     // Step 3: Nest no-dep resources under their first dependent (Issue #928)
     // A no-dep resource can be nested only if every dependent has at least one
@@ -441,7 +454,7 @@ pub fn build_single_parent_tree<S, V: crate::resource::PlanValueKind>(
     let mut nested_under_dependent: BTreeSet<usize> = BTreeSet::new();
     for &idx in &initial_roots {
         let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
-        children.sort_by_key(|a| sort_key(a));
+        children.sort_by(compare_effects);
         if !children.is_empty() {
             let all_dependents_have_other_deps = children.iter().all(|&child_idx| {
                 effect_deps.get(&child_idx).is_some_and(|child_deps| {
@@ -506,11 +519,11 @@ pub fn build_single_parent_tree<S, V: crate::resource::PlanValueKind>(
         if parent_candidates.is_empty() {
             continue;
         }
-        // Pick the shallowest parent; break ties by (resource_type, binding_name)
+        // Pick the shallowest parent; break ties by the total effect order.
         parent_candidates.sort_by(|a, b| {
             let da = depth.get(a).copied().unwrap_or(usize::MAX);
             let db = depth.get(b).copied().unwrap_or(usize::MAX);
-            da.cmp(&db).then_with(|| sort_key(a).cmp(&sort_key(b)))
+            da.cmp(&db).then_with(|| compare_effects(a, b))
         });
         let parent = parent_candidates[0];
         dependents.entry(parent).or_default().push(*idx);
@@ -521,26 +534,26 @@ pub fn build_single_parent_tree<S, V: crate::resource::PlanValueKind>(
     // igw_attachment (depth 1) rather than route (depth 2+).
     for &idx in &nested_under_dependent {
         let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
-        // Pick the shallowest dependent; break ties by (resource_type, binding_name)
+        // Pick the shallowest dependent; break ties by the total effect order.
         children.sort_by(|a, b| {
             let da = depth.get(a).copied().unwrap_or(usize::MAX);
             let db = depth.get(b).copied().unwrap_or(usize::MAX);
-            da.cmp(&db).then_with(|| sort_key(a).cmp(&sort_key(b)))
+            da.cmp(&db).then_with(|| compare_effects(a, b))
         });
         if let Some(&best_dependent) = children.first() {
             dependents.entry(best_dependent).or_default().push(idx);
         }
     }
 
-    // Step 7: Sort each parent's children by (resource_type, binding_name)
+    // Step 7: Sort each parent's children by the total effect order.
     #[allow(clippy::iter_over_hash_type)] // keyed rebuild: child buckets are independently sorted
     for children in dependents.values_mut() {
-        children.sort_by_key(|a| sort_key(a));
+        children.sort_by(compare_effects);
     }
 
-    // Also sort roots by (resource_type, binding_name)
+    // Also sort roots by the total effect order.
     let mut sorted_roots = roots;
-    sorted_roots.sort_by_key(|a| sort_key(a));
+    sorted_roots.sort_by(compare_effects);
 
     (sorted_roots, dependents)
 }
@@ -1038,6 +1051,61 @@ mod tests {
         let (roots, dependents) = build_single_parent_tree(&plan, &graph);
         assert_eq!(roots, vec![0]);
         assert_eq!(dependents.get(&0), Some(&vec![1]));
+    }
+
+    #[test]
+    fn tied_deposed_dependents_produce_the_same_tree_across_fresh_graphs() {
+        let id = |binding: &'static str| {
+            ResolvedResourceId::with_provider_identity("test", "Widget", binding, None)
+        };
+        let mut plan = Plan::new();
+        for (binding, dependencies) in [("a", vec![]), ("b", vec![]), ("c", vec![id("a")])] {
+            plan.add(Effect::Create(ResolvedResource::from_resolved_parts(
+                Resource::with_provider("test", "Widget", binding, None)
+                    .with_root_binding(binding)
+                    .with_dependency_phase(()),
+                dependencies.into_iter().collect(),
+                Default::default(),
+            )));
+        }
+        for generation in ["111111111111", "222222222222"] {
+            plan.add(Effect::Delete {
+                id: id("x"),
+                identifier: crate::effect::fixture_applied_identifier(generation),
+                generation: crate::effect::EffectGeneration::Deposed(
+                    serde_json::from_value(serde_json::json!(generation)).unwrap(),
+                ),
+                directives: Directives::default(),
+                binding: Some(absolute("x")),
+                dependencies: crate::resource::PersistedDestroyDependencies::decode_persisted(
+                    [id("b"), id("c")].into_iter().collect(),
+                )
+                .unwrap(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
+            });
+        }
+
+        // 0[2[3[1],4]]: the first deposed generation must parent b, and the
+        // two x deletes must remain in plan order under c.
+        let expected = (
+            vec![0],
+            HashMap::from([
+                (0, vec![2]),
+                (1, vec![]),
+                (2, vec![3, 4]),
+                (3, vec![1]),
+                (4, vec![]),
+            ]),
+        );
+        for build in 0..64 {
+            let graph = build_dependency_graph(&plan);
+            assert_eq!(
+                build_single_parent_tree(&plan, &graph),
+                expected,
+                "fresh graph build {build} must use the same parent and sibling order",
+            );
+        }
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub mod formatter;
 pub mod heredoc;
 pub mod hint;
 pub mod identifier;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub mod identity_recording;
 pub mod input_rules;
 pub mod integer_arithmetic;
 #[doc(hidden)]
