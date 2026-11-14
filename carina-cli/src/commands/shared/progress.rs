@@ -1287,6 +1287,8 @@ mod tests {
         let origin = {
             let mut active = state.active.lock().unwrap();
             let origin = active.entries.get(&1).unwrap().started;
+            #[allow(clippy::iter_over_hash_type)]
+            // commutative: every test heartbeat receives the same injected timestamp
             for entry in active.entries.values_mut() {
                 entry.started = origin;
                 entry.last_reported = origin;

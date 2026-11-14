@@ -85,6 +85,7 @@ impl DependencyGraph {
         let mut visited = HashSet::new();
         let mut rec_stack = HashSet::new();
 
+        #[allow(clippy::iter_over_hash_type)] // commutative: only the existence of a cycle escapes
         for node in self.edges.keys() {
             if self.has_cycle_util(node, &mut visited, &mut rec_stack) {
                 return true;
@@ -828,6 +829,8 @@ impl RootConfigSignature {
         let mut all_targets: HashSet<String> = HashSet::new();
         let mut all_sources: HashSet<String> = HashSet::new();
 
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: source/target set membership is accumulated before roots are sorted
         for (source, deps) in &self.dependency_graph.edges {
             all_sources.insert(source.clone());
             for dep in deps {

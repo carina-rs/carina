@@ -52,6 +52,8 @@ impl HistoricalDisplaySource for HashMap<DeletedInstanceKey, HashMap<String, Val
     fn historical_display<'a>(&'a self, plan: &Plan) -> Cow<'a, HistoricalDisplayAttributes> {
         let mut display = HistoricalDisplayAttributes::for_plan(plan);
         let empty_nested_write_only = carina_core::provider::NestedWriteOnlyRecord::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: test display attributes are installed by distinct delete-instance keys
         for (key, attributes) in self {
             let attributes = attributes
                 .iter()

@@ -4981,6 +4981,8 @@ impl ProviderNormalizer for SavedAttrsHydratingNormalizer {
     ) -> BoxFuture<'a, ProviderResult<()>> {
         for (id, state) in states {
             if let Some(saved) = saved_attrs.get(id) {
+                #[allow(clippy::iter_over_hash_type)]
+                // keyed rebuild: test hydration fills distinct missing saved keys
                 for (attribute, value) in saved {
                     state
                         .attributes

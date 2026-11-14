@@ -579,6 +579,8 @@ pub(crate) fn lift_saved_state_enum_leaves(
     // carina#3739: hydration is map-driven, so reconciliation must cover the
     // same map. This includes materialized for-loop children before an expanded
     // resource slice is available.
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: infallible enum lifting operates independently per resource
     for (id, attrs) in saved_attrs.iter_mut() {
         if let Some(schema) = registry.get(
             &id.provider,

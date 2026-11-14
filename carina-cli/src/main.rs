@@ -1,3 +1,5 @@
+#![deny(clippy::iter_over_hash_type)]
+
 mod process_inputs;
 use std::io::ErrorKind;
 use std::num::NonZeroUsize;

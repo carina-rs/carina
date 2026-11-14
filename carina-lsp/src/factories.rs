@@ -1,6 +1,6 @@
 //! Production offline provider resolution and factory construction.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use carina_core::parser::ProviderConfig;
@@ -143,7 +143,7 @@ mod loader {
         loader: &VerifiedFactoryLoader,
     ) -> FactoryBuildResult {
         let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
-        let mut errors: HashMap<String, String> = HashMap::new();
+        let mut errors: BTreeMap<String, String> = BTreeMap::new();
         let mut fingerprint: Vec<(String, crate::backend::ProviderInstallFingerprint)> =
             Vec::with_capacity(providers.len());
 

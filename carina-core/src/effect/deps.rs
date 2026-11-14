@@ -702,6 +702,8 @@ where
     }
 
     let mut delete_blockers_by_id: HashMap<ResolvedResourceId, Vec<usize>> = HashMap::new();
+    #[allow(clippy::iter_over_hash_type)]
+    // sorted immediately after: blocker vectors are sorted and deduplicated before use
     for (key, targets) in &instance_to_idx {
         let blockers = targets.lookup_delete_blockers();
         if !blockers.is_empty() {
@@ -711,6 +713,8 @@ where
                 .extend(blockers);
         }
     }
+    #[allow(clippy::iter_over_hash_type)]
+    // keyed rebuild: each blocker vector is independently sorted and deduplicated
     for blockers in delete_blockers_by_id.values_mut() {
         blockers.sort_unstable();
         blockers.dedup();
@@ -719,7 +723,11 @@ where
     let analyzer = DependencyAnalyzer::new(instance_to_idx, delete_blockers_by_id, known_graph_ids);
     let mut analysis = DependencyAnalysis::new(effects.len() + aliases.len());
     if let ScheduleInputs::Apply = inputs {
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: replacement edges union independent prerequisite sets
         for (dependent, dependencies) in replacement_edges {
+            #[allow(clippy::iter_over_hash_type)]
+            // keyed rebuild: duplicate prerequisite edges have identical read metadata
             for dependency in dependencies {
                 analysis.add_edge(dependent, dependency, ReadsSet::unknown());
             }
@@ -806,6 +814,8 @@ pub fn relax_update_update_edges<S, P: PlanValueKind, E: AsRef<Effect<S, P>>>(
         let Some(parents) = analysis.deps_of(child).cloned() else {
             continue;
         };
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: independent dependency edges are removed when read/write sets are disjoint
         for parent in parents {
             let Some(writes) = WritesSet::from_update(effects[parent].as_ref()) else {
                 continue;
@@ -1581,6 +1591,8 @@ mod tests {
         instance_to_idx: HashMap<EffectInstanceKey, IdentityTargets>,
     ) -> DependencyAnalyzer {
         let mut delete_blockers_by_id: HashMap<ResolvedResourceId, Vec<usize>> = HashMap::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // sorted immediately after: test blocker vectors are sorted and deduplicated before use
         for (key, targets) in &instance_to_idx {
             let blockers = targets.lookup_delete_blockers();
             if !blockers.is_empty() {
@@ -1590,6 +1602,8 @@ mod tests {
                     .extend(blockers);
             }
         }
+        #[allow(clippy::iter_over_hash_type)]
+        // keyed rebuild: test blocker vectors are independently sorted and deduplicated
         for blockers in delete_blockers_by_id.values_mut() {
             blockers.sort_unstable();
             blockers.dedup();

@@ -1,3 +1,5 @@
+#![deny(clippy::iter_over_hash_type)]
+
 use carina_core::{EnvironmentSnapshot, parser::ProviderContext};
 use carina_lsp::Backend;
 use carina_lsp::factories::{build_factories, install_prober, trusted_local_grants_from_env};

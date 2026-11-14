@@ -5252,6 +5252,8 @@ mod tests {
     #[test]
     fn json_decode_reconstructs_every_registered_builtin_validator() {
         let positive_int = TypeIdentity::bare("PositiveInt");
+        #[allow(clippy::iter_over_hash_type)]
+        // commutative: validator round-trip assertions are independent per identity
         for (kind, identity) in crate::schema::builtin_validator_registry().keys() {
             let wire = match kind {
                 crate::schema::RefinedScalarKind::String => protocol::AttributeType::String {
