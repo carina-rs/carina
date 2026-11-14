@@ -953,6 +953,7 @@ fn provider_declaration(
 /// Parser-owned inventories survive directory merging and binding phase changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigurationBlock {
+    Require,
     Arguments,
     Attributes,
     Provider,
@@ -1223,6 +1224,7 @@ impl SyntaxInventory {
         {
             let pair = statement.into_inner().next().expect("statement body");
             let kind = match pair.as_rule() {
+                Rule::require_statement => Some(ConfigurationBlock::Require),
                 Rule::arguments_block => Some(ConfigurationBlock::Arguments),
                 Rule::attributes_block => Some(ConfigurationBlock::Attributes),
                 Rule::provider_block => Some(ConfigurationBlock::Provider),
@@ -1270,7 +1272,12 @@ impl SyntaxInventory {
                 _ => None,
             };
             if let Some(kind) = kind {
-                let location = DeclarationLocation::block_header_from_pair(&pair, file, source);
+                let location = match kind {
+                    ConfigurationBlock::Require => {
+                        DeclarationLocation::from_pair(&pair, file, source)
+                    }
+                    _ => DeclarationLocation::block_header_from_pair(&pair, file, source),
+                };
                 let declaration = ConfigurationBlockDeclaration::new(kind, &location, file);
                 out.configuration_blocks
                     .push(Located::new(location, declaration));

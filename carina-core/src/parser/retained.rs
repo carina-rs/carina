@@ -308,7 +308,7 @@ impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
 /// retained with every require node, and reused by all resolver entry points.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum RequireScope {
-    /// An isolated buffer cannot establish that sibling arguments are absent.
+    /// No complete directory verdict is available for this require node.
     #[default]
     Unknown,
     /// Only the directory loader mints this declaration-completeness proof.

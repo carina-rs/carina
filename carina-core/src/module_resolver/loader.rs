@@ -37,112 +37,220 @@ pub fn get_parsed_file(
     Ok(parsed)
 }
 
-/// Load a module from a directory path.
-///
-/// Modules are directory-scoped: all `.crn` files in the directory are merged
-/// uniformly, with no file name (including `main.crn`) treated as privileged.
-///
-/// Returns `None` if `path` is not a directory, cannot be read/parsed, or
-/// contains no module definitions (no inputs or outputs).
-pub fn load_module(path: &ResolvedPath, config: &ProviderContext) -> Option<ParsedFile> {
+/// A failed module load distinguishes unavailable source from a directory that
+/// was read successfully but cannot be imported. Static consumers may skip
+/// unavailable sources; they must not interpret that as proof of importability.
+#[derive(Debug, thiserror::Error)]
+pub enum ModuleLoadError {
+    #[error("{0}")]
+    Unavailable(ModuleError),
+    #[error("{error}")]
+    NotModule {
+        error: Box<ModuleError>,
+        /// Imports remain available to the static walk without exposing the
+        /// rejected directory's expressions or placement report.
+        imports: Vec<crate::parser::UseStatement>,
+    },
+}
+
+impl ModuleLoadError {
+    pub fn into_errors(self) -> Vec<ModuleError> {
+        let error = match self {
+            Self::Unavailable(error) => error,
+            Self::NotModule { error, .. } => *error,
+        };
+        match error {
+            ModuleError::Multiple(errors) => errors.into_vec(),
+            error => vec![error],
+        }
+    }
+    fn rejected(error: ModuleError) -> Self {
+        Self::NotModule {
+            error: Box::new(error),
+            imports: Vec::new(),
+        }
+    }
+    pub(crate) fn into_first_error(self) -> ModuleError {
+        self.into_errors()
+            .into_iter()
+            .next()
+            .expect("a module failure is nonempty")
+    }
+}
+
+/// Load an imported directory. Empty entry lists do not affect importability.
+pub fn load_module(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+) -> Result<ParsedFile, ModuleLoadError> {
     load_module_with_diagnostics(path, config).map(|loaded| loaded.parsed)
 }
 
-/// Diagnostic-preserving variant of [`load_module`].
 pub fn load_module_with_diagnostics(
     path: &ResolvedPath,
     config: &ProviderContext,
-) -> Option<LoadedModule> {
-    load_module_with_diagnostics_and_schemas(path, config, &crate::schema::SchemaRegistry::new())
+) -> Result<LoadedModule, ModuleLoadError> {
+    load_module_with_diagnostics_and_schemas(
+        path,
+        config,
+        &crate::schema::SchemaRegistry::new(),
+        &path.source_label(),
+    )
 }
 
 pub fn load_module_with_diagnostics_and_schemas(
     path: &ResolvedPath,
     config: &ProviderContext,
     schemas: &crate::schema::SchemaRegistry,
-) -> Option<LoadedModule> {
-    let path = path.clone();
-    if !path.is_dir() {
-        return None;
-    }
-    load_directory_module_with_diagnostics_and_config(&path, config, &Default::default(), schemas)
+    display_root: &std::path::Path,
+) -> Result<LoadedModule, ModuleLoadError> {
+    load_imported_directory(path, config, &Default::default(), schemas, display_root)
 }
 
-/// Load all `.crn` files from a directory and merge them into a single `ParsedFile`.
-///
-/// Returns `None` if the directory cannot be read or contains no module
-/// definitions (no arguments/attributes).
-///
-/// Routed through [`crate::config_loader::parse_directory_files`] so
-/// every file's `ParseContext` is seeded with the binding-name union
-/// from sibling `.crn` files (#2817).
+/// Read and admit a directory through the same import boundary as the resolver.
 pub fn load_directory_module(
-    dir_path: &ResolvedPath,
+    path: &ResolvedPath,
     config: &ProviderContext,
-) -> Option<ParsedFile> {
-    load_directory_module_with_diagnostics_and_config(
-        dir_path,
-        config,
-        &Default::default(),
-        &crate::schema::SchemaRegistry::new(),
-    )
-    .map(|loaded| loaded.parsed)
+) -> Result<ParsedFile, ModuleLoadError> {
+    load_module(path, config)
 }
 
-/// Load a module signature using the caller's provider catalog.
-///
-/// A dotted argument type is intentionally ambiguous during bootstrap: it can
-/// name either a provider value type or a managed-resource handle. Signature
-/// consumers that already own an enriched provider context must therefore use
-/// that context while parsing, or a valid bare handle in `depends_on` can be
-/// rejected before the signature is available to diagnose its call site.
 pub(crate) fn load_module_with_overrides(
     path: &ResolvedPath,
     config: &ProviderContext,
     overrides: &crate::config_loader::SourceOverrides,
-) -> Option<ParsedFile> {
-    if !path.is_dir() {
-        return None;
-    }
-    load_directory_module_with_diagnostics_and_config(
+) -> Result<ParsedFile, ModuleLoadError> {
+    load_imported_directory(
         path,
         config,
         overrides,
         &crate::schema::SchemaRegistry::new(),
+        &path.source_label(),
     )
     .map(|loaded| loaded.parsed)
 }
 
-fn load_directory_module_with_diagnostics_and_config(
+/// The shared import boundary consumes the issued verdict before exposing a
+/// parsed module to signature, expression or expansion consumers. A rejected
+/// root can therefore publish its in-module prohibition without also publishing
+/// root-placement findings from that directory.
+pub(crate) fn load_imported_directory(
     dir_path: &ResolvedPath,
     config: &ProviderContext,
     overrides: &crate::config_loader::SourceOverrides,
     schemas: &crate::schema::SchemaRegistry,
-) -> Option<LoadedModule> {
+    display_root: &std::path::Path,
+) -> Result<LoadedModule, ModuleLoadError> {
+    use ModuleLoadError::Unavailable;
+    let metadata = dir_path
+        .metadata()
+        .map_err(|e| Unavailable(ModuleError::Io(e)))?;
+    if !metadata.is_dir() {
+        return Err(ModuleLoadError::rejected(ModuleError::NotADirectory {
+            path: dir_path.source_label().to_string_lossy().into_owned(),
+        }));
+    }
     let inputs = crate::config_loader::DirectoryFiles::discover(dir_path, overrides)
-        .ok()?
+        .map_err(|e| Unavailable(ModuleError::Io(e)))?
         .read_all(overrides)
-        .ok()?;
+        .map_err(|e| Unavailable(ModuleError::Io(e.into_error())))?;
     let parsed_files = inputs
-        .parse_from_root(config, &dir_path.source_label())
-        .ok()?;
+        .parse_from_root(config, display_root)
+        .map_err(|located| {
+            Unavailable(match located.source_file {
+                Some(path) => ModuleError::ParseInFile {
+                    path,
+                    error: located.error,
+                },
+                None => ModuleError::Parse(*located.error),
+            })
+        })?;
+    if parsed_files.is_empty() {
+        return Err(ModuleLoadError::rejected(
+            ModuleError::NoConfigurationFiles {
+                path: crate::paths::DisplayPath::for_diagnostics_from(
+                    dir_path.source_label(),
+                    &ResolvedPath::new(display_root)
+                        .map_err(|e| Unavailable(ModuleError::Io(e)))?,
+                ),
+            },
+        ));
+    }
     let duplicate_declarations =
         crate::config_loader::find_duplicate_declarations(&dir_path.source_label(), &parsed_files);
-
     let mut merged = parsed_files.empty_assembly();
     for (_, parsed) in parsed_files {
         crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
     }
+    let module = LoadedModule {
+        directory: dir_path.clone(),
+        parsed: merged,
+        duplicate_declarations,
+    };
+    // The issued verdict is the importability decision. A root cannot escape
+    // rejection even if a public AST list is later changed: the evidence itself
+    // still identifies a prohibited root block.
+    match module.parsed.directory_verdict() {
+        crate::config_loader::DirectoryVerdict::Root(root) => {
+            let error = ModuleError::from_errors(module.placement_errors()).unwrap_or_else(|| {
+                match root.evidence() {
+                    crate::config_loader::RootEvidence::Provider { .. } => {
+                        ModuleError::ProviderInModule
+                    }
+                    crate::config_loader::RootEvidence::Backend { .. } => {
+                        ModuleError::BackendInModule
+                    }
+                }
+                .with_root_evidence(root.clone())
+            });
+            return Err(ModuleLoadError::NotModule {
+                error: Box::new(error),
+                imports: module.parsed.uses,
+            });
+        }
+        // These snapshots remain available to signature/reference checking.
+        // State/upstream/exports prohibitions run in validation and expansion,
+        // preserving independent diagnostics from an otherwise importable body.
+        crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
+        | crate::config_loader::DirectoryVerdict::NoEvidence(_) => {}
+        crate::config_loader::DirectoryVerdict::Unknown => {
+            unreachable!("a successfully parsed complete directory has an issued verdict")
+        }
+    }
+    let mut module = module;
+    crate::parser::retained::judge_configuration(&mut module.parsed, schemas, config);
+    Ok(module)
+}
 
-    crate::parser::retained::judge_configuration(&mut merged, schemas, config);
-    if merged.arguments.is_empty() && merged.attribute_params.is_empty() {
-        None
-    } else {
-        Some(LoadedModule {
-            directory: dir_path.clone(),
-            parsed: merged,
-            duplicate_declarations,
+impl LoadedModule {
+    pub(crate) fn placement_errors(&self) -> Vec<ModuleError> {
+        let root = self.parsed.directory_verdict().root();
+        [
+            crate::validation::validate_no_provider_in_module(self)
+                .err()
+                .map(|_| ModuleError::ProviderInModule),
+            crate::validation::validate_no_state_blocks_in_module(self)
+                .err()
+                .map(|_| ModuleError::StateBlockInModule),
+            crate::validation::validate_no_backend_in_module(self)
+                .err()
+                .map(|_| ModuleError::BackendInModule),
+            crate::validation::validate_no_upstream_states_in_module(self)
+                .err()
+                .map(|_| ModuleError::UpstreamStateInModule),
+            crate::validation::validate_no_exports_in_module(self)
+                .err()
+                .map(|_| ModuleError::ExportsInModule),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|error| match (&error, root) {
+            (ModuleError::ProviderInModule | ModuleError::BackendInModule, Some(root)) => {
+                error.with_root_evidence(root.clone())
+            }
+            _ => error,
         })
+        .collect()
     }
 }
 
@@ -182,8 +290,9 @@ pub fn derive_module_name(path: &ResolvedPath) -> String {
 
 /// Load a module from a directory by reading all `.crn` files.
 ///
-/// Unlike [`load_directory_module`], this returns a `Result` with descriptive
-/// error messages and does not check for module definitions (inputs/outputs).
+/// This direct-entry metadata API retains the issued verdict and supports
+/// roots and templates. Unlike the import APIs, it does not admit the directory
+/// for `use` or run in-module prohibitions.
 ///
 /// Routed through [`crate::config_loader::parse_directory_files`] for
 /// directory-aware parse (#2817).
@@ -286,7 +395,7 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = load_module(
+        let parsed = load_module_from_directory(
             &crate::paths::ResolvedPath::new(dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
@@ -355,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn load_module_returns_none_for_file_path() {
+    fn load_module_distinguishes_a_file_path_from_unavailable_source() {
         let tmp = tempdir().unwrap();
         let single = tmp.path().join("solo.crn");
         fs::write(&single, "arguments {\n  x: String\n}\n").unwrap();
@@ -364,7 +473,7 @@ mod tests {
                 &crate::paths::ResolvedPath::new(&single).unwrap(),
                 &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
             )
-            .is_none()
+            .is_err()
         );
     }
 
@@ -417,5 +526,108 @@ mod tests {
             derive_module_name(&crate::paths::ResolvedPath::new(&path).unwrap()),
             "custom"
         );
+    }
+}
+
+#[cfg(test)]
+mod importability_tests {
+    use super::*;
+    #[test]
+    fn module_load_distinguishes_unavailable_source_from_rejected_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = ResolvedPath::new(directory.path()).unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let Err(ModuleLoadError::NotModule { error, .. }) = load_module(&path, &context) else {
+            panic!("empty directory must have a typed rejection");
+        };
+        assert!(matches!(
+            error.root_cause(),
+            ModuleError::NoConfigurationFiles { .. }
+        ));
+        fs::write(directory.path().join("arguments.crn"), "arguments {}\n").unwrap();
+        fs::write(directory.path().join("broken.crn"), "let broken =\n").unwrap();
+        assert!(matches!(
+            load_module(&path, &context),
+            Err(ModuleLoadError::Unavailable(
+                ModuleError::ParseInFile { .. }
+            ))
+        ));
+        fs::write(directory.path().join("broken.crn"), [0xff]).unwrap();
+        assert!(matches!(
+            load_module(&path, &context),
+            Err(ModuleLoadError::Unavailable(ModuleError::Io(_)))
+        ));
+        fs::remove_file(directory.path().join("broken.crn")).unwrap();
+        fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let Err(ModuleLoadError::NotModule { error, .. }) = load_module(&path, &context) else {
+            panic!("root evidence must prohibit import");
+        };
+        assert!(matches!(error.root_cause(), ModuleError::ProviderInModule));
+        assert!(error.root_evidence().is_some());
+    }
+
+    #[test]
+    fn complete_directory_verdict_includes_require_and_preserves_the_neutral_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = ResolvedPath::new(directory.path()).unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        fs::write(directory.path().join("main.crn"), "let value = 1\n").unwrap();
+        for (evidence, expected) in [
+            ("", "neutral"),
+            ("arguments {}\n", "module"),
+            ("attributes {}\n", "module"),
+            ("require false, 'PRIVATE_GUARD'\n", "module"),
+            ("provider mock {}\nrequire false, 'PRIVATE_GUARD'\n", "root"),
+            (
+                "backend local { path = 'state.json' }\narguments {}\n",
+                "root",
+            ),
+        ] {
+            fs::write(directory.path().join("evidence.crn"), evidence).unwrap();
+            let loaded = load_module_from_directory(&path, &context).unwrap();
+            use crate::config_loader::DirectoryVerdict;
+            let actual = match loaded.directory_verdict() {
+                DirectoryVerdict::Root(_) => "root",
+                DirectoryVerdict::ModuleTemplate(_) => "module",
+                DirectoryVerdict::NoEvidence(proof) => {
+                    assert_eq!(
+                        proof.root_note(),
+                        "directory is treated as a root configuration on direct entry because it has no `provider` or `backend` block and no `arguments` block, `attributes` block, or `require` statement."
+                    );
+                    "neutral"
+                }
+                DirectoryVerdict::Unknown => panic!("complete inventory must issue a verdict"),
+            };
+            assert_eq!(actual, expected, "{evidence}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod imported_snapshot_tests {
+    use super::*;
+    #[test]
+    fn importable_snapshot_keeps_non_root_prohibitions_for_the_validation_phase() {
+        for (name, source) in [
+            ("exports.crn", "exports { value: Int = 1 }\n"),
+            ("state.crn", "removed { from = mock.test.resource 'old' }\n"),
+            (
+                "upstream.crn",
+                "let prior = upstream_state { source = '../prior' }\n",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            fs::write(
+                directory.path().join("arguments.crn"),
+                "arguments { n: Int = 1 }\n",
+            )
+            .unwrap();
+            fs::write(directory.path().join(name), source).unwrap();
+            let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+            assert!(
+                load_module(&ResolvedPath::new(directory.path()).unwrap(), &context).is_ok(),
+                "{name}: a successfully parsed non-root remains available to static signature/type consumers"
+            );
+        }
     }
 }

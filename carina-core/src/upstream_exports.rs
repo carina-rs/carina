@@ -1922,6 +1922,11 @@ mod tests {
             "exports { value: Int = 1 }\n",
         )
         .unwrap();
+        std::fs::write(
+            upstream_dir.join("backend.crn"),
+            "backend local { path = 'state.json' }\n",
+        )
+        .unwrap();
         let guard = upstream_dir.join(std::ffi::OsString::from_vec(b"\xff.crn".to_vec()));
         let physical = std::fs::write(&guard, "require false, 'upstream guard'\n").is_ok();
         let overrides = crate::config_loader::SourceOverrides::from([(
@@ -1952,7 +1957,10 @@ mod tests {
             assert_eq!(finding.location().span().end_column(), 32);
             assert_eq!(
                 finding.detail().to_string(),
-                "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
+                format!(
+                    "`require` is only allowed inside a module\nNote: directory is a root configuration because of the backend block at {}:1.",
+                    crate::paths::DisplayPath::for_diagnostics(upstream_dir.join("backend.crn"))
+                )
             );
             if physical {
                 let (_, errors) = super::resolve_upstream_exports_report_with_overrides(

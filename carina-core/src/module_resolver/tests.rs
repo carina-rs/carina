@@ -5966,12 +5966,15 @@ fn test_load_module_rejects_backend_and_cleans_resolving_set() {
                     .load_module("module")
                     .expect_err("backend inside a module must be rejected");
                 assert!(
-                    matches!(&err, ModuleError::BackendInModule),
+                    matches!(err.root_cause(), ModuleError::BackendInModule),
                     "expected BackendInModule on attempt {attempt}, got {err:?}",
                 );
                 assert_eq!(
                     err.to_string(),
-                    "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+                    format!(
+                        "backend blocks are not allowed inside modules. Define the backend at the root configuration level.\nNote: directory is a root configuration because of the backend block at {}:1.",
+                        crate::paths::DisplayPath::for_diagnostics(module_dir.join("backend.crn"))
+                    ),
                     "unexpected resolver error on attempt {attempt}",
                 );
             }
@@ -7425,7 +7428,7 @@ fn test_load_module_directory_merges_sibling_files_with_main() {
     )
     .unwrap();
 
-    let parsed = load_module(
+    let parsed = load_module_from_directory(
         &crate::paths::ResolvedPath::new(&tmp_dir).unwrap(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
@@ -10815,7 +10818,7 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
     .unwrap();
     std::fs::write(&exports_path, "exports {\n  result: String = 'value'\n}\n").unwrap();
 
-    let parsed = load_directory_module(
+    let parsed = load_module_from_directory(
         &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
@@ -11955,6 +11958,11 @@ let child = consumer_module { record = "record-id" }
 #[test]
 fn root_require_template_apis_need_declaration_evidence() {
     let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
     fs::write(directory.path().join("guards.crn"), "require true, 'x'\n").unwrap();
     let context = LoadedProviderContext::empty_for_test();
     let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
@@ -11973,7 +11981,12 @@ fn root_require_template_apis_need_declaration_evidence() {
             let error = result.expect_err("a template API cannot manufacture module declarations");
             assert_eq!(
                 error.require_outside_module().unwrap().detail().to_string(),
-                "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
+                format!(
+                    "`require` is only allowed inside a module\nNote: directory is a root configuration because of the backend block at {}:1.",
+                    crate::paths::DisplayPath::for_diagnostics(
+                        directory.path().join("backend.crn")
+                    )
+                )
             );
         }
     });
@@ -11982,6 +11995,11 @@ fn root_require_template_apis_need_declaration_evidence() {
 #[test]
 fn root_require_has_only_the_expression_report_carrier() {
     let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
     fs::write(
         directory.path().join("guards.crn"),
         "require true, 'private'\n",
@@ -12017,6 +12035,11 @@ fn root_require_has_only_the_expression_report_carrier() {
 fn root_require_public_strict_resolvers_keep_admission_verdict() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    fs::write(
         directory.path().join("guards.crn"),
         "require true, 'private'\n",
     )
@@ -12038,7 +12061,12 @@ fn root_require_public_strict_resolvers_keep_admission_verdict() {
             let finding = error.require_outside_module().unwrap();
             assert_eq!(
                 finding.detail().to_string(),
-                "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
+                format!(
+                    "`require` is only allowed inside a module\nNote: directory is a root configuration because of the backend block at {}:1.",
+                    crate::paths::DisplayPath::for_diagnostics(
+                        directory.path().join("backend.crn")
+                    )
+                )
             );
             assert_eq!(
                 finding.location().file().path(),
@@ -12123,7 +12151,7 @@ fn expanded_unknown_directory_keeps_its_own_verdict() {
 }
 
 #[test]
-fn empty_directory_metadata_keeps_the_complete_root_verdict() {
+fn empty_directory_metadata_keeps_the_no_evidence_verdict() {
     let directory = tempfile::tempdir().unwrap();
     let context = LoadedProviderContext::empty_for_test();
     let parsed = super::load_module_from_directory(
@@ -12133,6 +12161,6 @@ fn empty_directory_metadata_keeps_the_complete_root_verdict() {
     .unwrap();
     assert!(matches!(
         parsed.directory_verdict(),
-        crate::config_loader::DirectoryVerdict::Root(_)
+        crate::config_loader::DirectoryVerdict::NoEvidence(_)
     ));
 }

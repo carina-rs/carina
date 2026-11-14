@@ -507,7 +507,8 @@ pub(crate) fn validate_root_backend<E>(parsed: &carina_core::parser::File<E>) ->
     match parsed.directory_verdict() {
         carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
         | carina_core::config_loader::DirectoryVerdict::Unknown => return Vec::new(),
-        carina_core::config_loader::DirectoryVerdict::Root(_) => {}
+        carina_core::config_loader::DirectoryVerdict::Root(_)
+        | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
     }
     if let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
@@ -1062,7 +1063,8 @@ fn validate_and_resolve_configuration(
     // definitions intentionally retain typed module-argument slots until a
     // caller expands them; root configurations must be fully expanded.
     let placeholder_boundary = match parsed.directory_verdict() {
-        carina_core::config_loader::DirectoryVerdict::Root(_) => {
+        carina_core::config_loader::DirectoryVerdict::Root(_)
+        | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {
             carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
         }
         carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)

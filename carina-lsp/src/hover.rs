@@ -458,7 +458,13 @@ impl HoverProvider {
         // Load the module to get its definition
         let module_path = base_path.join(&import_path).ok()?;
         let module_parsed =
-            carina_core::module_resolver::load_module(&module_path, doc.provider_context())?;
+            match carina_core::module_resolver::load_module(&module_path, doc.provider_context()) {
+                Ok(module) => module,
+                Err(
+                    carina_core::module_resolver::ModuleLoadError::NotModule { .. }
+                    | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
+                ) => return None,
+            };
 
         let mut content = format!("## {}\n\n`{}`\n", word, import_path);
 
@@ -518,7 +524,13 @@ impl HoverProvider {
         // Load the module to get argument definitions
         let module_path = base_path.join(&import_path).ok()?;
         let module_parsed =
-            carina_core::module_resolver::load_module(&module_path, doc.provider_context())?;
+            match carina_core::module_resolver::load_module(&module_path, doc.provider_context()) {
+                Ok(module) => module,
+                Err(
+                    carina_core::module_resolver::ModuleLoadError::NotModule { .. }
+                    | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
+                ) => return None,
+            };
 
         // Find the argument matching the word
         let arg = module_parsed.arguments.iter().find(|a| a.name == word)?;
@@ -1173,6 +1185,46 @@ mod tests {
             Arc::new(context),
         );
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        for (word, occurrence) in [("service", 1), ("name", 0)] {
+            let content = hover_markdown(
+                &provider,
+                &doc,
+                hover_position(source, word, occurrence),
+                Some(directory.path()),
+            );
+            assert!(
+                content.is_none(),
+                "root evidence must prevent module hover: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn providerless_module_hover_keeps_deferred_environment_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let module = directory.path().join("module");
+        std::fs::create_dir(&module).unwrap();
+        std::fs::write(
+            module.join("arguments.crn"),
+            "arguments { name: String = version() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module.join("functions.crn"),
+            "fn version() { env('MODE') }\n",
+        )
+        .unwrap();
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+            "MODE".to_string(),
+            "1.0.0".into(),
+        )]));
+        let source = "let service = use { source = './module' }\nservice {\n  name = 'value'\n}\n";
+        let doc = Document::new_with_path(
+            source.to_string(),
+            directory.path().join("main.crn"),
+            Arc::new(context),
+        );
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         for (word, occurrence, expected) in
             [("service", 1, "## service"), ("name", 0, "## service.name")]
         {
@@ -1184,6 +1236,9 @@ mod tests {
             )
             .expect("module hover must retain the captured environment");
             assert!(content.contains(expected), "{content}");
+            if word == "name" {
+                assert!(content.contains("- **Default**: "), "{content}");
+            }
         }
     }
 

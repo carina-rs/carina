@@ -309,6 +309,44 @@ fn module_parameter_completion_uses_environment_snapshot() {
     );
     let items =
         test_provider().complete_for_test(&doc, Position::new(2, 2), Some(directory.path()));
+    assert!(
+        items.is_empty(),
+        "root evidence must prevent module parameters: {items:?}"
+    );
+    let snippets = test_provider().top_level_completions(
+        Position::new(0, 0),
+        &doc.text(),
+        Some(&carina_core::paths::ResolvedPath::new(directory.path()).unwrap()),
+        doc.provider_context(),
+    );
+    let service = snippets
+        .iter()
+        .find(|item| item.label == "service")
+        .unwrap();
+    assert_eq!(service.insert_text.as_deref(), Some("service {\n  ${1}\n}"));
+}
+
+#[test]
+fn providerless_module_parameter_completion_keeps_deferred_environment_defaults() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "fn version() { env('MODE') }\narguments { name: String = version() }\n",
+    )
+    .unwrap();
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+        "MODE".to_string(),
+        "1.0.0".into(),
+    )]));
+    let doc = Document::new_with_path(
+        "let service = use { source = './module' }\nservice {\n  \n}\n".to_string(),
+        directory.path().join("main.crn"),
+        Arc::new(context),
+    );
+    let items =
+        test_provider().complete_for_test(&doc, Position::new(2, 2), Some(directory.path()));
     assert!(items.iter().any(|item| item.label == "name"), "{items:?}");
     let snippets = test_provider().top_level_completions(
         Position::new(0, 0),
@@ -5725,7 +5763,13 @@ fn bootstrap_provider_instance_completion_ignores_unconsumed_lets() {
 fn bootstrap_module_argument_completion_ignores_unconsumed_lets() {
     let directory = tempfile::tempdir().unwrap();
     let module = directory.path().join("module");
-    write_bootstrap_completion_directory(&module, "arguments { name: String }\n");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(module.join("arguments.crn"), "arguments { name: String }\n").unwrap();
+    std::fs::write(
+        module.join("locals.crn"),
+        "let token = secret(env('UNSET_X'))\nlet unused = env('UNSET_Y')\n",
+    )
+    .unwrap();
     let text = "let service = use { source = './module' }\nservice {\n  \n}\n";
     let doc = Document::new_with_path(
         text.to_string(),

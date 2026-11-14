@@ -13,30 +13,40 @@ handle.
 Carina determines the declaration scope from the complete directory, including
 all sibling `.crn` files:
 
-| Declarations in the directory | Scope when validated directly |
-| --- | --- |
-| Any authored `provider` or `backend` block, including a provider instance bound with `let` | Root configuration |
-| No provider/backend, but an `arguments` or `attributes` block | Uninstantiated module template, even with an empty block |
-| Neither kind of block | Root configuration |
+| Evidence in the complete directory | Direct CLI, LSP, `upstream_state`, `module info` and TUI | Imported with `use` |
+| --- | --- | --- |
+| Any authored `provider` or `backend` block, including a provider instance bound with `let` | Root configuration | Rejected: provider/backend blocks belong to the root |
+| No root evidence, and an `arguments` block, `attributes` block, or `require` statement | Module template; empty blocks count | Module |
+| Neither root nor module evidence | Root configuration (`module info` displays File metadata) | Module |
 
-Root configurations cannot declare `arguments` or `attributes`, empty or
-populated. Root outputs use `exports`. Module templates inherit providers from
-their caller; provider and backend blocks are rejected inside imported modules.
-A template's `require` conditions remain unevaluated until a module call binds
-its arguments. Calling a module still requires at least one declared argument
-or output attribute; empty blocks alone do not make a directory callable.
+All sibling `.crn` files contribute to this verdict. Root configurations cannot
+declare `arguments`, `attributes`, or `require`; empty blocks are also rejected.
+Root outputs use `exports`. A template's `require` conditions remain unevaluated
+until a module call binds its arguments. A require-only directory is therefore
+a template when validated directly or opened in the language server.
+
+A directory is importable when it has at least one `.crn` file and no provider
+or backend block. Arguments and outputs are optional; entry counts do not
+change importability. Importing an existing directory with no `.crn` files
+reports `No .crn files found`. Imported modules cannot declare state blocks
+(`moved`, `import`, `removed`), `upstream_state`, or `exports`; those declarations
+do not supply root evidence.
+
+A directory with no provider/backend can be applied directly as a root and also
+imported by another root, which would manage its resources twice.
 
 If a sibling cannot be read or parsed, or an editor buffer has no directory
-snapshot, the scope is unknown. Carina issues no scope verdict in that case;
-ordinary expression checks still run. `module info` displays neutral file metadata
-for an unknown snapshot, without classifying it as a module or root.
+snapshot, the verdict is unknown. Carina defers placement checks; ordinary
+expression checks still run. `module info` displays neutral file metadata for
+an unknown snapshot.
 
-Each root-placement diagnostic explains the directory verdict. With a provider
-or backend block, the CLI includes an indented note under the error naming that block's file and line;
-the language server attaches its location as related information to the same
-diagnostic. Without either block, the diagnostic explains that the complete
-directory has no `arguments` or `attributes` block, without inventing a source
-location.
+Each root-placement diagnostic carries the provider/backend evidence from the
+verdict. The CLI includes an indented note naming its file and line; the
+language server attaches that location as related information to the same
+diagnostic. The same evidence accompanies a prohibition when a root directory
+is imported. Direct entry of a directory with neither kind of evidence has no
+evidence location: its explanation states that there is no provider/backend
+block and no arguments/attributes block or require statement.
 
 ## Block Roles at a Glance
 
@@ -74,7 +84,7 @@ cross a state boundary. Export an identity value such as
 
 ## Module Structure
 
-A module is a directory containing one or more `.crn` files that together declare `arguments` and `attributes` blocks. Carina merges every `.crn` file in the directory as peers; there is no privileged filename like `main.crn`.
+A module is an importable directory containing one or more `.crn` files. Its `arguments` and `attributes` blocks are optional. Carina merges every `.crn` file in the directory as peers; there is no privileged filename like `main.crn`.
 
 ```crn
 # modules/network/main.crn  (any filename works — main.crn is just convention)

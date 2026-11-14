@@ -460,6 +460,6 @@ apply follows the
 [saved-plan validation rules](/reference/dsl/modules/#when-constraints-run).
 
 The [directory scope rules](/reference/dsl/modules/#root-configurations-and-module-templates)
-define roots, standalone templates, and incomplete directory snapshots.
+define roots, standalone templates, directories interpreted by entry point, and incomplete snapshots. A require-only directory without provider/backend evidence is a standalone template; its condition is not evaluated.
 
 The condition is a [validate expression](/reference/dsl/expressions/#validate-expressions) that supports comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), integer arithmetic (`+`, `-`, `*`, `/`, `%`), and logical operators (`&&`, `||`, `!`).

@@ -670,7 +670,8 @@ impl DiagnosticRun<'_> {
         // for a module-definition directory. Keep editor diagnostics at the
         // same layer instead of adding backend-schema errors.
         match merged.directory.parsed.directory_verdict() {
-            carina_core::config_loader::DirectoryVerdict::Root(_) => {}
+            carina_core::config_loader::DirectoryVerdict::Root(_)
+            | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
             carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
             | carina_core::config_loader::DirectoryVerdict::Unknown => return Vec::new(),
         }
@@ -979,7 +980,7 @@ impl DiagnosticRun<'_> {
         if let Some(error) = residual.analysis_invariant() {
             return render_analysis_invariant(doc, error).into_iter().collect();
         }
-        let message = residual.display_relative_to(&base.source_label());
+        let message = residual.lsp_message_relative_to(&base.source_label());
         let element = residual.element_diagnostic();
         let mut diagnostics = element
             .and_then(|finding| {
@@ -1012,6 +1013,11 @@ impl DiagnosticRun<'_> {
                     render_merged(doc, finding, DiagnosticSeverity::ERROR, message.clone())
                 }),
         );
+        if let Some(evidence) = residual.root_evidence() {
+            for diagnostic in &mut diagnostics {
+                super::attach_root_evidence(diagnostic, evidence);
+            }
+        }
         diagnostics
     }
 

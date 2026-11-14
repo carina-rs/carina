@@ -96,7 +96,10 @@ fn assert_buffer_membership(buffer_text: &str, disk_text: &str, expected_templat
             );
             assert_eq!(
                 findings[0].detail().to_string(),
-                "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
+                format!(
+                    "`require` is only allowed inside a module\nNote: directory is a root configuration because of the provider block at {}:1.",
+                    crate::paths::DisplayPath::for_diagnostics(&file)
+                )
             );
         }
     }
@@ -114,7 +117,7 @@ fn unsaved_template_cannot_be_admitted_as_disk_directory() {
 #[test]
 fn unsaved_directory_cannot_inherit_disk_template_scope() {
     assert_buffer_membership(
-        "require false, 'guard'\n",
+        "provider mock {}\nrequire false, 'guard'\n",
         "arguments { n: Int }\nrequire false, 'guard'\n",
         false,
     );
@@ -320,17 +323,21 @@ fn recovery_uses_sibling_declaration_evidence() {
     std::fs::remove_file(broken).unwrap();
     std::fs::remove_file(directory.path().join("guards.crn")).unwrap();
     let complete = load();
-    let findings = complete.judged().report().findings();
-    assert_eq!(findings.len(), 1);
-    assert_eq!(
-        findings[0].detail().to_string(),
-        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
-    );
+    assert!(matches!(
+        require_scope(complete.parsed()),
+        RequireScope::ModuleTemplate(_)
+    ));
+    assert!(complete.judged().report().findings().is_empty());
 }
 
 #[test]
 fn root_require_retained_rejection_cannot_be_erased() {
     let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
     std::fs::write(
         directory.path().join("guards.crn"),
         "require false, 'retained guard'\n",
@@ -354,7 +361,10 @@ fn root_require_retained_rejection_cannot_be_erased() {
     );
     assert_eq!(
         findings[0].detail().to_string(),
-        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
+        format!(
+            "`require` is only allowed inside a module\nNote: directory is a root configuration because of the backend block at {}:1.",
+            crate::paths::DisplayPath::for_diagnostics(directory.path().join("backend.crn"))
+        )
     );
     assert!(findings[0].location().file().path().ends_with("guards.crn"));
 }
@@ -368,6 +378,11 @@ fn strict_require_error_retains_location_and_typed_cause() {
     std::fs::write(
         upstream_dir.join("guards.crn"),
         "require true, 'chain guard'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        upstream_dir.join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
     )
     .unwrap();
     let context = config();
@@ -393,7 +408,12 @@ fn strict_require_error_retains_location_and_typed_cause() {
     );
     assert_eq!(
         located.detail().to_string(),
-        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
+        format!(
+            "`require` is only allowed inside a module\nNote: directory is a root configuration because of the backend block at {}:1.",
+            crate::paths::DisplayPath::for_diagnostics(
+                directory.path().join("upstream/backend.crn")
+            )
+        )
     );
     assert!(error.source().is_none());
     let upstream = crate::upstream_exports::UpstreamExportSourceError::Module {

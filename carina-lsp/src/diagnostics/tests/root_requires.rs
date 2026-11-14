@@ -158,22 +158,14 @@ fn aliased_provider_supplies_root_evidence_for_module_declarations_and_require()
 }
 
 #[test]
-fn blockless_root_explains_complete_directory_evidence_without_fake_location() {
+fn require_only_directory_is_a_template_without_related_information() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("guards.crn");
     let source = "require false, 'PRIVATE_GUARD'\n";
     std::fs::write(&path, source).unwrap();
+    std::fs::write(directory.path().join("main.crn"), "// sibling\n").unwrap();
     let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(
-        diagnostics[0].message,
-        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
-    );
-    assert!(diagnostics[0].related_information.is_none());
-    assert_eq!(
-        diagnostics[0].range,
-        Range::new(Position::new(0, 0), Position::new(0, 30))
-    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 }
 
 fn assert_empty_template(blocks: &str) {
@@ -551,18 +543,7 @@ fn root_require_unreadable_sibling_keeps_unknown_scope() {
     assert!(engine.analyze(&document, Some(&path)).is_empty());
     std::fs::remove_file(broken).unwrap();
     let diagnostics = engine.analyze(&document, Some(&path));
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-    assert_eq!(
-        diagnostics[0].message,
-        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
-    );
-    assert_eq!(
-        diagnostics[0].range,
-        Range::new(
-            Position::new(0, 0),
-            Position::new(0, source.trim_end().encode_utf16().count() as u32)
-        )
-    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 }
 
 #[test]
@@ -617,4 +598,113 @@ fn relative_document_path_keeps_root_evidence_in_its_directory() {
         )
         .unwrap()
     );
+}
+
+#[test]
+fn require_only_template_changes_to_root_when_a_provider_is_added() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guards.crn");
+    let source = "require false, 'PRIVATE_GUARD'\n";
+    std::fs::write(&path, source).unwrap();
+    std::fs::write(directory.path().join("main.crn"), "// sibling\n").unwrap();
+    let document = create_document_at(source, path.clone());
+    let engine = test_engine();
+    assert!(engine.analyze(&document, Some(&path)).is_empty());
+    let provider = directory.path().join("providers.crn");
+    std::fs::write(&provider, "provider mock {}\n").unwrap();
+    let diagnostics = engine.analyze(&document, Some(&path));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "`require` is only allowed inside a module"
+    );
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 0), Position::new(0, 30))
+    );
+    assert_eq!(
+        diagnostics[0].related_information.as_ref().unwrap()[0]
+            .location
+            .uri,
+        tower_lsp::lsp_types::Url::from_file_path(provider).unwrap()
+    );
+}
+
+#[test]
+fn blockless_directory_lsp_interprets_module_evidence_and_neutral_resources() {
+    let loaded = loaded_providers_from_factories(vec![Box::new(
+        carina_provider_mock::ConfiguredBuiltinMock::new(
+            carina_provider_mock::MockBehavior::default(),
+            carina_provider_mock::MockScope::memory(),
+        ),
+    )]);
+    let engine = DiagnosticEngine::new(loaded, vec!["mock".into()]);
+    for source in [
+        "let value = 1\n",
+        "require false, 'PRIVATE_GUARD'\n",
+        "mock.test.resource { name = 'child' }\n",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.crn");
+        std::fs::write(&path, source).unwrap();
+        std::fs::write(directory.path().join("locals.crn"), "// sibling\n").unwrap();
+        let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn imported_root_prohibition_keeps_evidence_and_excludes_placement_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let child = directory.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let evidence = child.join("providers.crn");
+    std::fs::write(&evidence, "provider mock {}\n").unwrap();
+    std::fs::write(child.join("arguments.crn"), "arguments {}\n").unwrap();
+    std::fs::write(child.join("guards.crn"), "require false, 'PRIVATE_GUARD'\n").unwrap();
+    let source = "let child = use { source = './child' }\nlet call = child {}\n";
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+    );
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(1, 11), Position::new(1, 16))
+    );
+    let related = diagnostics[0].related_information.as_ref().unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].message,
+        "This provider block makes the directory a root configuration."
+    );
+    assert_eq!(
+        related[0].location.uri,
+        tower_lsp::lsp_types::Url::from_file_path(evidence).unwrap()
+    );
+    assert_eq!(
+        related[0].location.range,
+        Range::new(Position::new(0, 0), Position::new(0, 13))
+    );
+}
+
+#[test]
+fn no_evidence_upstream_directory_keeps_its_root_exports() {
+    let directory = tempfile::tempdir().unwrap();
+    let upstream = directory.path().join("upstream");
+    std::fs::create_dir(&upstream).unwrap();
+    std::fs::write(
+        upstream.join("exports.crn"),
+        "exports { value: String = 'published' }\n",
+    )
+    .unwrap();
+    std::fs::write(upstream.join("locals.crn"), "// sibling\n").unwrap();
+    let source = "let prior = upstream_state { source = './upstream' }\nexports { value: String = prior.value }\n";
+    let path = directory.path().join("main.crn");
+    std::fs::write(&path, source).unwrap();
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 }

@@ -953,7 +953,7 @@ impl FileSignature {
             DirectoryVerdict::ModuleTemplate(_) => Self::Module(
                 ModuleSignature::from_directory_module(parsed, module_name, config),
             ),
-            DirectoryVerdict::Root(_) => {
+            DirectoryVerdict::Root(_) | DirectoryVerdict::NoEvidence(_) => {
                 Self::RootConfig(RootConfigSignature::from_parsed_file(parsed, module_name))
             }
             DirectoryVerdict::Unknown => {

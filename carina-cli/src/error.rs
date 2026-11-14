@@ -1183,6 +1183,11 @@ pub enum AppError {
     UpstreamReference(Box<UpstreamReferenceFailure>),
     #[error("{0}")]
     ModuleResolution(Box<ModuleResolutionFailure>),
+    #[error("{path}: {error}")]
+    ModuleImport {
+        path: carina_core::paths::DisplayPath,
+        error: std::sync::Arc<carina_core::module_resolver::ModuleError>,
+    },
     /// Lint aborts expansion with the typed resolver failure and original path presentation.
     #[error("Module resolution error: {}", error.display_relative_to(base))]
     LintModuleResolution {
@@ -1910,6 +1915,9 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
 pub(crate) fn root_placement_notes(error: &AppError) -> Vec<String> {
     fn module_notes(error: &carina_core::module_resolver::ModuleError, notes: &mut Vec<String>) {
         for finding in error.individual_errors() {
+            if let Some(evidence) = finding.error.root_evidence() {
+                notes.push(format!("Note: {}", evidence.note()));
+            }
             if let Some(rejection) = finding.error.require_outside_module() {
                 notes.push(format!(
                     "Note: {}",
@@ -1932,6 +1940,7 @@ pub(crate) fn root_placement_notes(error: &AppError) -> Vec<String> {
                     }
                 }
                 AppError::LintModuleResolution { error, .. } => module_notes(error, &mut notes),
+                AppError::ModuleImport { error, .. } => module_notes(error, &mut notes),
                 AppError::RootPlacementGroup(group) => {
                     for error in &group.errors {
                         notes.extend(root_placement_notes(error));

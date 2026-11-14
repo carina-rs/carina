@@ -196,7 +196,9 @@ fn parser_placeholder_boundary(
     use carina_core::config_loader::DirectoryVerdict;
     use carina_core::parser::ParserPlaceholderBoundary;
     match verdict {
-        DirectoryVerdict::Root(_) => ParserPlaceholderBoundary::ExpandedFile,
+        DirectoryVerdict::Root(_) | DirectoryVerdict::NoEvidence(_) => {
+            ParserPlaceholderBoundary::ExpandedFile
+        }
         DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::Unknown => {
             ParserPlaceholderBoundary::ModuleDefinition
         }
@@ -1764,7 +1766,8 @@ impl DiagnosticRun<'_> {
                         )
                     } else if !provider_loaded {
                         match preferred_tree.directory_verdict() {
-                            carina_core::config_loader::DirectoryVerdict::Root(_) => {}
+                            carina_core::config_loader::DirectoryVerdict::Root(_)
+                            | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
                             carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
                             | carina_core::config_loader::DirectoryVerdict::Unknown => continue,
                         }

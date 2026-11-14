@@ -444,14 +444,17 @@ impl<E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder>> Root
 }
 
 /// The sole directory classification, issued from one complete sibling inventory.
-/// Root and template witnesses have private constructors: callers can borrow
-/// and clone a verdict, but cannot manufacture either classification.
+/// Evidence witnesses have private constructors: callers can borrow and
+/// clone a verdict, but cannot manufacture a complete directory classification.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DirectoryVerdict {
     #[default]
     Unknown,
     Root(RootDirectoryVerdict),
     ModuleTemplate(ModuleTemplateDeclarations),
+    /// A complete directory with neither root nor module evidence. Entry points
+    /// interpret it as a root when direct, and as a module when imported.
+    NoEvidence(DirectoryWithoutEvidence),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,8 +465,18 @@ pub struct RootDirectoryVerdict {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleTemplateDeclarations(());
 
-/// Every positive root reason owns its authored location; the negative proof
-/// is a separate case and can never supply an invented source location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryWithoutEvidence(());
+
+impl DirectoryWithoutEvidence {
+    /// The direct-entry interpretation has no authored evidence location.
+    pub fn root_note(&self) -> &'static str {
+        "directory is treated as a root configuration on direct entry because it has no `provider` or `backend` block and no `arguments` block, `attributes` block, or `require` statement."
+    }
+}
+
+/// Every root verdict owns its authored evidence location. Direct entry of a
+/// directory without evidence is represented separately by `NoEvidence`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootEvidence {
     Provider {
@@ -476,14 +489,13 @@ pub enum RootEvidence {
         file: crate::paths::PersistedPath,
         utf16_columns: (u32, u32),
     },
-    CompleteDirectoryWithoutModuleDeclarations,
 }
 
 impl DirectoryVerdict {
     pub fn root(&self) -> Option<&RootDirectoryVerdict> {
         match self {
             Self::Root(root) => Some(root),
-            Self::Unknown | Self::ModuleTemplate(_) => None,
+            Self::Unknown | Self::ModuleTemplate(_) | Self::NoEvidence(_) => None,
         }
     }
 }
@@ -496,11 +508,7 @@ impl RootDirectoryVerdict {
         format!("{message}\nNote: {}", self.evidence.note())
     }
     pub fn lsp_message(&self, message: &str) -> String {
-        if self.evidence.location().is_some() {
-            message.to_string()
-        } else {
-            self.format_message(message)
-        }
+        message.to_string()
     }
 }
 
@@ -510,13 +518,11 @@ impl RootEvidence {
     pub fn file_locator(&self) -> Option<&crate::paths::PersistedPath> {
         match self {
             Self::Provider { file, .. } | Self::Backend { file, .. } => Some(file),
-            Self::CompleteDirectoryWithoutModuleDeclarations => None,
         }
     }
     pub fn location(&self) -> Option<&parser::DeclarationLocation> {
         match self {
             Self::Provider { location, .. } | Self::Backend { location, .. } => Some(location),
-            Self::CompleteDirectoryWithoutModuleDeclarations => None,
         }
     }
     pub fn utf16_columns(&self) -> Option<(u32, u32)> {
@@ -524,7 +530,6 @@ impl RootEvidence {
             Self::Provider { utf16_columns, .. } | Self::Backend { utf16_columns, .. } => {
                 Some(*utf16_columns)
             }
-            Self::CompleteDirectoryWithoutModuleDeclarations => None,
         }
     }
     pub fn related_message(&self) -> &'static str {
@@ -533,9 +538,6 @@ impl RootEvidence {
                 "This provider block makes the directory a root configuration."
             }
             Self::Backend { .. } => "This backend block makes the directory a root configuration.",
-            Self::CompleteDirectoryWithoutModuleDeclarations => {
-                "The complete directory has no arguments or attributes block."
-            }
         }
     }
     pub fn note(&self) -> String {
@@ -549,7 +551,6 @@ impl RootEvidence {
         match self {
             Self::Provider { location, .. } => located("provider", location),
             Self::Backend { location, .. } => located("backend", location),
-            Self::CompleteDirectoryWithoutModuleDeclarations => "directory is a root configuration because the complete directory has no `arguments` or `attributes` block.".to_string(),
         }
     }
 }
@@ -563,6 +564,10 @@ impl DirectoryRequireScope {
         use parser::retained::RequireScope;
         let scope = match &self.0 {
             DirectoryVerdict::Unknown => RequireScope::Unknown,
+            // A neutral inventory has no require nodes: a require would itself
+            // supply module evidence. Keep the file's distinct verdict; this
+            // unused default scope grants no node a placement/evaluation verdict.
+            DirectoryVerdict::NoEvidence(_) => RequireScope::Unknown,
             DirectoryVerdict::Root(root) => RequireScope::UnvalidatedDirectory(root.clone()),
             DirectoryVerdict::ModuleTemplate(template) => {
                 RequireScope::ModuleTemplate(template.clone())
@@ -630,9 +635,9 @@ impl CompleteDirectoryInventories<'_> {
                             utf16_columns: block.detail().utf16_columns(),
                         })
                     }
-                    ConfigurationBlock::Arguments | ConfigurationBlock::Attributes => {
-                        module_block = true
-                    }
+                    ConfigurationBlock::Arguments
+                    | ConfigurationBlock::Attributes
+                    | ConfigurationBlock::Require => module_block = true,
                     _ => {}
                 }
             }
@@ -642,11 +647,7 @@ impl CompleteDirectoryInventories<'_> {
                 evidence: std::sync::Arc::new(evidence),
             }),
             (None, true) => DirectoryVerdict::ModuleTemplate(ModuleTemplateDeclarations(())),
-            (None, false) => DirectoryVerdict::Root(RootDirectoryVerdict {
-                evidence: std::sync::Arc::new(
-                    RootEvidence::CompleteDirectoryWithoutModuleDeclarations,
-                ),
-            }),
+            (None, false) => DirectoryVerdict::NoEvidence(DirectoryWithoutEvidence(())),
         };
         DirectoryRequireScope(verdict)
     }

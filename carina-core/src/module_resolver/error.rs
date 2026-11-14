@@ -84,6 +84,16 @@ pub enum ModuleError {
         error: Box<ModuleError>,
     },
 
+    /// The prohibition and its directory evidence are one semantic diagnostic.
+    #[error("{error}\nNote: {}", root.evidence().note())]
+    WithRootEvidence {
+        error: Box<ModuleError>,
+        root: crate::config_loader::RootDirectoryVerdict,
+    },
+
+    #[error("No .crn files found in {path}")]
+    NoConfigurationFiles { path: crate::paths::DisplayPath },
+
     #[error("Module not found: {0}")]
     NotFound(String),
 
@@ -224,6 +234,46 @@ impl From<ParseError> for ModuleError {
 }
 
 impl ModuleError {
+    pub(crate) fn with_root_evidence(
+        self,
+        root: crate::config_loader::RootDirectoryVerdict,
+    ) -> Self {
+        Self::WithRootEvidence {
+            error: Box::new(self),
+            root,
+        }
+    }
+
+    pub fn root_evidence(&self) -> Option<&crate::config_loader::RootEvidence> {
+        match self {
+            Self::WithRootEvidence { root, .. } => Some(root.evidence()),
+            Self::OwnedByCalls { error, .. }
+            | Self::AtCall { error, .. }
+            | Self::WithProviderTypeWarnings { error, .. } => error.root_evidence(),
+            _ => None,
+        }
+    }
+
+    pub fn lsp_message_relative_to(&self, root: &Path) -> String {
+        // Only the new evidence note moves into relatedInformation. Preserve
+        // every established non-root renderer, including deferred-body owners.
+        if self.root_evidence().is_none() {
+            return self.display_relative_to(root);
+        }
+        match self {
+            Self::WithRootEvidence { error, .. } => error.lsp_message_relative_to(root),
+            Self::OwnedByCalls { error, .. } | Self::AtCall { error, .. } => {
+                error.lsp_message_relative_to(root)
+            }
+            Self::WithProviderTypeWarnings { error, warnings } => format!(
+                "{}\n{}",
+                error.lsp_message_relative_to(root),
+                render_provider_type_warnings(warnings),
+            ),
+            _ => self.display_relative_to(root),
+        }
+    }
+
     /// Authored require rejected outside a module and its location, without exposing the diagnostic
     /// already included in this error's Display as another source-chain link.
     pub fn require_outside_module(
@@ -268,9 +318,9 @@ impl ModuleError {
                 .iter()
                 .chain(error.provider_type_warnings())
                 .collect(),
-            Self::OwnedByCalls { error, .. } | Self::AtCall { error, .. } => {
-                error.provider_type_warnings()
-            }
+            Self::OwnedByCalls { error, .. }
+            | Self::AtCall { error, .. }
+            | Self::WithRootEvidence { error, .. } => error.provider_type_warnings(),
             Self::Multiple(errors) => errors
                 .iter()
                 .flat_map(Self::provider_type_warnings)
@@ -312,11 +362,14 @@ impl ModuleError {
     /// Outermost typed source ownership for this failure.
     pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
         match self {
-            Self::WithProviderTypeWarnings { error, .. } => error.call_source(),
+            Self::WithProviderTypeWarnings { error, .. } | Self::WithRootEvidence { error, .. } => {
+                error.call_source()
+            }
             Self::Multiple(_errors) => ModuleErrorCallSource::Unavailable,
             Self::OwnedByCalls { calls, .. } => ModuleErrorCallSource::Owners(calls),
             Self::AtCall { call, .. } => ModuleErrorCallSource::Failing(call),
-            Self::NotFound(_)
+            Self::NoConfigurationFiles { .. }
+            | Self::NotFound(_)
             | Self::CircularImport(_)
             | Self::MissingArgument { .. }
             | Self::InvalidArgumentType { .. }
@@ -345,11 +398,14 @@ impl ModuleError {
 
     pub(crate) fn failing_call(&self) -> Option<&ModuleCallId> {
         match self {
-            Self::WithProviderTypeWarnings { error, .. } => error.failing_call(),
+            Self::WithProviderTypeWarnings { error, .. } | Self::WithRootEvidence { error, .. } => {
+                error.failing_call()
+            }
             Self::Multiple(_errors) => None,
             Self::OwnedByCalls { calls: _, error } => error.failing_call(),
             Self::AtCall { call, error } => error.failing_call().or(Some(call)),
-            Self::NotFound(_)
+            Self::NoConfigurationFiles { .. }
+            | Self::NotFound(_)
             | Self::CircularImport(_)
             | Self::MissingArgument {
                 module: _,
@@ -441,8 +497,10 @@ impl ModuleError {
         match self {
             Self::OwnedByCalls { error, .. }
             | Self::AtCall { error, .. }
-            | Self::WithProviderTypeWarnings { error, .. } => error.root_cause(),
+            | Self::WithProviderTypeWarnings { error, .. }
+            | Self::WithRootEvidence { error, .. } => error.root_cause(),
             error @ (Self::Multiple(_)
+            | Self::NoConfigurationFiles { .. }
             | Self::NotFound(_)
             | Self::CircularImport(_)
             | Self::MissingArgument { .. }
@@ -476,6 +534,10 @@ impl ModuleError {
     /// the same stable, project-relative path in either case.
     pub fn display_relative_to(&self, root: &Path) -> String {
         match self {
+            Self::WithRootEvidence {
+                error,
+                root: evidence,
+            } => evidence.format_message(&error.display_relative_to(root)),
             Self::WithProviderTypeWarnings { error, warnings } => format!(
                 "{}\n{}",
                 error.display_relative_to(root),
@@ -568,7 +630,8 @@ impl ModuleError {
                 diagnostic.location().span().start_column(),
                 diagnostic.detail()
             ),
-            Self::NotFound(_)
+            Self::NoConfigurationFiles { .. }
+            | Self::NotFound(_)
             | Self::CircularImport(_)
             | Self::MissingArgument { .. }
             | Self::InvalidArgumentType { .. }
@@ -597,8 +660,10 @@ impl ModuleError {
             Self::ParseInFile { path: _, error } => {
                 parse_error_is_deferred_for_body_rejection(error)
             }
-            Self::OwnedByCalls { .. }
+            Self::WithRootEvidence { .. }
+            | Self::OwnedByCalls { .. }
             | Self::AtCall { .. }
+            | Self::NoConfigurationFiles { .. }
             | Self::NotFound(_)
             | Self::CircularImport(_)
             | Self::MissingArgument { .. }
@@ -724,6 +789,31 @@ mod tests {
         let size = size_of::<ModuleError>();
         println!("ModuleError: {size} bytes");
         assert!(size < 128, "ModuleError is {size} bytes");
+    }
+
+    #[test]
+    fn lsp_renderer_keeps_non_root_deferred_body_call_context() {
+        let parsed = crate::parser::parse_file(
+            "let child = use { source = './child' }\nchild {}\n",
+            Path::new("main.crn"),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let call = &parsed.module_calls[0];
+        let error = ModuleError::Parse(ParseError::UndefinedDeferredIterable {
+            name: "missing".to_string(),
+            line: 2,
+            span: Box::new(call.source_span()),
+            suggestion: None,
+            in_scope: Vec::new(),
+        })
+        .with_failing_call(call.id().clone());
+        let cli = error.display_relative_to(Path::new("."));
+        assert!(
+            cli.starts_with("module call in main.crn at line 2: "),
+            "{cli}"
+        );
+        assert_eq!(error.lsp_message_relative_to(Path::new(".")), cli);
     }
 
     #[test]

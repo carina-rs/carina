@@ -375,15 +375,20 @@ impl CompletionProvider {
                     &self.schemas,
                 ),
         };
-        carina_core::config_loader::parse_directory_for_metadata(
+        let directory = carina_core::config_loader::parse_directory_for_metadata(
             &module_path,
             &provider_context,
             &std::collections::HashMap::new(),
             &self.schemas,
         )
-        .ok()
-        .map(|directory| directory.into_parsed())
-        .filter(|parsed| !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty())
+        .ok()?;
+        use carina_core::config_loader::DirectoryVerdict;
+        match directory.parsed().directory_verdict() {
+            DirectoryVerdict::Root(_) | DirectoryVerdict::Unknown => None,
+            DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::NoEvidence(_) => {
+                Some(directory.into_parsed())
+            }
+        }
     }
 
     pub(super) fn module_parameter_completions(
@@ -590,7 +595,7 @@ impl CompletionProvider {
         if let Some(path) = import_path.as_deref()
             && let Some(base) = base_path
             && let Ok(module_path) = base.join(path)
-            && let Some(parsed) =
+            && let Ok(parsed) =
                 carina_core::module_resolver::load_module(&module_path, provider_ctx)
             && !parsed.arguments.is_empty()
         {

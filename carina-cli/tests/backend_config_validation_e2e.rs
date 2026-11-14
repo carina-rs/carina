@@ -183,10 +183,10 @@ fn validate_module_backend_reports_only_the_structural_error_in_directory() {
 
     assert_eq!(
         diagnostics,
-        vec![
-            "backend blocks are not allowed inside modules. Define the backend at the root configuration level."
-                .to_string()
-        ],
+        vec![format!(
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.\nNote: directory is a root configuration because of the backend block at {}:1.",
+            carina_core::paths::DisplayPath::for_diagnostics(module.join("backend.crn"))
+        )],
         "CLI validate must match the LSP module-directory diagnostic"
     );
 }

@@ -1063,8 +1063,12 @@ The canonical root/module definition is in
 [Root Configurations and Module Templates](site/src/content/reference/dsl/modules.md#root-configurations-and-module-templates).
 Keep directory classification in the loader, using the complete sibling
 inventory and one typed verdict shared by declaration checks and require
-admission. Root verdicts carry their authored evidence location or the complete
-directory's negative proof; render that evidence without searching again.
+admission and importability. Root verdicts carry their authored provider/backend
+evidence location; render it without searching again. Module evidence includes
+arguments, attributes, and require (empty blocks count). The distinct no-evidence
+verdict is a module when imported and a root on direct/LSP/upstream/metadata entry.
+Unknown snapshots defer placement checks. Importability never depends on entry
+counts; an empty directory has a typed no-configuration-files error.
 A root require's condition is not inferred or evaluated after
 parsing succeeds. Loading alone can retain a finding; commands reject it when
 they run configuration validation.

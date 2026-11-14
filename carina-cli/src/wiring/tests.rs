@@ -487,11 +487,16 @@ fn static_validation_walks_multifile_modules_using_environment_snapshot() {
     .unwrap();
     let project_path = carina_core::paths::ResolvedPath::new(project.path()).unwrap();
     let context = carina_core::parser::ProviderContext::new(runtime.environment().clone());
-    assert!(
-        carina_core::module_resolver::load_module(&project_path.join("child").unwrap(), &context,)
-            .is_some(),
-        "module must parse with supplied env"
-    );
+    let result =
+        carina_core::module_resolver::load_module(&project_path.join("child").unwrap(), &context);
+    let Err(carina_core::module_resolver::ModuleLoadError::NotModule { error, .. }) = result else {
+        panic!("supplied env must allow parsing through to the provider prohibition");
+    };
+    assert!(matches!(
+        error.root_cause(),
+        carina_core::module_resolver::ModuleError::ProviderInModule
+    ));
+
     let loaded = carina_core::config_loader::load_configuration_with_config(
         &project_path,
         &context,

@@ -236,6 +236,11 @@ fn upstream_failures() -> (
     let upstream = directory.path().join("upstream");
     fs::create_dir(&upstream).unwrap();
     fs::write(
+        upstream.join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    fs::write(
         upstream.join("guards.crn"),
         "require false, 'upstream guard'\n",
     )
@@ -288,8 +293,19 @@ fn module_require_error_chain_renders_once() {
     assert_eq!(finding.location().span().start_column(), 1);
     assert_eq!(finding.location().span().end_column(), 32);
     assert_eq!(
-        finding.detail().to_string().lines().next().unwrap(),
-        ROOT_REQUIRE_ERROR
+        finding.detail().to_string(),
+        format!(
+            "{ROOT_REQUIRE_ERROR}\nNote: directory is a root configuration because of the backend block at {}:1.",
+            carina_core::paths::DisplayPath::for_diagnostics(
+                finding
+                    .location()
+                    .file()
+                    .path()
+                    .parent()
+                    .unwrap()
+                    .join("backend.crn")
+            )
+        )
     );
     assert_eq!(
         carina_cli::error::format_error_with_source_chain(error.as_ref()),
@@ -336,9 +352,12 @@ fn assert_empty_template(blocks: &str) {
         "let empty = use { source = './empty' }\nlet call = empty {}\n",
     )
     .unwrap();
-    rejected(
-        &directory.run(&["validate", "."]),
-        "Module not found: ./empty",
+    let output = directory.run(&["validate", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "Validating...\n");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Error: main.crn at line 2\nError: module 'empty' (call 'call'): arguments : guard\n"
     );
 }
 
@@ -547,7 +566,7 @@ const ROOT_BACKEND_NOTE: &str =
     "Note: directory is a root configuration because of the backend block at providers.crn:1.";
 
 #[test]
-fn blockless_root_explains_complete_directory_evidence() {
+fn require_only_directory_is_a_template_in_json() {
     let directory = root_with_mock_resource();
     fs::remove_file(directory.project.join("providers.crn")).unwrap();
     fs::write(
@@ -556,15 +575,13 @@ fn blockless_root_explains_complete_directory_evidence() {
     )
     .unwrap();
     let output = directory.run(&["validate", "--json", "."]);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["errors"].as_array().unwrap().len(), 1);
     assert_eq!(
-        report["errors"][0]["message"],
-        "`require` is only allowed inside a module\nNote: directory is a root configuration because the complete directory has no `arguments` or `attributes` block."
+        report,
+        json!({"status":"ok", "resource_count":0, "resources":[]})
     );
-    assert_eq!(report["errors"][0]["location"]["file"], "main.crn");
 }
 
 fn root_with_mock_resource() -> Directory {
@@ -1335,11 +1352,10 @@ fn root_require_blockless_import_keeps_module_context() {
         "let checked = use { source = './checked' }\n",
     )
     .unwrap();
-    // An imported directory is analyzed in module context. Existing callability
-    // rules for a directory with no declared inputs/outputs are unchanged.
+    // Require evidence makes a standalone template; entry lists do not gate use.
     for args in [&["validate", "."][..], &["validate", "--json", "."]] {
         let imported = directory.run(args);
-        rejected(&imported, "Module not found: ./checked");
+        success(&imported);
         assert!(!output_text(&imported).contains(ROOT_REQUIRE_ERROR));
     }
     fs::write(
@@ -1348,10 +1364,10 @@ fn root_require_blockless_import_keeps_module_context() {
     )
     .unwrap();
     let called = directory.run(&["validate", "."]);
-    rejected(&called, "Module not found: ./checked");
+    success(&called);
     assert!(!output_text(&called).contains(ROOT_REQUIRE_ERROR));
-    rejected(&directory.run(&["validate", "checked"]), ROOT_REQUIRE_ERROR);
-    rejected(&directory.run(&["lint", "checked"]), ROOT_REQUIRE_ERROR);
+    success(&directory.run(&["validate", "checked"]));
+    success(&directory.run(&["lint", "checked"]));
 }
 
 #[test]
@@ -1472,4 +1488,332 @@ fn module_info_consumes_the_directory_verdict() {
         assert_eq!(text, format!("{header}{sections}"));
         assert!(output.stderr.is_empty());
     }
+}
+
+fn configure_importability_target(directory: &Directory, files: &[(&str, &str)]) {
+    directory.clear_root_require();
+    for entry in fs::read_dir(directory.project.join("checked")).unwrap() {
+        fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    for (name, source) in files {
+        fs::write(directory.project.join("checked").join(name), source).unwrap();
+    }
+    fs::write(
+        directory.project.join("main.crn"),
+        "let checked = use { source = './checked' }\nlet call = checked {}\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn argumentless_let_module_is_importable() {
+    let directory = Directory::new("true");
+    configure_importability_target(
+        &directory,
+        &[
+            ("locals.crn", "let value = 1\n"),
+            ("main.crn", "// second sibling\n"),
+        ],
+    );
+    assert_empty_import_plan(&directory);
+    let direct = directory.run(&["validate", "checked"]);
+    assert_eq!(direct.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(direct.stdout).unwrap(),
+        "Validating...\n✓ 0 resources validated successfully.\n"
+    );
+    assert!(direct.stderr.is_empty());
+}
+
+#[test]
+fn require_only_directory_is_a_standalone_template() {
+    let directory = Directory::new("true");
+    configure_importability_target(
+        &directory,
+        &[
+            ("guards.crn", "require false, 'PRIVATE_GUARD'\n"),
+            ("main.crn", "// second sibling\n"),
+        ],
+    );
+    let output = directory.run(&["validate", "checked"]);
+    success(&output);
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Validating...\n✓ 0 resources validated successfully.\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn empty_arguments_module_is_importable() {
+    let directory = Directory::new("true");
+    configure_importability_target(
+        &directory,
+        &[
+            ("arguments.crn", "arguments {}\n"),
+            ("main.crn", "// second sibling\n"),
+        ],
+    );
+    assert_empty_import_plan(&directory);
+}
+
+#[test]
+fn imported_root_reports_only_its_provider_prohibition() {
+    let directory = Directory::new("true");
+    configure_importability_target(
+        &directory,
+        &[
+            ("arguments.crn", "arguments { n: Int = 1 }\n"),
+            ("providers.crn", "provider mock {}\n"),
+            ("guards.crn", "require false, 'PRIVATE_GUARD'\n"),
+        ],
+    );
+    let message = "provider blocks are not allowed inside modules. Define providers at the root configuration level.";
+    let note = "Note: directory is a root configuration because of the provider block at checked/providers.crn:1.";
+    for (args, stdout) in [
+        (&["validate", "."][..], "Validating...\n"),
+        (&["plan", "."][..], ""),
+    ] {
+        let output = directory.run(args);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), stdout);
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!("Error: checked: {message}\n  {note}\n")
+        );
+    }
+    let output = directory.run(&["lint", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!("warning: .:1  checked: {message}\n{note}\nError: Found 1 lint warning(s).\n")
+    );
+    let output = directory.run(&["validate", "--json", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        report["errors"][0]["message"],
+        format!("checked: {message}\n{note}")
+    );
+}
+
+#[test]
+fn empty_import_directory_has_a_specific_error() {
+    let directory = Directory::new("true");
+    configure_importability_target(&directory, &[]);
+    let output = directory.run(&["validate", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Error: checked: No .crn files found in checked\n"
+    );
+}
+
+fn assert_empty_import_plan(directory: &Directory) {
+    let output = directory.run(&["validate", "."]);
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Validating...\n✓ 1 resources validated successfully.\n  • _virtual.call\n"
+    );
+    assert!(output.stderr.is_empty());
+    let output = directory.run(&["plan", "."]);
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Using mock provider\nRefreshing state...\n\nNo changes. Infrastructure is up-to-date.\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn require_only_module_is_importable_and_checked_at_its_call() {
+    let directory = Directory::new("true");
+    configure_importability_target(
+        &directory,
+        &[
+            ("guards.crn", "require true, 'PRIVATE_GUARD'\n"),
+            ("main.crn", "// sibling\n"),
+        ],
+    );
+    assert_empty_import_plan(&directory);
+    fs::write(
+        directory.project.join("checked/guards.crn"),
+        "require false, 'module constraint'\n",
+    )
+    .unwrap();
+    for (args, stdout) in [
+        (&["validate", "."][..], "Validating...\n"),
+        (&["plan", "."][..], ""),
+    ] {
+        let output = directory.run(args);
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), stdout);
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "Error: main.crn at line 2\nError: module 'checked' (call 'call'): arguments : module constraint\n"
+        );
+    }
+}
+
+#[test]
+fn argumentless_resource_module_is_importable() {
+    let directory = Directory::new("true");
+    configure_importability_target(
+        &directory,
+        &[
+            (
+                "main.crn",
+                "let r = mock.test.resource { name = 'child' }\n",
+            ),
+            ("locals.crn", "// sibling\n"),
+        ],
+    );
+    let output = directory.run(&["validate", "."]);
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Validating...\n✓ 2 resources validated successfully.\n  • mock.test.resource.call.r\n  • _virtual.call\n"
+    );
+    assert!(output.stderr.is_empty());
+    let output = directory.run(&["plan", "."]);
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    let output = String::from_utf8(output.stdout).unwrap();
+    let output = regex_lite::Regex::new(r"took [0-9]+\.[0-9]+s")
+        .unwrap()
+        .replace_all(&output, "took <duration>");
+    assert_eq!(
+        output,
+        "Using mock provider\nRefreshing state...\n  ✓ mock.test.resource call.r took <duration>\n\nExecution Plan:\n\n  ▾ module \"call\" (./checked)\n     └─ + mock.test.resource call.r\n           name: 'child'\n           identifier: (known after apply)\n\nPlan: 1 to add, 0 to change, 0 to destroy.\n\n"
+    );
+    let direct = directory.run(&["validate", "checked"]);
+    assert_eq!(direct.status.code(), Some(0), "{}", output_text(&direct));
+    assert_eq!(
+        String::from_utf8(direct.stdout).unwrap(),
+        "Validating...\n✓ 1 resources validated successfully.\n  • mock.test.resource.r\n⚠ Unused let binding 'r'. Consider using an anonymous resource instead.\n"
+    );
+    assert!(direct.stderr.is_empty());
+}
+
+#[test]
+fn argumentless_anonymous_calls_use_existing_identifier_collision() {
+    let directory = Directory::new("true");
+    configure_importability_target(
+        &directory,
+        &[
+            ("locals.crn", "let value = 1\n"),
+            (
+                "main.crn",
+                "let r = mock.test.resource { name = 'child' }\n",
+            ),
+        ],
+    );
+    fs::write(
+        directory.project.join("main.crn"),
+        "let checked = use { source = './checked' }\nchecked {}\nchecked {}\n",
+    )
+    .unwrap();
+    let output = directory.run(&["validate", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "Validating...\n");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Error: Anonymous resource identifier collision: 'mock.test.resource' and 'mock.test.resource' produce the same identifier 'checked_fb23c2625f6f70ca.r'. Use `let` bindings to give them distinct names.\n"
+    );
+}
+
+#[test]
+fn blockless_imports_retain_root_owned_declaration_prohibitions() {
+    for (name, source, message, note) in [
+        (
+            "upstream.crn",
+            "let previous = upstream_state { source = '../upstream' }\n",
+            "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+            None,
+        ),
+        (
+            "exports.crn",
+            "exports { value: Int = 1 }\n",
+            "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+            None,
+        ),
+        (
+            "state.crn",
+            "moved { from = mock.test.resource 'old' to = mock.test.resource 'new' }\n",
+            "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+            None,
+        ),
+        (
+            "state.crn",
+            "removed { from = mock.test.resource 'old' }\n",
+            "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+            None,
+        ),
+        (
+            "state.crn",
+            "import { to = mock.test.resource 'new' id = 'existing' }\n",
+            "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+            None,
+        ),
+        (
+            "providers.crn",
+            "provider mock {}\n",
+            "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
+            Some("provider"),
+        ),
+        (
+            "backend.crn",
+            "backend local { path = 'state.json' }\n",
+            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+            Some("backend"),
+        ),
+    ] {
+        let directory = Directory::new("true");
+        configure_importability_target(&directory, &[(name, source), ("main.crn", "// sibling\n")]);
+        for (args, stdout) in [
+            (&["validate", "."][..], "Validating...\n"),
+            (&["plan", "."][..], ""),
+        ] {
+            let output = directory.run(args);
+            assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), stdout);
+            let note = note.map(|kind| format!("  Note: directory is a root configuration because of the {kind} block at checked/{name}:1.\n")).unwrap_or_default();
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                format!("Error: checked: {message}\n{note}")
+            );
+        }
+    }
+}
+
+#[test]
+fn no_evidence_directory_is_root_for_upstream_and_module_info() {
+    let directory = Directory::new("true");
+    directory.clear_root_require();
+    let upstream = directory.project.join("upstream");
+    fs::create_dir(&upstream).unwrap();
+    fs::write(
+        upstream.join("exports.crn"),
+        "exports { value: String = 'published' }\n",
+    )
+    .unwrap();
+    fs::write(upstream.join("locals.crn"), "// sibling\n").unwrap();
+    fs::write(directory.project.join("main.crn"), "let prior = upstream_state { source = './upstream' }\nlet r = mock.test.resource { name = 'root' comment = prior.value }\n").unwrap();
+    let output = directory.run(&["validate", "."]);
+    assert_eq!(output.status.code(), Some(0), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Validating...\n✓ 1 resources validated successfully.\n  • mock.test.resource.r\n⚠ Unused let binding 'r'. Consider using an anonymous resource instead.\n"
+    );
+    assert!(output.stderr.is_empty());
+    let output = directory.run(&["module", "info", "upstream"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "\u{1b}[1mFile:\u{1b}[0m \u{1b}[36mupstream\u{1b}[0m\n\n\u{1b}[1m=== IMPORTS ===\u{1b}[0m\n\n  \u{1b}[2m(none)\u{1b}[0m\n\n\u{1b}[1m=== CREATES ===\u{1b}[0m\n\n  \u{1b}[2m(none)\u{1b}[0m\n\n"
+    );
+    assert!(output.stderr.is_empty());
 }

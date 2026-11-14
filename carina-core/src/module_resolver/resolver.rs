@@ -168,6 +168,14 @@ impl ResidualModuleResolutionError {
         self.0.display_relative_to(root)
     }
 
+    pub fn lsp_message_relative_to(&self, root: &Path) -> String {
+        self.0.lsp_message_relative_to(root)
+    }
+
+    pub fn root_evidence(&self) -> Option<&crate::config_loader::RootEvidence> {
+        self.0.root_evidence()
+    }
+
     pub fn file_diagnostic(
         &self,
         base: &crate::paths::ResolvedPath,
@@ -258,7 +266,7 @@ impl ResidualModuleResolutionError {
         match self.0.root_cause() {
             ModuleError::RequireOutsideModule(_) => None,
             ModuleError::AnalysisInvariant(_) => None,
-            ModuleError::WithProviderTypeWarnings { .. } => {
+            ModuleError::WithProviderTypeWarnings { .. } | ModuleError::WithRootEvidence { .. } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
             ModuleError::Multiple(_errors) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
@@ -308,6 +316,9 @@ impl ResidualModuleResolutionError {
                 Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
             ModuleError::NotFound(_module) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
+            ModuleError::NoConfigurationFiles { .. } => {
+                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
+            }
             ModuleError::CircularImport(_module) => None,
             ModuleError::Io(_error) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::UnknownModule(_module) => {
@@ -367,7 +378,7 @@ impl ResidualModuleResolutionError {
         let root_cause = self.0.root_cause();
         match root_cause {
             ModuleError::AnalysisInvariant(_) => false,
-            ModuleError::WithProviderTypeWarnings { .. } => {
+            ModuleError::WithProviderTypeWarnings { .. } | ModuleError::WithRootEvidence { .. } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
             ModuleError::Multiple(_errors) => false,
@@ -402,7 +413,7 @@ impl ResidualModuleResolutionError {
             }),
             ModuleError::OwnedByCalls { calls: _, error: _ } => false,
             ModuleError::AtCall { call: _, error: _ } => false,
-            ModuleError::NotFound(_) => false,
+            ModuleError::NotFound(_) | ModuleError::NoConfigurationFiles { .. } => false,
             ModuleError::CircularImport(_) => false,
             ModuleError::ArgumentValueAccess {
                 module: _,
@@ -600,7 +611,9 @@ fn without_covered_reference_type_members(
         ModuleError::ReferenceType(errors) => errors
             .without_covered_module_calls(findings)
             .map(ModuleError::ReferenceType),
-        error @ (ModuleError::NotFound(_)
+        error @ (ModuleError::WithRootEvidence { .. }
+        | ModuleError::NoConfigurationFiles { .. }
+        | ModuleError::NotFound(_)
         | ModuleError::CircularImport(_)
         | ModuleError::MissingArgument {
             module: _,
@@ -1265,41 +1278,6 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             }
         };
 
-        // Verify it's a module (has arguments or attributes)
-        if parsed.arguments.is_empty() && parsed.attribute_params.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::NotFound(path.to_string()));
-        }
-
-        // Expansion-phase backstops for root-owned blocks inside modules. The
-        // CLI's validation walks are the user-facing gates: they collect
-        // module-path-prefixed diagnostics and stop before expansion, so
-        // validate/plan/apply and lint cannot emit both forms. The production
-        // paths that bypass those walks but still expand are destroy, state
-        // refresh, and apply's backend-bootstrap re-resolve
-        // (`skip_resource_validation = true`). `fixture_plan` also depends on
-        // these backstops as test support.
-        if !parsed.providers.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::ProviderInModule);
-        }
-        if !parsed.state_blocks.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::StateBlockInModule);
-        }
-        if parsed.backend.is_some() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::BackendInModule);
-        }
-        if !parsed.upstream_states.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::UpstreamStateInModule);
-        }
-        if !parsed.export_params.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::ExportsInModule);
-        }
-
         // Recursively resolve nested module imports within this module.
         // The module's directory is used for resolving its relative imports.
         if let Err(e) = self.resolve_nested_modules(&mut parsed, &full_path) {
@@ -1324,24 +1302,15 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// in `main.crn` would be invisible to `${env}` interpolations in
     /// sibling `role.crn` (#2815). #2817.
     fn load_directory_module(&self, dir_path: &ResolvedPath) -> Result<ParsedFile, ModuleError> {
-        let files =
-            crate::config_loader::DirectoryFiles::discover(dir_path, &self.source_overrides)?
-                .read_all(&self.source_overrides)
-                .map_err(|error| ModuleError::from(error.into_error()))?;
-        let parsed_files = files
-            .parse_from_root(self.config(), &self.configuration_root)
-            .map_err(|located| match located.source_file {
-                Some(path) => ModuleError::ParseInFile {
-                    path,
-                    error: located.error,
-                },
-                None => ModuleError::Parse(*located.error),
-            })?;
-
-        let mut merged = parsed_files.empty_assembly();
-        for (_, parsed) in parsed_files {
-            crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
-        }
+        let mut module = super::loader::load_imported_directory(
+            dir_path,
+            self.config(),
+            &self.source_overrides,
+            self.schemas,
+            &self.configuration_root,
+        )
+        .map_err(super::loader::ModuleLoadError::into_first_error)?;
+        let merged = &mut module.parsed;
 
         // Preserve authored value trees while this file is a reusable
         // template. Reference resolution may fold a direct reference, but an
@@ -1354,22 +1323,21 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         // dependency bindings that expansion subsequently instance-prefixes.
         // Argument bindings remain deferred for call-site substitution.
         crate::parser::resolve_resource_refs_in_session_unsealed(
-            &mut merged,
+            merged,
             self.session,
             self.resolution.context(),
         )
         .map_err(ModuleError::Parse)?;
 
-        P::resolve_file_type_exprs(&mut merged, self.session)?;
-        crate::parser::retained::judge_configuration(
-            &mut merged,
-            self.schemas,
-            self.session.catalog(),
-        );
+        P::resolve_file_type_exprs(merged, self.session)?;
+        crate::parser::retained::judge_configuration(merged, self.schemas, self.session.catalog());
         if let Some(error) = merged.expression_report().first_error() {
             return Err(ModuleError::Parse(error));
         }
-        Ok(merged)
+        if let Some(error) = module.placement_errors().into_iter().next() {
+            return Err(error);
+        }
+        Ok(module.parsed)
     }
 
     /// Resolve a relative path to an absolute path

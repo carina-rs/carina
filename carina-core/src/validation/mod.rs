@@ -5524,7 +5524,8 @@ fn resource_values_report<
     // root configuration. Keep every other schema/type check below active for
     // modules; only defer this provider-availability diagnostic.
     match parsed.directory_verdict() {
-        crate::config_loader::DirectoryVerdict::Root(_) => all_errors.extend(
+        crate::config_loader::DirectoryVerdict::Root(_)
+        | crate::config_loader::DirectoryVerdict::NoEvidence(_) => all_errors.extend(
             group_anonymous_resource_schema_errors(parsed.iter_all_resources().filter_map(
                 |resource| match resource {
                     ResourceRef::Resource(resource) => {
@@ -8055,11 +8056,11 @@ pub fn configuration_placement_diagnostics<
                     ConfigurationBlock::State => "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
                     ConfigurationBlock::UpstreamState => "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
                     ConfigurationBlock::Exports => "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
-                    ConfigurationBlock::Arguments | ConfigurationBlock::Attributes => return None,
+                    ConfigurationBlock::Arguments | ConfigurationBlock::Attributes | ConfigurationBlock::Require => return None,
                 };
                 (message, None)
             }
-            DirectoryVerdict::Unknown => return None,
+            DirectoryVerdict::Unknown | DirectoryVerdict::NoEvidence(_) => return None,
         };
         Some(crate::parser::Located::new(block.location().clone(), ConfigurationPlacementDiagnostic { message, root }))
     }).collect()
@@ -9595,23 +9596,31 @@ impl ModuleCallChecker<'_> {
         // rejects the same declaration; its parser backstop is deduplicated
         // against this source-anchored finding.
         if let Some(mut module) = self.module_cache.get(&guard).cloned().or_else(|| {
-            crate::module_resolver::loader::load_module_with_overrides(
+            use crate::module_resolver::ModuleLoadError;
+            match crate::module_resolver::loader::load_module_with_overrides(
                 &module_dir,
                 self.provider_context.as_provider_context(),
                 &self.source_overrides,
-            )
-            .or_else(|| {
-                crate::module_resolver::loader::load_module_with_overrides(
-                    &module_dir,
-                    &ProviderContext::new(
-                        self.provider_context
-                            .as_provider_context()
-                            .environment
-                            .clone(),
-                    ),
-                    &self.source_overrides,
-                )
-            })
+            ) {
+                Ok(module) => Some(module),
+                Err(ModuleLoadError::NotModule { .. }) => None,
+                Err(ModuleLoadError::Unavailable(_)) => {
+                    match crate::module_resolver::loader::load_module_with_overrides(
+                        &module_dir,
+                        &ProviderContext::new(
+                            self.provider_context
+                                .as_provider_context()
+                                .environment
+                                .clone(),
+                        ),
+                        &self.source_overrides,
+                    ) {
+                        Ok(module) => Some(module),
+                        Err(ModuleLoadError::NotModule { .. }) => None,
+                        Err(ModuleLoadError::Unavailable(_)) => None,
+                    }
+                }
+            }
         }) {
             let resolution_errors = resolve_file_type_exprs(
                 &mut module,

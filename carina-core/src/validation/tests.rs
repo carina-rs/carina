@@ -4550,11 +4550,11 @@ fn arguments_alone_is_ok() {
 }
 
 #[test]
-fn empty_arguments_in_root_ok() {
+fn direct_directory_without_module_evidence_is_ok() {
     let parsed = admitted_placement_directory("// No arguments block.\n");
     assert!(matches!(
         parsed.parsed().directory_verdict(),
-        crate::config_loader::DirectoryVerdict::Root(_)
+        crate::config_loader::DirectoryVerdict::NoEvidence(_)
     ));
     assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_ok());
 }
