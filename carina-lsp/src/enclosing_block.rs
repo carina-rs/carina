@@ -193,10 +193,10 @@ fn parse_resource_header(
 }
 
 /// Scan bindings using the same header seam as hover and enclosing blocks.
-/// Parentheses preserve a selector; conditional branches must all supply the
-/// same selector. Coalescing ignores non-resource operands but rejects any
-/// disagreement between resource operands. This is syntax inference only:
-/// neither registered-name substrings nor the evaluated branch select a type.
+/// Only direct resource/read declarations and conditionals whose branch tails
+/// are direct declarations supply a selector. Every tail must have the same
+/// exact path and kind, regardless of which branch core evaluates. Parentheses,
+/// coalescing and nested conditional tails do not preserve a resource selector.
 /// Associate selectors with declaration lines before deduplicating names
 /// buffer-first. An unsaved scalar binding therefore keeps its `None` selector
 /// instead of receiving the selector of a later on-disk declaration.
@@ -223,7 +223,7 @@ pub(crate) fn resource_binding_selectors(text: &str) -> Vec<(String, Option<Sche
                 tokens: &tokens,
                 cursor: tokens.partition_point(|token| token.position < start),
             };
-            let selector = match parser.expression(0) {
+            let selector = match parser.expression(0, true) {
                 Ok(BindingSelector::Resource(selector)) => Some(selector),
                 _ => None,
             };
@@ -327,34 +327,28 @@ impl BindingSelectorParser<'_> {
         Ok(())
     }
 
-    fn expression(&mut self, depth: usize) -> Result<BindingSelector, ()> {
+    fn expression(&mut self, depth: usize, resource_position: bool) -> Result<BindingSelector, ()> {
         // Edited source must not be able to exhaust the LSP's stack.
         if depth > 128 {
             return Err(());
         }
-        let mut selector = self.operand(depth)?;
+        let mut selector = self.operand(depth, resource_position)?;
         while self.peek() == Some("??") {
             self.cursor += 1;
-            let other = self.operand(depth + 1)?;
-            selector = match (selector, other) {
-                (BindingSelector::NonResource, other) | (other, BindingSelector::NonResource) => {
-                    other
-                }
-                (selected, other) if selected == other => selected,
-                _ => BindingSelector::Conflict,
-            };
+            self.operand(depth + 1, false)?;
+            selector = BindingSelector::NonResource;
         }
         Ok(selector)
     }
 
-    fn operand(&mut self, depth: usize) -> Result<BindingSelector, ()> {
-        let mut selector = self.primary(depth)?;
+    fn operand(&mut self, depth: usize, resource_position: bool) -> Result<BindingSelector, ()> {
+        let mut selector = self.primary(depth, resource_position)?;
         loop {
             match self.peek() {
                 Some("+") | Some("-") | Some("*") | Some("/") | Some("%") | Some("|>")
                 | Some(">>") => {
                     self.cursor += 1;
-                    self.primary(depth + 1)?;
+                    self.primary(depth + 1, false)?;
                 }
                 Some("[") => self.group()?,
                 Some(field) if field.starts_with('.') => self.cursor += 1,
@@ -365,21 +359,24 @@ impl BindingSelectorParser<'_> {
         Ok(selector)
     }
 
-    fn primary(&mut self, depth: usize) -> Result<BindingSelector, ()> {
+    fn primary(&mut self, depth: usize, resource_position: bool) -> Result<BindingSelector, ()> {
         let token = self.tokens.get(self.cursor).ok_or(())?;
         match token.text.as_str() {
             "(" => {
                 self.cursor += 1;
-                let selector = self.expression(depth + 1)?;
+                self.expression(depth + 1, false)?;
                 self.expect(")")?;
-                Ok(selector)
+                Ok(BindingSelector::NonResource)
             }
-            "if" => self.conditional(depth + 1),
+            "if" => self.conditional(depth + 1, resource_position),
             "[" | "{" => {
                 self.group()?;
                 Ok(BindingSelector::NonResource)
             }
             "for" => {
+                if !resource_position {
+                    return Err(());
+                }
                 self.body_start()?;
                 self.group()?;
                 Ok(BindingSelector::NonResource)
@@ -388,12 +385,17 @@ impl BindingSelectorParser<'_> {
             _ => {
                 self.cursor += 1;
                 let mut path_position = token.position;
-                if matches!(token.text.as_str(), "read" | "provider" | "wait") {
+                if token.text == "read" {
                     path_position = self.tokens.get(self.cursor).ok_or(())?.position;
                     self.cursor += 1;
                 }
                 match self.peek() {
                     Some("{") => {
+                        // Conditions and branch-local lets are value positions
+                        // in core, so declarations cannot appear there.
+                        if !resource_position {
+                            return Err(());
+                        }
                         let header = parse_resource_header(self.lexed, path_position, true);
                         // Preserve completion for a direct resource declaration
                         // whose body is still being edited. Alternatives must
@@ -415,26 +417,45 @@ impl BindingSelectorParser<'_> {
         }
     }
 
-    fn conditional(&mut self, depth: usize) -> Result<BindingSelector, ()> {
+    fn conditional(
+        &mut self,
+        depth: usize,
+        resource_position: bool,
+    ) -> Result<BindingSelector, ()> {
+        let condition_start = self.cursor + 1;
         self.body_start()?;
-        let selector = self.branch(depth)?;
+        let mut condition = BindingSelectorParser {
+            lexed: self.lexed,
+            tokens: &self.tokens[condition_start..self.cursor],
+            cursor: 0,
+        };
+        condition.expression(depth + 1, false)?;
+        if condition.cursor != condition.tokens.len() {
+            return Err(());
+        }
+        let selector = self.branch(depth, resource_position)?;
         if self.peek() == Some("else") {
             self.cursor += 1;
-            if self.branch(depth)? != selector {
+            if self.branch(depth, resource_position)? != selector {
                 return Ok(BindingSelector::Conflict);
             }
         }
         Ok(selector)
     }
 
-    fn branch(&mut self, depth: usize) -> Result<BindingSelector, ()> {
+    fn branch(&mut self, depth: usize, resource_position: bool) -> Result<BindingSelector, ()> {
         self.expect("{")?;
         while self.peek() == Some("let") {
             self.cursor += 2; // keyword and local binding name
             self.expect("=")?;
-            self.expression(depth + 1)?;
+            self.expression(depth + 1, false)?;
         }
-        let selector = self.expression(depth + 1)?;
+        // Core lowers only direct declarations as structural branch tails.
+        // Nested value conditionals remain usable inside local value bindings.
+        if resource_position && self.peek() == Some("if") {
+            return Err(());
+        }
+        let selector = self.expression(depth + 1, resource_position)?;
         self.expect("}")?;
         Ok(selector)
     }

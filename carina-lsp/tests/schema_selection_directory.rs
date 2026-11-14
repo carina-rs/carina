@@ -417,22 +417,60 @@ fn walk_back_let_preserves_current_binding() {
 }
 
 fn assert_sibling_selector(rhs: &str, attribute: Option<&str>) {
-    let source = format!("let x = {rhs}\n");
-    carina_core::parser::parse_syntax_inventory(&source, std::path::Path::new("main.crn"))
-        .unwrap_or_else(|error| panic!("fixture must be grammar-valid: {source}: {error:?}"));
-    assert_sibling_selector_source(&source, attribute);
+    for condition in [false, true] {
+        let source = format!(
+            "let c = {condition}\nlet d = false\nlet y = 'a'\nlet z = 'b'\n\
+             let settings = {{ enabled = true }}\n\
+             fn check(value: String): Bool {{ true }}\nlet x = {rhs}\n"
+        );
+        carina_core::parser::parse_syntax_inventory(&source, std::path::Path::new("main.crn"))
+            .unwrap_or_else(|error| panic!("fixture must be grammar-valid: {source}: {error:?}"));
+        assert_sibling_selector_source(&source, attribute);
+    }
 }
 
 fn assert_sibling_selector_source(source: &str, attribute: Option<&str>) {
     let fixture = Fixture::new(source, "exports {}\n");
+    if attribute.is_some() {
+        // Grammar acceptance alone also admits structural expressions that
+        // core cannot lower. Every positive selector fixture must lower too.
+        let mut context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        context.resource_types =
+            ProviderContext::resource_types_from_schema_registry(&fixture.schemas);
+        carina_core::parser::parse_file(
+            source,
+            &fixture.directory.path().join("main.crn"),
+            &context,
+        )
+        .unwrap_or_else(|error| {
+            panic!("positive fixture must lower through core: {source}: {error}")
+        });
+    }
     let items = fixture.complete("exports.crn", "attributes {\n  value = x.|\n}\n");
     let labels = labels(&items);
     for candidate in ["managed_only", "lookup_only", "subnet_only", "filter", "id"] {
         assert_eq!(
             labels.contains(&format!("x.{candidate}").as_str()),
-            attribute == Some(candidate) || attribute == Some("filter") && candidate == "id",
+            attribute == Some(candidate),
             "{source}: {labels:?}"
         );
+    }
+}
+
+#[test]
+fn direct_resource_bindings_also_lower_through_core() {
+    assert_sibling_selector("mock.ec2.Vpc {}", Some("managed_only"));
+    assert_sibling_selector("read mock.ec2.Vpc {}", Some("lookup_only"));
+}
+
+#[test]
+fn module_call_bindings_have_no_resource_selector() {
+    for rhs in [
+        "mod {}",
+        "if c { mod {} }",
+        "if c { mod {} } else { mod {} }",
+    ] {
+        assert_sibling_selector(rhs, None);
     }
 }
 
@@ -461,11 +499,23 @@ fn conditional_binding_uses_branch_results_not_condition_or_locals() {
     for rhs in [
         "if settings.enabled { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
         "if check('literal { else }') { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+        "if (c) { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+        "if c { let local = 1\n mock.ec2.Vpc {} } else { let local = 'a'\n mock.ec2.Vpc {} }",
+        "if c { let local = y ?? z\n mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+        "if c { let local = if d { 1 } else { 2 }\n mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
+    ] {
+        assert_sibling_selector(rhs, Some("managed_only"));
+    }
+}
+
+#[test]
+fn conditional_binding_declarations_in_value_positions_are_untyped() {
+    for rhs in [
         "if mock.ec2.Subnet {} { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
         "if c { let local = mock.ec2.Subnet {} mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
         "if c { let local = mock.ec2.Subnet {} ?? mock.ec2.Vpc {} mock.ec2.Vpc {} } else { mock.ec2.Vpc {} }",
     ] {
-        assert_sibling_selector(rhs, Some("managed_only"));
+        assert_sibling_selector(rhs, None);
     }
 }
 
@@ -505,6 +555,24 @@ fn conditional_binding_non_resource_branch_is_untyped() {
 }
 
 #[test]
+fn conditional_binding_wrapped_resource_tails_are_untyped() {
+    for rhs in [
+        "if c { (mock.ec2.Vpc {}) } else { mock.ec2.Vpc {} }",
+        "if c { mock.ec2.Vpc {} } else { (mock.ec2.Vpc {}) }",
+        "if c { (read mock.ec2.Vpc {}) } else { (read mock.ec2.Vpc {}) }",
+        "if c { mock.ec2.Vpc {} ?? y } else { mock.ec2.Vpc {} }",
+        "if c { mock.ec2.Vpc {} } else { y ?? mock.ec2.Vpc {} }",
+        "if c { mock.ec2.Vpc {} ?? mock.ec2.Vpc {} } else { mock.ec2.Vpc {} ?? mock.ec2.Vpc {} }",
+    ] {
+        // A direct resource before `??` also fails core's branch grammar.
+        for condition in [false, true] {
+            let source = format!("let c = {condition}\nlet y = 'a'\nlet x = {rhs}\n");
+            assert_sibling_selector_source(&source, None);
+        }
+    }
+}
+
+#[test]
 fn conditional_binding_missing_branch_is_untyped() {
     for source in [
         "let x = if c { mock.ec2.Vpc {} } else {\n",
@@ -518,21 +586,25 @@ fn conditional_binding_missing_branch_is_untyped() {
 
 #[test]
 fn conditional_binding_without_else_uses_single_branch() {
-    for rhs in ["if c { mock.ec2.Vpc {} }", "if c {\n  mock.ec2.Vpc {}\n}"] {
+    for rhs in [
+        "if c { mock.ec2.Vpc {} }",
+        "if c {\n  mock.ec2.Vpc {}\n}",
+        "if c { let l = 1\n mock.ec2.Vpc {} }",
+    ] {
         assert_sibling_selector(rhs, Some("managed_only"));
     }
 }
 
 #[test]
-fn conditional_binding_nested_else_if() {
-    assert_sibling_selector(
+fn conditional_binding_nested_if_is_untyped() {
+    for rhs in [
         "if c { mock.ec2.Vpc {} } else { if d { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} } }",
-        Some("managed_only"),
-    );
-    assert_sibling_selector(
         "if c { mock.ec2.Vpc {} } else { if d { mock.ec2.Vpc {} } else { mock.ec2.Subnet {} } }",
-        None,
-    );
+        "if c { if d { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} } } else { mock.ec2.Vpc {} }",
+        "if c { if d { read mock.ec2.Vpc {} } else { read mock.ec2.Vpc {} } } else { read mock.ec2.Vpc {} }",
+    ] {
+        assert_sibling_selector(rhs, None);
+    }
     let invalid = "let x = if c { mock.ec2.Vpc {} } else if d { mock.ec2.Vpc {} }";
     assert!(
         carina_core::parser::parse_syntax_inventory(invalid, std::path::Path::new("main.crn"))
@@ -543,45 +615,42 @@ fn conditional_binding_nested_else_if() {
 }
 
 #[test]
-fn parenthesized_resource_binding() {
+fn parenthesized_resource_binding_is_untyped() {
     for rhs in [
         "(mock.ec2.Vpc {})",
         "((mock.ec2.Vpc {}))",
         "(\n  mock.ec2.Vpc {}\n)",
         "(if c { mock.ec2.Vpc {} } else { mock.ec2.Vpc {} })",
     ] {
-        assert_sibling_selector(rhs, Some("managed_only"));
+        assert_sibling_selector(rhs, None);
     }
 }
 
 #[test]
-fn parenthesized_read_binding() {
+fn parenthesized_read_binding_is_untyped() {
     for rhs in ["(read mock.ec2.Vpc {})", "(read\n  mock.ec2.Vpc {})"] {
-        assert_sibling_selector(rhs, Some("lookup_only"));
+        assert_sibling_selector(rhs, None);
     }
 }
 
 #[test]
-fn coalesced_resource_binding() {
+fn coalesced_resource_binding_is_untyped() {
     for rhs in [
         "mock.ec2.Vpc {} ?? mock.ec2.Vpc {}",
         "(mock.ec2.Vpc {}) ?? (mock.ec2.Vpc {}) ?? mock.ec2.Vpc {}",
         "(\n  mock.ec2.Vpc {}\n) ?? (\n  mock.ec2.Vpc {}\n)",
     ] {
-        assert_sibling_selector(rhs, Some("managed_only"));
+        assert_sibling_selector(rhs, None);
     }
 }
 
 #[test]
-fn coalesced_read_binding() {
-    assert_sibling_selector(
-        "read mock.ec2.Vpc {} ?? read mock.ec2.Vpc {}",
-        Some("lookup_only"),
-    );
+fn coalesced_read_binding_is_untyped() {
+    assert_sibling_selector("read mock.ec2.Vpc {} ?? read mock.ec2.Vpc {}", None);
 }
 
 #[test]
-fn coalesced_non_resource_operand_keeps_resource_selector() {
+fn coalesced_non_resource_operand_does_not_type_resource_binding() {
     for rhs in [
         "y ?? mock.ec2.Vpc {}",
         "mock.ec2.Vpc {} ?? y",
@@ -595,7 +664,7 @@ fn coalesced_non_resource_operand_keeps_resource_selector() {
         "wait y { until = y.a == 'done' } ?? mock.ec2.Vpc {}",
         "(y ?? mock.ec2.Vpc {})",
     ] {
-        assert_sibling_selector(rhs, Some("managed_only"));
+        assert_sibling_selector(rhs, None);
     }
 }
 
