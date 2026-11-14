@@ -32,6 +32,8 @@ use std::time::Duration;
 mod attribute_admission;
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
+#[path = "tests/storage_readiness.rs"]
+mod storage_readiness;
 
 use cancellation_fixture::ApplyCancellationFixture;
 
@@ -7513,10 +7515,7 @@ fn bootstrap_test_backend() -> (tempfile::TempDir, Box<dyn StateBackend>) {
     (temp, backend)
 }
 
-#[derive(Default)]
-struct BootstrapWriteFailureBackend {
-    create_calls: AtomicUsize,
-}
+struct BootstrapWriteFailureBackend;
 
 #[async_trait::async_trait]
 impl StateBackend for BootstrapWriteFailureBackend {
@@ -7570,13 +7569,10 @@ impl StateBackend for BootstrapWriteFailureBackend {
         ))
     }
 
-    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
-        Ok(true)
-    }
-
-    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
-        self.create_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        Ok(carina_state::StorageReadiness::Ready)
     }
 }
 
@@ -7837,13 +7833,10 @@ async fn declared_state_bucket_successful_create_seed_write_failure_is_actionabl
         create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::Success,
     };
-    let error = bootstrap_declared_state_bucket(
-        color_mode,
-        &provider,
-        &BootstrapWriteFailureBackend::default(),
-    )
-    .await
-    .expect_err("a successful create followed by a seed write failure must be actionable");
+    let error =
+        bootstrap_declared_state_bucket(color_mode, &provider, &BootstrapWriteFailureBackend)
+            .await
+            .expect_err("a successful create followed by a seed write failure must be actionable");
 
     let AppError::StateBucketSeed(seed) = &error else {
         panic!("seed write failure lost its bootstrap context: {error:?}");
@@ -8403,7 +8396,7 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
-            backend: &BootstrapWriteFailureBackend::default(),
+            backend: &BootstrapWriteFailureBackend,
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
@@ -12385,8 +12378,102 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
 }
 
 #[tokio::test]
+async fn auto_create_backend_bucket_disabled_policy_keeps_configuration_error() {
+    let (backend, requests) = crate::test_support::missing_s3_backend(false).await;
+    let StorageReadiness::Provisionable(bootstrap) = backend.storage_readiness().await.unwrap()
+    else {
+        panic!("fixture bucket must be missing")
+    };
+
+    let error = select_s3_bucket_bootstrap(bootstrap, None).unwrap_err();
+    assert!(matches!(&error, AppError::Config(_)));
+    assert_eq!(
+        error.to_string(),
+        "Backend bucket 'state-bucket' not found and auto_create is disabled"
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        ["HEAD"]
+    );
+}
+
+#[tokio::test]
+async fn auto_create_backend_bucket_declared_resource_precedes_disabled_policy() {
+    let resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    for auto_create in [false, true] {
+        let (backend, requests) = crate::test_support::missing_s3_backend(auto_create).await;
+        let StorageReadiness::Provisionable(bootstrap) = backend.storage_readiness().await.unwrap()
+        else {
+            panic!("fixture bucket must be missing")
+        };
+        let S3BucketBootstrap::Declared(selected) =
+            select_s3_bucket_bootstrap(bootstrap, Some(&resource)).unwrap()
+        else {
+            panic!("a declared bucket must use the provider regardless of auto-create policy")
+        };
+        assert_eq!(selected.id, resource.id);
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            ["HEAD"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_create_backend_bucket_apply_redacts_env_bucket_like_plan() {
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+        "STATE_BUCKET".into(),
+        "private-bucket-name".into(),
+    )]));
+    let mut parsed = carina_core::parser::parse_file(
+        "backend s3 { bucket = env('STATE_BUCKET') key = 'state.json' auto_create = false }",
+        Path::new("backend.crn"),
+        &context,
+    )
+    .unwrap();
+    carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
+    let config = carina_state::BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
+    let (backend, requests) =
+        crate::test_support::missing_s3_backend_with_settings(config.as_s3().unwrap()).await;
+    let StorageReadiness::Provisionable(bootstrap) = backend.storage_readiness().await.unwrap()
+    else {
+        panic!("fixture bucket must be missing")
+    };
+
+    let error = select_s3_bucket_bootstrap(bootstrap, None).unwrap_err();
+    assert!(matches!(&error, AppError::Config(_)));
+    // The disabled-policy message is shared with plan, including env() redaction.
+    assert_eq!(
+        error.to_string(),
+        "Backend bucket value from env() not found and auto_create is disabled"
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        ["HEAD"]
+    );
+}
+
+#[tokio::test]
 async fn auto_create_backend_bucket_does_not_require_provider_schema() {
-    let backend = BootstrapWriteFailureBackend::default();
+    let (backend, requests) = crate::test_support::missing_s3_backend(true).await;
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "other",
@@ -12401,13 +12488,32 @@ async fn auto_create_backend_bucket_does_not_require_provider_schema() {
             )
             .is_none()
     );
-    create_auto_bootstrap_bucket(&backend).await.unwrap();
-    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+    let bootstrap = match backend.storage_readiness().await.unwrap() {
+        StorageReadiness::Ready => panic!("fixture bucket must be missing"),
+        StorageReadiness::Provisionable(bootstrap) => bootstrap,
+        StorageReadiness::Unavailable(error) => panic!("S3 storage must be provisionable: {error}"),
+    };
+    let S3BucketBootstrap::AutoCreate(auto_create) =
+        select_s3_bucket_bootstrap(bootstrap, None).unwrap()
+    else {
+        panic!("an undeclared bucket with auto-create enabled must obtain creation authority")
+    };
+    auto_create.create().await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        ["HEAD", "PUT", "PUT"]
+    );
+    assert!(!requests[1].uri.contains("publicAccessBlock"));
+    assert!(requests[2].uri.contains("publicAccessBlock"));
 }
 
 #[tokio::test]
 async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
-    let backend = BootstrapWriteFailureBackend::default();
+    let (backend, requests) = crate::test_support::missing_s3_backend(true).await;
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "aws",
@@ -12424,8 +12530,15 @@ async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
             .validate()
             .unwrap(),
     );
-    create_auto_bootstrap_bucket(&backend).await.unwrap();
-    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+    let bootstrap = match backend.storage_readiness().await.unwrap() {
+        StorageReadiness::Ready => panic!("fixture bucket must be missing"),
+        StorageReadiness::Provisionable(bootstrap) => bootstrap,
+        StorageReadiness::Unavailable(error) => panic!("S3 storage must be provisionable: {error}"),
+    };
+    bootstrap.auto_create().unwrap().create().await.unwrap();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.iter().filter(|r| r.method == "PUT").count(), 2);
+    assert!(requests.iter().any(|r| r.uri.contains("publicAccessBlock")));
 }
 
 #[path = "tests/issue_4283.rs"]

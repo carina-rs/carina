@@ -14,7 +14,7 @@ use carina_core::resource::{
 };
 use thiserror::Error;
 
-use crate::backend::{BackendError, BackendResult};
+use crate::backend::{BackendError, BackendResult, StorageReadinessStatus};
 use crate::backend_config::{BackendConfig, S3BackendSettings};
 use crate::backend_lock::BackendLock;
 use crate::backends::{S3_BACKEND_PROVIDER_NAME, S3_BACKEND_RESOURCE_TYPE, StateUrl};
@@ -185,16 +185,8 @@ impl ResolvedReadBackend {
         crate::backend::read_published_exports(self.backend.as_ref()).await
     }
 
-    pub async fn bucket_exists(&self) -> BackendResult<bool> {
-        self.backend.bucket_exists().await
-    }
-
-    pub fn provider_name(&self) -> Option<&str> {
-        self.backend.provider_name()
-    }
-
-    pub fn resource_type(&self) -> Option<&str> {
-        self.backend.resource_type()
+    pub async fn storage_readiness(&self) -> BackendResult<StorageReadinessStatus> {
+        Ok(self.backend.storage_readiness().await?.into_status())
     }
 
     pub fn selected_config(&self) -> &BackendConfig {
@@ -218,12 +210,33 @@ pub struct VerifiedMutationBackendSelection {
 }
 
 impl VerifiedMutationBackendSelection {
-    pub fn s3_settings(&self) -> Option<&S3BackendSettings> {
-        self.configured.config().as_s3()
+    pub fn protected_bucket(&self) -> Option<ProtectedBackendBucket> {
+        self.configured
+            .config()
+            .as_s3()
+            .map(|settings| ProtectedBackendBucket {
+                bucket: settings.bucket().to_owned(),
+            })
     }
 
     pub async fn resolve(&self) -> BackendResult<Box<dyn crate::StateBackend>> {
         crate::backends::create_backend(&self.configured).await
+    }
+}
+
+/// The state bucket protected by a verified mutation backend selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedBackendBucket {
+    bucket: String,
+}
+
+impl ProtectedBackendBucket {
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn resource_type(&self) -> &'static str {
+        S3_BACKEND_RESOURCE_TYPE
     }
 }
 
@@ -611,6 +624,12 @@ mod tests {
         .unwrap();
         let resolved = selected.resolve_with_drift_warning(|_| {}).await.unwrap();
 
+        match resolved.storage_readiness().await.unwrap() {
+            StorageReadinessStatus::Ready => {}
+            StorageReadinessStatus::Provisionable(_) => panic!("local storage cannot provision S3"),
+            StorageReadinessStatus::Unavailable(error) => panic!("local storage is ready: {error}"),
+        }
+
         let BackendConfig::Local(settings) = resolved.selected_config() else {
             panic!("read must select the old local backend")
         };
@@ -714,6 +733,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded_target.into_state().lineage, "configured-new");
+    }
+
+    #[test]
+    fn verified_mutation_selection_owns_protected_bucket_identity() {
+        for config in [s3_config("configured-bucket"), local_config("state.json")] {
+            let directory = tempfile::tempdir().unwrap();
+            let project = ResolvedPath::new(directory.path()).unwrap();
+            BackendLock::for_config(Some(&config))
+                .unwrap()
+                .save(&project)
+                .unwrap();
+            let MutationBackendSelection::Verified(selected) =
+                BackendSelection::verified_for_mutation(&project, Some(&config)).unwrap()
+            else {
+                panic!("matching backend lock must verify the selection")
+            };
+
+            if config.backend_type == "s3" {
+                let protected: crate::ProtectedBackendBucket = selected.protected_bucket().unwrap();
+                assert_eq!(protected.bucket(), "configured-bucket");
+                assert_eq!(protected.resource_type(), "s3.Bucket");
+            } else {
+                assert!(selected.protected_bucket().is_none());
+            }
+        }
     }
 
     #[test]
