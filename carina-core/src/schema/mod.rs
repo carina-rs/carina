@@ -4150,7 +4150,7 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// annotations, module/export boundaries and function signatures use identified
     /// refinements or unconstrained scalars. Resolved resource/data-source inputs
     /// pass through `admit_apply_resource`/`admit_apply_data_source`; provider/backend
-    /// configuration enters `admit()` through `validation/admission/configuration/`.
+    /// configuration has its own field admission in `validation/admission/configuration/`.
     /// These checks validate the full destination declaration before dispatch,
     /// preserving #2218's safety without static containment. Function parameters/returns also
     /// have runtime constraint checks; backend schemas have no anonymous refinements.
