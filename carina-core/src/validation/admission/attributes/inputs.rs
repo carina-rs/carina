@@ -19,6 +19,51 @@ pub enum SlotPrechecks<'a> {
     Unreported,
 }
 
+/// Keep supplied keys and values, taking matched slots' order from their owner.
+/// Canonical aliases share the authored slot's occurrence and instance. Names
+/// outside that inventory retain their producer's order and report-only handling.
+pub(super) fn in_resource_order<'v, B: BindingAddress, D, V>(
+    resource: &crate::parser::AnalysisResourceRef<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
+    values: &'v IndexMap<String, V>,
+) -> std::vec::IntoIter<(&'v String, &'v V)>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let mut names_by_slot = HashMap::<_, Vec<_>>::new();
+    for (index, name) in values.keys().enumerate() {
+        if let Ok(slot) = resource.authored_slot(name) {
+            names_by_slot
+                .entry((slot.occurrence(), slot.instance()))
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut included = vec![false; values.len()];
+    let mut ordered = Vec::with_capacity(values.len());
+    let mut include = |index: usize| {
+        if !included[index] {
+            included[index] = true;
+            ordered.push(values.get_index(index).expect("supplied attribute index"));
+        }
+    };
+    for name in resource.attributes().keys() {
+        if let Some(index) = values.get_index_of(name) {
+            include(index);
+        }
+        if let Ok(slot) = resource.authored_slot(name)
+            && let Some(aliases) = names_by_slot.get(&(slot.occurrence(), slot.instance()))
+        {
+            for index in aliases {
+                include(*index);
+            }
+        }
+    }
+    for index in 0..values.len() {
+        include(index);
+    }
+    ordered.into_iter()
+}
+
 /// Producer-owned attribute projections and their authored authority.
 ///
 /// Classify `values()` after producing/evaluating these inputs. Admission only
@@ -26,6 +71,7 @@ pub enum SlotPrechecks<'a> {
 #[derive(Clone)]
 pub struct ResourceAttributeInputs<B: BindingAddress> {
     owner: ResourceId,
+    precheck: Option<crate::parser::ResourcePrecheckIdentity>,
     pub(super) scope: crate::schema::value_validation::AssignmentScope,
     report: Option<Arc<crate::parser::retained::ExpressionReport<B>>>,
     inputs: IndexMap<String, PreparedAttribute<B>>,
@@ -149,7 +195,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             D,
             B,
         >,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         report: &crate::parser::retained::ExpressionReport<B>,
     ) -> Self
     where
@@ -173,7 +219,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             D,
             B,
         >,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         report: &crate::parser::retained::ExpressionReport<B>,
         unchecked: crate::parser::retained::NoAuthoredEvidence,
     ) -> Self
@@ -182,11 +228,11 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     {
         let mut prepared = Self {
             owner: resource.id().clone(),
+            precheck: unchecked.precheck_identity(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(unchecked)),
             report: Some(Arc::new(report.clone())),
-            inputs: values
-                .iter()
+            inputs: in_resource_order(resource, values)
                 .map(|(name, value)| {
                     (
                         name.clone(),
@@ -228,14 +274,14 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             D,
             B,
         >,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         report: &crate::parser::retained::ExpressionReport<B>,
     ) -> Result<Self, MissingEvidence>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let report = report.for_resource(resource.id())?;
-        let mut inputs = Self::prepare(resource, values.iter(), true);
+        let mut inputs = Self::prepare(resource, in_resource_order(resource, values), true);
         inputs.report = Some(Arc::new(report.clone()));
         Ok(inputs)
     }
@@ -324,6 +370,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .collect();
         let mut prepared = Self {
             owner: resource.id().clone(),
+            precheck: resource.precheck_identity(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             report: None,
             inputs,
@@ -359,7 +406,11 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
                 PreparedAttribute::WithoutValue { precheck, .. } => {
                     *precheck = match prechecks {
                         SlotPrechecks::Reported(report)
-                            if report.has_slot_finding(&self.owner, name) =>
+                            if report.has_slot_finding(
+                                &self.owner,
+                                self.precheck.as_ref(),
+                                name,
+                            ) =>
                         {
                             SlotPrecheck::OrdinaryFinding
                         }
@@ -376,8 +427,8 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     pub(super) fn prepare_missing<Pass: ResourceAdmissionPass>(
         &self,
         report: &crate::parser::retained::ExpressionReport<B>,
-    ) -> crate::ConversionChannel {
-        prepare_missing::<Pass, _, _>(self.inputs.values(), report)
+    ) -> MissingInputs {
+        prepare_missing::<Pass, _, _>(self.inputs.iter(), report)
     }
 
     /// Input provenance, distinct from candidate sealing or successful admission.
@@ -403,7 +454,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         &'a self,
         context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
         failed: impl FnMut(&str, KnowledgeError<B>),
-    ) -> HashMap<String, Classification<'a, ParserPlaceholder, B>> {
+    ) -> IndexMap<String, Classification<'a, ParserPlaceholder, B>> {
         collect_classified_attributes(
             self.values().map(|(name, value)| (name.to_owned(), value)),
             context,
@@ -415,12 +466,12 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     /// Unchanged values keep their allocations and their existing proofs.
     pub fn materialize_and_classify<'a, S: ClassificationStage>(
         &'a mut self,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
         context: &KnowledgeContext<'_, ParserPlaceholder, B, S>,
         failed: impl FnMut(&str, KnowledgeError<B>),
     ) -> (
         &'a Self,
-        HashMap<String, Classification<'a, ParserPlaceholder, B>>,
+        IndexMap<String, Classification<'a, ParserPlaceholder, B>>,
     ) {
         // Additional resolved names have no authored authority. Preserve
         // main's classified/report path instead of inventing a seam finding.
@@ -438,9 +489,10 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         self.apply_materializations(values);
         let inputs: &Self = self;
         let classified = collect_classified_attributes(
-            values
-                .keys()
-                .filter_map(|name| inputs.value(name).map(|value| (name.clone(), value))),
+            inputs
+                .values()
+                .filter(|(name, _)| values.contains_key(*name))
+                .map(|(name, value)| (name.to_owned(), value)),
             context,
             failed,
         );
@@ -452,7 +504,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     #[cfg(test)]
     pub(crate) fn materialize(
         &mut self,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
     ) -> Result<(), MissingEvidence> {
         let unmatched = self.unmatched_materializations(values);
         if !unmatched.is_empty() {
@@ -467,7 +519,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 
     fn unmatched_materializations(
         &self,
-        values: &HashMap<String, Value<ParserPlaceholder, B>>,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
     ) -> Vec<(String, MissingEvidence)> {
         values
             .keys()
@@ -481,7 +533,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .collect()
     }
 
-    fn apply_materializations(&mut self, values: &HashMap<String, Value<ParserPlaceholder, B>>) {
+    fn apply_materializations(&mut self, values: &IndexMap<String, Value<ParserPlaceholder, B>>) {
         for (name, input) in &mut self.inputs {
             let Some(value) = values.get(name) else {
                 continue;
@@ -596,15 +648,15 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 // classifications directly, rather than producer-owned resolved inputs.
 pub(super) fn missing_schema_inputs<B: BindingAddress, V>(
     slots: &crate::parser::retained::AuthoredSlots<B>,
-    attributes: &HashMap<String, V>,
+    attributes: &IndexMap<String, V>,
     report: &crate::parser::retained::ExpressionReport<B>,
-) -> crate::ConversionChannel {
+) -> MissingInputs {
     let mut inputs = attributes
         .iter()
         .map(|(name, value)| (name.clone(), PreparedAttribute::WithValue(value)))
         .collect();
     join_slots(slots, &mut inputs);
-    prepare_missing::<LiveResource, _, _>(inputs.values(), report)
+    prepare_missing::<LiveResource, _, _>(inputs.iter(), report)
 }
 
 fn join_slots<B: BindingAddress, V>(
@@ -631,22 +683,50 @@ fn join_slots<B: BindingAddress, V>(
     }
 }
 
+pub(super) struct MissingInputs {
+    ordinary: Vec<(String, TypeError)>,
+    conversions: crate::ConversionChannel,
+}
+impl MissingInputs {
+    pub(super) fn finish(
+        self,
+        mut findings: crate::schema::ResourceValueValidation,
+        coverage: &mut WalkCoverage,
+    ) -> crate::schema::ResourceValueValidation {
+        coverage.record_conversions(self.conversions);
+        for (name, error) in self.ordinary {
+            findings.push_attribute_error(&name, error);
+        }
+        findings
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.ordinary.is_empty() && self.conversions.findings().is_empty()
+    }
+}
 fn prepare_missing<'a, Pass: ResourceAdmissionPass, B: BindingAddress + 'a, V: 'a>(
-    inputs: impl Iterator<Item = &'a PreparedAttribute<B, V>>,
+    inputs: impl Iterator<Item = (&'a String, &'a PreparedAttribute<B, V>)>,
     report: &crate::parser::retained::ExpressionReport<B>,
-) -> crate::ConversionChannel {
-    let mut findings = crate::ConversionChannel::default();
-    for input in inputs {
+) -> MissingInputs {
+    let mut findings = MissingInputs {
+        ordinary: Vec::new(),
+        conversions: Default::default(),
+    };
+    for (name, input) in inputs {
         match input {
             PreparedAttribute::WithValue(_) => {}
             PreparedAttribute::WithoutValue { slot, precheck } => match precheck {
                 SlotPrecheck::OrdinaryFinding => {}
                 SlotPrecheck::NoOrdinaryFinding => {
-                    if let Ok(source) = slot
+                    match slot
                         .source_judgement_in(report)
                         .or_else(|_| slot.source_judgement())
                     {
-                        findings.append(Pass::missing_source(source));
+                        Ok(source) => findings.conversions.append(Pass::missing_source(source)),
+                        Err(missing) => findings.ordinary.push((
+                            name.clone(),
+                            crate::validation::admission::assignment_seam_error(missing),
+                        )),
                     }
                 }
             },
@@ -706,6 +786,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn r11_missing_omitted_source_evidence_is_a_failure() {
+        let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "mock.Sink { attr = 'ok' as mock.Name }",
+            std::path::Path::new("missing-omitted-source.crn"),
+            &catalog,
+        )
+        .unwrap()
+        .resolve_root_for_test();
+        let schemas = SchemaRegistry::new();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let mut slot = resource.authored_slot("attr").unwrap().clone();
+        slot.invalidate_judgement();
+        let inputs = [PreparedAttribute::<_, ()>::WithoutValue {
+            slot: Arc::new(slot),
+            precheck: SlotPrecheck::NoOrdinaryFinding,
+        }];
+        let empty =
+            crate::parser::parse_file("", std::path::Path::new("empty-evidence.crn"), &catalog)
+                .unwrap()
+                .resolve_root_for_test();
+        let name = "attr".to_owned();
+        let missing = prepare_missing::<LiveResource, _, _>(
+            inputs.iter().map(|input| (&name, input)),
+            empty.expression_report(),
+        );
+        assert!(
+            !missing.is_empty(),
+            "missing source evidence was silently accepted"
+        );
+    }
+
+    #[test]
     fn r9_report_only_omitted_input_cannot_gain_authored_authority_by_materializing() {
         let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse_file(
@@ -722,9 +839,9 @@ mod tests {
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
         let mut inputs =
-            ResourceAttributeInputs::from_report(resource, &HashMap::new(), judged.report());
+            ResourceAttributeInputs::from_report(resource, &IndexMap::new(), judged.report());
         inputs
-            .materialize(&HashMap::from([(
+            .materialize(&IndexMap::from([(
                 "attr".into(),
                 Value::Concrete(crate::resource::ConcreteValue::String("ok".into())),
             )]))

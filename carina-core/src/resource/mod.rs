@@ -4049,8 +4049,7 @@ pub enum DeferredValue<P: ValueKind = NoPlaceholder, B: BindingAddress = Absolut
         function: std::sync::Arc<crate::parser::UserFunction<B>>,
         /// Lexical function scope captured with `function`. Function bodies
         /// may call sibling helpers after this outer call is deferred.
-        functions:
-            std::sync::Arc<std::collections::HashMap<String, crate::parser::UserFunction<B>>>,
+        functions: std::sync::Arc<IndexMap<String, crate::parser::UserFunction<B>>>,
         args: Vec<FunctionArgument<P, B>>,
         source_line: DiagnosticSourceLine,
     },

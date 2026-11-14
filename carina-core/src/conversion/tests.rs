@@ -1424,7 +1424,7 @@ fn round5_for_iterable_and_literal_access_are_placement_rejections() -> TestResu
 }
 
 #[test]
-fn round5_nonexpanded_conversions_do_not_resolve_targets_but_placement_is_checked() -> TestResult {
+fn round11_nonexpanded_judge_positions_check_static_conversion_legality() -> TestResult {
     let fixture = Fixture::string();
     for body in [
         "target = 'ok' as unloaded.Name",
@@ -1445,14 +1445,22 @@ fn round5_nonexpanded_conversions_do_not_resolve_targets_but_placement_is_checke
                 "{outcome:#?}"
             );
         } else {
-            outcome.assert_accepted();
+            assert_eq!(conversions.len(), 1, "{outcome:#?}");
+            assert_eq!(
+                conversions[0].0,
+                ConversionErrorKind::Target,
+                "{outcome:#?}"
+            );
+            fixture
+                .check(&source.replace(" as unloaded.Name", ""))?
+                .assert_accepted();
         }
     }
     Ok(())
 }
 
 #[test]
-fn round5_reported_schema_validation_cannot_admit_without_a_source_proof() {
+fn r11_reported_schema_validation_requires_a_recorded_static_source_verdict() {
     let fixture = Fixture::string();
     let parsed = crate::parser::parse_file(
         "mock.Sink { target = 'ok' as mock.Name }",
@@ -1465,7 +1473,7 @@ fn round5_reported_schema_validation_cannot_admit_without_a_source_proof() {
         &fixture.schemas,
         &fixture.catalog,
     );
-    for file in [&parsed, configuration.judged().file()] {
+    for (judged, file) in [(false, &parsed), (true, configuration.judged().file())] {
         let result = crate::test_utils::legacy_validate_resources(
             file,
             &fixture.schemas,
@@ -1473,13 +1481,17 @@ fn round5_reported_schema_validation_cannot_admit_without_a_source_proof() {
             &fixture.catalog,
             &mut Vec::new(),
         );
-        let error = result
-            .expect_err("a classified validation projection cannot mint a proof for a conversion");
-        assert_eq!(
-            error.matches("conversion cannot be checked here").count(),
-            1,
-            "{error}"
-        );
+        if judged {
+            result.expect("the sealed static verdict supplies conversion authority");
+        } else {
+            let error =
+                result.expect_err("an unjudged validation projection cannot forge authority");
+            assert_eq!(
+                error.matches("conversion cannot be checked here").count(),
+                1,
+                "{error}"
+            );
+        }
     }
 }
 

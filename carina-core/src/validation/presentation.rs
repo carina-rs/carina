@@ -552,11 +552,27 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             >,
     {
         for resource in tree.project_resources() {
-            if !resource
-                .authored_slots()
-                .is_some_and(|slots| slots.carries_conversion(judged.report()))
-            {
+            if self.ordinary_failure().is_some() {
                 continue;
+            }
+            let carrying = match resource.authored_slots() {
+                Some(slots) => slots.carries_conversion(judged.report()),
+                None => Ok(false),
+            };
+            match carrying {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(missing) => {
+                    self.ordinary.push((
+                        FindingSubject::Root,
+                        OrdinaryFinding::Resource(Box::new(ResourceAdmissionFinding::schema(
+                            resource.id(),
+                            None,
+                            &super::admission::assignment_seam_error(missing),
+                        ))),
+                    ));
+                    continue;
+                }
             }
             let (identity, revision) = admission_use(resource);
             if self.admitted_uses.get(&identity).is_some_and(|admitted| {
@@ -566,9 +582,6 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                     (Some(_), None) | (None, Some(_)) => false,
                 }
             }) {
-                continue;
-            }
-            if self.ordinary_failure().is_some() {
                 continue;
             }
             self.walk_resource(resource, |coverage| {

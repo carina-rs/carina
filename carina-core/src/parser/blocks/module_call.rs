@@ -10,7 +10,7 @@ use crate::parser::context::{ExpressionMode, ParseContext, StructuralSinkMode, n
 use crate::parser::error::ParseError;
 use crate::parser::grammar::PreprocessedFile;
 use crate::parser::parse_expression_eval_with_mode;
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 /// Parse module call
 pub(crate) fn parse_module_call(
@@ -33,7 +33,7 @@ pub(crate) fn parse_module_call(
         });
     }
 
-    let mut arguments = HashMap::new();
+    let mut arguments = IndexMap::new();
     for arg in inner {
         if arg.as_rule() == Rule::module_call_arg {
             let mut arg_inner = arg.into_inner();

@@ -568,7 +568,7 @@ impl InsideSecret for ValueValidationFindings {
 pub struct ResourceValueValidation {
     pub(super) errors: Vec<TypeError>,
     pub(super) error_paths: HashMap<usize, (String, LeafPath)>,
-    pub(super) attributes: HashMap<String, ValueValidationFindings>,
+    pub(super) attributes: indexmap::IndexMap<String, ValueValidationFindings>,
 }
 
 /// CLI preserves main's path ownership. Exact finding ownership is reserved
@@ -726,7 +726,7 @@ impl ResourceValueValidation {
     }
 
     pub fn take_attribute(&mut self, name: &str) -> Option<ValueValidationFindings> {
-        self.attributes.remove(name)
+        self.attributes.shift_remove(name)
     }
 
     pub fn symbolic_errors(&self) -> impl Iterator<Item = (&str, &LeafPath, &TypeError)> {
@@ -4219,7 +4219,7 @@ impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
                     TypeError::UnknownStructField {
                         struct_name: name.clone(),
                         field: key.clone(),
-                        suggestion: suggest_similar_name(key, &known),
+                        suggestion: suggest_similar_name(key, &known, &[]),
                     },
                 ),
             };
@@ -4886,6 +4886,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn taking_an_attribute_preserves_remaining_symbolic_diagnostic_order() {
+        let mut report = ResourceValueValidation {
+            attributes: ["zulu", "alpha", "quartz", "bravo", "mango", "delta"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.to_owned(),
+                        ValueValidationFindings {
+                            symbolic: vec![SymbolicFinding::authored_hook(
+                                LeafPath::from_segments([]),
+                                TypeError::UnknownAttribute {
+                                    name: name.into(),
+                                    suggestion: None,
+                                },
+                            )],
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(report.take_attribute("alpha").is_some());
+        assert_eq!(
+            report
+                .symbolic_errors()
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>(),
+            ["zulu", "quartz", "bravo", "mango", "delta"],
+        );
+    }
+
+    #[test]
     fn round7_symbolic_coverage_preserves_distinct_ordinary_findings() {
         let path = LeafPath::from_segments([]);
         let ordinary = TypeError::MissingRequired {
@@ -4900,7 +4933,7 @@ mod tests {
                 (0, ("input".into(), path.clone())),
                 (1, ("input".into(), path.clone())),
             ]),
-            attributes: HashMap::from([(
+            attributes: indexmap::IndexMap::from([(
                 "input".into(),
                 ValueValidationFindings {
                     symbolic: vec![SymbolicFinding::authored_hook(path, hook)],
@@ -4949,7 +4982,7 @@ mod tests {
             let report = ResourceValueValidation {
                 errors: vec![error.clone()],
                 error_paths: HashMap::from([(0, ("input".into(), path.clone()))]),
-                attributes: HashMap::from([(
+                attributes: indexmap::IndexMap::from([(
                     "input".into(),
                     ValueValidationFindings {
                         symbolic: vec![finding],
@@ -5881,7 +5914,7 @@ mod rootless_tests {
                     message: "VpcId rejects bad".into(),
                 })
             };
-            assert_eq!(schema.validate_with_origins_and_lookup::<crate::resource::NoPlaceholder, AbsoluteBindingAddress>(&HashMap::new(), &|_| false, &lookup), Ok(()));
+            assert_eq!(schema.validate_with_origins_and_lookup::<crate::resource::NoPlaceholder, AbsoluteBindingAddress>(&indexmap::IndexMap::new(), &|_| false, &lookup), Ok(()));
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 0,

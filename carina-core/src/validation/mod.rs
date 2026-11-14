@@ -809,8 +809,7 @@ impl std::error::Error for BindingUseFinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingUseReport {
     findings: Vec<BindingUseFinding>,
-    slot_findings:
-        Option<std::sync::Arc<HashSet<(crate::resource::ResourceId, crate::parser::AttributeKey)>>>,
+    slot_findings: Option<std::sync::Arc<HashSet<SlotFindingKey>>>,
 }
 
 impl std::fmt::Display for BindingUseReport {
@@ -896,15 +895,29 @@ pub enum ResolveFileError {
     Expansion(#[from] crate::resource::ExpansionError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SlotFindingKey {
+    Resource(crate::resource::ResourceId, crate::parser::AttributeKey),
+    Authored(
+        crate::parser::ResourcePrecheckIdentity,
+        crate::parser::AttributeKey,
+    ),
+}
 impl BindingUseReport {
     pub(crate) fn has_slot_finding(
         &self,
         resource: &crate::resource::ResourceId,
+        identity: Option<&crate::parser::ResourcePrecheckIdentity>,
         name: &str,
     ) -> bool {
         self.slot_findings
             .as_ref()
-            .is_some_and(|findings| findings.contains(&(resource.clone(), name.into())))
+            .is_some_and(|findings| match identity {
+                Some(identity) => {
+                    findings.contains(&SlotFindingKey::Authored(identity.clone(), name.into()))
+                }
+                None => findings.contains(&SlotFindingKey::Resource(resource.clone(), name.into())),
+            })
     }
 
     pub fn findings(&self) -> &[BindingUseFinding] {
@@ -1398,11 +1411,23 @@ fn binding_use_expression<'a, B: BindingAddress>(
             .for_resource(address.resource_id()),
         crate::parser::BindingUseOwner::ModuleArgument { .. } => Ok(context.expression_report),
     }?;
-    report.expression_in(&use_site.expression_instance, use_site.location())
+    match use_site.type_source {
+        crate::parser::BindingTypeSource::Binding => {
+            report.expression_in(&use_site.expression_instance, use_site.location())
+        }
+        crate::parser::BindingTypeSource::Conversion(node) => {
+            report.source_node(&use_site.expression_instance, node)
+        }
+        crate::parser::BindingTypeSource::MissingConversion => Err(
+            crate::parser::retained::MissingEvidence::new("conversion binding source node"),
+        ),
+    }
 }
 
 enum OrdinaryUseSource<'a> {
     Judged(crate::parser::retained::OrdinaryJudgedExpr<'a>),
+    Static(std::sync::Arc<crate::parser::retained::StaticSourceReceipt>),
+    WalkOwned,
     Missing(crate::parser::retained::MissingEvidence),
 }
 impl<'a> OrdinaryUseSource<'a> {
@@ -1415,6 +1440,11 @@ impl<'a> OrdinaryUseSource<'a> {
         match self {
             Self::Judged(source) => Ok(*source),
             Self::Missing(error) => Err(error.clone()),
+            Self::Static(_) | Self::WalkOwned => {
+                Err(crate::parser::retained::MissingEvidence::new(
+                    "carried source has a typed static owner",
+                ))
+            }
         }
     }
 }
@@ -1530,6 +1560,17 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
     ordinary_source: &OrdinaryUseSource<'_>,
 ) -> Result<(), BindingResolutionError> {
     let expected = sink.expression_type();
+    match ordinary_source {
+        OrdinaryUseSource::Static(receipt) => {
+            return receipt.binding_result(&expected).map_err(|error| {
+                BindingResolutionError::DeferredAccess(Box::new(
+                    DeferredAccessTypeError::InvalidAccess { error },
+                ))
+            });
+        }
+        OrdinaryUseSource::WalkOwned => return Ok(()),
+        OrdinaryUseSource::Judged(_) | OrdinaryUseSource::Missing(_) => {}
+    }
     let builtin_members = binding_use_expression(use_site, context).is_ok_and(|expression| {
         expression
             .for_sink(&expected, context.raw_provider_context())
@@ -1995,6 +2036,8 @@ fn binding_use_authority_owns_source(
         matches!(
             source.binding_diagnostic_owner(expected, &INTERPOLATION_REF_SINK, config),
             crate::parser::retained::BindingDiagnosticOwner::AuthoredExpression
+                | crate::parser::retained::BindingDiagnosticOwner::JudgedConversion(_)
+                | crate::parser::retained::BindingDiagnosticOwner::WalkOwnedConversion
         )
     }) {
         return false;
@@ -2142,18 +2185,7 @@ where
     };
 
     for record in file.bare_binding_uses().records() {
-        let evidence = match &record.authored.owner {
-            crate::parser::BindingUseOwner::Resource(address) => context
-                .expression_report
-                .for_resource(address.resource_id()),
-            crate::parser::BindingUseOwner::ModuleArgument { .. } => Ok(context.expression_report),
-        }
-        .and_then(|report| {
-            report.expression_in(
-                &record.authored.expression_instance,
-                record.authored.location(),
-            )
-        });
+        let evidence = binding_use_expression(&record.authored, context);
         let expected = file.expected_at_use(&record.authored, context);
         let ordinary_source = match evidence {
             Ok(expression) => {
@@ -2163,6 +2195,12 @@ where
                     &fallback,
                     context.raw_provider_context(),
                 ) {
+                    crate::parser::retained::BindingDiagnosticOwner::JudgedConversion(receipt) => {
+                        Some(OrdinaryUseSource::Static(receipt))
+                    }
+                    crate::parser::retained::BindingDiagnosticOwner::WalkOwnedConversion => {
+                        Some(OrdinaryUseSource::WalkOwned)
+                    }
                     crate::parser::retained::BindingDiagnosticOwner::AuthoredExpression => {
                         // Delegate only type admission. Structural/pending uses
                         // must still reach the ordinary bare-handle gate below.
@@ -2272,10 +2310,21 @@ where
                     std::sync::Arc::make_mut(
                         report.slot_findings.get_or_insert_with(Default::default),
                     )
-                    .insert((
-                        address.resource_id().clone(),
-                        finding.use_site.path.root_name(),
-                    ));
+                    .extend(
+                        std::iter::once(SlotFindingKey::Resource(
+                            address.resource_id().clone(),
+                            finding.use_site.path.root_name(),
+                        ))
+                        .chain(address.input_origin().map(|origin| {
+                            SlotFindingKey::Authored(
+                                crate::parser::ResourcePrecheckIdentity {
+                                    origin,
+                                    instance: finding.use_site.expression_instance.clone(),
+                                },
+                                finding.use_site.path.root_name(),
+                            )
+                        })),
+                    );
                 }
                 report.findings.push(finding);
             }

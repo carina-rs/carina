@@ -1310,6 +1310,7 @@ impl<B: BindingAddress> JudgedSlot<B> {
 /// Ordinary compatibility checks have no authority to reach these slots.
 #[derive(Debug, Clone)]
 pub struct NoAuthoredEvidence {
+    precheck: Option<crate::parser::ResourcePrecheckIdentity>,
     resource: crate::resource::ResourceId,
     slots: Vec<UnreachedSlot>,
 }
@@ -1326,6 +1327,7 @@ impl NoAuthoredEvidence {
         let resource = source.id();
         let slots = source.authored_slots();
         Self {
+            precheck: source.precheck_identity(),
             resource: resource.clone(),
             slots: slots
                 .into_iter()
@@ -1346,6 +1348,9 @@ impl NoAuthoredEvidence {
         }
     }
 
+    pub(crate) fn precheck_identity(&self) -> Option<crate::parser::ResourcePrecheckIdentity> {
+        self.precheck.clone()
+    }
     pub fn resource_id(&self) -> &crate::resource::ResourceId {
         &self.resource
     }
@@ -1564,6 +1569,7 @@ pub struct AuthoredSlots<B: BindingAddress = RelativeBindingName> {
     aliases: std::collections::HashMap<String, String>,
     synthetic: indexmap::IndexMap<String, SyntheticSource>,
     declaration: Option<SlotDeclarationId>,
+    input_origin: Option<SlotDeclarationId>,
 }
 // Admission metadata is not part of a resource's value semantics.
 impl<B: BindingAddress> PartialEq for AuthoredSlots<B> {
@@ -1584,6 +1590,7 @@ impl<B: BindingAddress> Default for AuthoredSlots<B> {
             aliases: Default::default(),
             synthetic: Default::default(),
             declaration: None,
+            input_origin: None,
         }
     }
 }
@@ -1604,6 +1611,12 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             .map(|slot| slot.generation)
             .reduce(ProjectionGeneration::latest)
     }
+    pub(crate) fn set_input_origin(&mut self, origin: Option<SlotDeclarationId>) {
+        self.input_origin = origin;
+    }
+    pub(crate) fn input_origin(&self) -> Option<SlotDeclarationId> {
+        self.input_origin.clone()
+    }
     pub(super) fn set_declaration(&mut self, declaration: SlotDeclarationId) {
         self.declaration = Some(declaration);
     }
@@ -1619,12 +1632,18 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             )
         })
     }
-    pub(crate) fn carries_conversion(&self, report: &ExpressionReport<B>) -> bool {
-        self.slots.values().any(|slot| {
-            slot.source_judgement_in(report)
-                .or_else(|_| slot.source_judgement())
-                .is_ok_and(JudgedExpr::contains_any_conversion)
-        })
+    pub(crate) fn carries_conversion(
+        &self,
+        report: &ExpressionReport<B>,
+    ) -> Result<bool, MissingEvidence> {
+        let mut carries = false;
+        for slot in self.slots.values() {
+            carries |= slot
+                .source_judgement_in(report)
+                .or_else(|_| slot.source_judgement())?
+                .contains_any_conversion();
+        }
+        Ok(carries)
     }
     pub fn get(&self, name: &str) -> Result<&JudgedSlot<B>, MissingEvidence> {
         self.slots
@@ -1736,6 +1755,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             aliases: self.aliases,
             synthetic: self.synthetic,
             declaration: self.declaration,
+            input_origin: self.input_origin,
             slots: self
                 .slots
                 .into_iter()

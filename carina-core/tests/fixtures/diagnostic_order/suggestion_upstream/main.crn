@@ -1,0 +1,2 @@
+let unused = up.hat
+mock.test.resource { name = "consumer" }

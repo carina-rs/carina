@@ -132,6 +132,22 @@ impl ProviderFactory for MeasuringFactory {
                 .validate()
                 .unwrap(),
         );
+        schemas.push(
+            ResourceSchema::new("NestedQuery")
+                .as_data_source()
+                .attribute(
+                    AttributeSchema::optional(
+                        "attr",
+                        AttributeType::struct_(
+                            "Nested",
+                            vec![StructField::optional("value", named()).build()],
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
         for (query, sink, destination) in [
             (
                 "AmbiguousQuery",
@@ -466,8 +482,22 @@ async fn deferred(case: DeferredCase, read: bool, resource_iterable: bool) {
         .await;
     if read {
         assert_eq!(result["validate"]["status"], "error", "{result}");
-        assert_eq!(conversion_count(&result["validate"]), 0, "{result}");
-        assert_eq!(lsp_conversion_count(&result["lsp"]), 0, "{result}");
+        // The ordinary finalizer still blocks every deferred read. Judge-owned
+        // static source failures can precede it, including in a stopped run.
+        let static_rejection = usize::from(
+            matches!(case, DeferredCase::LiteralKind)
+                || (resource_iterable && matches!(case, DeferredCase::WrongTarget)),
+        );
+        assert_eq!(
+            conversion_count(&result["validate"]),
+            static_rejection,
+            "{result}"
+        );
+        assert_eq!(
+            lsp_conversion_count(&result["lsp"]),
+            static_rejection,
+            "{result}"
+        );
         assert!(
             result["validate"]["errors"]
                 .as_array()
@@ -685,7 +715,28 @@ async fn r10_prefix_missing_value_reports_p3_on_cli_and_lsp() {
                 && e["message"] == "conversion cannot be checked here"),
         "{result}"
     );
-    assert_eq!(lsp_conversion_count(&result["lsp"]), 1, "{result}");
+    let plain = fixture
+        .observe(
+            "prefix-root-plain-control",
+            &source.replace(" as mock.PrefixName", ""),
+        )
+        .await;
+    let messages = |diagnostics: &Json| {
+        diagnostics
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic["message"].clone(),
+                    diagnostic["severity"].clone(),
+                    diagnostic["code"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(messages(&result["lsp"]), messages(&plain["lsp"]));
+    assert_eq!(lsp_conversion_count(&result["lsp"]), 0, "{result}");
     assert_eq!(result["plan"]["ok"], false, "{result}");
 }
 
@@ -719,7 +770,28 @@ async fn reinstanced_prefix(module: bool) {
     );
     assert_eq!(conversion_count(&result["validate"]), 1, "{result}");
     if !module {
-        assert_eq!(lsp_conversion_count(&result["lsp"]), 1, "{result}");
+        let plain = fixture
+            .observe(
+                "prefix-loop-plain-control",
+                &source.replace(" as mock.PrefixName", ""),
+            )
+            .await;
+        let messages = |diagnostics: &Json| {
+            diagnostics
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|diagnostic| {
+                    (
+                        diagnostic["message"].clone(),
+                        diagnostic["severity"].clone(),
+                        diagnostic["code"].clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(messages(&result["lsp"]), messages(&plain["lsp"]));
+        assert_eq!(lsp_conversion_count(&result["lsp"]), 0, "{result}");
     }
 }
 #[tokio::test]
@@ -858,7 +930,7 @@ fn binary_seed(fixture: &Fixture, source: &str) {
 }
 
 #[test]
-fn r10_read_only_managed_calls_do_not_dispatch_authored_attributes() {
+fn r11_read_only_managed_calls_block_judge_conversion_failures() {
     let fixture = Fixture::new();
     binary_seed(
         &fixture,
@@ -882,10 +954,20 @@ fn r10_read_only_managed_calls_do_not_dispatch_authored_attributes() {
             .replace(fixture.path().to_str().unwrap(), "<fixture>")
     );
     assert_eq!(validate["ok"], false, "{observation}");
-    assert_eq!(refresh["ok"], true, "{observation}");
-    assert_eq!(destroy["ok"], true, "{observation}");
-    assert!(refresh_ops.contains("read "), "{observation}");
-    assert!(destroy_ops.contains("delete "), "{observation}");
+    assert_eq!(refresh["ok"], false, "{observation}");
+    assert_eq!(destroy["ok"], false, "{observation}");
+    assert!(refresh_ops.is_empty(), "{observation}");
+    assert!(destroy_ops.is_empty(), "{observation}");
+    fixture.write("main.crn", &source.replace(" as Int", ""));
+    let plain_refresh = binary(&fixture, &["state", "refresh", "--lock=false"]);
+    assert_eq!(plain_refresh["ok"], true, "{plain_refresh}");
+    let plain_destroy = binary(&fixture, &["destroy", "--auto-approve", "--lock=false"]);
+    assert_eq!(plain_destroy["ok"], true, "{plain_destroy}");
+    let plain_ops = std::fs::read_to_string(fixture.path().join("provider-ops.log")).unwrap();
+    assert!(
+        plain_ops.contains("read ") && plain_ops.contains("delete "),
+        "{plain_ops}"
+    );
     assert!(
         !refreshed_state.contains("AUTHORED-UNJUDGED-R10"),
         "{observation}"
@@ -930,6 +1012,9 @@ fn r10_state_refresh_cannot_dispatch_an_unjudged_data_source_argument() {
             .replace(fixture.path().to_str().unwrap(), "<fixture>")
     );
     assert_eq!(validate["ok"], false, "{observation}");
+    assert_eq!(refresh["ok"], false, "{observation}");
+    assert_eq!(destroy["ok"], false, "{observation}");
+    assert!(destroy_ops.is_empty(), "{observation}");
     assert!(
         !operations
             .lines()
@@ -1001,5 +1086,94 @@ async fn r10_known_iterable_read_reaches_live_conversion_admission() {
                 "{result}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn r11_reinstanced_bare_operand_has_only_its_ordinary_slot_precheck() {
+    let fixture = Fixture::new();
+    let source = "let p = mock.Source {}\nlet sinks = for n in ['a', 'b'] { mock.Sink { attr = p as mock.Name } }\n";
+    let measured = fixture
+        .observe("r11-reinstanced-bare-operand", source)
+        .await;
+    assert_eq!(measured["validate"]["status"], "error", "{measured}");
+    assert_eq!(conversion_count(&measured["validate"]), 0, "{measured}");
+    assert_eq!(lsp_conversion_count(&measured["lsp"]), 0, "{measured}");
+    assert!(
+        measured["lsp"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["message"]
+                .as_str()
+                .unwrap()
+                .contains("is a resource, not a value")),
+        "{measured}"
+    );
+    let twin = fixture
+        .observe(
+            "r11-reinstanced-bare-plain",
+            &source.replace(" as mock.Name", ""),
+        )
+        .await;
+    let ordinary = |findings: &Json| {
+        findings
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| {
+                finding["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("is a resource, not a value")
+            })
+            .map(|finding| {
+                (
+                    finding["message"].clone(),
+                    finding["code"].clone(),
+                    finding["severity"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ordinary(&measured["validate"]["errors"]),
+        ordinary(&twin["validate"]["errors"])
+    );
+    assert_eq!(ordinary(&measured["lsp"]), ordinary(&twin["lsp"]));
+}
+
+#[tokio::test]
+async fn r11_main_deferred_read_plain_whole_and_nested_references_are_blocked_by_finalization() {
+    let fixture = Fixture::new();
+    fixture.upstream(false);
+    for body in [
+        "read mock.Query { attr = n }",
+        "read mock.NestedQuery { attr = { value = n } }",
+    ] {
+        let source = format!(
+            "let up = upstream_state {{ source = './up' }}\nlet outputs = for n in up.names {{ {body} }}\n"
+        );
+        let observed = fixture
+            .observe("main-deferred-read-plain-reference", &source)
+            .await;
+        assert_eq!(observed["validate"]["status"], "error", "{observed}");
+        assert_eq!(conversion_count(&observed["validate"]), 0);
+        assert_eq!(lsp_conversion_count(&observed["lsp"]), 0);
+        for findings in [&observed["validate"]["errors"], &observed["lsp"]] {
+            assert!(
+                findings
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| finding["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("only a managed resource body can be deferred until apply")),
+                "{observed}"
+            );
+        }
+        assert_eq!(observed["plan"]["ok"], false, "{observed}");
+        assert!(observed["plan"]["events"].as_array().unwrap().is_empty());
     }
 }

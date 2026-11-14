@@ -1272,7 +1272,7 @@ fn validate_known_provider_values(
         }
         ApplyAdmissionErrors::Constraints(report) => ProviderPreparationError::ValueConstraint {
             resource: Box::new(id.clone()),
-            errors: ProviderValueConstraintErrors::from_admission(report),
+            errors: ProviderValueConstraintErrors::from_admission(*report),
         },
     })
 }

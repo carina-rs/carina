@@ -209,7 +209,19 @@ fn conversion_discarded_union_claim_is_judged_once_and_covers_wrapped_leaf() {
         "conversion-carrying transports cannot mint an ordinary assignment proof"
     );
     assert!(findings.authored.errors.is_empty());
-    assert_eq!(findings.authored.conversions.findings().len(), 1);
+    assert_eq!(
+        findings.authored.conversions.findings().len(),
+        0,
+        "the walk reads the recorded rejection"
+    );
+    let presented =
+        crate::validation::ConversionValidation::<std::convert::Infallible>::new(judged.report())
+            .complete()
+            .into_presented();
+    assert_eq!(
+        crate::conversion::tests::conversion_errors(&presented).len(),
+        1
+    );
 }
 
 #[test]
@@ -241,7 +253,7 @@ fn conversion_does_not_reclassify_an_int_as_a_string_construction() {
     assert!(!view.is_single_string_construction());
     assert_eq!(
         expression.binding_diagnostic_owner(Some(&sink), &sink, &catalog),
-        BindingDiagnosticOwner::AuthoredExpression
+        BindingDiagnosticOwner::WalkOwnedConversion
     );
 }
 

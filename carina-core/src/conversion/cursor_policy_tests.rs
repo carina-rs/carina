@@ -427,70 +427,87 @@ fn conversion_discarded_union_rejects_ambiguous_identity() {
 }
 
 #[test]
-fn conversion_no_authored_evidence_cannot_admit_a_converted_slot() {
+fn r11_report_only_slot_reads_a_static_verdict_or_fails_closed() {
     let catalog = super::tests::catalog();
-    let schemas = schema();
-    let parsed = crate::parser::parse_file(
-        "let sink = mock.Sink { target = 'ok' as mock.Name }",
+    let mut schemas = schema();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Source")
+            .attribute(AttributeSchema::optional("output", named()).build())
+            .validate()
+            .unwrap(),
+    );
+    for (operand, expected) in [("'ok'", 0), ("p.output", 1)] {
+        let parsed = crate::parser::parse_file(
+        &format!("let p = mock.Source {{}}\nlet sink = mock.Sink {{ target = {operand} as mock.Name }}"),
         Path::new("b1.crn"),
         &catalog,
     )
     .unwrap()
     .resolve_root_for_test();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
-    let judged = configuration.judged();
-    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
-    let resource = tree.resources().next().unwrap();
-    let values = resource.resolved_attributes();
-    let inputs = crate::validation::admission::attributes::ResourceAttributeInputs::from_report(
-        resource,
-        &values,
-        judged.report(),
-    );
-    let classified = inputs.classify(
-        &crate::resource::knowledge::KnowledgeContext::validation(),
-        |_, _| {},
-    );
-    let bindings =
-        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        let mut validation: crate::validation::ConversionValidation =
-            crate::validation::ConversionValidation::new(judged.report());
-        let report = validation.admit_resource(
-            crate::validation::admission::attributes::ResourceAdmissionRequest {
-                resource,
-                parsed: judged.file(),
-                schema: resource.schema(&schemas).unwrap(),
-                attributes: &classified,
-                quoted: resource.quoted_string_attrs(),
-                inputs: &inputs,
-                bindings: &bindings,
-                session,
-                schemas: &schemas,
-            },
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree
+            .resources()
+            .find(|resource| resource.binding() == Some("sink"))
+            .unwrap();
+        let values = resource.attributes().into_owned();
+        let inputs = crate::validation::admission::attributes::ResourceAttributeInputs::from_report(
+            resource,
+            &values,
+            judged.report(),
         );
-        assert_eq!(report.errors().count(), 0, "{report:?}");
-        assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
+        let classified = inputs.classify(
+            &crate::resource::knowledge::KnowledgeContext::validation(),
+            |_, _| {},
+        );
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-            validation.admit_remaining_resources(
-                &tree,
-                judged,
-                &bindings,
-                session,
-                crate::validation::admission::attributes::SlotPrechecks::Unreported,
+            let mut validation: crate::validation::ConversionValidation =
+                crate::validation::ConversionValidation::new(judged.report());
+            let report = validation.admit_resource(
+                crate::validation::admission::attributes::ResourceAdmissionRequest {
+                    resource,
+                    parsed: judged.file(),
+                    schema: resource.schema(&schemas).unwrap(),
+                    attributes: &classified,
+                    quoted: resource.quoted_string_attrs(),
+                    inputs: &inputs,
+                    bindings: &bindings,
+                    session,
+                    schemas: &schemas,
+                },
+            );
+            assert_eq!(report.errors().count(), 0, "{report:?}");
+            assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
+            crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+                validation.admit_remaining_resources(
+                    &tree,
+                    judged,
+                    &bindings,
+                    session,
+                    crate::validation::admission::attributes::SlotPrechecks::Unreported,
+                );
+            });
+            let conversions = validation.complete().into_presented();
+            assert_eq!(
+                conversion_errors(&conversions).len(),
+                expected,
+                "{conversions:?}"
+            );
+            assert!(
+                !crate::test_utils::render_presented_for_test(&conversions)
+                    .contains("bug in carina")
             );
         });
-        let conversions = validation.complete().into_presented();
-        assert_eq!(conversion_errors(&conversions).len(), 1, "{conversions:?}");
-        assert!(
-            !crate::test_utils::render_presented_for_test(&conversions).contains("bug in carina")
-        );
-    });
+    }
 }
 
 #[test]
-fn round5_stale_authored_inputs_fail_through_the_conversion_proof() {
+fn r11_stale_projection_can_only_reuse_an_already_recorded_static_verdict() {
     use crate::validation::admission::attributes::ResourceAttributeInputs;
     let catalog = super::tests::catalog();
     let schemas = schema();
@@ -551,19 +568,7 @@ fn round5_stale_authored_inputs_fail_through_the_conversion_proof() {
                 assert_eq!(findings.symbolic_errors().count(), 0, "{findings:?}");
             });
             let presented = run.complete().into_presented();
-            assert_eq!(
-                conversion_errors(&presented).len(),
-                usize::from(converted),
-                "{presented:?}"
-            );
-            if converted {
-                assert!(
-                    conversion_errors(&presented)[0]
-                        .diagnostic_message()
-                        .contains("conversion cannot be checked here"),
-                    "{presented:?}"
-                );
-            }
+            assert_eq!(conversion_errors(&presented).len(), 0, "{presented:?}");
         }
     }
 }
@@ -640,7 +645,7 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                         crate::resource::ConcreteValue::String("ok".into()),
                     ),
                 };
-                let values = std::collections::HashMap::from([("target".into(), value)]);
+                let values = indexmap::IndexMap::from([("target".into(), value)]);
                 let inputs =
                     ResourceAttributeInputs::from_resolved(resource, &values, judged.report())
                         .unwrap();
@@ -694,7 +699,7 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                 let conversions = conversion_errors(&presented);
                 assert_eq!(
                     conversions.len(),
-                    usize::from(matches!(projection, Projection::Pending)),
+                    usize::from(!matches!(projection, Projection::Scalar)),
                     "map={map}, union={union}, {projection:?}: {presented:?}"
                 );
                 if let Some(conversion) = conversions.first() {
@@ -740,7 +745,7 @@ fn r9_syntax_with_values(
     projection: R9Projection,
 ) -> crate::validation::PresentedFindings {
     let values = match projection {
-        R9Projection::Pending => std::collections::HashMap::from([(
+        R9Projection::Pending => indexmap::IndexMap::from([(
             "target".into(),
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::PendingReRead(
@@ -992,7 +997,7 @@ fn r5b_pending_transport_requires_a_shape_compatible_destination() {
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
-        let values = std::collections::HashMap::from([(
+        let values = indexmap::IndexMap::from([(
             "target".into(),
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::PendingReRead(
@@ -1350,7 +1355,7 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
 }
 
 #[test]
-fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence() {
+fn r11_alias_uses_each_read_their_recorded_static_verdict() {
     use crate::validation::admission::attributes::ResourceAttributeInputs;
     let schemas = schema();
     let catalog = super::tests::catalog();
@@ -1371,7 +1376,7 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
             crate::validation::ConversionValidation::new(judged.report());
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             for resource in tree.resources() {
-                let values = resource.resolved_attributes();
+                let values = resource.attributes().into_owned();
                 let inputs = if resource.binding() == Some("second") {
                     ResourceAttributeInputs::from_report(resource, &values, judged.report())
                 } else {
@@ -1408,16 +1413,8 @@ fn conversion_one_authored_alias_use_cannot_cover_another_use_without_evidence()
             );
         });
         let conversions = validation.complete().into_presented();
-        assert_eq!(
-            conversions.len(),
-            usize::from(second == "converted"),
-            "{source}\n{conversions:?}"
-        );
-        assert_eq!(
-            conversion_errors(&conversions).len(),
-            usize::from(second == "converted"),
-            "{conversions:?}"
-        );
+        assert_eq!(conversions.len(), 0, "{source}\n{conversions:?}");
+        assert_eq!(conversion_errors(&conversions).len(), 0, "{conversions:?}");
         assert!(
             !crate::test_utils::render_presented_for_test(&conversions).contains("bug in carina")
         );
@@ -1634,7 +1631,7 @@ fn r7_no_as_opaque_pairing_keeps_main_validation_then_plan_field_error() {
     let proof =
         PlanResolved::try_from(value.knowledge(&KnowledgeContext::plan(&resolved)).unwrap())
             .unwrap();
-    let attributes = std::collections::HashMap::from([("target".into(), proof)]);
+    let attributes = indexmap::IndexMap::from([("target".into(), proof)]);
     let id = crate::resource::ResourceId::pending_with_provider("mock", "Sink", None);
     let catalog = super::tests::catalog();
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
@@ -1659,23 +1656,16 @@ fn r7_no_as_opaque_pairing_keeps_main_validation_then_plan_field_error() {
 }
 
 #[test]
-fn r9_authored_slot_without_a_value_fails_closed_unless_conversion_free() {
-    for converted in [false, true] {
-        let expression = if converted {
-            "'ok' as mock.Name"
-        } else {
-            "'ok'"
-        };
+fn r11_omitted_value_does_not_add_p3_after_a_judge_verdict() {
+    for expression in ["'ok'", "'ok' as mock.Name", "42 as mock.Name"] {
         let presented = r9_syntax_with_values(expression, named(), R9Projection::Absent);
         let conversions = conversion_errors(&presented);
-        assert_eq!(conversions.len(), usize::from(converted), "{presented:?}");
+        let expected = usize::from(expression.starts_with("42"));
+        assert_eq!(conversions.len(), expected, "{presented:?}");
         if let Some(error) = conversions.first() {
-            assert_eq!(
-                error.diagnostic_message(),
-                "conversion cannot be checked here"
-            );
+            assert_eq!(error.kind(), ConversionErrorKind::ScalarKind);
         }
-        assert_eq!(presented.len(), usize::from(converted), "{presented:?}");
+        assert_eq!(presented.len(), expected, "{presented:?}");
     }
 }
 
@@ -1711,7 +1701,7 @@ fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
-        let values = std::collections::HashMap::from([(
+        let values = indexmap::IndexMap::from([(
             "target".into(),
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::PendingReRead(
@@ -1791,7 +1781,7 @@ fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
             .unwrap(),
     )
     .unwrap();
-    let attributes = std::collections::HashMap::from([("target".into(), proof)]);
+    let attributes = indexmap::IndexMap::from([("target".into(), proof)]);
     let id = crate::resource::ResourceId::pending_with_provider("mock", "Sink", None);
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         let findings = crate::validation::admission::attributes::admit_plan_attributes::<
@@ -1816,4 +1806,119 @@ fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
             "{errors:?}"
         );
     });
+}
+
+#[test]
+fn r11_judge_owned_static_conversion_failures_do_not_require_admission() {
+    let catalog = super::tests::catalog();
+    let mut results = Vec::new();
+    for (expression, destination, kind) in [
+        ("'ok' as Int", named(), ConversionErrorKind::Target),
+        (
+            "'ok' as mock.Other",
+            named(),
+            ConversionErrorKind::Destination,
+        ),
+        ("7 as mock.Name", named(), ConversionErrorKind::ScalarKind),
+        ("['ok'] as mock.Name", named(), ConversionErrorKind::Source),
+        (
+            "'ok' as mock.Name",
+            AttributeType::union(vec![named(), named()]),
+            ConversionErrorKind::AmbiguousDestination,
+        ),
+    ] {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Sink")
+                .attribute(AttributeSchema::optional("target", destination).build())
+                .validate()
+                .unwrap(),
+        );
+        let source = format!("mock.Sink {{ target = {expression} }}");
+        let parsed = crate::parser::parse_file(&source, Path::new("judge-owned.crn"), &catalog)
+            .unwrap()
+            .resolve_root_for_test();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        // No resource admission walk: read-only and stopped runs still own
+        // exactly main's Judge findings before a provider may be dispatched.
+        let presented = crate::validation::ConversionValidation::<std::convert::Infallible>::new(
+            configuration.judged().report(),
+        )
+        .complete()
+        .into_presented();
+        let errors = conversion_errors(&presented);
+        println!("R11-JUDGE source={source}; findings={presented:?}");
+        results.push((source, errors.len() == 1 && errors[0].kind() == kind));
+    }
+    assert!(
+        results.iter().all(|(_, correct)| *correct),
+        "static verdict missing without resource admission: {results:?}"
+    );
+}
+
+#[test]
+fn r11_walk_consumes_a_judge_verdict_without_resolving_the_target_again() {
+    use crate::parser::retained::{AuthoredCursor, conversion::check as policy};
+    use crate::schema::value_validation::{AuthoredOutcome, CheckValue};
+    use crate::validation::admission::kind::ResourceAttribute;
+    let catalog = super::tests::catalog();
+    let schemas = schema();
+    for (operand, accepted) in [("'ok'", true), ("42", false)] {
+        let parsed = crate::parser::parse_file(
+            &format!("mock.Sink {{ target = {operand} as mock.Name }}"),
+            Path::new("static-replay.crn"),
+            &catalog,
+        )
+        .unwrap()
+        .resolve_root_for_test();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let destination = resource.schema(&schemas).unwrap();
+        let declaration = destination
+            .schema()
+            .as_schema()
+            .attributes()
+            .get("target")
+            .unwrap()
+            .parts()
+            .attr_type;
+        let cursor =
+            AuthoredCursor::authored(resource.authored_slot("target").unwrap().cursor().unwrap());
+        let values = resource.attributes();
+        // This catalog cannot resolve mock.Name. A recomputation would either
+        // reject the accepted case or emit a second target finding.
+        let empty = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let verdict = policy::<ResourceAttribute, _, _>(
+            declaration,
+            CheckValue::Current(&values["target"]),
+            &crate::schema::LeafPath::from_segments([]),
+            cursor.clone(),
+            destination.schema().as_schema().defs(),
+            &empty,
+        )
+        .unwrap();
+        let witness = match verdict {
+            AuthoredOutcome::Claimed(witness) => witness,
+            AuthoredOutcome::Continue(_, _) | AuthoredOutcome::Transport(_) => {
+                panic!("the Convert needs a verdict")
+            }
+            AuthoredOutcome::Deferred(never) => match never {},
+        };
+        let result = witness.consume(declaration, &cursor).unwrap().decide(
+            |findings, _owner| (true, findings.conversions.findings().len()),
+            |findings| (false, findings.conversions.findings().len()),
+        );
+        assert_eq!(result, (accepted, 0));
+        let presented = crate::validation::ConversionValidation::<std::convert::Infallible>::new(
+            judged.report(),
+        )
+        .complete()
+        .into_presented();
+        assert_eq!(conversion_errors(&presented).len(), usize::from(!accepted));
+    }
 }

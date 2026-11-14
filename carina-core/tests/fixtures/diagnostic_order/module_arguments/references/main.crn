@@ -1,0 +1,9 @@
+let x = choice {
+  flag = true
+  zulu_ref = missing_zulu.name
+  alpha_ref = missing_alpha.name
+  quartz_ref = missing_quartz.name
+  bravo_ref = missing_bravo.name
+  mango_ref = missing_mango.name
+  delta_ref = missing_delta.name
+}

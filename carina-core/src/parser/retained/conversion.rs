@@ -2,12 +2,16 @@
 
 pub(crate) mod diagnostic;
 pub(crate) mod flow;
+mod static_source;
+pub(in crate::parser::retained) use static_source::{ConversionTypeJudgement, StaticVerdict};
 
 use super::*;
 use crate::schema::value_validation::{AssignmentFindings, AuthoredOutcome, CheckValue};
 use crate::schema::{AttrTypeKind, CompiledAttributeType, LeafPath, RefinedScalarKind, TypeError};
 use crate::validation::admission::DestinationKind;
-use diagnostic::{ConversionError, ConversionErrorKind as Kind, DeclarationBounds};
+use diagnostic::{
+    ConversionError, ConversionErrorKind as Kind, ConversionTypePath, DeclarationBounds,
+};
 
 /// Reasons a syntax child has no assignable declaration. This decision does
 /// not inspect its value, in either pending or discarded visits.
@@ -304,6 +308,9 @@ impl ConversionVerdict {
     }
     /// The same proof failure as a validation projection without navigation.
     pub(crate) fn unavailable_source(source: &JudgedExpr) -> crate::ConversionChannel {
+        if source.statically_checked() {
+            return Default::default();
+        }
         match source.conversion_evidence() {
             ConversionEvidence::Free(_proof) => Default::default(),
             ConversionEvidence::Carried(carried) => Self::unavailable_conversion(source, carried),
@@ -664,7 +671,32 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                             source: source.judgement_stamp(),
                         },
                         location: site.location.clone(),
-                        verdict: ConversionVerdict::unchecked(source, carried),
+                        verdict: match source.conversion_type_judgement() {
+                            Some(record) => match record.owner(declaration) {
+                                static_source::StaticOwner::JudgedStatically(verdict) => verdict
+                                    .consume::<K>(
+                                        path,
+                                        static_source::SourceKnowledge::at(checked, source),
+                                        static_source::VerdictOrigin::Judge,
+                                    ),
+                                static_source::StaticOwner::WalkOwned => {
+                                    ConversionVerdict::unchecked(source, carried)
+                                }
+                                static_source::StaticOwner::Missing(error) => {
+                                    ConversionVerdict::invalid_witness(error)
+                                }
+                            },
+                            None => match source.static_rejection() {
+                                Some(_rejection) => ConversionVerdict(Box::new(
+                                    Decision::Rejected(AssignmentFindings {
+                                        claim_effect:
+                                            crate::schema::value_validation::ClaimEffect::Rejected,
+                                        ..Default::default()
+                                    }),
+                                )),
+                                None => ConversionVerdict::unchecked(source, carried),
+                            },
+                        },
                     }));
                 }
             }
@@ -687,10 +719,9 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
         ));
     }
     match node.kind() {
-        ExprKind::Convert { target, .. } => {
-            let discarded = match checked {
-                CheckValue::Current(_) | CheckValue::Pending => false,
-                CheckValue::Discarded => true,
+        ExprKind::Convert { .. } => {
+            match checked {
+                CheckValue::Current(_) | CheckValue::Pending | CheckValue::Discarded => {}
                 CheckValue::Covered => {
                     return Ok(rejection(
                         &usage,
@@ -699,7 +730,7 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                         "conversion is not supported inside this expression",
                     ));
                 }
-            };
+            }
             if usage.placement_edge() == EdgeRole::ConvertOperand {
                 return Ok(rejection(
                     &usage,
@@ -747,90 +778,30 @@ pub(crate) fn check<K: DestinationKind, P: crate::resource::PlaceholderKind, B: 
                     "a conversion cannot be the operand of another conversion",
                 ));
             }
-            let mut matched_destination = false;
-            let result = (|| {
-                let target =
-                    diagnostic::resolve_target(target.detail(), &node.location().authored, config)
-                        .map_err(|failure| failure.owned_by(node.node_id()))?;
-                let resolved = crate::schema::value_validation::resolve_assignment_declaration(
-                    declaration,
-                    defs,
-                )
-                .map_err(|cause| {
-                    ConversionError::destination(&node.location().authored, node.node_id(), cause)
-                })?;
-                let selected = destination(resolved, &target, defs).map_err(|kind| {
-                    error(
-                        node,
-                        kind,
-                        "conversion destination must have exactly one matching type identity",
-                    )
-                })?;
-                matched_destination = true;
-                let message = if discarded {
-                    "discarded conversion operand has an incompatible scalar kind"
-                } else {
-                    "conversion operand has no compatible scalar source judgement"
-                };
-                let source_type = check_scalar_kind(selected, source)
-                    .map_err(|kind| error(node, kind, message))?;
-                if discarded {
-                    return Ok(AssignmentFindings::default());
-                }
-                let known_value =
-                    matches!(checked, CheckValue::Current(Value::Concrete(_))) || source.concrete();
-                if matches!(resolved.kind(), AttrTypeKind::Union(_)) && !known_value {
-                    return Err(error(
-                        node,
-                        Kind::UnsupportedPosition,
-                        "conversion of an unknown value under a union destination is not supported yet",
-                    ));
-                }
-                if let TypeExpr::SchemaType { owned } = source_type {
-                    let source_declaration =
-                        diagnostic::source_declaration(owned, &node.location().authored, config)
-                            .map_err(|failure| failure.owned_by(node.node_id()))?;
-                    if let Some(bounds) = DeclarationBounds::from_declaration(selected)
-                        && DeclarationBounds::from_declaration(&source_declaration)
-                            .is_some_and(|source| source.disjoint(&bounds))
-                    {
-                        return Err(error(
-                            node,
-                            Kind::Disjoint,
-                            "conversion source and destination declaration bounds are disjoint",
-                        ));
-                    }
-                }
-                Ok(crate::validation::admission::conversion_local::<K>(path))
-            })();
-            Ok(match result {
-                Ok(mut findings) => {
-                    findings.matched_destination = true;
-                    claimed(
-                        &usage,
-                        declaration,
-                        ConversionVerdict(Box::new(Decision::Accepted(
-                            findings,
-                            AcceptedConversion {
-                                node: node.node_id(),
-                                location: node.location().authored,
-                                secret: node.judgement().diagnostic_is_secret(),
-                            },
-                        ))),
-                    )
-                }
-                Err(failure) => rejected(
+            use static_source::{SourceKnowledge, StaticOwner};
+            let knowledge = SourceKnowledge::at(checked, source);
+            let Some(record) = node.judgement().conversion_type_judgement() else {
+                return Ok(rejection(
                     &usage,
                     declaration,
-                    if node.judgement().diagnostic_is_secret() {
-                        failure.inside_secret()
-                    } else {
-                        failure
-                    },
-                    matched_destination,
-                ),
-            })
+                    Kind::Source,
+                    "conversion has no static source judgement",
+                ));
+            };
+            let verdict = match record.owner(declaration) {
+                StaticOwner::WalkOwned => record
+                    .check_walk(source, declaration, defs, config, knowledge)
+                    .consume::<K>(path, knowledge, static_source::VerdictOrigin::Walk),
+                StaticOwner::JudgedStatically(verdict) => {
+                    verdict.consume::<K>(path, knowledge, static_source::VerdictOrigin::Judge)
+                }
+                StaticOwner::Missing(error) => {
+                    return Ok(rejected(&usage, declaration, error, false));
+                }
+            };
+            Ok(claimed(&usage, declaration, verdict))
         }
+
         ExprKind::If | ExprKind::Coalesce => {
             if !node.judgement().contains_any_conversion() {
                 return Ok(pass(&usage, declaration));

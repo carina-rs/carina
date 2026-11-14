@@ -1,0 +1,6 @@
+let zulu = choice { value = "zulu" }
+let alpha = choice { value = "alpha" }
+let quartz = choice { value = "quartz" }
+let bravo = choice { value = "bravo" }
+let mango = choice { value = "mango" }
+let delta = choice { value = "delta" }

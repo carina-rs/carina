@@ -1,0 +1,2 @@
+fn alpha(): String { "alpha" }
+fn zebra(): Int { 1 }

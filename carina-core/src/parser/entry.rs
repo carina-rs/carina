@@ -766,7 +766,7 @@ pub(crate) fn parse_with_seeded_bindings(
 pub(crate) fn top_level_user_functions(
     input: &str,
     config: &ProviderContext,
-) -> Result<HashMap<String, UserFunction>, ParseError> {
+) -> Result<IndexMap<String, UserFunction>, ParseError> {
     resolve_top_level_user_functions(&[(Path::new("test.crn"), input)], config)
 }
 
@@ -778,7 +778,7 @@ pub(crate) fn top_level_user_functions(
 pub(crate) fn top_level_user_functions_in_files(
     files: &[(PathBuf, String)],
     config: &ProviderContext,
-) -> Result<HashMap<String, UserFunction>, ParseError> {
+) -> Result<IndexMap<String, UserFunction>, ParseError> {
     let sources = files
         .iter()
         .map(|(path, input)| (path.as_path(), input.as_str()))
@@ -789,10 +789,10 @@ pub(crate) fn top_level_user_functions_in_files(
 fn resolve_top_level_user_functions(
     sources: &[(&Path, &str)],
     config: &ProviderContext,
-) -> Result<HashMap<String, UserFunction>, ParseError> {
+) -> Result<IndexMap<String, UserFunction>, ParseError> {
     // Preserve the old directory behavior for duplicate names: a later file
     // owns the seed, while two declarations in the same file are an error.
-    let mut owners = HashMap::<String, usize>::new();
+    let mut owners = IndexMap::<String, usize>::new();
     for (source_index, (path, input)) in sources.iter().enumerate() {
         let preprocessed_file =
             super::preprocess_file(input).map_err(|error| locate_function_error(error, path))?;
@@ -833,7 +833,7 @@ fn resolve_top_level_user_functions(
 
     let mut pending = owners.keys().cloned().collect::<HashSet<_>>();
     let Some((initial_path, initial_input)) = sources.first() else {
-        return Ok(HashMap::new());
+        return Ok(IndexMap::new());
     };
     let initial_file = Arc::new(
         super::preprocess_file(initial_input)
@@ -915,7 +915,15 @@ fn resolve_top_level_user_functions(
         }
     }
 
-    Ok(functions)
+    // Resolution follows dependencies. Each name keeps its first declaration's
+    // slot in sorted-file order; duplicates use the later file's definition.
+    Ok(owners
+        .into_keys()
+        .map(|name| {
+            let function = functions.remove(&name).expect("resolved function");
+            (name, function)
+        })
+        .collect())
 }
 
 fn locate_function_error(error: ParseError, path: &Path) -> ParseError {
@@ -955,7 +963,7 @@ pub(crate) fn parse_with_directory_context(
     source_file: &std::path::Path,
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
-    user_functions: &HashMap<String, UserFunction>,
+    user_functions: &IndexMap<String, UserFunction>,
     bindings_fully_classified: bool,
 ) -> Result<ParsedFile, super::resolve::RootInputFailure> {
     parse_with_seeded_bindings_inner(
@@ -972,7 +980,7 @@ fn parse_with_seeded_bindings_inner(
     input: &str,
     config: &ProviderContext,
     seeds: &[BindingSeed<'_>],
-    seeded_user_functions: &HashMap<String, UserFunction>,
+    seeded_user_functions: &IndexMap<String, UserFunction>,
     bindings_fully_classified: bool,
     source_file: &std::path::Path,
 ) -> Result<ParsedFile, super::resolve::RootInputFailure> {

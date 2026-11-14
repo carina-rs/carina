@@ -1039,3 +1039,87 @@ pub const NON_CONTEXT_RULES: &[(&str, &str)] = &[
         "lexical/type/address token or structural envelope; its expression children are classified separately",
     ),
 ];
+
+/// Static source-type ownership examples; both forms have a wrong source for
+/// mock.Name, and the converted form names the distinct loaded mock.Other.
+#[derive(Clone, Copy, Debug)]
+pub enum OwnerPosition {
+    BareBinding,
+    AliasOperand,
+    ModuleInstance,
+    KnownIterableRead,
+    DeferredManaged,
+    DeferredReadGuard,
+    NestedReference,
+}
+pub const OWNER_POSITIONS: [OwnerPosition; 7] = [
+    OwnerPosition::BareBinding,
+    OwnerPosition::AliasOperand,
+    OwnerPosition::ModuleInstance,
+    OwnerPosition::KnownIterableRead,
+    OwnerPosition::DeferredManaged,
+    OwnerPosition::DeferredReadGuard,
+    OwnerPosition::NestedReference,
+];
+impl OwnerPosition {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BareBinding => "bare-binding-operand",
+            Self::AliasOperand => "alias-operand",
+            Self::ModuleInstance => "module-instance",
+            Self::KnownIterableRead => "known-iterable-read",
+            Self::DeferredManaged => "managed-deferred-template",
+            Self::DeferredReadGuard => "deferred-read-ordinary-guard",
+            Self::NestedReference => "nested-reference-leaf",
+        }
+    }
+    pub fn fixture(self, converted: bool) -> Fixture {
+        let cast = |operand: &str| {
+            if converted {
+                format!("{operand} as mock.Other")
+            } else {
+                operand.to_owned()
+            }
+        };
+        let source = match self {
+            Self::BareBinding => {
+                format!("let value = 7\nmock.Sink {{ attr = {} }}\n", cast("value"))
+            }
+            Self::AliasOperand => format!(
+                "let value = 7\nlet alias = {}\nmock.Sink {{ attr = alias }}\n",
+                cast("value")
+            ),
+            Self::ModuleInstance => {
+                "let child = use { source = './child' }\nlet instance = child { value = 7 }\n"
+                    .into()
+            }
+            Self::KnownIterableRead => format!(
+                "let results = for n in [7] {{ read mock.Query {{ attr = {} }} }}\n",
+                cast("n")
+            ),
+            Self::DeferredManaged => format!(
+                "let p = mock.Source {{}}\nlet results = for n in p.items {{ mock.Sink {{ attr = {} }} }}\n",
+                cast("7")
+            ),
+            Self::DeferredReadGuard => format!(
+                "let p = mock.Source {{}}\nlet results = for n in p.items {{ read mock.Query {{ attr = {} }} }}\n",
+                cast("7")
+            ),
+            Self::NestedReference => format!(
+                "let p = mock.Source {{ number = 7 }}\nmock.Sink {{ config = {{ value = {} }} }}\n",
+                cast("p.number")
+            ),
+        };
+        let mut fixture = Fixture::source(source);
+        if matches!(self, Self::ModuleInstance) {
+            fixture.files.insert(
+                "child/main.crn".into(),
+                format!(
+                    "arguments {{ value: Int }}\nmock.Sink {{ attr = {} }}\n",
+                    cast("value")
+                ),
+            );
+        }
+        fixture
+    }
+}

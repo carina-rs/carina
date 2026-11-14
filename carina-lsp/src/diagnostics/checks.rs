@@ -1090,12 +1090,14 @@ impl DiagnosticRun<'_> {
         // This is a projected provider-value query, not authored admission.
         // It returns only provider finalization errors and publishes no AST
         // findings from its deliberately separate metadata parse.
-        let module_resolution = carina_core::module_resolver::resolve_modules_with_config(
-            merged.clone(),
-            base_path,
-            self.provider_context,
-            &self.schemas,
-        );
+        let module_resolution =
+            carina_core::module_resolver::resolve_modules_with_config_and_overrides(
+                merged.clone(),
+                base_path,
+                self.provider_context,
+                &self.schemas,
+                &overrides,
+            );
         if let Ok(graph) = module_resolution {
             let mut resolved = graph;
             if let Err(error) =
@@ -1953,7 +1955,7 @@ impl DiagnosticRun<'_> {
                             let known_attrs: Vec<&str> =
                                 known_attributes.iter().map(String::as_str).collect();
                             let suggestion =
-                                suggest_similar_name(&diagnostic_attribute, &known_attrs)
+                                suggest_similar_name(&diagnostic_attribute, &known_attrs, &[])
                                     .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
                                     .unwrap_or_default();
                             format!(
@@ -1975,9 +1977,10 @@ impl DiagnosticRun<'_> {
                                 .attribute_location(&diagnostic_binding, &diagnostic_attribute);
                             let known_attrs: Vec<&str> =
                                 known_attributes.iter().map(String::as_str).collect();
-                            let suffix = suggest_similar_name(&diagnostic_attribute, &known_attrs)
-                                .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
-                                .unwrap_or_else(|| ".".to_string());
+                            let suffix =
+                                suggest_similar_name(&diagnostic_attribute, &known_attrs, &[])
+                                    .map(|suggestion| format!(". Did you mean '{}'?", suggestion))
+                                    .unwrap_or_else(|| ".".to_string());
                             format!(
                                 "Unknown attribute '{}' on '{}'{}",
                                 diagnostic_attribute, diagnostic_binding, suffix,

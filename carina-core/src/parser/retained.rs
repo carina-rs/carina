@@ -69,9 +69,11 @@ pub(crate) use cursor::{
 
 /// The existing authored walk owns source diagnostics for expressions that
 /// require its policy. This is diagnostic ownership, not an admission proof.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BindingDiagnosticOwner<'a> {
     OrdinarySource(OrdinaryJudgedExpr<'a>),
+    JudgedConversion(Arc<StaticSourceReceipt>),
+    WalkOwnedConversion,
     AuthoredExpression,
 }
 
@@ -387,6 +389,50 @@ impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
             | AuthoredChildRoles::Computed
             | AuthoredChildRoles::Function { .. }
             | AuthoredChildRoles::Sink { .. } => None,
+        }
+    }
+    fn is_bare_source(&self) -> bool {
+        match &self.kind {
+            ExprKind::Binding(_) => true,
+            ExprKind::Alias | ExprKind::Parens | ExprKind::Definition => {
+                match self.children.as_slice() {
+                    [child] => child.authored.is_bare_source(),
+                    [] | [_, _, ..] => false,
+                }
+            }
+            ExprKind::Scalar(_)
+            | ExprKind::Parameter(_)
+            | ExprKind::LoopSlot(_)
+            | ExprKind::UntypedParameter
+            | ExprKind::Reference { .. }
+            | ExprKind::List
+            | ExprKind::Map(_)
+            | ExprKind::NestedBlock { .. }
+            | ExprKind::Interpolation { .. }
+            | ExprKind::EmptyInterpolation
+            | ExprKind::Secret
+            | ExprKind::Call(_)
+            | ExprKind::Function { .. }
+            | ExprKind::Sequence
+            | ExprKind::Access(_)
+            | ExprKind::Integer { .. }
+            | ExprKind::Convert { .. }
+            | ExprKind::Coalesce
+            | ExprKind::Element
+            | ExprKind::Iterable
+            | ExprKind::Resource { .. }
+            | ExprKind::Sink { .. }
+            | ExprKind::If
+            | ExprKind::For
+            | ExprKind::Wait
+            | ExprKind::Compose
+            | ExprKind::DynamicAccess
+            | ExprKind::ModuleCall
+            | ExprKind::Boolean
+            | ExprKind::Declaration
+            | ExprKind::RequireCondition(_)
+            | ExprKind::ProviderDeclaration
+            | ExprKind::Unsupported(_) => false,
         }
     }
     fn sink_value(&self) -> Option<&ExprValue<P, B>> {
@@ -1763,6 +1809,14 @@ impl CapturedNodes {
             }
         }
     }
+    pub(in crate::parser) fn resource_declaration(
+        &self,
+        pair: &Pair<'_, Rule>,
+    ) -> Option<SlotDeclarationId> {
+        self.resource_declarations
+            .get(&self.node_id(pair)?)
+            .cloned()
+    }
     pub(in crate::parser) fn node_id(&self, pair: &Pair<'_, Rule>) -> Option<NodeId> {
         self.get(&ParseNodeKey::of(pair)).map(ExprValue::node_id)
     }
@@ -2905,6 +2959,8 @@ pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
 pub use conversion::flow::{ConversionRejection, SinkRejection};
 mod judgement {
     #[cfg(test)]
+    mod diagnostic_order_tests;
+    #[cfg(test)]
     mod round2_tests;
 
     use super::*;
@@ -3299,6 +3355,9 @@ mod judgement {
         member: Option<Arc<JudgedExpr>>,
         elements: Arc<Vec<JudgedExpr>>,
         fields: Arc<crate::parser::ConfigurationAttributes<JudgedExpr>>,
+        converted: Option<Arc<conversion::ConversionTypeJudgement>>,
+        structural_source: bool,
+        static_source: Option<Arc<StaticSourceReceipt>>,
     }
 
     impl std::fmt::Debug for JudgedExprData {
@@ -3348,11 +3407,59 @@ mod judgement {
     }
 
     impl JudgedExpr {
-        fn build(data: Arc<JudgedExprData>, edges: conversion::flow::JudgementEdges<'_>) -> Self {
+        fn build(
+            mut data: Arc<JudgedExprData>,
+            edges: conversion::flow::JudgementEdges<'_>,
+        ) -> Self {
+            match &edges {
+                conversion::flow::JudgementEdges::Convert {
+                    site,
+                    target,
+                    operand,
+                    bare,
+                } => {
+                    Arc::make_mut(&mut data).converted =
+                        Some(Arc::new(conversion::ConversionTypeJudgement::new(
+                            site,
+                            target,
+                            (*operand).clone(),
+                            *bare,
+                        )));
+                }
+                conversion::flow::JudgementEdges::NonCrossed(_)
+                | conversion::flow::JudgementEdges::MissingReference(_) => {
+                    Arc::make_mut(&mut data).converted = None
+                }
+                conversion::flow::JudgementEdges::Leaf
+                | conversion::flow::JudgementEdges::Follow { .. }
+                | conversion::flow::JudgementEdges::Selected(_) => {}
+            }
             Self {
                 data,
                 conversions: edges.sources(),
             }
+        }
+        pub(crate) fn statically_checked(&self) -> bool {
+            self.static_source.as_ref().is_some_and(|receipt| {
+                self.converted.is_some()
+                    || matches!(
+                        receipt.result,
+                        Err(static_admission::JudgeSourceError::Conversion)
+                    )
+            })
+        }
+        pub(in crate::parser::retained) fn static_rejection(&self) -> Option<&StaticSourceReceipt> {
+            self.static_source.as_deref().filter(|receipt| {
+                matches!(
+                    receipt.result,
+                    Err(static_admission::JudgeSourceError::Conversion)
+                )
+            })
+        }
+        pub(in crate::parser::retained) fn conversion_type_judgement(
+            &self,
+        ) -> Option<&conversion::ConversionTypeJudgement> {
+            self.converted.as_deref()
         }
         pub(super) fn conversion_evidence(&self) -> ConversionEvidence<'_> {
             match self.conversions.carried() {
@@ -3797,6 +3904,25 @@ mod judgement {
     }
     /// Expression evidence interpreted at a particular sink. Only this view
     /// exposes construction and assignment categories.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct StaticSourceReceipt {
+        expected: TypeExpr,
+        result: Result<ExpressionAdmission, static_admission::JudgeSourceError>,
+    }
+    impl StaticSourceReceipt {
+        pub(in crate::parser::retained) fn matches(&self, expected: &TypeExpr) -> bool {
+            &self.expected == expected
+        }
+        pub(crate) fn binding_result(&self, expected: &TypeExpr) -> Result<(), InferenceError> {
+            if expected != &self.expected {
+                return Err(MissingEvidence::new("static source receipt destination").into());
+            }
+            match &self.result {
+                Ok(_) | Err(static_admission::JudgeSourceError::Conversion) => Ok(()),
+                Err(static_admission::JudgeSourceError::Ordinary(error)) => Err(error.clone()),
+            }
+        }
+    }
     pub struct SinkJudgedExpr<'a> {
         expression: std::borrow::Cow<'a, JudgedExprData>,
         sink: &'a TypeExpr,
@@ -3818,7 +3944,17 @@ mod judgement {
             config: &crate::parser::ProviderContext,
         ) -> BindingDiagnosticOwner<'_> {
             let Some(proof) = self.no_conversion() else {
-                return BindingDiagnosticOwner::AuthoredExpression;
+                return match self.static_source.as_deref() {
+                    Some(receipt) => {
+                        BindingDiagnosticOwner::JudgedConversion(Arc::new(receipt.clone()))
+                    }
+                    None => match expected
+                        .and_then(|expected| self.converted.as_ref()?.binding_receipt(expected))
+                    {
+                        Some(receipt) => BindingDiagnosticOwner::JudgedConversion(receipt),
+                        None => BindingDiagnosticOwner::WalkOwnedConversion,
+                    },
+                };
             };
             let ordinary = OrdinaryJudgedExpr {
                 data: &self.data,
@@ -4033,6 +4169,8 @@ mod judgement {
     ) -> Result<ExpressionAdmission, InferenceError> {
         admit_ordinary_data(source.data, source.proof, sink, context, config)
     }
+    mod static_admission;
+    use static_admission::{OrdinarySourceMode, StaticChild, StaticSourceMode};
     fn admit_ordinary_data(
         expression: &JudgedExprData,
         no_conversion: NoConversion,
@@ -4040,16 +4178,37 @@ mod judgement {
         context: AdmissionContext,
         config: &super::super::ProviderContext,
     ) -> Result<ExpressionAdmission, InferenceError> {
+        admit_source_data(
+            expression,
+            sink,
+            context,
+            config,
+            &mut OrdinarySourceMode(no_conversion),
+            None,
+        )
+    }
+    fn admit_source_data<'d, M: StaticSourceMode<'d>>(
+        expression: &JudgedExprData,
+        sink: &TypeExpr,
+        context: AdmissionContext,
+        config: &super::super::ProviderContext,
+        mode: &mut M,
+        declaration: Option<&'d crate::schema::CompiledAttributeType>,
+    ) -> Result<ExpressionAdmission, M::Error> {
         use ExpressionAdmission::{DeferredInterpolation, ProviderPending, ValueCheck};
+        let checked_source = mode.enter(expression, sink, context, declaration, config)?;
+        let Some(expression) = checked_source.data() else {
+            return Ok(mode.value_check());
+        };
         let expression = expression.for_sink(sink, config);
         let (ty, kind, concrete) = match &expression.judgement {
             ExprJudgement::Failed { error, .. } | ExprJudgement::Rejected { error, .. } => {
-                return Err(error.clone());
+                return Err(error.clone().into());
             }
             ExprJudgement::AuthorityUnavailable(authority) => {
                 return Ok(ProviderPending(authority.clone()));
             }
-            ExprJudgement::Declaration => return Err(assignment_error(&expression, sink)),
+            ExprJudgement::Declaration => return Err(assignment_error(&expression, sink).into()),
             ExprJudgement::Typed { ty, kind, .. } => (
                 Some(ty),
                 Some(kind),
@@ -4064,12 +4223,12 @@ mod judgement {
                 .try_fold(ValueCheck, |admission, branch| {
                     Ok(combine_admission(
                         admission,
-                        admit_ordinary_data(branch, no_conversion, sink, context, config)?,
+                        admit_source_data(branch, sink, context, config, mode, declaration)?,
                     ))
                 });
         }
         if expression.is_value_dependent() {
-            return Ok(ordinary_value_check(no_conversion));
+            return Ok(mode.value_check());
         }
         let sink = crate::validation::resolve_type_expr(sink, config).map_err(|error| {
             InferenceError::UnknownType {
@@ -4091,7 +4250,7 @@ mod judgement {
             // Retain reference evidence for resource attribute admission. This
             // expression pass has neither the destination descriptor nor the
             // binding authority to decide that assignment a second time.
-            return Ok(ordinary_value_check(no_conversion));
+            return Ok(mode.value_check());
         }
         if context == AdmissionContext::Function
             && (matches!(ty, Some(TypeExpr::Ref(_)))
@@ -4100,7 +4259,7 @@ mod judgement {
                     && sink.is_string_shaped()))
         {
             // FunctionArgument owns handle identity; schema strings keep concrete refinement checks.
-            return Ok(ordinary_value_check(no_conversion));
+            return Ok(mode.value_check());
         }
         if let TypeExpr::Union(members) = sink {
             if expression.requires_declared_assignment()
@@ -4110,14 +4269,21 @@ mod judgement {
                     .iter()
                     .all(|member| matches!(member, TypeExpr::StringLiteral(_)))
             {
-                return Ok(ordinary_value_check(no_conversion));
+                return Ok(mode.value_check());
             }
-            return members
-                .iter()
-                .find_map(|member| {
-                    admit_ordinary_data(&expression, no_conversion, member, context, config).ok()
-                })
-                .ok_or_else(|| assignment_error(&expression, sink));
+            let mut failures = Vec::new();
+            for (index, member) in members.iter().enumerate() {
+                let mut probe = mode.probe();
+                let child = probe.child(declaration, StaticChild::Union(index))?;
+                match admit_source_data(&expression, member, context, config, &mut probe, child) {
+                    Ok(admission) => {
+                        mode.commit(probe);
+                        return Ok(admission);
+                    }
+                    Err(error) => failures.push((probe, error)),
+                }
+            }
+            return Err(mode.failed_union(failures, assignment_error(&expression, sink)));
         }
         if let Some(shape) = expression.collection_kind() {
             let child_context = if matches!(
@@ -4132,13 +4298,13 @@ mod judgement {
             let pairs: Vec<_> = match (shape, sink) {
                 (CollectionKind::List, TypeExpr::List(inner)) => expression
                     .elements()
-                    .map(|child| (child, inner.as_ref()))
+                    .map(|child| (child, inner.as_ref(), StaticChild::List))
                     .collect(),
                 (CollectionKind::Map, TypeExpr::Map(inner)) => expression
                     .fields()
                     .map(|(_, child)| child)
                     .chain(expression.member.iter().map(Arc::as_ref))
-                    .map(|child| (child, inner.as_ref()))
+                    .map(|child| (child, inner.as_ref(), StaticChild::Map))
                     .collect(),
                 (CollectionKind::Map, TypeExpr::Struct { fields }) => fields
                     .iter()
@@ -4148,22 +4314,29 @@ mod judgement {
                     .map(|(name, sink)| {
                         expression
                             .field(name)
-                            .map(|child| (child, sink))
+                            .map(|child| (child, sink, StaticChild::Field(name)))
                             .map_err(|_| InferenceError::UnknownType {
                                 reason: format!("expected struct, missing field '{name}'"),
                             })
                     })
                     .collect::<Result<_, _>>()?,
                 (CollectionKind::List | CollectionKind::Map, _) => {
-                    return Err(assignment_error(&expression, sink));
+                    return Err(assignment_error(&expression, sink).into());
                 }
             };
             return pairs
                 .into_iter()
-                .try_fold(ValueCheck, |admission, (child, sink)| {
+                .try_fold(ValueCheck, |admission, (child, sink, route)| {
                     Ok(combine_admission(
                         admission,
-                        admit_ordinary_data(child, no_conversion, sink, child_context, config)?,
+                        admit_source_data(
+                            child,
+                            sink,
+                            child_context,
+                            config,
+                            mode,
+                            mode.child(declaration, route)?,
+                        )?,
                     ))
                 });
         }
@@ -4174,9 +4347,9 @@ mod judgement {
         ) = (actual, sink)
         {
             return if actual == expected {
-                Ok(ordinary_value_check(no_conversion))
+                Ok(mode.value_check())
             } else {
-                Err(assignment_error(&expression, sink))
+                Err(assignment_error(&expression, sink).into())
             };
         }
         if let Some(authority) = unavailable_type(actual) {
@@ -4187,33 +4360,31 @@ mod judgement {
             {
                 Ok(ProviderPending(authority))
             } else {
-                Err(assignment_error(&expression, sink))
+                Err(assignment_error(&expression, sink).into())
             };
         }
         if expression.requires_declared_assignment() {
             if *actual == TypeExpr::String && !matches!(sink, TypeExpr::String) {
-                return Err(assignment_error(&expression, sink));
+                return Err(assignment_error(&expression, sink).into());
             }
             return match crate::validation::typecheck::inferred_type_assignment(
                 sink,
                 actual,
                 &config.custom_types,
             ) {
-                crate::schema::TypeAssignability::Assignable => {
-                    Ok(ordinary_value_check(no_conversion))
-                }
+                crate::schema::TypeAssignability::Assignable => Ok(mode.value_check()),
                 crate::schema::TypeAssignability::Mismatch => {
-                    Err(assignment_error(&expression, sink))
+                    Err(assignment_error(&expression, sink).into())
                 }
                 crate::schema::TypeAssignability::Unchecked(evidence) => evidence
                     .into_types()
                     .find_map(|ty| pending_type(&ty))
                     .map(ProviderPending)
-                    .ok_or_else(|| assignment_error(&expression, sink)),
+                    .ok_or_else(|| assignment_error(&expression, sink).into()),
             };
         }
         if context == AdmissionContext::StructValue && concrete {
-            return Ok(ordinary_value_check(no_conversion));
+            return Ok(mode.value_check());
         }
         if let Some(authority) = unavailable_type(sink) {
             return if matches!(
@@ -4222,7 +4393,7 @@ mod judgement {
             ) {
                 Ok(ProviderPending(authority))
             } else {
-                Err(assignment_error(&expression, sink))
+                Err(assignment_error(&expression, sink).into())
             };
         }
         if matches!(
@@ -4240,13 +4411,15 @@ mod judgement {
                         sink,
                         &TypeExpr::String,
                     ),
-                })
+                }
+                .into())
             } else {
                 Err(InferenceError::UnknownType {
                     reason: format!(
                         "cannot assign deferred interpolation: expected {sink}, got String"
                     ),
-                })
+                }
+                .into())
             };
         }
         let shaped = match actual {
@@ -4272,9 +4445,9 @@ mod judgement {
             | TypeExpr::UnloadedSchemaType(_) => false,
         };
         if shaped {
-            Ok(ordinary_value_check(no_conversion))
+            Ok(mode.value_check())
         } else {
-            Err(assignment_error(&expression, sink))
+            Err(assignment_error(&expression, sink).into())
         }
     }
 
@@ -4322,7 +4495,7 @@ mod judgement {
     #[derive(Clone)]
     pub struct ExpressionReport<B: BindingAddress = RelativeBindingName> {
         bindings: Arc<HashMap<B, JudgedExpr>>,
-        expressions: Arc<HashMap<ExpressionLocation, JudgedExpr>>,
+        expressions: Arc<IndexMap<ExpressionLocation, JudgedExpr>>,
         pub(super) nodes: Arc<HashMap<(ExpressionInstance, NodeId), JudgedExpr>>,
         pub(crate) placements: Arc<crate::ConversionChannel>,
         pub(super) syntax_nodes: Arc<AuthoredNodes<B>>,
@@ -4334,7 +4507,7 @@ mod judgement {
         findings: Arc<Vec<Located<InferenceError>>>,
         function_errors: Arc<Vec<Located<InferenceError>>>,
         operands: Arc<HashMap<ExpressionLocation, [JudgedExpr; 2]>>,
-        module_attributes: Arc<HashMap<(B, String), JudgedExpr>>,
+        module_attributes: Arc<IndexMap<(B, String), JudgedExpr>>,
         resource_reports: Arc<HashMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>>,
         parameters: Arc<HashMap<String, JudgedExpr>>,
         pub(super) instance: ExpressionInstance,
@@ -4520,7 +4693,7 @@ mod judgement {
                             expression.clone(),
                         )
                     })
-                    .collect::<HashMap<_, _>>()
+                    .collect::<IndexMap<_, _>>()
                     .into(),
                 resource_reports,
                 parameters: self.parameters.clone(),
@@ -4632,6 +4805,14 @@ mod judgement {
                 .filter(|(key, _)| key.instance == self.instance)
                 .map(|(key, value)| (key.authored.clone(), value.clone()))
                 .collect()
+        }
+        pub(crate) fn source_node(
+            &self,
+            instance: &ExpressionInstance,
+            node: NodeId,
+        ) -> Result<&JudgedExpr, MissingEvidence> {
+            self.node(instance, node)
+                .ok_or_else(|| MissingEvidence::new("conversion binding source node"))
         }
         pub(crate) fn parameter(&self, name: &str) -> Result<&JudgedExpr, MissingEvidence> {
             self.parameters
@@ -4814,7 +4995,7 @@ mod judgement {
         }
         fn index_authored<'a, B: BindingAddress>(
             expression: &'a ExprValue<ParserPlaceholder, B>,
-            authored: &mut HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
+            authored: &mut IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
             visited: &mut std::collections::HashSet<usize>,
         ) {
             if !visited.insert(Arc::as_ptr(&expression.authored) as usize) {
@@ -4827,7 +5008,7 @@ mod judgement {
                 index_authored(child, authored, visited);
             }
         }
-        let mut authored = HashMap::new();
+        let mut authored = IndexMap::new();
         let mut visited = std::collections::HashSet::new();
         for expression in expressions
             .roots
@@ -4836,22 +5017,18 @@ mod judgement {
         {
             index_authored(expression, &mut authored, &mut visited);
         }
-        let functions = authored
-            .values()
-            .filter_map(|expression| {
-                if let ExprKind::Function {
-                    name, signature, ..
-                } = &expression.authored.kind
-                {
-                    Some((
-                        (expression.authored.location.instance.clone(), name.clone()),
-                        signature.clone(),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut functions = HashMap::new();
+        for expression in authored.values() {
+            if let ExprKind::Function {
+                name, signature, ..
+            } = &expression.authored.kind
+            {
+                // Match the parser seed rule when duplicate declarations survive analysis.
+                functions
+                    .entry((expression.authored.location.instance.clone(), name.clone()))
+                    .or_insert_with(|| signature.clone());
+            }
+        }
         let authority = Arc::new(config.clone());
         let mut judge = Judge {
             authority: authority.clone(),
@@ -4865,7 +5042,7 @@ mod judgement {
             demand: JudgementDemand::Value,
             scope: DiagnosticScope::Public,
             placement_owner: None,
-            by_location: HashMap::new(),
+            by_location: IndexMap::new(),
             by_node: HashMap::new(),
             syntax_nodes: HashMap::new(),
             visiting: Vec::new(),
@@ -5004,7 +5181,7 @@ mod judgement {
 
     struct Judge<'a, P: crate::resource::PlaceholderKind, B: BindingAddress> {
         authority: Arc<super::super::ProviderContext>,
-        authored: HashMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
+        authored: IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
         bindings: &'a InferenceBindings<P, B>,
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
@@ -5014,7 +5191,7 @@ mod judgement {
         demand: JudgementDemand,
         scope: DiagnosticScope,
         placement_owner: Option<Arc<ConversionSite>>,
-        by_location: HashMap<ExpressionLocation, JudgedExpr>,
+        by_location: IndexMap<ExpressionLocation, JudgedExpr>,
         by_node: HashMap<(ExpressionInstance, NodeId), JudgedExpr>,
         syntax_nodes: AuthoredNodes<B>,
         visiting: Vec<usize>,
@@ -5022,7 +5199,7 @@ mod judgement {
         placements: conversion::flow::PlacementFindings,
         function_errors: Vec<Located<InferenceError>>,
         operands: HashMap<ExpressionLocation, [JudgedExpr; 2]>,
-        module_attributes: Option<&'a HashMap<(B, String), JudgedExpr>>,
+        module_attributes: Option<&'a IndexMap<(B, String), JudgedExpr>>,
     }
 
     impl<P: crate::resource::PlaceholderKind, B: BindingAddress> Judge<'_, P, B> {
@@ -5218,11 +5395,18 @@ mod judgement {
             use conversion::flow::{JudgementEdges as E, NonCrossedEdge as N};
 
             let edges = match &root.kind {
-                ExprKind::Convert { .. } => E::Convert(
-                    root.first_conversion
+                ExprKind::Convert { target, .. } => E::Convert {
+                    site: root
+                        .first_conversion
                         .as_deref()
                         .expect("Convert owns its site"),
-                ),
+                    target: target.detail(),
+                    operand: children.first().expect("Convert has its operand judgement"),
+                    bare: root
+                        .children
+                        .first()
+                        .is_some_and(|operand| operand.authored.is_bare_source()),
+                },
                 ExprKind::Resource { .. } => E::NonCrossed(N::SchemaAttributeReference),
                 ExprKind::Function { .. } | ExprKind::UntypedParameter => {
                     E::NonCrossed(N::FunctionParameter)
@@ -5290,6 +5474,12 @@ mod judgement {
                 },
             };
             let mut result = JudgedExpr::build(result.data, edges);
+            if matches!(
+                root.kind,
+                ExprKind::Resource { .. } | ExprKind::For | ExprKind::Wait | ExprKind::ModuleCall
+            ) {
+                result.data_mut().structural_source = true;
+            }
             result.data_mut().origin = Some(root.location.clone());
             result.data_mut().authority = Some(self.authority.clone());
             if matches!(root.kind, ExprKind::Reference { .. }) {
@@ -6249,19 +6439,56 @@ mod judgement {
                                 schema.schema().as_schema().defs(),
                             );
                             let value = child.authored.sink_value().expect("named sink value");
-                            let judged = self.judge(value);
-                            // Source preparation does not admit a carrying slot;
-                            // only the schema cursor policy can do that.
-                            let source = match judged.type_projection() {
-                                TypeProjection::Available(source) => source,
-                                TypeProjection::NoProjection(_) => continue,
-                            };
-                            let admission = admit_ordinary_with_context(
-                                source,
+                            let mut judged = self.judge(value);
+                            let admission = static_admission::admit_judged_resource_source(
+                                &judged,
                                 &expected,
-                                AdmissionContext::Resource,
+                                attribute.field_type(),
+                                schema.schema().as_schema().defs(),
                                 self.config,
+                                &mut self.placements,
+                                value.authored.is_bare_source(),
                             );
+                            let admission = match admission {
+                                static_admission::ResourceSourceAdmission::Ordinary(result) => {
+                                    result
+                                }
+                                static_admission::ResourceSourceAdmission::WalkOwned(result) => {
+                                    result
+                                }
+                                static_admission::ResourceSourceAdmission::JudgedStatically(
+                                    result,
+                                ) => {
+                                    judged.data_mut().static_source =
+                                        Some(Arc::new(StaticSourceReceipt {
+                                            expected: expected.clone(),
+                                            result: result.clone(),
+                                        }));
+                                    self.by_location
+                                        .insert(value.authored.location.clone(), judged.clone());
+                                    self.by_node.insert(
+                                        (value.authored.location.instance.clone(), value.node_id()),
+                                        judged.clone(),
+                                    );
+                                    self.memo.insert(
+                                        (
+                                            Arc::as_ptr(&value.authored) as usize,
+                                            self.scope,
+                                            self.demand,
+                                        ),
+                                        judged.clone(),
+                                    );
+                                    match result {
+                                        Ok(admission) => Ok(admission),
+                                        Err(static_admission::JudgeSourceError::Ordinary(
+                                            error,
+                                        )) => Err(error),
+                                        Err(static_admission::JudgeSourceError::Conversion) => {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            };
                             if let Err(error) = admission {
                                 // Direct resource parameters retain the binding
                                 // check's resource, argument, and source context.
@@ -6557,6 +6784,9 @@ mod judgement {
                 member: None,
                 elements: Arc::default(),
                 fields: Arc::default(),
+                converted: None,
+                structural_source: false,
+                static_source: None,
             }),
         }
     }
@@ -6679,3 +6909,5 @@ mod judgement {
         result
     }
 }
+
+pub(crate) use judgement::StaticSourceReceipt;

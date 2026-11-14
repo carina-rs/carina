@@ -2696,7 +2696,7 @@ tags = {
                 .collect(),
             module_calls: calls
                 .into_iter()
-                .map(|name| ModuleCall::test(name.to_string(), None, HashMap::new()))
+                .map(|name| ModuleCall::test(name.to_string(), None, indexmap::IndexMap::new()))
                 .collect(),
             ..ParsedFile::default()
         }

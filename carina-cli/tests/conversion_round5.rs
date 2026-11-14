@@ -164,10 +164,10 @@ fn round5_alias_into_non_slot_sinks_is_rejected_by_placement() {
 }
 
 #[test]
-fn round5_only_resolver_templates_publish_module_placement_findings() {
+fn r11_resolver_templates_publish_placement_and_judge_static_findings() {
     for (called, body, expected) in [
         (false, "mock.Sink { attr = 'ok' as mock.Name }", 0),
-        (false, "mock.Sink { attr = 42 as mock.Name }", 0),
+        (false, "mock.Sink { attr = 42 as mock.Name }", 1),
         (false, "mock.Sink { attr = upper('ok' as mock.Name) }", 1),
         (true, "mock.Sink { attr = 42 as mock.Name }", 1),
     ] {

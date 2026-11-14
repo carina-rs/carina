@@ -644,7 +644,7 @@ fn round1_seam_materialization_reports_unmatched_attribute_names() {
     let mut inputs = crate::validation::admission::attributes::ResourceAttributeInputs::new(
         tree.resources().next().unwrap(),
     );
-    let outcome = inputs.materialize(&std::collections::HashMap::from([(
+    let outcome = inputs.materialize(&indexmap::IndexMap::from([(
         "unmatched".into(),
         Value::Concrete(crate::resource::ConcreteValue::Int(1)),
     )]));
@@ -2365,7 +2365,7 @@ fn review_seam_producer_materialization_keeps_a_real_projection_pairing() {
     let source = resource.authored_slot("input").unwrap();
     let mut inputs = ResourceAttributeInputs::new(resource);
     inputs
-        .materialize(&std::collections::HashMap::from([(
+        .materialize(&indexmap::IndexMap::from([(
             "input".into(),
             Value::Concrete(crate::resource::ConcreteValue::String("after".into())),
         )]))

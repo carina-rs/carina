@@ -1,0 +1,2 @@
+let result = zebra("works")
+mock.test.resource { name = result }

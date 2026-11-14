@@ -4463,7 +4463,7 @@ mod tests {
             }),
             Value::Deferred(DeferredValue::ResolvedFunctionCall {
                 function: resolved_function,
-                functions: std::sync::Arc::new(HashMap::new()),
+                functions: std::sync::Arc::new(indexmap::IndexMap::new()),
                 args: Vec::new(),
                 source_line: (0).into(),
             }),

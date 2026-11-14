@@ -323,7 +323,7 @@ for key in keys({a = source.identifier, b = source.identifier}) {
 
 #[test]
 fn lexical_body_dependencies_are_part_of_user_call_knowledge() {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
     let parsed = carina_core::parser::parse_file(
         "fn captured() { 1 }",
         std::path::Path::new("functions.crn"),
@@ -336,7 +336,7 @@ fn lexical_body_dependencies_are_part_of_user_call_knowledge() {
     )));
     let call: V = Value::Deferred(DeferredValue::ResolvedFunctionCall {
         function: Arc::new(function),
-        functions: Arc::new(HashMap::new()),
+        functions: Arc::new(indexmap::IndexMap::new()),
         args: vec![],
         source_line: 0.into(),
     });
@@ -551,7 +551,7 @@ mod condition_timing {
 }
 
 mod structural_consumers {
-    use std::collections::HashMap;
+    use indexmap::IndexMap;
 
     use carina_core::parser::ProviderContext;
     use carina_core::resource::knowledge::KnowledgeContext;
@@ -588,7 +588,7 @@ mod structural_consumers {
                 ]))),
                 default: Box::new(Value::Concrete(ConcreteValue::List(vec![]))),
             });
-        let attributes = HashMap::from([(
+        let attributes = IndexMap::from([(
             "values".to_owned(),
             value
                 .knowledge(&KnowledgeContext::validation())

@@ -96,6 +96,19 @@ impl ProviderFactory for TotalityFactory {
                 .validate()
                 .unwrap(),
             ResourceSchema::new("Source")
+                .attribute(AttributeSchema::optional("number", AttributeType::int()).build())
+                .attribute(
+                    AttributeSchema::optional(
+                        "other",
+                        AttributeType::refined_string(
+                            Some(TypeIdentity::from_dotted("mock.Other")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
                 .attribute(AttributeSchema::optional("output", name()).build())
                 .attribute(
                     AttributeSchema::optional(

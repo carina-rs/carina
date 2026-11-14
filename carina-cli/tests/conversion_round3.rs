@@ -378,10 +378,10 @@ fn r5b_read_only_commands_use_mains_ordinary_judge_gate() {
                 "conversion is not supported at this position",
             ),
             (
-                "P2 kind",
+                "Judge-owned conversion kind",
                 "mock.actions.OidcSubject { claim_keys = [1 as mock.actions.OidcSubject.ClaimKey] }\n",
-                true,
-                "",
+                false,
+                "conversion operand has no compatible scalar source judgement",
             ),
         ] {
             write(directory.path(), "main.crn", body);
@@ -396,12 +396,6 @@ fn r5b_read_only_commands_use_mains_ordinary_judge_gate() {
                 assert!(text.contains(message), "{text}");
             }
             assert!(!text.contains("bug in carina"), "{text}");
-            if case == "P2 kind" {
-                assert!(
-                    !text.contains("conversion is") && !text.contains("conversion operand"),
-                    "{text}"
-                );
-            }
         }
     }
 }

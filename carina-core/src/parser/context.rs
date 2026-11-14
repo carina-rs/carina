@@ -114,7 +114,7 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// Imported modules (alias -> path)
     pub(super) imported_modules: HashMap<String, String>,
     /// User-defined functions
-    pub(super) user_functions: Arc<HashMap<String, UserFunction>>,
+    pub(super) user_functions: Arc<IndexMap<String, UserFunction>>,
     /// Interned user-function definitions used by deferred call nodes.
     /// Invalidated together with `user_function_scope` whenever the mutable
     /// parser table changes.
@@ -270,6 +270,21 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         &self.diagnostic_source.path
     }
 
+    pub(super) fn authored_resource_declaration(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> Option<super::retained::SlotDeclarationId> {
+        self.authored_nodes.resource_declaration(pair)
+    }
+    pub(super) fn conversion_type_source(
+        &self,
+        pair: &pest::iterators::Pair<'_, Rule>,
+    ) -> super::BindingTypeSource {
+        match self.authored_nodes.node_id(pair) {
+            Some(node) => super::BindingTypeSource::Conversion(node),
+            None => super::BindingTypeSource::MissingConversion,
+        }
+    }
     pub(super) fn authored_resource_slots(
         &self,
         pair: &pest::iterators::Pair<'_, Rule>,
@@ -492,7 +507,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             bindings: IndexMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
-            user_functions: Arc::new(HashMap::new()),
+            user_functions: Arc::new(IndexMap::new()),
             resolved_user_functions: RefCell::new(HashMap::new()),
             seeded_user_functions: HashSet::new(),
             evaluating_functions: Vec::new(),
@@ -581,20 +596,20 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
         self.resolved_user_functions.borrow_mut().clear();
     }
 
-    pub(super) fn replace_user_functions(&mut self, functions: HashMap<String, UserFunction>) {
+    pub(super) fn replace_user_functions(&mut self, functions: IndexMap<String, UserFunction>) {
         self.user_functions = Arc::new(functions);
         self.invalidate_user_function_cache();
     }
 
     pub(super) fn replace_shared_user_functions(
         &mut self,
-        functions: Arc<HashMap<String, UserFunction>>,
+        functions: Arc<IndexMap<String, UserFunction>>,
     ) {
         self.user_functions = functions;
         self.invalidate_user_function_cache();
     }
 
-    pub(super) fn extend_user_functions(&mut self, functions: HashMap<String, UserFunction>) {
+    pub(super) fn extend_user_functions(&mut self, functions: IndexMap<String, UserFunction>) {
         Arc::make_mut(&mut self.user_functions).extend(functions);
         self.invalidate_user_function_cache();
     }
@@ -604,7 +619,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
         self.invalidate_user_function_cache();
     }
 
-    pub(super) fn user_functions_mut(&mut self) -> &mut HashMap<String, UserFunction> {
+    pub(super) fn user_functions_mut(&mut self) -> &mut IndexMap<String, UserFunction> {
         self.invalidate_user_function_cache();
         Arc::make_mut(&mut self.user_functions)
     }
@@ -620,7 +635,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
         Some(function)
     }
 
-    pub(super) fn shared_user_function_scope(&self) -> Arc<HashMap<String, UserFunction>> {
+    pub(super) fn shared_user_function_scope(&self) -> Arc<IndexMap<String, UserFunction>> {
         Arc::clone(&self.user_functions)
     }
 
@@ -791,10 +806,10 @@ pub(super) enum StructuralSinkMode {
     DirectHandle,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum BindingUseRecording {
     Ordinary,
-    ProjectionOnly,
+    ConversionOperand(super::BindingTypeSource),
 }
 
 #[derive(Clone)]
@@ -835,22 +850,29 @@ impl ExpressionMode<'_> {
 impl<'a> ExpressionMode<'a> {
     /// Conversion owns the type judgement. Structural uses and pending slots
     /// still belong to the ordinary bare-handle gate, even for an operand.
-    pub(super) fn conversion_operand(&self) -> Self {
+    pub(super) fn conversion_operand(&self, source: super::BindingTypeSource) -> Self {
         Self {
-            binding_uses: BindingUseRecording::ProjectionOnly,
+            binding_uses: BindingUseRecording::ConversionOperand(source),
             is_integer_operand: false,
             ..self.clone()
         }
     }
 
+    pub(super) fn resource_input_origin(&self) -> Option<super::retained::SlotDeclarationId> {
+        self.sink.as_ref().and_then(|sink| match &sink.owner {
+            BindingUseOwner::Resource(address) => address.input_origin(),
+            BindingUseOwner::ModuleArgument { .. } => None,
+        })
+    }
     pub(super) fn resource(
         id: ResourceId,
         source_file: &'a std::path::Path,
         preprocessed_file: &'a super::PreprocessedFile,
+        origin: Option<super::retained::SlotDeclarationId>,
     ) -> Self {
         Self {
             sink: Some(ExpressionSink {
-                owner: BindingUseOwner::Resource(ResourceAddress::new(id)),
+                owner: BindingUseOwner::Resource(ResourceAddress::new(id, origin)),
                 root_path: AttributePath::root("<resource>"),
                 path: AttributePath::root("<resource>"),
                 source_file,
@@ -923,7 +945,7 @@ impl<'a> ExpressionMode<'a> {
             sink: None,
             source,
             is_integer_operand: true,
-            binding_uses: self.binding_uses,
+            binding_uses: self.binding_uses.clone(),
         }
     }
 
@@ -1002,7 +1024,7 @@ impl<'a> ExpressionMode<'a> {
             }),
             source: self.source,
             is_integer_operand: self.is_integer_operand,
-            binding_uses: self.binding_uses,
+            binding_uses: self.binding_uses.clone(),
         }
     }
 
@@ -1077,7 +1099,12 @@ impl<'a> ExpressionMode<'a> {
             }
             ParseBindingRef::Unbound => return None,
         };
+        let type_source = match &self.binding_uses {
+            BindingUseRecording::Ordinary => super::BindingTypeSource::Binding,
+            BindingUseRecording::ConversionOperand(source) => source.clone(),
+        };
         let authored = BareBindingUse {
+            type_source,
             expression_instance: super::retained::ExpressionInstance::Root,
             location,
             source_file: SourceFileId::new(sink.source_file.to_path_buf()),
@@ -1097,20 +1124,9 @@ impl<'a> ExpressionMode<'a> {
                 owner: sink.owner.clone(),
                 path: sink.root_path.clone(),
             });
-        let record_use = match self.binding_uses {
-            BindingUseRecording::Ordinary => true,
-            BindingUseRecording::ProjectionOnly => match &source {
-                BareBindingSource::Structural(_) => true,
-                // Value sources have no pending/bare-handle gate; only their
-                // duplicate type precheck belongs to the conversion policy.
-                BareBindingSource::Value { .. } => false,
-            },
-        };
-        if record_use {
-            ctx.parsed_binding_uses
-                .borrow_mut()
-                .record(authored, source, pending_slot.clone());
-        }
+        ctx.parsed_binding_uses
+            .borrow_mut()
+            .record(authored, source, pending_slot.clone());
         pending_slot
     }
 }

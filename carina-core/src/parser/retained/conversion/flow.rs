@@ -140,6 +140,12 @@ impl PlacementFindings {
     pub(in crate::parser::retained) fn take_findings(&mut self) -> crate::ConversionChannel {
         std::mem::take(&mut self.findings)
     }
+    pub(in crate::parser::retained) fn append_static(
+        &mut self,
+        findings: crate::ConversionChannel,
+    ) {
+        self.findings.append(findings);
+    }
     pub(in crate::parser::retained) fn append_rejection(&mut self, rejection: ConversionRejection) {
         self.findings.append(rejection.into_channel());
     }
@@ -221,7 +227,12 @@ pub(in crate::parser::retained) enum JudgementEdges<'a> {
         children: &'a [JudgedExpr],
     },
     Selected(&'a JudgedExpr),
-    Convert(&'a ConversionSite),
+    Convert {
+        site: &'a ConversionSite,
+        target: &'a ConversionTypePath,
+        operand: &'a JudgedExpr,
+        bare: bool,
+    },
     NonCrossed(NonCrossedEdge),
     MissingReference(MissingReferenceEdge),
 }
@@ -241,7 +252,12 @@ impl JudgementEdges<'_> {
                 sources.join(child.conversion_sources().clone())
             }),
             Self::Selected(child) => child.conversion_sources().clone(),
-            Self::Convert(site) => ConversionSources::conversion(site),
+            Self::Convert {
+                site,
+                target: _,
+                operand: _,
+                bare: _,
+            } => ConversionSources::conversion(site),
             Self::NonCrossed(edge) => match edge {
                 NonCrossedEdge::ModuleArgument
                 | NonCrossedEdge::FunctionParameter

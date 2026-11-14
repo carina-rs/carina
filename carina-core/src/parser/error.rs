@@ -756,7 +756,7 @@ impl ParseError {
         span: Option<SourceSpan>,
     ) -> ParseError {
         let known_refs: Vec<&str> = known_bindings.iter().map(String::as_str).collect();
-        let suggestion = crate::schema::suggest_similar_name(&name, &known_refs);
+        let suggestion = crate::schema::suggest_similar_name(&name, &known_refs, &[]);
         let mut in_scope = known_bindings;
         in_scope.sort();
         ParseError::UndefinedIdentifier {
@@ -775,7 +775,7 @@ impl ParseError {
         span: SourceSpan,
     ) -> ParseError {
         let known_refs: Vec<&str> = known_bindings.iter().map(String::as_str).collect();
-        let suggestion = crate::schema::suggest_similar_name(&name, &known_refs);
+        let suggestion = crate::schema::suggest_similar_name(&name, &known_refs, &[]);
         let mut in_scope = known_bindings;
         in_scope.sort();
         ParseError::UndefinedDeferredIterable {

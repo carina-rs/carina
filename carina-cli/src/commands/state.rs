@@ -424,7 +424,7 @@ async fn run_state_migration_check(
     state_file: &LocalStateFile,
     provider_schema_args: &[String],
 ) -> Result<(), AppError> {
-    let mut provider_schema_overrides = HashMap::new();
+    let mut provider_schema_overrides = indexmap::IndexMap::new();
     for argument in provider_schema_args {
         let (name, path) = argument.split_once('=').ok_or_else(|| {
             AppError::Config(format!(

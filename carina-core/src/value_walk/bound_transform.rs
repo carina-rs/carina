@@ -57,7 +57,7 @@ pub(super) trait BoundTransform<P: ValueKind, B: BindingAddress>: TransformOutpu
         &mut self,
         _at: &At<'_>,
         function: Arc<crate::parser::UserFunction<B>>,
-        functions: Arc<HashMap<String, crate::parser::UserFunction<B>>>,
+        functions: Arc<indexmap::IndexMap<String, crate::parser::UserFunction<B>>>,
         args: Vec<FunctionArgument<P, B>>,
         source_line: crate::resource::DiagnosticSourceLine,
     ) -> Result<Value<P, B>, WalkError> {

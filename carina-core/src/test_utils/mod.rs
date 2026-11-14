@@ -15,10 +15,7 @@ pub fn admit_resource_attribute_report<
     B: crate::resource::BindingAddress,
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &std::collections::HashMap<
-        String,
-        crate::resource::knowledge::Classification<'_, P, B>,
-    >,
+    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
     is_string_literal: &dyn Fn(&str) -> bool,
     custom_types: &crate::parser::ProviderCustomTypes,
 ) -> crate::schema::ResourceValueValidation {
@@ -94,10 +91,7 @@ pub fn admit_resource_attributes<
     B: crate::resource::BindingAddress,
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &std::collections::HashMap<
-        String,
-        crate::resource::knowledge::Classification<'_, P, B>,
-    >,
+    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
     is_string_literal: &dyn Fn(&str) -> bool,
     custom_types: &crate::parser::ProviderCustomTypes,
 ) -> Result<(), Vec<crate::schema::TypeError>> {

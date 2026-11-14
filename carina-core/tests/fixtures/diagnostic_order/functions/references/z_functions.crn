@@ -1,0 +1,3 @@
+fn alpha(): Int { source.name }
+fn bravo(): Int { sink(source.name) }
+fn sink(value: Int): Int { value }

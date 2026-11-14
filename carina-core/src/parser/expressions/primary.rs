@@ -366,7 +366,7 @@ pub(crate) fn parse_postfix_eval_with_mode(
             let untyped_mode = if !steps.is_empty() {
                 Some(ExpressionMode::untyped())
             } else if converted {
-                Some(mode.conversion_operand())
+                Some(mode.conversion_operand(ctx.conversion_type_source(&syntax)))
             } else {
                 None
             };

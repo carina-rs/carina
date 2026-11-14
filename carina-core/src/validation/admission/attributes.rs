@@ -171,8 +171,8 @@ fn admission_findings<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>
 /// pending admissions are dropped; apply re-admits the resolved resource values.
 pub fn admit_plan_attributes<K: RechecksResolved>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    id: &ResourceId,
-    attributes: &std::collections::HashMap<String, PlanResolved<'_>>,
+    resource: &ResourceId,
+    attributes: &indexmap::IndexMap<String, PlanResolved<'_>>,
     quoted: &std::collections::HashSet<String>,
     session: &dyn ProviderTypeCheckContext,
 ) -> crate::schema::ResourceValueValidation {
@@ -188,8 +188,12 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
             None,
             &|name| quoted.contains(name),
             &|name, selected, _| {
-                let destination =
-                    schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
+                let destination = schema.admission_selected_attribute::<K>(
+                    resource,
+                    name,
+                    selected,
+                    session.catalog(),
+                );
                 let (candidate, boundary) = Candidate::plan(attributes[name].clone(), session);
                 admission_findings(&mut admit(&destination, candidate, &boundary))
             },
@@ -199,7 +203,7 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
 #[derive(Debug)]
 pub(crate) enum ApplyAdmissionErrors {
     Admission(AdmissionErrors),
-    Constraints(crate::schema::ResourceValueValidation),
+    Constraints(Box<crate::schema::ResourceValueValidation>),
 }
 impl From<AdmissionErrors> for ApplyAdmissionErrors {
     fn from(error: AdmissionErrors) -> Self {
@@ -269,7 +273,7 @@ fn admit_apply_attributes<K: RechecksResolved>(
     session: &dyn ProviderTypeCheckContext,
 ) -> Result<(), ApplyAdmissionErrors> {
     use std::cell::RefCell;
-    let mut projected = std::collections::HashMap::new();
+    let mut projected = indexmap::IndexMap::new();
     let mut projection_errors = Vec::new();
     for (name, value) in resource_attributes {
         let value = match authored {
@@ -347,7 +351,7 @@ fn admit_apply_attributes<K: RechecksResolved>(
         return Err(ApplyAdmissionErrors::Admission(failures.pop().unwrap()));
     }
     if report.errors().next().is_some() {
-        return Err(ApplyAdmissionErrors::Constraints(report));
+        return Err(ApplyAdmissionErrors::Constraints(Box::new(report)));
     }
     Ok(())
 }
@@ -403,10 +407,7 @@ pub(crate) fn admit_validation_attributes<
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     id: &ResourceId,
-    attributes: &std::collections::HashMap<
-        String,
-        crate::resource::knowledge::Classification<'_, P, B>,
-    >,
+    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
     quoted: &std::collections::HashSet<String>,
     bindings: Option<&BindingIndex<'_, B>>,
     session: &dyn ProviderTypeCheckContext,
@@ -427,7 +428,7 @@ pub(crate) fn admit_validation_attributes<
         }
         SchemaInputSource::Authored(slots) => slots,
     };
-    coverage.record_conversions(inputs::missing_schema_inputs(slots, attributes, report));
+    let missing = inputs::missing_schema_inputs(slots, attributes, report);
     let candidate = |name: &str, proof| {
         if let Some(projection) = slots.projected_phase(name) {
             return Ok(Box::new(Candidate::validation_projected(
@@ -463,6 +464,7 @@ pub(crate) fn admit_validation_attributes<
         schema,
         id,
         attributes,
+        attributes.iter(),
         quoted,
         bindings,
         session,
@@ -474,7 +476,7 @@ pub(crate) fn admit_validation_attributes<
         },
     );
     *coverage = visits.into_inner();
-    findings
+    missing.finish(findings, coverage)
 }
 
 /// Programmatic values enter a NoAuthored walk, with no callback or conversion
@@ -486,15 +488,13 @@ pub(crate) fn admit_value_only_attributes<
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     id: &ResourceId,
-    attributes: &std::collections::HashMap<
-        String,
-        crate::resource::knowledge::Classification<'_, P, B>,
-    >,
+    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
     quoted: &std::collections::HashSet<String>,
     session: &dyn ProviderTypeCheckContext,
 ) -> crate::schema::ResourceValueValidation {
     schema.schema().as_schema().validate_admission_report(
         attributes,
+        attributes.iter(),
         &|name| quoted.contains(name),
         &crate::schema::value_validation::AttributeAdmission {
             known: &|name, selected, proof| {
@@ -536,16 +536,23 @@ enum ValidationInput<'a, P: PlaceholderKind, B: BindingAddress> {
 /// One authored attribute report, shared by CLI validation and LSP rendering.
 #[allow(clippy::too_many_arguments)]
 fn admit_validation_attributes_with_input<
-    'v,
+    'a,
+    'v: 'a,
     K: RechecksResolved,
     P: PlaceholderKind,
     B: BindingAddress,
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     id: &ResourceId,
-    attributes: &std::collections::HashMap<
+    attributes: &'a indexmap::IndexMap<
         String,
         crate::resource::knowledge::Classification<'v, P, B>,
+    >,
+    entries: impl IntoIterator<
+        Item = (
+            &'a String,
+            &'a crate::resource::knowledge::Classification<'v, P, B>,
+        ),
     >,
     quoted: &std::collections::HashSet<String>,
     bindings: Option<&BindingIndex<'_, B>>,
@@ -646,6 +653,7 @@ fn admit_validation_attributes_with_input<
     };
     schema.schema().as_schema().validate_admission_report(
         attributes,
+        entries,
         &|name| quoted.contains(name),
         &crate::schema::value_validation::AttributeAdmission {
             known: &|name, selected, proof| {
@@ -682,7 +690,7 @@ where
         &'a crate::parser::AnalysisResourceRef<'file, ParserPlaceholder, ParserPlaceholder, D, B>,
     pub parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     pub schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    pub attributes: &'a std::collections::HashMap<
+    pub attributes: &'a indexmap::IndexMap<
         String,
         crate::resource::knowledge::Classification<'a, ParserPlaceholder, B>,
     >,
@@ -770,9 +778,7 @@ where
     if let Err(missing) = inputs.authored_evidence() {
         coverage.no_authored_evidence(missing);
     }
-    coverage.record_conversions(
-        inputs.prepare_missing::<Pass>(inputs.report(parsed.expression_report())),
-    );
+    let missing = inputs.prepare_missing::<Pass>(inputs.report(parsed.expression_report()));
     let visits = std::cell::RefCell::new(std::mem::take(coverage));
     let findings = if uses_resource_attribute_admission(resource.kind()) {
         typed_resource_attribute_admissions::<Pass, kind::ResourceAttribute, _, _, _>(
@@ -786,7 +792,7 @@ where
         )
     };
     *coverage = visits.into_inner();
-    findings
+    missing.finish(findings, coverage)
 }
 
 /// Admit every analysis item using the same destination-kind policy.
@@ -815,7 +821,7 @@ pub fn resource_attribute_admissions<
         B,
     >,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &std::collections::HashMap<
+    attributes: &indexmap::IndexMap<
         String,
         crate::resource::knowledge::Classification<'_, crate::resource::ParserPlaceholder, B>,
     >,
@@ -870,7 +876,7 @@ fn typed_resource_attribute_admissions<
         B,
     >,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &std::collections::HashMap<
+    attributes: &indexmap::IndexMap<
         String,
         crate::resource::knowledge::Classification<'_, crate::resource::ParserPlaceholder, B>,
     >,
@@ -1210,6 +1216,7 @@ fn typed_resource_attribute_admissions<
         schema,
         resource.id(),
         attributes,
+        inputs::in_resource_order(resource, attributes),
         quoted,
         Some(bindings),
         session,
@@ -1272,7 +1279,7 @@ fn unrendered_resource_admissions<Pass: ResourceAdmissionPass, E, D, B: BindingA
     let Some(schema) = resource.schema(judged.schemas()) else {
         return;
     };
-    let values = resource.resolved_attributes();
+    let values = resource.attributes().into_owned();
     let mut inputs = ResourceAttributeInputs::for_resource(resource, judged.report())
         .unwrap_or_else(|_| {
             ResourceAttributeInputs::from_report(resource, &values, judged.report())
@@ -1299,6 +1306,52 @@ fn unrendered_resource_admissions<Pass: ResourceAdmissionPass, E, D, B: BindingA
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[test]
+    fn apply_admission_validates_every_supplied_attribute() {
+        let resource: crate::resource::Resource<_, NoPlaceholder, AbsoluteBindingAddress> =
+            crate::resource::Resource::with_provider("test", "Sink", "sink", None);
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            crate::schema::ResourceSchema::new("Sink")
+                .attribute(
+                    crate::schema::AttributeSchema::optional(
+                        "extra",
+                        crate::schema::AttributeType::string(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let attributes = indexmap::IndexMap::from([(
+            "extra".into(),
+            Value::Concrete(crate::resource::ConcreteValue::Int(1)),
+        )]);
+        let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            let result = admit_apply_attributes::<kind::ResourceAttribute>(
+                &resource.id,
+                &attributes,
+                None,
+                &Default::default(),
+                schemas.get_for(&resource).unwrap(),
+                &ResolvedBindings::default(),
+                session,
+            );
+            let Err(ApplyAdmissionErrors::Constraints(report)) = result else {
+                panic!("extra attribute must be validated");
+            };
+            assert_eq!(
+                report
+                    .diagnostic_errors()
+                    .map(|(_, path, _)| path.unwrap().0)
+                    .collect::<Vec<_>>(),
+                ["extra"]
+            );
+        });
+    }
 
     #[test]
     fn review_r2_validation_and_plan_keep_resolution_failures_without_findings() {

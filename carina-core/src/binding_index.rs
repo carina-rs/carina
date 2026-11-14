@@ -644,7 +644,7 @@ impl std::fmt::Display for RefTypeError {
                 known_exports,
             } => {
                 let known: Vec<&str> = known_exports.iter().map(String::as_str).collect();
-                let suggestion = suggest_similar_name(export, &known)
+                let suggestion = suggest_similar_name(export, &known, &[])
                     .map(|suggestion| format!(" Did you mean `{}`?", suggestion))
                     .unwrap_or_default();
                 write!(
@@ -679,7 +679,7 @@ pub enum RefType {
 }
 
 fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
-    suggest_similar_name(unknown, known)
+    suggest_similar_name(unknown, known, &[])
         .map(|suggestion| format!(" Did you mean '{}'?", suggestion))
         .unwrap_or_default()
 }
@@ -707,7 +707,7 @@ pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     /// keep this index-only view keyed by the visible composition binding.
     pending_composition_handles: HashMap<B, HashMap<String, crate::parser::ResourceTypePath>>,
     registry: &'a SchemaRegistry,
-    user_functions: &'a HashMap<String, crate::parser::UserFunction<B>>,
+    user_functions: &'a indexmap::IndexMap<String, crate::parser::UserFunction<B>>,
 }
 
 impl<'a, B: BindingAddress> BindingIndex<'a, B> {

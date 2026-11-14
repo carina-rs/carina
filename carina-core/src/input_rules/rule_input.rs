@@ -1280,7 +1280,7 @@ fn classify(value: &InputValue) -> Classification<'_, ParserPlaceholder> {
         &KnowledgeContext::validation(),
         |_, _| {},
     )
-    .remove("")
+    .shift_remove("")
     .expect("one input")
 }
 

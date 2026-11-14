@@ -1962,11 +1962,33 @@ pub fn resolve_modules_with_config<E: ResolveExportBindingPhase<ParserPlaceholde
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    resolve_modules_with_config_and_overrides(
+        parsed,
+        base_dir,
+        config,
+        schemas,
+        &Default::default(),
+    )
+}
+
+/// Resolve projected metadata against the same unsaved source snapshot as the
+/// directory parse. This returns values and ordinary resolver errors; callers
+/// do not publish authored findings from a separate metadata-only parse.
+pub fn resolve_modules_with_config_and_overrides<
+    E: ResolveExportBindingPhase<ParserPlaceholder>,
+>(
+    parsed: RootDirectoryParse<E>,
+    base_dir: &ResolvedPath,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: &SchemaRegistry,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let resolution = parsed.module_resolution_context();
     let mut parsed = parsed.into_parsed();
-    let expanded =
-        RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas, resolution)?
-            .expand()?;
+    let mut resolver =
+        ModuleResolver::with_config_and_schemas(base_dir, config, schemas, resolution);
+    resolver.source_overrides = overrides.clone();
+    let expanded = RefCheckedModuleGraph::check_with_resolver(&mut parsed, resolver)?.expand()?;
     ensure_expanded_root_graph(&expanded)?;
     finalize_deferred_for_bodies(expanded)
         .map(|graph| publish_authored_module_graph(graph, config.catalog()))

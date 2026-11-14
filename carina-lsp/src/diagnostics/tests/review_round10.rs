@@ -145,7 +145,7 @@ fn r10_reinstanced_omitted_slots_keep_source_evidence_in_the_lsp_fallback() {
             let buffer_tree = carina_core::parser::AnalysisTree::try_from_file(doc.parsed().unwrap()).unwrap();
             let mut selections = Vec::new();
             for resource in buffer_tree.project_resources().filter(|resource| resource.authored_slot("attr").is_ok()) {
-                let values = resource.resolved_attributes();
+                let values = resource.attributes().into_owned();
                 let (_, inputs) = select_admission_inputs(resource, Some(&source_map), &values, source_configuration.judged().report(), SlotPrechecks::Unreported);
                 selections.push(serde_json::json!({"resource":resource.id().to_string(), "value_present":values.contains_key("attr"), "fallback":inputs.authored_evidence().is_err()}));
             }
@@ -155,7 +155,7 @@ fn r10_reinstanced_omitted_slots_keep_source_evidence_in_the_lsp_fallback() {
             let expanded_tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
             let mut rows = Vec::new();
             for resource in expanded_tree.project_resources().filter(|resource|resource.authored_slot("attr").is_ok()) {
-                let values = resource.resolved_attributes();
+                let values = resource.attributes().into_owned();
                 let for_resource = ResourceAttributeInputs::for_resource(resource, judged.report()).is_ok();
                 let slot = resource.authored_slot("attr").unwrap();
                 let cursor = slot.cursor();

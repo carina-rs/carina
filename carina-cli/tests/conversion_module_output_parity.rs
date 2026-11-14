@@ -644,7 +644,7 @@ fn round4_conversions(json: &serde_json::Value) -> Vec<&serde_json::Value> {
         .collect()
 }
 #[test]
-fn round4_nonexpanded_structural_and_module_conversions_have_no_rejection() {
+fn r11_nonexpanded_structural_and_module_conversions_follow_their_judge_prechecks() {
     let mut failures = Vec::new();
     for (name, root, module) in [
         (
@@ -684,7 +684,16 @@ fn round4_nonexpanded_structural_and_module_conversions_have_no_rejection() {
                 );
             }
             let json = round4_validate(directory.path());
-            if json["status"] != "ok" || !round4_conversions(&json).is_empty() {
+            let checked_empty_element = name == "empty_for" && !conversion.is_empty();
+            let conversions = round4_conversions(&json);
+            let correct = if checked_empty_element {
+                json["status"] == "error"
+                    && conversions.len() == 1
+                    && conversions[0]["code"] == "conversion_source"
+            } else {
+                json["status"] == "ok" && conversions.is_empty()
+            };
+            if !correct {
                 failures.push(format!("{name}, conversion={conversion:?}: {json}"));
             }
         }
@@ -960,7 +969,8 @@ fn round4_template_preflight_defers_owned_references_but_preserves_plain_sibling
     for (field, expected_conversion, expected_ordinary) in [
         ("attr = other.name", 0, 1),
         ("attr = other.name as mock.Name", 0, 0),
-        ("attr = 42 as mock.Name", 0, 0),
+        // The resolver template's Judge owns this static literal verdict.
+        ("attr = 42 as mock.Name", 1, 0),
         ("config = { plain = other.name }", 0, 1),
         (
             "config = { converted = other.name as mock.Name plain = other.name }",

@@ -92,7 +92,12 @@ pub(crate) fn parse_resource_for_target(
             target.template_resource_id(provider, &resource_type, None)
         }
     };
-    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
+    let mode = ExpressionMode::resource(
+        provisional_id.clone(),
+        source_file,
+        preprocessed_file,
+        ctx.authored_resource_declaration(&syntax),
+    );
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
     let parsed_contents = parse_block_contents_with_quoted(
         iter,
@@ -102,12 +107,13 @@ pub(crate) fn parse_resource_for_target(
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
-    let authored_slots = ctx.authored_resource_slots(
+    let mut authored_slots = ctx.authored_resource_slots(
         &syntax,
         &parsed_contents.sinks,
         &parsed_contents.attributes,
         crate::schema::SchemaKind::Resource,
     )?;
+    authored_slots.set_input_origin(mode.resource_input_origin());
     let attributes = parsed_contents.attributes;
     let ParsedDirectives {
         directives,
@@ -461,7 +467,12 @@ pub(crate) fn parse_read_resource_expr(
         ResourceIdentity::new(binding_name.to_string()),
         None,
     );
-    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
+    let mode = ExpressionMode::resource(
+        provisional_id.clone(),
+        source_file,
+        preprocessed_file,
+        ctx.authored_resource_declaration(&syntax),
+    );
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
     let parsed_contents = parse_block_contents_with_quoted(
         inner,
@@ -471,12 +482,13 @@ pub(crate) fn parse_read_resource_expr(
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
-    let authored_slots = ctx.authored_resource_slots(
+    let mut authored_slots = ctx.authored_resource_slots(
         &syntax,
         &parsed_contents.sinks,
         &parsed_contents.attributes,
         crate::schema::SchemaKind::DataSource,
     )?;
+    authored_slots.set_input_origin(mode.resource_input_origin());
     let attributes = parsed_contents.attributes;
     let ParsedDirectives {
         directives,

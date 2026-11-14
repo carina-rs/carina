@@ -1,0 +1,9 @@
+let x = choice {
+  flag = true
+  zulu_call = missing_zulu()
+  alpha_call = missing_alpha()
+  quartz_call = missing_quartz()
+  bravo_call = missing_bravo()
+  mango_call = missing_mango()
+  delta_call = missing_delta()
+}

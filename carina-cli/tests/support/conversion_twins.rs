@@ -61,6 +61,12 @@ pub fn emit_twins(directory: &Path) -> usize {
             }
         }
     }
+    for position in OWNER_POSITIONS {
+        position
+            .fixture(false)
+            .write(&directory.join("static-owner").join(position.label()));
+        count += 1;
+    }
     std::fs::write(directory.join("grammar-audit.txt"), format!("{}\nnon-expression rules: {NON_CONTEXT_RULES:?}\ntransport roles: {TRANSPORT_EXAMPLES:?}\n", manifest.join("\n"))).unwrap();
     count
 }

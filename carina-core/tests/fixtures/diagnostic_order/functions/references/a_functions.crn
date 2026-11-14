@@ -1,0 +1,2 @@
+fn zebra(): Int { source.name }
+fn mango(): Int { sink(source.name) }

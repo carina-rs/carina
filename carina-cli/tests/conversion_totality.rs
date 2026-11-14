@@ -522,7 +522,7 @@ fn merge_require_conversions_remain_ordinary_syntax_errors() {
 }
 
 #[test]
-fn merge_module_require_failure_stops_before_resource_conversion_admission() {
+fn r11_module_require_failure_keeps_already_judged_static_conversion_findings() {
     let directory = tempfile::tempdir().unwrap();
     for passes in [false, true] {
         let condition = if passes { "true" } else { "false" };
@@ -532,32 +532,157 @@ fn merge_module_require_failure_stops_before_resource_conversion_admission() {
         assert_eq!(cli["status"], "error", "{cli}");
         assert!(!internal(&cli.to_string()), "{cli}");
         let errors = cli["errors"].as_array().unwrap();
-        assert_eq!(errors.len(), 1, "{cli}");
-        if passes {
-            assert_eq!(conversion_count(&cli), 1, "{cli}");
-            assert_eq!(errors[0]["code"], "conversion_scalar_kind", "{cli}");
-            assert!(
-                errors[0]["location"]["file"]
-                    .as_str()
-                    .unwrap()
-                    .ends_with("child/main.crn"),
-                "{cli}"
-            );
-        } else {
-            assert_eq!(conversion_count(&cli), 0, "{cli}");
-            assert!(errors[0]["code"].is_null(), "{cli}");
+        assert_eq!(errors.len(), if passes { 1 } else { 2 }, "{cli}");
+        assert_eq!(conversion_count(&cli), 1, "{cli}");
+        let conversion = errors
+            .iter()
+            .find(|finding| finding["code"] == "conversion_scalar_kind")
+            .unwrap();
+        assert!(
+            conversion["location"]["file"]
+                .as_str()
+                .unwrap()
+                .ends_with("child/main.crn")
+        );
+        if !passes {
+            let ordinary = errors
+                .iter()
+                .filter(|finding| finding["code"].is_null())
+                .cloned()
+                .collect::<Vec<_>>();
             assert_eq!(
-                errors[0]["message"],
-                "module 'child' (call 'net'): arguments : require merge guard",
-                "{cli}"
+                ordinary[0]["message"],
+                "module 'child' (call 'net'): arguments : require merge guard"
             );
             require_validation_fixture(true, condition, "mock.Sink { attr = 'ok' }")
                 .write(directory.path());
             let control = validate(directory.path());
             assert_eq!(
-                cli, control,
-                "ordinary require failure is exactly main's output with a valid no-as resource"
+                ordinary,
+                *control["errors"].as_array().unwrap(),
+                "ordinary require diagnostics retain main's output"
             );
         }
+    }
+}
+
+#[test]
+fn r11_generated_source_type_owner_stage_matches_the_no_as_twin() {
+    let check = |label: &str, twin: Fixture, converted: Fixture, conversion_expected: usize| {
+        let directory = tempfile::tempdir().unwrap();
+        twin.write(directory.path());
+        let ordinary = validate(directory.path());
+        let ordinary_lsp = lsp_findings(&twin, directory.path());
+        converted.write(directory.path());
+        let checked = validate(directory.path());
+        let checked_lsp = lsp_findings(&converted, directory.path());
+        assert_eq!(
+            conversion_count(&checked),
+            conversion_expected,
+            "{label}: {checked}"
+        );
+        if ordinary["status"] == "error" {
+            assert_eq!(
+                checked["status"], "error",
+                "{label}: twin={ordinary}; as={checked}"
+            );
+        }
+        let error = Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR);
+        if ordinary_lsp.iter().any(|finding| finding.severity == error) {
+            assert!(
+                checked_lsp.iter().any(|finding| finding.severity == error),
+                "{label}: twin={ordinary_lsp:?}; as={checked_lsp:?}"
+            );
+        }
+        let conversions = checked_lsp.iter().filter(|finding| matches!(&finding.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code.starts_with("conversion_"))).count();
+        assert_eq!(conversions, conversion_expected, "{label}: {checked_lsp:?}");
+        assert!(
+            !internal(&checked.to_string())
+                && checked_lsp
+                    .iter()
+                    .all(|finding| !internal(&finding.message))
+        );
+        eprintln!(
+            "owner-stage {label}: twin CLI={} LSP-errors={}; as CLI={} LSP-errors={}",
+            ordinary["status"],
+            ordinary_lsp
+                .iter()
+                .filter(|finding| finding.severity == error)
+                .count(),
+            checked["status"],
+            checked_lsp
+                .iter()
+                .filter(|finding| finding.severity == error)
+                .count()
+        );
+    };
+    let mut cells = 0;
+    for position in POSITIONS {
+        for known in [true, false] {
+            let twin = fixture(position, known, true, false);
+            let mut converted = fixture(position, known, true, true);
+            for source in converted.files.values_mut() {
+                *source = source.replace("as mock.Name", "as mock.Other");
+            }
+            let expected = if known {
+                converted
+                    .files
+                    .values()
+                    .map(|source| source.matches(" as mock.Other").count())
+                    .sum()
+            } else {
+                0
+            };
+            check(
+                &format!("{position:?}/schema={known}"),
+                twin,
+                converted,
+                expected,
+            );
+            cells += 4;
+        }
+    }
+    for position in OWNER_POSITIONS {
+        check(
+            position.label(),
+            position.fixture(false),
+            position.fixture(true),
+            1,
+        );
+        cells += 4;
+    }
+    assert_eq!(cells, (POSITIONS.len() * 2 + OWNER_POSITIONS.len()) * 4);
+    eprintln!("source-type owner-stage matrix: {cells} surface/form cells");
+}
+
+#[test]
+fn r11_module_template_knowledge_cannot_reject_a_known_instance_union_value() {
+    for called in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut generated = Fixture::source(format!(
+            "let child = use {{ source = './child' }}\n{}",
+            if called {
+                "let instance = child { value = 'ok' }\n"
+            } else {
+                ""
+            }
+        ));
+        generated.files.insert(
+            "child/main.crn".into(),
+            "arguments { value: String }\nmock.Sink { choice = value as mock.Name }\n".into(),
+        );
+        generated.write(directory.path());
+        let cli = validate(directory.path());
+        // Compare the same root/instance scope as CLI. A child document opened
+        // standalone has no caller's argument values and remains a pending union.
+        let root_document = Fixture {
+            files: std::collections::BTreeMap::from([(
+                "main.crn".into(),
+                generated.files["main.crn"].clone(),
+            )]),
+        };
+        let lsp = lsp_findings(&root_document, directory.path());
+        assert_eq!(cli["status"], "ok", "called={called}: {cli}");
+        assert!(lsp.iter().all(|finding| !matches!(&finding.code, Some(tower_lsp::lsp_types::NumberOrString::String(code)) if code.starts_with("conversion_"))), "called={called}: {lsp:?}");
     }
 }

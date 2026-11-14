@@ -274,7 +274,7 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
             let judged = configuration.judged();
             let tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
             let resource = tree.resources().next().unwrap();
-            let values = resource.resolved_attributes();
+            let values = resource.attributes().into_owned();
             let inputs = ResourceAttributeInputs::from_report(resource, &values, judged.report());
             let classified = inputs.classify(
                 &carina_core::resource::knowledge::KnowledgeContext::validation(),

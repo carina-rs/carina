@@ -1,0 +1,2 @@
+fn zebra(value: String): String { alpha(value) }
+fn mango(value: String): String { value }

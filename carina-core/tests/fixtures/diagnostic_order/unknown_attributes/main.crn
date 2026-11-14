@@ -1,0 +1,9 @@
+mock.test.resource {
+  name = "ordered"
+  zulu_knob = "z"
+  alpha_knob = "a"
+  quartz_knob = "q"
+  bravo_knob = "b"
+  mango_knob = "m"
+  delta_knob = "d"
+}

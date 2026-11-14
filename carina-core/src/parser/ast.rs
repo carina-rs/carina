@@ -3971,15 +3971,37 @@ impl BindingScopeId {
 
 /// Stable parser address of a resource that owns an authored value sink.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ResourceAddress(ResourceId);
+pub struct ResourceAddress {
+    resource: ResourceId,
+    origin: Option<super::retained::SlotDeclarationId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ResourcePrecheckIdentity {
+    pub(crate) origin: super::retained::SlotDeclarationId,
+    pub(crate) instance: super::retained::ExpressionInstance,
+}
 
 impl ResourceAddress {
-    pub(in crate::parser) fn new(id: ResourceId) -> Self {
-        Self(id)
+    pub(in crate::parser) fn new(
+        id: ResourceId,
+        origin: Option<super::retained::SlotDeclarationId>,
+    ) -> Self {
+        Self {
+            resource: id,
+            origin,
+        }
     }
-
+    fn remapped(&self, resource: ResourceId) -> Self {
+        Self {
+            resource,
+            origin: self.origin.clone(),
+        }
+    }
+    pub(crate) fn input_origin(&self) -> Option<super::retained::SlotDeclarationId> {
+        self.origin.clone()
+    }
     pub fn resource_id(&self) -> &ResourceId {
-        &self.0
+        &self.resource
     }
 }
 
@@ -4078,6 +4100,7 @@ pub enum BareBindingKind {
 /// lookup. This data is parser-only and never enters [`Value`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BareBindingUse {
+    pub(crate) type_source: BindingTypeSource,
     pub(crate) expression_instance: super::retained::ExpressionInstance,
     pub(in crate::parser) location: super::DeclarationLocation,
     pub source_file: SourceFileId,
@@ -4089,6 +4112,12 @@ pub struct BareBindingUse {
     pub binding: BareBindingKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindingTypeSource {
+    Binding,
+    Conversion(super::retained::NodeId),
+    MissingConversion,
+}
 impl BareBindingUse {
     pub fn location(&self) -> &super::DeclarationLocation {
         &self.location
@@ -4239,12 +4268,12 @@ impl<B: BindingAddress> ParsedBindingUses<B> {
                 else {
                     unreachable!("resource owner index points to a module argument")
                 };
-                *address = ResourceAddress::new(to.clone());
+                *address = address.remapped(to.clone());
                 if let Some(slot) = &mut self.records[*index].pending_slot {
                     let BindingUseOwner::Resource(address) = &mut slot.owner else {
                         unreachable!("resource record has a module-argument pending slot")
                     };
-                    *address = ResourceAddress::new(to.clone());
+                    *address = address.remapped(to.clone());
                 }
             }
             self.record_indices_by_owner
@@ -4491,7 +4520,7 @@ impl ModuleCallId {
 pub struct ModuleCall<P: ValueKind = ParserPlaceholder, B: BindingAddress = RelativeBindingName> {
     pub module_name: String,
     pub binding_name: Option<B>,
-    arguments: HashMap<String, AuthoredModuleArgument<P, B>>,
+    arguments: IndexMap<String, AuthoredModuleArgument<P, B>>,
     source: Box<ModuleCallSite>,
     loop_origin: Option<Box<crate::resource::LoopElementOrigin>>,
 }
@@ -4501,7 +4530,7 @@ impl<P: ValueKind, B: BindingAddress> ModuleCall<P, B> {
         module_name: impl Into<String>,
         binding_name: Option<B>,
         id: ModuleCallId,
-        arguments: HashMap<String, AuthoredModuleArgument<P, B>>,
+        arguments: IndexMap<String, AuthoredModuleArgument<P, B>>,
     ) -> Self {
         Self {
             module_name: module_name.into(),
@@ -4666,7 +4695,7 @@ impl<P: ValueKind> ModuleCall<P, RelativeBindingName> {
     pub(crate) fn test(
         module_name: impl Into<String>,
         binding_name: Option<String>,
-        arguments: HashMap<String, ModuleArgument<P, RelativeBindingName>>,
+        arguments: IndexMap<String, ModuleArgument<P, RelativeBindingName>>,
     ) -> Self {
         let span = SourceSpan::dummy();
         let source = format!(
@@ -5271,7 +5300,7 @@ pub struct ParserBindingMetadata<B: BindingAddress = RelativeBindingName> {
     structural_aliases: IndexMap<B, UnexpandedStructuralHandle<B>>,
     value_structural_handles: IndexMap<B, UnexpandedStructuralHandleMetadata<B>>,
     resource_source_files: HashMap<ResourceId, PathBuf>,
-    template_dependency_values: HashMap<ResourceId, IndexMap<String, Value<ParserPlaceholder, B>>>,
+    template_dependency_values: IndexMap<ResourceId, IndexMap<String, Value<ParserPlaceholder, B>>>,
     pending_function_type_checks: Vec<PendingFunctionTypeCheck<B>>,
 }
 
@@ -5371,7 +5400,7 @@ impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
             structural_aliases: IndexMap::new(),
             value_structural_handles: IndexMap::new(),
             resource_source_files: HashMap::new(),
-            template_dependency_values: HashMap::new(),
+            template_dependency_values: IndexMap::new(),
             pending_function_type_checks: Vec::new(),
         }
     }
@@ -6666,7 +6695,7 @@ pub struct File<
     pub export_params: Vec<E>,
     pub backend: Option<BackendConfig<P, B>>,
     pub state_blocks: Vec<StateBlock<P, B>>,
-    pub user_functions: HashMap<String, UserFunction<B>>,
+    pub user_functions: IndexMap<String, UserFunction<B>>,
     pub upstream_states: Vec<UpstreamState<B>>,
     pub wait_bindings: Vec<WaitBinding<B>>,
     pub requires: Vec<RequireBlock<P, B>>,
@@ -6771,7 +6800,7 @@ where
             export_params: Vec::new(),
             backend: None,
             state_blocks: Vec::new(),
-            user_functions: HashMap::new(),
+            user_functions: IndexMap::new(),
             upstream_states: Vec::new(),
             wait_bindings: Vec::new(),
             requires: Vec::new(),
@@ -9674,7 +9703,7 @@ mod substitute_placeholder_tests {
         parsed.module_calls.push(ModuleCall::test(
             "module",
             Some("module_call_name".to_string()),
-            HashMap::new(),
+            indexmap::IndexMap::new(),
         ));
         parsed.upstream_states.push(UpstreamState {
             binding: "upstream_name".into(),
@@ -11262,5 +11291,39 @@ where
     }
     pub(crate) fn attach_authored_inputs(&mut self, inputs: crate::input_rules::AuthoredInputs) {
         self.authored_inputs = Some(std::sync::Arc::new(inputs));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_order_tests {
+    #[test]
+    fn template_metadata_values_keep_resource_declaration_order() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diagnostic_order/metadata_values");
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut parsed = crate::config_loader::parse_directory(
+            &crate::paths::ResolvedPath::new(root).unwrap(),
+            &context,
+        )
+        .unwrap()
+        .into_parsed();
+        parsed.capture_template_dependency_values();
+        let mut seen = Vec::new();
+        parsed
+            .parser_binding_metadata
+            .try_visit_values(&mut |value| {
+                if let crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                    value,
+                )) = value
+                    && let Some(name) = value
+                        .diagnostic_literal()
+                        .and_then(|value| value.strip_prefix("meta-"))
+                {
+                    seen.push(name.to_owned());
+                }
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(seen, ["zulu", "alpha", "quartz", "bravo", "mango", "delta"]);
     }
 }
