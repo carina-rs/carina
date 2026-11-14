@@ -56,7 +56,8 @@ pub fn local_backend_for_test(state_path: impl Into<std::path::PathBuf>) -> Box<
 }
 
 /// Inject an in-process S3 client while retaining the production readiness
-/// and provisioning path. No provisioning capability is constructed by tests.
+/// and provisioning path. Tests cannot construct a provisioning capability
+/// directly; they obtain one only through `storage_readiness()`.
 #[cfg(any(test, feature = "test-utils"))]
 pub fn s3_backend_for_test(
     client: aws_sdk_s3::Client,

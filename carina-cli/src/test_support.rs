@@ -7,6 +7,85 @@ use carina_core::{EnvironmentSnapshot, TestUserDirs};
 use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
 use std::sync::{Arc, OnceLock};
 
+/// A confirmed storage failure; every state or lock operation is forbidden.
+#[cfg(test)]
+pub(crate) struct UnavailableStorageBackend {
+    message: &'static str,
+    readiness_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl UnavailableStorageBackend {
+    pub(crate) fn new(message: &'static str) -> Self {
+        Self {
+            message,
+            readiness_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn readiness_calls(&self) -> usize {
+        self.readiness_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl carina_state::StateBackend for UnavailableStorageBackend {
+    async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {
+        panic!("unavailable storage must not be read")
+    }
+
+    async fn read_state_bytes(
+        &self,
+    ) -> carina_state::BackendResult<Option<carina_state::RawState>> {
+        panic!("unavailable storage bytes must not be read")
+    }
+
+    async fn write_state(&self, _: &carina_state::StateFile) -> carina_state::BackendResult<()> {
+        panic!("unavailable storage must not be written")
+    }
+
+    async fn write_state_locked(
+        &self,
+        _: &carina_state::StateFile,
+        _: &carina_state::LockInfo,
+    ) -> carina_state::BackendResult<()> {
+        panic!("unavailable storage must not be written under a lock")
+    }
+
+    async fn acquire_lock(&self, _: &str) -> carina_state::BackendResult<carina_state::LockInfo> {
+        panic!("unavailable storage must not be locked")
+    }
+
+    async fn release_lock(&self, _: &carina_state::LockInfo) -> carina_state::BackendResult<()> {
+        panic!("unavailable storage must not release a lock")
+    }
+
+    async fn renew_lock(
+        &self,
+        _: &carina_state::LockInfo,
+    ) -> carina_state::BackendResult<carina_state::LockInfo> {
+        panic!("unavailable storage must not renew a lock")
+    }
+
+    async fn force_unlock(&self, _: &str) -> carina_state::BackendResult<()> {
+        panic!("unavailable storage must not be force-unlocked")
+    }
+
+    async fn storage_readiness(
+        &self,
+    ) -> carina_state::BackendResult<carina_state::StorageReadiness> {
+        self.readiness_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(carina_state::StorageReadiness::Unavailable(
+            carina_state::StorageUnavailable::new(carina_state::BackendError::Configuration(
+                self.message.into(),
+            )),
+        ))
+    }
+}
+
 /// Obtain a real S3 readiness capability over an in-process HTTP service.
 /// The returned request log makes bucket creation and public-access blocking
 /// observable without granting a test double its own provisioning method.

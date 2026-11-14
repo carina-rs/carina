@@ -5760,9 +5760,77 @@ fn plan_s3_storage_bootstrap(
     Ok(Some(storage))
 }
 
+/// Gate plan's state read on readiness before resolving operation providers.
+async fn load_plan_storage(
+    readiness: StorageReadinessStatus,
+    read_state: impl std::future::Future<
+        Output = carina_state::BackendResult<Option<carina_state::LoadedState>>,
+    >,
+    resources: &[Resource],
+    use_locked_backend: bool,
+) -> Result<(Option<StateFile>, Option<S3BootstrapInfo>), AppError> {
+    let mut state_file: Option<StateFile> = None;
+    let state_bucket_bootstrap = match readiness {
+        StorageReadinessStatus::Ready => {
+            // Plan keeps schema migrations in memory; mutation paths persist
+            // them under the state lock.
+            state_file = read_state
+                .await
+                .map_err(AppError::Backend)?
+                .map(|loaded| loaded.into_state());
+            None
+        }
+        StorageReadinessStatus::Provisionable(storage) => {
+            let bucket_name = storage.settings().bucket();
+            let backend_resource_type = storage.resource_type();
+            #[rustfmt::skip]
+            let has_bucket_resource = resources.iter().any(|r| { // allow: direct — plan-time reconciliation
+                r.id.resource_type == backend_resource_type
+                    && r.attributes
+                        .get("bucket")
+                        .is_some_and(|v| matches!(v, Value::Concrete(ConcreteValue::String(s)) if s.expose_plaintext() == bucket_name))
+            });
+            plan_s3_storage_bootstrap(storage, has_bucket_resource, use_locked_backend)?
+        }
+        StorageReadinessStatus::Unavailable(unavailable) => {
+            return Err(AppError::Backend(unavailable.into_error()));
+        }
+    };
+
+    Ok((state_file, state_bucket_bootstrap))
+}
+
 #[cfg(test)]
 mod storage_readiness_tests {
     use super::*;
+    use carina_state::StateBackend;
+
+    #[tokio::test]
+    async fn storage_readiness_unavailable_stops_plan_before_state_read() {
+        for migration_pending in [false, true] {
+            let message = "state storage requires an external repair";
+            let backend = crate::test_support::UnavailableStorageBackend::new(message);
+
+            // run_plan_using resolves its opaque read capability itself. This
+            // is the command's readiness match, before any operation provider
+            // resolution; the read future panics if it is polled.
+            let error = load_plan_storage(
+                backend.storage_readiness().await.unwrap().into_status(),
+                backend.read_state(),
+                &[],
+                migration_pending,
+            )
+            .await
+            .expect_err("confirmed unavailability must abort plan");
+
+            let AppError::Backend(carina_state::BackendError::Configuration(original)) = error
+            else {
+                panic!("unavailability must preserve the backend configuration error")
+            };
+            assert_eq!(original, message);
+            assert_eq!(backend.readiness_calls(), 1);
+        }
+    }
 
     async fn missing_storage(auto_create: bool) -> S3BootstrapInfo {
         let (backend, _) = crate::test_support::missing_s3_backend(auto_create).await;
@@ -6055,38 +6123,16 @@ pub(crate) async fn run_plan_using(
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
-    let mut state_file: Option<StateFile> = None;
-    let state_bucket_bootstrap = match plan_backend
-        .storage_readiness()
-        .await
-        .map_err(AppError::Backend)?
-    {
-        StorageReadinessStatus::Ready => {
-            // Plan keeps schema migrations in memory; mutation paths persist
-            // them under the state lock.
-            state_file = plan_backend
-                .read_state()
-                .await
-                .map_err(AppError::Backend)?
-                .map(|loaded| loaded.into_state());
-            None
-        }
-        StorageReadinessStatus::Provisionable(storage) => {
-            let bucket_name = storage.settings().bucket();
-            let backend_resource_type = storage.resource_type();
-            #[rustfmt::skip]
-            let has_bucket_resource = parsed.resources.iter().any(|r| { // allow: direct — plan-time reconciliation
-                r.id.resource_type == backend_resource_type
-                    && r.attributes
-                        .get("bucket")
-                        .is_some_and(|v| matches!(v, Value::Concrete(ConcreteValue::String(s)) if s.expose_plaintext() == bucket_name))
-            });
-            plan_s3_storage_bootstrap(storage, has_bucket_resource, use_locked_backend)?
-        }
-        StorageReadinessStatus::Unavailable(unavailable) => {
-            return Err(AppError::Backend(unavailable.into_error()));
-        }
-    };
+    let (mut state_file, state_bucket_bootstrap) = load_plan_storage(
+        plan_backend
+            .storage_readiness()
+            .await
+            .map_err(AppError::Backend)?,
+        plan_backend.read_state(),
+        &parsed.resources,
+        use_locked_backend,
+    )
+    .await?;
 
     // T0 fingerprint; see `StateSnapshot` for the TOCTOU rationale.
     let state_snapshot_t0 = StateSnapshot::capture(state_file.as_ref());

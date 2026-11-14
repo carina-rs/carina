@@ -32,6 +32,8 @@ use std::time::Duration;
 mod attribute_admission;
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
+#[path = "tests/storage_readiness.rs"]
+mod storage_readiness;
 
 use cancellation_fixture::ApplyCancellationFixture;
 

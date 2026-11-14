@@ -1961,7 +1961,6 @@ async fn run_apply_with_observer_factory(
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
     let path = project_argument;
-    let color_mode = runtime.color_mode();
     let loaded = load_configuration_with_config(
         project,
         provider_context,
@@ -1979,7 +1978,7 @@ async fn run_apply_with_observer_factory(
         base_dir,
         &mut crate::commands::human_provider_notices(runtime.color_mode()),
     )?;
-    let mut validated_config = providers.validate_config_pair(
+    let validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,
         base_dir,
@@ -2004,6 +2003,75 @@ async fn run_apply_with_observer_factory(
         .map_err(AppError::Backend)?
         .into();
 
+    let validated_config = prepare_apply_storage(
+        runtime,
+        project,
+        provider_context,
+        validated_config,
+        bootstrap_unresolved,
+        backend_file.as_ref(),
+        backend.as_ref(),
+    )
+    .await?;
+    let color_mode = runtime.color_mode();
+
+    // Acquire lock (unless --lock=false)
+    let state_lock = if lock {
+        println!("{}", "Acquiring state lock...".cyan(color_mode));
+        let acquired = backend
+            .acquire_lock("apply")
+            .await
+            .map_err(|error| map_lock_error(error, path))?;
+        println!("  {} Lock acquired", "✓".green(color_mode));
+        StateLock::held(acquired)
+    } else {
+        println!(
+            "{}",
+            "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
+                .yellow(color_mode)
+                .bold(color_mode)
+        );
+        StateLock::disabled_by_cli_flag()
+    };
+
+    symlink_retarget_test_barrier("CARINA_TEST_APPLY_LOCK_HANDSHAKE_DIR").await;
+
+    // All code after lock acquisition observes the shared cancellation token.
+    // A lock that survives execution is released after cancellation; proven
+    // heartbeat loss returns without a capability that could be released.
+    let outcome = run_apply_locked_owned(
+        validated_config,
+        auto_approve,
+        Arc::clone(&backend),
+        state_lock,
+        project,
+        provider_context,
+        cancel.clone(),
+        observer_factory,
+        parallelism,
+        accept_legacy_name_overrides,
+    )
+    .await;
+    let timing = finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await?;
+    if let Some(elapsed) = timing {
+        println!("{}", format_total_apply_line(elapsed));
+    }
+
+    Ok(())
+}
+
+/// Prepare storage before apply acquires a lock or constructs operation providers.
+async fn prepare_apply_storage(
+    runtime: &crate::runtime::CommandRuntime,
+    project: &ResolvedPath,
+    provider_context: &ProviderContext,
+    mut validated_config: ValidatedConfig,
+    bootstrap_unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
+    backend_file: Option<&ResolvedPath>,
+    backend: &dyn StateBackend,
+) -> Result<ValidatedConfig, AppError> {
+    let color_mode = runtime.color_mode();
+    let base_dir = project;
     match backend
         .storage_readiness()
         .await
@@ -2074,7 +2142,7 @@ async fn run_apply_with_observer_factory(
                         bucket_resource.clone(),
                         BootstrapCreateContext {
                             provider_context: validated_config.context().provider_context(),
-                            backend: backend.as_ref(),
+                            backend,
                             parsed: validated_config.resources().parsed(),
                             provider_configs: bootstrap_provider_inputs.configs(),
                             normalizer: bucket_normalizer.as_ref(),
@@ -2099,7 +2167,7 @@ async fn run_apply_with_observer_factory(
                     let backend_provider_name = storage.provider_name();
 
                     // Append resource definition to backend file
-                    let target_file = backend_file.as_ref().unwrap_or(project);
+                    let target_file = backend_file.unwrap_or(project);
 
                     let resource_code = storage.resource_definition();
 
@@ -2167,49 +2235,7 @@ async fn run_apply_with_observer_factory(
         }
     }
 
-    // Acquire lock (unless --lock=false)
-    let state_lock = if lock {
-        println!("{}", "Acquiring state lock...".cyan(color_mode));
-        let acquired = backend
-            .acquire_lock("apply")
-            .await
-            .map_err(|error| map_lock_error(error, path))?;
-        println!("  {} Lock acquired", "✓".green(color_mode));
-        StateLock::held(acquired)
-    } else {
-        println!(
-            "{}",
-            "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
-                .yellow(color_mode)
-                .bold(color_mode)
-        );
-        StateLock::disabled_by_cli_flag()
-    };
-
-    symlink_retarget_test_barrier("CARINA_TEST_APPLY_LOCK_HANDSHAKE_DIR").await;
-
-    // All code after lock acquisition observes the shared cancellation token.
-    // A lock that survives execution is released after cancellation; proven
-    // heartbeat loss returns without a capability that could be released.
-    let outcome = run_apply_locked_owned(
-        validated_config,
-        auto_approve,
-        Arc::clone(&backend),
-        state_lock,
-        project,
-        provider_context,
-        cancel.clone(),
-        observer_factory,
-        parallelism,
-        accept_legacy_name_overrides,
-    )
-    .await;
-    let timing = finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await?;
-    if let Some(elapsed) = timing {
-        println!("{}", format_total_apply_line(elapsed));
-    }
-
-    Ok(())
+    Ok(validated_config)
 }
 
 /// Deterministic test rendezvous, following plan's state-drift handshake.
