@@ -1,7 +1,10 @@
 //! Syntax-owned element provenance. Every location is minted from a grammar pair.
 use pest::iterators::{Pair, Pairs};
 
-use super::resource_body::{BlockContent, BlockContents, DirectiveEntry, ResourceBody};
+use super::resource_body::{
+    BlockContent, BlockContents, ClassifiedResourceDirectives, DirectiveBlock, DirectiveEntry,
+    ResourceBody,
+};
 use super::{DeclarationLocation, Located, PreprocessedFile, Rule};
 use crate::resource::ResourceDirective;
 use std::{
@@ -315,6 +318,7 @@ impl ElementLocations {
         pair: &Pair<'_, Rule>,
         file: &PreprocessedFile,
         path: &Path,
+        directives: &ClassifiedResourceDirectives,
     ) -> Self {
         let mut out = Self { ..Self::default() };
         if let Some(body) = ResourceBody::from_pair(pair.clone()) {
@@ -323,7 +327,7 @@ impl ElementLocations {
                 ElementKind::ResourceType,
                 DeclarationLocation::from_pair(&resource_type, file, path),
             ));
-            collect_keys(contents, &[], file, path, &mut out);
+            collect_keys(contents, &[], file, path, directives, &mut out);
         } else if pair.as_rule() == Rule::wait_expr {
             let mut inner = pair.clone().into_inner();
             let target = inner.next().expect("wait grammar has a target");
@@ -355,6 +359,7 @@ impl ElementLocations {
                 &[],
                 file,
                 path,
+                directives,
                 &mut out,
             );
         }
@@ -375,6 +380,7 @@ fn collect_keys(
     parent: &[super::AttributePathSegment],
     file: &PreprocessedFile,
     source: &Path,
+    directives: &ClassifiedResourceDirectives,
     out: &mut ElementLocations,
 ) {
     use super::AttributePathSegment as Segment;
@@ -385,30 +391,30 @@ fn collect_keys(
             BlockContent::Directives(block) => {
                 // Runtime parsing keeps the first block, so its element
                 // provenance must also come only from that block.
-                if block.duplicate().is_some() {
-                    continue;
+                match block.classification(directives) {
+                    DirectiveBlock::First => {}
+                    DirectiveBlock::Duplicate(_finding) => continue,
                 }
-                for entry in block.entries() {
-                    let attribute = match entry {
-                        DirectiveEntry::Attribute(attribute) => attribute,
-                        DirectiveEntry::Invalid(_) => continue,
+                for (attribute, entry) in block.entries(directives) {
+                    let directive = match entry {
+                        DirectiveEntry::Valid(directive) => *directive,
+                        DirectiveEntry::Invalid(_finding) => continue,
                     };
                     let mut parts = attribute.into_inner();
                     let name = parts.next().expect("directive key");
-                    let key = super::extract_key_string(name.clone());
-                    match key.as_deref().ok().and_then(ResourceDirective::from_name) {
-                        Some(ResourceDirective::Provider) => {
+                    match directive {
+                        ResourceDirective::Provider => {
                             let value = parts.next().expect("directive value");
                             out.values.push((
                                 ElementKind::Provider,
                                 DeclarationLocation::from_pair(&value, file, source),
                             ));
                         }
-                        Some(ResourceDirective::IgnoreChanges) => out.values.push((
+                        ResourceDirective::IgnoreChanges => out.values.push((
                             ElementKind::IgnoreChanges,
                             DeclarationLocation::from_pair(&name, file, source),
                         )),
-                        _ => {}
+                        ResourceDirective::Lifecycle(_) | ResourceDirective::DependsOn => {}
                     }
                 }
                 continue;
@@ -457,7 +463,14 @@ fn collect_keys(
                         list_literal: false,
                         literal_container: true,
                     });
-                    collect_keys(BlockContents::ordinary(inner), &path, file, source, out);
+                    collect_keys(
+                        BlockContents::ordinary(inner),
+                        &path,
+                        file,
+                        source,
+                        directives,
+                        out,
+                    );
                 } else if let Some(value) = inner.next() {
                     out.attribute_values
                         .push(value_location(&value, &path, file, source));
@@ -467,7 +480,7 @@ fn collect_keys(
                             DeclarationLocation::from_pair(&value, file, source),
                         ));
                     }
-                    collect_value_keys(value, &path, file, source, out);
+                    collect_value_keys(value, &path, file, source, directives, out);
                 }
             }
             Rule::block_content => collect_keys(
@@ -475,6 +488,7 @@ fn collect_keys(
                 parent,
                 file,
                 source,
+                directives,
                 out,
             ),
             _ => {}
@@ -487,6 +501,7 @@ fn collect_value_keys(
     parent: &[super::AttributePathSegment],
     file: &PreprocessedFile,
     source: &Path,
+    directives: &ClassifiedResourceDirectives,
     out: &mut ElementLocations,
 ) {
     if pair.as_rule() == Rule::map {
@@ -495,6 +510,7 @@ fn collect_value_keys(
             parent,
             file,
             source,
+            directives,
             out,
         );
     } else if pair.as_rule() == Rule::list {
@@ -503,11 +519,11 @@ fn collect_value_keys(
             path.push(super::AttributePathSegment::ListIndex(index));
             out.attribute_values
                 .push(value_location(&value, &path, file, source));
-            collect_value_keys(value, &path, file, source, out);
+            collect_value_keys(value, &path, file, source, directives, out);
         }
     } else {
         for child in pair.into_inner() {
-            collect_value_keys(child, parent, file, source, out);
+            collect_value_keys(child, parent, file, source, directives, out);
         }
     }
 }
@@ -1013,12 +1029,6 @@ impl ModuleDeclarationBlocks {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectiveSyntaxIssue {
-    InvalidEntry,
-    DuplicateBlock { first_line: usize },
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxInventory<
     B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
 > {
@@ -1034,8 +1044,6 @@ pub struct SyntaxInventory<
     configuration_blocks: Vec<Located<ConfigurationBlock>>,
     module_declaration_blocks: ModuleDeclarationBlocks,
     backend_keys: Vec<Located<super::AttributeKey>>,
-    directive_keys: Vec<Located<super::AttributeKey>>,
-    directive_issues: Vec<Located<DirectiveSyntaxIssue>>,
     anonymous_headers: Vec<DeclarationLocation>,
     loops: Vec<DeclarationLocation>,
     state_targets: Vec<DeclarationLocation>,
@@ -1053,8 +1061,6 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
             configuration_blocks: Vec::new(),
             module_declaration_blocks: ModuleDeclarationBlocks::Absent,
             backend_keys: Vec::new(),
-            directive_keys: Vec::new(),
-            directive_issues: Vec::new(),
             anonymous_headers: Vec::new(),
             loops: Vec::new(),
             state_targets: Vec::new(),
@@ -1086,12 +1092,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     }
     pub(crate) fn backend_keys(&self) -> &[Located<super::AttributeKey>] {
         &self.backend_keys
-    }
-    pub(crate) fn directive_keys(&self) -> &[Located<super::AttributeKey>] {
-        &self.directive_keys
-    }
-    pub(crate) fn directive_issues(&self) -> &[Located<DirectiveSyntaxIssue>] {
-        &self.directive_issues
     }
     pub(crate) fn anonymous_headers(&self) -> &[DeclarationLocation] {
         &self.anonymous_headers
@@ -1133,8 +1133,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             .module_declaration_blocks
             .union(other.module_declaration_blocks);
         self.backend_keys.extend(other.backend_keys);
-        self.directive_keys.extend(other.directive_keys);
-        self.directive_issues.extend(other.directive_issues);
         self.anonymous_headers.extend(other.anonymous_headers);
         self.loops.extend(other.loops);
         self.state_targets.extend(other.state_targets);
@@ -1153,8 +1151,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             configuration_blocks: self.configuration_blocks,
             module_declaration_blocks: self.module_declaration_blocks,
             backend_keys: self.backend_keys,
-            directive_keys: self.directive_keys,
-            directive_issues: self.directive_issues,
             anonymous_headers: self.anonymous_headers,
             loops: self.loops,
             state_targets: self.state_targets,
@@ -1184,7 +1180,8 @@ impl SyntaxInventory {
         pairs: Pairs<'_, Rule>,
         file: &PreprocessedFile,
         source: &Path,
-    ) -> Self {
+    ) -> (Self, ClassifiedResourceDirectives) {
+        let directives = ClassifiedResourceDirectives::from_pairs(pairs.clone(), file, source);
         let expressions = super::retained::Expressions::from_pairs(pairs.clone(), file, source);
         let declarations = declaration_inventory(pairs.clone(), file, source);
         use crate::validation::{
@@ -1310,40 +1307,6 @@ impl SyntaxInventory {
             }
         }
         let mut attributes = ElementLocations::default();
-        for body in pairs.clone().flatten().filter_map(ResourceBody::from_pair) {
-            let (_, contents) = body.into_parts();
-            for content in contents {
-                if let BlockContent::Directives(block) = content {
-                    if let Some((name, first)) = block.duplicate() {
-                        out.directive_issues.push(Located::new(
-                            DeclarationLocation::from_pair(name, file, source),
-                            DirectiveSyntaxIssue::DuplicateBlock {
-                                first_line: DeclarationLocation::from_pair(first, file, source)
-                                    .span()
-                                    .start_line(),
-                            },
-                        ));
-                    }
-                    for entry in block.entries() {
-                        match entry {
-                            DirectiveEntry::Attribute(attribute) => {
-                                let key = attribute.into_inner().next().expect("directive key");
-                                out.directive_keys.push(Located::new(
-                                    DeclarationLocation::from_pair(&key, file, source),
-                                    super::AttributeKey::literal_in_file(key, file),
-                                ));
-                            }
-                            DirectiveEntry::Invalid(entry) => {
-                                out.directive_issues.push(Located::new(
-                                    DeclarationLocation::from_pair(&entry, file, source),
-                                    DirectiveSyntaxIssue::InvalidEntry,
-                                ))
-                            }
-                        }
-                    }
-                }
-            }
-        }
         for parameter in pairs
             .clone()
             .flatten()
@@ -1357,6 +1320,7 @@ impl SyntaxInventory {
                     &[super::AttributePathSegment::Attribute(name.to_string())],
                     file,
                     source,
+                    &directives,
                     &mut attributes,
                 );
             }
@@ -1399,7 +1363,8 @@ impl SyntaxInventory {
                         .flatten()
                         .filter(|p| p.as_rule() == Rule::upstream_state_expr)
                     {
-                        let elements = ElementLocations::from_pair(&upstream, file, source);
+                        let elements =
+                            ElementLocations::from_pair(&upstream, file, source, &directives);
                         for (kind, location) in elements.values {
                             if kind == ElementKind::Source {
                                 out.upstream_sources
@@ -1410,6 +1375,6 @@ impl SyntaxInventory {
                 }
             }
         }
-        out
+        (out, directives)
     }
 }

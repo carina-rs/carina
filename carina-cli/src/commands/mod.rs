@@ -676,7 +676,7 @@ fn validate_and_resolve_configuration(
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
-    // Binding-use validation is a production-readiness invariant, not a
+    // Binding-use and directive syntax validation are readiness invariants, not a
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
     // policy checks remain gated by `skip_resource_validation`.
@@ -686,18 +686,17 @@ fn validate_and_resolve_configuration(
         &enriched_context.catalog().environment,
         ctx.schemas(),
     );
-    if !skip_resource_validation {
-        for syntax in std::iter::once(parsed.parser_binding_metadata.syntax()).chain(
-            module_walk
+    for metadata in std::iter::once(&parsed.parser_binding_metadata).chain(
+        module_walk
+            .iter()
+            .map(|module| &module.loaded().parsed.parser_binding_metadata),
+    ) {
+        directive_errors.extend(
+            carina_core::validation::resource_directive_findings(metadata)
                 .iter()
-                .map(|module| module.loaded().parsed.parser_binding_metadata.syntax()),
-        ) {
-            directive_errors.extend(
-                carina_core::validation::resource_directive_findings(syntax)
-                    .into_iter()
-                    .map(|finding| AppError::ResourceDirective(Box::new(finding))),
-            );
-        }
+                .cloned()
+                .map(|finding| AppError::ResourceDirective(Box::new(finding))),
+        );
     }
 
     let mut errors: Vec<AppError> = Vec::new();

@@ -37,8 +37,12 @@ pub(crate) fn parse_wait_expr(
     source_file: &std::path::Path,
 ) -> Result<WaitBinding, ParseError> {
     debug_assert_eq!(pair.as_rule(), Rule::wait_expr);
-    let declaration =
-        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
+    let declaration = crate::parser::DeclarationProvenance::from_pair(
+        &pair,
+        preprocessed_file,
+        source_file,
+        &ctx.resource_directives,
+    );
     let (line, _) = pair.as_span().start_pos().line_col();
     let mut inner = pair.into_inner();
 

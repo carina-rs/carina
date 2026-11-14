@@ -558,3 +558,197 @@ fn duplicate_directives_have_identical_cli_and_lsp_errors_at_the_second_name() {
         assert!(lsp(directory.path(), name).is_empty(), "{name}");
     }
 }
+
+struct DirectiveProject {
+    directory: tempfile::TempDir,
+}
+
+impl DirectiveProject {
+    fn applied() -> Self {
+        let project = Self {
+            directory: fixture(),
+        };
+        std::fs::write(
+            project.directory.path().join("main.crn"),
+            "backend local { path = 'carina.state.json' }\n",
+        )
+        .unwrap();
+        project.resource("");
+        project.success(&["init", "."]);
+        project.success(&["apply", ".", "--auto-approve", "--lock=false"]);
+        project
+    }
+
+    fn resource(&self, body: &str) {
+        std::fs::write(
+            self.directory.path().join("resources.crn"),
+            format!("mock.test.resource {{\n  name = 'example'\n{body}\n}}\n"),
+        )
+        .unwrap();
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_carina"))
+            .args(args)
+            .current_dir(self.directory.path())
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .env(
+                "CARINA_MOCK_STATE_FILE",
+                self.directory.path().join("mock-state.json"),
+            )
+            .env(
+                "CARINA_MOCK_OP_LOG",
+                self.directory.path().join("operations.log"),
+            )
+            .output()
+            .unwrap()
+    }
+
+    fn success(&self, args: &[&str]) -> std::process::Output {
+        let output = self.run(args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        output
+    }
+
+    fn assert_rejected_without_mutation(&self, args: &[&str], located: &str) {
+        let state_path = self.directory.path().join("carina.state.json");
+        let provider_path = self.directory.path().join("mock-state.json");
+        let state = std::fs::read(&state_path).unwrap();
+        let provider = std::fs::read(&provider_path).unwrap();
+        let output = self.run(args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(located), "{args:?}: {stderr}");
+        assert_eq!(stderr.matches(located).count(), 1, "{stderr}");
+        assert_eq!(std::fs::read(&state_path).unwrap(), state);
+        assert_eq!(std::fs::read(&provider_path).unwrap(), provider);
+        let operations =
+            std::fs::read_to_string(self.directory.path().join("operations.log")).unwrap();
+        assert!(
+            !operations.lines().any(|line| line.starts_with("delete ")),
+            "{operations}"
+        );
+    }
+}
+
+#[test]
+fn commands_that_resolve_resources_reject_unknown_directive_keys_destroy() {
+    let project = DirectiveProject::applied();
+    project.resource("  directives {\n    prevent_destory = true\n  }");
+    project.assert_rejected_without_mutation(
+        &["destroy", ".", "--auto-approve", "--lock=false"],
+        "resources.crn:4:5: Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?",
+    );
+}
+
+#[test]
+fn commands_that_resolve_resources_reject_unknown_directive_keys_state_refresh() {
+    let project = DirectiveProject::applied();
+    project.resource("  directives {\n    prevent_destory = true\n  }");
+    project.assert_rejected_without_mutation(
+        &["state", "refresh", ".", "--lock=false"],
+        "resources.crn:4:5: Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?",
+    );
+}
+
+#[test]
+fn invalid_directive_entries_and_duplicate_blocks_match_validate_on_destroy() {
+    for (body, located) in [
+        (
+            "  directives {\n    prevent_destroy {}\n  }",
+            "resources.crn:4:5: Directive entries must be 'key = value' assignments",
+        ),
+        (
+            "  directives {\n    let flag = absent\n  }",
+            "resources.crn:4:5: Directive entries must be 'key = value' assignments",
+        ),
+        (
+            "  directives { prevent_destroy = true }\n  directives { prevent_destroy = false }",
+            "resources.crn:4:3: Duplicate attribute 'directives' (first defined on line 3)",
+        ),
+        (
+            "  directives {\n    'prevent_destory' = true\n  }",
+            "resources.crn:4:5: Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?",
+        ),
+    ] {
+        let project = DirectiveProject::applied();
+        project.resource(body);
+        project.assert_rejected_without_mutation(&["validate", "."], located);
+        project.assert_rejected_without_mutation(
+            &["destroy", ".", "--auto-approve", "--lock=false"],
+            located,
+        );
+    }
+}
+
+#[test]
+fn quoted_directive_keys_share_normalization_between_validation_and_destroy() {
+    let project = DirectiveProject::applied();
+    project.resource("  directives {\n    'prevent_destroy' = false\n    \"force_delete\" = true\n    'ignore_changes' = [name]\n    \"depends_on\" = []\n  }");
+    project.success(&["validate", "."]);
+    assert!(lsp(project.directory.path(), "resources.crn").is_empty());
+    project.success(&["destroy", ".", "--auto-approve", "--lock=false"]);
+    let operations =
+        std::fs::read_to_string(project.directory.path().join("operations.log")).unwrap();
+    assert_eq!(
+        operations
+            .lines()
+            .filter(|line| line.starts_with("delete "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn non_root_directives_remain_ordinary_schema_attributes_on_destroy() {
+    let project = DirectiveProject::applied();
+    project.resource("  rule {\n    directives { prevent_destory = true }\n  }");
+    let output = project.run(&["validate", "."]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("Unknown field 'directives' in Rule"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Unknown directive"), "{stderr}");
+    // Destroy skips resource schema policy, while keeping the same root-only
+    // interpretation of directives as validate.
+    project.success(&["destroy", ".", "--auto-approve", "--lock=false"]);
+}
+
+#[test]
+fn direct_state_reads_force_unlock_and_fmt_allow_invalid_directive_keys() {
+    let project = DirectiveProject::applied();
+    project.resource("directives {prevent_destory=true\nlet flag = absent\nunsupported {} }");
+    let state_path = project.directory.path().join("carina.state.json");
+    let state = std::fs::read(&state_path).unwrap();
+    let url = format!("file://{}", state_path.display());
+    let output = project.success(&["state", "show", "--state-url", &url, "--json"]);
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(shown.to_string().contains("example"), "{shown}");
+    let lock_path = state_path.with_extension("lock");
+    std::fs::write(
+        &lock_path,
+        serde_json::to_vec(&serde_json::json!({
+            "id": "directive-recovery", "operation": "apply", "who": "test",
+            "created": "2026-01-01T00:00:00Z", "expires": "2099-01-01T00:00:00Z"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    project.success(&["force-unlock", "directive-recovery", "."]);
+    assert!(!lock_path.exists());
+    project.success(&["fmt", "."]);
+    project.success(&["fmt", ".", "--check"]);
+    let formatted =
+        std::fs::read_to_string(project.directory.path().join("resources.crn")).unwrap();
+    for entry in [
+        "prevent_destory = true",
+        "let flag = absent",
+        "unsupported {",
+    ] {
+        assert!(formatted.contains(entry), "{formatted}");
+    }
+    assert_eq!(std::fs::read(&state_path).unwrap(), state);
+}

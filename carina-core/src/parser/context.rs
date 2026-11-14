@@ -168,6 +168,7 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     binding_scope_source_file: std::path::PathBuf,
     diagnostic_source: Source,
     authored_nodes: Arc<super::retained::CapturedNodes>,
+    pub(super) resource_directives: Arc<super::resource_body::ClassifiedResourceDirectives>,
     next_binding_scope: Rc<Cell<u64>>,
     /// The exact preprocessing map for the file whose pest pairs are being
     /// lowered. Shared ownership lets nested parser contexts preserve authored
@@ -242,6 +243,7 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
         );
         context.session = self.session;
         context.authored_nodes = self.authored_nodes.clone();
+        context.resource_directives = self.resource_directives.clone();
         context.evaluation_scopes = self.evaluation_scopes.clone();
         context
     }
@@ -479,6 +481,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             binding_scope_source_file: source_file,
             diagnostic_source,
             authored_nodes: Arc::default(),
+            resource_directives: Arc::default(),
             next_binding_scope: Rc::new(Cell::new(1)),
             source_position_map: None,
             evaluation_scopes: Default::default(),

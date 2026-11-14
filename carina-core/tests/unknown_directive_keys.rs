@@ -13,7 +13,7 @@ fn non_assignment_directive_entries_are_all_located_without_evaluation() {
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("invalid entries are collected without evaluating their contents");
-    let findings = resource_directive_findings(parsed.parser_binding_metadata.syntax());
+    let findings = resource_directive_findings(&parsed.parser_binding_metadata);
     assert_eq!(findings.len(), 4, "{findings:?}");
     for (finding, (line, width)) in findings.iter().zip([(3, 15), (4, 11), (5, 14)]) {
         assert_eq!(
@@ -114,7 +114,7 @@ fn unknown_directive_keys_use_shared_suggestions_at_each_authored_key() {
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("unknown keys must not abort parsing");
-        let findings = resource_directive_findings(parsed.parser_binding_metadata.syntax());
+        let findings = resource_directive_findings(&parsed.parser_binding_metadata);
         assert_eq!(findings.len(), 1, "{key}: {findings:?}");
         let expected = match suggestion {
             Some(name) => format!("Unknown directive '{key}', did you mean '{name}'?"),
@@ -206,7 +206,7 @@ mock.test.resource {
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    assert!(resource_directive_findings(parsed.parser_binding_metadata.syntax()).is_empty());
+    assert!(resource_directive_findings(&parsed.parser_binding_metadata).is_empty());
     let child = &parsed.resources[1];
     assert!(!child.dependencies.depends_on.is_empty());
     assert!(!child.attributes.contains_key("depends_on"));

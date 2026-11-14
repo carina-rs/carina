@@ -32,12 +32,12 @@ mod dependencies;
 mod element_tests;
 mod elements;
 pub use dependencies::{UnexpandedDependencies, UnexpandedDependencyOperand};
+pub(crate) use elements::ModuleDeclarationBlocks;
 pub(crate) use elements::{AccessLocations, AccessProvenance};
 pub use elements::{
     AttributeKeyLocation, ConfigurationBlock, DeclarationAnnotation, DeclarationRecord,
     ReferenceLocations, ReferenceProvenance, SyntaxInventory,
 };
-pub(crate) use elements::{DirectiveSyntaxIssue, ModuleDeclarationBlocks};
 mod entry;
 pub(crate) use entry::{AuthoredParse, scope_parse_failure};
 mod error;

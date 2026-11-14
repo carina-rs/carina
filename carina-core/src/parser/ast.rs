@@ -5273,6 +5273,7 @@ impl UnexpandedCompositionAttribute<AbsoluteBindingAddress> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParserBindingMetadata<B: BindingAddress = RelativeBindingName> {
     pub(crate) syntax: Box<super::SyntaxInventory<B>>,
+    pub(crate) directive_findings: Vec<super::Located<crate::validation::ResourceDirectiveFinding>>,
     pub(crate) unexpanded_composition_attributes: Vec<UnexpandedCompositionAttribute<B>>,
     structural_handles: IndexMap<B, UnexpandedStructuralHandle<B>>,
     structural_aliases: IndexMap<B, UnexpandedStructuralHandle<B>>,
@@ -5373,6 +5374,7 @@ impl<B: BindingAddress> Default for ParserBindingMetadata<B> {
     fn default() -> Self {
         Self {
             syntax: Default::default(),
+            directive_findings: Vec::new(),
             unexpanded_composition_attributes: Vec::new(),
             structural_handles: IndexMap::new(),
             structural_aliases: IndexMap::new(),
@@ -5461,6 +5463,7 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
     ) -> Result<(), E> {
         let Self {
             syntax: _syntax,
+            directive_findings: _directive_findings,
             unexpanded_composition_attributes,
             structural_handles: _structural_handles,
             structural_aliases: _structural_aliases,
@@ -5500,6 +5503,20 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
 
     pub(crate) fn extend(&mut self, other: Self) {
         self.syntax.extend(*other.syntax);
+        // A module can contribute several instances of the same authored site.
+        for finding in other.directive_findings {
+            if !self.directive_findings.contains(&finding) {
+                self.directive_findings.push(finding);
+            }
+        }
+        self.directive_findings.sort_by(|left, right| {
+            let left = left.location();
+            let right = right.location();
+            left.file().path().cmp(right.file().path()).then_with(|| {
+                (left.span().start_line(), left.span().start_column())
+                    .cmp(&(right.span().start_line(), right.span().start_column()))
+            })
+        });
         self.unexpanded_composition_attributes
             .extend(other.unexpanded_composition_attributes);
         self.structural_handles.extend(other.structural_handles);
@@ -5550,6 +5567,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
     ) -> ParserBindingMetadata<AbsoluteBindingAddress> {
         let Self {
             syntax,
+            directive_findings,
             unexpanded_composition_attributes,
             structural_handles,
             structural_aliases,
@@ -5560,6 +5578,7 @@ impl ParserBindingMetadata<RelativeBindingName> {
         } = self;
         ParserBindingMetadata {
             syntax: Box::new((*syntax).map_bindings(resolve)),
+            directive_findings,
             unexpanded_composition_attributes: unexpanded_composition_attributes
                 .into_iter()
                 .map(|attribute| attribute.map_bindings(resolve))
@@ -5626,6 +5645,7 @@ impl ParserBindingMetadata<AbsoluteBindingAddress> {
     ) {
         let Self {
             syntax,
+            directive_findings: _directive_findings,
             unexpanded_composition_attributes,
             structural_handles,
             structural_aliases,

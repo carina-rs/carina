@@ -11,7 +11,8 @@ use crate::parser::context::{
 };
 use crate::parser::error::ParseError;
 use crate::parser::resource_body::{
-    BlockContent, BlockContents, DirectiveEntry, ResourceBody, ResourceDirectives,
+    BlockContent, BlockContents, ClassifiedResourceDirectives, DirectiveBlock, DirectiveEntry,
+    ResourceBody, ResourceDirectives,
 };
 use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{BoundDeferredTarget, Rule};
@@ -62,8 +63,12 @@ pub(crate) fn parse_resource_for_target(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<Resource, ParseError> {
-    let declaration =
-        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
+    let declaration = crate::parser::DeclarationProvenance::from_pair(
+        &pair,
+        preprocessed_file,
+        source_file,
+        &ctx.resource_directives,
+    );
     let syntax = pair.clone();
     let (resource_type, contents) = ResourceBody::from_pair(pair)
         .expect("resource parser requires a resource body")
@@ -243,10 +248,19 @@ fn parse_block_contents_with_quoted(
                 // Keep the first block, including when it is empty. The
                 // inventory reports duplicates and inspects every block;
                 // later blocks cannot overwrite or evaluate runtime settings.
-                if directives.is_none() {
-                    check_directives_depends_on_elements(block.clone())?;
-                    check_directives_provider_value(block.clone())?;
-                    directives = Some(parse_directives(block, &local_ctx)?);
+                match block.classification(&local_ctx.resource_directives) {
+                    DirectiveBlock::First => {
+                        check_directives_depends_on_elements(
+                            block.clone(),
+                            &local_ctx.resource_directives,
+                        )?;
+                        check_directives_provider_value(
+                            block.clone(),
+                            &local_ctx.resource_directives,
+                        )?;
+                        directives = Some(parse_directives(block, &local_ctx)?);
+                    }
+                    DirectiveBlock::Duplicate(_finding) => {}
                 }
                 continue;
             }
@@ -439,8 +453,12 @@ pub(crate) fn parse_read_resource_expr(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<DataSource, ParseError> {
-    let declaration =
-        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
+    let declaration = crate::parser::DeclarationProvenance::from_pair(
+        &pair,
+        preprocessed_file,
+        source_file,
+        &ctx.resource_directives,
+    );
     let syntax = pair.clone();
     let (resource_type, contents) = ResourceBody::from_pair(pair)
         .expect("read parser requires a resource body")
@@ -515,27 +533,16 @@ fn parse_directives(
 ) -> Result<ParsedDirectives, ParseError> {
     let mut parsed_directives = ParsedDirectives::default();
 
-    for entry in block.entries() {
-        let attr = match entry {
-            DirectiveEntry::Attribute(attribute) => attribute,
-            // The inventory retains every malformed entry for validation.
-            DirectiveEntry::Invalid(_) => continue,
+    for (attr, entry) in block.entries(&ctx.resource_directives) {
+        let directive = match entry {
+            DirectiveEntry::Valid(directive) => *directive,
+            DirectiveEntry::Invalid(_finding) => continue,
         };
 
         let mut attr_inner = attr.into_inner();
-        let key = extract_key_string(next_pair(
-            &mut attr_inner,
-            "attribute name",
-            "directives block",
-        )?)?;
+        let _key = next_pair(&mut attr_inner, "attribute name", "directives block")?;
         let value_pair = next_pair(&mut attr_inner, "attribute value", "directives block")?;
         let line = value_pair.line_col().0;
-
-        let Some(directive) = ResourceDirective::from_name(&key) else {
-            // SyntaxInventory retains unknown keys and their locations for
-            // collected validation; do not evaluate their unused values.
-            continue;
-        };
 
         match directive {
             ResourceDirective::Lifecycle(directive) => {
@@ -775,17 +782,18 @@ fn eval_as_binding_name(
 /// reject any `depends_on = [...]` element that is a string literal — bare
 /// binding identifiers and string literals collapse to the same `Value`
 /// later, so this is the only place we can tell `[role]` from `["role"]`.
-fn check_directives_depends_on_elements(block: ResourceDirectives<'_>) -> Result<(), ParseError> {
-    for entry in block.entries() {
-        let attr = match entry {
-            DirectiveEntry::Attribute(attribute) => attribute,
-            DirectiveEntry::Invalid(_) => continue,
+fn check_directives_depends_on_elements(
+    block: ResourceDirectives<'_>,
+    classified: &ClassifiedResourceDirectives,
+) -> Result<(), ParseError> {
+    for (attr, entry) in block.entries(classified) {
+        let directive = match entry {
+            DirectiveEntry::Valid(directive) => *directive,
+            DirectiveEntry::Invalid(_finding) => continue,
         };
         let mut attr_inner = attr.into_inner();
-        let key_pair = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
-        if ResourceDirective::from_name(&extract_key_string(key_pair)?)
-            != Some(ResourceDirective::DependsOn)
-        {
+        let _key = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
+        if directive != ResourceDirective::DependsOn {
             continue;
         }
         let value_pair = next_pair(&mut attr_inner, "attribute value", "directives attribute")?;
@@ -820,17 +828,18 @@ fn check_directives_depends_on_elements(block: ResourceDirectives<'_>) -> Result
 
 /// Reject `provider = "<string>"` at the pest layer, where a quoted literal
 /// remains distinguishable from a bare binding identifier.
-fn check_directives_provider_value(block: ResourceDirectives<'_>) -> Result<(), ParseError> {
-    for entry in block.entries() {
-        let attr = match entry {
-            DirectiveEntry::Attribute(attribute) => attribute,
-            DirectiveEntry::Invalid(_) => continue,
+fn check_directives_provider_value(
+    block: ResourceDirectives<'_>,
+    classified: &ClassifiedResourceDirectives,
+) -> Result<(), ParseError> {
+    for (attr, entry) in block.entries(classified) {
+        let directive = match entry {
+            DirectiveEntry::Valid(directive) => *directive,
+            DirectiveEntry::Invalid(_finding) => continue,
         };
         let mut attr_inner = attr.into_inner();
-        let key_pair = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
-        if ResourceDirective::from_name(&extract_key_string(key_pair)?)
-            != Some(ResourceDirective::Provider)
-        {
+        let _key = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
+        if directive != ResourceDirective::Provider {
             continue;
         }
         let value_pair = next_pair(&mut attr_inner, "attribute value", "directives attribute")?;
@@ -923,10 +932,8 @@ mod tests {
             )
             .unwrap();
             assert!(
-                crate::validation::resource_directive_findings(
-                    parsed.parser_binding_metadata.syntax()
-                )
-                .is_empty()
+                crate::validation::resource_directive_findings(&parsed.parser_binding_metadata)
+                    .is_empty()
             );
             let child = &parsed.resources[1];
             let mut lifecycle_count = 0;
@@ -969,9 +976,8 @@ mod tests {
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .expect("duplicate blocks are collected without evaluating the second block");
-            let findings = crate::validation::resource_directive_findings(
-                parsed.parser_binding_metadata.syntax(),
-            );
+            let findings =
+                crate::validation::resource_directive_findings(&parsed.parser_binding_metadata);
             assert_eq!(findings.len(), 1, "{findings:?}");
             assert_eq!(
                 findings[0].detail().to_string(),
@@ -1012,9 +1018,8 @@ mod tests {
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .expect("duplicate blocks must not abort the inventory");
-            let findings = crate::validation::resource_directive_findings(
-                parsed.parser_binding_metadata.syntax(),
-            );
+            let findings =
+                crate::validation::resource_directive_findings(&parsed.parser_binding_metadata);
             assert_eq!(findings.len(), 1, "{findings:?}");
             assert_eq!(
                 findings[0].detail().to_string(),

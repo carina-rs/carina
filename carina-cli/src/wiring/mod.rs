@@ -1032,13 +1032,14 @@ pub(crate) fn failed_validate_configuration(
                     Err(_) => {
                         // Syntax findings survive value failures such as a
                         // duplicate let, just as they do in editor buffers.
-                        if let Ok(syntax) = carina_core::parser::parse_syntax_inventory(
+                        if let Ok(metadata) = carina_core::parser::parse_syntax_inventory(
                             &source,
                             &file.source_label(),
                         ) {
                             errors.extend(
-                                validation::resource_directive_findings(&syntax)
-                                    .into_iter()
+                                validation::resource_directive_findings(&metadata)
+                                    .iter()
+                                    .cloned()
                                     .map(|finding| AppError::ResourceDirective(Box::new(finding))),
                             );
                         }
@@ -1052,11 +1053,10 @@ pub(crate) fn failed_validate_configuration(
                     warning
                 }));
                 errors.extend(
-                    validation::resource_directive_findings(
-                        parsed.parser_binding_metadata.syntax(),
-                    )
-                    .into_iter()
-                    .map(|finding| AppError::ResourceDirective(Box::new(finding))),
+                    validation::resource_directive_findings(&parsed.parser_binding_metadata)
+                        .iter()
+                        .cloned()
+                        .map(|finding| AppError::ResourceDirective(Box::new(finding))),
                 );
                 match validation::resolve_file_type_exprs(&mut parsed, session) {
                     Ok(findings) => errors.extend(
@@ -1564,6 +1564,9 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
         }
         carina_core::validation::ResolveFileError::Expression(finding) => {
             AppError::ExpressionType(finding)
+        }
+        carina_core::validation::ResolveFileError::ResourceDirective(finding) => {
+            AppError::ResourceDirective(finding)
         }
         carina_core::validation::ResolveFileError::BindingUse(report) => {
             binding_use_report_error(report)

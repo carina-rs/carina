@@ -885,6 +885,8 @@ pub enum ResolveFileError {
     #[error(transparent)]
     Expression(Box<crate::parser::Located<inference::InferenceError>>),
     #[error(transparent)]
+    ResourceDirective(Box<crate::parser::Located<ResourceDirectiveFinding>>),
+    #[error(transparent)]
     BindingUse(#[from] BindingUseReport),
     #[error(transparent)]
     Expansion(#[from] crate::resource::ExpansionError),
@@ -2220,6 +2222,11 @@ fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteB
     schemas: &SchemaRegistry,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
+    if let Some(finding) = resource_directive_findings(&file.parser_binding_metadata).first() {
+        return Err(ResolveFileError::ResourceDirective(Box::new(
+            finding.clone(),
+        )));
+    }
     if let Some(finding) = file.expression_report().findings().first() {
         return Err(ResolveFileError::Expression(Box::new(finding.clone())));
     }

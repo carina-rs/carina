@@ -36,13 +36,12 @@ macro_rules! resource_directives {
                 $((stringify!($key), Self::$other)),+
             ];
 
+            /// Lexical editor hints for incomplete source. Resource parsing and
+            /// diagnostics consume the shared CST classification instead.
             pub fn from_name(key: &str) -> Option<Self> {
                 Self::ALL.iter().find_map(|(name, directive)| (*name == key).then_some(*directive))
             }
 
-            pub(crate) fn from_key(key: &crate::parser::AttributeKey) -> Option<Self> {
-                Self::ALL.iter().find_map(|(name, directive)| key.matches(name).then_some(*directive))
-            }
         }
 
         impl<B: BindingAddress> Directives<B, ParserPlaceholder> {

@@ -686,18 +686,18 @@ impl DiagnosticRun<'_> {
         let buffer_parsed = doc.parsed();
         // Duplicate declarations can prevent runtime parsing while leaving a
         // complete syntax inventory. Keep directive diagnostics in that case.
-        let recovered_syntax = buffer_parsed
+        let recovered_metadata = buffer_parsed
             .is_none()
             .then(|| carina_core::parser::parse_syntax_inventory(&text, doc.source_file()).ok())
             .flatten();
-        let buffer_syntax = buffer_parsed
-            .map(|parsed| parsed.parser_binding_metadata.syntax())
-            .or(recovered_syntax.as_ref());
-        if let Some(syntax) = buffer_syntax {
-            for finding in carina_core::validation::resource_directive_findings(syntax) {
+        let buffer_metadata = buffer_parsed
+            .map(|parsed| &parsed.parser_binding_metadata)
+            .or(recovered_metadata.as_ref());
+        if let Some(metadata) = buffer_metadata {
+            for finding in carina_core::validation::resource_directive_findings(metadata) {
                 if let Some(diagnostic) = render_merged(
                     doc,
-                    &finding,
+                    finding,
                     DiagnosticSeverity::ERROR,
                     finding.detail().to_string(),
                 ) {

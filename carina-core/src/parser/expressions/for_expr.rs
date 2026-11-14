@@ -374,8 +374,12 @@ pub(crate) fn parse_for_expr(
 ) -> Result<(Vec<Resource>, Vec<DataSource>, Vec<ModuleCall>), ParseError> {
     let for_line = pair.as_span().start_pos().line_col().0;
     let for_span = SourceSpan::from_pest(&pair, preprocessed_file);
-    let declaration =
-        crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
+    let declaration = crate::parser::DeclarationProvenance::from_pair(
+        &pair,
+        preprocessed_file,
+        source_file,
+        &ctx.resource_directives,
+    );
     let mut inner = pair.into_inner();
 
     // Parse the binding pattern
