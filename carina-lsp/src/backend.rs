@@ -58,6 +58,10 @@ struct ProviderState {
 }
 
 impl ProviderState {
+    fn empty(environment: carina_core::EnvironmentSnapshot) -> Self {
+        Self::new(vec![], HashMap::new(), vec![], None, vec![], environment)
+    }
+
     fn new(
         factories: Vec<Box<dyn ProviderFactory>>,
         mut provider_errors: HashMap<String, String>,
@@ -200,7 +204,8 @@ fn probe_install_fingerprint(
 const PROVIDER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Per-directory provider states keyed by configuration directory.
-struct ProviderStates {
+pub struct ProviderStates {
+    discovery_scope: workspace::DiscoveryScope,
     environment: carina_core::EnvironmentSnapshot,
     /// Directory → ProviderState. Each directory with provider declarations
     /// gets its own state with its own schemas.
@@ -213,18 +218,18 @@ struct ProviderStates {
 }
 
 impl ProviderStates {
-    fn new(environment: carina_core::EnvironmentSnapshot) -> Self {
+    #[cfg(feature = "test-utils")]
+    pub fn with_replay_discovery(mut self, scope: workspace::DiscoveryScope) -> Self {
+        self.discovery_scope = scope;
+        self
+    }
+
+    pub fn new(environment: carina_core::EnvironmentSnapshot) -> Self {
         Self {
+            discovery_scope: workspace::DiscoveryScope::default(),
             by_dir: HashMap::new(),
             import_map: HashMap::new(),
-            empty: ProviderState::new(
-                vec![],
-                HashMap::new(),
-                vec![],
-                None,
-                vec![],
-                environment.clone(),
-            ),
+            empty: ProviderState::empty(environment.clone()),
             environment,
         }
     }
@@ -729,18 +734,8 @@ async fn publish_diagnostics_for(
         return;
     };
     let current_file_path = uri.to_file_path().ok();
-    let base_path = current_file_path
-        .as_deref()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
     let guard = providers.read().await;
-    let state = base_path
-        .as_ref()
-        .map(|p| guard.state_for_path(p))
-        .unwrap_or(&guard.empty);
-    let diagnostics = state
-        .diagnostic_engine
-        .analyze(&doc, current_file_path.as_deref());
+    let diagnostics = analyze_document(&guard, &doc, current_file_path.as_deref());
     drop(guard);
 
     client.publish_diagnostics(uri, diagnostics, None).await;
@@ -765,9 +760,88 @@ async fn load_schemas_impl(
         return;
     };
 
-    let environment = providers.read().await.environment.clone();
+    let result =
+        reload_provider_states(&workspace_root, factory_builder, install_prober, providers).await;
+    for warning in result.warnings {
+        client
+            .log_message(
+                MessageType::WARNING,
+                format!(
+                    "Provider '{}' not loaded in {}: {}",
+                    warning.provider,
+                    warning.directory.display(),
+                    warning.reason,
+                ),
+            )
+            .await;
+    }
+    // Empty discovery historically installs its fallback without an INFO log.
+    if result.reloaded && result.directories > 0 {
+        client
+            .log_message(
+                MessageType::INFO,
+                format!(
+                    "Loaded providers for {} directory(s), {} resource type schema(s) total",
+                    result.directories, result.schemas,
+                ),
+            )
+            .await;
+    }
+    if result.reloaded || result.import_map_changed {
+        let uris: Vec<Url> = documents.iter().map(|r| r.key().clone()).collect();
+        for uri in uris {
+            publish_diagnostics_for(client, documents, providers, uri).await;
+        }
+    }
+}
+
+/// Analyze one opened document using the same nearest-directory/import-map
+/// selection as publication. Only this document supplies a buffer override.
+pub fn analyze_document(
+    states: &ProviderStates,
+    document: &Document,
+    current_file_path: Option<&Path>,
+) -> Vec<Diagnostic> {
+    let state = current_file_path
+        .and_then(Path::parent)
+        .map(|path| states.state_for_path(path))
+        .unwrap_or(&states.empty);
+    state.diagnostic_engine.analyze(document, current_file_path)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProviderLoadWarning {
+    pub directory: PathBuf,
+    pub provider: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Default)]
+pub struct ProviderReload {
+    pub warnings: Vec<ProviderLoadWarning>,
+    pub directories: usize,
+    pub schemas: usize,
+    pub reloaded: bool,
+    pub import_map_changed: bool,
+}
+
+/// Discover, reuse/build, and install workspace provider states without a
+/// transport. The drain and installation locks match the server's reload path.
+pub async fn reload_provider_states(
+    workspace_root: &Path,
+    factory_builder: &FactoryBuilder,
+    install_prober: Option<&ProviderInstallProber>,
+    providers: &tokio::sync::RwLock<ProviderStates>,
+) -> ProviderReload {
+    let mut warnings = Vec::new();
+    let (environment, scope) = {
+        let states = providers.read().await;
+        (states.environment.clone(), states.discovery_scope.clone())
+    };
     let mut dir_providers = HashMap::new();
-    for (dir, configs) in workspace::discover_providers_by_dir(&workspace_root, &environment) {
+    for (dir, configs) in
+        workspace::discover_providers_in_scope(workspace_root, &environment, &scope)
+    {
         let entry = dir_providers
             .entry(PathIdentity::new(&dir))
             .or_insert_with(|| (dir.clone(), configs.clone()));
@@ -776,7 +850,7 @@ async fn load_schemas_impl(
             *entry = (dir, configs);
         }
     }
-    let import_map = workspace::discover_import_map(&workspace_root, &environment);
+    let import_map = workspace::discover_imports_in_scope(workspace_root, &environment, &scope);
 
     // Drain the current states up-front so matching per-dir entries can
     // be reused without re-running the factory builder. Anything left in
@@ -793,21 +867,7 @@ async fn load_schemas_impl(
         )
     };
 
-    if dir_providers.is_empty() {
-        let dropped_any = !old_states.is_empty();
-        let mut states = ProviderStates::new(environment);
-        states.import_map = import_map.clone();
-        *providers.write().await = states;
-        if dropped_any || old_import_map != import_map {
-            let uris: Vec<Url> = documents.iter().map(|r| r.key().clone()).collect();
-            for uri in uris {
-                publish_diagnostics_for(client, documents, providers, uri).await;
-            }
-        }
-        return;
-    }
-
-    let mut states = ProviderStates::new(environment.clone());
+    let mut by_dir = HashMap::new();
     let mut total_schemas = 0;
     // Track whether any dir was freshly rebuilt (or whether the set of
     // known dirs changed). When every dir was reused and the import map
@@ -827,7 +887,7 @@ async fn load_schemas_impl(
             && configs_match(&existing.configs, &dir_configs)
         {
             total_schemas += existing.schema_count();
-            states.by_dir.insert(identity, existing);
+            by_dir.insert(identity, existing);
             continue;
         }
 
@@ -843,19 +903,11 @@ async fn load_schemas_impl(
         .await
         .unwrap_or_default();
 
-        for (name, reason) in &dir_errors {
-            client
-                .log_message(
-                    MessageType::WARNING,
-                    format!(
-                        "Provider '{}' not loaded in {}: {}",
-                        name,
-                        dir.display(),
-                        reason
-                    ),
-                )
-                .await;
-        }
+        warnings.extend(dir_errors.iter().map(|(name, reason)| ProviderLoadWarning {
+            directory: dir.clone(),
+            provider: name.clone(),
+            reason: reason.clone(),
+        }));
 
         let state = ProviderState::new(
             dir_factories,
@@ -866,7 +918,7 @@ async fn load_schemas_impl(
             environment.clone(),
         );
         total_schemas += state.schema_count();
-        states.by_dir.insert(identity, state);
+        by_dir.insert(identity, state);
     }
 
     // `old_states` was drained by `remove()` above; anything left is a
@@ -877,27 +929,22 @@ async fn load_schemas_impl(
     // `ProviderState` applies to module files; republish diagnostics in
     // that case even when factories were all reused.
     let import_map_changed = old_import_map != import_map;
-    states.import_map = import_map;
-    let dir_count = states.by_dir.len();
-    *providers.write().await = states;
-
-    if any_work {
-        client
-            .log_message(
-                MessageType::INFO,
-                format!(
-                    "Loaded providers for {} directory(s), {} resource type schema(s) total",
-                    dir_count, total_schemas
-                ),
-            )
-            .await;
+    let dir_count = by_dir.len();
+    {
+        let mut states = providers.write().await;
+        // Reload only the provider data. Environment and discovery scope stay
+        // attached to the workspace even when no provider directories remain.
+        states.by_dir = by_dir;
+        states.import_map = import_map;
     }
 
-    if any_work || import_map_changed {
-        let uris: Vec<Url> = documents.iter().map(|r| r.key().clone()).collect();
-        for uri in uris {
-            publish_diagnostics_for(client, documents, providers, uri).await;
-        }
+    warnings.sort_by(|a, b| (&a.directory, &a.provider).cmp(&(&b.directory, &b.provider)));
+    ProviderReload {
+        warnings,
+        directories: dir_count,
+        schemas: total_schemas,
+        reloaded: any_work,
+        import_map_changed,
     }
 }
 
@@ -1773,6 +1820,92 @@ mod reload_skip_tests {
         config: ProviderConfig<ParserPlaceholder>,
     ) -> workspace::DiscoveredProviderConfig {
         workspace::DiscoveredProviderConfig::from_parser(config)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reload_characterizes_disk_configs_cache_deletion_and_module_inheritance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let caller = temp.path().join("caller");
+        let module = temp.path().join("module");
+        std::fs::create_dir(&caller).unwrap();
+        std::fs::create_dir(&module).unwrap();
+        let provider_file = caller.join("providers.crn");
+        std::fs::write(&provider_file, "provider mock {}\n").unwrap();
+        std::fs::write(
+            caller.join("main.crn"),
+            "let child = use { source = '../module' }\n",
+        )
+        .unwrap();
+        std::fs::write(caller.join("exports.crn"), "exports {}\n").unwrap();
+        std::fs::write(caller.join("backend.crn"), "backend local {}\n").unwrap();
+        std::fs::write(
+            module.join("main.crn"),
+            "mock.test.resource { name = 'module' }\n",
+        )
+        .unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builder: FactoryBuilder = Arc::new({
+            let builds = Arc::clone(&builds);
+            move |_| {
+                builds.fetch_add(1, Ordering::SeqCst);
+                (vec![], HashMap::new(), vec![])
+            }
+        });
+        let (service, socket) = tower_lsp::LspService::new(|client| {
+            Backend::new(
+                client,
+                ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+                Some(builder),
+            )
+        });
+        drop(socket);
+        let backend = service.inner();
+        backend
+            .workspace_root
+            .set(Some(temp.path().to_path_buf()))
+            .unwrap();
+        backend.load_schemas().await;
+        let schemas = Arc::clone(
+            &backend
+                .providers
+                .read()
+                .await
+                .state_for_path(&module)
+                .schemas,
+        );
+        assert!(
+            !schemas.is_empty(),
+            "module inherits the caller's builtin schemas"
+        );
+        backend.load_schemas().await;
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(
+            &schemas,
+            &backend
+                .providers
+                .read()
+                .await
+                .state_for_path(&caller)
+                .schemas
+        ));
+        std::fs::write(&provider_file, "provider mock { region = 'changed' }\n").unwrap();
+        backend.load_schemas().await;
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
+        assert!(!Arc::ptr_eq(
+            &schemas,
+            &backend
+                .providers
+                .read()
+                .await
+                .state_for_path(&caller)
+                .schemas
+        ));
+        std::fs::remove_file(provider_file).unwrap();
+        backend.load_schemas().await;
+        assert!(backend.providers.read().await.by_dir.is_empty());
+        assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     // #2136: save of a non-provider `.crn` must not trigger a

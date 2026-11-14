@@ -222,7 +222,7 @@ See the codex skill for the full subcontracting protocol.
 - Always write a failing reproducing test BEFORE implementing the fix.
 - For TTY/rendering bugs, use PTY-based reproduction.
 - When bugs are found or issues are pointed out, write a test that captures the fix so the regression is caught and the expected behavior is documented.
-- Run full verify/review/CI gates before merge.
+- Run the local checks, review and CI gates before merge (see Verify Protocol).
 
 ## Review Checklist — Carina-Specific Concerns
 
@@ -324,8 +324,17 @@ When selecting kinds, only their required tools are checked before execution.
 the selected packages, so feature unification can differ from CI's `--workspace`
 run. When in doubt, run `scripts/verify.sh` without `--local`.
 
-1. Run `scripts/verify.sh --local` before `gh pr create` and before pushing
-   follow-up commits to an open PR. It runs the same check definitions and
+1. Before `gh pr create` and before pushing follow-up commits to an open PR,
+   run only the checks that belong to the change: the pre-commit hook (fmt and
+   clippy on the touched crates; do not set `SKIP_CLIPPY`), the tests the
+   change adds or affects, selected by name, and `cargo check -p` for
+   dependent crates when a type or public API changed. PR CI runs the full
+   check set; do not run `scripts/verify.sh --local`, a workspace-wide
+   nextest, the determinism repeats or the parity script locally as a gate.
+   When CI fails, read the failed job's log, fix it, and re-run only the
+   failed tests locally before pushing.
+   `scripts/verify.sh --local` remains available for debugging a CI failure
+   that cannot be reproduced by name. It runs the same check definitions and
    feature flags as CI; only crate scope comes from `scripts/touched-crates.sh`.
    Local scope includes touched crates and their transitive reverse dependents
    in the workspace, including dependents through dev and build dependencies.
@@ -1252,8 +1261,8 @@ High-value patterns in this repo:
 
 Constraints specific to this repo:
 
-- A workflow does NOT relax any gate. Each agent still runs
-  `scripts/verify.sh --local` as described in the Verify Protocol. Findings
+- A workflow does NOT relax any gate. Each agent still runs the local
+  checks described in the Verify Protocol, and PR CI must be green. Findings
   still need a reproducing test before a fix lands.
 - Agents that mutate files in parallel must use `isolation: 'worktree'`
   to avoid clobbering each other; read-only finders do not need it.
