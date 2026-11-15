@@ -1157,7 +1157,7 @@ mod tests {
             };
             let checked = crate::BackendConfig::try_from(&raw).unwrap();
             let settings = checked.as_s3().unwrap();
-            assert_eq!(settings.bucket_diagnostic_literal(), None);
+            assert_eq!(settings.bucket_diagnostic_display(), "(secret)");
             check(settings);
         });
     }
@@ -1166,7 +1166,6 @@ mod tests {
     fn secret_payload_bucket_auto_create_uses_secret_mask() {
         with_secret_payload_bucket(|settings| {
             let message = S3AutoCreateDisabled::new(settings).to_string();
-            eprintln!("secret bucket auto-create: {message}");
             assert!(!message.contains("private-token"), "{message}");
             assert!(!message.to_ascii_lowercase().contains("env"), "{message}");
             assert_eq!(
@@ -1182,7 +1181,6 @@ mod tests {
             let message = crate::BackendSelection::for_bucket_delete(settings, "requested-bucket")
                 .unwrap_err()
                 .to_string();
-            eprintln!("secret bucket delete mismatch: {message}");
             assert!(!message.contains("private-token"), "{message}");
             assert!(!message.to_ascii_lowercase().contains("env"), "{message}");
             assert_eq!(
@@ -1215,7 +1213,6 @@ mod tests {
                 .to_string(),
             format!("{settings:?}"),
         ];
-        eprintln!("env backend diagnostics: {observations:#?}");
         assert!(
             observations
                 .iter()

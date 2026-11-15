@@ -1011,7 +1011,6 @@ fn assert_enum_witness_shows_env_and_masks_secret_value(base: DraftType, expecte
         .require_provider_schemas()
         .expect_err("the retained witness must reject the value");
         let message = error.to_string();
-        eprintln!("enum witness: {message}");
         assert!(message.contains(expected), "{message}");
         if value.contains_diagnostic_sensitive_string() {
             assert!(!message.contains(plaintext), "secret leaked: {message}");

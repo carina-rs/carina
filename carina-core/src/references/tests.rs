@@ -2694,8 +2694,6 @@ async fn env_reference_resolves_and_compares_as_public_string() {
     );
     let unprepared = fixture.plan(&prepare_empty_for_tests());
     let prepared = fixture.prepare().await;
-    eprintln!("env reference without witness: {unprepared:?}");
-    eprintln!("env reference preparation: {prepared:?}");
     let references = prepared.expect("ordinary env references must reach the provider");
     assert!(matches!(
         unprepared,

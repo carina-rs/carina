@@ -4186,7 +4186,6 @@ fn resource_scalar_mismatches_display_environment_plaintext() {
     );
 
     let diagnostics = engine.analyze(&doc, None);
-    eprintln!("resource scalar mismatches: {diagnostics:#?}");
     let mismatches = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("Type mismatch: expected"))
@@ -14319,7 +14318,14 @@ fn write_tag_key_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
 
 #[test]
 fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
-    type DirectoryCase<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+    use tower_lsp::lsp_types::DiagnosticSeverity;
+
+    type DirectoryCase<'a> = (
+        &'a str,
+        &'a str,
+        &'a [(&'a str, &'a str)],
+        (&'a str, DiagnosticSeverity),
+    );
 
     let cases: &[DirectoryCase<'_>] = &[
         (
@@ -14333,6 +14339,10 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
                 ("functions.crn", "fn f() { env('LEAKX') }\n"),
                 ("m/main.crn", "arguments { n: 'dev' | 'prod' }\n"),
             ],
+            (
+                "module call 'm (anonymous call)': argument 'n': expected 'dev' | 'prod', got secret",
+                DiagnosticSeverity::ERROR,
+            ),
         ),
         (
             "module list argument",
@@ -14348,6 +14358,10 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
                 ),
                 ("m/main.crn", "arguments { l: list(Int) }\n"),
             ],
+            (
+                "module call 'm (anonymous call)': argument 'l': at list element 0: expected Int, got secret",
+                DiagnosticSeverity::ERROR,
+            ),
         ),
         (
             "literal union export",
@@ -14356,6 +14370,10 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
                 ("functions.crn", "fn f() { env('LEAKX') }\n"),
                 ("exports.crn", "exports {\n  e: 'dev' | 'prod' = f()\n}\n"),
             ],
+            (
+                "export 'e' cannot hold a secret value",
+                DiagnosticSeverity::WARNING,
+            ),
         ),
         (
             "nested function export",
@@ -14364,35 +14382,62 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
                 ("functions.crn", "fn k(x) { x }\n"),
                 ("exports.crn", "exports {\n  q: Int = k(env('LEAKX'))\n}\n"),
             ],
+            (
+                "export 'q' cannot hold a secret value",
+                DiagnosticSeverity::WARNING,
+            ),
         ),
     ];
 
     let environment =
         carina_core::EnvironmentSnapshot::new([("LEAKX".to_string(), "hunter2SECRET".into())]);
-    for (label, filename, files) in cases {
-        let temp = write_tag_key_fixture(files);
-        let buffer = std::fs::read_to_string(temp.path().join(filename)).unwrap();
-        let diagnostics = analyze_with_buffer_and_environment(
-            &test_engine(),
-            temp.path(),
-            filename,
-            &buffer,
-            environment.clone(),
-        );
-        eprintln!("{label}: {diagnostics:#?}");
-
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("got string")),
-            "{label}: diagnostics={diagnostics:#?}"
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.message.contains("hunter2SECRET")),
-            "{label} omitted env plaintext: diagnostics={diagnostics:#?}"
-        );
+    for (label, filename, files, (expected_secret_message, expected_secret_severity)) in cases {
+        for hidden in [true, false] {
+            let temp = write_tag_key_fixture(files);
+            if hidden {
+                for (path, source) in files.iter() {
+                    std::fs::write(
+                        temp.path().join(path),
+                        source.replace("env('LEAKX')", "secret(env('LEAKX'))"),
+                    )
+                    .unwrap();
+                }
+            }
+            let buffer = std::fs::read_to_string(temp.path().join(filename)).unwrap();
+            let diagnostics = analyze_with_buffer_and_environment(
+                &test_engine(),
+                temp.path(),
+                filename,
+                &buffer,
+                environment.clone(),
+            );
+            if hidden {
+                assert!(
+                    !format!("{diagnostics:#?}").contains("hunter2SECRET"),
+                    "SECRET CONTROL PLAINTEXT LEAK: {label}; diagnostics={diagnostics:#?}"
+                );
+                assert_eq!(diagnostics.len(), 1, "{label}: {diagnostics:#?}");
+                assert_eq!(diagnostics[0].message, *expected_secret_message, "{label}");
+                assert_eq!(
+                    diagnostics[0].severity,
+                    Some(*expected_secret_severity),
+                    "{label}"
+                );
+            } else {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.message.contains("got string")),
+                    "{label}: diagnostics={diagnostics:#?}"
+                );
+                assert!(
+                    diagnostics
+                        .iter()
+                        .all(|diagnostic| diagnostic.message.contains("hunter2SECRET")),
+                    "{label} omitted env plaintext: diagnostics={diagnostics:#?}"
+                );
+            }
+        }
     }
 }
 

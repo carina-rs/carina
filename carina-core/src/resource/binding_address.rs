@@ -265,7 +265,7 @@ pub trait BindingAddress:
     /// Render an unquoted binding spelling, hiding protected strings.
     fn diagnostic_spelling(&self) -> &str {
         self.diagnostic_literal()
-            .unwrap_or(ValueString::DIAGNOSTIC_MASK)
+            .unwrap_or(crate::schema::SECRET_VALUE_MASK)
     }
 }
 

@@ -1741,7 +1741,7 @@ fn unresolved_identity_prefix_values_produce_distinct_anonymous_addresses() {
 }
 
 #[test]
-fn diagnostic_sensitive_strings_preserve_plaintext_anonymous_identity() {
+fn secret_marked_strings_preserve_plaintext_anonymous_identity() {
     let schema = PatternResourceSchema::new("test.resource").attribute(
         PatternAttributeSchema::optional("name", PatternAttributeType::string())
             .create_only()
@@ -1763,15 +1763,15 @@ fn diagnostic_sensitive_strings_preserve_plaintext_anonymous_identity() {
     };
 
     let mut literal = vec![resource("one".into())];
-    let mut from_env = vec![resource(ValueString::diagnostic_sensitive("one"))];
+    let mut secret_marked = vec![resource(ValueString::diagnostic_sensitive("one"))];
     compute_anonymous_identifiers_for_test(&mut literal, &[], &registry, &|_| Vec::new())
         .expect("literal identity");
-    compute_anonymous_identifiers_for_test(&mut from_env, &[], &registry, &|_| Vec::new())
-        .expect("env-derived identity");
+    compute_anonymous_identifiers_for_test(&mut secret_marked, &[], &registry, &|_| Vec::new())
+        .expect("secret-marked identity");
 
-    assert_eq!(from_env[0].id, literal[0].id);
+    assert_eq!(secret_marked[0].id, literal[0].id);
     assert_eq!(
-        from_env[0].id.identity_str(),
+        secret_marked[0].id.identity_str(),
         Some("mock_test_resource_96081a11"),
         "diagnostic provenance must not change the identifier generated on main",
     );
@@ -1856,7 +1856,7 @@ fn module_handle_dependency_does_not_change_anonymous_identity_hash() {
 }
 
 #[test]
-fn distinct_diagnostic_sensitive_strings_produce_distinct_anonymous_identities() {
+fn distinct_secret_marked_strings_produce_distinct_anonymous_identities() {
     let schema = PatternResourceSchema::new("test.resource").attribute(
         PatternAttributeSchema::optional("name", PatternAttributeType::string())
             .create_only()
@@ -1881,13 +1881,13 @@ fn distinct_diagnostic_sensitive_strings_produce_distinct_anonymous_identities()
     let mut resources = vec![resource("one"), resource("two")];
 
     compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
-        .expect("distinct env-derived values must not collide");
+        .expect("distinct secret-marked strings must not collide");
 
     assert_ne!(resources[0].id, resources[1].id);
 }
 
 #[test]
-fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
+fn secret_marked_subscript_paths_use_plaintext_for_identity() {
     let schema = PatternResourceSchema::new("test.resource").attribute(
         PatternAttributeSchema::optional("source", PatternAttributeType::string())
             .create_only()
@@ -1916,19 +1916,19 @@ fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
     };
 
     let mut literal = vec![resource("one".into())];
-    let mut from_env = vec![resource(ValueString::diagnostic_sensitive("one"))];
+    let mut secret_marked = vec![resource(ValueString::diagnostic_sensitive("one"))];
     compute_anonymous_identifiers_for_test(&mut literal, &[], &registry, &|_| Vec::new())
         .expect("literal subscript identity");
-    compute_anonymous_identifiers_for_test(&mut from_env, &[], &registry, &|_| Vec::new())
-        .expect("env-derived subscript identity");
-    assert_eq!(from_env[0].id, literal[0].id);
+    compute_anonymous_identifiers_for_test(&mut secret_marked, &[], &registry, &|_| Vec::new())
+        .expect("secret-marked subscript identity");
+    assert_eq!(secret_marked[0].id, literal[0].id);
 
     let mut distinct = vec![
         resource(ValueString::diagnostic_sensitive("one")),
         resource(ValueString::diagnostic_sensitive("two")),
     ];
     compute_anonymous_identifiers_for_test(&mut distinct, &[], &registry, &|_| Vec::new())
-        .expect("distinct env-derived subscript paths must not collide");
+        .expect("distinct secret-marked subscript paths must not collide");
     assert_ne!(distinct[0].id, distinct[1].id);
 }
 

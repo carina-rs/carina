@@ -1710,7 +1710,6 @@ mod tests {
             format_constraint_actual(&strings),
             format_constraint_actual(&hidden),
         ];
-        eprintln!("env constraint actuals: {actuals:?}");
         assert_eq!(
             actuals,
             [

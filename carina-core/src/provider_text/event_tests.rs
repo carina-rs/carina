@@ -525,7 +525,6 @@ fn env_event_values_are_public_until_wrapped_in_secret() {
             observations.push((hidden, present_event(event).to_string()));
         }
     }
-    eprintln!("env provider events: {observations:?}");
     assert!(
         observations.iter().all(|(hidden, text)| {
             text.contains("observed-public-value") != *hidden

@@ -221,10 +221,6 @@ impl S3BackendSettings {
         self.bucket.expose_plaintext()
     }
 
-    pub fn bucket_diagnostic_literal(&self) -> Option<&str> {
-        self.bucket.diagnostic_literal()
-    }
-
     pub(crate) fn bucket_diagnostic_display(&self) -> String {
         self.bucket.diagnostic_display()
     }
@@ -683,7 +679,10 @@ mod tests {
         let resolved = BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
         let settings = resolved.as_s3().unwrap();
         assert_eq!(settings.bucket(), plaintext);
-        assert_eq!(settings.bucket_diagnostic_literal(), Some(plaintext));
+        assert_eq!(
+            settings.bucket_diagnostic_display(),
+            format!("'{plaintext}'")
+        );
         assert!(format!("{settings:?}").contains(plaintext));
     }
 }

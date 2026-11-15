@@ -67,7 +67,10 @@ pub(crate) fn builtin_cidr_subnet<B: BindingAddress>(
     let result =
         calculate_cidr_subnet(prefix_str.expose_plaintext(), newbits, netnum).map_err(|error| {
             if prefix_str.is_diagnostic_sensitive() {
-                "cidr_subnet() sensitive prefix is not a valid CIDR string".to_string()
+                format!(
+                    "cidr_subnet() failed for prefix {}",
+                    prefix_str.diagnostic_display()
+                )
             } else {
                 error
             }
@@ -153,6 +156,35 @@ fn calculate_cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Stri
 mod tests {
     use crate::builtins::evaluate_builtin_to_value_for_tests as evaluate_builtin;
     use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
+
+    #[test]
+    fn secret_payload_cidr_failures_use_secret_mask() {
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut messages = Vec::new();
+        for (prefix, newbits, netnum) in [("private-token", 1, 0), ("10.0.0.0/16", -1, 0)] {
+            let payload: crate::resource::SecretPayload<
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+            > = Box::new(Value::Concrete(ConcreteValue::String(prefix.into()))).into();
+            payload.visit(|value| {
+                assert!(value.contains_diagnostic_sensitive_string());
+                let error = crate::builtins::evaluate_builtin_with_config_to_value(
+                    "cidr_subnet",
+                    &[
+                        value.clone(),
+                        Value::Concrete(ConcreteValue::Int(newbits)),
+                        Value::Concrete(ConcreteValue::Int(netnum)),
+                    ],
+                    &config,
+                )
+                .expect_err("both invalid CIDR and invalid subnet arguments must fail");
+                assert!(!error.contains(prefix), "{error}");
+                assert!(!error.contains("env"), "{error}");
+                messages.push(error);
+            });
+        }
+        assert_eq!(messages, ["cidr_subnet() failed for prefix (secret)"; 2]);
+    }
 
     fn cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Value, String> {
         let args = vec![

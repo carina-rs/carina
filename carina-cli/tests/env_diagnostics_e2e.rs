@@ -104,7 +104,6 @@ fn env_validation_directory_cli_text_json_and_lsp_preserves_secret_boundary() {
             ));
         }
     }
-    eprintln!("env validation observations: {observations:#?}");
     assert!(
         observations.iter().all(|(_, _, correct, _)| *correct),
         "env() must be shown and secret(env(...)) must stay masked: {observations:#?}"

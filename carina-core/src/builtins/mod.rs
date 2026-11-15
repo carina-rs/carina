@@ -1022,10 +1022,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(
-            error,
-            "cidr_subnet() sensitive prefix is not a valid CIDR string"
-        );
+        assert_eq!(error, "cidr_subnet() failed for prefix (secret)");
         assert!(!error.contains("private-prefix"));
     }
 

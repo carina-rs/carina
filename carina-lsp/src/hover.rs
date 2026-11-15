@@ -2647,10 +2647,6 @@ EOT
         let HoverContents::Markup(content) = hover.contents else {
             panic!("builtin hover must use markup");
         };
-        eprintln!(
-            "env hover: {ordinary}; secret hover: {hidden}; documentation: {}",
-            content.value
-        );
         assert!(!hidden.contains("hover-env-value"));
         assert_eq!(ordinary, "'hover-env-value'");
         assert!(content.value.contains("ordinary string"));

@@ -278,10 +278,11 @@ pub use carina_provider_protocol::types::{
 
 /// Count and element policies enforced together when walking a list.
 ///
-/// Elements containing secrets or diagnostic-sensitive strings are skipped for
-/// uniqueness, like unresolved elements, to avoid revealing equality. The
-/// same applies when a secret encloses the list. Provider output and persisted
-/// state skip uniqueness as well; length constraints always apply.
+/// Elements containing secrets, including strings marked by the secret
+/// mechanism, are skipped for uniqueness, like unresolved elements, to avoid
+/// revealing equality. The same applies when a secret encloses the list.
+/// Provider output and persisted state skip uniqueness as well; length
+/// constraints always apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListConstraints {
     length: Option<(Option<u64>, Option<u64>)>,
@@ -5323,9 +5324,10 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
 }
 
 /// Compare the ordinary JSON of a value canonicalized with its successful fit
-/// for the active purpose. Unresolved elements and elements containing secrets
-/// or diagnostic-sensitive strings are not comparable: even a masked duplicate
-/// would reveal equality. The provider remains the final authority for them.
+/// for the active purpose. Unresolved elements and elements containing secrets,
+/// including strings marked by the secret mechanism, are not comparable: even a
+/// masked duplicate would reveal equality. The provider remains the final
+/// authority for them.
 /// Canonicalization preserves integer/float spellings and struct block aliases,
 /// so those spellings remain distinct keys: uniqueness can miss duplicates but
 /// must never invent them (including by rounding large integers to floats).
@@ -7091,7 +7093,10 @@ fn format_string_literal_expected_enum(
     } else {
         join_expected(expected)
     };
-    let user_typed = user_typed.render_string_literal();
+    let user_typed = match user_typed {
+        DiagnosticValue::TypeOnlyString => SECRET_VALUE_MASK.to_string(),
+        DiagnosticValue::Plain(_) | DiagnosticValue::Masked => user_typed.render_string_literal(),
+    };
     format!(
         "{} expects an enum identifier, got a string literal {}. Use one of: {}",
         target, user_typed, tail
@@ -7623,6 +7628,7 @@ pub enum InvalidEnumValueKind {
 pub enum DiagnosticValue {
     Plain(String),
     Masked,
+    /// A string marked by the secret mechanism, retaining only its type.
     TypeOnlyString,
 }
 

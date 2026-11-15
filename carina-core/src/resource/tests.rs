@@ -65,7 +65,6 @@ fn with_secret_payload_string(check: impl FnOnce(&ValueString)) {
 }
 
 fn assert_secret_mask_message(actual: &str, expected: &str) {
-    eprintln!("secret mask message: {actual}");
     assert!(!actual.contains("private-token"), "{actual}");
     assert!(!actual.to_ascii_lowercase().contains("env"), "{actual}");
     assert_eq!(actual, expected);
@@ -772,7 +771,7 @@ fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_has
 }
 
 #[test]
-fn diagnostic_sensitive_string_is_runtime_equivalent_but_formatting_safe() {
+fn secret_marked_string_is_runtime_equivalent_but_formatting_safe() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 

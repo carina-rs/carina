@@ -1051,7 +1051,7 @@ fn parse_primary_eval_with_mode_inner(
                                 line,
                                 message: format!(
                                     "unresolved binding containing {}",
-                                    ValueString::DIAGNOSTIC_MASK
+                                    crate::schema::SECRET_VALUE_MASK
                                 ),
                             })
                         }

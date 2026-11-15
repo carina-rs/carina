@@ -2990,8 +2990,6 @@ pub struct ValueString {
 }
 
 impl ValueString {
-    pub(crate) const DIAGNOSTIC_MASK: &str = crate::schema::SECRET_VALUE_MASK;
-
     /// Construct an ordinary authored/runtime string.
     pub fn plain(plaintext: impl Into<String>) -> Self {
         Self {
@@ -3025,8 +3023,8 @@ impl ValueString {
         self.diagnostic_sensitive
     }
 
-    /// Return a diagnostic-safe authored literal, or `None` when only the
-    /// runtime type may be rendered.
+    /// Return a diagnostic-safe authored literal, or `None` for a string marked
+    /// by the secret mechanism.
     pub fn diagnostic_literal(&self) -> Option<&str> {
         (!self.diagnostic_sensitive).then_some(self.plaintext.as_str())
     }
@@ -3035,11 +3033,11 @@ impl ValueString {
     pub fn diagnostic_display(&self) -> String {
         self.diagnostic_literal()
             .map(display_string_literal)
-            .unwrap_or_else(|| Self::DIAGNOSTIC_MASK.to_string())
+            .unwrap_or_else(|| crate::schema::SECRET_VALUE_MASK.to_string())
     }
 
-    /// Build a derived string and inherit diagnostic sensitivity from every
-    /// string input that contributed to it.
+    /// Build a derived string and inherit the secret mechanism's marking from
+    /// every string input that contributed to it.
     pub(crate) fn derived_from<'a>(
         plaintext: impl Into<String>,
         sources: impl IntoIterator<Item = &'a Self>,
@@ -3946,11 +3944,10 @@ impl Hash for ModuleArgumentDiagnostic {
 /// failed during permissive resolution.
 ///
 /// The inner string has no public constructor. Built-in handlers are the
-/// diagnostic-safety boundary: values derived from sensitive inputs must be
-/// masked before their errors reach the resolver (as `env()` and `decrypt()`
-/// do). Keeping the constructor crate-private prevents downstream callers from
-/// attaching arbitrary, potentially sensitive payloads to an unavailable
-/// value.
+/// diagnostic-safety boundary: strings marked by the secret mechanism must be
+/// masked before their errors reach the resolver. Keeping the constructor
+/// crate-private prevents downstream callers from attaching arbitrary,
+/// potentially sensitive payloads to an unavailable value.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct UnavailableReason(UnavailableFailure);
 

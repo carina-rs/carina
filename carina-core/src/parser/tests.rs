@@ -8662,7 +8662,6 @@ fn parse_if_env_condition_includes_the_string_value() {
 
     let error = parse(&input, &config).expect_err("non-bool condition");
     let message = error.to_string();
-    eprintln!("if condition: {message}");
 
     assert!(message.contains(plaintext), "message={message}");
     assert!(message.contains("got: string"), "message={message}");
@@ -12606,7 +12605,6 @@ fn env_derived_provider_version_error_shows_plaintext() {
 
     let error = parse(&input, &config).expect_err("invalid version");
     let message = error.to_string();
-    eprintln!("provider version: {message}");
 
     assert!(message.contains(plaintext), "message={message}");
     assert!(
@@ -12638,7 +12636,6 @@ fn env_derived_subscript_is_shown_in_unresolved_reference_diagnostic() {
     let message = crate::value::value_to_json(&expanded_value(value))
         .expect_err("reference remains unresolved")
         .to_string();
-    eprintln!("reference subscript: {message}");
 
     assert!(message.contains(plaintext), "message={message}");
     assert!(
@@ -12670,7 +12667,6 @@ fn env_derived_pre_field_subscript_is_shown_in_unresolved_reference_diagnostic()
     let message = crate::value::value_to_json(&expanded_value(value))
         .expect_err("reference remains unresolved")
         .to_string();
-    eprintln!("reference binding subscript: {message}");
 
     assert!(message.contains(plaintext), "message={message}");
     assert!(
@@ -21253,7 +21249,6 @@ fn secret_provider_version_is_rejected_before_sensitive_string_fallback() {
         )
         .unwrap_err();
         let message = error.to_string();
-        eprintln!("secret provider-version boundary: {message}");
         assert!(
             message.contains("'version' must be a string literal"),
             "{message}"
@@ -21277,7 +21272,6 @@ fn secret_subscript_is_rejected_before_sensitive_binding_guard() {
         )
         .unwrap_err();
         let message = error.to_string();
-        eprintln!("secret binding-subscript boundary: {message}");
         assert!(
             message.contains("index access key must be an integer or string"),
             "{message}"

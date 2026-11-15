@@ -149,7 +149,7 @@ pub(in crate::parser) fn parse_provider_block(
                     None => {
                         format!(
                             "Provider '{name}': Invalid version constraint: {}",
-                            ValueString::DIAGNOSTIC_MASK
+                            crate::schema::SECRET_VALUE_MASK
                         )
                     }
                 };

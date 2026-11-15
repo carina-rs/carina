@@ -423,13 +423,30 @@ mod tests {
             };
             observations.push((label, message));
         }
-        eprintln!("env diagnostic observations: {observations:#?}");
-        assert!(
-            observations
-                .iter()
-                .all(|(_, message)| message.contains("env-diagnostic-")),
-            "ordinary env values must remain visible: {observations:#?}"
-        );
+        let expected = [
+            ("description", "string 'env-diagnostic-value'"),
+            ("enum literal", "Mode expects an enum identifier, got a string literal 'env-diagnostic-value'. Use one of: allowed"),
+            ("cidr_subnet", "cidr_subnet() invalid CIDR format: 'env-diagnostic-value' (expected 'address/prefix')"),
+            ("decrypt", "decrypt failed: env-diagnostic-value, key=None"),
+            ("decrypt key", "decrypt failed: ciphertext, key=Some(\"env-diagnostic-value\")"),
+            ("env", "environment variable 'env-diagnostic-value' is not set"),
+            ("map", "map(): field 'env-diagnostic-field' not found in map element"),
+            ("provider text", "provider saw env-diagnostic-value"),
+            ("provider string-list text", "provider saw env-diagnostic-value"),
+            ("provider version", "Invalid expression at line 2: Provider 'mock': Invalid version constraint 'env-diagnostic-value': unexpected character 'e' while parsing major version number"),
+            ("for iterable", "Invalid expression at line 1: `for v in ...` — iterable is string 'env-diagnostic-value' (expected list)"),
+            ("missing binding", "cannot serialize at JSON conversion: unresolved reference missing['env-diagnostic-value']"),
+            ("reference subscript", "cannot serialize at JSON conversion: unresolved reference missing.value['env-diagnostic-value']"),
+            ("reference binding subscript", "cannot serialize at JSON conversion: unresolved reference missing['env-diagnostic-value'].value"),
+            ("missing map key", "Invalid expression at line 2: key 'env-diagnostic-value' not found in map; available keys: 'available'"),
+            ("function parameter", "Invalid expression at line 2: function 'f': parameter 'x': expected Int, got string 'env-diagnostic-value'"),
+            ("custom type validation", "Invalid expression at line 2: function 'f': parameter 'x': expected Ipv4Address, got string 'env-diagnostic-value': Validation failed: Invalid IPv4 address 'env-diagnostic-value': expected 4 octets"),
+            ("if condition", "Invalid expression at line 1: if condition must be a Bool value, got: string 'env-diagnostic-value'"),
+        ]
+        .into_iter()
+        .map(|(label, message)| (label, message.to_string()))
+        .collect::<Vec<_>>();
+        assert_eq!(observations, expected);
     }
 
     #[test]
@@ -508,7 +525,6 @@ mod tests {
             .unwrap_err();
             observed.push((error, expected));
         }
-        eprintln!("env CIDR diagnostics: {observed:#?}");
         assert!(
             observed
                 .iter()
@@ -518,7 +534,7 @@ mod tests {
 
     #[test]
     fn env_strings_stay_public_through_string_builtins() {
-        let var_name = "CARINA_TEST_ENV_SENSITIVITY_PROPAGATES";
+        let var_name = "CARINA_TEST_ENV_PUBLIC_STRING_BUILTINS";
         let config = ProviderContext::new(EnvironmentSnapshot::new([(
             var_name.to_string(),
             "hunter2SECRET".into(),

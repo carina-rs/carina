@@ -1563,7 +1563,7 @@ fn unique_lists_compare_nested_canonical_values_and_skip_partial_objects() {
 }
 
 #[test]
-fn unique_list_skips_whole_secrets_and_diagnostic_sensitive_elements() {
+fn unique_list_skips_whole_secrets_and_secret_marked_elements() {
     let list = unique_list_from_protocol(AttributeType::string(), true);
     let duplicate = Value::Concrete(ConcreteValue::List(vec![
         Value::Concrete(ConcreteValue::String("private-claim".into())),
@@ -1574,7 +1574,7 @@ fn unique_list_skips_whole_secrets_and_diagnostic_sensitive_elements() {
     assert!(Schema::flat(list).validate_collect(&secret).is_empty());
 
     let sensitive = Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-        "env-private-claim",
+        "secret-marked-claim",
     )));
     let duplicate = Value::Concrete(ConcreteValue::List(vec![sensitive.clone(), sensitive]));
     let list = unique_list_from_protocol(AttributeType::string(), true);
@@ -1789,10 +1789,6 @@ fn unique_list_compares_env_values_but_keeps_secrets_private() {
     let secret = Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
     let hidden = Value::Concrete(ConcreteValue::List(vec![secret.clone(), secret]));
     let errors = Schema::flat(list.clone()).validate_collect(&plain);
-    eprintln!("env unique list: {errors:?}");
-    for (_, error) in &errors {
-        eprintln!("env unique list message: {error}");
-    }
     assert!(
         list.validate(&hidden).is_ok(),
         "secret equality must stay private"
@@ -1813,12 +1809,12 @@ fn unique_list_skips_plain_before_secret() {
 }
 
 #[test]
-fn unique_list_skips_diagnostic_sensitive_before_plain() {
+fn unique_list_skips_secret_marked_before_plain() {
     assert_mixed_sensitive_list_is_not_comparable(false, true);
 }
 
 #[test]
-fn unique_list_skips_plain_before_diagnostic_sensitive() {
+fn unique_list_skips_plain_before_secret_marked() {
     assert_mixed_sensitive_list_is_not_comparable(false, false);
 }
 
@@ -5322,6 +5318,46 @@ fn validate_enum_rejects_quoted_string_literal() {
         matches!(err, TypeError::StringLiteralExpectedEnum { ref user_typed, .. } if user_typed.as_plain() == Some("IPv4")),
         "expected StringLiteralExpectedEnum, got: {err:?}"
     );
+}
+
+#[test]
+fn secret_payload_enum_string_diagnostic_uses_secret_mask() {
+    let enum_type = AttributeType::enum_(
+        crate::schema::enum_identity("Mode", None),
+        Some(vec!["allowed".to_string()]),
+        vec![],
+        None,
+        None,
+    );
+    let payload: crate::resource::SecretPayload<
+        crate::resource::NoPlaceholder,
+        AbsoluteBindingAddress,
+    > = Box::new(Value::Concrete(ConcreteValue::String(
+        "private-token".into(),
+    )))
+    .into();
+    assert_eq!(
+        enum_type
+            .validate(&Value::Concrete(ConcreteValue::String(
+                "public-token".into()
+            )))
+            .expect_err("ordinary strings are not enum identifiers")
+            .to_string(),
+        "Mode expects an enum identifier, got a string literal 'public-token'. Use one of: allowed"
+    );
+    payload.visit(|value| {
+        assert!(value.contains_diagnostic_sensitive_string());
+        let error = enum_type
+            .validate(value)
+            .expect_err("strings are not enum identifiers");
+        let message = error.to_string();
+        assert!(!message.contains("private-token"), "{message}");
+        assert!(!message.contains("env"), "{message}");
+        assert_eq!(
+            message,
+            "Mode expects an enum identifier, got a string literal (secret). Use one of: allowed"
+        );
+    });
 }
 
 #[test]

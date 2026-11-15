@@ -357,7 +357,6 @@ let result = f(env('CARINA_3848_SECRET'))
         .output()
         .expect("run carina validate");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    eprintln!("function boundary: {stderr}");
 
     assert!(
         !output.status.success(),
@@ -372,7 +371,8 @@ let result = f(env('CARINA_3848_SECRET'))
 
 #[test]
 fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
-    let cases: &[(&str, &[(&str, &str)])] = &[
+    type DirectoryCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+    let cases: &[DirectoryCase<'_>] = &[
         (
             "module literal union argument",
             &[
@@ -383,6 +383,7 @@ fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
                 ("functions.crn", "fn f() { env('LEAKX') }\n"),
                 ("m/main.crn", "arguments { n: 'dev' | 'prod' }\n"),
             ],
+            "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'n': expected 'dev' | 'prod', got secret\n",
         ),
         (
             "module list argument",
@@ -397,6 +398,7 @@ fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
                 ),
                 ("m/main.crn", "arguments { l: list(Int) }\n"),
             ],
+            "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'l': at list element 0: expected Int, got secret\n",
         ),
         (
             "literal union export",
@@ -404,6 +406,7 @@ fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
                 ("functions.crn", "fn f() { env('LEAKX') }\n"),
                 ("exports.crn", "exports { e: 'dev' | 'prod' = f() }\n"),
             ],
+            "Error: export 'e' cannot hold a secret value\n",
         ),
         (
             "nested function export",
@@ -411,30 +414,52 @@ fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
                 ("functions.crn", "fn k(x) { x }\n"),
                 ("exports.crn", "exports { q: Int = k(env('LEAKX')) }\n"),
             ],
+            "Error: export 'q' cannot hold a secret value\n",
         ),
     ];
 
-    for (label, files) in cases {
-        let fixture = multi_file_fixture(files);
-        let output = Command::new(env!("CARGO_BIN_EXE_carina"))
-            .current_dir(fixture.path())
-            .env("NO_COLOR", "1")
-            .env("LEAKX", "hunter2SECRET")
-            .args(["validate", "."])
-            .output()
-            .expect("run carina validate");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("{label}: {stderr}");
-
-        assert!(
-            !output.status.success(),
-            "{label} must fail; stderr={stderr}"
-        );
-        assert!(stderr.contains("got string"), "{label}: stderr={stderr}");
-        assert!(
-            stderr.contains("hunter2SECRET"),
-            "{label} omitted env plaintext: stderr={stderr}"
-        );
+    for (label, files, expected_secret_stderr) in cases {
+        for hidden in [true, false] {
+            let fixture = multi_file_fixture(files);
+            if hidden {
+                for (filename, source) in *files {
+                    std::fs::write(
+                        fixture.path().join(filename),
+                        source.replace("env('LEAKX')", "secret(env('LEAKX'))"),
+                    )
+                    .unwrap();
+                }
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+                .current_dir(fixture.path())
+                .env("NO_COLOR", "1")
+                .env_remove("CLICOLOR_FORCE")
+                .env("LEAKX", "hunter2SECRET")
+                .args(["validate", "."])
+                .output()
+                .expect("run carina validate");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if hidden {
+                assert!(
+                    !stdout.contains("hunter2SECRET") && !stderr.contains("hunter2SECRET"),
+                    "SECRET CONTROL PLAINTEXT LEAK: {label}; stdout={stdout:?}; stderr={stderr:?}"
+                );
+                assert_eq!(output.status.code(), Some(1), "{label}: {output:?}");
+                assert_eq!(&*stdout, "Validating...\n", "{label}");
+                assert_eq!(&*stderr, *expected_secret_stderr, "{label}");
+            } else {
+                assert!(
+                    !output.status.success(),
+                    "{label} must fail; stderr={stderr}"
+                );
+                assert!(stderr.contains("got string"), "{label}: stderr={stderr}");
+                assert!(
+                    stderr.contains("hunter2SECRET"),
+                    "{label} omitted env plaintext: stderr={stderr}"
+                );
+            }
+        }
     }
 }
 
