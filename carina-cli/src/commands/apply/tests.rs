@@ -28,6 +28,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "tests/provider_event_inventory.rs"]
+mod provider_event_inventory;
+
 #[path = "tests/attribute_admission.rs"]
 mod attribute_admission;
 #[path = "tests/cancellation_fixture.rs"]
