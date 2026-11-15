@@ -58,7 +58,7 @@ impl ReqwestTransport {
             .build()
             .map_err(|error| GitHubError::Transport {
                 kind: "client construction",
-                error: error.without_url(),
+                error: render_transport_error(error),
             })?;
         Ok(Self {
             client,
@@ -161,24 +161,30 @@ impl GitHubTransport for ReqwestTransport {
         })
     }
 }
-fn transport_error(error: reqwest::Error, method: Method) -> GitHubError {
+fn render_transport_error(error: reqwest::Error) -> String {
     // Raw download URLs may carry GitHub-issued credentials in their query.
-    // Strip the URL before retaining the error in either Display or Debug.
-    let error = error.without_url();
-    if error.is_timeout() {
+    // Strip the URL, render every cause once, and redact queries in any source
+    // text before retaining the diagnostic in either Display or Debug.
+    super::redact_url_queries(&carina_core::executor::render_error_chain(
+        &error.without_url(),
+    ))
+}
+
+fn transport_error(error: reqwest::Error, method: Method) -> GitHubError {
+    let is_timeout = error.is_timeout();
+    let kind = if error.is_connect() {
+        "connection"
+    } else {
+        "request or response"
+    };
+    let error = render_transport_error(error);
+    if is_timeout {
         match method {
             Method::Get => GitHubError::TransportDeadline { error },
             Method::Put | Method::Delete => GitHubError::MutationTransportDeadline { error },
         }
     } else {
-        GitHubError::Transport {
-            kind: if error.is_connect() {
-                "connection"
-            } else {
-                "request or response"
-            },
-            error,
-        }
+        GitHubError::Transport { kind, error }
     }
 }
 
@@ -193,11 +199,40 @@ mod tests {
         let source = reqwest::Client::new()
             .get("http://[invalid")
             .build()
-            .unwrap_err();
-        let detail = source.to_string();
+            .unwrap_err()
+            .without_url();
+        let detail = carina_core::executor::render_error_chain(&source);
         let error = transport_error(source, Method::Get);
         assert_eq!(error.to_string().matches(&detail).count(), 1, "{error}");
         assert!(error.source().is_none());
+    }
+
+    #[tokio::test]
+    async fn github_round11_transport_connection_refused_includes_the_source_chain() {
+        use std::error::Error;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/?token=SECRET", listener.local_addr().unwrap());
+        drop(listener);
+        let source = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap_err()
+            .without_url();
+        assert!(source.is_connect());
+        let detail = carina_core::executor::render_error_chain(&source);
+        let error = transport_error(source, Method::Get);
+        let message = error.to_string();
+        assert!(
+            message.to_ascii_lowercase().contains("refused"),
+            "{message}"
+        );
+        assert_eq!(message.matches(&detail).count(), 1, "{message}");
+        assert!(error.source().is_none());
+        assert!(!format!("{error:?} {error}").contains("SECRET"));
     }
 
     #[tokio::test]
@@ -206,14 +241,20 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/?token=SECRET", listener.local_addr().unwrap());
         // wall-clock-ok: a real loopback socket timeout produces reqwest's timeout error.
-        let source = reqwest::Client::new()
+        let source = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
             .get(&url)
             .timeout(std::time::Duration::from_millis(20))
             .send()
             .await
             .unwrap_err();
         assert!(source.is_timeout());
+        let source = source.without_url();
+        let detail = carina_core::executor::render_error_chain(&source);
         let error = transport_error(source, Method::Get);
+        assert_eq!(error.to_string().matches(&detail).count(), 1, "{error}");
         assert_eq!(
             error.to_string().matches("error sending request").count(),
             1,
@@ -369,15 +410,21 @@ mod tests {
         let url = format!("http://{}/?token=SECRET", listener.local_addr().unwrap());
         for method in [Method::Get, Method::Put, Method::Delete] {
             // wall-clock-ok: a real loopback socket timeout produces reqwest's timeout error.
-            let source = reqwest::Client::new()
+            let source = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
                 .get(&url)
                 .timeout(std::time::Duration::from_millis(20))
                 .send()
                 .await
                 .unwrap_err();
             assert!(source.is_timeout());
+            let source = source.without_url();
+            let detail = carina_core::executor::render_error_chain(&source);
             let error = transport_error(source, method);
             let message = error.to_string();
+            assert_eq!(message.matches(&detail).count(), 1, "{message}");
             assert!(!format!("{error:?} {error}").contains("SECRET"));
             assert_eq!(
                 message.contains("a dispatched mutation may have completed"),

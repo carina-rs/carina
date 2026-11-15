@@ -58,16 +58,13 @@ pub enum GitHubError {
     #[error("GitHub credential lookup task failed: {error}")]
     CredentialTask { error: tokio::task::JoinError },
     #[error("GitHub transport failure ({kind}): {error}")]
-    Transport {
-        kind: &'static str,
-        error: reqwest::Error,
-    },
+    Transport { kind: &'static str, error: String },
     #[error("GitHub operation deadline exceeded: {error}")]
-    TransportDeadline { error: reqwest::Error },
+    TransportDeadline { error: String },
     #[error(
         "GitHub operation deadline exceeded; a dispatched mutation may have completed: {error}"
     )]
-    MutationTransportDeadline { error: reqwest::Error },
+    MutationTransportDeadline { error: String },
     #[error("GitHub API returned HTTP {status}: {body}{id}", id = request_id_description(.request_id.as_deref()))]
     Api {
         status: u16,

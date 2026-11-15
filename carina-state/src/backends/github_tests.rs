@@ -401,10 +401,7 @@ async fn github_round3_lost_delete_transport_reply_recovers_in_the_same_call() {
                 let mut store = fake.0.lock().unwrap();
                 store.after_commit_error = Some(GitHubError::Transport {
                     kind: "lost delete reply",
-                    error: reqwest::Client::new()
-                        .get("http://[invalid")
-                        .build()
-                        .unwrap_err(),
+                    error: "delete committed but its response was lost".into(),
                 });
                 if successor {
                     store.after_success = Some(serde_json::to_vec(&replacement).unwrap());
@@ -1654,10 +1651,7 @@ async fn github_readiness_confirms_archived_storage_is_unavailable_and_transport
         ) -> Result<GitHubResponse, GitHubError> {
             Err(GitHubError::Transport {
                 kind: "offline failure",
-                error: reqwest::Client::new()
-                    .get("http://[invalid")
-                    .build()
-                    .unwrap_err(),
+                error: "simulated offline transport failure".into(),
             })
         }
     }
@@ -2241,10 +2235,7 @@ async fn github_round2_committed_rate_limit_retry_conflict_is_already_applied() 
 async fn github_round2_lost_acquire_response_recovers_our_exact_lease() {
     let error = GitHubError::Transport {
         kind: "lost response",
-        error: reqwest::Client::new()
-            .get("http://[invalid")
-            .build()
-            .unwrap_err(),
+        error: "lease committed but its response was lost".into(),
     };
     let fake = Fake::default();
     fake.0.lock().unwrap().after_commit_error = Some(error);
