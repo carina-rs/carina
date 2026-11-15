@@ -8,25 +8,35 @@ use super::validation::ModuleConstraintDiagnostic;
 
 /// Two or more resolver failures retained by a non-collecting API.
 ///
-/// The field is private and construction is centralized in
-/// [`ModuleError::from_errors`], so `ModuleError::Multiple` cannot represent
-/// an empty or needlessly singleton failure.
+/// Private fields and a shared nonempty constructor prevent empty or
+/// needlessly singleton failures. Import provenance comes only from the
+/// loader's complete typed set, so body and root prohibitions can both be
+/// presented individually without changing other resolver error groups.
 #[derive(Debug)]
-pub struct MultipleModuleErrors(Vec<ModuleError>);
+pub struct MultipleModuleErrors {
+    errors: Vec<ModuleError>,
+    group: ModuleErrorGroup,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ModuleErrorGroup {
+    Resolution,
+    ImportProhibitions,
+}
 
 impl MultipleModuleErrors {
     pub(crate) fn iter(&self) -> impl Iterator<Item = &ModuleError> {
-        self.0.iter()
+        self.errors.iter()
     }
 
     pub(crate) fn into_vec(self) -> Vec<ModuleError> {
-        self.0
+        self.errors
     }
 }
 
 impl std::fmt::Display for MultipleModuleErrors {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (index, error) in self.0.iter().enumerate() {
+        for (index, error) in self.errors.iter().enumerate() {
             if index > 0 {
                 formatter.write_str("\n")?;
             }
@@ -255,34 +265,42 @@ impl ModuleError {
     const PROVIDER_IN_MODULE: &'static str = "provider blocks are not allowed inside modules. Define providers at the root configuration level.";
     const BACKEND_IN_MODULE: &'static str = "backend blocks are not allowed inside modules. Define the backend at the root configuration level.";
 
-    /// Decompose only evidence-bearing import rejections. Other resolver
+    /// Decompose complete import prohibition sets. Other resolver
     /// failures keep their established grouping and source rendering.
-    pub(crate) fn into_root_evidence_errors(self) -> Vec<Self> {
-        self.decompose_root_evidence_errors()
+    pub(crate) fn into_import_prohibition_errors(self) -> Vec<Self> {
+        self.decompose_import_prohibition_errors()
     }
 
-    fn decompose_root_evidence_errors(self) -> Vec<Self> {
-        if self.root_evidence().is_none() {
-            return vec![self];
-        }
+    fn decompose_import_prohibition_errors(self) -> Vec<Self> {
         match self {
-            Self::Multiple(errors) => errors
-                .into_vec()
-                .into_iter()
-                .flat_map(|error| error.decompose_root_evidence_errors())
-                .collect(),
+            Self::Multiple(errors) => {
+                let separate = match errors.group {
+                    ModuleErrorGroup::ImportProhibitions => true,
+                    ModuleErrorGroup::Resolution => {
+                        errors.iter().any(|error| error.root_evidence().is_some())
+                    }
+                };
+                if !separate {
+                    return vec![Self::Multiple(errors)];
+                }
+                errors
+                    .into_vec()
+                    .into_iter()
+                    .flat_map(|error| error.decompose_import_prohibition_errors())
+                    .collect()
+            }
             Self::OwnedByCalls { calls, error } => error
-                .decompose_root_evidence_errors()
+                .decompose_import_prohibition_errors()
                 .into_iter()
                 .map(|error| error.with_owning_calls(calls.clone()))
                 .collect(),
             Self::AtCall { call, error } => error
-                .decompose_root_evidence_errors()
+                .decompose_import_prohibition_errors()
                 .into_iter()
                 .map(|error| error.with_failing_call(call.clone()))
                 .collect(),
             Self::WithProviderTypeWarnings { error, warnings } => error
-                .decompose_root_evidence_errors()
+                .decompose_import_prohibition_errors()
                 .into_iter()
                 .map(|error| Self::WithProviderTypeWarnings {
                     error: Box::new(error),
@@ -739,12 +757,29 @@ impl ModuleError {
         Some(Self::from_nonempty_errors(first, rest))
     }
     pub(crate) fn from_nonempty_errors(first: Self, rest: Vec<Self>) -> Self {
+        Self::from_nonempty_errors_grouped(first, rest, ModuleErrorGroup::Resolution)
+    }
+
+    pub(super) fn from_import_prohibitions(
+        prohibitions: super::loader::ModuleProhibitions,
+    ) -> Self {
+        let mut errors = prohibitions.into_errors().into_iter();
+        let first = errors.next().expect("a prohibition set is nonempty");
+        Self::from_nonempty_errors_grouped(
+            first,
+            errors.collect(),
+            ModuleErrorGroup::ImportProhibitions,
+        )
+    }
+
+    fn from_nonempty_errors_grouped(first: Self, rest: Vec<Self>, group: ModuleErrorGroup) -> Self {
         if rest.is_empty() {
             first
         } else {
-            Self::Multiple(MultipleModuleErrors(
-                std::iter::once(first).chain(rest).collect(),
-            ))
+            Self::Multiple(MultipleModuleErrors {
+                errors: std::iter::once(first).chain(rest).collect(),
+                group,
+            })
         }
     }
 
@@ -1281,13 +1316,13 @@ mod tests {
         )
         .unwrap();
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let parsed = crate::config_loader::parse_directory(
+        let Err(super::super::loader::ModuleLoadError::NotModule {
+            error: rejection,
+            imports: _,
+        }) = super::super::loader::load_module_with_diagnostics(
             &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
             &context,
         )
-        .unwrap();
-        let crate::config_loader::DirectoryVerdict::Root(root) =
-            parsed.complete_directory_verdict()
         else {
             panic!("root");
         };
@@ -1306,12 +1341,12 @@ mod tests {
             message: "provider schema unavailable".into(),
         };
         for warnings_outside in [false, true] {
-            let (first, rest) = root.import_prohibitions();
-            let expected = [
-                first.root_evidence().unwrap().clone(),
-                rest[0].root_evidence().unwrap().clone(),
-            ];
-            let multiple = ModuleError::from_nonempty_errors(first, rest);
+            let errors = rejection.clone().into_errors();
+            let expected = errors
+                .iter()
+                .map(|error| error.root_evidence().unwrap().clone())
+                .collect::<Vec<_>>();
+            let multiple = rejection.clone().into_error();
             let wrapped = if warnings_outside {
                 multiple
                     .with_owning_calls(vec![call.clone()])
@@ -1321,7 +1356,7 @@ mod tests {
                     .with_provider_type_warnings(vec![warning.clone()])
                     .with_owning_calls(vec![call.clone()])
             };
-            let leaves = wrapped.into_root_evidence_errors();
+            let leaves = wrapped.into_import_prohibition_errors();
             assert_eq!(leaves.len(), 2);
             assert!(matches!(
                 leaves[0].root_cause(),

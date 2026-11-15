@@ -44,6 +44,104 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
         .module_resolution_context()
 }
 
+#[test]
+fn imported_prohibitions_remain_complete_on_every_resolver_load_and_retry() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../carina-cli/tests/fixtures/import_root_boundary");
+    for (root_evidence, arguments) in [(true, false), (false, false), (false, true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let module = directory.path().join("rooted");
+        fs::create_dir(&module).unwrap();
+        for name in ["main.crn", "exports.crn", "providers.crn", "backend.crn"] {
+            if !root_evidence && matches!(name, "providers.crn" | "backend.crn") {
+                continue;
+            }
+            fs::copy(fixture.join("rooted").join(name), module.join(name)).unwrap();
+        }
+        if arguments {
+            fs::write(module.join("arguments.crn"), "arguments { n: Int = 1 }\n").unwrap();
+        }
+        let golden = if root_evidence {
+            "five.lsp.json"
+        } else {
+            "three.lsp.json"
+        };
+        let expected: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(fixture.join(golden)).unwrap()).unwrap();
+        crate::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |session| {
+                let mut resolver = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+                    session,
+                    resolver_context(),
+                );
+                for _attempt in 0..2 {
+                    let error = resolver.load_module("rooted").unwrap_err();
+                    let leaves = error.individual_errors();
+                    let messages = leaves
+                        .iter()
+                        .map(|leaf| {
+                            serde_json::Value::String(
+                                leaf.error.lsp_message_relative_to(directory.path()),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        messages,
+                        expected
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|item| item["message"].clone())
+                            .collect::<Vec<_>>(),
+                        "root evidence: {root_evidence}, arguments: {arguments}"
+                    );
+                    assert_eq!(
+                        leaves
+                            .iter()
+                            .filter(|leaf| leaf.error.root_evidence().is_some())
+                            .count(),
+                        if root_evidence { 2 } else { 0 }
+                    );
+                    assert!(resolver.resolving.is_empty());
+                }
+                let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+                fs::write(
+                    directory.path().join("main.crn"),
+                    "let m = use { source = './rooted' }\nm {}\n",
+                )
+                .unwrap();
+                let parsed =
+                    crate::config_loader::parse_directory(&root, session.catalog()).unwrap();
+                let schemas = crate::schema::SchemaRegistry::new();
+                let report =
+                    resolve_modules_with_diagnostics(parsed.admit(&schemas, session), &root, &[])
+                        .into_validation(&mut crate::test_utils::conversion_validation::<
+                            std::convert::Infallible,
+                        >());
+                let ModuleResolutionDiagnosticResult::Unowned { errors } = report else {
+                    panic!("prohibited imports cannot publish a graph");
+                };
+                assert_eq!(
+                    errors
+                        .iter()
+                        .map(|error| serde_json::Value::String(
+                            error.lsp_message_relative_to(directory.path())
+                        ))
+                        .collect::<Vec<_>>(),
+                    expected
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| item["message"].clone())
+                        .collect::<Vec<_>>()
+                );
+            },
+        );
+    }
+}
+
 fn assert_round4_empty_template(blocks: &str) {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("arguments.crn"), blocks).unwrap();

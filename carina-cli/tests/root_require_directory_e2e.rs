@@ -1866,16 +1866,12 @@ fn imported_backend_precedes_state_prohibition_on_validating_paths() {
                 ""
             }
         );
-        let tail = if args[0] == "validate" {
-            format!("Error: checked: {state_message}\n")
-        } else {
-            String::new()
-        };
         let prefix = if args[0] == "validate" {
             "checked: "
         } else {
             "Module resolution error: "
         };
+        let tail = format!("Error: {prefix}{state_message}\n");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
             format!("Error: {prefix}{backend}\n{note}{tail}")

@@ -122,7 +122,7 @@ use carina_core::hint::ProjectCommand;
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
-use carina_core::module_resolver::{self, ModuleError};
+use carina_core::module_resolver::{self, ModuleProhibition};
 use carina_core::name_override::{NameOverride, NameOverrideSource};
 use carina_core::parser::{
     ExpandedFile, ExpandedInferredExportParam, ExpandedInferredFile, ExpandedProviderConfig,
@@ -5293,64 +5293,41 @@ pub(crate) fn validate_module_internal_ref_types(
     }
 }
 
-/// Every rejected load is rendered once; loaded bodies keep their independent
-/// placement checks. Cause routing is exhaustive at ModuleRejection's boundary.
+/// Consume the loader's complete prohibition sets without rechecking bodies.
+/// Keep the established CLI order: rejected directories, then each loaded-body
+/// category across the depth-first module walk.
 pub(crate) fn validate_module_boundaries(module_walk: &ModuleWalk) -> Vec<AppError> {
-    let mut errors = rejected_module_errors(module_walk);
-    errors.extend(validate_no_state_blocks_in_modules(module_walk));
-    errors.extend(validate_no_upstream_states_in_modules(module_walk));
-    errors.extend(validate_no_exports_in_modules(module_walk));
-    errors
-}
-
-fn rejected_module_errors(module_walk: &ModuleWalk) -> Vec<AppError> {
-    module_walk
+    let mut errors = module_walk
         .rejections()
         .iter()
         .map(crate::module_walk::RejectedModuleAtPath::diagnostic)
-        .collect()
-}
-
-/// Reject state blocks in every recursively loaded module and preserve each
-/// module's import path in the resulting user-facing diagnostic. The module
-/// directory unit deliberately includes imported-but-uncalled nested modules,
-/// matching the provider validation policy. The resolver retains its own
-/// expansion-phase backstop for callers that bypass this validation walk.
-pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
-    let mut errors = Vec::new();
-    for module in module_walk.iter() {
-        if validation::validate_no_state_blocks_in_module(module.loaded()).is_err() {
-            errors.push(module.import_diagnostic(ModuleError::StateBlockInModule));
-        }
-    }
-    errors
-}
-
-/// Reject upstream state declarations in every recursively loaded module and
-/// preserve each module's import path in the resulting user-facing diagnostic.
-/// The resolver retains its own expansion-phase backstop for callers that
-/// bypass this validation walk.
-pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
-    let mut errors = Vec::new();
-    for module in module_walk.iter() {
-        if validation::validate_no_upstream_states_in_module(module.loaded()).is_err() {
-            errors.push(module.import_diagnostic(ModuleError::UpstreamStateInModule));
-        }
-    }
-    errors
-}
-
-/// Reject exports blocks in every recursively loaded module and preserve each
-/// module's import path in the resulting user-facing diagnostic. The resolver
-/// retains its own expansion-phase backstop for callers that bypass this
-/// validation walk.
-pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
-    let mut errors = Vec::new();
-    for module in module_walk.iter() {
-        if validation::validate_no_exports_in_module(module.loaded()).is_err() {
-            errors.push(module.import_diagnostic(ModuleError::ExportsInModule));
-        }
-    }
+        .collect::<Vec<_>>();
+    let mut body = module_walk
+        .iter()
+        .flat_map(|module| {
+            module
+                .loaded()
+                .import_prohibitions()
+                .into_iter()
+                .flat_map(move |prohibitions| {
+                    prohibitions
+                        .iter()
+                        .map(move |prohibition| (module, prohibition))
+                })
+        })
+        .collect::<Vec<_>>();
+    body.sort_by_key(|(_, prohibition)| match prohibition {
+        ModuleProhibition::Provider { evidence: _ } => 0,
+        ModuleProhibition::Backend { evidence: _ } => 1,
+        ModuleProhibition::State => 2,
+        ModuleProhibition::UpstreamState => 3,
+        ModuleProhibition::Exports => 4,
+    });
+    errors.extend(
+        body.into_iter().map(|(module, prohibition)| {
+            module.import_diagnostic(prohibition.clone().into_error())
+        }),
+    );
     errors
 }
 

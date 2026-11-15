@@ -827,42 +827,6 @@ impl RootDirectoryVerdict {
             RootDeclarations::Provider(_) => None,
         }
     }
-    /// The provider prohibition precedes the backend prohibition. This result
-    /// is nonempty by construction, independent of any mutable AST lists.
-    pub(crate) fn import_prohibitions(
-        &self,
-    ) -> (
-        crate::module_resolver::ModuleError,
-        Vec<crate::module_resolver::ModuleError>,
-    ) {
-        use crate::module_resolver::ModuleError;
-        match self.0.as_ref() {
-            RootDeclarations::Provider(provider) => (
-                ModuleError::ProviderInModule {
-                    evidence: provider.evidence(),
-                },
-                vec![],
-            ),
-            RootDeclarations::Backend { backend } => (
-                ModuleError::BackendInModule {
-                    evidence: backend.evidence(),
-                },
-                vec![],
-            ),
-            RootDeclarations::Both {
-                first: _,
-                provider,
-                backend,
-            } => (
-                ModuleError::ProviderInModule {
-                    evidence: provider.evidence(),
-                },
-                vec![ModuleError::BackendInModule {
-                    evidence: backend.evidence(),
-                }],
-            ),
-        }
-    }
     pub fn format_message(&self, message: &str) -> String {
         format!("{message}\n{}", evidence_note(&self.evidence().note(), ""))
     }

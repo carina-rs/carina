@@ -13,5 +13,35 @@
     },
     "severity": 1,
     "source": "carina"
+  },
+  {
+    "message": "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+    "range": {
+      "end": {
+        "character": 1,
+        "line": 1
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    },
+    "severity": 1,
+    "source": "carina"
+  },
+  {
+    "message": "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+    "range": {
+      "end": {
+        "character": 1,
+        "line": 1
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    },
+    "severity": 1,
+    "source": "carina"
   }
 ]

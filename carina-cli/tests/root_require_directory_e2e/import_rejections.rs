@@ -92,13 +92,11 @@ fn imported_root_pins_all_five_errors_and_call_site_on_every_transport() {
 }
 
 #[test]
-fn removing_root_evidence_keeps_three_cli_errors_and_the_first_lsp_error() {
+fn removing_root_evidence_keeps_three_errors_on_every_transport() {
     let directory = fixture();
     for name in ["providers.crn", "backend.crn"] {
         fs::remove_file(directory._temp.path().join("rooted").join(name)).unwrap();
     }
-    // Without root evidence, the LSP resolver still stops at the first body
-    // prohibition. Pin that measured limitation alongside all three CLI errors.
     assert_transports(
         &directory,
         include_str!("../fixtures/import_root_boundary/three.stderr"),

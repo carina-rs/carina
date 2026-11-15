@@ -997,12 +997,6 @@ pub(super) struct RefCheckWitness(
     >,
 );
 
-#[derive(Clone, Copy)]
-enum ImportErrorReporting {
-    First,
-    All,
-}
-
 /// Compile-time policy for resolving type annotations in loaded modules.
 pub(crate) trait TypeResolutionPolicy {
     fn resolve_file_type_exprs<
@@ -1112,7 +1106,6 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Present for diagnostic resolution, including command validation.
     /// Expansion records outcomes at the bound-argument evaluation seam.
     pub(super) constraint_reports: RefCell<Option<ModuleCallConstraintReports>>,
-    import_error_reporting: ImportErrorReporting,
     /// The type-resolution mode is selected by the resolver's type. This field
     /// is private so callers cannot construct a resolver with a new policy.
     type_resolution: PhantomData<P>,
@@ -1228,7 +1221,6 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             session,
             schemas,
             constraint_reports: RefCell::new(None),
-            import_error_reporting: ImportErrorReporting::First,
             type_resolution: PhantomData,
         }
     }
@@ -1413,11 +1405,11 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             self.schemas,
             &self.configuration_root,
         )
-        .map_err(|error| match self.import_error_reporting {
-            ImportErrorReporting::First => error.into_first_error(),
-            ImportErrorReporting::All => error.into_error(),
-        })?;
-        let placement_error = module.placement_errors().into_iter().next();
+        .map_err(super::loader::ModuleLoadError::into_error)?;
+        let placement_error = module
+            .import_prohibitions()
+            .cloned()
+            .map(super::loader::ModuleProhibitions::into_error);
         let mut merged = module.into_parsed();
 
         // Preserve authored value trees while this file is a reusable
@@ -2174,17 +2166,11 @@ pub fn resolve_modules_with_diagnostics_and_overrides<
     covered_findings: &[crate::validation::ModuleCallFinding],
     overrides: &crate::config_loader::SourceOverrides,
 ) -> ModuleResolutionReport<E::Absolute> {
-    resolve_modules_with_import_diagnostics(
-        parsed,
-        base_dir,
-        covered_findings,
-        overrides,
-        ImportErrorReporting::First,
-    )
+    resolve_modules_with_import_diagnostics(parsed, base_dir, covered_findings, overrides)
 }
 
-/// Editor import diagnostics retain each prohibition and its own evidence.
-/// Command paths keep their established first import error behavior.
+/// Compatibility entry point: every diagnostic resolver now retains the
+/// complete loader-owned prohibition set and its per-finding evidence.
 pub fn resolve_modules_with_all_import_diagnostics_and_overrides<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
 >(
@@ -2193,13 +2179,7 @@ pub fn resolve_modules_with_all_import_diagnostics_and_overrides<
     covered_findings: &[crate::validation::ModuleCallFinding],
     overrides: &crate::config_loader::SourceOverrides,
 ) -> ModuleResolutionReport<E::Absolute> {
-    resolve_modules_with_import_diagnostics(
-        parsed,
-        base_dir,
-        covered_findings,
-        overrides,
-        ImportErrorReporting::All,
-    )
+    resolve_modules_with_import_diagnostics(parsed, base_dir, covered_findings, overrides)
 }
 
 fn resolve_modules_with_import_diagnostics<
@@ -2209,14 +2189,12 @@ fn resolve_modules_with_import_diagnostics<
     base_dir: &ResolvedPath,
     covered_findings: &[crate::validation::ModuleCallFinding],
     overrides: &crate::config_loader::SourceOverrides,
-    import_error_reporting: ImportErrorReporting,
 ) -> ModuleResolutionReport<E::Absolute> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let mut resolver =
         ModuleResolver::with_constraint_reports(base_dir, config, schemas, resolution);
     resolver.source_overrides = overrides.clone();
-    resolver.import_error_reporting = import_error_reporting;
     resolve_modules_with_diagnostics_and_resolver(parsed, resolver, covered_findings)
 }
 
@@ -2341,7 +2319,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
     let resolution_failed = !errors.is_empty();
     let errors = errors
         .into_iter()
-        .flat_map(ModuleError::into_root_evidence_errors)
+        .flat_map(ModuleError::into_import_prohibition_errors)
         .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings))
         .collect::<Vec<_>>();
     let placements = graph.expression_report().placements.clone();

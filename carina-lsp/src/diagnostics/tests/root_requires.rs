@@ -1166,3 +1166,59 @@ fn existing_module_only_errors_survive_unknown_directory() {
         );
     }
 }
+
+#[test]
+fn imported_body_prohibitions_pin_complete_vectors_with_and_without_root_evidence() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../carina-cli/tests/fixtures/import_root_boundary");
+    let engine = DiagnosticEngine::new(
+        loaded_providers_from_factories(vec![Box::new(
+            carina_provider_mock::ConfiguredBuiltinMock::new(
+                carina_provider_mock::MockBehavior::default(),
+                carina_provider_mock::MockScope::memory(),
+            ),
+        )]),
+        vec!["mock".into()],
+    );
+    for (root_evidence, arguments, golden) in [
+        (true, false, "five.lsp.json"),
+        (false, false, "three.lsp.json"),
+        (false, true, "three.lsp.json"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        for relative in [
+            "caller/main.crn",
+            "caller/providers.crn",
+            "rooted/main.crn",
+            "rooted/exports.crn",
+            "rooted/providers.crn",
+            "rooted/backend.crn",
+        ] {
+            if !root_evidence && matches!(relative, "rooted/providers.crn" | "rooted/backend.crn") {
+                continue;
+            }
+            let path = directory.path().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::copy(fixture.join(relative), path).unwrap();
+        }
+        if arguments {
+            std::fs::write(
+                directory.path().join("rooted/arguments.crn"),
+                "arguments { n: Int = 1 }\n",
+            )
+            .unwrap();
+        }
+        let path = directory.path().join("caller/main.crn");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let diagnostics = engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
+        let root = tower_lsp::lsp_types::Url::from_directory_path(directory.path()).unwrap();
+        let expected = std::fs::read_to_string(fixture.join(golden))
+            .unwrap()
+            .replace("$ROOT", root.as_str().trim_end_matches('/'));
+        assert_eq!(
+            serde_json::to_value(diagnostics).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&expected).unwrap(),
+            "root evidence: {root_evidence}, arguments: {arguments}"
+        );
+    }
+}

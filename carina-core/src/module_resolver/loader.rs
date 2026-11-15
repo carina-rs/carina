@@ -16,6 +16,7 @@ use super::error::ModuleError;
 pub struct LoadedModule {
     directory: ResolvedPath,
     verdict: crate::config_loader::CompleteDirectoryVerdict,
+    prohibitions: Option<ModuleProhibitions>,
     parsed: ParsedFile,
     pub duplicate_declarations: Vec<crate::config_loader::DuplicateDeclaration>,
 }
@@ -44,6 +45,12 @@ impl LoadedModule {
 
     pub(super) fn into_parsed(self) -> ParsedFile {
         self.parsed
+    }
+
+    /// Complete, loader-owned prohibition set. Static consumers may still
+    /// inspect a non-root template's signature without collecting it again.
+    pub fn import_prohibitions(&self) -> Option<&ModuleProhibitions> {
+        self.prohibitions.as_ref()
     }
 
     pub fn preflight(&self) -> ModuleTemplate {
@@ -129,53 +136,108 @@ pub enum ModuleLoadError {
 /// contain an unrelated resolver error or grow a silently ignored cause.
 #[derive(Debug, Clone)]
 pub enum ModuleRejection {
-    NotADirectory {
-        path: String,
-    },
-    NoConfigurationFiles {
-        path: crate::paths::DisplayPath,
-    },
-    Root {
-        root: crate::config_loader::RootDirectoryVerdict,
-        body: Vec<ModuleBodyProhibition>,
-    },
+    NotADirectory { path: String },
+    NoConfigurationFiles { path: crate::paths::DisplayPath },
+    Prohibited(ModuleProhibitions),
 }
-#[derive(Debug, Clone, Copy)]
-pub enum ModuleBodyProhibition {
+
+/// One category in an imported directory's complete prohibition set.
+#[derive(Debug, Clone)]
+pub enum ModuleProhibition {
+    Provider {
+        evidence: crate::config_loader::RootEvidence,
+    },
+    Backend {
+        evidence: crate::config_loader::RootEvidence,
+    },
     State,
     UpstreamState,
     Exports,
 }
-impl ModuleBodyProhibition {
-    fn into_error(self) -> ModuleError {
+
+impl ModuleProhibition {
+    pub fn into_error(self) -> ModuleError {
         match self {
+            Self::Provider { evidence } => ModuleError::ProviderInModule { evidence },
+            Self::Backend { evidence } => ModuleError::BackendInModule { evidence },
             Self::State => ModuleError::StateBlockInModule,
             Self::UpstreamState => ModuleError::UpstreamStateInModule,
             Self::Exports => ModuleError::ExportsInModule,
         }
     }
 }
+
+/// A nonempty, complete set issued only by the imported-directory loader.
+/// Private fields prevent a consumer from replacing it with a selected leaf.
+#[derive(Debug, Clone)]
+pub struct ModuleProhibitions {
+    first: ModuleProhibition,
+    rest: Vec<ModuleProhibition>,
+}
+
+impl ModuleProhibitions {
+    /// The only producer for both Root and non-root imported directories.
+    fn collect(module: &LoadedModule) -> Option<Self> {
+        let root = match &module.verdict {
+            crate::config_loader::DirectoryVerdict::Root(root) => vec![
+                root.provider_evidence()
+                    .map(|evidence| ModuleProhibition::Provider { evidence }),
+                root.backend_evidence()
+                    .map(|evidence| ModuleProhibition::Backend { evidence }),
+            ],
+            crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
+            | crate::config_loader::DirectoryVerdict::NoEvidence(_) => Vec::new(),
+            crate::config_loader::DirectoryVerdict::Unknown(unknown) => match *unknown {},
+        };
+        let body = [
+            crate::validation::validate_no_state_blocks_in_module(module)
+                .err()
+                .map(|_| ModuleProhibition::State),
+            crate::validation::validate_no_upstream_states_in_module(module)
+                .err()
+                .map(|_| ModuleProhibition::UpstreamState),
+            crate::validation::validate_no_exports_in_module(module)
+                .err()
+                .map(|_| ModuleProhibition::Exports),
+        ];
+        let mut findings = root.into_iter().chain(body).flatten();
+        Some(Self {
+            first: findings.next()?,
+            rest: findings.collect(),
+        })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ModuleProhibition> {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+
+    pub fn into_errors(self) -> Vec<ModuleError> {
+        std::iter::once(self.first)
+            .chain(self.rest)
+            .map(ModuleProhibition::into_error)
+            .collect()
+    }
+
+    pub(crate) fn into_error(self) -> ModuleError {
+        ModuleError::from_import_prohibitions(self)
+    }
+}
 impl ModuleRejection {
-    fn into_nonempty_errors(self) -> (ModuleError, Vec<ModuleError>) {
+    pub fn into_errors(self) -> Vec<ModuleError> {
         match self {
-            Self::NotADirectory { path } => (ModuleError::NotADirectory { path }, vec![]),
+            Self::NotADirectory { path } => vec![ModuleError::NotADirectory { path }],
             Self::NoConfigurationFiles { path } => {
-                (ModuleError::NoConfigurationFiles { path }, vec![])
+                vec![ModuleError::NoConfigurationFiles { path }]
             }
-            Self::Root { root, body } => {
-                let (first, mut rest) = root.import_prohibitions();
-                rest.extend(body.into_iter().map(ModuleBodyProhibition::into_error));
-                (first, rest)
-            }
+            Self::Prohibited(prohibitions) => prohibitions.into_errors(),
         }
     }
-    pub fn into_errors(self) -> Vec<ModuleError> {
-        let (first, rest) = self.into_nonempty_errors();
-        std::iter::once(first).chain(rest).collect()
-    }
-    fn into_error(self) -> ModuleError {
-        let (first, rest) = self.into_nonempty_errors();
-        ModuleError::from_nonempty_errors(first, rest)
+    pub(crate) fn into_error(self) -> ModuleError {
+        match self {
+            Self::NotADirectory { path } => ModuleError::NotADirectory { path },
+            Self::NoConfigurationFiles { path } => ModuleError::NoConfigurationFiles { path },
+            Self::Prohibited(prohibitions) => prohibitions.into_error(),
+        }
     }
 }
 impl std::fmt::Display for ModuleRejection {
@@ -203,12 +265,6 @@ impl ModuleLoadError {
             error: Box::new(error),
             imports: Vec::new(),
         }
-    }
-    pub(crate) fn into_first_error(self) -> ModuleError {
-        self.into_errors()
-            .into_iter()
-            .next()
-            .expect("a module failure is nonempty")
     }
 }
 
@@ -321,21 +377,25 @@ pub(crate) fn load_imported_directory(
     for (_, parsed) in parsed_files {
         crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
     }
-    let module = LoadedModule {
+    let mut module = LoadedModule {
         directory: dir_path.clone(),
         verdict,
         parsed: merged,
         duplicate_declarations,
+        prohibitions: None,
     };
+    module.prohibitions = ModuleProhibitions::collect(&module);
     // The issued verdict is the importability decision. A root cannot escape
     // rejection even if a public AST list is later changed: the evidence itself
     // still identifies a prohibited root block.
     match module.verdict {
-        crate::config_loader::DirectoryVerdict::Root(ref root) => {
-            let error = ModuleRejection::Root {
-                root: root.clone(),
-                body: module.body_prohibitions(),
-            };
+        crate::config_loader::DirectoryVerdict::Root(_) => {
+            let error = ModuleRejection::Prohibited(
+                module
+                    .prohibitions
+                    .take()
+                    .expect("root evidence prohibits import"),
+            );
             return Err(ModuleLoadError::NotModule {
                 error: Box::new(error),
                 imports: module.parsed.uses,
@@ -350,31 +410,6 @@ pub(crate) fn load_imported_directory(
     let mut module = module;
     crate::parser::retained::judge_configuration(&mut module.parsed, schemas, config);
     Ok(module)
-}
-
-impl LoadedModule {
-    fn body_prohibitions(&self) -> Vec<ModuleBodyProhibition> {
-        [
-            crate::validation::validate_no_state_blocks_in_module(self)
-                .err()
-                .map(|_| ModuleBodyProhibition::State),
-            crate::validation::validate_no_upstream_states_in_module(self)
-                .err()
-                .map(|_| ModuleBodyProhibition::UpstreamState),
-            crate::validation::validate_no_exports_in_module(self)
-                .err()
-                .map(|_| ModuleBodyProhibition::Exports),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
-    pub(crate) fn placement_errors(&self) -> Vec<ModuleError> {
-        self.body_prohibitions()
-            .into_iter()
-            .map(ModuleBodyProhibition::into_error)
-            .collect()
-    }
 }
 
 /// Derive the module name from a file or directory path.
@@ -618,7 +653,7 @@ mod tests {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let errors = loaded.placement_errors();
+        let errors = loaded.import_prohibitions().unwrap().clone().into_errors();
         assert_eq!(errors.len(), 1);
         assert_eq!(
             errors[0].to_string(),

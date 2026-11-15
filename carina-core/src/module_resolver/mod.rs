@@ -39,9 +39,9 @@ mod validation;
 pub use error::{DiagnosticLine, ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
 pub use loader::{
-    LoadedModule, ModuleLoadError, ModuleRejection, ModuleTemplate, ModuleTemplatePreflight,
-    derive_module_name, get_parsed_file, load_directory_module, load_module,
-    load_module_from_directory, load_module_with_diagnostics,
+    LoadedModule, ModuleLoadError, ModuleProhibition, ModuleProhibitions, ModuleRejection,
+    ModuleTemplate, ModuleTemplatePreflight, derive_module_name, get_parsed_file,
+    load_directory_module, load_module, load_module_from_directory, load_module_with_diagnostics,
     load_module_with_diagnostics_and_schemas,
 };
 pub(crate) use resolver::{

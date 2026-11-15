@@ -202,7 +202,7 @@ fn visit_module(
                     })
                 }
                 rejection @ (ModuleRejection::NoConfigurationFiles { path: _ }
-                | ModuleRejection::Root { root: _, body: _ }) => {
+                | ModuleRejection::Prohibited(_)) => {
                     walk.rejections
                         .extend(rejection.into_errors().into_iter().map(|error| {
                             RejectedModuleAtPath {
