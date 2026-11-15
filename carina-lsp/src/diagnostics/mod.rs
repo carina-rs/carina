@@ -1,6 +1,6 @@
 #[cfg(feature = "test-utils")]
 use crate::admission_coverage::{
-    self as replay_coverage, ExpandedDeclineReason, Path as AdmissionPath, classification_preflight,
+    self as replay_coverage, ExpandedDeclineReason, Path as AdmissionPath,
 };
 
 mod buffer;
@@ -10,6 +10,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -19,9 +20,11 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::DiagnosticDocument as Document;
 use crate::position;
-use carina_core::parser::{
-    ParseError, ProviderConfig, SourceSpan, WarningKind, contains_function_call,
+use carina_core::identifier::{
+    CanonicalAttributeValues, CanonicalResource, PrefixCanonicalized, SuffixSource,
+    canonicalize_file_prefixes,
 };
+use carina_core::parser::{ParseError, ProviderConfig, SourceSpan, WarningKind};
 use carina_core::paths::PathIdentity;
 use carina_core::provider::{
     HostErrorCause, LoadedProviderSnapshot, ProviderFactory, SuspendedValidationId,
@@ -32,14 +35,10 @@ use carina_core::resource::{
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
 use carina_core::validation::DeferredAccessTypeError;
-#[cfg(not(feature = "test-utils"))]
-use carina_core::validation::admission::attributes::classification_preflight;
+#[cfg(test)]
+use carina_core::validation::admission::attributes::uses_resource_attribute_admission;
 use carina_core::validation::admission::attributes::{
     ClassificationDiagnostics, ResourceAttributeInputs, ValidationEvaluation,
-};
-#[cfg(test)]
-use carina_core::validation::admission::attributes::{
-    resource_attribute_admissions, uses_resource_attribute_admission,
 };
 
 #[derive(Debug)]
@@ -76,62 +75,31 @@ impl carina_core::validation::ValidationClientError for OrdinaryDiagnostic {
     }
 }
 
+#[cfg(test)]
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
-fn authored_validation_resources<'t, 'a>(
-    tree: &'t carina_core::parser::AnalysisTree<'a>,
-) -> HashMap<
-    carina_core::parser::AuthoredResourceInstanceKey<'a>,
-    &'t carina_core::parser::AnalysisResourceRef<'a>,
-> {
-    tree.project_resources()
-        .filter_map(|resource| resource.authored_instance_key().map(|key| (key, resource)))
-        .collect()
-}
-
-fn select_admission_inputs<'r, 'a>(
-    resource: &'r carina_core::parser::AnalysisResourceRef<'a>,
-    authored_resources: Option<
-        &HashMap<
-            carina_core::parser::AuthoredResourceInstanceKey<'a>,
-            &'r carina_core::parser::AnalysisResourceRef<'a>,
-        >,
-    >,
-    values: &IndexMap<String, Value>,
-    report: &carina_core::parser::retained::ExpressionReport,
+fn select_admission_inputs<X, D, B: BindingAddress>(
+    resource: &CanonicalResource<'_, X, D, B>,
+    values: &CanonicalAttributeValues<ParserPlaceholder, B>,
+    report: &carina_core::parser::retained::ExpressionReport<B>,
     prechecks: carina_core::validation::admission::attributes::SlotPrechecks<'_>,
-) -> (
-    &'r carina_core::parser::AnalysisResourceRef<'a>,
-    carina_core::validation::admission::attributes::ResourceAttributeInputs<RelativeBindingName>,
-) {
-    use carina_core::validation::admission::attributes::ResourceAttributeInputs;
-    let authored = resource
-        .authored_instance_key()
-        .and_then(|key| authored_resources?.get(&key).copied());
-    match authored.and_then(|source| {
-        let resolved = ResourceAttributeInputs::from_resolved(source, values, report);
-        #[cfg(feature = "test-utils")]
-        let resolved = resolved.inspect_err(|_| replay_coverage::resolved_inputs_fell_back());
-        resolved
-            .ok()
-            .map(|inputs| (source, inputs.with_prechecks(prechecks)))
-    }) {
-        Some(authored) => authored,
-        // Main checks the expanded owner against its resolved values. Only
-        // unchecked-slot metadata comes from the matched source tree.
-        None => (
-            resource,
+) -> ResourceAttributeInputs<B>
+where
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let resolved = ResourceAttributeInputs::from_resolved(resource, values, report);
+    #[cfg(feature = "test-utils")]
+    let resolved = resolved.inspect_err(|_| replay_coverage::resolved_inputs_fell_back());
+    resolved
+        .unwrap_or_else(|_| {
             ResourceAttributeInputs::from_report_with_evidence(
                 resource,
                 values,
                 report,
-                carina_core::parser::retained::NoAuthoredEvidence::for_resource(
-                    authored.unwrap_or(resource),
-                ),
+                carina_core::parser::retained::NoAuthoredEvidence::for_resource(resource),
             )
-            .with_prechecks(prechecks),
-        ),
-    }
+        })
+        .with_prechecks(prechecks)
 }
 
 type ExpandedAnalysis<'a> = carina_core::parser::AnalysisTree<
@@ -145,10 +113,9 @@ type ExpandedAnalysis<'a> = carina_core::parser::AnalysisTree<
     >,
     AbsoluteBindingAddress,
 >;
-type ExpandedResource<'a> = carina_core::parser::AnalysisResourceRef<
+type ExpandedResource<'a> = CanonicalResource<
     'a,
-    ParserPlaceholder,
-    ParserPlaceholder,
+    carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
     carina_core::parser::ResolvedDeferredForPhase<
         ParserPlaceholder,
         ParserPlaceholder,
@@ -437,11 +404,20 @@ struct DiagnosticValidationInputs<'a> {
         carina_core::binding_index::ResolvedBindings<ParserPlaceholder, RelativeBindingName>,
 }
 
-fn render_classification_diagnostics(
+fn render_classification_diagnostics<D, B: BindingAddress>(
     doc: &Document,
-    resource: &carina_core::parser::AnalysisResourceRef<'_>,
-    diagnostics: ClassificationDiagnostics<RelativeBindingName>,
-) -> Vec<Diagnostic> {
+    resource: &carina_core::parser::AnalysisResourceRef<
+        '_,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        D,
+        B,
+    >,
+    diagnostics: ClassificationDiagnostics<B>,
+) -> Vec<Diagnostic>
+where
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     diagnostics
         .0
         .into_iter()
@@ -464,43 +440,60 @@ fn render_classification_diagnostics(
 
 /// Expanded values and their binding authority stay in the absolute phase.
 /// Authored values are used separately for source positions and lexical checks.
-type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
-    'a,
-    carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
-    carina_core::parser::ResolvedDeferredForPhase<
-        ParserPlaceholder,
-        ParserPlaceholder,
+type ExpandedConfiguration<'a> = PrefixCanonicalized<
+    carina_core::parser::retained::JudgedFile<
+        'a,
+        carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
+        carina_core::parser::ResolvedDeferredForPhase<
+            ParserPlaceholder,
+            ParserPlaceholder,
+            AbsoluteBindingAddress,
+        >,
         AbsoluteBindingAddress,
     >,
-    AbsoluteBindingAddress,
 >;
 struct ExpandedDiagnosticValidationInputs<'a> {
     configuration: &'a ExpandedConfiguration<'a>,
-    resources: HashMap<&'a carina_core::resource::ResourceId, &'a ExpandedResource<'a>>,
-    // Compatibility observer for main's seam tests. Production coverage is
-    // owned only by ConversionValidation and borrowed for every walk.
-    #[cfg(test)]
-    coverage: carina_core::validation::admission::WalkCoverage,
+    resources: Vec<&'a ExpandedResource<'a>>,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
 
-impl ExpandedDiagnosticValidationInputs<'_> {
+impl<'a> ExpandedDiagnosticValidationInputs<'a> {
     #[cfg(test)]
     fn resource_admissions(
         &mut self,
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
-        let resource = *self.resources.get(resource_id)?;
-        let schemas = self.configuration.schemas();
-        let Some(schema) = resource.schema(schemas) else {
-            #[cfg(feature = "test-utils")]
-            {
-                replay_coverage::missing_schema(AdmissionPath::Expanded, &resource_id.provider);
-                replay_coverage::declined(ExpandedDeclineReason::MissingSchema);
-            }
-            return None;
-        };
+        let mut validation =
+            carina_core::validation::ConversionValidation::<OrdinaryDiagnostic>::new(
+                self.configuration.report(),
+            );
+        let resource = self
+            .resources
+            .iter()
+            .copied()
+            .find(|resource| resource.id() == resource_id)?;
+        self.admit_owner(
+            &mut validation,
+            resource,
+            carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
+            session,
+        )
+        .map(|outcome| outcome.values)
+    }
+
+    fn admit_owner<F: carina_core::validation::ValidationClientError>(
+        &self,
+        validation: &mut carina_core::validation::ConversionValidation<F>,
+        resource: &ExpandedResource<'a>,
+        prechecks: carina_core::validation::admission::attributes::SlotPrechecks<'_>,
+        session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Option<
+        carina_core::validation::admission::attributes::ResourceAdmissionOutcome<
+            AbsoluteBindingAddress,
+        >,
+    > {
         let Ok(inputs) =
             ResourceAttributeInputs::for_resource(resource, self.configuration.report())
         else {
@@ -508,75 +501,20 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             replay_coverage::declined(ExpandedDeclineReason::MissingReport);
             return None;
         };
-        #[cfg(feature = "test-utils")]
-        replay_coverage::reached(AdmissionPath::Expanded);
-        Some(
-            resource_attribute_admissions(
+        let inputs = inputs.with_prechecks(prechecks);
+        let request =
+            carina_core::validation::admission::attributes::ResourceAdmissionRequest::new(
                 resource,
-                self.configuration.file(),
-                schema,
                 resource.quoted_string_attrs(),
                 inputs,
                 ValidationEvaluation::expanded(),
                 &self.binding_index,
                 session,
-                schemas,
-                &mut self.coverage,
             )
-            .values,
-        )
-    }
-
-    fn resource_admissions_in<F: carina_core::validation::ValidationClientError>(
-        &mut self,
-        validation: &mut carina_core::validation::ConversionValidation<F>,
-        resource_id: &carina_core::resource::ResourceId,
-        prechecks: &carina_core::validation::BindingUseReport,
-        session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Option<carina_core::schema::ResourceValueValidation> {
-        let Some(&resource) = self.resources.get(resource_id) else {
-            #[cfg(feature = "test-utils")]
-            replay_coverage::declined(ExpandedDeclineReason::MissingResource);
-            return None;
-        };
-        let schemas = self.configuration.schemas();
-        let Some(schema) = resource.schema(schemas) else {
-            #[cfg(feature = "test-utils")]
-            {
-                replay_coverage::missing_schema(AdmissionPath::Expanded, &resource_id.provider);
-                replay_coverage::declined(ExpandedDeclineReason::MissingSchema);
-            }
-            return None;
-        };
-        let Ok(inputs) =
-            ResourceAttributeInputs::for_resource(resource, self.configuration.report())
-        else {
-            #[cfg(feature = "test-utils")]
-            replay_coverage::declined(ExpandedDeclineReason::MissingReport);
-            return None;
-        };
-        let inputs = inputs.with_prechecks(
-            carina_core::validation::admission::attributes::SlotPrechecks::Reported(prechecks),
-        );
+            .ok()?;
         #[cfg(feature = "test-utils")]
         replay_coverage::reached(AdmissionPath::Expanded);
-        Some(
-            validation
-                .admit_resource(
-                    carina_core::validation::admission::attributes::ResourceAdmissionRequest {
-                        resource,
-                        parsed: self.configuration.file(),
-                        schema,
-                        quoted: resource.quoted_string_attrs(),
-                        inputs,
-                        evaluation: ValidationEvaluation::expanded(),
-                        bindings: &self.binding_index,
-                        session,
-                        schemas,
-                    },
-                )
-                .values,
-        )
+        Some(validation.admit_resource(request))
     }
 }
 
@@ -762,6 +700,583 @@ impl DiagnosticRun<'_> {
             binding_use_report,
             export_value_bindings,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_resource_admission<X, D, B: BindingAddress>(
+        &self,
+        doc: &Document,
+        rref: &CanonicalResource<'_, X, D, B>,
+        expression_report: &carina_core::parser::retained::ExpressionReport<B>,
+        outcome: carina_core::validation::admission::attributes::ResourceAdmissionOutcome<B>,
+        binding_error_sinks: &HashSet<(carina_core::resource::ResourceId, String)>,
+        pending_resource_sinks: &HashSet<(carina_core::resource::ResourceId, String)>,
+        provider_validation_deduplicator: &ProviderValidationDeduplicator,
+        prior_diagnostics: &[Diagnostic],
+        diagnostics: &mut Vec<Diagnostic>,
+    ) where
+        D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let resource_id = rref.id();
+        let resource_attributes = rref.attributes();
+        let resource_quoted_string_attrs = rref.quoted_string_attrs();
+        let validated_schema = rref.resource_schema();
+        let schema = validated_schema.as_schema();
+        let bn_map = schema.block_name_map();
+        let full_resource_type = format!("{}.{}", resource_id.provider, resource_id.resource_type);
+        if schema.is_data_source()
+            && rref.kind() != carina_core::parser::AnalysisItemKind::DataSource
+        {
+            let finding = carina_core::parser::Located::new(rref.type_location().clone(), ());
+            diagnostics.extend(render_merged(doc, &finding, DiagnosticSeverity::ERROR, format!("{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}", full_resource_type, full_resource_type)));
+        }
+        for finding in rref.ignore_changes_findings(validated_schema.schema()) {
+            diagnostics.extend(render_merged(
+                doc,
+                &finding,
+                DiagnosticSeverity::ERROR,
+                format!("{}: {}", resource_id, finding.detail()),
+            ));
+        }
+        let mut value_validation = outcome.values;
+        diagnostics.extend(render_classification_diagnostics(
+            doc,
+            rref,
+            outcome.classification_diagnostics,
+        ));
+        // Attribute rendering consumes its report entries. Preserve
+        // core's diagnostic ownership before taking those entries.
+        let resource_diagnostic_errors = value_validation
+            .diagnostic_errors()
+            .map(|(error, _, coverage)| (error.clone(), coverage))
+            .collect::<Vec<_>>();
+        let mut reported_attribute_diagnostics = HashSet::new();
+        let retained_failures = resource_attributes
+            .keys()
+            .filter(|name| value_validation.is_retained_failure(name))
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        for (attr_name, authored_attr_value) in resource_attributes.iter() {
+            let authored_has_function_call = rref
+                .authored_attribute_has_function_call(attr_name)
+                .unwrap_or(false);
+            let location =
+                rref.attribute_value_location(attr_name, &carina_core::schema::FieldPath::new());
+            let judged_expression = expression_report.expression(location);
+            let judged_expression = match judged_expression {
+                Ok(expression) => expression,
+                Err(error) => {
+                    let finding = carina_core::parser::Located::new(location.clone(), error);
+                    diagnostics.extend(render_merged(
+                        doc,
+                        &finding,
+                        DiagnosticSeverity::ERROR,
+                        finding.detail().to_string(),
+                    ));
+                    continue;
+                }
+            };
+            let attr_value = authored_attr_value;
+            let typecheck_value = attr_value;
+            // Resolve block_name to canonical attribute name
+            let canonical_name = bn_map
+                .get(attr_name)
+                .map(|s| s.as_str())
+                .unwrap_or(attr_name);
+
+            // Check for mixed syntax: both block_name and canonical name present
+            // Skip when block_name == canonical name (singular names like "statement")
+            if let Some(canon) = bn_map.get(attr_name)
+                && canon != attr_name
+                && resource_attributes.contains_key(canon)
+            {
+                let finding = carina_core::parser::Located::new(
+                    rref.attribute_key_location(attr_name).clone(),
+                    format!(
+                        "Cannot use both '{}' and '{}' (they refer to the same attribute)",
+                        attr_name, canon,
+                    ),
+                );
+                diagnostics.extend(render_merged(
+                    doc,
+                    &finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().clone(),
+                ));
+                continue;
+            }
+
+            // Core's resource validator owns unknown attributes and
+            // their spelling suggestions. Nothing else applies here.
+            if !schema.attributes().contains_key(canonical_name) {
+                continue;
+            }
+
+            // Type validation
+            if let Some(attr_schema) = schema.attributes().get(canonical_name) {
+                let effective_attribute = validated_schema
+                    .effective_attribute(canonical_name)
+                    .expect("validated schema attributes must have effective views");
+                let effective_type = effective_attribute.value_type();
+                // The shared resource-level validator below owns read-only
+                // assignments. Skip type and authoring guidance here so it
+                // emits the single writability diagnostic, matching core.
+                if effective_attribute.is_read_only() {
+                    continue;
+                }
+
+                if binding_error_sinks.contains(&(resource_id.clone(), attr_name.clone())) {
+                    continue;
+                }
+
+                let attr_findings = value_validation
+                    .take_attribute(attr_name)
+                    .unwrap_or_default();
+                // Admission owns the syntax verdict. Parser-owned
+                // block keys supply the established guidance ranges.
+                if matches!(
+                    attr_findings.local_error(),
+                    Some(TypeError::BlockSyntaxNotAllowed { .. })
+                ) {
+                    let search_name = attr_schema.block_name().unwrap_or(attr_name);
+                    let mut reported_block_syntax = false;
+                    for location in rref.attribute_block_keys(attr_name) {
+                        reported_block_syntax = true;
+                        let finding = carina_core::parser::Located::new(
+                            location.clone(),
+                            format!(
+                                "'{}' cannot use block syntax; use map assignment: {} = {{ ... }}",
+                                search_name, search_name,
+                            ),
+                        );
+                        diagnostics.extend(render_merged(
+                            doc,
+                            &finding,
+                            DiagnosticSeverity::ERROR,
+                            finding.detail().clone(),
+                        ));
+                    }
+                    if reported_block_syntax {
+                        continue;
+                    }
+                }
+
+                let assignment_value = judged_expression.assignment_value(typecheck_value);
+                let symbolic = attr_findings.symbolic_findings().to_vec();
+                let has_exact_findings = symbolic.iter().any(|finding| !finding.covers_path());
+                let mut handled_enum_diagnostic = false;
+                if matches!(
+                    effective_type.shape(),
+                    carina_core::schema::Shape::Enum { .. }
+                ) && let Some(diag) = build_enum_diagnostic(
+                    attr_findings.local_error(),
+                    attr_name,
+                    resource_quoted_string_attrs.contains(attr_name),
+                    doc,
+                    rref,
+                ) {
+                    diagnostics.push(diag);
+                    handled_enum_diagnostic = true;
+                    reported_attribute_diagnostics.insert(canonical_name.to_string());
+                    // Continue past the generic match: this attribute
+                    // is already reported with the richer diagnostic.
+                    if !has_exact_findings {
+                        continue;
+                    }
+                }
+                if !handled_enum_diagnostic && let Some(error) = attr_findings.local_error() {
+                    let tagged = error.clone().with_attribute(attr_name);
+                    if crate::code_action::enum_diagnostic_data_for_error(&tagged).is_some() {
+                        let finding = carina_core::parser::Located::new(
+                            rref.attribute_value_location(
+                                attr_name,
+                                &carina_core::schema::FieldPath::new(),
+                            )
+                            .clone(),
+                            tagged,
+                        );
+                        if let Some(diagnostic) = render_schema_diagnostic(
+                            doc,
+                            &finding,
+                            rref.replaceable_attribute_value(attr_name),
+                        ) {
+                            diagnostics.push(diagnostic);
+                            reported_attribute_diagnostics.insert(canonical_name.to_string());
+                        }
+                        handled_enum_diagnostic = true;
+                        if !has_exact_findings {
+                            continue;
+                        }
+                    }
+                }
+                for finding in &symbolic {
+                    let covers_path = finding.covers_path();
+                    if handled_enum_diagnostic && covers_path {
+                        continue;
+                    }
+                    let (path, error) = finding.diagnostic();
+                    use carina_core::resource::SecretDiagnosticError;
+                    use carina_core::validation::admission::AdmissionReferenceError;
+                    let (location, severity, message) = match error {
+                        TypeError::Reference { error, .. } => match error.as_ref() {
+                            SecretDiagnosticError::Public(AdmissionReferenceError::Arithmetic(
+                                finding,
+                            )) => (
+                                finding.location(),
+                                DiagnosticSeverity::ERROR,
+                                finding.detail().to_string(),
+                            ),
+                            SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
+                                error,
+                            )) => (
+                                rref.attribute_key_location(attr_name),
+                                match error {
+                                    DeferredAccessTypeError::InvalidAccess { .. } => {
+                                        DiagnosticSeverity::ERROR
+                                    }
+                                    DeferredAccessTypeError::TypeMismatch { .. } => {
+                                        DiagnosticSeverity::WARNING
+                                    }
+                                },
+                                finding.diagnostic_message(),
+                            ),
+                            // The reference existence pass owns these same findings.
+                            SecretDiagnosticError::Public(
+                                AdmissionReferenceError::UnknownBinding { .. }
+                                | AdmissionReferenceError::Path(_)
+                                | AdmissionReferenceError::ProtectedBinding
+                                | AdmissionReferenceError::ProtectedAttribute,
+                            ) => continue,
+                            SecretDiagnosticError::Public(AdmissionReferenceError::Authored(
+                                finding,
+                            )) if finding.is_lookup_error() => continue,
+                            SecretDiagnosticError::Public(
+                                AdmissionReferenceError::ResourceHandle { reference, types },
+                            ) => (
+                                rref.attribute_key_location(attr_name),
+                                DiagnosticSeverity::WARNING,
+                                format!("Type mismatch: {types} (from {reference})"),
+                            ),
+                            SecretDiagnosticError::Public(
+                                AdmissionReferenceError::Resolution(_)
+                                | AdmissionReferenceError::Authored(_),
+                            )
+                            | SecretDiagnosticError::InsideSecret => (
+                                rref.attribute_key_location(attr_name),
+                                DiagnosticSeverity::ERROR,
+                                error.to_string(),
+                            ),
+                        },
+                        TypeError::TypeMismatch { types } => {
+                            let message = validation::reference_mismatch_message(
+                                assignment_value,
+                                path,
+                                attr_name,
+                                types,
+                            );
+                            (
+                                rref.attribute_key_location(attr_name),
+                                DiagnosticSeverity::WARNING,
+                                message,
+                            )
+                        }
+                        _ => (
+                            rref.attribute_key_location(attr_name),
+                            DiagnosticSeverity::WARNING,
+                            error.to_string(),
+                        ),
+                    };
+                    let finding = carina_core::parser::Located::new(location.clone(), message);
+                    if let Some(diagnostic) =
+                        render_merged(doc, &finding, severity, finding.detail().clone())
+                    {
+                        if !prior_diagnostics
+                            .iter()
+                            .chain(diagnostics.iter())
+                            .any(|existing| {
+                                existing.range == diagnostic.range
+                                    && existing.message == diagnostic.message
+                            })
+                        {
+                            diagnostics.push(diagnostic);
+                        }
+                        if covers_path {
+                            reported_attribute_diagnostics.insert(canonical_name.to_string());
+                        }
+                    }
+                }
+
+                if handled_enum_diagnostic {
+                    continue;
+                }
+
+                let container_findings = attr_findings
+                    .local_findings()
+                    .iter()
+                    .any(|(path, _)| !path.is_empty())
+                    || matches!(
+                        attr_findings.structure(),
+                        carina_core::schema::ValueStructure::List
+                            | carina_core::schema::ValueStructure::Map
+                    )
+                    || matches!(
+                        attr_findings.local_error(),
+                        Some(
+                            TypeError::ListItemError { .. }
+                                | TypeError::MapValueError { .. }
+                                | TypeError::StructFieldError { .. }
+                        )
+                    );
+                if container_findings {
+                    let findings = attr_findings
+                        .into_local_findings()
+                        .into_iter()
+                        .filter(|(path, error)| {
+                            (!path.is_empty() || !authored_has_function_call)
+                                && !validation::covered_by_symbolic_findings(path, error, &symbolic)
+                        })
+                        .collect();
+                    let (nested, reported_duplicate) =
+                        self.render_container_findings(doc, rref, attr_name, findings);
+                    if reported_duplicate {
+                        reported_attribute_diagnostics.insert(canonical_name.to_string());
+                    }
+                    diagnostics.extend(nested);
+                } else if !symbolic.iter().any(|finding| finding.covers_path()) {
+                    let error = attr_findings.local_error();
+                    let message = match error {
+                        Some(TypeError::TypeMismatch { types }) => {
+                            match (types.expected(), assignment_value) {
+                                ("Bool", GenericValue::Concrete(ConcreteValue::String(_))) => {
+                                    Some(format!(
+                                        "Type mismatch: expected Bool, got {}. Use true or false.",
+                                        carina_core::ValueDescription::of(attr_value)
+                                    ))
+                                }
+                                ("Int", GenericValue::Concrete(ConcreteValue::String(_))) => {
+                                    Some(format!(
+                                        "Type mismatch: expected Int, got {}.",
+                                        carina_core::ValueDescription::of(attr_value)
+                                    ))
+                                }
+                                ("Float", GenericValue::Concrete(ConcreteValue::String(_))) => {
+                                    Some(format!(
+                                        "Type mismatch: expected Float, got {}.",
+                                        carina_core::ValueDescription::of(attr_value)
+                                    ))
+                                }
+                                _ => error
+                                    .filter(|_| !authored_has_function_call)
+                                    .map(ToString::to_string),
+                            }
+                        }
+                        Some(
+                            TypeError::InvalidEnumVariant { .. }
+                            | TypeError::BindingShadowsEnumMember(_)
+                            | TypeError::UnionStructMismatch { .. }
+                            | TypeError::UnionAlternativesMismatch { .. }
+                            | TypeError::BlockSyntaxNotAllowed { .. },
+                        ) => error
+                            .filter(|_| !authored_has_function_call)
+                            .map(|error| error.clone().with_attribute(attr_name).to_string()),
+                        _ => None,
+                    };
+                    if let Some(message) = message {
+                        let finding = carina_core::parser::Located::new(
+                            rref.attribute_key_location(attr_name).clone(),
+                            message,
+                        );
+                        if let Some(diagnostic) = render_merged(
+                            doc,
+                            &finding,
+                            DiagnosticSeverity::WARNING,
+                            finding.detail().clone(),
+                        ) {
+                            diagnostics.push(diagnostic);
+                            reported_attribute_diagnostics.insert(canonical_name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Render the report produced by the single owner-bound walk.
+        {
+            for (error, symbolic_coverage) in resource_diagnostic_errors {
+                if error
+                    .attribute_name()
+                    .is_some_and(|name| retained_failures.contains(name))
+                {
+                    continue;
+                }
+                // Existence checks render lookup failures at their
+                // reference tokens, even when admission emits none.
+                if let TypeError::Reference { error, .. } = &error
+                    && let carina_core::resource::SecretDiagnosticError::Public(error) = error.as_ref()
+                    && match error {
+                        carina_core::validation::admission::AdmissionReferenceError::UnknownBinding { .. }
+                        | carina_core::validation::admission::AdmissionReferenceError::Path(_)
+                        | carina_core::validation::admission::AdmissionReferenceError::ProtectedBinding
+                        | carina_core::validation::admission::AdmissionReferenceError::ProtectedAttribute => true,
+                        carina_core::validation::admission::AdmissionReferenceError::Authored(finding) => finding.is_lookup_error(),
+                        _ => false,
+                    }
+                {
+                    continue;
+                }
+                if let carina_core::schema::TypeError::MissingRequired { name } = &error
+                    && pending_resource_sinks
+                        .iter()
+                        .any(|(pending_resource, authored_name)| {
+                            pending_resource == resource_id
+                                && bn_map
+                                    .get(authored_name)
+                                    .map(String::as_str)
+                                    .unwrap_or(authored_name)
+                                    == name
+                        })
+                {
+                    continue;
+                }
+                if !provider_validation_deduplicator.should_emit_type_error(&error) {
+                    continue;
+                }
+                // Skip errors that are already reported with precise positions
+                // by the attribute-level checks above, including intrinsic secrets.
+                if matches!(
+                    &error,
+                    carina_core::schema::TypeError::FieldGroupViolation { path, .. }
+                        if !path.is_empty()
+                ) {
+                    continue;
+                }
+                // Statically evaluated expressions may first become known
+                // in this pass. Suppress list refinements only when
+                // the attribute pass emitted them.
+                if is_duplicate_list_error(&error)
+                    && error.attribute_name().is_some_and(|attribute| {
+                        let canonical = bn_map
+                            .get(attribute)
+                            .map(String::as_str)
+                            .unwrap_or(attribute);
+                        reported_attribute_diagnostics.contains(canonical)
+                    })
+                {
+                    continue;
+                }
+                if !is_duplicate_list_error(&error)
+                    && matches!(
+                        &error,
+                        TypeError::BlockSyntaxNotAllowed { .. }
+                            | TypeError::TypeMismatch { .. }
+                            | TypeError::BindingShadowsEnumMember(_)
+                            | TypeError::InvalidEnumVariant { .. }
+                            | TypeError::UnknownStructField { .. }
+                            | TypeError::UnionStructMismatch { .. }
+                            | TypeError::UnionAlternativesMismatch { .. }
+                            | TypeError::StructFieldError { .. }
+                            | TypeError::ListItemError { .. }
+                            | TypeError::MapValueError { .. }
+                    )
+                {
+                    continue;
+                }
+                // The binding-use authority checks the resolved value,
+                // including its destination member constraints. Its
+                // diagnostic owns this sink even when the schema pass
+                // sees a concrete local error instead of a reference.
+                if error.attribute_name().is_some_and(|name| {
+                    binding_error_sinks.contains(&(resource_id.clone(), name.to_string()))
+                }) {
+                    continue;
+                }
+                if symbolic_coverage.owns_finding()
+                    || error
+                        .attribute_name()
+                        .is_some_and(|name| reported_attribute_diagnostics.contains(name))
+                {
+                    continue;
+                }
+                let location = error
+                    .attribute_name()
+                    .filter(|name| resource_attributes.contains_key(*name))
+                    .map_or(rref.type_location(), |name| {
+                        let assignment = rref.attribute_assignment_location(name);
+                        let span = assignment.span();
+                        if matches!(
+                            error,
+                            carina_core::schema::TypeError::UnknownAttribute { .. }
+                        ) && span.start_line() == span.end_line()
+                        {
+                            assignment
+                        } else {
+                            // Multiline containers retain the precise key instead
+                            // of widening beyond main's single-line anchor.
+                            rref.attribute_key_location(name)
+                        }
+                    });
+                let finding = carina_core::parser::Located::new(location.clone(), error);
+                diagnostics.extend(render_merged(
+                    doc,
+                    &finding,
+                    DiagnosticSeverity::ERROR,
+                    finding.detail().to_string(),
+                ));
+            }
+        }
+
+        // Lint: prefer block syntax for List<Struct> attributes
+        diagnostics.extend(self.check_list_struct_syntax(doc, rref, validated_schema.schema()));
+    }
+
+    fn report_missing_resource_schema<D, B: BindingAddress>(
+        &self,
+        doc: &Document,
+        resource: &carina_core::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) where
+        D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let provider = &resource.id().provider;
+        #[cfg(feature = "test-utils")]
+        replay_coverage::missing_schema(AdmissionPath::Relative, provider);
+        let full = format!("{}.{}", provider, resource.id().resource_type);
+        let (severity, message) = if let Some(reason) = self.provider_errors.get(provider) {
+            (
+                DiagnosticSeverity::INFORMATION,
+                format!("Provider '{}' is not loaded: {}", provider, reason),
+            )
+        } else if self.known_provider_names.contains(provider) {
+            (
+                DiagnosticSeverity::ERROR,
+                format!("Unknown resource type: {full}"),
+            )
+        } else if !self.provider_names.contains(&provider.to_string()) {
+            (
+                DiagnosticSeverity::ERROR,
+                format!(
+                    "Provider '{}' has no loaded schema for this file: no provider block for it was found in this file's configuration.",
+                    provider
+                ),
+            )
+        } else {
+            (
+                DiagnosticSeverity::WARNING,
+                format!("No schema for {} — attribute validation skipped", full),
+            )
+        };
+        diagnostics.extend(render_merged(
+            doc,
+            &carina_core::parser::Located::new(resource.type_location().clone(), ()),
+            severity,
+            message,
+        ));
     }
 
     fn collect_diagnostics(
@@ -1401,19 +1916,31 @@ impl DiagnosticRun<'_> {
             } else {
                 None
             };
-            let pre_expansion_configuration = if let Some(snapshot) = recovery_snapshot {
-                carina_core::config_loader::load_buffer_configuration_in_directory(
-                    snapshot,
-                    &self.schemas,
-                    self.provider_context.catalog(),
-                )
-            } else {
-                carina_core::config_loader::load_buffer_configuration(
-                    pre_expansion_input,
-                    &self.schemas,
-                    self.provider_context.catalog(),
-                )
-            };
+            let mut admission_file = recovery_snapshot.map_or_else(
+                || pre_expansion_input.clone(),
+                |snapshot| snapshot.into_scoped_file(),
+            );
+            if merged.is_none()
+                && let Ok(tree) = carina_core::parser::AnalysisTree::try_from_file(&admission_file)
+            {
+                match carina_core::parser::resolve_resource_refs_from_analysis(
+                    &tree,
+                    self.provider_context,
+                ) {
+                    Ok(resolved) => admission_file = resolved,
+                    Err(error) => {
+                        if matches!(&error, carina_core::parser::AnalysisResolutionError::Diagnostic(finding)
+                                if matches!(finding.detail(), ParseError::SecretDerivedBackendAttribute { .. }))
+                        {
+                            diagnostics.extend(render_analysis_resolution_error(doc, &error));
+                        }
+                    }
+                }
+            }
+            let canonical_pre_expansion =
+                canonicalize_file_prefixes(admission_file, &self.schemas, SuffixSource::Preview);
+            let pre_expansion_configuration =
+                canonical_pre_expansion.judge(&self.schemas, self.provider_context.catalog());
             let expression_report = pre_expansion_configuration.judged().report();
             for finding in expression_report.findings() {
                 if let Some(diagnostic) = render_merged(
@@ -1500,37 +2027,23 @@ impl DiagnosticRun<'_> {
                 (None, Some(_graph)) => Default::default(),
                 (None, None) => Default::default(),
             };
-            let expanded_configuration = expanded_graph.map(|graph| {
-                carina_core::config_loader::load_buffer_configuration(
-                    graph,
-                    &self.schemas,
-                    self.provider_context.catalog(),
-                )
+            let expanded_canonical = expanded_graph.map(|graph| {
+                canonicalize_file_prefixes(graph.clone(), &self.schemas, SuffixSource::Preview)
             });
-            let expanded_validation_tree = match &expanded_configuration {
-                Some(configuration) => {
-                    carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file())
-                        .ok()
-                }
-                None => None,
-            };
-            let mut expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
-                let configuration = configuration.judged();
-                let graph = configuration.file();
+            let expanded_configuration = expanded_canonical
+                .as_ref()
+                .map(|graph| graph.judge(&self.schemas, self.provider_context.catalog()));
+            let expanded_validation_tree = expanded_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.analysis_tree().ok());
+            let expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
                 let tree = expanded_validation_tree.as_ref()?;
-                let mut resources = HashMap::new();
-                for resource in tree.resources() {
-                    resources.entry(resource.id()).or_insert(resource);
-                }
                 Some(ExpandedDiagnosticValidationInputs {
                     configuration,
-                    resources,
-                    #[cfg(test)]
-                    coverage: Default::default(),
-                    binding_index:
-                        carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-                            graph, &self.schemas, Some(&expanded_upstream_exports), &module_signatures, self.provider_context,
-                        ),
+                    resources: tree.resources().collect(),
+                    binding_index: carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                        configuration.file(), &self.schemas, Some(&expanded_upstream_exports), &module_signatures, self.provider_context,
+                    ),
                 })
             });
             let DiagnosticValidationInputs {
@@ -1610,13 +2123,6 @@ impl DiagnosticRun<'_> {
                 }
                 diagnostics.push(diagnostic);
             }
-            let semantic_file = current_file_path.and_then(|path| {
-                merged_result
-                    .as_ref()
-                    .and_then(|result| result.directory.semantic_file(path))
-            });
-            let semantic_tree = semantic_file
-                .and_then(|file| carina_core::parser::AnalysisTree::try_from_file(file).ok());
             let authored_inputs = if let Some(graph) = expanded_graph {
                 graph.authored_inputs().cloned()
             } else {
@@ -1818,11 +2324,11 @@ impl DiagnosticRun<'_> {
             if let Some(configuration) = &expanded_configuration {
                 conversion_validation.include(configuration.judged().report());
             }
-            let authored_tree = carina_core::parser::AnalysisTree::try_from_file(
-                pre_expansion_configuration.judged().file(),
-            )
-            .ok();
-            if let Some(inputs) = expanded_validation_inputs.as_mut() {
+            let authored_tree = pre_expansion_configuration.analysis_tree().ok();
+            if let (Some(inputs), Some(canonical_tree)) = (
+                expanded_validation_inputs.as_ref(),
+                expanded_validation_tree.as_ref(),
+            ) {
                 // A rejected call already owns the diagnostic. Do not add a
                 // downstream resource consequence of that same rejection.
                 let rejected_calls: Vec<_> = prior_diagnostics
@@ -1835,28 +2341,48 @@ impl DiagnosticRun<'_> {
                     .project_resources()
                     .map(|resource| resource.id().clone())
                     .collect();
-                let configuration = inputs.configuration;
-                for resource in &configuration.file().resources {
-                    if authored_ids.contains(&resource.id) {
+                // Unknown schemas cannot produce admission owners. Preserve replay's
+                // observation of module resources declined before binding.
+                #[cfg(feature = "test-utils")]
+                for resource in &inputs.configuration.file().resources {
+                    if !authored_ids.contains(&resource.id)
+                        && matches!(
+                            &resource.module_source,
+                            Some(carina_core::resource::ModuleSource::Module(_))
+                        )
+                        && self.schemas.get_for(resource).is_none()
+                    {
+                        replay_coverage::missing_schema(
+                            AdmissionPath::Expanded,
+                            &resource.id.provider,
+                        );
+                        replay_coverage::declined(ExpandedDeclineReason::MissingSchema);
+                        replay_coverage::declined_outcome(false);
+                    }
+                }
+                for resource in canonical_tree.managed_resources() {
+                    if authored_ids.contains(resource.id()) {
                         continue;
                     }
                     let Some(carina_core::resource::ModuleSource::Module(origin)) =
-                        &resource.module_source
+                        &resource.module_source()
                     else {
                         continue;
                     };
                     let call = &origin.module_call_path().root().id;
-                    let Some(report) = inputs.resource_admissions_in(
+                    let Some(report) = inputs.admit_owner(
                         conversion_validation,
-                        &resource.id,
-                        &binding_use_report,
+                        resource,
+                        carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                            &binding_use_report,
+                        ),
                         self.provider_context,
                     ) else {
                         #[cfg(feature = "test-utils")]
                         replay_coverage::declined_outcome(false);
                         continue;
                     };
-                    for error in report.errors() {
+                    for error in report.values.errors() {
                         let finding = carina_core::parser::Located::new(
                             call.declaration_location().clone(),
                             error,
@@ -1865,7 +2391,7 @@ impl DiagnosticRun<'_> {
                             doc,
                             &finding,
                             DiagnosticSeverity::ERROR,
-                            format!("{}: {}", resource.id, finding.detail()),
+                            format!("{}: {}", resource.id(), finding.detail()),
                         ) && !rejected_calls.contains(&diagnostic.range)
                             && !prior_diagnostics.contains(&diagnostic)
                             && !diagnostics.contains(&diagnostic)
@@ -1875,151 +2401,24 @@ impl DiagnosticRun<'_> {
                     }
                 }
             }
-            // Admission reads the sealed slots and projections owned by the
-            // judged directory. Source locations still anchor each diagnostic.
-            let authored_resources = authored_tree.as_ref().map(authored_validation_resources);
-            // The document AST intentionally preserves function calls for
-            // source-oriented checks. Build a parallel, same-order view with
-            // locally resolvable calls evaluated so schema diagnostics see
-            // the actual value type (not a deferred FunctionCall). The value
-            // itself carries any diagnostic-sensitivity provenance.
-            let resolved_buffer = {
-                match carina_core::parser::resolve_resource_refs_from_analysis(
-                    tree,
-                    self.provider_context,
-                ) {
-                    Ok(resolved) => Some(resolved),
-                    Err(error) => {
-                        if matches!(&error, carina_core::parser::AnalysisResolutionError::Diagnostic(finding)
-                            if matches!(finding.detail(), ParseError::SecretDerivedBackendAttribute { .. }))
-                        {
-                            diagnostics.extend(render_analysis_resolution_error(doc, &error));
-                        }
-                        None
+            // The canonical files supply both owners and values. Raw document trees remain only for syntax checks.
+            publish_prefix_errors(doc, &pre_expansion_configuration, &mut diagnostics);
+            if let Some(configuration) = &expanded_configuration {
+                publish_prefix_errors(doc, configuration, &mut diagnostics);
+            }
+            if let Some(authored_tree) = &authored_tree {
+                for resource in authored_tree
+                    .project_resource_refs()
+                    .filter(|resource| resource.location().file().path() == doc.source_file())
+                {
+                    if resource.schema(&self.schemas).is_none() {
+                        self.report_missing_resource_schema(doc, resource, &mut diagnostics);
                     }
                 }
-            };
-            let resolved_buffer_resources = resolved_buffer
-                .as_ref()
-                .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
-            // Every schema finding is anchored by the sealed parser view,
-            // including the semantic per-file fallback after a buffer parse fails.
-            for (resource_index, rref) in tree.project_resources().enumerate() {
-                let resource_id = rref.id();
-                let resource_attributes = rref.attributes();
-                let resolved_resource_attributes = resolved_buffer_resources
-                    .as_ref()
-                    .and_then(|resources| resources.get(resource_index))
-                    .map(|resource| resource.attributes());
-                let semantic_resource_attributes =
-                    semantic_tree.as_ref().and_then(|semantic_tree| {
-                        semantic_tree
-                            .resources()
-                            .find(|candidate| {
-                                candidate.location() == rref.location()
-                                    && candidate.binding_address() == rref.binding_address()
-                            })
-                            .map(|candidate| candidate.attributes().into_owned())
-                    });
-                let resource_quoted_string_attrs = rref.quoted_string_attrs();
-                let resource_schema = || rref.schema(&self.schemas);
-                let provider = &resource_id.provider;
-                let full_resource_type = format!("{}.{}", provider, resource_id.resource_type);
-
-                if resource_schema().is_none() {
-                    #[cfg(feature = "test-utils")]
-                    replay_coverage::missing_schema(AdmissionPath::Relative, provider);
-                    let provider_loaded = self.provider_names.contains(&provider.to_string());
-
-                    let (severity, message) = if let Some(reason) =
-                        self.provider_errors.get(provider)
-                    {
-                        (
-                            DiagnosticSeverity::INFORMATION,
-                            format!("Provider '{}' is not loaded: {}", provider, reason),
-                        )
-                    } else if self.known_provider_names.contains(provider) {
-                        (
-                            DiagnosticSeverity::ERROR,
-                            format!("Unknown resource type: {full_resource_type}"),
-                        )
-                    } else if !provider_loaded {
-                        (
-                            DiagnosticSeverity::ERROR,
-                            format!(
-                                "Provider '{}' has no loaded schema for this file: no provider block for it was found in this file's configuration.",
-                                provider
-                            ),
-                        )
-                    } else {
-                        (
-                            DiagnosticSeverity::WARNING,
-                            format!(
-                                "No schema for {}.{} — attribute validation skipped",
-                                provider, resource_id.resource_type
-                            ),
-                        )
-                    };
-                    let finding =
-                        carina_core::parser::Located::new(rref.type_location().clone(), message);
-                    diagnostics.extend(render_merged(
-                        doc,
-                        &finding,
-                        severity,
-                        finding.detail().clone(),
-                    ));
-                }
-
-                // Semantic validation using schema
-                let validated_schema = resource_schema();
-                if let Some(validated_schema) = validated_schema {
-                    let schema = validated_schema.as_schema();
-                    if schema.is_data_source()
-                        && rref.kind() != carina_core::parser::AnalysisItemKind::DataSource
-                    {
-                        let finding = carina_core::parser::Located::new(
-                            rref.type_location().clone(),
-                            format!(
-                                "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
-                                full_resource_type, full_resource_type,
-                            ),
-                        );
-                        diagnostics.extend(render_merged(
-                            doc,
-                            &finding,
-                            DiagnosticSeverity::ERROR,
-                            finding.detail().clone(),
-                        ));
-                    }
-                    for finding in rref.ignore_changes_findings(validated_schema.schema()) {
-                        diagnostics.extend(render_merged(
-                            doc,
-                            &finding,
-                            DiagnosticSeverity::ERROR,
-                            format!("{}: {}", resource_id, finding.detail()),
-                        ));
-                    }
-                }
-                if let Some(validated_schema) = validated_schema {
-                    let schema = validated_schema.as_schema();
-                    // Build block_name -> canonical_name map for this schema
-                    let bn_map = schema.block_name_map();
-                    let resolved_attrs = semantic_resource_attributes
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or_else(|| rref.attributes().into_owned());
-                    let (admission_resource, inputs) = select_admission_inputs(
-                        rref,
-                        authored_resources.as_ref(),
-                        &resolved_attrs,
-                        expression_report,
-                        carina_core::validation::admission::attributes::SlotPrechecks::Reported(
-                            &binding_use_report,
-                        ),
-                    );
-                    // Expansion supplies the binding authority for composition
-                    // exports. Select that input before admitting attributes;
-                    // the authored tree below supplies only rendering locations.
+                for rref in authored_tree
+                    .project_resources()
+                    .filter(|resource| resource.location().file().path() == doc.source_file())
+                {
                     let uses_composition_output = rref.references().iter().any(|reference| {
                         pre_expansion_input.module_calls.iter().any(|call| {
                             call.binding_name.as_ref().is_some_and(|binding| {
@@ -2027,601 +2426,79 @@ impl DiagnosticRun<'_> {
                             })
                         })
                     });
-                    let expanded = expanded_validation_inputs
-                        .as_mut()
+                    // Preserve the composition-only route; compare existing source-instance identities across phases.
+                    let key = rref.authored_instance_key();
+                    let selected = expanded_validation_inputs
+                        .as_ref()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| {
-                            let result = inputs.resource_admissions_in(
-                                conversion_validation,
-                                resource_id,
-                                &binding_use_report,
-                                self.provider_context,
-                            );
-                            #[cfg(feature = "test-utils")]
-                            if result.is_none() {
-                                replay_coverage::declined_outcome(true);
-                            }
-                            result
+                            inputs.resources.iter().copied().find(|candidate| {
+                                key.as_ref()
+                                    .zip(candidate.authored_instance_key())
+                                    .is_some_and(|(a, b)| a.same_source_instance(&b))
+                            })
                         });
-                    let (mut value_validation, classification_diagnostics) = match expanded {
-                        Some(values) => {
-                            let diagnostics = classification_preflight(
-                                &inputs,
-                                ValidationEvaluation::relative_static(),
-                                self.provider_context,
-                            );
-                            (values, diagnostics)
-                        }
-                        None => {
-                            #[cfg(feature = "test-utils")]
-                            replay_coverage::reached(AdmissionPath::Relative);
-                            let outcome = conversion_validation.admit_resource(
-                                carina_core::validation::admission::attributes::ResourceAdmissionRequest {
-                                    resource: admission_resource, parsed, schema: validated_schema,
-                                    quoted: resource_quoted_string_attrs, inputs, evaluation: ValidationEvaluation::relative_static(),
-                                    bindings: &binding_index, session: self.provider_context, schemas: &self.schemas,
-                                },
-                            );
-                            (outcome.values, outcome.classification_diagnostics)
-                        }
-                    };
-                    diagnostics.extend(render_classification_diagnostics(
-                        doc,
-                        rref,
-                        classification_diagnostics,
-                    ));
-                    // Attribute rendering consumes its report entries. Preserve
-                    // core's diagnostic ownership before taking those entries.
-                    let resource_diagnostic_errors = value_validation
-                        .diagnostic_errors()
-                        .map(|(error, _, coverage)| (error.clone(), coverage))
-                        .collect::<Vec<_>>();
-                    let mut reported_attribute_diagnostics = HashSet::new();
-                    let retained_failures = resource_attributes
-                        .keys()
-                        .filter(|name| value_validation.is_retained_failure(name))
-                        .map(String::as_str)
-                        .collect::<HashSet<_>>();
-                    for (attr_name, authored_attr_value) in resource_attributes.iter() {
-                        let location = rref.attribute_value_location(
-                            attr_name,
-                            &carina_core::schema::FieldPath::new(),
-                        );
-                        let judged_expression = expression_report.expression(location);
-                        let judged_expression = match judged_expression {
-                            Ok(expression) => expression,
-                            Err(error) => {
-                                let finding =
-                                    carina_core::parser::Located::new(location.clone(), error);
-                                diagnostics.extend(render_merged(
-                                    doc,
-                                    &finding,
-                                    DiagnosticSeverity::ERROR,
-                                    finding.detail().to_string(),
-                                ));
-                                continue;
-                            }
-                        };
-                        // Constructed results use the directory's evaluated
-                        // values; the buffer copy cannot resolve sibling lets.
-                        let attr_value = if contains_function_call(authored_attr_value) {
-                            semantic_resource_attributes
-                                .as_ref()
-                                .filter(|_| {
-                                    validated_schema
-                                        .effective_attribute_by_authored_name(attr_name)
-                                        .is_some_and(|attribute| {
-                                            let sink =
-                                                carina_core::validation::expression_sink_type(
-                                                    attribute.field_type(),
-                                                    validated_schema.owner(),
-                                                    validated_schema.schema().as_schema().defs(),
-                                                );
-                                            let expression = judged_expression
-                                                .for_sink(&sink, self.provider_context.catalog());
-                                            expression.is_single_string_construction()
-                                                || expression.has_constructed_members()
-                                        })
-                                })
-                                .and_then(|attributes| attributes.get(attr_name))
-                                .or_else(|| {
-                                    resolved_resource_attributes
-                                        .as_ref()
-                                        .and_then(|attributes| attributes.get(attr_name))
-                                })
-                                .unwrap_or(authored_attr_value)
-                        } else {
-                            authored_attr_value
-                        };
-                        let typecheck_value = semantic_resource_attributes
-                            .as_ref()
-                            .and_then(|attributes| attributes.get(attr_name))
-                            .unwrap_or(attr_value);
-                        // Resolve block_name to canonical attribute name
-                        let canonical_name = bn_map
-                            .get(attr_name)
-                            .map(|s| s.as_str())
-                            .unwrap_or(attr_name);
-
-                        // Check for mixed syntax: both block_name and canonical name present
-                        // Skip when block_name == canonical name (singular names like "statement")
-                        if let Some(canon) = bn_map.get(attr_name)
-                            && canon != attr_name
-                            && resource_attributes.contains_key(canon)
-                        {
-                            let finding = carina_core::parser::Located::new(
-                                rref.attribute_key_location(attr_name).clone(),
-                                format!(
-                                    "Cannot use both '{}' and '{}' (they refer to the same attribute)",
-                                    attr_name, canon,
-                                ),
-                            );
-                            diagnostics.extend(render_merged(
-                                doc,
-                                &finding,
-                                DiagnosticSeverity::ERROR,
-                                finding.detail().clone(),
-                            ));
-                            continue;
-                        }
-
-                        // Core's resource validator owns unknown attributes and
-                        // their spelling suggestions. Nothing else applies here.
-                        if !schema.attributes().contains_key(canonical_name) {
-                            continue;
-                        }
-
-                        // Type validation
-                        if let Some(attr_schema) = schema.attributes().get(canonical_name) {
-                            let effective_attribute = validated_schema
-                                .effective_attribute(canonical_name)
-                                .expect("validated schema attributes must have effective views");
-                            let effective_type = effective_attribute.value_type();
-                            // The shared resource-level validator below owns read-only
-                            // assignments. Skip type and authoring guidance here so it
-                            // emits the single writability diagnostic, matching core.
-                            if effective_attribute.is_read_only() {
-                                continue;
-                            }
-
-                            if binding_error_sinks
-                                .contains(&(resource_id.clone(), attr_name.clone()))
-                            {
-                                continue;
-                            }
-
-                            let attr_findings = value_validation
-                                .take_attribute(attr_name)
-                                .unwrap_or_default();
-                            // Admission owns the syntax verdict. Parser-owned
-                            // block keys supply the established guidance ranges.
-                            if matches!(
-                                attr_findings.local_error(),
-                                Some(TypeError::BlockSyntaxNotAllowed { .. })
-                            ) {
-                                let search_name = attr_schema.block_name().unwrap_or(attr_name);
-                                let mut reported_block_syntax = false;
-                                for location in rref.attribute_block_keys(attr_name) {
-                                    reported_block_syntax = true;
-                                    let finding = carina_core::parser::Located::new(
-                                        location.clone(),
-                                        format!(
-                                            "'{}' cannot use block syntax; use map assignment: {} = {{ ... }}",
-                                            search_name, search_name,
-                                        ),
-                                    );
-                                    diagnostics.extend(render_merged(
-                                        doc,
-                                        &finding,
-                                        DiagnosticSeverity::ERROR,
-                                        finding.detail().clone(),
-                                    ));
-                                }
-                                if reported_block_syntax {
-                                    continue;
-                                }
-                            }
-
-                            let assignment_value =
-                                judged_expression.assignment_value(typecheck_value);
-                            let symbolic = attr_findings.symbolic_findings().to_vec();
-                            let has_exact_findings =
-                                symbolic.iter().any(|finding| !finding.covers_path());
-                            let mut handled_enum_diagnostic = false;
-                            if matches!(
-                                effective_type.shape(),
-                                carina_core::schema::Shape::Enum { .. }
-                            ) && let Some(diag) = build_enum_diagnostic(
-                                attr_findings.local_error(),
-                                attr_name,
-                                resource_quoted_string_attrs.contains(attr_name),
-                                doc,
-                                rref,
-                            ) {
-                                diagnostics.push(diag);
-                                handled_enum_diagnostic = true;
-                                reported_attribute_diagnostics.insert(canonical_name.to_string());
-                                // Continue past the generic match: this attribute
-                                // is already reported with the richer diagnostic.
-                                if !has_exact_findings {
-                                    continue;
-                                }
-                            }
-                            if !handled_enum_diagnostic
-                                && let Some(error) = attr_findings.local_error()
-                            {
-                                let tagged = error.clone().with_attribute(attr_name);
-                                if crate::code_action::enum_diagnostic_data_for_error(&tagged)
-                                    .is_some()
-                                {
-                                    let finding = carina_core::parser::Located::new(
-                                        rref.attribute_value_location(
-                                            attr_name,
-                                            &carina_core::schema::FieldPath::new(),
-                                        )
-                                        .clone(),
-                                        tagged,
-                                    );
-                                    if let Some(diagnostic) = render_schema_diagnostic(
-                                        doc,
-                                        &finding,
-                                        rref.replaceable_attribute_value(attr_name),
-                                    ) {
-                                        diagnostics.push(diagnostic);
-                                        reported_attribute_diagnostics
-                                            .insert(canonical_name.to_string());
-                                    }
-                                    handled_enum_diagnostic = true;
-                                    if !has_exact_findings {
-                                        continue;
-                                    }
-                                }
-                            }
-                            for finding in &symbolic {
-                                let covers_path = finding.covers_path();
-                                if handled_enum_diagnostic && covers_path {
-                                    continue;
-                                }
-                                let (path, error) = finding.diagnostic();
-                                use carina_core::resource::SecretDiagnosticError;
-                                use carina_core::validation::admission::AdmissionReferenceError;
-                                let (location, severity, message) = match error {
-                                    TypeError::Reference { error, .. } => match error.as_ref() {
-                                        SecretDiagnosticError::Public(
-                                            AdmissionReferenceError::Arithmetic(finding),
-                                        ) => (
-                                            finding.location(),
-                                            DiagnosticSeverity::ERROR,
-                                            finding.detail().to_string(),
-                                        ),
-                                        SecretDiagnosticError::Public(
-                                            AdmissionReferenceError::Computed(error),
-                                        ) => (
-                                            rref.attribute_key_location(attr_name),
-                                            match error {
-                                                DeferredAccessTypeError::InvalidAccess {
-                                                    ..
-                                                } => DiagnosticSeverity::ERROR,
-                                                DeferredAccessTypeError::TypeMismatch {
-                                                    ..
-                                                } => DiagnosticSeverity::WARNING,
-                                            },
-                                            finding.diagnostic_message(),
-                                        ),
-                                        // The reference existence pass owns these same findings.
-                                        SecretDiagnosticError::Public(
-                                            AdmissionReferenceError::UnknownBinding { .. }
-                                            | AdmissionReferenceError::Path(_)
-                                            | AdmissionReferenceError::ProtectedBinding
-                                            | AdmissionReferenceError::ProtectedAttribute,
-                                        ) => continue,
-                                        SecretDiagnosticError::Public(
-                                            AdmissionReferenceError::Authored(finding),
-                                        ) if finding.is_lookup_error() => continue,
-                                        SecretDiagnosticError::Public(
-                                            AdmissionReferenceError::ResourceHandle {
-                                                reference,
-                                                types,
-                                            },
-                                        ) => (
-                                            rref.attribute_key_location(attr_name),
-                                            DiagnosticSeverity::WARNING,
-                                            format!("Type mismatch: {types} (from {reference})"),
-                                        ),
-                                        SecretDiagnosticError::Public(
-                                            AdmissionReferenceError::Resolution(_)
-                                            | AdmissionReferenceError::Authored(_),
-                                        )
-                                        | SecretDiagnosticError::InsideSecret => (
-                                            rref.attribute_key_location(attr_name),
-                                            DiagnosticSeverity::ERROR,
-                                            error.to_string(),
-                                        ),
-                                    },
-                                    TypeError::TypeMismatch { types } => {
-                                        let message = validation::reference_mismatch_message(
-                                            assignment_value,
-                                            path,
-                                            attr_name,
-                                            types,
-                                        );
-                                        (
-                                            rref.attribute_key_location(attr_name),
-                                            DiagnosticSeverity::WARNING,
-                                            message,
-                                        )
-                                    }
-                                    _ => (
-                                        rref.attribute_key_location(attr_name),
-                                        DiagnosticSeverity::WARNING,
-                                        error.to_string(),
-                                    ),
-                                };
-                                let finding =
-                                    carina_core::parser::Located::new(location.clone(), message);
-                                if let Some(diagnostic) =
-                                    render_merged(doc, &finding, severity, finding.detail().clone())
-                                {
-                                    if !prior_diagnostics.iter().chain(diagnostics.iter()).any(
-                                        |existing| {
-                                            existing.range == diagnostic.range
-                                                && existing.message == diagnostic.message
-                                        },
-                                    ) {
-                                        diagnostics.push(diagnostic);
-                                    }
-                                    if covers_path {
-                                        reported_attribute_diagnostics
-                                            .insert(canonical_name.to_string());
-                                    }
-                                }
-                            }
-
-                            if handled_enum_diagnostic {
-                                continue;
-                            }
-
-                            let container_findings = attr_findings
-                                .local_findings()
-                                .iter()
-                                .any(|(path, _)| !path.is_empty())
-                                || matches!(
-                                    attr_findings.structure(),
-                                    carina_core::schema::ValueStructure::List
-                                        | carina_core::schema::ValueStructure::Map
-                                )
-                                || matches!(
-                                    attr_findings.local_error(),
-                                    Some(
-                                        TypeError::ListItemError { .. }
-                                            | TypeError::MapValueError { .. }
-                                            | TypeError::StructFieldError { .. }
-                                    )
-                                );
-                            if container_findings {
-                                let findings = attr_findings
-                                    .into_local_findings()
-                                    .into_iter()
-                                    .filter(|(path, error)| {
-                                        (!path.is_empty()
-                                            || !contains_function_call(authored_attr_value))
-                                            && !validation::covered_by_symbolic_findings(
-                                                path, error, &symbolic,
-                                            )
-                                    })
-                                    .collect();
-                                let (nested, reported_duplicate) =
-                                    self.render_container_findings(doc, rref, attr_name, findings);
-                                if reported_duplicate {
-                                    reported_attribute_diagnostics
-                                        .insert(canonical_name.to_string());
-                                }
-                                diagnostics.extend(nested);
-                            } else if !symbolic.iter().any(|finding| finding.covers_path()) {
-                                let error = attr_findings.local_error();
-                                let message = match error {
-                                    Some(TypeError::TypeMismatch { types }) => {
-                                        match (types.expected(), assignment_value) {
-                                            ("Bool", Value::Concrete(ConcreteValue::String(_))) => {
-                                                Some(format!(
-                                                    "Type mismatch: expected Bool, got {}. Use true or false.",
-                                                    carina_core::ValueDescription::of(attr_value)
-                                                ))
-                                            }
-                                            ("Int", Value::Concrete(ConcreteValue::String(_))) => {
-                                                Some(format!(
-                                                    "Type mismatch: expected Int, got {}.",
-                                                    carina_core::ValueDescription::of(attr_value)
-                                                ))
-                                            }
-                                            (
-                                                "Float",
-                                                Value::Concrete(ConcreteValue::String(_)),
-                                            ) => Some(format!(
-                                                "Type mismatch: expected Float, got {}.",
-                                                carina_core::ValueDescription::of(attr_value)
-                                            )),
-                                            _ => error
-                                                .filter(|_| {
-                                                    !contains_function_call(authored_attr_value)
-                                                })
-                                                .map(ToString::to_string),
-                                        }
-                                    }
-                                    Some(
-                                        TypeError::InvalidEnumVariant { .. }
-                                        | TypeError::BindingShadowsEnumMember(_)
-                                        | TypeError::UnionStructMismatch { .. }
-                                        | TypeError::UnionAlternativesMismatch { .. }
-                                        | TypeError::BlockSyntaxNotAllowed { .. },
-                                    ) => error
-                                        .filter(|_| !contains_function_call(authored_attr_value))
-                                        .map(|error| {
-                                            error.clone().with_attribute(attr_name).to_string()
-                                        }),
-                                    _ => None,
-                                };
-                                if let Some(message) = message {
-                                    let finding = carina_core::parser::Located::new(
-                                        rref.attribute_key_location(attr_name).clone(),
-                                        message,
-                                    );
-                                    if let Some(diagnostic) = render_merged(
-                                        doc,
-                                        &finding,
-                                        DiagnosticSeverity::WARNING,
-                                        finding.detail().clone(),
-                                    ) {
-                                        diagnostics.push(diagnostic);
-                                        reported_attribute_diagnostics
-                                            .insert(canonical_name.to_string());
-                                    }
-                                }
-                            }
-                        }
+                    let rejected = expanded_validation_tree
+                        .as_ref()
+                        .filter(|_| uses_composition_output)
+                        .is_some_and(|tree| {
+                            tree.rejected_resources().any(|candidate| {
+                                key.as_ref()
+                                    .zip(candidate.authored_instance_key())
+                                    .is_some_and(|(a, b)| a.same_source_instance(&b))
+                            })
+                        });
+                    if rejected {
+                        continue;
                     }
-
-                    // Render the report produced by the single owner-bound walk.
+                    if let (Some(owner), Some(inputs)) =
+                        (selected, expanded_validation_inputs.as_ref())
                     {
-                        for (error, symbolic_coverage) in resource_diagnostic_errors {
-                            if error
-                                .attribute_name()
-                                .is_some_and(|name| retained_failures.contains(name))
-                            {
-                                continue;
-                            }
-                            // Existence checks render lookup failures at their
-                            // reference tokens, even when admission emits none.
-                            if let TypeError::Reference { error, .. } = &error
-                                && let carina_core::resource::SecretDiagnosticError::Public(error) = error.as_ref()
-                                && match error {
-                                    carina_core::validation::admission::AdmissionReferenceError::UnknownBinding { .. }
-                                    | carina_core::validation::admission::AdmissionReferenceError::Path(_)
-                                    | carina_core::validation::admission::AdmissionReferenceError::ProtectedBinding
-                                    | carina_core::validation::admission::AdmissionReferenceError::ProtectedAttribute => true,
-                                    carina_core::validation::admission::AdmissionReferenceError::Authored(finding) => finding.is_lookup_error(),
-                                    _ => false,
-                                }
-                            {
-                                continue;
-                            }
-                            if let carina_core::schema::TypeError::MissingRequired { name } = &error
-                                && pending_resource_sinks.iter().any(
-                                    |(pending_resource, authored_name)| {
-                                        pending_resource == resource_id
-                                            && bn_map
-                                                .get(authored_name)
-                                                .map(String::as_str)
-                                                .unwrap_or(authored_name)
-                                                == name
-                                    },
-                                )
-                            {
-                                continue;
-                            }
-                            if !provider_validation_deduplicator.should_emit_type_error(&error) {
-                                continue;
-                            }
-                            // Skip errors that are already reported with precise positions
-                            // by the attribute-level checks above, including intrinsic secrets.
-                            if matches!(
-                                &error,
-                                carina_core::schema::TypeError::FieldGroupViolation { path, .. }
-                                    if !path.is_empty()
-                            ) {
-                                continue;
-                            }
-                            // Statically evaluated expressions may first become known
-                            // in this pass. Suppress list refinements only when
-                            // the attribute pass emitted them.
-                            if is_duplicate_list_error(&error)
-                                && error.attribute_name().is_some_and(|attribute| {
-                                    let canonical = bn_map
-                                        .get(attribute)
-                                        .map(String::as_str)
-                                        .unwrap_or(attribute);
-                                    reported_attribute_diagnostics.contains(canonical)
-                                })
-                            {
-                                continue;
-                            }
-                            if !is_duplicate_list_error(&error)
-                                && matches!(
-                                    &error,
-                                    TypeError::BlockSyntaxNotAllowed { .. }
-                                        | TypeError::TypeMismatch { .. }
-                                        | TypeError::BindingShadowsEnumMember(_)
-                                        | TypeError::InvalidEnumVariant { .. }
-                                        | TypeError::UnknownStructField { .. }
-                                        | TypeError::UnionStructMismatch { .. }
-                                        | TypeError::UnionAlternativesMismatch { .. }
-                                        | TypeError::StructFieldError { .. }
-                                        | TypeError::ListItemError { .. }
-                                        | TypeError::MapValueError { .. }
-                                )
-                            {
-                                continue;
-                            }
-                            // The binding-use authority checks the resolved value,
-                            // including its destination member constraints. Its
-                            // diagnostic owns this sink even when the schema pass
-                            // sees a concrete local error instead of a reference.
-                            if error.attribute_name().is_some_and(|name| {
-                                binding_error_sinks
-                                    .contains(&(resource_id.clone(), name.to_string()))
-                            }) {
-                                continue;
-                            }
-                            if symbolic_coverage.owns_finding()
-                                || error.attribute_name().is_some_and(|name| {
-                                    reported_attribute_diagnostics.contains(name)
-                                })
-                            {
-                                continue;
-                            }
-                            let location = error
-                                .attribute_name()
-                                .filter(|name| resource_attributes.contains_key(*name))
-                                .map_or(rref.type_location(), |name| {
-                                    let assignment = rref.attribute_assignment_location(name);
-                                    let span = assignment.span();
-                                    if matches!(
-                                        error,
-                                        carina_core::schema::TypeError::UnknownAttribute { .. }
-                                    ) && span.start_line() == span.end_line()
-                                    {
-                                        assignment
-                                    } else {
-                                        // Multiline containers retain the precise key instead
-                                        // of widening beyond main's single-line anchor.
-                                        rref.attribute_key_location(name)
-                                    }
-                                });
-                            let finding =
-                                carina_core::parser::Located::new(location.clone(), error);
-                            diagnostics.extend(render_merged(
+                        if let Some(outcome) = inputs.admit_owner(
+                            conversion_validation,
+                            owner,
+                            carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                                &binding_use_report,
+                            ),
+                            self.provider_context,
+                        ) {
+                            self.render_resource_admission(
                                 doc,
-                                &finding,
-                                DiagnosticSeverity::ERROR,
-                                finding.detail().to_string(),
-                            ));
+                                owner,
+                                inputs.configuration.report(),
+                                outcome,
+                                &binding_error_sinks,
+                                &pending_resource_sinks,
+                                &provider_validation_deduplicator,
+                                &prior_diagnostics,
+                                &mut diagnostics,
+                            );
+                        }
+                    } else {
+                        #[cfg(feature = "test-utils")]
+                        replay_coverage::reached(AdmissionPath::Relative);
+                        let values = rref.values();
+                        let inputs = select_admission_inputs(
+                            rref,
+                            &values,
+                            expression_report,
+                            carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                                &binding_use_report,
+                            ),
+                        );
+                        match carina_core::validation::admission::attributes::ResourceAdmissionRequest::new(rref, rref.quoted_string_attrs(), inputs, ValidationEvaluation::relative_static(), &binding_index, self.provider_context) {
+                            Ok(request) => {
+                                let outcome = conversion_validation.admit_resource(request);
+                                self.render_resource_admission(doc, rref, expression_report, outcome, &binding_error_sinks, &pending_resource_sinks, &provider_validation_deduplicator, &prior_diagnostics, &mut diagnostics);
+                            }
+                            Err(error) => diagnostics.extend(render_merged(doc, &carina_core::parser::Located::new(rref.type_location().clone(), ()), DiagnosticSeverity::ERROR, error.to_string())),
                         }
                     }
-
-                    // Lint: prefer block syntax for List<Struct> attributes
-                    diagnostics.extend(self.check_list_struct_syntax(
-                        doc,
-                        rref,
-                        validated_schema.schema(),
-                    ));
                 }
             }
 
-            if let (Some(tree), Some(inputs)) =
-                (&expanded_validation_tree, &expanded_validation_inputs)
-            {
-                conversion_validation.admit_remaining_resources(
-                    tree,
+            if let Some(inputs) = &expanded_validation_inputs {
+                let remaining = conversion_validation.admit_remaining_resources(
                     inputs.configuration,
                     &inputs.binding_index,
                     self.provider_context,
@@ -2629,10 +2506,17 @@ impl DiagnosticRun<'_> {
                         &binding_use_report,
                     ),
                 );
+                if let Err(error) = remaining {
+                    diagnostics.push(Diagnostic {
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: error.to_string(),
+                        source: Some("carina".into()),
+                        ..Default::default()
+                    });
+                }
             }
-            if let Some(authored_tree) = &authored_tree {
-                conversion_validation.admit_remaining_resources(
-                    authored_tree,
+            if authored_tree.is_some() {
+                let remaining = conversion_validation.admit_remaining_resources(
                     pre_expansion_configuration.judged(),
                     &binding_index,
                     self.provider_context,
@@ -2640,6 +2524,14 @@ impl DiagnosticRun<'_> {
                         &binding_use_report,
                     ),
                 );
+                if let Err(error) = remaining {
+                    diagnostics.push(Diagnostic {
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message: error.to_string(),
+                        source: Some("carina".into()),
+                        ..Default::default()
+                    });
+                }
             }
             // Check the current buffer's attributes against directory-wide
             // binding authority while keeping diagnostics owned by this file.
@@ -3035,13 +2927,22 @@ impl DiagnosticEngine {
 ///
 /// See #2309. The structured payload is consumed by
 /// [`crate::code_action::code_actions_for_diagnostic`].
-fn build_enum_diagnostic(
+fn build_enum_diagnostic<D, B: BindingAddress>(
     error: Option<&TypeError>,
     attr_name: &str,
     is_quoted_literal: bool,
     doc: &Document,
-    resource: &carina_core::parser::AnalysisResourceRef<'_>,
-) -> Option<Diagnostic> {
+    resource: &carina_core::parser::AnalysisResourceRef<
+        '_,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        D,
+        B,
+    >,
+) -> Option<Diagnostic>
+where
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     let tagged = error?.clone().with_attribute(attr_name);
     // Reshape into the shape-mismatch diagnostic when the value came
     // from a quoted string literal — mirrors CLI behavior (#2094).
@@ -3067,6 +2968,7 @@ fn build_enum_diagnostic(
 
 fn is_duplicate_list_error(error: &TypeError) -> bool {
     match error {
+        TypeError::AttributePrefix(_error) => false,
         TypeError::DuplicateListElement {
             value: _,
             index: _,
@@ -3176,5 +3078,38 @@ fn render_schema_diagnostic(
 fn decorate_schema_diagnostic(diagnostic: &mut Diagnostic, error: &carina_core::schema::TypeError) {
     if let Some(data) = crate::code_action::enum_diagnostic_data_for_error(error) {
         diagnostic.data = Some(serde_json::to_value(data).expect("EnumDiagnosticData serialize"));
+    }
+}
+
+fn publish_prefix_errors<X, D, B: BindingAddress>(
+    doc: &Document,
+    configuration: &PrefixCanonicalized<carina_core::parser::retained::JudgedFile<'_, X, D, B>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) where
+    X: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    for (resource, error) in configuration.prefix_failures() {
+        let location = error
+            .location()
+            .filter(|location| location.file().path() == doc.source_file())
+            .or_else(|| {
+                resource
+                    .module_source
+                    .as_ref()
+                    .and_then(carina_core::resource::ModuleSource::module_call)
+                    .map(|origin| origin.module_call_path().root().id.declaration_location())
+            });
+        if let Some(location) = location
+            && let Some(diagnostic) = render_merged(
+                doc,
+                &carina_core::parser::Located::new(location.clone(), ()),
+                DiagnosticSeverity::ERROR,
+                error.to_string(),
+            )
+            && !diagnostics.contains(&diagnostic)
+        {
+            diagnostics.push(diagnostic);
+        }
     }
 }

@@ -1389,6 +1389,19 @@ pub struct AuthoredResourceInstanceKey<'a, B: BindingAddress = RelativeBindingNa
     module_scope: Option<&'a str>,
 }
 
+impl<B: BindingAddress> AuthoredResourceInstanceKey<'_, B> {
+    /// Match the same source instance across relative/absolute binding phases.
+    /// This is an address comparison, not admission authority.
+    pub fn same_source_instance<C: BindingAddress>(
+        &self,
+        other: &AuthoredResourceInstanceKey<'_, C>,
+    ) -> bool {
+        self.declaration == other.declaration
+            && self.element == other.element
+            && self.module_scope == other.module_scope
+    }
+}
+
 impl<'a, P, T, D, B> AnalysisResourceRef<'a, P, T, D, B>
 where
     P: ValueKind,
@@ -1671,6 +1684,10 @@ where
     B: BindingAddress,
     D: DeferredForPhaseTraversal<P, P, B>,
 {
+    pub(crate) fn is_project_resource(&self) -> bool {
+        self.in_project_walk
+    }
+
     pub fn attributes(&self) -> std::borrow::Cow<'a, indexmap::IndexMap<String, Value<P, B>>> {
         self.resource.attributes()
     }
@@ -2859,12 +2876,8 @@ where
         &self.iterables
     }
 
-    pub(crate) fn admission_report(&self) -> &super::retained::ExpressionReport<B> {
-        self.file
-            .parser_binding_metadata
-            .syntax()
-            .expressions()
-            .admission_report()
+    pub(crate) fn into_resources(self) -> Vec<AnalysisResourceRef<'a, P, T, D, B>> {
+        self.resources
     }
 
     pub fn resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {

@@ -198,29 +198,12 @@ fn canonical_unresolved_for_test(
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam> {
-    resolve_config_block_names_for_test(
-        resolve_module_file_for_test(parsed.clone()),
-        unresolved.clone(),
-        ctx.schemas(),
-    )
-    .unwrap_or_else(|errors| {
-        panic!(
-            "test block-name resolution failed: {}",
-            errors
-                .into_iter()
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
+    ParserCanonicalResourcePair::from_block_pair(
+        resolve_config_block_names_for_test(
+            resolve_module_file_for_test(parsed.clone()),
+            unresolved.clone(),
+            ctx.schemas(),
         )
-    })
-}
-
-fn canonical_resolved_unresolved_for_test(
-    ctx: &WiringContext,
-    parsed: &carina_core::parser::ModuleResolvedInferredFile,
-    unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam> {
-    resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
         .unwrap_or_else(|errors| {
             panic!(
                 "test block-name resolution failed: {}",
@@ -230,7 +213,30 @@ fn canonical_resolved_unresolved_for_test(
                     .collect::<Vec<_>>()
                     .join("\n")
             )
-        })
+        }),
+        ctx.schemas(),
+    )
+}
+
+fn canonical_resolved_unresolved_for_test(
+    ctx: &WiringContext,
+    parsed: &carina_core::parser::ModuleResolvedInferredFile,
+    unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
+) -> ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam> {
+    ParserCanonicalResourcePair::from_block_pair(
+        resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
+            .unwrap_or_else(|errors| {
+                panic!(
+                    "test block-name resolution failed: {}",
+                    errors
+                        .into_iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            }),
+        ctx.schemas(),
+    )
 }
 
 fn canonical_resources_for_test(
@@ -4338,7 +4344,7 @@ fn load_and_resolve_module_data_source_fixture(
             )
         });
 
-    (parsed, unresolved_parsed)
+    ((*parsed).clone(), unresolved_parsed)
 }
 
 #[tokio::test]

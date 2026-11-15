@@ -83,13 +83,115 @@ pub struct CanonicalResourcePair<
     prefix_fallbacks: Vec<HashMap<String, Value<P>>>,
 }
 
-pub(crate) type ParserCanonicalResourcePair<E> =
-    CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder>;
+#[derive(Debug, Clone)]
+pub(crate) struct ParserCanonicalResourcePair<E> {
+    parsed:
+        carina_core::identifier::PrefixCanonicalized<carina_core::parser::ModuleResolvedFile<E>>,
+    unresolved: Vec<Resource<ModuleSource, ParserPlaceholder>>,
+}
 
-type CanonicalResourceParts<E, P, T> = (
-    File<E, P, T, ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>, AbsoluteBindingAddress>,
-    Vec<Resource<ModuleSource, P>>,
-);
+impl<E> ParserCanonicalResourcePair<E> {
+    pub(super) fn resolve_block_names(
+        access: &super::ValidationPipelineAccess,
+        parsed: carina_core::parser::ModuleResolvedFile<E>,
+        unresolved: UnresolvedConfigSnapshot,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, Vec<BlockNameConflict>> {
+        let pair =
+            CanonicalResourcePair::<E, ParserPlaceholder, ParserPlaceholder>::resolve_block_names(
+                access, parsed, unresolved, schemas,
+            )?;
+        Ok(Self::from_block_pair(pair, schemas))
+    }
+
+    pub(crate) fn from_block_pair(
+        pair: CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder>,
+        schemas: &SchemaRegistry,
+    ) -> Self {
+        let (parsed, unresolved) = pair.into_parts();
+        Self {
+            parsed: carina_core::identifier::canonicalize_file_prefixes(
+                parsed,
+                schemas,
+                carina_core::identifier::SuffixSource::Random,
+            ),
+            unresolved,
+        }
+    }
+    pub(crate) fn resolve_attr_prefixes_report(
+        self,
+        _schemas: &SchemaRegistry,
+    ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixError>> {
+        if self.parsed.prefix_errors().is_empty() {
+            Ok(self)
+        } else {
+            Err(self.parsed.prefix_errors().to_vec())
+        }
+    }
+    pub fn parsed(&self) -> &carina_core::parser::ModuleResolvedFile<E> {
+        &self.parsed
+    }
+    pub fn canonicalized(
+        &self,
+    ) -> &carina_core::identifier::PrefixCanonicalized<carina_core::parser::ModuleResolvedFile<E>>
+    {
+        &self.parsed
+    }
+    #[cfg(test)]
+    pub fn unresolved(&self) -> &[Resource<ModuleSource, ParserPlaceholder>] {
+        &self.unresolved
+    }
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        carina_core::identifier::PrefixCanonicalized<carina_core::parser::ModuleResolvedFile<E>>,
+        Vec<Resource<ModuleSource, ParserPlaceholder>>,
+    ) {
+        (self.parsed, self.unresolved)
+    }
+    pub fn canonicalize_and_compute_anonymous_identifiers(
+        &mut self,
+        registry: &SchemaRegistry,
+        providers: &[carina_core::parser::ProviderConfig<
+            ParserPlaceholder,
+            AbsoluteBindingAddress,
+        >],
+        factories: &[Box<dyn carina_core::provider::ProviderFactory>],
+        conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
+    ) -> Result<(), CanonicalResourceIdentityError> {
+        let resources = self.parsed.canonicalize_values()?;
+        carina_core::identifier::compute_anonymous_identifiers_with_factories(
+            resources,
+            providers,
+            factories,
+            registry,
+            conflict_policy,
+        )
+        .map_err(|error| match error {
+            carina_core::identifier::AnonymousIdentityComputationError::ProviderConfig(error) => {
+                CanonicalResourceIdentityError::ProviderConfig(error)
+            }
+            carina_core::identifier::AnonymousIdentityComputationError::Identity(error) => {
+                CanonicalResourceIdentityError::Identity(error)
+            }
+        })
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        parsed: carina_core::parser::ModuleResolvedFile<E>,
+        unresolved: Vec<Resource<ModuleSource, ParserPlaceholder>>,
+        schemas: &SchemaRegistry,
+    ) -> Self {
+        Self {
+            parsed: carina_core::identifier::canonicalize_file_prefixes(
+                parsed,
+                schemas,
+                carina_core::identifier::SuffixSource::Random,
+            ),
+            unresolved,
+        }
+    }
+}
 
 #[cfg(test)]
 impl<E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
@@ -98,32 +200,23 @@ impl<E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
     pub(crate) fn into_expanded_for_test(
         self,
     ) -> Result<CanonicalResourcePair<E::Expanded>, carina_core::resource::ExpansionError> {
-        let Self {
-            parsed,
-            unresolved,
-            prefix_fallbacks,
-        } = self;
-        let unresolved = unresolved
+        let schemas = self.parsed.schemas().clone();
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let unresolved = self
+            .unresolved
             .into_iter()
-            .map(|resource| resource.into_expanded(&carina_core::schema::SchemaRegistry::new()))
+            .map(|resource| resource.into_expanded(&schemas))
             .collect::<Result<_, _>>()?;
-        let prefix_fallbacks = prefix_fallbacks
-            .into_iter()
-            .map(|attributes| carina_core::resource::into_expanded_value_map(attributes, None))
-            .collect::<Result<_, _>>()
-            .map_err(carina_core::resource::LeftoverPlaceholders::from)?;
-        Ok(CanonicalResourcePair {
-            parsed: parsed.into_expanded(
-                &carina_core::schema::SchemaRegistry::new(),
-                &carina_core::parser::ProviderContext::new(
-                    carina_core::EnvironmentSnapshot::empty(),
-                ),
-            )?,
-            unresolved,
-            prefix_fallbacks,
-        })
+        let parsed = self.parsed.into_expanded(&schemas, &context)?;
+        Ok(CanonicalResourcePair::new(parsed, unresolved))
     }
 }
+
+type CanonicalResourceParts<E, P, T> = (
+    File<E, P, T, ResolvedDeferredForPhase<P, T, AbsoluteBindingAddress>, AbsoluteBindingAddress>,
+    Vec<Resource<ModuleSource, P>>,
+);
 
 /// Failure while canonicalizing resource values and assigning anonymous
 /// identities inside a [`CanonicalResourcePair`].

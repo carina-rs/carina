@@ -26,6 +26,15 @@ pub enum DestinationError {
     },
 }
 
+pub(crate) fn declaration_identity(
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
+) -> DeclarationIdentity {
+    DeclarationIdentity {
+        owner: DeclarationOwner::Provider(schema.schema_type_owner().clone()),
+        schema: schema.schema().admission_identity,
+    }
+}
+
 fn identity(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     id: &ResourceId,
@@ -427,7 +436,33 @@ pub(crate) fn admit_validation_attributes<
     } = authority;
     let slots = match source {
         SchemaInputSource::Programmatic => {
-            return admit_value_only_attributes::<K, P, B>(schema, id, attributes, quoted, session);
+            let values = attributes
+                .iter()
+                .map(|(name, proof)| {
+                    (
+                        name.clone(),
+                        crate::resource::knowledge::ClassifiedRef::from(proof)
+                            .diagnostic_value()
+                            .clone(),
+                    )
+                })
+                .collect();
+            return match crate::identifier::canonicalize_prefix_values(
+                schema,
+                id,
+                values,
+                crate::identifier::SuffixSource::Preview,
+            ) {
+                Ok(values) => {
+                    admit_value_only_attributes::<K, P, B>(schema, id, &values, quoted, session)
+                }
+                Err(errors) => crate::schema::ResourceValueValidation::from_errors(
+                    errors
+                        .into_iter()
+                        .map(|error| TypeError::AttributePrefix(Box::new(error)))
+                        .collect(),
+                ),
+            };
         }
         SchemaInputSource::Authored(slots) => slots,
     };
@@ -491,12 +526,18 @@ pub(crate) fn admit_value_only_attributes<
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     id: &ResourceId,
-    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
+    values: &crate::identifier::CanonicalAttributeValues<P, B>,
     quoted: &std::collections::HashSet<String>,
     session: &dyn ProviderTypeCheckContext,
 ) -> crate::schema::ResourceValueValidation {
-    schema.schema().as_schema().validate_admission_report(
-        attributes,
+    let mut classification_errors = Vec::new();
+    let attributes = crate::resource::knowledge::collect_classified_attributes(
+        values.iter().map(|(name, value)| (name.clone(), value)),
+        &crate::resource::knowledge::KnowledgeContext::validation(),
+        |name, error| classification_errors.push((name.to_owned(), TypeError::from(error))),
+    );
+    let mut report = schema.schema().as_schema().validate_admission_report(
+        &attributes,
         attributes.iter(),
         &|name| quoted.contains(name),
         &crate::schema::value_validation::AttributeAdmission {
@@ -516,7 +557,11 @@ pub(crate) fn admit_value_only_attributes<
             },
             unknown: None,
         },
-    )
+    );
+    for (name, error) in classification_errors {
+        report.push_attribute_error(&name, error);
+    }
+    report
 }
 
 type ValidationCandidateFactory<'a, P, B> =
@@ -689,16 +734,87 @@ pub struct ResourceAdmissionRequest<'a, 'file, E, D, B: BindingAddress>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    pub resource:
+    resource:
         &'a crate::parser::AnalysisResourceRef<'file, ParserPlaceholder, ParserPlaceholder, D, B>,
-    pub parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
-    pub schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    pub quoted: &'a std::collections::HashSet<String>,
-    pub inputs: ResourceAttributeInputs<B>,
-    pub evaluation: ValidationEvaluation<B>,
-    pub bindings: &'a BindingIndex<'a, B>,
-    pub session: &'a dyn ProviderTypeCheckContext,
-    pub schemas: &'a SchemaRegistry,
+    parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    schema: crate::schema::OwnerBoundResourceSchema<'a>,
+    quoted: &'a std::collections::HashSet<String>,
+    inputs: ResourceAttributeInputs<B>,
+    evaluation: ValidationEvaluation<B>,
+    bindings: &'a BindingIndex<'a, B>,
+    session: &'a dyn ProviderTypeCheckContext,
+    schemas: &'a SchemaRegistry,
+}
+
+impl<'a, 'file, E, D, B: BindingAddress> ResourceAdmissionRequest<'a, 'file, E, D, B>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    pub(crate) fn resource(
+        &self,
+    ) -> &'a crate::parser::AnalysisResourceRef<'file, ParserPlaceholder, ParserPlaceholder, D, B>
+    {
+        self.resource
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test(
+        resource: &'a crate::parser::AnalysisResourceRef<
+            'file,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+        schema: crate::schema::OwnerBoundResourceSchema<'a>,
+        quoted: &'a std::collections::HashSet<String>,
+        inputs: ResourceAttributeInputs<B>,
+        evaluation: ValidationEvaluation<B>,
+        bindings: &'a BindingIndex<'a, B>,
+        session: &'a dyn ProviderTypeCheckContext,
+        schemas: &'a SchemaRegistry,
+    ) -> Self {
+        Self {
+            resource,
+            parsed,
+            schema,
+            quoted,
+            inputs,
+            evaluation,
+            bindings,
+            session,
+            schemas,
+        }
+    }
+
+    pub fn new(
+        owner: &'a crate::identifier::CanonicalResource<'file, E, D, B>,
+        quoted: &'a std::collections::HashSet<String>,
+        inputs: ResourceAttributeInputs<B>,
+        evaluation: ValidationEvaluation<B>,
+        bindings: &'a BindingIndex<'a, B>,
+        session: &'a dyn ProviderTypeCheckContext,
+    ) -> Result<Self, crate::parser::retained::MissingEvidence> {
+        let schema = owner.resource_schema();
+        if inputs.declaration.as_ref() != Some(&declaration_identity(schema)) {
+            return Err(crate::parser::retained::MissingEvidence::new(
+                "canonical resource schema/value pairing",
+            ));
+        }
+        Ok(Self {
+            resource: owner,
+            parsed: owner.file(),
+            schema,
+            quoted,
+            inputs,
+            evaluation,
+            bindings,
+            session,
+            schemas: owner.schemas(),
+        })
+    }
 }
 
 type ResourceAdmissionCandidate<'a, B> = (
@@ -802,10 +918,21 @@ where
     }
 }
 
+pub(crate) fn resource_attribute_admissions<E, D, B: BindingAddress>(
+    request: ResourceAdmissionRequest<'_, '_, E, D, B>,
+    coverage: &mut WalkCoverage,
+) -> ResourceAdmissionOutcome<B>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    resource_admissions_for_pass::<LiveResource, _, _, _>(request, coverage)
+}
+
 /// Admit every analysis item using the same destination-kind policy.
 /// Classifications are built from the consumed inputs.
 #[allow(clippy::too_many_arguments)]
-pub fn resource_attribute_admissions<
+#[cfg(test)]
+pub(crate) fn resource_attribute_admissions_for_test<
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
@@ -1235,112 +1362,86 @@ fn typed_resource_attribute_admissions<
 /// diagnostics are outside the current LSP document. Each resource is visited
 /// once; ordinary/provider callbacks retain the main-branch document scope.
 pub(crate) fn unrendered_resource_conversion_admissions<E, D, B: BindingAddress>(
-    resource: &crate::parser::AnalysisResourceRef<
-        '_,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    resource: &crate::identifier::CanonicalResource<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
     prechecks: SlotPrechecks<'_>,
     coverage: &mut WalkCoverage,
-) where
-    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
-    D: crate::parser::DeferredForPhaseTraversal<
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            B,
-        >,
+) -> Result<(), crate::parser::retained::MissingEvidence>
+where
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    unrendered_resource_admissions::<LiveResource, E, D, B>(
-        resource, judged, bindings, session, prechecks, coverage,
-    );
+    unrendered_resource_admissions::<LiveResource, _, _, _>(
+        resource, bindings, session, prechecks, coverage,
+    )
 }
-
 fn unrendered_resource_admissions<Pass: ResourceAdmissionPass, E, D, B: BindingAddress>(
-    resource: &crate::parser::AnalysisResourceRef<
-        '_,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    resource: &crate::identifier::CanonicalResource<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
     prechecks: SlotPrechecks<'_>,
     coverage: &mut WalkCoverage,
-) where
-    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
-    D: crate::parser::DeferredForPhaseTraversal<
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            B,
-        >,
+) -> Result<(), crate::parser::retained::MissingEvidence>
+where
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    let Some(schema) = resource.schema(judged.schemas()) else {
-        return;
-    };
-    let values = resource.attributes().into_owned();
-    let mut inputs = ResourceAttributeInputs::for_resource(resource, judged.report())
-        .unwrap_or_else(|_| {
-            ResourceAttributeInputs::from_report(resource, &values, judged.report())
+    let values = resource.values();
+    let mut inputs = ResourceAttributeInputs::for_resource(resource, resource.report())
+        .unwrap_or_else(|_missing| {
+            ResourceAttributeInputs::from_report(resource, &values, resource.report())
         })
         .with_prechecks(prechecks);
     inputs.scope = crate::schema::value_validation::AssignmentScope::ClaimedValues;
-    resource_admissions_for_pass::<Pass, E, D, B>(
-        ResourceAdmissionRequest {
-            resource,
-            parsed: judged.file(),
-            schema,
-            quoted: resource.quoted_string_attrs(),
-            inputs,
-            evaluation: ValidationEvaluation::None,
-            bindings,
-            session,
-            schemas: judged.schemas(),
-        },
-        coverage,
-    );
+    let request = ResourceAdmissionRequest::new(
+        resource,
+        resource.quoted_string_attrs(),
+        inputs,
+        ValidationEvaluation::None,
+        bindings,
+        session,
+    )?;
+    resource_admissions_for_pass::<Pass, _, _, _>(request, coverage);
+    Ok(())
 }
 
 #[cfg(doctest)]
 /// The paired examples differ only in the argument supplied as the product.
 ///
 /// ```
-/// use carina_core::{binding_index::BindingIndex, parser::{AnalysisResourceRef, ParsedFile},
+/// use carina_core::{binding_index::BindingIndex,
+///     identifier::CanonicalResource, parser::{ParsedExportParam, ParsedDeferredForPhase},
 ///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
-///     schema::{OwnerBoundResourceSchema, SchemaRegistry}, validation::admission::{WalkCoverage,
-///         attributes::{ResourceAttributeInputs, ValidationEvaluation, resource_attribute_admissions}},
+///     validation::admission::attributes::{ResourceAdmissionRequest, ResourceAttributeInputs, ValidationEvaluation},
 ///     validation::deferred_types::ProviderTypeCheckContext};
-/// fn caller(resource: &AnalysisResourceRef<'_>, parsed: &ParsedFile,
-///     schema: OwnerBoundResourceSchema<'_>, classifications: &indexmap::IndexMap<String,
-///         Classification<'_, ParserPlaceholder, RelativeBindingName>>,
-///     quoted: &std::collections::HashSet<String>, inputs: ResourceAttributeInputs<RelativeBindingName>,
-///     evaluation: ValidationEvaluation<RelativeBindingName>, bindings: &BindingIndex<'_, RelativeBindingName>,
-///     session: &dyn ProviderTypeCheckContext, schemas: &SchemaRegistry, coverage: &mut WalkCoverage) {
-///     let _ = resource_attribute_admissions(resource, parsed, schema, quoted,
-///         inputs, evaluation, bindings, session, schemas, coverage);
+/// type Owner<'f> = CanonicalResource<'f, ParsedExportParam,
+///     ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>, RelativeBindingName>;
+/// fn caller<'a, 'file: 'a>(resource: &'a Owner<'file>,
+///     classifications: &indexmap::IndexMap<String, Classification<'a, ParserPlaceholder, RelativeBindingName>>,
+///     quoted: &'a std::collections::HashSet<String>, inputs: ResourceAttributeInputs<RelativeBindingName>,
+///     evaluation: ValidationEvaluation<RelativeBindingName>, bindings: &'a BindingIndex<'a, RelativeBindingName>,
+///     session: &'a dyn ProviderTypeCheckContext) {
+///     let _ = ResourceAdmissionRequest::new(resource, quoted,
+///         inputs, evaluation, bindings, session);
 /// }
 /// ```
 ///
 /// ```compile_fail,E0308
-/// use carina_core::{binding_index::BindingIndex, parser::{AnalysisResourceRef, ParsedFile},
+/// use carina_core::{binding_index::BindingIndex,
+///     identifier::CanonicalResource, parser::{ParsedExportParam, ParsedDeferredForPhase},
 ///     resource::{ParserPlaceholder, RelativeBindingName}, resource::knowledge::Classification,
-///     schema::{OwnerBoundResourceSchema, SchemaRegistry}, validation::admission::{WalkCoverage,
-///         attributes::{ResourceAttributeInputs, ValidationEvaluation, resource_attribute_admissions}},
+///     validation::admission::attributes::{ResourceAdmissionRequest, ResourceAttributeInputs, ValidationEvaluation},
 ///     validation::deferred_types::ProviderTypeCheckContext};
-/// fn caller(resource: &AnalysisResourceRef<'_>, parsed: &ParsedFile,
-///     schema: OwnerBoundResourceSchema<'_>, classifications: &indexmap::IndexMap<String,
-///         Classification<'_, ParserPlaceholder, RelativeBindingName>>,
-///     quoted: &std::collections::HashSet<String>, inputs: ResourceAttributeInputs<RelativeBindingName>,
-///     evaluation: ValidationEvaluation<RelativeBindingName>, bindings: &BindingIndex<'_, RelativeBindingName>,
-///     session: &dyn ProviderTypeCheckContext, schemas: &SchemaRegistry, coverage: &mut WalkCoverage) {
-///     let _ = resource_attribute_admissions(resource, parsed, schema, quoted,
-///         classifications, evaluation, bindings, session, schemas, coverage);
+/// type Owner<'f> = CanonicalResource<'f, ParsedExportParam,
+///     ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>, RelativeBindingName>;
+/// fn caller<'a, 'file: 'a>(resource: &'a Owner<'file>,
+///     classifications: &indexmap::IndexMap<String, Classification<'a, ParserPlaceholder, RelativeBindingName>>,
+///     quoted: &'a std::collections::HashSet<String>, inputs: ResourceAttributeInputs<RelativeBindingName>,
+///     evaluation: ValidationEvaluation<RelativeBindingName>, bindings: &'a BindingIndex<'a, RelativeBindingName>,
+///     session: &'a dyn ProviderTypeCheckContext) {
+///     let _ = ResourceAdmissionRequest::new(resource, quoted,
+///         classifications, evaluation, bindings, session);
 /// }
 /// ```
 ///

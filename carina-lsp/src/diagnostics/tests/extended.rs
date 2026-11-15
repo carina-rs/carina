@@ -3688,17 +3688,7 @@ fn suspension_deduplication_does_not_turn_validation_errors_into_success() {
             schema,
             &attributes
                 .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap(),
-                    )
-                })
+                .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
             &|_| false,
             &engine.provider_context.custom_types,
@@ -4020,17 +4010,7 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
             .expect("test schema must be owner-bound"),
         &attributes
             .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    value
-                        .knowledge(
-                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                        )
-                        .map(|proof| proof.into_classification())
-                        .unwrap(),
-                )
-            })
+            .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         &|name| name == "hosted_zone_id",
         &core_resolver,

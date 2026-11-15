@@ -448,6 +448,18 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
         }
     }
 
+    pub(crate) fn contains_function_call(&self) -> bool {
+        fn contains<B: BindingAddress>(node: &AuthoredExpr<ParserPlaceholder, B>) -> bool {
+            match &node.kind {
+                ExprKind::Call(_) => true,
+                // A function/resource definition is not an evaluated call.
+                ExprKind::Function { .. } | ExprKind::Resource { .. } => false,
+                _ => node.children.iter().any(|child| contains(&child.authored)),
+            }
+        }
+        contains(self.node.node)
+    }
+
     pub(crate) fn child_count(&self) -> usize {
         self.node.node.children.len()
     }

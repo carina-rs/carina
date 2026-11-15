@@ -5892,7 +5892,9 @@ pub fn resource_reference_findings<
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<PresentedFindings, crate::parser::AnalysisTreeError> {
@@ -5915,7 +5917,9 @@ pub fn resource_reference_findings_in<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     run: &mut ConversionValidation<F>,
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     subject: FindingSubject,
@@ -5970,7 +5974,9 @@ pub fn resource_admission_findings<
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
@@ -5995,7 +6001,9 @@ pub fn resource_admission_findings_in<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     run: &mut ConversionValidation<F>,
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
@@ -6019,7 +6027,9 @@ fn complete_resource_admission_report<
     F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
@@ -6144,7 +6154,9 @@ fn resource_admission_report<
     F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     conversion_validation: &mut ConversionValidation<F>,
@@ -6156,7 +6168,6 @@ fn resource_admission_report<
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
     let inference_bindings = inference::bindings_from_parsed(parsed);
-    let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
 
     // Validate declarations directly instead of relying on a later resource
     // attribute to happen to expose an expression. Keep the authored
@@ -6172,17 +6183,16 @@ fn resource_admission_report<
     publish_admission_diagnostics(
         crate::validation::deferred_types::TypeCheckSession::run(
             bindings.provider_context(),
-            |session| {
+            |session| -> Result<(), crate::parser::AnalysisTreeError> {
                 // Match the main-branch project walk. Parser-side deferred read
                 // templates are checked at expansion, not admitted here.
                 for step in conversion_validation.resource_steps(
-                    tree.project_resources(),
                     judged,
                     bindings,
                     session,
                     subject.clone(),
                     boundary.clone(),
-                ) {
+                )? {
                     let (resource, result) = step.into_parts();
                     let values = match result {
                         Ok(Some(values)) => values,
@@ -6271,10 +6281,11 @@ fn resource_admission_report<
                     }
                     attributes.insert(resource.id().clone(), values);
                 }
+                Ok(())
             },
         ),
         diagnostics,
-    );
+    )?;
 
     if parsed.deferred_for_sites().next().is_some() {
         all_errors.extend(validate_deferred_for_iterable_types_with_bindings(

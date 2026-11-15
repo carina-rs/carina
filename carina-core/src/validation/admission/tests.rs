@@ -247,10 +247,10 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                 .find(|resource| resource.id().resource_type == "Sink")
                 .unwrap();
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-            let inputs = attributes::ResourceAttributeInputs::new(resource);
+            let inputs = attributes::ResourceAttributeInputs::new_for_test(resource);
             with_session_for_test(&catalog, |session| {
                 let (findings, work) = count_admission_work(|| {
-                    let outcome = attributes::resource_attribute_admissions(
+                    let outcome = attributes::resource_attribute_admissions_for_test(
                         resource,
                         judged.file(),
                         resource.schema(&schemas).unwrap(),

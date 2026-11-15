@@ -6608,7 +6608,7 @@ mod tests {
             registry
                 .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
                 .expect("decoded fixture must be owner-bound"),
-            &indexmap::IndexMap::<String, carina_core::resource::knowledge::Classification<'_>>::new(),
+            &indexmap::IndexMap::<String, carina_core::resource::Value>::new(),
             &|_| false,
             &resolver,
         )
@@ -7581,15 +7581,7 @@ mod tests {
                 bound_schema,
                 &attrs
                     .iter()
-                    .map(|(name, value)| (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation()
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap()
-                    ))
+                    .map(|(name, value)| (name.clone(), value.clone()))
                     .collect(),
                 &|_| false,
                 &resolver
@@ -7615,15 +7607,7 @@ mod tests {
                 bound_schema,
                 &attrs
                     .iter()
-                    .map(|(name, value)| (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation()
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap()
-                    ))
+                    .map(|(name, value)| (name.clone(), value.clone()))
                     .collect(),
                 &|_| false,
                 &resolver

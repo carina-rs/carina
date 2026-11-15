@@ -144,7 +144,7 @@ fn conversion_lsp_parse_rejection_keeps_the_convert_range_and_cause() {
     let catalog =
         carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let configuration =
-        carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        carina_core::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let presented = carina_core::validation::ConversionValidation::<std::convert::Infallible>::new(
         configuration.judged().report(),
     )
@@ -272,29 +272,20 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                 std::fs::write(directory.path().join("main.crn"), "let main = 'ok'").unwrap();
             }
             let parsed = carina_core::parser::parse_file(&source, &path, &catalog).unwrap();
-            let configuration =
-                carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            let configuration = carina_core::test_utils::load_canonical_buffer_configuration(
+                &parsed, &schemas, &catalog,
+            );
             let judged = configuration.judged();
-            let tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+            let tree = judged.analysis_tree().unwrap();
             let resource = tree.resources().next().unwrap();
-            let values = resource.attributes().into_owned();
+            let values = resource.values();
             let inputs = ResourceAttributeInputs::from_report(resource, &values, judged.report());
 
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
             let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
             carina_core::validation::deferred_types::with_session_for_test(&catalog, |session| {
-                let findings = validation.admit_resource(ResourceAdmissionRequest {
-                    resource,
-                    parsed: judged.file(),
-                    schema: resource.schema(&schemas).unwrap(),
-
-                    quoted: resource.quoted_string_attrs(),
-                    inputs,
-                    evaluation: carina_core::validation::admission::attributes::ValidationEvaluation::None,
-                    bindings: &bindings,
-                    session,
-                    schemas: &schemas,
-                }).values;
+                let findings = validation.admit_resource(ResourceAdmissionRequest::new(resource, resource.quoted_string_attrs(), inputs,
+                    carina_core::validation::admission::attributes::ValidationEvaluation::None, &bindings, session).unwrap()).values;
                 ordinary.push(
                     findings
                         .errors()
@@ -308,24 +299,23 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                     let empty =
                         carina_core::parser::parse_file("let other = 'ok'", &path, &catalog)
                             .unwrap();
-                    let empty_configuration = carina_core::config_loader::load_buffer_configuration(
-                        &empty, &schemas, &catalog,
-                    );
+                    let empty_configuration =
+                        carina_core::test_utils::load_canonical_buffer_configuration(
+                            &empty, &schemas, &catalog,
+                        );
                     validation.admit_remaining_resources(
-                        &tree,
                         empty_configuration.judged(),
                         &bindings,
                         session,
                         carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
-                    );
+                    ).unwrap();
                 } else {
                     validation.admit_remaining_resources(
-                        &tree,
                         judged,
                         &bindings,
                         session,
                         carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
-                    );
+                    ).unwrap();
                 }
             });
             let presented = validation.complete().into_presented();

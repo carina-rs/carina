@@ -1140,7 +1140,12 @@ impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
 }
 
 /// Terminal validation output, constructed only from a scoped settlement.
-pub(crate) struct ValidationReport<'a, T = carina_core::parser::ModuleResolvedInferredFile> {
+pub(crate) struct ValidationReport<
+    'a,
+    T = carina_core::identifier::PrefixCanonicalized<
+        carina_core::parser::ModuleResolvedInferredFile,
+    >,
+> {
     result: Result<T, NonEmptyValidationErrors>,
     authored_inputs: carina_core::input_rules::AuthoredInputs,
     warnings: Vec<carina_core::parser::ParseWarning>,
@@ -1363,7 +1368,9 @@ fn validation_report_with<'a, T>(
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     name_resolution: crate::commands::ConfigNameResolution,
     finish: impl FnOnce(
-        carina_core::parser::ModuleResolvedInferredFile,
+        carina_core::identifier::PrefixCanonicalized<
+            carina_core::parser::ModuleResolvedInferredFile,
+        >,
         &ValidationProviderCatalog<'_>,
     ) -> Result<T, AppError>,
 ) -> ValidationReport<'a, T> {
@@ -1624,20 +1631,15 @@ where
 }
 
 fn resolve_file_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>(
-    file: carina_core::parser::ModuleResolvedFile<E>,
+    file: carina_core::identifier::PrefixCanonicalized<carina_core::parser::ModuleResolvedFile<E>>,
     base_dir: &ResolvedPath,
     context: &WiringContext,
     catalog: &ValidationProviderCatalog<'_>,
 ) -> Result<carina_core::validation::ResolvedFile<E::Expanded>, AppError> {
     let module_signatures =
         module_resolver::load_resolved_module_signatures(&file, base_dir, catalog.catalog());
-    carina_core::validation::resolve_bare_binding_uses_in_session(
-        file,
-        context.schemas(),
-        catalog,
-        &module_signatures,
-    )
-    .map_err(resolve_file_error)
+    file.resolve_binding_uses(context.schemas(), catalog, &module_signatures)
+        .map_err(resolve_file_error)
 }
 
 fn resolve_pair_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>(
@@ -3549,7 +3551,9 @@ pub fn validate_resource_admissions_with_ctx<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &carina_core::identifier::PrefixCanonicalized<
+        carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
 ) -> Vec<crate::error::PresentedAppError> {
     let (errors, warnings) = resource_admission_report_with_ctx(ctx, judged, bindings);
@@ -3565,7 +3569,9 @@ pub(crate) fn resource_admission_report_with_ctx<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &carina_core::identifier::PrefixCanonicalized<
+        carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
 ) -> (
     Vec<crate::error::PresentedAppError>,
@@ -3601,7 +3607,9 @@ pub(crate) fn resource_admission_report_in_run<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &carina_core::identifier::PrefixCanonicalized<
+        carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
     run: &mut validation::ConversionValidation<AppError>,
 ) -> Vec<carina_core::parser::ParseWarning> {
@@ -3684,9 +3692,9 @@ pub fn validate_deferred_populate_refs_with_ctx<
 
 #[cfg(test)]
 pub fn validate_resource_ref_types_with_ctx<
-    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
+    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B> + Clone,
     B: BindingAddress,
-    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B> + Clone,
 >(
     ctx: &WiringContext,
     judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
@@ -3764,6 +3772,9 @@ pub fn validate_attribute_param_ref_types_with_ctx<
 }
 
 /// File-level name resolution also covers residual deferred-for templates.
+type PrefixCanonicalFile<E, P, T, D, B> =
+    carina_core::identifier::PrefixCanonicalized<carina_core::parser::File<E, P, T, D, B>>;
+
 pub(crate) fn resolve_file_names_with_ctx<
     E,
     P: PlaceholderKind,
@@ -3772,14 +3783,29 @@ pub(crate) fn resolve_file_names_with_ctx<
     D: carina_core::parser::DeferredForPhaseTraversal<P, T, B>,
 >(
     ctx: &WiringContext,
-    parsed: &mut carina_core::parser::File<E, P, T, D, B>,
-) -> Vec<AppError> {
-    let mut errors = resolve_file_block_names_with_schemas(parsed, ctx.schemas())
+    mut parsed: carina_core::parser::File<E, P, T, D, B>,
+) -> Result<PrefixCanonicalFile<E, P, T, D, B>, Vec<AppError>> {
+    let mut errors = resolve_file_block_names_with_schemas(&mut parsed, ctx.schemas())
         .err()
         .map(block_name_errors)
         .unwrap_or_default();
-    errors.extend(resolve_attr_prefixes_with_ctx(ctx, &mut parsed.resources));
-    errors
+    let canonical = carina_core::identifier::canonicalize_file_prefixes(
+        parsed,
+        ctx.schemas(),
+        carina_core::identifier::SuffixSource::Random,
+    );
+    errors.extend(
+        canonical
+            .prefix_errors()
+            .iter()
+            .cloned()
+            .map(|error| AppError::AttributePrefix(Box::new(error))),
+    );
+    if errors.is_empty() {
+        Ok(canonical)
+    } else {
+        Err(errors)
+    }
 }
 
 fn resolve_config_names_with_ctx<E>(
@@ -3806,8 +3832,11 @@ pub fn resolve_config_block_names_for_test<E>(
     parsed: carina_core::parser::ModuleResolvedFile<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<ParserCanonicalResourcePair<E>, Vec<carina_core::schema::BlockNameConflict>> {
-    ParserCanonicalResourcePair::resolve_block_names(
+) -> Result<
+    CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder>,
+    Vec<carina_core::schema::BlockNameConflict>,
+> {
+    CanonicalResourcePair::<E, ParserPlaceholder, ParserPlaceholder>::resolve_block_names(
         &ValidationPipelineAccess::new(),
         parsed,
         unresolved,
@@ -4552,12 +4581,32 @@ pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx<
     providers: &[ProviderConfig<P, AbsoluteBindingAddress>],
     conflict_policy: identifier::AnonymousIdentityConflictPolicy,
 ) -> Result<Vec<AppError>, AppError> {
-    match resources.canonicalize_and_compute_anonymous_identifiers(
+    canonical_identity_errors(resources.canonicalize_and_compute_anonymous_identifiers(
         ctx.schemas(),
         providers,
         ctx.factories(),
         conflict_policy,
-    ) {
+    ))
+}
+
+pub(crate) fn compute_parser_pair_anonymous_identifiers_with_policy_with_ctx<E>(
+    ctx: &WiringContext,
+    resources: &mut ParserCanonicalResourcePair<E>,
+    providers: &[ProviderConfig<ParserPlaceholder, AbsoluteBindingAddress>],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
+) -> Result<Vec<AppError>, AppError> {
+    canonical_identity_errors(resources.canonicalize_and_compute_anonymous_identifiers(
+        ctx.schemas(),
+        providers,
+        ctx.factories(),
+        conflict_policy,
+    ))
+}
+
+fn canonical_identity_errors(
+    result: Result<(), CanonicalResourceIdentityError>,
+) -> Result<Vec<AppError>, AppError> {
+    match result {
         Ok(()) => Ok(Vec::new()),
         Err(CanonicalResourceIdentityError::EnumCanonicalization(error)) => Err(error.into()),
         Err(CanonicalResourceIdentityError::ProviderConfig(error)) => Ok(vec![error.into()]),
@@ -5245,7 +5294,8 @@ pub(crate) fn validate_module_internal_ref_types(
             continue;
         }
 
-        let parsed = template.parsed();
+        let configuration = template.judge(ctx.schemas(), config.catalog());
+        let parsed = configuration.judged().file();
         let imported = module_resolver::load_resolved_module_signatures(
             parsed,
             module.module_path(),
@@ -5254,7 +5304,6 @@ pub(crate) fn validate_module_internal_ref_types(
         let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
             parsed, ctx.schemas(), None, &imported, config,
         );
-        let configuration = template.judge(ctx.schemas(), config.catalog());
         let mut sink = ValidationReportSink {
             errors: Vec::new(),
             warnings: Vec::new(),
@@ -11150,9 +11199,13 @@ pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
         WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
     let mut parsed = carina_core::parser::ExpandedParsedFile::default();
     parsed.resources = resources.to_vec();
-    let errors = resolve_file_names_with_ctx(&ctx, &mut parsed);
-    resources.clone_from_slice(&parsed.resources);
-    errors_to_legacy_result(errors)
+    match resolve_file_names_with_ctx(&ctx, parsed) {
+        Ok(canonical) => {
+            resources.clone_from_slice(&canonical.resources);
+            Ok(())
+        }
+        Err(errors) => errors_to_legacy_result(errors),
+    }
 }
 
 #[cfg(test)]

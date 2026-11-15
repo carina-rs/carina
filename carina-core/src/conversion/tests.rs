@@ -353,9 +353,10 @@ where
     if let Some(report) = supplied {
         crate::parser::retained::attach_report(&mut parsed, report.clone());
     }
-    let configuration = crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+    let configuration =
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, schemas, catalog);
     let judged = configuration.judged();
-    let tree =
+    let _tree =
         crate::parser::AnalysisTree::try_from_file(judged.file()).map_err(|e| e.to_string())?;
     let bindings = BindingIndex::from_parsed(judged.file(), schemas, catalog);
     let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
@@ -372,13 +373,15 @@ where
         let bare = crate::validation::check_expanded_bare_binding_uses(&context);
         findings.extend(bare.findings().iter().map(|e| finding(e)));
         let mut resources = Vec::new();
-        for step in validation.admitted_resources(
-            &tree,
-            judged,
-            &bindings,
-            session,
-            crate::validation::FindingSubject::Root,
-        ) {
+        for step in validation
+            .admitted_resources(
+                judged,
+                &bindings,
+                session,
+                crate::validation::FindingSubject::Root,
+            )
+            .unwrap()
+        {
             let (resource, result) = step.into_parts();
             let attributes = resource.attributes();
             let mut admitted = result
@@ -1172,7 +1175,7 @@ fn conversion_review_cached_placement_does_not_replace_original_source_checks() 
     let parsed = crate::parser::parse_file(source, Path::new("conversion.crn"), &initial.catalog)
         .map_err(|e| format!("normal parse rejected authored source: {e}"))?
         .resolve_root_for_test();
-    let configuration = crate::config_loader::load_buffer_configuration(
+    let configuration = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         &initial.schemas,
         &initial.catalog,
@@ -1203,7 +1206,7 @@ fn conversion_changed_bindings_are_rejudged_before_admission() -> TestResult {
     )
     .map_err(|e| format!("normal parse rejected authored source: {e}"))?
     .resolve_root_for_test();
-    let old = crate::config_loader::load_buffer_configuration(
+    let old = crate::test_utils::load_canonical_buffer_configuration(
         &initial,
         &fixture.schemas,
         &fixture.catalog,
@@ -1256,7 +1259,7 @@ fn conversion_source_snapshot_rejects_a_detached_report() -> TestResult {
         .map_err(|e| format!("normal parse rejected authored source: {e}"))?
         .resolve_root_for_test();
     let detached_fixture = Fixture::string();
-    let detached = crate::config_loader::load_buffer_configuration(
+    let detached = crate::test_utils::load_canonical_buffer_configuration(
         &other,
         &detached_fixture.schemas,
         &fixture.catalog,
@@ -1409,7 +1412,7 @@ fn r11_reported_schema_validation_requires_a_recorded_static_source_verdict() {
         &fixture.catalog,
     )
     .unwrap();
-    let configuration = crate::config_loader::load_buffer_configuration(
+    let configuration = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         &fixture.schemas,
         &fixture.catalog,

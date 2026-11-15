@@ -43,7 +43,7 @@ use crate::wiring::{
     NonEmptyValidationErrors, ParserCanonicalResourcePair, ValidationProviderCatalog,
     ValidationProviderCatalogExt, WiringContext,
     compute_anonymous_identifiers_with_policy_with_ctx,
-    compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
+    compute_parser_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx,
     validate_module_attribute_refs_after_expansion_failure, validate_module_internal_ref_types,
     validate_no_backend_in_modules, validate_no_exports_in_modules,
@@ -328,6 +328,7 @@ pub fn validate_and_resolve_with_config(
             duplicate_declarations,
         )
         .into_result()
+        .map(|canonical| (*canonical).clone())
         .map_err(|errors| collapse_presented_errors(errors.into_vec()))
 }
 
@@ -375,6 +376,7 @@ pub fn validate_and_resolve_with_provider_load_for_test(
             duplicate_declarations,
         )
         .into_result()
+        .map(|canonical| (*canonical).clone())
         .map_err(|errors| collapse_presented_errors(errors.into_vec()))
 }
 
@@ -419,7 +421,11 @@ pub(crate) enum ConfigNameResolution {
 /// owner transitions.
 pub(crate) enum ResolvedConfig {
     Evaluated {
-        parsed: Box<carina_core::parser::ModuleResolvedInferredFile>,
+        parsed: Box<
+            carina_core::identifier::PrefixCanonicalized<
+                carina_core::parser::ModuleResolvedInferredFile,
+            >,
+        >,
     },
     Paired {
         resources: Box<
@@ -436,6 +442,17 @@ impl ResolvedConfig {
         }
     }
 
+    fn canonicalized(
+        &self,
+    ) -> &carina_core::identifier::PrefixCanonicalized<
+        carina_core::parser::ModuleResolvedInferredFile,
+    > {
+        match self {
+            Self::Evaluated { parsed } => parsed,
+            Self::Paired { resources } => resources.canonicalized(),
+        }
+    }
+
     fn compute_anonymous_identifiers(
         &mut self,
         ctx: &WiringContext,
@@ -444,10 +461,7 @@ impl ResolvedConfig {
         let providers = self.parsed().providers.clone();
         match self {
             Self::Evaluated { parsed, .. } => {
-                let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
-                    &mut parsed.resources,
-                    ctx.schemas(),
-                )?;
+                let canonical_resources = parsed.canonicalize_values()?;
                 Ok(compute_anonymous_identifiers_with_policy_with_ctx(
                     ctx,
                     canonical_resources,
@@ -456,7 +470,7 @@ impl ResolvedConfig {
                 ))
             }
             Self::Paired { resources, .. } => {
-                compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx(
+                compute_parser_pair_anonymous_identifiers_with_policy_with_ctx(
                     ctx,
                     resources,
                     &providers,
@@ -1135,13 +1149,14 @@ fn validate_and_resolve_configuration(
     // attributes, so its failures gate the remaining pipeline.
     let mut resolved_config = match name_resolution {
         ConfigNameResolution::EvaluatedOnly | ConfigNameResolution::ReadOnly => {
-            let name_errors = resolve_file_names_with_ctx(ctx, &mut parsed);
-            if !name_errors.is_empty() {
-                errors.extend(name_errors);
-                return Err(ValidationStopped::existing(errors));
-            }
-            ResolvedConfig::Evaluated {
-                parsed: Box::new(parsed),
+            match resolve_file_names_with_ctx(ctx, parsed) {
+                Ok(parsed) => ResolvedConfig::Evaluated {
+                    parsed: Box::new(parsed),
+                },
+                Err(name_errors) => {
+                    errors.extend(name_errors);
+                    return Err(ValidationStopped::existing(errors));
+                }
             }
         }
         ConfigNameResolution::Paired(unresolved) => {
@@ -1275,11 +1290,9 @@ fn validate_and_resolve_configuration(
                 enriched_context.catalog(),
             ),
         );
-        let configuration = carina_core::config_loader::load_buffer_configuration(
-            parsed,
-            ctx.schemas(),
-            enriched_context.catalog(),
-        );
+        let configuration = resolved_config
+            .canonicalized()
+            .judge(ctx.schemas(), enriched_context.catalog());
         let admission_warnings = crate::wiring::resource_admission_report_in_run(
             ctx,
             configuration.judged(),

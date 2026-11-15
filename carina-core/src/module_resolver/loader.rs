@@ -28,7 +28,16 @@ pub struct ModuleTemplate {
 /// Judgement evidence for the separate module-template preflight boundary.
 /// Root configuration judgements cannot enter this boundary.
 pub struct ModuleTemplatePreflight<'a> {
-    configuration: crate::config_loader::BufferConfiguration<'a>,
+    configuration: crate::identifier::PrefixCanonicalized<
+        crate::parser::retained::JudgedFile<
+            'a,
+            crate::parser::ParsedExportParam,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
+        >,
+    >,
 }
 
 impl LoadedModule {
@@ -64,27 +73,30 @@ impl ModuleTemplate {
         context: &ProviderContext,
     ) -> ModuleTemplatePreflight<'a> {
         ModuleTemplatePreflight {
-            configuration: crate::config_loader::load_buffer_configuration(
-                &self.parsed,
+            configuration: crate::identifier::canonicalize_file_prefixes(
+                self.parsed.clone(),
                 schemas,
-                context,
-            ),
+                crate::identifier::SuffixSource::Preview,
+            )
+            .judge(schemas, context),
         }
     }
 }
 
-impl ModuleTemplatePreflight<'_> {
+impl<'a> ModuleTemplatePreflight<'a> {
     pub fn judged(
         &self,
-    ) -> &crate::parser::retained::JudgedFile<
-        '_,
-        crate::parser::ParsedExportParam,
-        crate::parser::ParsedDeferredForPhase<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
+    ) -> &crate::identifier::PrefixCanonicalized<
+        crate::parser::retained::JudgedFile<
+            'a,
+            crate::parser::ParsedExportParam,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
         >,
     > {
-        self.configuration.judged()
+        &self.configuration
     }
 }
 

@@ -9,13 +9,41 @@ pub mod loopback;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod provider_text;
 
-/// Run classified resource fixtures through production validation admission.
+pub fn load_canonical_buffer_configuration<'a, E, D, B: crate::resource::BindingAddress>(
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    schemas: &'a crate::schema::SchemaRegistry,
+    context: &crate::parser::ProviderContext,
+) -> crate::identifier::PrefixCanonicalized<crate::parser::retained::JudgedFile<'a, E, D, B>>
+where
+    E: Clone + crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
+    D: Clone
+        + crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    crate::identifier::canonicalize_file_prefixes(
+        parsed.clone(),
+        schemas,
+        crate::identifier::SuffixSource::Preview,
+    )
+    .judge(schemas, context)
+}
+
+/// Run resource value fixtures through production validation admission.
 pub fn admit_resource_attribute_report<
     P: crate::resource::PlaceholderKind,
     B: crate::resource::BindingAddress,
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
+    attributes: &indexmap::IndexMap<String, crate::resource::Value<P, B>>,
     is_string_literal: &dyn Fn(&str) -> bool,
     custom_types: &crate::parser::ProviderCustomTypes,
 ) -> crate::schema::ResourceValueValidation {
@@ -28,6 +56,22 @@ pub fn admit_resource_attribute_report<
         schema.schema().parts().resource_type,
         None,
     );
+    let attributes = match crate::identifier::canonicalize_prefix_values(
+        schema,
+        &id,
+        attributes.clone(),
+        crate::identifier::SuffixSource::Preview,
+    ) {
+        Ok(values) => values,
+        Err(errors) => {
+            return crate::schema::ResourceValueValidation::from_errors(
+                errors
+                    .into_iter()
+                    .map(|error| crate::schema::TypeError::AttributePrefix(Box::new(error)))
+                    .collect(),
+            );
+        }
+    };
     let quoted = attributes
         .keys()
         .filter(|name| is_string_literal(name))
@@ -38,7 +82,7 @@ pub fn admit_resource_attribute_report<
             crate::validation::admission::kind::ResourceAttribute,
             P,
             B,
-        >(schema, &id, attributes, &quoted, session)
+        >(schema, &id, &attributes, &quoted, session)
     })
 }
 
@@ -53,10 +97,10 @@ pub fn admit_resource_attribute_report<
 /// is rejected even though each attribute is individually a valid String:
 ///
 /// ```
-/// use std::collections::HashMap;
+/// use indexmap::IndexMap;
 /// use carina_core::{
 ///     parser::ProviderCustomTypes,
-///     resource::{ConcreteValue, Value, knowledge::KnowledgeContext},
+///     resource::{ConcreteValue, Value},
 ///     schema::{AttributeSchema, AttributeType, FieldGroup, ResourceSchema, SchemaKind, SchemaRegistry},
 ///     test_utils::admit_resource_attributes,
 /// };
@@ -70,16 +114,13 @@ pub fn admit_resource_attribute_report<
 /// let mut schemas = SchemaRegistry::new();
 /// schemas.insert("awscc", schema);
 /// let schema = schemas.get("awscc", "ec2.vpc_gateway_attachment", SchemaKind::Resource).unwrap();
-/// let values: HashMap<String, Value> = HashMap::from([
+/// let values: IndexMap<String, Value> = IndexMap::from([
 ///     ("vpc_id".into(), Value::Concrete(ConcreteValue::String("vpc-12345678".into()))),
 ///     ("internet_gateway_id".into(), Value::Concrete(ConcreteValue::String("igw-12345678".into()))),
 ///     ("vpn_gateway_id".into(), Value::Concrete(ConcreteValue::String("vgw-12345678".into()))),
 /// ]);
-/// let attributes = values.iter().map(|(name, value)| {
-///     (name.clone(), value.knowledge(&KnowledgeContext::validation()).unwrap().into_classification())
-/// }).collect();
 /// let errors = admit_resource_attributes(
-///     schema, &attributes, &|_| true, &ProviderCustomTypes::default(),
+///     schema, &values, &|_| true, &ProviderCustomTypes::default(),
 /// ).unwrap_err();
 /// assert_eq!(errors.len(), 1);
 /// assert!(errors[0].to_string().contains(
@@ -91,7 +132,7 @@ pub fn admit_resource_attributes<
     B: crate::resource::BindingAddress,
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
+    attributes: &indexmap::IndexMap<String, crate::resource::Value<P, B>>,
     is_string_literal: &dyn Fn(&str) -> bool,
     custom_types: &crate::parser::ProviderCustomTypes,
 ) -> Result<(), Vec<crate::schema::TypeError>> {
@@ -521,41 +562,53 @@ pub fn legacy_validate_resources<
         .map_err(|findings| render_presented_for_test(&findings))
 }
 pub fn legacy_validate_resource_ref_types<
-    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
+    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B> + Clone,
     B: crate::resource::BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             B,
-        >,
+        > + Clone,
 >(
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     _: &std::collections::HashSet<String>,
     bindings: &crate::binding_index::BindingIndex<'_, B>,
     diagnostics: &mut dyn crate::validation::deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), LegacyValidationError> {
+    let canonical = crate::identifier::canonicalize_file_prefixes(
+        judged.file().clone(),
+        judged.schemas(),
+        crate::identifier::SuffixSource::Preview,
+    );
+    let canonical = canonical.judge(judged.schemas(), bindings.provider_context());
     legacy_findings_result(crate::validation::resource_reference_findings(
-        judged,
+        &canonical,
         bindings,
         diagnostics,
     ))
 }
 pub fn legacy_validate_resource_admissions<
-    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
+    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B> + Clone,
     B: crate::resource::BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             B,
-        >,
+        > + Clone,
 >(
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &crate::binding_index::BindingIndex<'_, B>,
     known: &std::collections::HashSet<String>,
     diagnostics: &mut dyn crate::validation::deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), LegacyValidationError> {
+    let canonical = crate::identifier::canonicalize_file_prefixes(
+        judged.file().clone(),
+        judged.schemas(),
+        crate::identifier::SuffixSource::Preview,
+    );
+    let canonical = canonical.judge(judged.schemas(), bindings.provider_context());
     legacy_findings_result(crate::validation::resource_admission_findings(
-        judged,
+        &canonical,
         bindings,
         known,
         diagnostics,

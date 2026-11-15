@@ -95,13 +95,7 @@ fn issue_4014_quoted_enum_and_secret_union_report_once() {
             schemas
                 .get("aws", "s3.bucket", SchemaKind::Resource)
                 .unwrap(),
-            &indexmap::IndexMap::from([(
-                attribute.into(),
-                value
-                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                    .unwrap()
-                    .into_classification(),
-            )]),
+            &indexmap::IndexMap::from([(attribute.into(), value.clone())]),
             &|name| name == "versioning",
             &context.custom_types,
         );

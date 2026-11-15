@@ -12853,13 +12853,10 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
         .expect("typed-error fixture schema must be registered");
     let error = crate::test_utils::admit_resource_attributes(
         schema,
-        &crate::schema::classified_attributes(
-            &std::collections::HashMap::<String, ExpandedValue>::from([(
-                "value".to_string(),
-                ExpandedValue::Concrete(ExpandedConcreteValue::String("value".into())),
-            )]),
-        )
-        .unwrap(),
+        &indexmap::IndexMap::<String, ExpandedValue>::from([(
+            "value".to_string(),
+            ExpandedValue::Concrete(ExpandedConcreteValue::String("value".into())),
+        )]),
         &|_| false,
         &config.custom_types,
     )

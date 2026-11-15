@@ -57,7 +57,8 @@ fn round9_admission_locations_use_linear_resource_work() {
         );
         let parsed = crate::parser::parse(&source, config).unwrap();
         let bindings = BindingIndex::from_parsed(&parsed, &schemas, config);
-        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, config);
+        let loaded =
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, config);
         let (findings, work) = crate::test_work::measure(|| {
             resource_admission_findings(
                 loaded.judged(),
@@ -272,7 +273,7 @@ fn validation_views_borrow_the_produced_report() {
     let schemas = SchemaRegistry::new();
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
-    let judged = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+    let judged = crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config);
     let first = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
     let second = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
     assert!(std::ptr::eq(
@@ -719,7 +720,7 @@ fn ref_validation_rejects_missing_provenance_without_panicking() {
                 let schemas = SchemaRegistry::new();
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(&parsed, &schemas, None, &signatures, session);
-                let configuration = crate::config_loader::load_buffer_configuration(
+                let configuration = crate::test_utils::load_canonical_buffer_configuration(
                     &parsed,
                     &schemas,
                     session.as_provider_context(),
@@ -983,7 +984,7 @@ fn module_call_findings_for_test(
     );
     let parsed = &fixture;
     let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
-        crate::config_loader::load_buffer_configuration(
+        crate::test_utils::load_canonical_buffer_configuration(
             parsed,
             &schemas,
             provider_context.as_provider_context(),
@@ -1072,7 +1073,7 @@ fn validate_resource_ref_types_for_test<
                 .iter()
                 .map(|argument| argument.name.clone())
                 .collect();
-            let configuration = crate::config_loader::load_buffer_configuration(
+            let configuration = crate::test_utils::load_canonical_buffer_configuration(
                 parsed,
                 schemas,
                 session.as_provider_context(),
@@ -1835,7 +1836,7 @@ fn refined_int_module_argument_report(annotation: &str, sink: TypeExpr) -> Bindi
         },
     )]);
     check_bare_binding_uses(&ValidationTypeContext::new(
-        crate::config_loader::load_buffer_configuration(
+        crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             provider_context.as_provider_context(),
@@ -2699,8 +2700,11 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     let schemas = SchemaRegistry::new();
     let provider_context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-    let judged_configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &provider_context);
+    let judged_configuration = crate::test_utils::load_canonical_buffer_configuration(
+        &parsed,
+        &schemas,
+        &provider_context,
+    );
     let context = ValidationTypeContext::new_providerless(
         judged_configuration.judged(),
         &provider_context,
@@ -2752,7 +2756,7 @@ fn binding_diagnostics_preserve_symlink_parent_source_spelling() {
     let schemas = function_ref_schema();
     let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
     let report = check_bare_binding_uses(&ValidationTypeContext::new(
-        crate::config_loader::load_buffer_configuration(
+        crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             provider.as_provider_context(),
@@ -2830,7 +2834,7 @@ let generated = for item in items {
     let schemas = function_ref_schema();
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
     let provider_context = LoadedProviderContext::empty_for_test();
-    let judged_configuration = crate::config_loader::load_buffer_configuration(
+    let judged_configuration = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         &schemas,
         provider_context.as_provider_context(),
@@ -5562,7 +5566,7 @@ fn check_module_calls_providerless_defers_unloaded_bare_count_argument() {
     )]);
     let schemas = SchemaRegistry::new();
     let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config).judged(),
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config).judged(),
         &config,
         &signatures,
     ));
@@ -5788,7 +5792,7 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
         &provider_context,
     );
     let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
-        crate::config_loader::load_buffer_configuration(
+        crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             provider_context.as_provider_context(),
@@ -6074,7 +6078,7 @@ child { values = [vpc] }
     )]);
     let schemas = SchemaRegistry::new();
     let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
-        crate::config_loader::load_buffer_configuration(
+        crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -6136,7 +6140,7 @@ let child = child_module { value = forwarded }
         },
     )]);
     let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
-        crate::config_loader::load_buffer_configuration(
+        crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -10773,7 +10777,7 @@ fn bare_typeexpr_sink_requires_authored_evidence() {
     let (parsed, signatures) = missing_inventory_fixture("n");
     let provider = LoadedProviderContext::empty_for_test();
     let schemas = SchemaRegistry::new();
-    let loaded = crate::config_loader::load_buffer_configuration(
+    let loaded = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         &schemas,
         provider.as_provider_context(),
@@ -10792,7 +10796,8 @@ fn bare_binding_precheck_preserves_rejection_after_constant_folding() {
             "let bad = {rhs}\nlet template = use {{ source = './child' }}\nlet child = template {{ x = bad }}"
         ))
         .unwrap();
-        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+        let loaded =
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config);
         let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
         let context =
             ValidationTypeContext::new_providerless(loaded.judged(), &config, &signatures);
@@ -10946,7 +10951,7 @@ fn review_r9_nested_symbolic_findings_are_rendered_once_per_path() {
     );
     let parsed = crate::parser::parse("let src = mock.test.Source {}\nlet sink = mock.test.Sink { values = [src.bad, src.bad] }\n", catalog.as_provider_context()).unwrap();
     let bindings = BindingIndex::from_parsed(&parsed, &schemas, catalog.as_provider_context());
-    let loaded = crate::config_loader::load_buffer_configuration(
+    let loaded = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         &schemas,
         catalog.as_provider_context(),
@@ -11001,7 +11006,7 @@ fn admission_deferred_read_keeps_main_verdict_across_files() {
         assert_eq!(tree.project_resources().count(), 0);
         let bindings = BindingIndex::from_parsed(&parsed, &schemas, catalog);
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, catalog);
         validate_resource_admissions(
             configuration.judged(),
             &bindings,
@@ -11098,7 +11103,7 @@ fn folded_children_keep_every_failure() {
         "let a = 'x'\nlet b = length([a ?? [1, 'y']])",
     ] {
         let parsed = crate::parser::parse_and_resolve(source).unwrap();
-        let loaded = crate::config_loader::load_buffer_configuration(
+        let loaded = crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             &expression_validation_config(),
@@ -11140,7 +11145,7 @@ fn resource_sink_does_not_repeat_child_findings() {
             .validate()
             .unwrap(),
     );
-    let loaded = crate::config_loader::load_buffer_configuration(
+    let loaded = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         &schemas,
         &expression_validation_config(),
@@ -11212,7 +11217,7 @@ fn deferred_loop_keys_and_indexes_are_not_concrete() {
     for pattern in ["for k, v in src.tags", "for (i, v) in src.names"] {
         let name = if pattern.contains("k,") { "k" } else { "i" };
         let parsed = crate::parser::parse_and_resolve(&format!("let src = mock.test.Source {{}}\n{pattern} {{ mock.test.Sink {{ name = \"${{{name}}}-inline\" }} }}")).unwrap();
-        let loaded = crate::config_loader::load_buffer_configuration(
+        let loaded = crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             &expression_validation_config(),
@@ -11328,13 +11333,13 @@ fn schema_bundle_replaces_findings_from_a_different_registry() {
     .unwrap();
     let strings = schemas(crate::schema::PatternAttributeType::string());
     let integers = schemas(crate::schema::PatternAttributeType::int());
-    let first = crate::config_loader::load_buffer_configuration(
+    let first = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         &strings,
         &expression_validation_config(),
     );
     assert_eq!(first.judged().report().findings().len(), 1);
-    let second = crate::config_loader::load_buffer_configuration(
+    let second = crate::test_utils::load_canonical_buffer_configuration(
         first.parsed(),
         &integers,
         &expression_validation_config(),

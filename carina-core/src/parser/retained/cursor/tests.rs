@@ -972,7 +972,7 @@ where
     B: BindingAddress,
 {
     use crate::validation::admission::attributes::{
-        ResourceAttributeInputs, resource_attribute_admissions,
+        ResourceAttributeInputs, resource_attribute_admissions_for_test,
     };
     let tree = crate::parser::AnalysisTree::try_from_file(source.file()).unwrap();
     let bindings =
@@ -982,9 +982,9 @@ where
         let rows = tree
             .project_resources()
             .map(|resource| {
-                let inputs = ResourceAttributeInputs::new(resource);
+                let inputs = ResourceAttributeInputs::new_for_test(resource);
                 let findings = {
-                    let outcome = resource_attribute_admissions(
+                    let outcome = resource_attribute_admissions_for_test(
                         resource,
                         source.file(),
                         schema,
@@ -1650,12 +1650,15 @@ fn seam_generated_prefix_result_has_explicit_projection_authority() {
             .validate()
             .unwrap(),
     );
-    let mut parsed =
+    let parsed =
         crate::parser::parse_and_resolve("let target = mock.Test { name_prefix = 'test-' }")
             .unwrap();
-    crate::identifier::resolve_attr_prefixes(&mut parsed.resources, &schemas).unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let parsed = crate::identifier::canonicalize_file_prefixes(
+        parsed,
+        &schemas,
+        crate::identifier::SuffixSource::Preview,
+    );
+    let configuration = parsed.judge(&schemas, &catalog);
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.project_resources().next().unwrap();
@@ -2167,7 +2170,7 @@ fn review_seam_composition_computed_values_keep_main_checks() {
 #[test]
 fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
     use crate::validation::admission::attributes::{
-        ResourceAttributeInputs, resource_attribute_admissions,
+        ResourceAttributeInputs, resource_attribute_admissions_for_test,
     };
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let mut schemas = SchemaRegistry::new();
@@ -2192,7 +2195,7 @@ fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
     for instantiate in [false, true] {
-        let inputs = ResourceAttributeInputs::new(resource);
+        let inputs = ResourceAttributeInputs::new_for_test(resource);
         let mut changed = judged.file().clone();
         if instantiate {
             changed.resources[0] = changed.resources[0].instantiate();
@@ -2208,7 +2211,7 @@ fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
             crate::binding_index::BindingIndex::from_parsed(&changed, &schemas, &catalog);
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             let findings = {
-                let outcome = resource_attribute_admissions(
+                let outcome = resource_attribute_admissions_for_test(
                     changed_resource,
                     &changed,
                     changed_resource.schema(&schemas).unwrap(),
