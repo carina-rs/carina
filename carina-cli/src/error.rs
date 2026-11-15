@@ -1207,6 +1207,9 @@ impl RootPlacementErrors {
     pub(crate) fn new(errors: Vec<AppError>) -> Self {
         Self { errors }
     }
+    pub(crate) fn errors(&self) -> &[AppError] {
+        &self.errors
+    }
 }
 impl std::fmt::Display for RootPlacementErrors {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2013,6 +2016,37 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
 /// retain their existing per-line error prefixes; declaration evidence is a note.
 pub use carina_core::module_resolver::DiagnosticLine as HumanErrorLine;
 
+pub enum HumanErrorPresentation {
+    Message(String),
+    Note(String),
+}
+
+/// Own the evidence continuation shared by command, validate and lint output.
+pub fn present_human_error_line(line: HumanErrorLine) -> HumanErrorPresentation {
+    let note = match line {
+        HumanErrorLine::Message(message) => return HumanErrorPresentation::Message(message),
+        HumanErrorLine::RootEvidence(evidence) => evidence.note(),
+        HumanErrorLine::ModuleEvidence(evidence) => evidence.note(),
+        HumanErrorLine::ModuleEvidenceRelative { evidence, root } => {
+            evidence.note_relative_to(&root)
+        }
+    };
+    HumanErrorPresentation::Note(format!("  Note: {note}"))
+}
+
+pub(crate) fn upstream_source_config_error<B: carina_core::resource::BindingAddress>(
+    binding: &B,
+    source: &std::path::Path,
+    error: std::io::Error,
+) -> AppError {
+    AppError::Config(format!(
+        "upstream_state '{}': cannot resolve source '{}': {}",
+        binding,
+        source.display(),
+        error
+    ))
+}
+
 fn prefix_first_message(lines: &mut [HumanErrorLine], prefix: &str) {
     if let Some(HumanErrorLine::Message(message)) = lines.first_mut() {
         message.insert_str(0, prefix);
@@ -2334,12 +2368,10 @@ pub(crate) fn has_directory_evidence_notes(error: &AppError) -> bool {
 pub(crate) fn lint_error_message(error: &AppError) -> String {
     human_error_lines(error)
         .into_iter()
+        .map(present_human_error_line)
         .map(|line| match line {
-            HumanErrorLine::Message(message) => message,
-            HumanErrorLine::RootEvidence(evidence) => format!("  Note: {}", evidence.note()),
-            HumanErrorLine::ModuleEvidence(evidence) => format!("  Note: {}", evidence.note()),
-            HumanErrorLine::ModuleEvidenceRelative { evidence, root } => {
-                format!("  Note: {}", evidence.note_relative_to(&root))
+            HumanErrorPresentation::Message(message) | HumanErrorPresentation::Note(message) => {
+                message
             }
         })
         .collect::<Vec<_>>()

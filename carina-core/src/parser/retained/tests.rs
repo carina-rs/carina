@@ -1347,13 +1347,8 @@ fn no_evidence_has_no_require_node_scope() {
         parsed.parsed().directory_verdict(),
         crate::config_loader::DirectoryVerdict::NoEvidence(_)
     ));
-    assert!(
-        parsed
-            .parsed()
-            .parser_binding_metadata
-            .syntax()
-            .expressions()
-            .require_scope
-            .is_none()
-    );
+    assert!(matches!(
+        require_scope(parsed.parsed()),
+        RequireScope::Absent(_)
+    ));
 }

@@ -85,10 +85,10 @@ impl ModuleCallConstraintReport {
 /// Complete graph owned by the successful module-admission boundary. Its
 /// constructor stays private to this resolver; mutable public ASTs cannot mint it.
 pub(crate) struct AuthoredModuleGraph<'a, E> {
-    file: &'a ModuleResolvedFile<E, crate::resource::AbsoluteBindingAddress>,
+    file: &'a ModuleResolvedFile<E>,
 }
 impl<E> AuthoredModuleGraph<'_, E> {
-    pub(crate) fn file(&self) -> &ModuleResolvedFile<E, crate::resource::AbsoluteBindingAddress> {
+    pub(crate) fn file(&self) -> &ModuleResolvedFile<E> {
         self.file
     }
 }
@@ -96,9 +96,9 @@ impl<E> AuthoredModuleGraph<'_, E> {
 /// Every successful module publication advances resource authority together;
 /// unavailable provider defaults remain a separate fact in that snapshot.
 fn publish_authored_module_graph<E>(
-    mut graph: ModuleResolvedFile<E, crate::resource::AbsoluteBindingAddress>,
+    mut graph: ModuleResolvedFile<E>,
     config: &ProviderContext,
-) -> ModuleResolvedFile<E, crate::resource::AbsoluteBindingAddress>
+) -> ModuleResolvedFile<E>
 where
     E: crate::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress> + Clone,
 {
@@ -119,7 +119,7 @@ pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 /// scratch graph that produced them.
 pub enum ModuleResolutionDiagnosticResult<E> {
     Expanded {
-        graph: Box<ModuleResolvedFile<E, AbsoluteBindingAddress>>,
+        graph: Box<ModuleResolvedFile<E>>,
     },
     ConstraintFailed {
         findings: Vec<crate::validation::ModuleCallFinding>,
@@ -232,14 +232,7 @@ impl ResidualModuleResolutionError {
 
     pub fn call_diagnostics<'a, D, B: crate::resource::BindingAddress>(
         &'a self,
-        tree: &crate::parser::AnalysisTree<
-            '_,
-            ParserPlaceholder,
-            ParserPlaceholder,
-            D,
-            B,
-            crate::parser::ParsedExportParam<ParserPlaceholder, B>,
-        >,
+        tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     ) -> Vec<crate::parser::Located<&'a Self>>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -901,8 +894,8 @@ mod diagnostic_status_tests {
 /// use carina_core::parser::{ParsedFile, ProviderContext};
 /// use carina_core::schema::SchemaRegistry;
 ///
-/// let mut first: ParsedFile = Default::default();
-/// let mut second: ParsedFile = Default::default();
+/// let mut first = ParsedFile::default();
+/// let mut second = ParsedFile::default();
 /// let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
 /// let schemas = SchemaRegistry::new();
 /// let checked = RefCheckedModuleGraph::check(
@@ -948,13 +941,7 @@ pub(crate) trait TypeResolutionPolicy {
     fn resolve_file_type_exprs<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     >(
-        parsed: &mut crate::parser::File<
-            E,
-            ParserPlaceholder,
-            ParserPlaceholder,
-            ParsedDeferredForPhase,
-            RelativeBindingName,
-        >,
+        parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError>;
 
@@ -971,16 +958,7 @@ impl TypeResolutionPolicy for StrictTypeResolution {
     fn resolve_file_type_exprs<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     >(
-        parsed: &mut crate::parser::File<
-            E,
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            crate::parser::ParsedDeferredForPhase<
-                crate::resource::ParserPlaceholder,
-                crate::resource::RelativeBindingName,
-            >,
-            crate::resource::RelativeBindingName,
-        >,
+        parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError> {
         let type_errors = crate::validation::resolve_file_type_exprs(parsed, config)?;
@@ -1006,16 +984,7 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
     fn resolve_file_type_exprs<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     >(
-        parsed: &mut crate::parser::File<
-            E,
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            crate::parser::ParsedDeferredForPhase<
-                crate::resource::ParserPlaceholder,
-                crate::resource::RelativeBindingName,
-            >,
-            crate::resource::RelativeBindingName,
-        >,
+        parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<(), ModuleError> {
         crate::validation::resolve_file_type_exprs_best_effort(parsed, config)?;
@@ -1229,16 +1198,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     >(
         &self,
-        mut parsed: crate::parser::File<
-            E,
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            crate::parser::ParsedDeferredForPhase<
-                crate::resource::ParserPlaceholder,
-                crate::resource::RelativeBindingName,
-            >,
-            crate::resource::RelativeBindingName,
-        >,
+        mut parsed: crate::parser::File<E>,
     ) -> (
         JudgedModuleFile<'cfg, E>,
         Result<RefCheckWitness, ModuleError>,
@@ -1546,16 +1506,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
 }
 
 fn lift_module_attribute_handles<E>(
-    parsed: &mut crate::parser::File<
-        E,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        crate::parser::ParsedDeferredForPhase<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
-        crate::resource::RelativeBindingName,
-    >,
+    parsed: &mut crate::parser::File<E>,
     signatures: &super::ResolvedModuleSignatures,
 ) {
     let calls = parsed
@@ -1786,12 +1737,7 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
     }
 
     /// Consume the checked graph and expand its root configuration.
-    fn expand(
-        mut self,
-    ) -> Result<
-        BindingResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress>,
-        ModuleError,
-    >
+    fn expand(mut self) -> Result<BindingResolvedFile<E::Absolute>, ModuleError>
     where
         E: ResolveExportBindingPhase<ParserPlaceholder>,
     {
@@ -1867,12 +1813,7 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
         })
     }
 
-    fn expand(
-        mut self,
-    ) -> Result<
-        BindingResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress>,
-        ModuleError,
-    >
+    fn expand(mut self) -> Result<BindingResolvedFile<E::Absolute>, ModuleError>
     where
         E: ResolveExportBindingPhase<ParserPlaceholder>,
     {
@@ -1897,22 +1838,16 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
 }
 
 fn finish_root_expansion<E: ResolveExportBindingPhase<ParserPlaceholder>>(
-    parsed: crate::parser::File<
-        E,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        crate::parser::ParsedDeferredForPhase<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
-        crate::resource::RelativeBindingName,
-    >,
+    parsed: crate::parser::File<E>,
     contributions: Vec<crate::parser::RootBindingResolvedParsedFile>,
     root: &RootScope,
-) -> BindingResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress> {
+) -> BindingResolvedFile<E::Absolute> {
     let mut expanded = parsed.resolve_root(root);
     for contribution in contributions {
-        expanded.merge_from(crate::config_loader::relabel_export_phase(contribution));
+        crate::config_loader::merge_parsed_file(
+            &mut expanded,
+            crate::config_loader::relabel_export_phase(contribution),
+        );
     }
     let mut provider_warnings = Vec::new();
     expanded.warnings.retain(|warning| {
@@ -1940,17 +1875,8 @@ fn root_expansion_scope() -> RootScope {
 /// methods use the same private primitive for
 /// editor-only root views of their loader-owned semantic files.
 pub(crate) fn expand_root_directory_file<E: ResolveExportBindingPhase<ParserPlaceholder>>(
-    parsed: crate::parser::File<
-        E,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        crate::parser::ParsedDeferredForPhase<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
-        crate::resource::RelativeBindingName,
-    >,
-) -> BindingResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress> {
+    parsed: crate::parser::File<E>,
+) -> BindingResolvedFile<E::Absolute> {
     let root = root_expansion_scope();
     finish_root_expansion(parsed, Vec::new(), &root)
 }
@@ -1985,7 +1911,7 @@ pub fn prepare_root_export_validation(
 /// use carina_core::paths::ResolvedPath;
 /// use carina_core::validation::deferred_types::TypeCheckSession;
 ///
-/// let parsed: ParsedFile = Default::default();
+/// let parsed = ParsedFile::default();
 /// let checks = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
 ///     resolve_modules_providerless(parsed, &ResolvedPath::new(".").unwrap())
 /// });
@@ -2020,7 +1946,7 @@ pub fn resolve_modules_providerless(
 pub fn resolve_modules_with_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
     parsed: AdmittedRootDirectory<'_, E>,
     base_dir: &ResolvedPath,
-) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     resolve_modules_with_config_and_overrides(parsed, base_dir, &Default::default())
 }
 
@@ -2032,7 +1958,7 @@ pub fn resolve_modules_with_config_and_overrides<
     parsed: AdmittedRootDirectory<'_, E>,
     base_dir: &ResolvedPath,
     overrides: &crate::config_loader::SourceOverrides,
-) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let mut resolver =
@@ -2049,7 +1975,7 @@ pub fn resolve_modules_with_config_and_overrides<
 pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
     parsed: AdmittedRootDirectory<'_, E>,
     base_dir: &ResolvedPath,
-) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let warnings = parsed
@@ -2078,7 +2004,7 @@ pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<Par
 pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPlaceholder>>(
     parsed: AdmittedRootDirectory<'_, E>,
     base_dir: &ResolvedPath,
-) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let expanded =
@@ -2095,7 +2021,7 @@ pub fn resolve_module_template_with_providerless_config<
 >(
     parsed: AdmittedRootDirectory<'_, E>,
     base_dir: &ResolvedPath,
-) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let warnings = parsed
@@ -2126,7 +2052,7 @@ pub(crate) fn resolve_upstream_modules_with_providerless_config<
     parsed: AdmittedRootDirectory<'_, E>,
     base_dir: &ResolvedPath,
     overrides: &crate::config_loader::SourceOverrides,
-) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let expanded = UpstreamRefCheckedModuleGraph::check_providerless(
@@ -2143,7 +2069,7 @@ pub(crate) fn resolve_upstream_modules_with_config<
     parsed: AdmittedRootDirectory<'_, E>,
     base_dir: &ResolvedPath,
     overrides: &crate::config_loader::SourceOverrides,
-) -> Result<ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress>, ModuleError> {
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let (parsed, resolution, config) = parsed.into_parts();
     let schemas = parsed.schemas();
     let expanded = UpstreamRefCheckedModuleGraph::check(
@@ -2751,7 +2677,7 @@ mod type_resolution_policy_tests {
                     config,
                     &schemas,
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(
-                        <crate::parser::ParsedFile>::default(),
+                        crate::parser::ParsedFile::default(),
                     )
                     .module_resolution_context(),
                 );
@@ -2761,7 +2687,7 @@ mod type_resolution_policy_tests {
                         config,
                         &schemas,
                         crate::config_loader::ParsedRootDirectory::from_parsed_for_test(
-                            <crate::parser::ParsedFile>::default(),
+                            crate::parser::ParsedFile::default(),
                         )
                         .module_resolution_context(),
                     );

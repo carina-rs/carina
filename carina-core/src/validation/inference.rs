@@ -1323,7 +1323,6 @@ pub fn infer_export_params_with_loaded_provider_schemas<D, B: BindingAddress>(
         crate::resource::ParserPlaceholder,
         D,
         B,
-        crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
     >,
     schemas: &ProviderLoadedSchemaRegistry,
     provider_context: &crate::parser::ProviderContext,

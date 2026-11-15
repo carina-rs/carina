@@ -180,7 +180,7 @@ pub(crate) mod test_support {
     /// Explicit rows shared by scheduler/display deferred-loop fixtures.
     pub fn compiled_loop(template: Box<ExpandedDeferredForExpression>) -> DeferredCreatePayload {
         let root = RootScope::new();
-        let configuration: ExpandedParsedFile = ExpandedParsedFile {
+        let configuration = ExpandedParsedFile {
             upstream_states: vec![crate::parser::UpstreamState {
                 caller: crate::parser::upstream_caller_for_test(),
                 binding: root.resolve("upstream".into()),
@@ -206,7 +206,7 @@ pub(crate) mod test_support {
         template: Box<ExpandedDeferredForExpression>,
         resources: Vec<crate::resource::ExpandedResource>,
     ) -> DeferredCreatePayload {
-        let configuration: ExpandedParsedFile = ExpandedParsedFile {
+        let configuration = ExpandedParsedFile {
             resources,
             ..Default::default()
         };
@@ -233,7 +233,7 @@ pub(crate) mod test_support {
                     .with_absolute_binding(root.resolve(RelativeBindingName::new(binding)))
             })
             .collect::<Vec<_>>();
-        let configuration: ExpandedParsedFile = ExpandedParsedFile {
+        let configuration = ExpandedParsedFile {
             resources,
             upstream_states: vec![crate::parser::UpstreamState {
                 caller: crate::parser::upstream_caller_for_test(),

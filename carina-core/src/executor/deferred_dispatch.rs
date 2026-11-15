@@ -579,7 +579,7 @@ mod tests {
         bindings: &ResolvedBindings,
         identity: &DeferredIdentityInputs<'_>,
     ) -> Result<Vec<Effect>, DeferredCreateFailure> {
-        let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
+        let configuration = crate::parser::ExpandedParsedFile {
             upstream_states: ["up", "parent", "upstream", "primary", "fallback"]
                 .into_iter()
                 .map(|binding| crate::parser::UpstreamState {

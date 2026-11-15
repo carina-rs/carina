@@ -979,12 +979,7 @@ async fn verify_upstream_snapshot(
             Ok(identity)
         })
         .map_err(|error| {
-            AppError::Config(format!(
-                "upstream_state '{}': cannot resolve source '{}': {}",
-                source.binding,
-                source.source.display(),
-                error
-            ))
+            crate::error::upstream_source_config_error(&source.binding, &source.source, error)
         });
         let loaded = super::plan::load_selected_upstream_identities(
             wiring.runtime(),

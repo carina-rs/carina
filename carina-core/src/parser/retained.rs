@@ -490,11 +490,12 @@ impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
 
 /// The declaration environment is selected at source/directory admission,
 /// retained with every require node, and reused by all resolver entry points.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequireScope {
     /// No complete directory verdict is available for this require node.
-    #[default]
     Unknown,
+    /// A complete inventory proved that this directory has no require nodes.
+    Absent(crate::config_loader::DirectoryWithoutEvidence),
     /// Only the directory loader mints this declaration-completeness proof.
     /// Any JudgedFile construction promotes it to Directory, including
     /// bootstrap/metadata inference. Callers decide whether to publish findings.
@@ -874,7 +875,7 @@ pub(in crate::parser) fn resource_slots(
 /// ```compile_fail,E0308
 /// use carina_core::{parser::{ParsedFile, ProviderContext}, schema::SchemaRegistry,
 ///     module_resolver::ResolvedModuleSignatures, validation::ValidationTypeContext};
-/// let raw: ParsedFile = Default::default();
+/// let raw = ParsedFile::default();
 /// let config = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
 /// let schemas = SchemaRegistry::new();
 /// let signatures = ResolvedModuleSignatures::default();
@@ -887,7 +888,7 @@ pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     report: Arc<ExpressionReport<B>>,
     arguments: IndexMap<B, TypeExpr>,
     instance: ExpressionInstance,
-    require_scope: Option<RequireScope>,
+    require_scope: RequireScope,
     captures: Arc<CapturedNodes>,
     projections: Arc<IndexMap<(ExpressionInstance, NodeId), Value<ParserPlaceholder, B>>>,
     template_placements: crate::ConversionChannel,
@@ -922,7 +923,7 @@ impl<B: BindingAddress> Default for Expressions<B> {
             report: Arc::new(ExpressionReport::empty()),
             arguments: IndexMap::new(),
             instance: ExpressionInstance::Root,
-            require_scope: None,
+            require_scope: RequireScope::Unknown,
             captures: Arc::default(),
             projections: Arc::default(),
             template_placements: Default::default(),
@@ -964,7 +965,7 @@ impl<B: BindingAddress> Expressions<B> {
         &self.report
     }
     fn set_require_scope(&mut self, scope: RequireScope) {
-        self.require_scope = Some(scope.clone());
+        self.require_scope = scope.clone();
         let mut memo = HashMap::new();
         let mut transform = |_: NodeId, current: Option<RetainedRequireCondition>| {
             current.map(|mut require| {
@@ -1178,8 +1179,8 @@ pub(crate) fn set_directory_require_scope<E, D, B: BindingAddress>(
     let (_, nodes) = scope.into_parts();
     let expressions = file.parser_binding_metadata.syntax.expressions_mut();
     match nodes {
-        crate::config_loader::DirectoryRequireNodes::Absent(_no_require_nodes) => {
-            expressions.require_scope = None;
+        crate::config_loader::DirectoryRequireNodes::Absent(no_require_nodes) => {
+            expressions.set_require_scope(RequireScope::Absent(no_require_nodes));
         }
         crate::config_loader::DirectoryRequireNodes::Present(scope) => {
             expressions.set_require_scope(scope);
@@ -1196,7 +1197,6 @@ pub(crate) fn require_scope<E, D, B: BindingAddress>(
         .expressions()
         .require_scope
         .clone()
-        .unwrap_or_default()
 }
 
 /// Full analysis acquires the root require rejection together with its
@@ -1206,11 +1206,15 @@ fn admit_require_scope<E, D, B: BindingAddress>(
     file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) {
     let expressions = file.parser_binding_metadata.syntax.expressions_mut();
-    let Some(RequireScope::UnvalidatedDirectory(evidence)) = expressions.require_scope.as_ref()
-    else {
-        return;
+    let evidence = match &expressions.require_scope {
+        RequireScope::UnvalidatedDirectory(evidence) => evidence.clone(),
+        RequireScope::Unknown
+        | RequireScope::Absent(_)
+        | RequireScope::Directory(_)
+        | RequireScope::ModuleTemplate(_)
+        | RequireScope::ModuleCall => return,
     };
-    expressions.set_require_scope(RequireScope::Directory(evidence.clone()));
+    expressions.set_require_scope(RequireScope::Directory(evidence));
 }
 
 pub(crate) fn judge_configuration<
@@ -1343,7 +1347,7 @@ impl Expressions {
             .read()
             .expect("retained require declarations")
             .clone();
-        let scope = self.require_scope.clone().unwrap_or_default();
+        let scope = self.require_scope.clone();
         let mut memo = HashMap::new();
         for root in &mut self.roots {
             retain_require_nodes(root, &mut memo, &mut |id, current| {
@@ -5236,6 +5240,7 @@ mod judgement {
                         Some((require.statement.clone(), verdict.clone()))
                     }
                     RequireScope::Unknown
+                    | RequireScope::Absent(_)
                     | RequireScope::ModuleTemplate(_)
                     | RequireScope::ModuleCall => None,
                 });

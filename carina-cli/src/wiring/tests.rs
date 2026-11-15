@@ -11081,8 +11081,8 @@ fn deferred_block_name_conflict_reports_materialized_template_address() {
         carina_core::parser::ForBinding::Simple("item".to_string()),
         template_resource,
     );
-    let unresolved: carina_core::parser::ParsedFile = Default::default();
-    let mut evaluated = resolve_file_for_test(<carina_core::parser::ParsedFile>::default());
+    let unresolved = carina_core::parser::ParsedFile::default();
+    let mut evaluated = resolve_file_for_test(carina_core::parser::ParsedFile::default());
     evaluated.replace_deferred_for_expressions(
         carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([deferred]),
     );
@@ -16315,7 +16315,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
         Err(error) => error,
     };
-    let unresolved: carina_core::parser::ParsedFile = Default::default();
+    let unresolved = carina_core::parser::ParsedFile::default();
     let pair_error = match incomplete_load().validate_config_pair(
         invalid_config(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -16366,7 +16366,7 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors_
     .parsed;
 
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
-        <carina_core::parser::ParsedFile>::default(),
+        carina_core::parser::ParsedFile::default(),
     );
     let error = match providers.validate_config_pair(parsed, unresolved, &project_path, false, &[])
     {

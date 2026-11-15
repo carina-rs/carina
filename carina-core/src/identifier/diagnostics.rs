@@ -3,14 +3,7 @@ use super::*;
 use crate::parser::{AnalysisTree, DeclarationLocation, DeferredForPhaseTraversal, Located};
 use crate::resource::ParserPlaceholder;
 
-type IdentityAnalysis<'a, D, B> = AnalysisTree<
-    'a,
-    ParserPlaceholder,
-    ParserPlaceholder,
-    D,
-    B,
-    crate::parser::ParsedExportParam<ParserPlaceholder, B>,
->;
+type IdentityAnalysis<'a, D, B> = AnalysisTree<'a, ParserPlaceholder, ParserPlaceholder, D, B>;
 
 pub fn attribute_derived_conflict_diagnostics<'a, D, B: BindingAddress>(
     tree: &IdentityAnalysis<'_, D, B>,

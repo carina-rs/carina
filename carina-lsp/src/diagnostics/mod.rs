@@ -144,7 +144,6 @@ type ExpandedAnalysis<'a> = carina_core::parser::AnalysisTree<
         AbsoluteBindingAddress,
     >,
     AbsoluteBindingAddress,
-    carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
 >;
 type ExpandedResource<'a> = carina_core::parser::AnalysisResourceRef<
     'a,
@@ -163,7 +162,6 @@ type RootAnalysis<'a> = carina_core::parser::AnalysisTree<
     ParserPlaceholder,
     carina_core::parser::ParsedDeferredForPhase<ParserPlaceholder, AbsoluteBindingAddress>,
     AbsoluteBindingAddress,
-    carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
 >;
 
 /// Seal each input at the parse/expansion boundary before dependent checks run.
@@ -250,8 +248,11 @@ fn directory_evidence_presentation(
 ) -> DirectoryEvidencePresentation {
     let location = evidence.location();
     let (start, end) = evidence.utf16_columns();
-    let uri = match tower_lsp::lsp_types::Url::from_file_path(evidence.file_locator().to_path_buf())
-    {
+    let locator = match carina_core::paths::PersistedPath::new(evidence.file_locator()) {
+        Ok(locator) => locator,
+        Err(_error) => return DirectoryEvidencePresentation::Note(evidence.note()),
+    };
+    let uri = match tower_lsp::lsp_types::Url::from_file_path(locator.to_path_buf()) {
         Ok(uri) => uri,
         Err(()) => return DirectoryEvidencePresentation::Note(evidence.note()),
     };
@@ -740,14 +741,7 @@ impl DiagnosticRun<'_> {
     fn resolve_diagnostic_upstream_exports<D, B: BindingAddress>(
         &self,
         base: &carina_core::paths::ResolvedPath,
-        tree: &carina_core::parser::AnalysisTree<
-            '_,
-            ParserPlaceholder,
-            ParserPlaceholder,
-            D,
-            B,
-            carina_core::parser::ParsedExportParam<ParserPlaceholder, B>,
-        >,
+        tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
         overrides: &carina_core::config_loader::SourceOverrides,
     ) -> Result<
         (
@@ -960,30 +954,39 @@ impl DiagnosticRun<'_> {
             buffer_analysis.as_ref(),
         ) {
             (Some(Ok(_)), _, _) | (_, None, _) | (_, _, None) => None,
-            (Some(Err(_)) | None, Some(buffer), Some(_)) => base_path
-                .and_then(|base| {
-                    carina_core::config_loader::DirectoryBufferSnapshot::capture(
-                        base,
-                        buffer.clone(),
-                        &overrides,
-                    )
-                    .ok()
-                })
-                .map(|snapshot| {
-                    carina_core::config_loader::load_buffer_configuration_in_directory(
-                        snapshot,
-                        &self.schemas,
-                        self.provider_context.catalog(),
-                    )
-                })
-                .or_else(|| {
+            (Some(Err(_)) | None, Some(buffer), Some(_)) => {
+                let isolated = || {
                     carina_core::config_loader::load_buffer_configuration_without_directory(
                         buffer,
                         &self.schemas,
                         self.provider_context,
                     )
-                    .ok()
-                }),
+                };
+                Some(match base_path {
+                    Some(base) => {
+                        match carina_core::config_loader::DirectoryBufferSnapshot::capture(
+                            base,
+                            buffer.clone(),
+                            &overrides,
+                        ) {
+                            Ok(snapshot) => {
+                                carina_core::config_loader::load_buffer_configuration_in_directory(
+                                    snapshot,
+                                    &self.schemas,
+                                    self.provider_context.catalog(),
+                                )
+                            }
+                            Err(error) => {
+                                log::debug!(
+                                    "using isolated buffer after directory capture failures: {error}"
+                                );
+                                isolated()
+                            }
+                        }
+                    }
+                    None => isolated(),
+                })
+            }
         };
         let buffer_parsed = recovery_configuration
             .as_ref()
@@ -1168,9 +1171,9 @@ impl DiagnosticRun<'_> {
             diagnostics.extend(self.check_mixed_tag_key_styles(doc, base, &result.directory, tree));
         }
         if let Some(boundary_file) = current_parsed {
-            let boundary_file_for_scope = merged.unwrap_or(boundary_file);
-            let boundary = if !boundary_file_for_scope.arguments.is_empty()
-                || !boundary_file_for_scope.attribute_params.is_empty()
+            let boundary = if merged
+                .unwrap_or(boundary_file)
+                .declares_module_placeholders()
             {
                 carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
             } else {
@@ -1435,10 +1438,7 @@ impl DiagnosticRun<'_> {
             // back to the buffer parse only when directory merging failed. This
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
-            let directive_file = merged.unwrap_or(parsed);
-            let directive_boundary = if !directive_file.arguments.is_empty()
-                || !directive_file.attribute_params.is_empty()
-            {
+            let directive_boundary = if merged.unwrap_or(parsed).declares_module_placeholders() {
                 carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
             } else {
                 carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
@@ -2796,18 +2796,19 @@ impl DiagnosticRun<'_> {
                     .filter(|b| current_file_bindings.contains(b))
                     .collect()
                 }
-                (None, None) => carina_core::config_loader::AuthoredBindingView::parse_file_source(
+                (None, None) => match carina_core::config_loader::AuthoredBindingView::parse_file_source(
                     &text,
                     current_file_path.unwrap_or_else(|| doc.source_file()),
                     self.provider_context.catalog(),
-                )
-                .map(|view| {
-                    carina_core::validation::check_unused_bindings_with_identity_requirements(
-                        &view,
-                        &self.schemas,
-                    )
-                })
-                .unwrap_or_default(),
+                ) {
+                    Ok(view) => carina_core::validation::check_unused_bindings_with_identity_requirements(
+                        &view, &self.schemas,
+                    ),
+                    Err(error) => {
+                        log::debug!("unused-binding analysis unavailable for buffer: {error}");
+                        Vec::new()
+                    }
+                },
                 (None, Some(_)) => Vec::new(),
             };
             diagnostics.extend(self.unused_binding_diagnostics(

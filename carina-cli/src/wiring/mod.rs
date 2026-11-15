@@ -5297,8 +5297,6 @@ pub(crate) fn validate_module_internal_ref_types(
 /// placement checks. Cause routing is exhaustive at ModuleRejection's boundary.
 pub(crate) fn validate_module_boundaries(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = rejected_module_errors(module_walk);
-    errors.extend(validate_no_provider_in_modules(module_walk));
-    errors.extend(validate_no_backend_in_modules(module_walk));
     errors.extend(validate_no_state_blocks_in_modules(module_walk));
     errors.extend(validate_no_upstream_states_in_modules(module_walk));
     errors.extend(validate_no_exports_in_modules(module_walk));
@@ -5313,25 +5311,6 @@ fn rejected_module_errors(module_walk: &ModuleWalk) -> Vec<AppError> {
         .collect()
 }
 
-/// Reject providers in every recursively loaded module and preserve each
-/// module's import path in the resulting user-facing diagnostic. The module
-/// directory unit deliberately includes imported-but-uncalled nested modules,
-/// matching the duplicate and attribute-type validation policy from
-/// #3711/#3714. The resolver retains its own expansion-phase backstop for
-/// callers that bypass this validation walk.
-pub(crate) fn validate_no_provider_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
-    let mut errors = Vec::new();
-    for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_provider_in_module(module.loaded()) {
-            errors.push(AppError::Validation(format!(
-                "{}: {message}",
-                module.diagnostic_label()
-            )));
-        }
-    }
-    errors
-}
-
 /// Reject state blocks in every recursively loaded module and preserve each
 /// module's import path in the resulting user-facing diagnostic. The module
 /// directory unit deliberately includes imported-but-uncalled nested modules,
@@ -5341,23 +5320,6 @@ pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> V
     let mut errors = Vec::new();
     for module in module_walk.iter() {
         if let Err(message) = validation::validate_no_state_blocks_in_module(module.loaded()) {
-            errors.push(AppError::Validation(format!(
-                "{}: {message}",
-                module.diagnostic_label()
-            )));
-        }
-    }
-    errors
-}
-
-/// Reject backend blocks in every recursively loaded module and preserve each
-/// module's import path in the resulting user-facing diagnostic. The resolver
-/// retains its own expansion-phase backstop for callers that bypass this
-/// validation walk.
-pub(crate) fn validate_no_backend_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
-    let mut errors = Vec::new();
-    for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_backend_in_module(module.loaded()) {
             errors.push(AppError::Validation(format!(
                 "{}: {message}",
                 module.diagnostic_label()

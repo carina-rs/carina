@@ -239,6 +239,21 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
             location: Some(Location::span(error.source_file(), error.source_span())),
             ..Diagnostic::new(error.to_string(), "error")
         },
+        AppError::RootPlacementGroup(group) => {
+            return group.errors().iter().flat_map(error_diagnostics).collect();
+        }
+        AppError::ModuleImport { path, error } => {
+            return module_error_diagnostics(error.individual_errors())
+                .into_iter()
+                .map(|mut diagnostic| {
+                    diagnostic.message = format!("{path}: {}", diagnostic.message);
+                    diagnostic
+                })
+                .collect();
+        }
+        AppError::LintModuleResolution { error, base: _ } => {
+            return module_error_diagnostics(error.individual_errors());
+        }
         AppError::ModuleImportResolution { error, base: _ } => {
             return module_error_diagnostics(error.individual_errors());
         }
@@ -622,19 +637,15 @@ impl ValidateReport {
                             )]
                         }
                     };
-                    for line in lines {
+                    for line in lines
+                        .into_iter()
+                        .map(crate::error::present_human_error_line)
+                    {
                         match line {
-                            crate::error::HumanErrorLine::RootEvidence(evidence) => {
-                                writeln!(stderr, "  Note: {}", evidence.note())?
+                            crate::error::HumanErrorPresentation::Note(note) => {
+                                writeln!(stderr, "{note}")?
                             }
-                            crate::error::HumanErrorLine::ModuleEvidenceRelative {
-                                evidence,
-                                root,
-                            } => writeln!(stderr, "  Note: {}", evidence.note_relative_to(&root))?,
-                            crate::error::HumanErrorLine::ModuleEvidence(evidence) => {
-                                writeln!(stderr, "  Note: {}", evidence.note())?
-                            }
-                            crate::error::HumanErrorLine::Message(message) => {
+                            crate::error::HumanErrorPresentation::Message(message) => {
                                 for line in message.lines() {
                                     writeln!(stderr, "{prefix} {line}")?;
                                 }

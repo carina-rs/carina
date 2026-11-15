@@ -1434,9 +1434,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     });
     file.backend = Some(BackendConfig {
         backend_type: "local".to_string(),
-        attributes: HashMap::<String, _>::from([("path".to_string(), empty())])
-            .into_iter()
-            .collect(),
+        attributes: (HashMap::<String, _>::from([("path".to_string(), empty())])).into(),
         attribute_spans: Default::default(),
     });
     file.variables.insert("greeting".to_string(), empty());
@@ -1736,7 +1734,7 @@ fn iter_all_resources_yields_direct_then_deferred() {
 #[test]
 fn resolved_resource_iterator_is_phase_exhaustive() {
     let resolved =
-        cross_deferred_for_resolution_seam(<ParsedFile>::default(), "// AST-only fixture\n");
+        cross_deferred_for_resolution_seam(ParsedFile::default(), "// AST-only fixture\n");
 
     let kinds = resolved
         .iter_all_resources()

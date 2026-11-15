@@ -4844,9 +4844,17 @@ moved {
             .contains("state blocks (moved, removed, and import) are not allowed inside modules")
     });
     assert!(
-        state_block_diag.is_none(),
-        "an unclassified buffer has no placement verdict: {diagnostics:#?}"
+        state_block_diag.is_some(),
+        "Should error about a moved block in a module. Got diagnostics: {:?}",
+        diagnostics
+            .iter()
+            .map(|diagnostic| &diagnostic.message)
+            .collect::<Vec<_>>()
     );
+    let diag = state_block_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diag.range.start.line, 4);
+    assert_eq!(diag.range.start.character, 0);
 }
 
 #[test]
@@ -5011,7 +5019,7 @@ let up = upstream_state { source = './b' }
 
     assert_eq!(
         upstream_state_lines,
-        Vec::<u32>::new(),
+        vec![4],
         "the discarded declaration must not hide or receive the real module violation: {diagnostics:#?}",
     );
 }
@@ -18359,81 +18367,6 @@ fn provider_in_module_with_sibling_arguments_emits_error_in_directory() {
     assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
     assert_eq!(diag.range.start.line, 0);
     assert_eq!(diag.range.start.character, 0);
-}
-
-#[test]
-fn moved_block_in_module_emits_error_in_directory() {
-    let engine = test_engine();
-    let doc = create_document(
-        r#"arguments {
-    name: String = "test"
-}
-
-moved {
-    from = mock.test.Resource 'old'
-    to = mock.test.Resource 'new'
-}"#,
-    );
-
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("main.crn");
-    let source = doc.text();
-    std::fs::write(&path, &source).unwrap();
-    let doc = create_document_at(&source, path.clone());
-    let diagnostics = engine.analyze(&doc, Some(&path));
-
-    let state_block_diag = diagnostics.iter().find(|diagnostic| {
-        diagnostic
-            .message
-            .contains("state blocks (moved, removed, and import) are not allowed inside modules")
-    });
-    assert!(
-        state_block_diag.is_some(),
-        "Should error about a moved block in a module. Got diagnostics: {:?}",
-        diagnostics
-            .iter()
-            .map(|diagnostic| &diagnostic.message)
-            .collect::<Vec<_>>()
-    );
-    let diag = state_block_diag.unwrap();
-    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(diag.range.start.line, 4);
-    assert_eq!(diag.range.start.character, 0);
-}
-
-#[test]
-fn discarded_upstream_state_does_not_suppress_real_module_diagnostic_in_directory() {
-    let engine = test_engine();
-    let doc = create_document(
-        r#"let _ = upstream_state { source = './a' }
-arguments {
-    n: String = "x"
-}
-let up = upstream_state { source = './b' }
-"#,
-    );
-
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("main.crn");
-    let source = doc.text();
-    std::fs::write(&path, &source).unwrap();
-    let doc = create_document_at(&source, path.clone());
-    let diagnostics = engine.analyze(&doc, Some(&path));
-    let upstream_state_lines: Vec<_> = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic
-                .message
-                .contains("upstream_state declarations are not allowed inside modules")
-        })
-        .map(|diagnostic| diagnostic.range.start.line)
-        .collect();
-
-    assert_eq!(
-        upstream_state_lines,
-        vec![4],
-        "the discarded declaration must not hide or receive the real module violation: {diagnostics:#?}",
-    );
 }
 
 #[test]

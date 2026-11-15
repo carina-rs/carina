@@ -14078,7 +14078,7 @@ async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: boo
     let mut plan = Plan::new();
     plan.add(deposed.to_delete_effect());
     let compiled = if bound {
-        let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
+        let configuration = crate::parser::ExpandedParsedFile {
             upstream_states: vec![crate::parser::UpstreamState {
                 caller: crate::parser::upstream_caller_for_test(),
                 binding: absolute_binding("cert"),
@@ -14204,7 +14204,7 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
         previous_attributes: Default::default(),
     };
     let first = old(0).id;
-    let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
+    let configuration = crate::parser::ExpandedParsedFile {
         upstream_states: vec![crate::parser::UpstreamState {
             caller: crate::parser::upstream_caller_for_test(),
             binding: absolute_binding("cert"),

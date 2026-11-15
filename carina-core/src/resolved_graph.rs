@@ -1495,7 +1495,7 @@ impl<E, D> From<File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>>
 ///
 /// ```compile_fail,E0382
 /// use carina_core::{parser::ExpandedParsedFile, resolved_graph::resolve_expanded_graph};
-/// let parsed: ExpandedParsedFile = Default::default();
+/// let parsed = ExpandedParsedFile::default();
 /// let first = resolve_expanded_graph(parsed.into());
 /// let second = resolve_expanded_graph(parsed.into());
 /// ```

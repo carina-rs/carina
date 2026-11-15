@@ -1,0 +1,3 @@
+attributes {}
+let seed = mock.test.resource { name = 'seed' }
+for flag in seed.name { mock.test.resource { name = 'one' directives { prevent_destroy = flag } } }

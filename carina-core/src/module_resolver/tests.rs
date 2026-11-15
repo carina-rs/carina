@@ -378,12 +378,11 @@ fn reconcile_anonymous_module_instances(
     >],
     find_state_names_by_type: &dyn Fn(&str, &str) -> Vec<String>,
 ) {
-    let mut file: crate::parser::ModuleResolvedParsedFile =
-        crate::parser::ModuleResolvedParsedFile {
-            resources: resources.to_vec(),
-            compositions: compositions.to_vec(),
-            ..Default::default()
-        };
+    let mut file = crate::parser::ModuleResolvedParsedFile {
+        resources: resources.to_vec(),
+        compositions: compositions.to_vec(),
+        ..Default::default()
+    };
     crate::module_resolver::reconcile_anonymous_module_instances(
         &mut file,
         find_state_names_by_type,
@@ -3868,7 +3867,7 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
 
     // A small module that declares two `argument` parameters and one
     // `attribute` output, used to verify both halves of the signature.
-    let module: ParsedFile = ParsedFile {
+    let module = ParsedFile {
         providers: vec![],
         resources: vec![],
         data_sources: vec![],
@@ -4222,7 +4221,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
                     source_line: (7).into(),
                 }),
             );
-            let mut module: ParsedFile = ParsedFile {
+            let mut module = ParsedFile {
                 resources: vec![origin, dependent],
                 ..ParsedFile::default()
             };
@@ -6341,7 +6340,7 @@ let root = outer { outer_port = producer.port }
         quoted_string_attrs: HashSet::new(),
         declaration: Default::default(),
     };
-    let outer: ParsedFile = ParsedFile {
+    let outer = ParsedFile {
         providers: vec![],
         data_sources: vec![],
         compositions: vec![inner],
@@ -6569,7 +6568,7 @@ fn test_argument_validation_fails_too_large() {
 #[test]
 fn test_argument_validation_no_message_uses_default() {
     use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
-    let module: ParsedFile = ParsedFile {
+    let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
         compositions: vec![],
@@ -6645,7 +6644,7 @@ fn test_argument_validation_no_message_uses_default() {
 #[test]
 fn test_argument_validation_len_with_list() {
     use crate::parser::{CompareOp, ValidateExpr, ValidationBlock};
-    let module: ParsedFile = ParsedFile {
+    let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
         compositions: vec![],
@@ -6740,7 +6739,7 @@ fn test_argument_validation_len_with_list() {
 #[test]
 fn test_require_block_passes() {
     use crate::parser::{CompareOp, RequireBlock, ValidateExpr};
-    let module: ParsedFile = ParsedFile {
+    let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
         compositions: vec![],
@@ -6834,7 +6833,7 @@ fn test_require_block_passes() {
 #[test]
 fn test_require_block_fails_with_not_expr() {
     use crate::parser::{RequireBlock, ValidateExpr};
-    let module: ParsedFile = ParsedFile {
+    let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
         compositions: vec![],
@@ -6928,7 +6927,7 @@ fn test_require_block_fails_with_not_expr() {
 #[test]
 fn test_require_block_len_function() {
     use crate::parser::{CompareOp, RequireBlock, ValidateExpr};
-    let module: ParsedFile = ParsedFile {
+    let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
         compositions: vec![],
@@ -7027,7 +7026,7 @@ fn test_require_block_len_function() {
 #[test]
 fn test_require_block_multiple_constraints() {
     use crate::parser::{CompareOp, RequireBlock, ValidateExpr};
-    let module: ParsedFile = ParsedFile {
+    let module = ParsedFile {
         providers: vec![],
         data_sources: vec![],
         compositions: vec![],
@@ -12148,7 +12147,6 @@ fn module_require_diagnostic_keeps_direct_constraint_type_and_message() {
         else {
             panic!("expected a module constraint diagnostic");
         };
-        let diagnostic: &ModuleConstraintDiagnostic = diagnostic;
         assert_eq!(
             diagnostic.to_string(),
             "module 'checked' (call 'control'): arguments 'n': module guard (got n = 2)"

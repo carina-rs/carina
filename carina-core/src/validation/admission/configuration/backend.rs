@@ -142,7 +142,7 @@ where
         &self,
     ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<LocatedBackendError>>>
     {
-        if !self.file().arguments.is_empty() || !self.file().attribute_params.is_empty() {
+        if self.file().declares_module_placeholders() {
             return None;
         }
         let backend = self.file().backend.as_ref()?;

@@ -821,17 +821,10 @@ fn render_app_error(
         _ => AppErrorRendering {
             stderr: error::human_error_lines(e)
                 .into_iter()
+                .map(error::present_human_error_line)
                 .map(|line| match line {
-                    error::HumanErrorLine::RootEvidence(evidence) => {
-                        format!("  Note: {}\n", evidence.note())
-                    }
-                    error::HumanErrorLine::ModuleEvidenceRelative { evidence, root } => {
-                        format!("  Note: {}\n", evidence.note_relative_to(&root))
-                    }
-                    error::HumanErrorLine::ModuleEvidence(evidence) => {
-                        format!("  Note: {}\n", evidence.note())
-                    }
-                    error::HumanErrorLine::Message(message) => {
+                    error::HumanErrorPresentation::Note(note) => format!("{note}\n"),
+                    error::HumanErrorPresentation::Message(message) => {
                         format_error_lines(color_mode, &message)
                     }
                 })

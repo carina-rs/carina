@@ -194,13 +194,8 @@ pub(crate) fn parsed_fixture(source: &str) -> carina_core::parser::ParsedFile {
         &carina_core::parser::ProviderContext::new(EnvironmentSnapshot::empty()),
     )
     .expect("parse authored fixture");
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("main.crn"), source).unwrap();
-    carina_core::config_loader::ParsedRootDirectory::from_parsed_in_directory_for_test(
-        parsed,
-        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
-    )
-    .into_parsed()
+    carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(parsed, source)
+        .into_parsed()
 }
 
 #[cfg(test)]

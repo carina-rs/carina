@@ -5780,7 +5780,7 @@ fn resource_values_report<
     // availability cannot be decided until its resources are expanded into a
     // root configuration. Keep every other schema/type check below active for
     // modules; only defer this provider-availability diagnostic.
-    if parsed.arguments.is_empty() && parsed.attribute_params.is_empty() {
+    if !parsed.declares_module_placeholders() {
         all_errors.extend(group_anonymous_resource_schema_errors(
             parsed
                 .iter_all_resources()
@@ -6398,14 +6398,7 @@ pub fn validate_module_iteration_shape<P: PlaceholderKind, B: BindingAddress>(
 /// }
 /// ```
 pub fn validate_deferred_for_iterable_types<D, B: BindingAddress>(
-    tree: &crate::parser::AnalysisTree<
-        '_,
-        ParserPlaceholder,
-        ParserPlaceholder,
-        D,
-        B,
-        crate::parser::ParsedExportParam<ParserPlaceholder, B>,
-    >,
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &SchemaRegistry,
     provider_context: &ProviderContext,
 ) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>
@@ -6471,14 +6464,7 @@ fn validate_deferred_for_iterable_types_with_bindings<
 
 /// Unknown roots in deferred iterables are owned by their authored occurrence.
 pub fn validate_for_iterable_bindings<D, B: BindingAddress>(
-    tree: &crate::parser::AnalysisTree<
-        '_,
-        ParserPlaceholder,
-        ParserPlaceholder,
-        D,
-        B,
-        crate::parser::ParsedExportParam<ParserPlaceholder, B>,
-    >,
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> Vec<crate::parser::Located<crate::parser::ParseError>>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -6932,14 +6918,7 @@ impl ExportBoundaryError {
 
     pub fn diagnostic<'a, D, B: BindingAddress>(
         &'a self,
-        tree: &crate::parser::AnalysisTree<
-            '_,
-            ParserPlaceholder,
-            ParserPlaceholder,
-            D,
-            B,
-            crate::parser::ParsedExportParam<ParserPlaceholder, B>,
-        >,
+        tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     ) -> crate::parser::Located<&'a Self>
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -7394,9 +7373,12 @@ fn is_string_compatible_type_on_path<'a>(
 pub fn validate_no_module_declarations_in_root<E>(
     parsed: &crate::parser::File<E>,
 ) -> Result<(), crate::parser::Located<ConfigurationPlacementDiagnostic>> {
-    match placement_diagnostics_for_inventory(parsed.parser_binding_metadata.syntax())
-        .into_iter()
-        .find(|finding| finding.detail().root_evidence().is_some())
+    match placement_diagnostics_for_inventory(
+        parsed.parser_binding_metadata.syntax(),
+        parsed.declares_module_placeholders(),
+    )
+    .into_iter()
+    .find(|finding| finding.detail().root_evidence().is_some())
     {
         Some(finding) => Err(finding),
         None => Ok(()),
@@ -8384,60 +8366,28 @@ pub fn configuration_placement_diagnostics<
 >(
     tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
 ) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
-    placement_diagnostics_for_inventory(tree.syntax())
+    placement_diagnostics_for_inventory(tree.syntax(), tree.file().declares_module_placeholders())
 }
 
 pub(crate) fn placement_diagnostics_for_inventory<B: BindingAddress>(
     syntax: &crate::parser::SyntaxInventory<B>,
+    declares_module_placeholders: bool,
 ) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
     use crate::config_loader::DirectoryVerdict;
     use crate::parser::ConfigurationBlock;
     syntax.configuration_blocks().iter().filter_map(|block| {
-        let (message, root) = match block.detail().directory_verdict() {
-            DirectoryVerdict::Root(root) => (root_declaration_message(block.detail().kind())?, Some(root.clone())),
-            DirectoryVerdict::ModuleTemplate(_) => {
-                let message = match block.detail().kind() {
-                    ConfigurationBlock::Provider | ConfigurationBlock::Backend => return None,
-                    ConfigurationBlock::State => "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
-                    ConfigurationBlock::UpstreamState => "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
-                    ConfigurationBlock::Exports => "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
-                    ConfigurationBlock::Arguments | ConfigurationBlock::Attributes | ConfigurationBlock::Require => return None,
-                };
-                (message, None)
-            }
-            DirectoryVerdict::Unknown(_) | DirectoryVerdict::NoEvidence(_) => return None,
+        let (message, root) = match block.detail().kind() {
+            ConfigurationBlock::State if declares_module_placeholders => ("state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.", None),
+            ConfigurationBlock::UpstreamState if declares_module_placeholders => ("upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.", None),
+            ConfigurationBlock::Exports if declares_module_placeholders => ("exports blocks are not allowed inside modules. Define exports at the root configuration level.", None),
+            ConfigurationBlock::Arguments | ConfigurationBlock::Attributes => match block.detail().directory_verdict() {
+                DirectoryVerdict::Root(root) => (root_declaration_message(block.detail().kind())?, Some(root.clone())),
+                DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::Unknown(_) | DirectoryVerdict::NoEvidence(_) => return None,
+            },
+            ConfigurationBlock::State | ConfigurationBlock::UpstreamState | ConfigurationBlock::Exports | ConfigurationBlock::Provider | ConfigurationBlock::Backend | ConfigurationBlock::Require => return None,
         };
         Some(crate::parser::Located::new(block.location().clone(), ConfigurationPlacementDiagnostic { message, root }))
     }).collect()
-}
-
-/// Check that a module file does not contain provider blocks.
-///
-/// Provider configuration should only be defined at the root configuration level,
-/// not inside explicitly imported modules. This is a module-use check, not
-/// a directory classifier; the loader witness establishes the module boundary.
-///
-/// ```compile_fail,E0308
-/// # fn root_file(file: &carina_core::parser::ParsedFile) {
-/// carina_core::validation::validate_no_provider_in_module(file).unwrap();
-/// # }
-/// ```
-pub fn validate_no_provider_in_module(
-    module: &crate::module_resolver::LoadedModule,
-) -> Result<(), String> {
-    if module
-        .parsed()
-        .parser_binding_metadata
-        .syntax()
-        .configuration_blocks()
-        .iter()
-        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::Provider)
-    {
-        return Err(
-            "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
-        );
-    }
-    Ok(())
 }
 
 /// Check that a module file does not contain state blocks.
@@ -8457,28 +8407,6 @@ pub fn validate_no_state_blocks_in_module(
     {
         return Err(
             "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.".to_string(),
-        );
-    }
-    Ok(())
-}
-
-/// Check that a module file does not contain a backend block.
-///
-/// Backend configuration should only be defined at the root configuration
-/// level, not inside explicitly imported modules.
-pub fn validate_no_backend_in_module(
-    module: &crate::module_resolver::LoadedModule,
-) -> Result<(), String> {
-    if module
-        .parsed()
-        .parser_binding_metadata
-        .syntax()
-        .configuration_blocks()
-        .iter()
-        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::Backend)
-    {
-        return Err(
-            "backend blocks are not allowed inside modules. Define the backend at the root configuration level.".to_string(),
         );
     }
     Ok(())

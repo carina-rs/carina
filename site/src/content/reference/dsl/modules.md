@@ -13,11 +13,11 @@ handle.
 Carina determines the declaration scope from the directory, including all sibling
 `.crn` files. With a complete inventory:
 
-| Evidence in the complete directory | Direct CLI, LSP, `module info` and TUI | Imported with `use` |
+| Evidence in the complete directory | Direct validation and LSP placement | Imported with `use` |
 | --- | --- | --- |
 | Any authored `provider` or `backend` block, including a provider instance bound with `let` | Root configuration | Rejected: provider/backend blocks belong to the root |
 | No root evidence, and an `arguments` block, `attributes` block, or `require` statement | Module template; empty blocks count | Module |
-| Neither root nor module evidence | Root configuration (`module info` displays File metadata) | Module |
+| Neither root nor module evidence | Root configuration | Module |
 
 All sibling `.crn` files contribute to this verdict. Root configurations cannot
 declare `arguments`, `attributes`, or `require`; empty blocks are also rejected.
@@ -28,7 +28,7 @@ a template when validated directly or opened in the language server.
 A directory is importable when it has at least one `.crn` file and no provider
 or backend block. Arguments and outputs are optional; entry counts do not
 change importability. Importing an existing directory with no `.crn` files
-reports `No .crn files found`. Imported modules and directly validated module templates cannot declare state
+reports `No .crn files found`. Imported modules cannot declare state
 blocks (`moved`, `import`, `removed`), `upstream_state`, or `exports`. Empty
 blocks count too. These declarations do not supply root evidence.
 
@@ -47,11 +47,11 @@ readable authored provider/backend block, including one in an unsaved buffer,
 establishes a root. Without root evidence, an incomplete directory or an editor
 buffer without a directory snapshot remains unknown. Module evidence alone
 cannot settle an incomplete inventory. Under unknown, Carina defers only
-root-only and module-only placement errors. Provider/backend schema and
-expression checks follow their usual rules.
+the placement errors added by these directory rules. Existing diagnostics for
+state blocks, `upstream_state`, and `exports` retain their usual behavior, as do
+provider/backend schema and expression checks.
 This partial recovery is specific to the language server; CLI directory loads
 still report the sibling read or parse failure.
-`module info` displays neutral file metadata for an unknown snapshot.
 
 Each root-placement diagnostic carries the provider/backend evidence from the
 verdict. The CLI includes an indented note naming its file and line; the

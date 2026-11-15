@@ -1107,7 +1107,7 @@ inventory and one typed verdict shared by declaration checks and require
 admission and importability. Root verdicts carry their authored provider/backend
 evidence location; render it without searching again. Module evidence includes
 arguments, attributes, and require (empty blocks count). The distinct no-evidence
-verdict is a module when imported and a root on direct/LSP/upstream/metadata entry.
+verdict is a module when imported and a root on direct/LSP/upstream entry.
 Readable provider/backend evidence establishes Root even with unavailable siblings
 or without a directory snapshot. Otherwise incomplete snapshots remain Unknown
 and defer only the root-only/module-only placement checks added by #4398.

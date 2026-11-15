@@ -14,10 +14,7 @@ fn backend_admission_skips_module_definitions() {
         )
         .unwrap();
         let tree = parser::AnalysisTree::try_from_file(&parsed).unwrap();
-        assert!(
-            !tree.file().arguments.is_empty() || !tree.file().attribute_params.is_empty(),
-            "{declaration}"
-        );
+        assert!(tree.file().declares_module_placeholders(), "{declaration}");
         assert!(tree.admit_backend().is_none(), "{declaration}");
     }
 }

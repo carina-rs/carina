@@ -541,8 +541,7 @@ pub(crate) fn validate_root_backend<E: carina_core::parser::ExportParamLike>(
 
 /// Recovery still checks each backend setting when the authored tree cannot seal.
 fn validate_unlocated_root_backend<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError> {
-    if parsed.arguments.is_empty()
-        && parsed.attribute_params.is_empty()
+    if !parsed.declares_module_placeholders()
         && let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
     {
@@ -717,7 +716,6 @@ fn validate_and_resolve_configuration(
     validation: &mut carina_core::validation::ConversionValidation<AppError>,
     directive_errors: &mut Vec<AppError>,
 ) -> Result<ResolvedConfig, ValidationStopped> {
-    let directory_verdict = parsed.complete_directory_verdict();
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
@@ -797,7 +795,7 @@ fn validate_and_resolve_configuration(
     let analysis = parsed.analysis();
     errors.extend(
         parsed
-            .configuration_placement_diagnostics()
+            .root_placement_diagnostics()
             .into_iter()
             .map(|finding| AppError::RootDeclaration(Box::new(finding))),
     );
@@ -1158,14 +1156,10 @@ fn validate_and_resolve_configuration(
     // This is the sole parser-placeholder boundary. Standalone module
     // definitions intentionally retain typed module-argument slots until a
     // caller expands them; root configurations must be fully expanded.
-    let placeholder_boundary = match directory_verdict {
-        carina_core::config_loader::DirectoryVerdict::Root(_)
-        | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {
-            carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
-        }
-        carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_) => {
-            carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
-        }
+    let placeholder_boundary = if parsed.declares_module_placeholders() {
+        carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+    } else {
+        carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
     };
     let directive_errors = parsed.directive_resolution_errors(
         placeholder_boundary,

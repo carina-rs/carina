@@ -857,7 +857,7 @@ pub fn resource_attribute_admissions<
 #[allow(clippy::too_many_arguments)]
 fn typed_resource_attribute_admissions<
     Pass: ResourceAdmissionPass,
-    A: RechecksResolved,
+    K: RechecksResolved,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
@@ -1027,7 +1027,7 @@ fn typed_resource_attribute_admissions<
             let mut findings = Default::default();
             Some(
                 reference
-                    .judge_at::<A>(contract, attr, _path, boundary, &mut findings)
+                    .judge_at::<K>(contract, attr, _path, boundary, &mut findings)
                     .map(|()| findings)
                     .map_err(|error| reference.error_with_origin(error)),
             )
@@ -1129,7 +1129,7 @@ fn typed_resource_attribute_admissions<
                 assignment::CandidateOrigin::of(expression.assignment_value(value))
             {
                 let mut findings = Default::default();
-                reference.judge_at::<A>(contract, attr, _path, boundary, &mut findings)?;
+                reference.judge_at::<K>(contract, attr, _path, boundary, &mut findings)?;
                 return Ok(findings);
             }
         }
@@ -1217,7 +1217,7 @@ fn typed_resource_attribute_admissions<
         candidate: &candidate,
         coverage,
     };
-    admit_validation_attributes_with_input::<A, _, _>(
+    admit_validation_attributes_with_input::<K, _, _>(
         schema,
         resource.id(),
         attributes,

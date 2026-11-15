@@ -521,7 +521,7 @@ mod provider_scope_evidence_tests {
             provider_config("east"),
             provider_config("west"),
         ];
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs.clone();
         let resolved = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
@@ -2981,7 +2981,7 @@ mod schema_fingerprint_tests {
     fn saved_provider_configs(
         configs: Vec<carina_core::parser::ExpandedProviderConfig>,
     ) -> SavedProviderConfigs {
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
         let resolved = carina_core::validation::deferred_types::with_session_for_test(
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
@@ -3871,7 +3871,12 @@ pub struct PlanWaitBinding {
     pub target: carina_core::resource::AbsoluteBindingAddress,
 }
 
-/// Upstream source saved at plan time.
+/// Serializable representation of an `upstream_state` declaration's
+/// source directory — needed because `parser::ast::UpstreamState` is
+/// not `Serialize`/`Deserialize` and pulling a `serde` derive into
+/// `carina-core::parser::ast` would have wider blast radius than this
+/// PR wants. Constructed once at plan time and consumed at
+/// apply-from-plan time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamSource {
     pub binding: carina_core::resource::AbsoluteBindingAddress,
@@ -4371,7 +4376,7 @@ impl ReloadedPlanFile<SnapshotLeaf> {
     pub(crate) fn into_live_without_secrets(
         self,
     ) -> Result<ReloadedPlanFile, carina_core::value::SecretRehydrationSiteError> {
-        let parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let parsed = carina_core::parser::ExpandedInferredFile::default();
         let provider_configuration = self
             .provider_configuration
             .rehydrate(&HashMap::new(), &HashMap::new())?;
@@ -7233,13 +7238,8 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
                 identity.source().metadata()?;
                 Ok(identity)
             })
-            .map_err(|e| {
-                AppError::Config(format!(
-                    "upstream_state '{}': cannot resolve source '{}': {}",
-                    us.binding,
-                    us.source.display(),
-                    e
-                ))
+            .map_err(|error| {
+                crate::error::upstream_source_config_error(&us.binding, &us.source, error)
             })
     });
     load_selected_upstream_identities(
@@ -7496,13 +7496,8 @@ async fn walk_upstream_cycles_only<B: carina_core::resource::BindingAddress>(
                 source.metadata()?;
                 Ok(source)
             })
-            .map_err(|e| {
-                AppError::Config(format!(
-                    "upstream_state '{}': cannot resolve source '{}': {}",
-                    us.binding,
-                    us.source.display(),
-                    e
-                ))
+            .map_err(|error| {
+                crate::error::upstream_source_config_error(&us.binding, &us.source, error)
             })?;
 
         let source_identity = source_abs.identity();
@@ -7911,7 +7906,7 @@ mod load_upstream_states_tests {
     #[tokio::test]
     async fn issue_4304_3a_review2_read_only_and_desired_provider_inputs_are_distinct() {
         let temp = tempfile::tempdir().unwrap();
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".into(),
             attributes: Default::default(),
@@ -8240,7 +8235,7 @@ mod load_upstream_states_tests {
     #[tokio::test]
     async fn review2_f8_provider_upstream_inventory_masks_secret_reference_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.upstream_states.push(UpstreamState {
             caller: carina_core::parser::upstream_caller_for_test(),
             binding: absolute_binding("private_upstream"),
@@ -8293,7 +8288,7 @@ mod load_upstream_states_tests {
     #[tokio::test]
     async fn provider_resolution_preserves_complete_parse_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
             attributes: (indexmap::IndexMap::<String, _>::from([(
@@ -8346,7 +8341,7 @@ mod load_upstream_states_tests {
     #[tokio::test]
     async fn provider_resolution_preserves_complete_invariant_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
             attributes: (indexmap::IndexMap::<String, _>::from([(
@@ -8397,7 +8392,7 @@ mod load_upstream_states_tests {
             )
             .unwrap();
         }
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
             attributes: Default::default(),
@@ -8492,7 +8487,7 @@ mod load_upstream_states_tests {
 
     #[test]
     fn provider_reference_scope_resource_walk_is_cycle_safe() {
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(ProviderConfig {
             name: "test".to_string(),
             attributes: (indexmap::IndexMap::<String, _>::from([(
@@ -8941,7 +8936,7 @@ mod load_upstream_states_tests {
         )
         .unwrap();
 
-        let old_backend = carina_core::parser::parse_file_and_resolve(
+        let old_backend = carina_core::parser::parse_file(
             r#"backend local { path = "old.state.json" }"#,
             std::path::Path::new("backend.crn"),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
@@ -9763,7 +9758,7 @@ mod run_plan_out_tests {
             ),
             changed_attributes: vec!["comment".to_string(), "web_acl_arn".to_string()],
         });
-        let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
                 plan: Box::new(
@@ -10187,7 +10182,7 @@ mod run_plan_out_tests {
                 |_| carina_core::data_source_value::DataSourceValue::deferred_to_apply(Vec::new()),
             );
 
-        let mut parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedParsedFile::default();
         parsed.data_sources = vec![parsed_data_source];
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let ctx = crate::wiring::PlanContext {
@@ -10296,7 +10291,7 @@ mod run_plan_out_tests {
             quoted_string_attrs: Default::default(),
             declaration: Default::default(),
         };
-        let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
                 plan: Box::new(crate::test_support::creation_fixture::checked(
@@ -10364,7 +10359,7 @@ mod run_plan_out_tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("main.crn");
         fs::write(&path, "provider mock {}\n").unwrap();
-        let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
         let secret = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(
                 carina_core::resource::ConcreteValue::String("upstream-secret".into()),
@@ -10448,7 +10443,7 @@ mod run_plan_out_tests {
             unresolved_attributes: Default::default(),
             binding: None,
         };
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = vec![configured.clone()];
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
@@ -10751,19 +10746,6 @@ mod plan_serialization_error_tests {
         Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path,
         }))
-    }
-
-    #[test]
-    fn plan_save_error_chain_renders_its_transparent_message_once() {
-        let error = super::PlanSaveError::ProviderEvidence(
-            super::ProviderEvidenceError::MissingProviderArtifact {
-                provider: "mock".into(),
-            },
-        );
-        assert_eq!(
-            crate::error::format_error_with_source_chain(&error),
-            error.to_string()
-        );
     }
 
     #[test]

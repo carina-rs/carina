@@ -110,7 +110,7 @@ fn unpinnable_buffer_root_keeps_placement_without_backend_recovery() {
 }
 
 #[test]
-fn round18_single_file_module_import_matches_main_diagnostic() {
+fn single_file_module_import_matches_main_diagnostic() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir(directory.path().join("modules")).unwrap();
     std::fs::write(directory.path().join("modules/x.crn"), "arguments {}\n").unwrap();
@@ -897,63 +897,6 @@ fn imported_provider_and_backend_each_keep_their_own_evidence() {
 }
 
 #[test]
-fn direct_template_root_only_blocks_are_rejected_in_the_authored_sibling() {
-    for evidence in ["arguments {}\n", "require true, 'x'\n"] {
-        for (file, source, message, start, end) in [
-            (
-                "exports.crn",
-                "exports {}\n",
-                "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
-                0,
-                7,
-            ),
-            (
-                "exports.crn",
-                "exports { value: Int = 1 }\n",
-                "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
-                0,
-                7,
-            ),
-            (
-                "state.crn",
-                "removed { from = aws.s3.Bucket 'old' }\n",
-                "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
-                0,
-                7,
-            ),
-            (
-                "upstream.crn",
-                "let previous = upstream_state { source = './upstream' }\n",
-                "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
-                0,
-                3,
-            ),
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            std::fs::write(directory.path().join("declarations.crn"), evidence).unwrap();
-            std::fs::create_dir(directory.path().join("upstream")).unwrap();
-            std::fs::write(
-                directory.path().join("upstream/exports.crn"),
-                "exports { value: Int = 1 }\n",
-            )
-            .unwrap();
-            std::fs::write(directory.path().join("upstream/main.crn"), "// sibling\n").unwrap();
-            let path = directory.path().join(file);
-            std::fs::write(&path, source).unwrap();
-            let diagnostics =
-                test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
-            assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-            assert_eq!(diagnostics[0].message, message);
-            assert_eq!(
-                diagnostics[0].range,
-                Range::new(Position::new(0, start), Position::new(0, end))
-            );
-            assert!(diagnostics[0].related_information.is_none());
-        }
-    }
-}
-
-#[test]
 fn upstream_module_templates_keep_module_evidence_as_related_information() {
     for (declaration, kind, end) in [
         ("require false, 'PRIVATE_GUARD'", "require statement", 30),
@@ -1172,5 +1115,54 @@ fn providerless_loop_directives_keep_legacy_placeholder_boundary() {
             assert_eq!(diagnostics.iter().map(|diagnostic| diagnostic.message.clone()).collect::<Vec<_>>(), expected, "{values}: {diagnostics:#?}");
             assert!(diagnostics.iter().all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)));
         }
+    }
+}
+
+#[test]
+fn existing_module_only_errors_survive_unknown_directory() {
+    for (block, message) in [
+        (
+            "moved { from = mock.test.Resource 'old' to = mock.test.Resource 'new' }",
+            "state blocks (moved, removed, and import) are not allowed inside modules",
+        ),
+        (
+            "removed { from = mock.test.Resource 'old' }",
+            "state blocks (moved, removed, and import) are not allowed inside modules",
+        ),
+        (
+            "import { to = mock.test.Resource 'new' id = 'id' }",
+            "state blocks (moved, removed, and import) are not allowed inside modules",
+        ),
+        (
+            "exports {}",
+            "exports blocks are not allowed inside modules",
+        ),
+        (
+            "let prior = upstream_state { source = './absent' }",
+            "upstream_state declarations are not allowed inside modules",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.crn");
+        let source = format!("arguments {{ name: String = 'x' }}\n{block}\n");
+        std::fs::write(&path, &source).unwrap();
+        std::fs::write(directory.path().join("broken.crn"), "let x = [\n").unwrap();
+        let diagnostics =
+            test_engine().analyze(&create_document_at(&source, path.clone()), Some(&path));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.starts_with(message))
+                .count(),
+            1,
+            "{block}: {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.starts_with(message))
+                .all(|diagnostic| diagnostic.range.start.line == 1
+                    && diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+        );
     }
 }

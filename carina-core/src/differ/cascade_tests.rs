@@ -1665,7 +1665,7 @@ fn resolve_cascade_targets(
     targets: DeferredCreateTargets,
     resources: &[ResolvedResource],
 ) -> ResolvedDeferredCreateTargets {
-    let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
+    let configuration = crate::parser::ExpandedParsedFile {
         resources: resources
             .iter()
             .map(|resource| resource.as_inner().clone().into_unexpanded_for_test())

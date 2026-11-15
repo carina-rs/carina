@@ -1031,7 +1031,7 @@ mod tests {
     // ---- Module info key handler tests ----
 
     fn make_module_info_app() -> ModuleInfoApp {
-        use carina_core::parser::ProviderContext;
+        use carina_core::parser::{ProviderContext, parse_file};
         let input = r#"
             arguments {
                 vpc: aws.vpc
@@ -1045,10 +1045,9 @@ mod tests {
                 vpc_id = vpc
             }
         "#;
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("main.crn"), input).unwrap();
-        let parsed = carina_core::module_resolver::load_module_from_directory(
-            &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+        let parsed = parse_file(
+            input,
+            std::path::Path::new("test_module.crn"),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();

@@ -1502,60 +1502,6 @@ fn root_require_note_belongs_to_the_single_error() {
     }
 }
 
-#[test]
-fn module_info_consumes_the_directory_verdict() {
-    let directory = Directory::new("true");
-    for (root_block, expected, populated) in [
-        (Some("provider mock {}\n"), "File:", false),
-        (
-            Some("backend local { path = 'state.json' }\n"),
-            "File:",
-            false,
-        ),
-        (None, "Module:", false),
-        (None, "Module:", true),
-    ] {
-        let module = directory.project.join("info");
-        fs::create_dir_all(&module).unwrap();
-        fs::write(
-            module.join("arguments.crn"),
-            if root_block.is_some() || populated {
-                "arguments { x: String }\n"
-            } else {
-                "arguments {}\n"
-            },
-        )
-        .unwrap();
-        let evidence = module.join("root.crn");
-        if let Some(source) = root_block {
-            fs::write(&evidence, source).unwrap();
-        } else if evidence.exists() {
-            fs::remove_file(&evidence).unwrap();
-        }
-        let output = directory.run(&["module", "info", "info"]);
-        success(&output);
-        let text = String::from_utf8(output.stdout).unwrap();
-        let header = format!("\u{1b}[1m{expected}\u{1b}[0m \u{1b}[36minfo\u{1b}[0m\n\n");
-        let empty = "  \u{1b}[2m(none)\u{1b}[0m\n\n";
-        let sections = if expected == "File:" {
-            format!(
-                "\u{1b}[1m=== IMPORTS ===\u{1b}[0m\n\n{empty}\u{1b}[1m=== CREATES ===\u{1b}[0m\n\n{empty}"
-            )
-        } else {
-            let arguments = if populated {
-                "  \u{1b}[97mx\u{1b}[0m: \u{1b}[32mString\u{1b}[0m  \u{1b}[33m(required)\u{1b}[0m\n\n"
-            } else {
-                empty
-            };
-            format!(
-                "\u{1b}[1m=== ARGUMENTS ===\u{1b}[0m\n\n{arguments}\u{1b}[1m=== CREATES ===\u{1b}[0m\n\n{empty}\u{1b}[1m=== ATTRIBUTES ===\u{1b}[0m\n\n{empty}"
-            )
-        };
-        assert_eq!(text, format!("{header}{sections}"));
-        assert!(output.stderr.is_empty());
-    }
-}
-
 fn configure_importability_target(directory: &Directory, files: &[(&str, &str)]) {
     directory.clear_root_require();
     for entry in fs::read_dir(directory.project.join("checked")).unwrap() {
@@ -1882,67 +1828,6 @@ fn no_evidence_directory_is_root_for_upstream_and_module_info() {
         "\u{1b}[1mFile:\u{1b}[0m \u{1b}[36mupstream\u{1b}[0m\n\n\u{1b}[1m=== IMPORTS ===\u{1b}[0m\n\n  \u{1b}[2m(none)\u{1b}[0m\n\n\u{1b}[1m=== CREATES ===\u{1b}[0m\n\n  \u{1b}[2m(none)\u{1b}[0m\n\n"
     );
     assert!(output.stderr.is_empty());
-}
-
-#[test]
-fn direct_module_template_rejects_root_only_declarations() {
-    for evidence in ["arguments {}\n", "require true, 'x'\n"] {
-        for (file, declaration, message, end_column) in [
-            (
-                "exports.crn",
-                "exports { value: Int = 1 }\n",
-                "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
-                8,
-            ),
-            (
-                "exports.crn",
-                "exports {}\n",
-                "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
-                8,
-            ),
-            (
-                "state.crn",
-                "removed { from = mock.test.resource 'old' }\n",
-                "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
-                8,
-            ),
-            (
-                "upstream.crn",
-                "let previous = upstream_state { source = '../upstream' }\n",
-                "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
-                4,
-            ),
-        ] {
-            let directory = Directory::new("true");
-            fs::create_dir(directory.project.join("upstream")).unwrap();
-            fs::write(
-                directory.project.join("upstream/exports.crn"),
-                "exports { value: Int = 1 }\n",
-            )
-            .unwrap();
-            fs::write(directory.project.join("upstream/main.crn"), "// sibling\n").unwrap();
-            configure_importability_target(
-                &directory,
-                &[("declarations.crn", evidence), (file, declaration)],
-            );
-            let human = directory.run(&["validate", "checked"]);
-            assert_eq!(human.status.code(), Some(1), "{}", output_text(&human));
-            assert_eq!(String::from_utf8(human.stdout).unwrap(), "Validating...\n");
-            assert_eq!(
-                String::from_utf8(human.stderr).unwrap(),
-                format!("Error: checked/{file}:1:1: {message}\n")
-            );
-            let output = directory.run(&["validate", "--json", "checked"]);
-            assert_eq!(output.status.code(), Some(1));
-            assert!(output.stderr.is_empty());
-            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(report["errors"].as_array().unwrap().len(), 1);
-            assert_eq!(
-                report["errors"],
-                json!([{ "message": message, "severity": "error", "code": null, "location": {"file": format!("checked/{file}"), "range": {"start": {"line": 1, "column": 1}, "end": {"line": 1, "column": end_column}}} }])
-            );
-        }
-    }
 }
 
 #[test]
@@ -2689,4 +2574,85 @@ fn saved_plan_missing_unused_upstream_keeps_main_stderr() {
         fs::read(directory.home.join("mock-state.json")).ok(),
         provider_state
     );
+}
+
+#[test]
+fn empty_module_declarations_keep_main_directive_boundary() {
+    for fixture in [
+        "empty_arguments_loop",
+        "empty_attributes_loop",
+        "require_loop",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/require_placement_boundaries")
+                .join(fixture)
+                .join("main.crn"),
+            project.join("main.crn"),
+        )
+        .unwrap();
+        let directory = Directory {
+            _temp: temp,
+            project,
+            home,
+        };
+        let output = directory.run(&["validate", "--json", "."]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let errors = report["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{fixture}: {report}");
+        assert_eq!(
+            errors[0]["message"],
+            "deferred-for iterable `seed.name`: expected list iterable, got String",
+            "{fixture}: {report}"
+        );
+        let human = directory.run(&["validate", "."]);
+        let stderr = String::from_utf8(human.stderr).unwrap();
+        assert_eq!(stderr.matches("Error:").count(), 1, "{fixture}: {stderr}");
+        assert!(
+            stderr.contains(errors[0]["message"].as_str().unwrap()),
+            "{fixture}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn direct_module_only_checks_keep_main_command_behavior() {
+    for block in [
+        "moved { from = mock.test.Resource 'old' to = mock.test.Resource 'new' }",
+        "removed { from = mock.test.Resource 'old' }",
+        "import { to = mock.test.Resource 'new' id = 'id' }",
+        "exports {}",
+    ] {
+        for declaration in [
+            "arguments { name: String = 'x' }",
+            "arguments {}",
+            "require true, 'guard'",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let project = temp.path().join("project");
+            let home = temp.path().join("home");
+            fs::create_dir_all(&project).unwrap();
+            fs::create_dir_all(&home).unwrap();
+            fs::write(
+                project.join("main.crn"),
+                format!("{declaration}\n{block}\n"),
+            )
+            .unwrap();
+            let directory = Directory {
+                _temp: temp,
+                project,
+                home,
+            };
+            let output = directory.run(&["validate", "--json", "."]);
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(output.status.success(), "{declaration}; {block}: {report}");
+            assert_eq!(report["status"], "ok", "{report}");
+            success(&directory.run(&["validate", "."]));
+        }
+    }
 }

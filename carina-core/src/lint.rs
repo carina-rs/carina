@@ -653,7 +653,6 @@ pub fn located_mixed_tag_key_styles<D, B: crate::resource::BindingAddress>(
         crate::resource::ParserPlaceholder,
         D,
         B,
-        crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
     >,
     entries: &[TagKeyEntry],
 ) -> Vec<crate::parser::Located<TagKeyWarning>>

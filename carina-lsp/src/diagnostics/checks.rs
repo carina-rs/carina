@@ -320,7 +320,6 @@ trait SemanticLookup: Sized {
             ParserPlaceholder,
             ParserPlaceholder,
             D,
-            carina_core::resource::RelativeBindingName,
         >,
     ) -> Option<&'a Self>
     where
@@ -337,7 +336,6 @@ impl SemanticLookup for AttributeParameter {
             ParserPlaceholder,
             ParserPlaceholder,
             D,
-            carina_core::resource::RelativeBindingName,
         >,
     ) -> Option<&'a Self>
     where
@@ -365,7 +363,6 @@ impl SemanticLookup for ParsedExportParam {
             ParserPlaceholder,
             ParserPlaceholder,
             D,
-            carina_core::resource::RelativeBindingName,
         >,
     ) -> Option<&'a Self>
     where
@@ -1801,14 +1798,7 @@ impl DiagnosticRun<'_> {
             D,
             B,
         >,
-        tree: &carina_core::parser::AnalysisTree<
-            '_,
-            ParserPlaceholder,
-            ParserPlaceholder,
-            D,
-            B,
-            carina_core::parser::ParsedExportParam<ParserPlaceholder, B>,
-        >,
+        tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     ) -> Vec<Diagnostic>
     where
         D: Clone

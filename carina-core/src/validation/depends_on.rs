@@ -329,7 +329,6 @@ mod tests {
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             D,
-            crate::resource::RelativeBindingName,
         >,
     ) -> Result<Vec<Located<DependsOnDiagnostic>>, crate::parser::AnalysisTreeError> {
         let mut parsed = parsed.clone();

@@ -1051,16 +1051,7 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
 fn validate_resource_ref_types_for_test<
     E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName> + Clone,
 >(
-    parsed: &crate::parser::File<
-        E,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        crate::parser::ParsedDeferredForPhase<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
-        crate::resource::RelativeBindingName,
-    >,
+    parsed: &crate::parser::File<E>,
     schemas: &SchemaRegistry,
 ) -> Result<(), String> {
     let mut fixture = parsed.clone();
@@ -4271,14 +4262,6 @@ fn provider_in_module_with_attributes_errors() {
 }
 
 #[test]
-fn module_without_provider_ok() {
-    let loaded = imported_placement_fixture("arguments { vpc_cidr: String }\n");
-
-    let result = validate_no_provider_in_module(&loaded);
-    assert!(result.is_ok());
-}
-
-#[test]
 fn moved_in_module_with_arguments_errors() {
     let loaded = imported_placement_fixture(
         "arguments { name: String }\nmoved { from = mock.test.Resource 'old' to = mock.test.Resource 'new' }\n",
@@ -4364,15 +4347,6 @@ fn backend_in_module_with_attributes_errors() {
             evidence.display()
         )
     );
-}
-
-#[test]
-fn module_without_backend_ok() {
-    let loaded = imported_placement_fixture("arguments { name: String }\n");
-
-    let result = validate_no_backend_in_module(&loaded);
-
-    assert!(result.is_ok());
 }
 
 #[test]

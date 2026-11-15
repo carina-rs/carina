@@ -302,10 +302,8 @@ pub struct AuthoredBindingView {
 }
 
 impl AuthoredBindingView {
-    pub(crate) fn from_directory_files(
-        files: &[(PathBuf, DirectoryResolvedFile)],
-        mut parsed: ParsedFile,
-    ) -> Self {
+    pub(crate) fn from_directory_files(files: &[(PathBuf, DirectoryResolvedFile)]) -> Self {
+        let mut parsed = ParsedFile::default();
         for (_, file) in files {
             merge_parsed_file(&mut parsed, file.parsed.clone());
         }
@@ -326,10 +324,7 @@ impl AuthoredBindingView {
         let files = vec![(source_file.to_path_buf(), source.to_string())];
         let parsed_files =
             parse_directory_files_located(&files, config).map_err(|located| *located.error)?;
-        Ok(Self::from_directory_files(
-            &parsed_files,
-            <ParsedFile>::default(),
-        ))
+        Ok(Self::from_directory_files(&parsed_files))
     }
 
     #[cfg(test)]
@@ -392,7 +387,7 @@ impl ModuleResolutionContext {
 /// root scope.
 #[derive(Debug, Clone)]
 pub struct RootDirectoryParse<E = crate::parser::ParsedExportParam> {
-    parsed: crate::parser::File<E>,
+    parsed: File<E>,
     resolution: ResolutionContext,
     verdict: CompleteDirectoryVerdict,
 }
@@ -403,11 +398,11 @@ pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExpor
 /// One sealed root snapshot with the directory authority for resolving its copy.
 pub struct InferredRootAnalysis<'a> {
     root: &'a InferredRootDirectory,
-    tree: crate::parser::AnalysisTree<
+    tree: parser::AnalysisTree<
         'a,
         ParserPlaceholder,
         ParserPlaceholder,
-        crate::parser::ParsedDeferredForPhase,
+        parser::ParsedDeferredForPhase,
         crate::resource::RelativeBindingName,
         parser::InferredExportParam,
     >,
@@ -416,11 +411,11 @@ pub struct InferredRootAnalysis<'a> {
 impl<'a> InferredRootAnalysis<'a> {
     pub fn tree(
         &self,
-    ) -> &crate::parser::AnalysisTree<
+    ) -> &parser::AnalysisTree<
         'a,
         ParserPlaceholder,
         ParserPlaceholder,
-        crate::parser::ParsedDeferredForPhase,
+        parser::ParsedDeferredForPhase,
         crate::resource::RelativeBindingName,
         parser::InferredExportParam,
     > {
@@ -538,7 +533,9 @@ pub type CompleteDirectoryVerdict = DirectoryVerdict<std::convert::Infallible>;
 /// fn cannot_promote(complete: CompleteDirectoryVerdict) -> IncompleteDirectoryVerdict {
 ///     match complete {
 ///         DirectoryVerdict::ModuleTemplate(module) => DirectoryVerdict::ModuleTemplate(module),
-///         _ => unreachable!(),
+///         DirectoryVerdict::Root(root) => DirectoryVerdict::Root(root),
+///         DirectoryVerdict::Unknown(impossible) => match impossible {},
+///         DirectoryVerdict::NoEvidence(neutral) => DirectoryVerdict::NoEvidence(neutral),
 ///     }
 /// }
 /// ```
@@ -584,7 +581,7 @@ pub struct RootDirectoryVerdict(std::sync::Arc<RootDeclarations>);
 struct RootDeclaration<K> {
     _kind: K,
     location: parser::DeclarationLocation,
-    file: crate::paths::PersistedPath,
+    file: PathBuf,
     utf16_columns: (u32, u32),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,7 +640,7 @@ impl ModuleTemplateDeclarations {
 pub struct ModuleEvidence {
     kind: ModuleEvidenceKind,
     location: parser::DeclarationLocation,
-    file: crate::paths::PersistedPath,
+    file: PathBuf,
     utf16_columns: (u32, u32),
 }
 
@@ -662,7 +659,7 @@ impl ModuleEvidence {
             ModuleEvidenceKind::Require => "require statement",
         }
     }
-    pub fn file_locator(&self) -> &crate::paths::PersistedPath {
+    pub fn file_locator(&self) -> &Path {
         &self.file
     }
     pub fn location(&self) -> &parser::DeclarationLocation {
@@ -678,10 +675,12 @@ impl ModuleEvidence {
         )
     }
     pub fn note_relative_to(&self, root: &ResolvedPath) -> String {
-        let label = self
-            .file
-            .lexical_relative_to(root.persisted_path())
-            .unwrap_or_else(|| self.file.display().clone());
+        let label = match crate::paths::PersistedPath::new(&self.file) {
+            Ok(file) => file
+                .lexical_relative_to(root.persisted_path())
+                .unwrap_or_else(|| file.display().clone()),
+            Err(_error) => crate::paths::DisplayPath::for_diagnostics(&self.file),
+        };
         format!(
             "directory is a module definition because of the {} at {}:{}.",
             self.declaration(),
@@ -701,7 +700,7 @@ impl ModuleEvidence {
 
 /// The shared renderer consumes evidence already owned by the verdict.
 pub trait DirectoryDeclarationEvidence {
-    fn file_locator(&self) -> &crate::paths::PersistedPath;
+    fn file_locator(&self) -> &Path;
     fn location(&self) -> &parser::DeclarationLocation;
     fn utf16_columns(&self) -> (u32, u32);
     fn related_message(&self) -> String;
@@ -709,7 +708,7 @@ pub trait DirectoryDeclarationEvidence {
 }
 
 impl DirectoryDeclarationEvidence for ModuleEvidence {
-    fn file_locator(&self) -> &crate::paths::PersistedPath {
+    fn file_locator(&self) -> &Path {
         self.file_locator()
     }
     fn location(&self) -> &parser::DeclarationLocation {
@@ -726,7 +725,7 @@ impl DirectoryDeclarationEvidence for ModuleEvidence {
     }
 }
 impl DirectoryDeclarationEvidence for RootEvidence {
-    fn file_locator(&self) -> &crate::paths::PersistedPath {
+    fn file_locator(&self) -> &Path {
         self.file_locator()
     }
     fn location(&self) -> &parser::DeclarationLocation {
@@ -752,12 +751,12 @@ pub struct DirectoryWithoutEvidence(());
 pub enum RootEvidence {
     Provider {
         location: parser::DeclarationLocation,
-        file: crate::paths::PersistedPath,
+        file: PathBuf,
         utf16_columns: (u32, u32),
     },
     Backend {
         location: parser::DeclarationLocation,
-        file: crate::paths::PersistedPath,
+        file: PathBuf,
         utf16_columns: (u32, u32),
     },
 }
@@ -845,9 +844,9 @@ impl RootDirectoryVerdict {
 }
 
 impl RootEvidence {
-    /// Absolute logical source captured by directory discovery. Rendering never
-    /// resolves an authored relative label from the process working directory.
-    pub fn file_locator(&self) -> &crate::paths::PersistedPath {
+    /// Source locator captured with the declaration. Disk snapshots carry their
+    /// absolute logical address; in-memory sources keep their authored label.
+    pub fn file_locator(&self) -> &Path {
         match self {
             Self::Provider {
                 file,
@@ -960,7 +959,12 @@ fn mark_complete_directory_files(
         completeness: CompleteInventory,
         inventories: files
             .iter()
-            .map(|(_, file)| (file.parsed.parser_binding_metadata.syntax(), &file.source))
+            .map(|(_, file)| {
+                (
+                    file.parsed.parser_binding_metadata.syntax(),
+                    file.source.clone(),
+                )
+            })
             .collect(),
     }
     .issue();
@@ -981,7 +985,7 @@ fn mark_complete_directory_files(
 /// One issuer for complete loading and partial editor snapshots. Its typed
 /// completeness determines what may be concluded when no root evidence exists.
 struct DirectoryInventories<'a, C> {
-    inventories: Vec<(&'a parser::SyntaxInventory, &'a crate::paths::PersistedPath)>,
+    inventories: Vec<(&'a parser::SyntaxInventory, PathBuf)>,
     completeness: C,
 }
 struct CompleteInventory;
@@ -1088,12 +1092,16 @@ impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
 
 impl<E> RootDirectoryParse<E> {
     /// Syntax placement findings remain available when value analysis fails.
-    pub fn configuration_placement_diagnostics(
+    pub fn root_placement_diagnostics(
         &self,
     ) -> Vec<parser::Located<crate::validation::ConfigurationPlacementDiagnostic>> {
         crate::validation::placement_diagnostics_for_inventory(
             self.parsed.parser_binding_metadata.syntax(),
+            self.parsed.declares_module_placeholders(),
         )
+        .into_iter()
+        .filter(|finding| finding.detail().root_evidence().is_some())
+        .collect()
     }
 
     fn with_resolution(
@@ -1117,7 +1125,7 @@ impl<E> RootDirectoryParse<E> {
 
     pub(crate) fn try_update<F, T>(mut self, update: F) -> Result<Self, T>
     where
-        F: FnOnce(&mut crate::parser::File<E>) -> Result<(), T>,
+        F: FnOnce(&mut File<E>) -> Result<(), T>,
     {
         update(&mut self.parsed)?;
         Ok(self)
@@ -1131,7 +1139,7 @@ impl<E> RootDirectoryParse<E> {
         &self.parsed
     }
 
-    pub fn into_parsed(self) -> crate::parser::File<E> {
+    pub fn into_parsed(self) -> File<E> {
         self.parsed
     }
 
@@ -1157,7 +1165,7 @@ impl<E> RootDirectoryParse<E> {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    fn from_test_fixture(parsed: crate::parser::File<E>, authored_source: Option<&str>) -> Self
+    fn from_test_fixture(mut parsed: crate::parser::File<E>, authored_source: Option<&str>) -> Self
     where
         E: crate::parser::ExportParamLike,
     {
@@ -1174,31 +1182,45 @@ impl<E> RootDirectoryParse<E> {
         if let Some(verdict) = issued {
             return Self::with_resolution(parsed, strict_resolution_context(), verdict);
         }
-        if let Some(source) = authored_source {
-            let fixture = tempfile::tempdir().unwrap();
-            std::fs::write(fixture.path().join("main.crn"), source).unwrap();
-            return Self::from_parsed_in_directory_for_test(
-                parsed,
-                &ResolvedPath::new(fixture.path()).unwrap(),
-            );
-        }
-        assert!(
-            parsed
-                .parser_binding_metadata
+        let label = parsed
+            .parser_binding_metadata
+            .syntax()
+            .configuration_blocks()
+            .first()
+            .map(|block| block.location().file().path().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("test.crn"));
+        let inventory = match authored_source {
+            Some(source) => parser::parse_syntax_inventory(source, &label)
+                .unwrap()
                 .syntax()
-                .configuration_blocks()
-                .is_empty(),
-            "authored configuration blocks need an explicit source or directory; use from_parsed_source_for_test or from_parsed_in_directory_for_test"
+                .clone(),
+            None => {
+                assert!(
+                    parsed
+                        .parser_binding_metadata
+                        .syntax()
+                        .configuration_blocks()
+                        .is_empty(),
+                    "authored configuration blocks need an explicit source or directory; use from_parsed_source_for_test or from_parsed_in_directory_for_test"
+                );
+                parsed.parser_binding_metadata.syntax().clone()
+            }
+        };
+        let verdict = DirectoryInventories {
+            inventories: vec![(&inventory, label)],
+            completeness: CompleteInventory,
+        }
+        .issue();
+        crate::parser::retained::set_directory_require_scope(
+            &mut parsed,
+            DirectoryRequireScope(verdict.for_retained_nodes()),
         );
-        // AST-only unit fixtures have no authored configuration declarations.
-        // Even this neutral authority comes from the ordinary directory issuer.
-        let fixture = tempfile::tempdir().unwrap();
-        std::fs::write(
-            fixture.path().join("main.crn"),
-            "// AST-only test fixture\n",
-        )
-        .unwrap();
-        Self::from_parsed_in_directory_for_test(parsed, &ResolvedPath::new(fixture.path()).unwrap())
+        crate::parser::retained::judge_configuration(
+            &mut parsed,
+            &SchemaRegistry::new(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        Self::with_resolution(parsed, strict_resolution_context(), verdict)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1223,7 +1245,7 @@ impl<E> RootDirectoryParse<E> {
                         .unwrap()
                         .syntax()
                         .clone(),
-                    file.persisted_path(),
+                    file.persisted_path().to_path_buf(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1231,7 +1253,7 @@ impl<E> RootDirectoryParse<E> {
             completeness: CompleteInventory,
             inventories: inventories
                 .iter()
-                .map(|(inventory, file)| (inventory, *file))
+                .map(|(inventory, file)| (inventory, file.clone()))
                 .collect(),
         }
         .issue();
@@ -1324,7 +1346,7 @@ impl<E> RootDirectoryParse<E> {
 }
 
 impl<E> std::ops::Deref for RootDirectoryParse<E> {
-    type Target = crate::parser::File<E>;
+    type Target = File<E>;
 
     fn deref(&self) -> &Self::Target {
         self.parsed()
@@ -1477,13 +1499,26 @@ struct SnapshotBufferMember {
     buffer: ParsedSourceBuffer,
 }
 
+struct IncompleteBufferSources {
+    sources: Vec<SnapshotSource>,
+    member: SnapshotBufferMember,
+}
+
 /// A discovered directory snapshot sealed with one parsed buffer member.
 /// The member's parser-owned contents override disk and conflicting snapshots;
 /// there is no constructor accepting an unrelated File or mutable source list.
 pub struct DirectoryBufferSnapshot {
     sources: Vec<SnapshotSource>,
     member: SnapshotBufferMember,
-    discovery_complete: bool,
+    discovery_failure: Option<DirectoryParseFailure>,
+}
+
+/// Both discovery attempts remain available when no snapshot can be captured.
+#[derive(Debug, thiserror::Error)]
+#[error("directory capture failed: {complete}; incomplete capture failed: {incomplete}")]
+pub struct DirectoryBufferCaptureError {
+    complete: Box<DirectoryParseFailure>,
+    incomplete: Box<DirectoryParseFailure>,
 }
 
 impl DirectoryBufferSnapshot {
@@ -1491,9 +1526,25 @@ impl DirectoryBufferSnapshot {
         directory: &ResolvedPath,
         buffer: ParsedSourceBuffer,
         overrides: &SourceOverrides,
-    ) -> Result<Self, DirectoryParseFailure> {
-        Self::capture_complete(directory, buffer.clone(), overrides)
-            .or_else(|_error| Self::capture_incomplete(directory, buffer, overrides))
+    ) -> Result<Self, DirectoryBufferCaptureError> {
+        match Self::capture_complete(directory, buffer.clone(), overrides) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(complete) => match Self::capture_incomplete(directory, buffer, overrides) {
+                Ok(recovery) => Ok(Self {
+                    sources: recovery.sources,
+                    member: recovery.member,
+                    discovery_failure: Some(complete),
+                }),
+                Err(incomplete) => Err(DirectoryBufferCaptureError {
+                    complete: Box::new(complete),
+                    incomplete: Box::new(incomplete),
+                }),
+            },
+        }
+    }
+
+    pub fn discovery_failure(&self) -> Option<&DirectoryParseFailure> {
+        self.discovery_failure.as_ref()
     }
 
     fn capture_complete(
@@ -1560,7 +1611,7 @@ impl DirectoryBufferSnapshot {
         Ok(Self {
             sources,
             member: SnapshotBufferMember { buffer },
-            discovery_complete: true,
+            discovery_failure: None,
         })
     }
 
@@ -1570,7 +1621,7 @@ impl DirectoryBufferSnapshot {
         directory: &ResolvedPath,
         buffer: ParsedSourceBuffer,
         overrides: &SourceOverrides,
-    ) -> Result<Self, DirectoryParseFailure> {
+    ) -> Result<IncompleteBufferSources, DirectoryParseFailure> {
         let discovery_error =
             |error| DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error));
         let parent = buffer.file.path().parent().ok_or_else(|| {
@@ -1650,10 +1701,9 @@ impl DirectoryBufferSnapshot {
             inventory: Some(buffer.parsed().parser_binding_metadata.syntax().clone()),
         });
         sources.sort_by(|left, right| left.file.cmp(&right.file));
-        Ok(Self {
+        Ok(IncompleteBufferSources {
             sources,
             member: SnapshotBufferMember { buffer },
-            discovery_complete: false,
         })
     }
 
@@ -1665,29 +1715,30 @@ impl DirectoryBufferSnapshot {
                 source
                     .inventory
                     .as_ref()
-                    .map(|inventory| (inventory, &source.file))
+                    .map(|inventory| (inventory, source.file.to_path_buf()))
             })
             .collect();
         let readable = inventories
             .iter()
             .flatten()
-            .map(|(inventory, file)| (*inventory, *file))
+            .map(|(inventory, file)| (*inventory, file.clone()))
             .collect();
-        let verdict = if self.discovery_complete && inventories.iter().all(Option::is_some) {
-            DirectoryInventories {
-                inventories: readable,
-                completeness: CompleteInventory,
-            }
-            .issue()
-            .for_retained_nodes()
-        } else {
-            DirectoryInventories {
-                inventories: readable,
-                completeness: IncompleteInventory,
-            }
-            .issue()
-            .for_retained_nodes()
-        };
+        let verdict =
+            if self.discovery_failure().is_none() && inventories.iter().all(Option::is_some) {
+                DirectoryInventories {
+                    inventories: readable,
+                    completeness: CompleteInventory,
+                }
+                .issue()
+                .for_retained_nodes()
+            } else {
+                DirectoryInventories {
+                    inventories: readable,
+                    completeness: IncompleteInventory,
+                }
+                .issue()
+                .for_retained_nodes()
+            };
         DirectoryRequireScope(verdict)
     }
 }
@@ -1714,11 +1765,13 @@ pub fn load_buffer_configuration_without_directory<'a>(
     buffer: &ParsedSourceBuffer,
     schemas: &'a SchemaRegistry,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> std::io::Result<BufferConfiguration<'a>> {
+) -> BufferConfiguration<'a> {
     let config = session.catalog();
-    let file = crate::paths::PersistedPath::new(buffer.file.path())?;
     let verdict = DirectoryInventories {
-        inventories: vec![(buffer.parsed.parser_binding_metadata.syntax(), &file)],
+        inventories: vec![(
+            buffer.parsed.parser_binding_metadata.syntax(),
+            buffer.file.path().to_path_buf(),
+        )],
         completeness: IncompleteInventory,
     }
     .issue()
@@ -1728,9 +1781,9 @@ pub fn load_buffer_configuration_without_directory<'a>(
         &mut parsed,
         DirectoryRequireScope(verdict),
     );
-    Ok(BufferConfiguration {
+    BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
-    })
+    }
 }
 
 impl LoadedConfig {
@@ -1754,7 +1807,7 @@ impl LoadedConfig {
 #[derive(Debug, Clone)]
 pub struct DirectoryResolvedFile {
     parsed: ParsedFile,
-    source: crate::paths::PersistedPath,
+    source: PathBuf,
     /// Names present in this file before sibling bindings were seeded. The
     /// final parse's `variables` map contains sibling seed echoes, so this set
     /// is required to distinguish local value-let declarations from context.
@@ -1789,7 +1842,7 @@ impl ParsedDirectoryFiles {
     }
 
     pub(crate) fn empty_assembly(&self) -> ParsedFile {
-        let mut parsed: ParsedFile = Default::default();
+        let mut parsed = ParsedFile::default();
         crate::parser::retained::set_directory_require_scope(
             &mut parsed,
             DirectoryRequireScope(self.verdict.for_retained_nodes()),
@@ -1881,7 +1934,7 @@ fn duplicate_groups(occurrences: DeclarationGroups) -> Vec<DuplicateDeclaration>
 /// diagnostics when an unrelated sibling fails to parse.
 pub fn find_duplicate_declarations_in_analysis(
     file_name: &Path,
-    tree: &crate::parser::AnalysisTree<'_>,
+    tree: &parser::AnalysisTree<'_>,
 ) -> Vec<DuplicateDeclaration> {
     let mut occurrences = BTreeMap::new();
     collect_inventory_declarations(file_name, tree.syntax(), &mut occurrences);
@@ -2331,8 +2384,7 @@ fn load_configuration_in_context(
             }
         };
         let verdict = parsed_files.verdict.clone();
-        let authored_bindings =
-            AuthoredBindingView::from_directory_files(&parsed_files, parsed_files.empty_assembly());
+        let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
         let duplicate_declarations = find_duplicate_declarations(path, &parsed_files);
 
         let mut merged = parsed_files.empty_assembly();
@@ -2788,8 +2840,7 @@ fn parse_directory_with_overrides_impl(
         }
     };
     let verdict = parsed_files.verdict.clone();
-    let authored_bindings =
-        AuthoredBindingView::from_directory_files(&parsed_files, parsed_files.empty_assembly());
+    let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
     let semantic_files = if resolution.is_diagnostics() {
         parsed_files
@@ -3087,18 +3138,8 @@ pub(crate) fn parse_directory_files_located(
         .unwrap_or_else(|| Path::new(""));
     let locators = files
         .iter()
-        .map(|(path, _source)| {
-            crate::paths::PersistedPath::new(path).map_err(|error| {
-                LocatedParseError::in_file(
-                    path,
-                    parser::ParseError::InternalError {
-                        expected: "source address".into(),
-                        context: error.to_string(),
-                    },
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|(path, _source)| path.clone())
+        .collect::<Vec<_>>();
     parse_directory_files_with_locators(files, &locators, config, display_root)
 }
 
@@ -3113,7 +3154,7 @@ pub(crate) fn parse_directory_files_located_from_root(
         .collect::<Vec<_>>();
     let locators = sources
         .iter()
-        .map(|(path, _source)| path.persisted_path().clone())
+        .map(|(path, _source)| path.persisted_path().to_path_buf())
         .collect::<Vec<_>>();
     parse_directory_files_with_locators(&labels, &locators, config, display_root)
 }
@@ -3122,7 +3163,7 @@ pub(crate) fn parse_directory_files_located_from_root(
 // strict directory entry point supplies locators from its already pinned inputs.
 fn parse_directory_files_with_locators(
     files: &[(PathBuf, String)],
-    locators: &[crate::paths::PersistedPath],
+    locators: &[PathBuf],
     config: &ProviderContext,
     display_root: &Path,
 ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
@@ -3168,7 +3209,7 @@ fn parse_directory_files_with_locators(
     // Deferred-loop body errors are explicitly retryable while sibling
     // bindings are provisional; every other error propagates here, and the
     // final pass reparses those bodies with fully classified bindings.
-    let mut pass1_union: ParsedFile = Default::default();
+    let mut pass1_union = ParsedFile::default();
     let mut pass_1a_local_variables = Vec::with_capacity(files.len());
     for (path, content) in files {
         let parsed = parser::parse_with_directory_context(
@@ -3281,7 +3322,7 @@ fn parse_directory_files_with_locators(
             },
         ));
     }
-    let mut merged: ParsedFile = Default::default();
+    let mut merged = ParsedFile::default();
     for (_, file) in &out {
         merge_parsed_file(&mut merged, file.parsed.clone());
     }
@@ -3516,6 +3557,95 @@ pub fn find_crn_files_in_dir(dir: &ResolvedPath) -> Result<Vec<ResolvedPath>, St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn neutral_root_blocks_do_not_hide_a_main_module_diagnostic() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for source in [
+            "moved { from = mock.test.Resource 'old' to = mock.test.Resource 'new' }",
+            "exports {}",
+            "let prior = upstream_state { source = './absent' }",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("main.crn"), source).unwrap();
+            let parsed =
+                parse_directory(&ResolvedPath::new(directory.path()).unwrap(), &context).unwrap();
+            assert!(matches!(
+                parsed.complete_directory_verdict(),
+                DirectoryVerdict::NoEvidence(_)
+            ));
+            assert!(!parsed.parsed().declares_module_placeholders());
+            let tree = parser::AnalysisTree::try_from_file(parsed.parsed()).unwrap();
+            assert!(crate::validation::configuration_placement_diagnostics(&tree).is_empty());
+        }
+    }
+
+    #[test]
+    fn directory_capture_preserves_both_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let buffer =
+            ParsedSourceBuffer::parse("let x = 1", &other.path().join("main.crn"), &context)
+                .unwrap();
+        let Err(error) = DirectoryBufferSnapshot::capture(
+            &ResolvedPath::new(directory.path()).unwrap(),
+            buffer,
+            &SourceOverrides::new(),
+        ) else {
+            panic!("a foreign buffer cannot be captured");
+        };
+        assert!(
+            error
+                .complete
+                .to_string()
+                .contains("buffer source is not a member of this directory")
+        );
+        assert!(
+            error
+                .incomplete
+                .to_string()
+                .contains("buffer source is not a member of this directory")
+        );
+        assert_eq!(
+            error
+                .to_string()
+                .matches("buffer source is not a member of this directory")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn authored_source_labels_do_not_gate_binding_analysis() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for label in ["", "relative.crn", "missing/../source.crn"] {
+            assert!(
+                AuthoredBindingView::parse_file_source(
+                    "let orphan = mock.test.resource { name = 'orphan' }\n",
+                    Path::new(label),
+                    &context,
+                )
+                .is_ok(),
+                "{label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_fixture_evidence_preserves_authored_label() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let label = Path::new("fixtures/module/main.crn");
+        let source = "arguments {}\n";
+        let parsed = parser::parse_file(source, label, &context).unwrap();
+        let fixture = ParsedRootDirectory::from_parsed_source_for_test(parsed, source);
+        let DirectoryVerdict::ModuleTemplate(template) = fixture.complete_directory_verdict()
+        else {
+            panic!("expected template");
+        };
+        assert_eq!(template.evidence().location().file().path(), label);
+        assert_eq!(template.evidence().file_locator().to_path_buf(), label);
+    }
+
     use super::*;
     use crate::resource::Value;
     use std::fs;
@@ -3627,13 +3757,16 @@ mod tests {
         {
             let snapshot =
                 DirectoryBufferSnapshot::capture(&root, buffer.clone(), overrides).unwrap();
-            assert!(!snapshot.discovery_complete);
+            assert!(snapshot.discovery_failure().is_some());
             let configuration =
                 load_buffer_configuration_in_directory(snapshot, &schemas, &context);
             match configuration.parsed().directory_verdict() {
                 DirectoryVerdict::Root(root) => {
                     assert!(has_root);
-                    assert_eq!(root.evidence().file_locator(), provider.persisted_path());
+                    assert_eq!(
+                        root.evidence().file_locator(),
+                        provider.persisted_path().to_path_buf()
+                    );
                 }
                 DirectoryVerdict::Unknown(()) => assert!(!has_root),
                 DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::NoEvidence(_) => {
@@ -5670,7 +5803,7 @@ awscc.ec2.SecurityGroup {
                 (
                     temp.path().join(name),
                     DirectoryResolvedFile {
-                        source: crate::paths::PersistedPath::new(temp.path().join(name)).unwrap(),
+                        source: temp.path().join(name),
                         parsed,
                         local_variable_names,
                     },

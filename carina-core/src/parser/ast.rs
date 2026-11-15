@@ -7606,14 +7606,7 @@ where
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-impl<E>
-    File<
-        E,
-        ParserPlaceholder,
-        ParserPlaceholder,
-        ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
-        RelativeBindingName,
-    >
+impl<E> File<E>
 where
     E: ResolveExportBindingPhase<ParserPlaceholder>,
     E::Absolute: IntoExpandedExportParam<AbsoluteBindingAddress>,
@@ -7665,6 +7658,12 @@ where
 {
     pub fn directory_verdict(&self) -> &crate::config_loader::DirectoryVerdict {
         self.parser_binding_metadata.syntax().directory_verdict()
+    }
+
+    /// Whether this file declares placeholders supplied by a module caller.
+    /// Empty declaration blocks do not introduce placeholders.
+    pub fn declares_module_placeholders(&self) -> bool {
+        !self.arguments.is_empty() || !self.attribute_params.is_empty()
     }
 
     /// Populate fixture resources while keeping parser-owned metadata private.

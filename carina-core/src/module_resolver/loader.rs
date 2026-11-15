@@ -370,19 +370,10 @@ impl LoadedModule {
         .collect()
     }
     pub(crate) fn placement_errors(&self) -> Vec<ModuleError> {
-        let mut errors = match self.verdict.root() {
-            Some(root) => {
-                let (first, rest) = root.import_prohibitions();
-                std::iter::once(first).chain(rest).collect()
-            }
-            None => Vec::new(),
-        };
-        errors.extend(
-            self.body_prohibitions()
-                .into_iter()
-                .map(ModuleBodyProhibition::into_error),
-        );
-        errors
+        self.body_prohibitions()
+            .into_iter()
+            .map(ModuleBodyProhibition::into_error)
+            .collect()
     }
 }
 

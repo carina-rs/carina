@@ -4,7 +4,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use carina_core::module::FileSignature;
-use carina_core::parser::ProviderContext;
+use carina_core::parser::{ProviderContext, parse_file};
 
 use crate::module_info_app::ModuleInfoApp;
 use crate::module_info_ui::draw;
@@ -64,10 +64,9 @@ fn build_module_signature() -> FileSignature {
             to_port           = 80
         }
     "#;
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("main.crn"), input).unwrap();
-    let parsed = carina_core::module_resolver::load_module_from_directory(
-        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+    let parsed = parse_file(
+        input,
+        std::path::Path::new("web_tier.crn"),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
@@ -95,10 +94,9 @@ fn build_root_config_signature() -> FileSignature {
             cidr_block = "10.0.1.0/24"
         }
     "#;
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("main.crn"), input).unwrap();
-    let parsed = carina_core::module_resolver::load_module_from_directory(
-        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
+    let parsed = parse_file(
+        input,
+        std::path::Path::new("main.crn"),
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();

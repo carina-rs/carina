@@ -8501,11 +8501,11 @@ fn paired_block_name_resolution_renames_resource_ref_alias_on_both_sides() {
         .resolve_root(&crate::resource::RootScope::new());
     let unresolved_resource = ParserResource::with_provider("test", "thing", "consumer", None)
         .with_attribute("rule", unresolved_ref.clone());
-    let evaluated: crate::parser::ParsedFile = crate::parser::ParsedFile {
+    let evaluated = crate::parser::ParsedFile {
         resources: vec![evaluated_resource],
         ..Default::default()
     };
-    let unresolved: crate::parser::ParsedFile = crate::parser::ParsedFile {
+    let unresolved = crate::parser::ParsedFile {
         resources: vec![unresolved_resource],
         ..Default::default()
     };
@@ -8578,11 +8578,11 @@ fn paired_ambiguous_alias_uses_authored_value_shape_on_both_sides() {
                 unresolved_ref.clone(),
             )]))),
         );
-    let evaluated: crate::parser::ParsedFile = crate::parser::ParsedFile {
+    let evaluated = crate::parser::ParsedFile {
         resources: vec![evaluated_resource],
         ..Default::default()
     };
-    let unresolved: crate::parser::ParsedFile = crate::parser::ParsedFile {
+    let unresolved = crate::parser::ParsedFile {
         resources: vec![unresolved_resource],
         ..Default::default()
     };
@@ -8624,7 +8624,7 @@ fn resolve_file_block_names_canonicalizes_data_source_blocks() {
             )])),
         )])),
     );
-    let mut parsed: crate::parser::ParsedFile = crate::parser::ParsedFile {
+    let mut parsed = crate::parser::ParsedFile {
         data_sources: vec![data_source],
         ..Default::default()
     };

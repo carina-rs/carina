@@ -20,7 +20,7 @@ fn resolve_wait_target(
     managed: &[ResolvedResource],
     data_sources: &[DataSource],
 ) -> WaitTargetLookup {
-    let configuration: crate::parser::ExpandedParsedFile = crate::parser::ExpandedParsedFile {
+    let configuration = crate::parser::ExpandedParsedFile {
         resources: managed
             .iter()
             .map(|row| row.as_inner().clone().into_unexpanded_for_test())

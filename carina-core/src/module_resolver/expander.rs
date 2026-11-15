@@ -1216,7 +1216,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
 
         // A module instance contributes only its instance-prefixed runtime
         // graph. Module-local declarations and boundary inputs remain empty
-        // on `<ParsedFile>::default()` because they were consumed above or are
+        // on `ParsedFile::default()` because they were consumed above or are
         // rejected while loading the module.
         let mut contribution =
             crate::parser::RootBindingResolvedParsedFile::empty_with_parsed_binding_uses(
@@ -2232,7 +2232,7 @@ fn select_deferred_module_ifs(
         }
     }
 
-    let mut contribution: ParsedFile = Default::default();
+    let mut contribution = ParsedFile::default();
     let mut forwarded = Vec::new();
     let mut selected_bindings = HashSet::new();
     for deferred in &module.deferred_module_ifs {
@@ -4546,7 +4546,7 @@ mod tests {
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                     session,
                     crate::config_loader::ParsedRootDirectory::from_parsed_for_test(
-                        <crate::parser::ParsedFile>::default(),
+                        crate::parser::ParsedFile::default(),
                     )
                     .module_resolution_context(),
                 );
@@ -4645,11 +4645,10 @@ mod tests {
             ResourceIdentity::new(current_prefix.clone()),
         ));
         resource.loop_provenance = provenance;
-        let mut file: crate::parser::ModuleResolvedParsedFile =
-            crate::parser::ModuleResolvedParsedFile {
-                resources: vec![resource],
-                ..Default::default()
-            };
+        let mut file = crate::parser::ModuleResolvedParsedFile {
+            resources: vec![resource],
+            ..Default::default()
+        };
 
         reconcile_anonymous_module_instances(
             &mut file,
@@ -4709,11 +4708,10 @@ mod tests {
             None,
         );
         resource.loop_provenance = crate::resource::LoopProvenance::direct(direct);
-        let mut file: crate::parser::ModuleResolvedParsedFile =
-            crate::parser::ModuleResolvedParsedFile {
-                resources: vec![resource],
-                ..Default::default()
-            };
+        let mut file = crate::parser::ModuleResolvedParsedFile {
+            resources: vec![resource],
+            ..Default::default()
+        };
 
         reconcile_anonymous_module_instances(
             &mut file,
