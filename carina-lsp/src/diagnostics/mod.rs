@@ -892,8 +892,6 @@ impl DiagnosticRun<'_> {
         let provider_validation_deduplicator = ProviderValidationDeduplicator::default();
         let text = doc.text();
         let buffer_parsed = doc.parsed();
-        // Validate the current AST before a cached parser snapshot can supply
-        // directory evidence. Recovery must not hide a malformed current view.
         // Duplicate declarations can prevent runtime parsing while leaving a
         // complete syntax inventory. Keep directive diagnostics in that case.
         let recovered_metadata = buffer_parsed
@@ -1341,7 +1339,9 @@ impl DiagnosticRun<'_> {
             current_analysis.as_ref(),
             preferred_analysis,
         ) {
-            diagnostics.extend(self.check_configuration_placement(doc, preferred_tree));
+            // Render placement once after recovery has selected its issued
+            // inventory, then insert at main's original presentation position.
+            let placement_index = diagnostics.len();
             diagnostics.extend(self.check_backend_config(
                 doc,
                 merged_result.as_ref(),
@@ -1463,22 +1463,22 @@ impl DiagnosticRun<'_> {
                     self.provider_context.catalog(),
                 )
             };
-            if merged.is_none()
-                && let Some(directory) = pre_expansion_configuration
+            let placement_directory = preferred_tree.syntax().issued_directory().or_else(|| {
+                pre_expansion_configuration
                     .parsed()
                     .parser_binding_metadata
                     .syntax()
                     .issued_directory()
-            {
-                for diagnostic in self.configuration_placement_diagnostics(
-                    doc,
-                    directory,
-                    carina_core::validation::is_module_definition(pre_expansion_input),
-                ) {
-                    if !diagnostics.contains(&diagnostic) {
-                        diagnostics.push(diagnostic);
-                    }
-                }
+            });
+            if let Some(directory) = placement_directory {
+                diagnostics.splice(
+                    placement_index..placement_index,
+                    self.configuration_placement_diagnostics(
+                        doc,
+                        directory,
+                        carina_core::validation::is_module_definition(pre_expansion_input),
+                    ),
+                );
             }
             let expression_report = pre_expansion_configuration.judged().report();
             for finding in expression_report.findings() {

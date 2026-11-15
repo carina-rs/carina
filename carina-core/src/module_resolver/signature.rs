@@ -26,6 +26,7 @@ pub type ResolvedModuleSignatures = HashMap<String, ResolvedModuleSignature>;
 // rejects genuinely invalid authored declarations before expansion. The
 // end-to-end guarantee is pinned by
 // `carina-cli/tests/validate_unknown_custom_type_e2e.rs`.
+#[cfg(test)]
 pub(super) fn resolved_signature(
     parsed: &ParsedFile,
     config: &ProviderContext,
@@ -37,8 +38,21 @@ pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
     parsed: &ParsedFile,
     config: &ProviderContext,
 ) -> ResolvedModuleSignature {
-    let arguments = parsed
-        .arguments
+    resolved_signature_declarations_with_policy::<P>(
+        &parsed.arguments,
+        &parsed.attribute_params,
+        &parsed.requires,
+        config,
+    )
+}
+
+pub(super) fn resolved_signature_declarations_with_policy<P: TypeResolutionPolicy>(
+    arguments: &[crate::parser::ArgumentParameter],
+    attribute_params: &[crate::parser::AttributeParameter],
+    requires: &[RequireBlock<ParserPlaceholder, RelativeBindingName>],
+    config: &ProviderContext,
+) -> ResolvedModuleSignature {
+    let arguments = arguments
         .iter()
         .map(|argument| ConsumerArgumentParameter {
             name: argument.name.clone(),
@@ -48,8 +62,7 @@ pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
             validations: argument.validations.clone(),
         })
         .collect();
-    let attributes = parsed
-        .attribute_params
+    let attributes = attribute_params
         .iter()
         .map(|attribute| {
             let resolved = attribute
@@ -75,7 +88,7 @@ pub(super) fn resolved_signature_with_policy<P: TypeResolutionPolicy>(
     ResolvedModuleSignature {
         arguments,
         attributes,
-        requires: parsed.requires.clone(),
+        requires: requires.to_vec(),
     }
 }
 
@@ -131,7 +144,12 @@ pub fn load_resolved_module_signatures_with_overrides<E, B: crate::resource::Bin
                         }
                     }
                 };
-            loaded.map(|module| (import.alias.clone(), resolved_signature(&module, config)))
+            loaded.map(|source| {
+                (
+                    import.alias.clone(),
+                    source.resolve::<StrictTypeResolution>(config),
+                )
+            })
         })
         .collect()
 }

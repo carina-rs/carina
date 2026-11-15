@@ -4204,6 +4204,11 @@ fn ref_type_mismatch_inside_for_body_is_rejected() {
 fn imported_placement_fixture(
     source: &str,
 ) -> Result<crate::module_resolver::LoadedModule, crate::module_resolver::ModuleLoadError> {
+    crate::parser::parse(
+        source,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .expect("placement fixture must parse before testing import admission");
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("main.crn"), source).unwrap();
     crate::module_resolver::load_module_with_diagnostics(
@@ -4212,26 +4217,65 @@ fn imported_placement_fixture(
     )
 }
 
+fn assert_imported_prohibition(
+    result: Result<crate::module_resolver::LoadedModule, crate::module_resolver::ModuleLoadError>,
+    expected: fn(&crate::module_resolver::ModuleProhibition) -> bool,
+    message: &str,
+) {
+    use crate::module_resolver::{ModuleLoadError, ModuleRejection};
+    let Err(ModuleLoadError::NotModule {
+        error,
+        imports: _,
+        signature: _,
+    }) = result
+    else {
+        panic!("expected a typed import prohibition, not success or an unrelated load failure");
+    };
+    let ModuleRejection::Prohibited(prohibitions) = *error else {
+        panic!("expected a prohibited parsed module");
+    };
+    let members = prohibitions.iter().collect::<Vec<_>>();
+    assert_eq!(
+        members.len(),
+        1,
+        "the fixture has exactly one prohibited category"
+    );
+    assert!(expected(members[0]), "wrong typed prohibition member");
+    assert_eq!(members[0].clone().into_error().to_string(), message);
+}
+
 fn imported_root_block_error(
     declarations: &str,
     block_file: &str,
     block: &str,
+    expected: fn(&crate::module_resolver::ModuleProhibition) -> bool,
 ) -> (String, std::path::PathBuf) {
+    use crate::module_resolver::{ModuleLoadError, ModuleRejection};
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    crate::parser::parse(declarations, &context).expect("interface fixture must parse");
+    crate::parser::parse(block, &context).expect("root block fixture must parse");
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("declarations.crn"), declarations).unwrap();
     let evidence = directory.path().join(block_file);
     std::fs::write(&evidence, block).unwrap();
-    let result = crate::module_resolver::load_module_with_diagnostics(
+    let Err(ModuleLoadError::NotModule {
+        error,
+        imports: _,
+        signature: _,
+    }) = crate::module_resolver::load_module_with_diagnostics(
         &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
-        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
-    (
-        result
-            .err()
-            .expect("root block must prohibit import")
-            .to_string(),
-        evidence,
+        &context,
     )
+    else {
+        panic!("root block must yield a typed prohibition");
+    };
+    let ModuleRejection::Prohibited(prohibitions) = *error else {
+        panic!("expected a parsed prohibited directory");
+    };
+    let members = prohibitions.iter().collect::<Vec<_>>();
+    assert_eq!(members.len(), 1);
+    assert!(expected(members[0]), "wrong root prohibition member");
+    (members[0].clone().into_error().to_string(), evidence)
 }
 
 #[test]
@@ -4240,6 +4284,12 @@ fn provider_in_module_with_arguments_errors() {
         "arguments { vpc_cidr: String }\n",
         "providers.crn",
         "provider awscc {}\n",
+        |member| {
+            matches!(
+                member,
+                crate::module_resolver::ModuleProhibition::Provider { evidence: _ }
+            )
+        },
     );
     assert_eq!(
         message,
@@ -4256,6 +4306,12 @@ fn provider_in_module_with_attributes_errors() {
         "attributes { vpc_id: String = 'dummy' }\n",
         "providers.crn",
         "provider awscc {}\n",
+        |member| {
+            matches!(
+                member,
+                crate::module_resolver::ModuleProhibition::Provider { evidence: _ }
+            )
+        },
     );
     assert_eq!(
         message,
@@ -4272,11 +4328,10 @@ fn moved_in_module_with_arguments_errors() {
         "arguments { name: String }\nmoved { from = mock.test.Resource 'old' to = mock.test.Resource 'new' }\n",
     );
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert_eq!(
-        result.unwrap_err(),
-        "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level."
+    assert_imported_prohibition(
+        loaded,
+        |member| matches!(member, crate::module_resolver::ModuleProhibition::State),
+        "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
     );
 }
 
@@ -4286,9 +4341,11 @@ fn removed_in_module_with_arguments_errors() {
         "arguments { name: String }\nremoved { from = mock.test.Resource 'legacy' }\n",
     );
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert!(result.is_err());
+    assert_imported_prohibition(
+        loaded,
+        |member| matches!(member, crate::module_resolver::ModuleProhibition::State),
+        "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+    );
 }
 
 #[test]
@@ -4297,9 +4354,11 @@ fn import_in_module_with_arguments_errors() {
         "arguments { name: String }\nimport { to = mock.test.Resource 'existing' id = 'resource-123' }\n",
     );
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert!(result.is_err());
+    assert_imported_prohibition(
+        loaded,
+        |member| matches!(member, crate::module_resolver::ModuleProhibition::State),
+        "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+    );
 }
 
 #[test]
@@ -4308,18 +4367,20 @@ fn state_block_in_module_with_attributes_errors() {
         "attributes { resource_id: String = 'dummy' }\nmoved { from = mock.test.Resource 'old' to = mock.test.Resource 'new' }\n",
     );
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert!(result.is_err());
+    assert_imported_prohibition(
+        loaded,
+        |member| matches!(member, crate::module_resolver::ModuleProhibition::State),
+        "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+    );
 }
 
 #[test]
 fn module_without_state_blocks_ok() {
     let loaded = imported_placement_fixture("arguments { name: String }\n");
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert!(result.is_ok());
+    let loaded = loaded.expect("an argument-only module must be admitted");
+    assert_eq!(loaded.parsed().arguments.len(), 1);
+    assert_eq!(loaded.parsed().arguments[0].name, "name");
 }
 
 #[test]
@@ -4328,6 +4389,12 @@ fn backend_in_module_with_arguments_errors() {
         "arguments { name: String }\n",
         "backend.crn",
         "backend local {}\n",
+        |member| {
+            matches!(
+                member,
+                crate::module_resolver::ModuleProhibition::Backend { evidence: _ }
+            )
+        },
     );
     assert_eq!(
         message,
@@ -4344,6 +4411,12 @@ fn backend_in_module_with_attributes_errors() {
         "attributes { resource_id: String = 'dummy' }\n",
         "backend.crn",
         "backend local {}\n",
+        |member| {
+            matches!(
+                member,
+                crate::module_resolver::ModuleProhibition::Backend { evidence: _ }
+            )
+        },
     );
     assert_eq!(
         message,
@@ -4360,11 +4433,15 @@ fn upstream_state_in_module_with_arguments_errors() {
         "arguments { name: String }\nlet up = upstream_state { source = '../other' }\n",
     );
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert_eq!(
-        result.unwrap_err(),
-        "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level."
+    assert_imported_prohibition(
+        loaded,
+        |member| {
+            matches!(
+                member,
+                crate::module_resolver::ModuleProhibition::UpstreamState
+            )
+        },
+        "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
     );
 }
 
@@ -4374,18 +4451,25 @@ fn upstream_state_in_module_with_attributes_errors() {
         "attributes { resource_id: String = 'dummy' }\nlet up = upstream_state { source = '../other' }\n",
     );
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert!(result.is_err());
+    assert_imported_prohibition(
+        loaded,
+        |member| {
+            matches!(
+                member,
+                crate::module_resolver::ModuleProhibition::UpstreamState
+            )
+        },
+        "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+    );
 }
 
 #[test]
 fn module_without_upstream_state_ok() {
     let loaded = imported_placement_fixture("arguments { name: String }\n");
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert!(result.is_ok());
+    let loaded = loaded.expect("an argument-only module must be admitted");
+    assert_eq!(loaded.parsed().arguments.len(), 1);
+    assert_eq!(loaded.parsed().arguments[0].name, "name");
 }
 
 #[test]
@@ -4394,11 +4478,10 @@ fn exports_in_module_with_arguments_errors() {
         "arguments { name: String }\nexports { module_value = 'module' }\n",
     );
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert_eq!(
-        result.unwrap_err(),
-        "exports blocks are not allowed inside modules. Define exports at the root configuration level."
+    assert_imported_prohibition(
+        loaded,
+        |member| matches!(member, crate::module_resolver::ModuleProhibition::Exports),
+        "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
     );
 }
 
@@ -4408,18 +4491,20 @@ fn exports_in_module_with_attributes_errors() {
         "attributes { resource_id: String = 'dummy' }\nexports { module_value = 'module' }\n",
     );
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert!(result.is_err());
+    assert_imported_prohibition(
+        loaded,
+        |member| matches!(member, crate::module_resolver::ModuleProhibition::Exports),
+        "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+    );
 }
 
 #[test]
 fn module_without_exports_ok() {
     let loaded = imported_placement_fixture("arguments { name: String }\n");
 
-    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
-
-    assert!(result.is_ok());
+    let loaded = loaded.expect("an argument-only module must be admitted");
+    assert_eq!(loaded.parsed().arguments.len(), 1);
+    assert_eq!(loaded.parsed().arguments[0].name, "name");
 }
 
 fn admitted_placement_directory(source: &str) -> crate::config_loader::ParsedRootDirectory {

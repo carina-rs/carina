@@ -1834,7 +1834,7 @@ fn no_evidence_directory_is_root_for_upstream_and_module_info() {
 }
 
 #[test]
-fn imported_backend_precedes_state_prohibition_on_validating_paths() {
+fn imported_prohibitions_keep_main_category_order_on_validating_paths() {
     let directory = Directory::new("true");
     directory.clear_root_require();
     success(&directory.run(&["apply", "--auto-approve", "."]));
@@ -1874,7 +1874,7 @@ fn imported_backend_precedes_state_prohibition_on_validating_paths() {
         let tail = format!("Error: {prefix}{state_message}\n");
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            format!("Error: {prefix}{backend}\n{note}{tail}")
+            format!("{tail}Error: {prefix}{backend}\n{note}")
         );
         assert_eq!(
             fs::read(directory.project.join("carina.state.json")).unwrap(),

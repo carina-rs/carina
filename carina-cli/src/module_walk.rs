@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use carina_core::module_resolver::{
-    self, LoadedModule, ModuleError, ModuleLoadError, ModuleRejection,
+    self, LoadedModule, ModuleError, ModuleLoadError, ModuleProhibitionCategory, ModuleRejection,
 };
 use carina_core::paths::{CanonicalPath, DisplayPath, ResolvedPath};
 
@@ -36,27 +36,14 @@ impl LoadedModuleAtPath {
 pub(crate) struct RejectedModuleAtPath {
     pub(crate) label: DisplayPath,
     pub(crate) error: std::sync::Arc<ModuleError>,
-    presentation: ImportPresentation,
-}
-
-enum ImportPresentation {
-    Boundary,
-    Resolution(ResolvedPath),
+    pub(crate) category: ModuleProhibitionCategory,
 }
 
 impl RejectedModuleAtPath {
     pub(crate) fn diagnostic(&self) -> crate::error::AppError {
-        match &self.presentation {
-            ImportPresentation::Boundary => crate::error::AppError::ModuleImport {
-                path: self.label.clone(),
-                error: self.error.clone(),
-            },
-            ImportPresentation::Resolution(base) => {
-                crate::error::AppError::ModuleImportResolution {
-                    error: self.error.clone(),
-                    base: Box::new(base.clone()),
-                }
-            }
+        crate::error::AppError::ModuleImport {
+            path: self.label.clone(),
+            error: self.error.clone(),
         }
     }
 }
@@ -97,7 +84,6 @@ impl ModuleWalk {
             visit_module(
                 ModuleVisit {
                     module_path: &module_path,
-                    authored_import: &import.path,
                     diagnostic_path: Path::new(&import.path),
                     diagnostic_base: &base_dir,
                     owners: &owners,
@@ -112,17 +98,6 @@ impl ModuleWalk {
         walk
     }
 
-    /// Main's lint walk skips single-file imports. The resolver remains the
-    /// fallback when no independently collected finding blocks expansion.
-    pub(crate) fn for_lint(mut self) -> Self {
-        self.rejections
-            .retain(|rejection| match &rejection.presentation {
-                ImportPresentation::Boundary => true,
-                ImportPresentation::Resolution(_) => false,
-            });
-        self
-    }
-
     pub(crate) fn rejections(&self) -> &[RejectedModuleAtPath] {
         &self.rejections
     }
@@ -134,7 +109,6 @@ impl ModuleWalk {
 
 struct ModuleVisit<'a> {
     module_path: &'a ResolvedPath,
-    authored_import: &'a str,
     diagnostic_path: &'a Path,
     diagnostic_base: &'a ResolvedPath,
     owners: &'a [carina_core::parser::ModuleCallId],
@@ -144,7 +118,6 @@ struct ModuleVisit<'a> {
 fn visit_module(
     ModuleVisit {
         module_path,
-        authored_import,
         diagnostic_path,
         diagnostic_base,
         owners,
@@ -184,36 +157,24 @@ fn visit_module(
             signature: _,
         }) => {
             match *error {
-                ModuleRejection::NotADirectory { path: _ } => {
-                    walk.rejections.push(RejectedModuleAtPath {
-                        label: DisplayPath::for_diagnostics_from(diagnostic_path, diagnostic_base),
-                        error: std::sync::Arc::new(
-                            ModuleError::NotADirectory {
-                                path: authored_import.to_owned(),
-                            }
-                            .with_import_owners(import_location.clone(), owners.to_vec()),
-                        ),
-                        presentation: ImportPresentation::Resolution(diagnostic_base.clone()),
-                    })
-                }
-                rejection @ (ModuleRejection::NoConfigurationFiles { path: _ }
-                | ModuleRejection::Prohibited(_)) => {
-                    walk.rejections
-                        .extend(rejection.into_errors().into_iter().map(|error| {
-                            RejectedModuleAtPath {
+                // Main's static walk skips ordinary load failures; the
+                // resolver owns their messages and call/file locations.
+                ModuleRejection::NotADirectory { path: _ }
+                | ModuleRejection::NoConfigurationFiles { path: _ } => return,
+                ModuleRejection::Prohibited(prohibitions) => {
+                    walk.rejections.extend(
+                        prohibitions
+                            .into_owned_errors(import_location.clone(), owners.to_vec())
+                            .into_iter()
+                            .map(|(category, error)| RejectedModuleAtPath {
                                 label: DisplayPath::for_diagnostics_from(
                                     diagnostic_path,
                                     diagnostic_base,
                                 ),
-                                error: std::sync::Arc::new(
-                                    error.with_import_owners(
-                                        import_location.clone(),
-                                        owners.to_vec(),
-                                    ),
-                                ),
-                                presentation: ImportPresentation::Boundary,
-                            }
-                        }));
+                                error: std::sync::Arc::new(error),
+                                category,
+                            }),
+                    );
                 }
             }
             imports
@@ -225,16 +186,14 @@ fn visit_module(
             Some((
                 module_path.join(&import.path).ok()?,
                 diagnostic_path.join(&import.path),
-                import.path.as_str(),
             ))
         })
         .collect();
 
-    for (child_module_path, child_diagnostic_path, authored_import) in child_paths {
+    for (child_module_path, child_diagnostic_path) in child_paths {
         visit_module(
             ModuleVisit {
                 module_path: &child_module_path,
-                authored_import,
                 diagnostic_path: &child_diagnostic_path,
                 diagnostic_base,
                 owners,
@@ -343,7 +302,7 @@ mod unavailable_tests {
 mod rejected_import_tests {
     use super::*;
     #[test]
-    fn every_rejected_import_is_rendered_once() {
+    fn ordinary_rejected_imports_are_left_to_the_resolver() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("not-a-directory.crn"), "// file\n").unwrap();
         std::fs::create_dir(directory.path().join("empty")).unwrap();
@@ -359,25 +318,8 @@ mod rejected_import_tests {
             &environment,
             &carina_core::schema::SchemaRegistry::new(),
         );
-        let errors = crate::wiring::validate_module_boundaries(&walk);
-        assert_eq!(errors.len(), 2, "{errors:?}");
-        let messages = errors.iter().map(ToString::to_string).collect::<Vec<_>>();
-        assert_eq!(
-            messages
-                .iter()
-                .filter(|message| message.contains("not-a-directory.crn"))
-                .count(),
-            1,
-            "{messages:?}"
-        );
-        assert_eq!(
-            messages
-                .iter()
-                .filter(|message| message.contains("No .crn files"))
-                .count(),
-            1,
-            "{messages:?}"
-        );
+        assert!(walk.rejections().is_empty());
+        assert!(crate::wiring::validate_module_boundaries(&walk).is_empty());
     }
 
     #[test]

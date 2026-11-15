@@ -1388,6 +1388,10 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let loaded = self.load_directory_module(&full_path);
         let mut parsed = match loaded {
             Ok(parsed) => parsed,
+            Err(ModuleError::NoConfigurationFiles { path: _ }) => {
+                self.resolving.remove(&canonical);
+                return Err(ModuleError::NotFound(path.to_string()));
+            }
             Err(error) => {
                 self.resolving.remove(&canonical);
                 return Err(error);

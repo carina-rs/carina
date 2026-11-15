@@ -636,17 +636,6 @@ impl DiagnosticRun<'_> {
         diagnostics
     }
 
-    pub(super) fn check_configuration_placement(
-        &self,
-        doc: &Document,
-        tree: &carina_core::parser::AnalysisTree<'_>,
-    ) -> Vec<Diagnostic> {
-        let Some(directory) = tree.syntax().issued_directory() else {
-            return Vec::new();
-        };
-        self.configuration_placement_diagnostics(doc, directory, tree.is_module_definition())
-    }
-
     pub(super) fn configuration_placement_diagnostics(
         &self,
         doc: &Document,

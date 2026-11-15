@@ -6075,7 +6075,7 @@ fn test_load_module_rejects_state_blocks() {
                     .expect_err("state block inside a module must be rejected");
 
                 assert!(
-                    matches!(&err, ModuleError::StateBlockInModule),
+                    matches!(err.root_cause(), ModuleError::StateBlockInModule),
                     "expected StateBlockInModule for {kind}, got {err:?}",
                 );
                 assert_eq!(
@@ -6165,7 +6165,7 @@ fn test_load_module_rejects_upstream_state_and_cleans_resolving_set() {
                     .load_module("module")
                     .expect_err("upstream_state inside a module must be rejected");
                 assert!(
-                    matches!(&err, ModuleError::UpstreamStateInModule),
+                    matches!(err.root_cause(), ModuleError::UpstreamStateInModule),
                     "expected UpstreamStateInModule on attempt {attempt}, got {err:?}",
                 );
                 assert_eq!(
@@ -6207,7 +6207,7 @@ fn test_load_module_rejects_exports_and_cleans_resolving_set() {
                     .load_module("module")
                     .expect_err("exports inside a module must be rejected");
                 assert!(
-                    matches!(&err, ModuleError::ExportsInModule),
+                    matches!(err.root_cause(), ModuleError::ExportsInModule),
                     "expected ExportsInModule on attempt {attempt}, got {err:?}",
                 );
                 assert_eq!(
@@ -12396,6 +12396,70 @@ fn module_if_audit_checks_functions_in_sibling_declaration_order() {
         let error = crate::module_resolver::ensure_expanded_root_graph(&expanded).unwrap_err();
         assert!(
             matches!(error, ModuleError::UnexpandedModuleTemplate { context } if context == "function parameter default")
+        );
+    });
+}
+
+#[test]
+fn uncalled_import_anchors_require_a_loader_issued_prohibition() {
+    for shape in ["missing", "syntax", "empty", "file", "cycle"] {
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("child");
+        if shape == "file" {
+            fs::write(&child, "arguments {}\n").unwrap();
+        } else if shape != "missing" {
+            fs::create_dir(&child).unwrap();
+            if shape == "syntax" {
+                fs::write(child.join("broken.crn"), "let =\n").unwrap();
+            }
+            if shape == "cycle" {
+                fs::write(
+                    child.join("main.crn"),
+                    "arguments { n: Int = 1 }\nlet self_import = use { source = '.' }\n",
+                )
+                .unwrap();
+            }
+        }
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let caller = crate::parser::parse_file(
+            "let child = use { source = './child' }\n",
+            &directory.path().join("main.crn"),
+            &context,
+        )
+        .unwrap();
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let mut resolver = ModuleResolver::new(
+                &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+                session,
+                resolver_context(),
+            );
+            let error = resolver.process_imports(&caller.uses, &[]).unwrap_err();
+            assert!(
+                matches!(error.call_source(), ModuleErrorCallSource::Unavailable),
+                "{shape}: an ordinary uncalled failure has no use anchor"
+            );
+        });
+    }
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("child")).unwrap();
+    fs::write(directory.path().join("child/exports.crn"), "exports {}\n").unwrap();
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let caller = crate::parser::parse_file(
+        "let child = use { source = './child' }\n",
+        &directory.path().join("main.crn"),
+        &context,
+    )
+    .unwrap();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        let mut resolver = ModuleResolver::new(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+            session,
+            resolver_context(),
+        );
+        let error = resolver.process_imports(&caller.uses, &[]).unwrap_err();
+        assert!(
+            matches!(error.call_source(), ModuleErrorCallSource::Import(location) if location == caller.uses[0].declaration_location()),
+            "a singleton prohibition retains its typed import ownership"
         );
     });
 }

@@ -33,6 +33,21 @@
     "source": "carina"
   },
   {
+    "message": "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+    "range": {
+      "end": {
+        "character": 1,
+        "line": 1
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    },
+    "severity": 1,
+    "source": "carina"
+  },
+  {
     "message": "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
     "range": {
       "end": {
@@ -62,21 +77,6 @@
         "message": "This backend block makes the directory a root configuration."
       }
     ],
-    "severity": 1,
-    "source": "carina"
-  },
-  {
-    "message": "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
-    "range": {
-      "end": {
-        "character": 1,
-        "line": 1
-      },
-      "start": {
-        "character": 0,
-        "line": 1
-      }
-    },
     "severity": 1,
     "source": "carina"
   },

@@ -463,9 +463,7 @@ impl HoverProvider {
             doc.provider_context(),
             &carina_core::schema::SchemaRegistry::new(),
             &module_path.source_label(),
-        )
-        .map(|source| source.parsed().clone())
-        {
+        ) {
             Ok(module) => module,
             Err(
                 carina_core::module_resolver::ModuleLoadError::NotModule {
@@ -539,9 +537,7 @@ impl HoverProvider {
             doc.provider_context(),
             &carina_core::schema::SchemaRegistry::new(),
             &module_path.source_label(),
-        )
-        .map(|source| source.parsed().clone())
-        {
+        ) {
             Ok(module) => module,
             Err(
                 carina_core::module_resolver::ModuleLoadError::NotModule {

@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use super::validation::ModuleConstraintDiagnostic;
 
-/// Two or more resolver failures retained by a non-collecting API.
+/// Multiple resolver failures, or a nonempty typed import-prohibition set.
 ///
 /// Private fields and a shared nonempty constructor prevent empty or
-/// needlessly singleton failures. Import provenance comes only from the
+/// singleton ordinary failures. Import provenance comes only from the
 /// loader's complete typed set, so body and root prohibitions can both be
 /// presented individually without changing other resolver error groups.
 #[derive(Debug)]
@@ -788,7 +788,7 @@ impl ModuleError {
     }
 
     fn from_nonempty_errors_grouped(first: Self, rest: Vec<Self>, group: ModuleErrorGroup) -> Self {
-        if rest.is_empty() {
+        if rest.is_empty() && matches!(group, ModuleErrorGroup::Resolution) {
             first
         } else {
             Self::Multiple(MultipleModuleErrors {
@@ -798,14 +798,16 @@ impl ModuleError {
         }
     }
 
-    /// Keep existing call anchors, falling back to the use expression only
-    /// when an import has no owning call.
+    /// Keep existing call anchors. Only a loader-issued prohibition group
+    /// may use the import declaration when there is no owning call.
     pub fn with_import_owners(
         self,
         location: crate::parser::DeclarationLocation,
         calls: Vec<ModuleCallId>,
     ) -> Self {
-        if calls.is_empty() {
+        if calls.is_empty()
+            && matches!(&self, Self::Multiple(errors) if matches!(errors.group, ModuleErrorGroup::ImportProhibitions))
+        {
             Self::AtImport {
                 location,
                 error: Box::new(self),
@@ -995,6 +997,7 @@ impl ModuleError {
     /// Semantic leaf after removing typed import ownership wrappers.
     pub fn root_cause(&self) -> &Self {
         match self {
+            Self::Multiple(errors) if errors.errors.len() == 1 => errors.errors[0].root_cause(),
             Self::AtImport { location: _, error }
             | Self::OwnedByCalls { error, calls: _ }
             | Self::AtCall { error, call: _ }

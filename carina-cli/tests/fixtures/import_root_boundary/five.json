@@ -22,7 +22,7 @@
       }
     },
     {
-      "message": "../rooted: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\nNote: directory is a root configuration because of the backend block at ../rooted/backend.crn:1.",
+      "message": "../rooted: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
       "severity": "error",
       "code": null,
       "location": {
@@ -40,7 +40,7 @@
       }
     },
     {
-      "message": "../rooted: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+      "message": "../rooted: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\nNote: directory is a root configuration because of the backend block at ../rooted/backend.crn:1.",
       "severity": "error",
       "code": null,
       "location": {

@@ -5293,12 +5293,17 @@ pub(crate) fn validate_module_internal_ref_types(
     }
 }
 
-/// Present the loader's prohibition sets in depth-first directory order.
-/// Prohibited bodies never enter the static validation walk.
+/// Present the loader's typed sets in main's category-first order, retaining
+/// depth-first directory order within each category. No body is reclassified.
 pub(crate) fn validate_module_boundaries(module_walk: &ModuleWalk) -> Vec<AppError> {
-    module_walk
-        .rejections()
-        .iter()
+    carina_core::module_resolver::ModuleProhibitionCategory::ALL
+        .into_iter()
+        .flat_map(|category| {
+            module_walk
+                .rejections()
+                .iter()
+                .filter(move |rejection| rejection.category == category)
+        })
         .map(crate::module_walk::RejectedModuleAtPath::diagnostic)
         .collect()
 }

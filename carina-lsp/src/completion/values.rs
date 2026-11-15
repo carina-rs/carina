@@ -2056,10 +2056,7 @@ impl CompletionProvider {
             else {
                 continue;
             };
-            for export in &parsed.export_params {
-                let Some(export_ty) = export.static_type.as_ref() else {
-                    continue;
-                };
+            for (export_name, export_ty) in parsed.export_types() {
                 if !type_expr_source_is_assignable_to(
                     export_ty,
                     target,
@@ -2068,13 +2065,13 @@ impl CompletionProvider {
                 ) {
                     continue;
                 }
-                let full_ref = format!("{}.{}", binding_name, export.name);
+                let full_ref = format!("{}.{}", binding_name, export_name);
                 items.push(CompletionItem {
                     label: full_ref.clone(),
                     kind: Some(CompletionItemKind::REFERENCE),
                     detail: Some(format!(
                         "Reference to {}'s exported {} ({})",
-                        binding_name, export.name, export_ty,
+                        binding_name, export_name, export_ty,
                     )),
                     insert_text: Some(full_ref),
                     ..Default::default()

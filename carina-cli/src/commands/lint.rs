@@ -304,8 +304,7 @@ fn lint_result(
         base_dir,
         &provider_context.environment,
         &carina_core::schema::SchemaRegistry::new(),
-    )
-    .for_lint();
+    );
     let module_boundary_findings = validate_module_boundaries(&module_walk);
 
     let (providers, provider_factory_error) = ProviderLoad::load_reporting(

@@ -427,7 +427,7 @@ impl CompletionProvider {
     }
 
     /// Resolve a `let X = use { ... }` binding to the called module's
-    /// parsed `ParsedFile`. Returns `None` if the import path can't be
+    /// static interface. Returns `None` if the import path can't be
     /// found, the call lacks a `base_path`, or the module fails to
     /// parse.
     pub(super) fn load_called_module(
@@ -436,7 +436,7 @@ impl CompletionProvider {
         text: &str,
         base_path: Option<&carina_core::paths::ResolvedPath>,
         provider_ctx: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Option<carina_core::parser::ParsedFile> {
+    ) -> Option<carina_core::module_resolver::ModuleSignatureSource> {
         let import_path = self.find_module_import_path(module_name, text, base_path)?;
         let base = base_path?;
         let module_path = base.join(&import_path).ok()?;
@@ -455,7 +455,7 @@ impl CompletionProvider {
             &self.schemas,
             &module_path.source_label(),
         ) {
-            Ok(module) => Some(module.parsed().clone()),
+            Ok(module) => Some(module),
             Err(carina_core::module_resolver::ModuleLoadError::Unavailable(_))
             | Err(carina_core::module_resolver::ModuleLoadError::NotModule {
                 error: _,
@@ -672,10 +672,9 @@ impl CompletionProvider {
             && let Ok(parsed) = carina_core::module_resolver::load_module_signature_with_schemas(
                 &module_path,
                 provider_ctx,
-                &self.schemas,
+                &carina_core::schema::SchemaRegistry::new(),
                 &module_path.source_label(),
             )
-            .map(|source| source.parsed().clone())
             && !parsed.arguments.is_empty()
         {
             let mut snippet = format!("{} {{\n", binding);

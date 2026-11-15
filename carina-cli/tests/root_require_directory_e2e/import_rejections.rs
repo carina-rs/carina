@@ -210,3 +210,263 @@ fn prohibited_imports_precede_body_expression_and_type_errors_on_every_transport
         }
     }
 }
+
+// Golden results measured on cc33cf977, including child syntax routing.
+#[test]
+fn ordinary_uncalled_imports_match_main_on_every_transport() {
+    type MainImportCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
+    let cases: &[MainImportCase<'_>] = &[
+        (
+            "uncalled-missing",
+            &[],
+            r###"Error: Module resolution error: IO error: No such file or directory (os error 2)
+"###,
+            r###"{
+  "status": "error",
+  "resource_count": 0,
+  "resources": [],
+  "errors": [
+    {
+      "message": "IO error: No such file or directory (os error 2)",
+      "severity": "error",
+      "code": null,
+      "location": null
+    }
+  ]
+}
+"###,
+        ),
+        (
+            "uncalled-syntax",
+            &[(
+                r###"target/broken.crn"###,
+                r###"let =
+"###,
+            )],
+            r###"Error: Module resolution error: Parse error in ../target/broken.crn: Syntax error:  --> 1:5
+Error:   |
+Error: 1 | let =
+Error:   |     ^---
+Error:   |
+Error:   = expected discard_pattern or identifier
+"###,
+            r###"{
+  "status": "error",
+  "resource_count": 0,
+  "resources": [],
+  "errors": [
+    {
+      "message": "Syntax error: expected discard_pattern or identifier",
+      "severity": "error",
+      "code": null,
+      "location": {
+        "file": "../target/broken.crn",
+        "range": {
+          "start": {
+            "line": 1,
+            "column": 5
+          },
+          "end": {
+            "line": 1,
+            "column": 5
+          }
+        }
+      }
+    }
+  ]
+}
+"###,
+        ),
+        (
+            "uncalled-empty",
+            &[],
+            r###"Error: Module resolution error: Module not found: ../target
+"###,
+            r###"{
+  "status": "error",
+  "resource_count": 0,
+  "resources": [],
+  "errors": [
+    {
+      "message": "Module not found: ../target",
+      "severity": "error",
+      "code": null,
+      "location": null
+    }
+  ]
+}
+"###,
+        ),
+        (
+            "uncalled-file",
+            &[(
+                r###"target"###,
+                r###"arguments {}
+"###,
+            )],
+            r###"Error: Module resolution error: Module path '../target' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.
+"###,
+            r###"{
+  "status": "error",
+  "resource_count": 0,
+  "resources": [],
+  "errors": [
+    {
+      "message": "Module path '../target' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+      "severity": "error",
+      "code": null,
+      "location": null
+    }
+  ]
+}
+"###,
+        ),
+        (
+            "uncalled-cycle",
+            &[
+                (
+                    r###"target/main.crn"###,
+                    r###"let again = use { source = './nested' }
+"###,
+                ),
+                (
+                    r###"target/nested/main.crn"###,
+                    r###"let again = use { source = '..' }
+"###,
+                ),
+                (
+                    r###"target/arguments.crn"###,
+                    r###"arguments { n: Int = 1 }
+"###,
+                ),
+                (
+                    r###"target/nested/arguments.crn"###,
+                    r###"arguments { n: Int = 1 }
+"###,
+                ),
+            ],
+            r###"Error: Module resolution error: Circular import detected: ..
+"###,
+            r###"{
+  "status": "error",
+  "resource_count": 0,
+  "resources": [],
+  "errors": [
+    {
+      "message": "Circular import detected: ..",
+      "severity": "error",
+      "code": null,
+      "location": null
+    }
+  ]
+}
+"###,
+        ),
+    ];
+    for (shape, files, human, report) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("caller");
+        fs::create_dir(&project).unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        for (name, source) in *files {
+            let path = temp.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        }
+        if *shape == "uncalled-empty" {
+            fs::create_dir(temp.path().join("target")).unwrap();
+        }
+        fs::write(
+            project.join("main.crn"),
+            "let m = use { source = '../target' }\n",
+        )
+        .unwrap();
+        fs::write(project.join("providers.crn"), "provider mock {}\n").unwrap();
+        let directory = Directory {
+            project,
+            home,
+            _temp: temp,
+        };
+        assert_transports(&directory, human, report, "[]");
+    }
+}
+
+#[test]
+fn imported_roots_keep_main_category_order_across_directories() {
+    let directory = fixture();
+    let root = directory._temp.path();
+    fs::create_dir(root.join("second")).unwrap();
+    for name in ["main.crn", "providers.crn", "backend.crn", "exports.crn"] {
+        fs::copy(
+            root.join("rooted").join(name),
+            root.join("second").join(name),
+        )
+        .unwrap();
+    }
+    for child in ["rooted", "second"] {
+        fs::write(
+            root.join(child).join("arguments.crn"),
+            "arguments { n: Int = 1 }\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        directory.project.join("main.crn"),
+        "let m = use { source = '../rooted' }\nlet n = use { source = '../second' }\nm {}\nn {}\n",
+    )
+    .unwrap();
+    let single: Value =
+        serde_json::from_str(include_str!("../fixtures/import_root_boundary/five.json")).unwrap();
+    let expected = single["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|error| {
+            let message = error["message"].as_str().unwrap();
+            [
+                message.to_string(),
+                message.replace("../rooted", "../second"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let output = directory.run(&["validate", "--json", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|error| error["message"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for (args, prefix, suffix) in [
+        (vec!["validate", "."], "Error: ", ""),
+        (
+            vec!["lint", "."],
+            "warning: .:1  ",
+            "Error: Found 10 lint warning(s).\n",
+        ),
+    ] {
+        let output = directory.run(&args);
+        assert_eq!(output.status.code(), Some(1));
+        let expected = expected
+            .iter()
+            .map(|message| {
+                let (message, note) = message
+                    .split_once('\n')
+                    .map_or((message.as_str(), None), |(message, note)| {
+                        (message, Some(note))
+                    });
+                format!(
+                    "{prefix}{message}\n{}",
+                    note.map_or_else(String::new, |note| format!("  {note}\n"))
+                )
+            })
+            .collect::<String>()
+            + suffix;
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
+    }
+}
