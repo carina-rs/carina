@@ -185,9 +185,9 @@ impl CompletionProvider {
             CompletionItem {
                 label: "backend".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("backend s3 {\n    bucket = \"${1:my-carina-state}\"\n    key    = \"${2:prod/carina.crnstate}\"\n    region = aws.Region.${3:ap_northeast_1}\n}".to_string()),
+                insert_text: Some(format!("backend ${{1|{}|}} {{\n    $0\n}}", carina_core::validation::admission::configuration::backend::BackendKind::ALL.into_iter().map(|kind| kind.name()).collect::<Vec<_>>().join(","))),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Configure state backend (S3)".to_string()),
+                detail: Some("Configure state backend".to_string()),
                 ..Default::default()
             },
             CompletionItem {
@@ -452,7 +452,7 @@ impl CompletionProvider {
         carina_core::config_loader::parse_directory_for_metadata(
             &module_path,
             &provider_context,
-            &indexmap::IndexMap::new(),
+            &Default::default(),
             &self.schemas,
         )
         .ok()

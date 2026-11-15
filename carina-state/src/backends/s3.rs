@@ -4,10 +4,15 @@ use async_trait::async_trait;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::timeout::TimeoutConfig;
+
+#[cfg(test)]
+pub(super) static S3_CONSTRUCTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
+use carina_core::shutdown::CleanupBudget;
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -38,16 +43,83 @@ const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` 
 // that retry, but the late checkpoint that caused the conflict is already
 // durable, and every later state PUT remains conditional. Normal operations
 // retain SDK retries.
-const CLEANUP_S3_OPERATION_TIMEOUT: Duration = Duration::from_millis(300);
 const STATE_WRITE_MAX_ATTEMPTS: usize = 5;
 
+const CLEANUP_REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
+
+#[derive(Clone, Copy)]
+enum CleanupRequest {
+    ReadLock,
+    HeadState,
+    WriteLock,
+    WriteState,
+    DeleteLock,
+}
+impl CleanupRequest {
+    fn timeout_error(self) -> BackendError {
+        let operation = match self {
+            Self::ReadLock => "s3.GetObject",
+            Self::HeadState => "s3.HeadObject",
+            Self::WriteLock | Self::WriteState => "s3.PutObject",
+            Self::DeleteLock => "s3.DeleteObject",
+        };
+        let error = BackendError::Io(format!(
+            "Cancellation cleanup {operation} timed out after {}ms",
+            CLEANUP_REQUEST_TIMEOUT.as_millis()
+        ));
+        match self {
+            Self::WriteState => BackendError::UnconfirmedStateSave {
+                error: Box::new(error),
+            },
+            Self::ReadLock | Self::HeadState | Self::WriteLock | Self::DeleteLock => error,
+        }
+    }
+}
+
+fn state_put_error(
+    error: aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
+    settings: &S3BackendSettings,
+) -> BackendError {
+    use aws_sdk_s3::error::SdkError;
+    let outcome = match &error {
+        SdkError::ServiceError(context)
+            if context.raw().status().is_server_error()
+                || context.raw().status().as_u16() == 429
+                || context.err().code() == Some("SlowDown") =>
+        {
+            crate::SaveFailureKind::Unconfirmed
+        }
+        SdkError::ConstructionFailure(_) | SdkError::ServiceError(_) => {
+            crate::SaveFailureKind::Failed
+        }
+        SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
+            crate::SaveFailureKind::Unconfirmed
+        }
+        // SdkError is non-exhaustive. A new transport failure cannot prove
+        // that the service did not accept the PUT.
+        _ => crate::SaveFailureKind::Unconfirmed,
+    };
+    let error = BackendError::Aws(Box::new(
+        AwsError::from_sdk_error("s3.PutObject", error)
+            .bucket(settings.bucket())
+            .key(settings.key()),
+    ));
+    match outcome {
+        crate::SaveFailureKind::Unconfirmed => BackendError::UnconfirmedStateSave {
+            error: Box::new(error),
+        },
+        crate::SaveFailureKind::Failed => error,
+    }
+}
+
 fn cleanup_operation_config() -> aws_sdk_s3::config::Builder {
+    let timeout = CLEANUP_REQUEST_TIMEOUT;
     aws_sdk_s3::Config::builder()
         .retry_config(RetryConfig::standard().with_max_attempts(1))
         .timeout_config(
             TimeoutConfig::builder()
-                .operation_timeout(CLEANUP_S3_OPERATION_TIMEOUT)
-                .operation_attempt_timeout(CLEANUP_S3_OPERATION_TIMEOUT)
+                .operation_timeout(timeout)
+                .operation_attempt_timeout(timeout)
                 .build(),
         )
 }
@@ -256,6 +328,8 @@ impl S3Backend {
     /// redirects, so any region from the chain reaches buckets in other
     /// regions.
     pub(crate) async fn from_config(config: &S3BackendSettings) -> BackendResult<Self> {
+        #[cfg(test)]
+        S3_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let sdk_region = sdk_chain_region().await;
         let region = resolve_region(config.region(), sdk_region.as_deref())?;
         let client = build_s3_client(&region).await;
@@ -265,6 +339,8 @@ impl S3Backend {
     /// URL origin retains encryption and forbids automatic bucket creation.
     /// The URL's candidate enters the same declared-settings admission path.
     pub(crate) async fn from_url_parts(bucket: String, key: String) -> BackendResult<Self> {
+        #[cfg(test)]
+        S3_CONSTRUCTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let settings = S3BackendSettings::from_url_parts(bucket, key)?;
         Self::from_config(&settings).await
     }
@@ -336,7 +412,7 @@ impl S3Backend {
     }
 
     async fn read_lock_with_etag_for_cleanup(&self) -> BackendResult<Option<(LockInfo, String)>> {
-        self.with_cleanup_operation_timeout("s3.GetObject", async {
+        self.with_cleanup_operation_timeout(CleanupRequest::ReadLock, async {
             let result = self
                 .client
                 .get_object()
@@ -378,17 +454,13 @@ impl S3Backend {
 
     async fn with_cleanup_operation_timeout<T>(
         &self,
-        operation: &'static str,
+        operation: CleanupRequest,
         future: impl std::future::Future<Output = BackendResult<T>>,
     ) -> BackendResult<T> {
-        tokio::time::timeout(CLEANUP_S3_OPERATION_TIMEOUT, future)
+        let timeout = CLEANUP_REQUEST_TIMEOUT;
+        tokio::time::timeout(timeout, future)
             .await
-            .map_err(|_| {
-                BackendError::Io(format!(
-                    "Cancellation cleanup {operation} timed out after {}ms",
-                    CLEANUP_S3_OPERATION_TIMEOUT.as_millis()
-                ))
-            })?
+            .map_err(|_| operation.timeout_error())?
     }
 
     fn lock_body(lock: &LockInfo) -> BackendResult<Vec<u8>> {
@@ -498,7 +570,7 @@ impl S3Backend {
         match operation {
             StateWriteOperation::Normal => read.await,
             StateWriteOperation::Cleanup => {
-                self.with_cleanup_operation_timeout("s3.HeadObject", read)
+                self.with_cleanup_operation_timeout(CleanupRequest::HeadState, read)
                     .await
             }
         }
@@ -552,18 +624,14 @@ impl S3Backend {
                 Err(error) if is_conditional_write_conflict(&error) => {
                     Ok(StatePutOutcome::Conflict)
                 }
-                Err(error) => Err(BackendError::Aws(Box::new(
-                    AwsError::from_sdk_error("s3.PutObject", error)
-                        .bucket(self.settings.bucket())
-                        .key(self.settings.key()),
-                ))),
+                Err(error) => Err(state_put_error(error, &self.settings)),
             }
         };
 
         match operation {
             StateWriteOperation::Normal => write.await,
             StateWriteOperation::Cleanup => {
-                self.with_cleanup_operation_timeout("s3.PutObject", write)
+                self.with_cleanup_operation_timeout(CleanupRequest::WriteState, write)
                     .await
             }
         }
@@ -663,7 +731,7 @@ impl S3Backend {
         etag: &str,
     ) -> BackendResult<bool> {
         let body = Self::lock_body(lock)?;
-        self.with_cleanup_operation_timeout("s3.PutObject", async {
+        self.with_cleanup_operation_timeout(CleanupRequest::WriteLock, async {
             let mut request = self
                 .client
                 .put_object()
@@ -766,7 +834,7 @@ impl S3Backend {
 
     async fn delete_lock_for_cleanup(&self) -> BackendResult<()> {
         let lock_key = self.lock_key();
-        self.with_cleanup_operation_timeout("s3.DeleteObject", async {
+        self.with_cleanup_operation_timeout(CleanupRequest::DeleteLock, async {
             self.client
                 .delete_object()
                 .bucket(self.settings.bucket())
@@ -814,6 +882,10 @@ impl S3Backend {
 
 #[async_trait]
 impl StateBackend for S3Backend {
+    fn cleanup_budget(&self) -> CleanupBudget {
+        self.settings.cleanup_budget()
+    }
+
     async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
         let state_location = self.state_location();
         match self.get_state_object().await? {
@@ -911,7 +983,11 @@ impl StateBackend for S3Backend {
         .await
     }
 
-    async fn write_state_for_cleanup(&self, state: &StateFile) -> BackendResult<()> {
+    async fn write_state_for_cleanup(
+        &self,
+        state: &StateFile,
+        _permit: &crate::CleanupPermit<'_>,
+    ) -> BackendResult<()> {
         self.write_state_for_cleanup_operation(state, StateWriteLock::Unlocked)
             .await
     }
@@ -920,6 +996,7 @@ impl StateBackend for S3Backend {
         &self,
         state: &StateFile,
         lock: &LockInfo,
+        _permit: &crate::CleanupPermit<'_>,
     ) -> BackendResult<()> {
         // Releasing first, or racing release against this write, is unsafe:
         // another process could acquire the now-free lock after our ownership
@@ -972,7 +1049,11 @@ impl StateBackend for S3Backend {
         self.delete_lock().await
     }
 
-    async fn release_lock_for_cleanup(&self, lock: &LockInfo) -> BackendResult<()> {
+    async fn release_lock_for_cleanup(
+        &self,
+        lock: &LockInfo,
+        _permit: &crate::CleanupPermit<'_>,
+    ) -> BackendResult<()> {
         let Some((existing_lock, _etag)) = self.read_lock_with_etag_for_cleanup().await? else {
             return Err(BackendError::LockNotFound(lock.id().to_owned()));
         };
@@ -1129,6 +1210,7 @@ mod tests {
     use super::*;
     use crate::state::ResourceState;
     use aws_sdk_s3::error::{ErrorMetadata, SdkError};
+    use std::time::Duration;
 
     fn with_secret_payload_bucket(check: impl FnOnce(&crate::S3BackendSettings)) {
         use carina_core::resource::{ConcreteValue, NoPlaceholder, SecretPayload, Value};
@@ -1300,6 +1382,9 @@ mod tests {
 
     #[test]
     fn cancellation_cleanup_s3_operations_have_a_bounded_single_attempt_budget() {
+        let settings =
+            S3BackendSettings::from_url_parts("test-bucket".into(), "state.json".into()).unwrap();
+        let budget = settings.cleanup_budget();
         let config = cleanup_operation_config().build();
         let retry = config
             .retry_config()
@@ -1315,10 +1400,15 @@ mod tests {
         );
         assert_eq!(
             timeout.operation_timeout(),
-            Some(CLEANUP_S3_OPERATION_TIMEOUT)
+            Some(Duration::from_millis(300))
+        );
+        assert_eq!(budget.state_flush(), Duration::from_secs(1));
+        assert_eq!(
+            timeout.operation_attempt_timeout(),
+            Some(CLEANUP_REQUEST_TIMEOUT)
         );
         assert!(
-            CLEANUP_S3_OPERATION_TIMEOUT * 5 < carina_core::shutdown::CLEANUP_DEADLINE,
+            CLEANUP_REQUEST_TIMEOUT * 5 < budget.total(),
             "three state calls plus two lock-release calls must fit inside the 2s cleanup deadline"
         );
     }
@@ -1353,6 +1443,85 @@ mod tests {
             status.try_into().unwrap(),
             aws_smithy_types::body::SdkBody::empty(),
         )
+    }
+
+    #[test]
+    fn round13_s3_dispatched_put_5xx_service_errors_are_unconfirmed() {
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        let settings =
+            S3BackendSettings::from_url_parts("test-bucket".into(), "state.json".into()).unwrap();
+        for (status, code) in [
+            (500, "InternalError"),
+            (503, "SlowDown"),
+            (503, "ServiceUnavailable"),
+        ] {
+            let error = state_put_error(
+                SdkError::service_error(
+                    PutObjectError::generic(ErrorMetadata::builder().code(code).build()),
+                    head_bucket_http_response(status),
+                ),
+                &settings,
+            );
+            assert!(
+                matches!(&error, BackendError::UnconfirmedStateSave { .. }),
+                "HTTP {status} {code}: {error:?}"
+            );
+            assert_eq!(
+                error.save_failure_kind(),
+                crate::SaveFailureKind::Unconfirmed
+            );
+        }
+    }
+
+    #[test]
+    fn round14_s3_throttled_put_service_errors_are_unconfirmed() {
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        let settings =
+            S3BackendSettings::from_url_parts("test-bucket".into(), "state.json".into()).unwrap();
+        for (status, code) in [(429, "TooManyRequests"), (400, "SlowDown")] {
+            let error = state_put_error(
+                SdkError::service_error(
+                    PutObjectError::generic(ErrorMetadata::builder().code(code).build()),
+                    head_bucket_http_response(status),
+                ),
+                &settings,
+            );
+            assert!(
+                matches!(&error, BackendError::UnconfirmedStateSave { .. }),
+                "HTTP {status} {code}: {error:?}"
+            );
+            assert_eq!(
+                error.save_failure_kind(),
+                crate::SaveFailureKind::Unconfirmed
+            );
+        }
+    }
+
+    #[test]
+    fn round13_s3_rejected_or_undispatched_put_is_a_definite_failure() {
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        let settings =
+            S3BackendSettings::from_url_parts("test-bucket".into(), "state.json".into()).unwrap();
+        for (status, code) in [
+            (400, "InvalidRequest"),
+            (403, "AccessDenied"),
+            (412, "PreconditionFailed"),
+        ] {
+            let error = state_put_error(
+                SdkError::service_error(
+                    PutObjectError::generic(ErrorMetadata::builder().code(code).build()),
+                    head_bucket_http_response(status),
+                ),
+                &settings,
+            );
+            assert!(matches!(&error, BackendError::Aws(_)), "{error:?}");
+            assert_eq!(error.save_failure_kind(), crate::SaveFailureKind::Failed);
+        }
+        assert_eq!(
+            state_put_error(SdkError::construction_failure("not dispatched"), &settings)
+                .save_failure_kind(),
+            crate::SaveFailureKind::Failed
+        );
     }
 
     #[test]

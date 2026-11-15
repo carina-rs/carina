@@ -1,6 +1,6 @@
 //! Configuration loading and .crn file discovery utilities
 
-use crate::paths::{CanonicalPath, ResolvedPath};
+use crate::paths::{CanonicalPath, DisplayPath, ResolvedPath};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -804,11 +804,7 @@ impl DirectoryBufferSnapshot {
                 )),
             ));
         }
-        let mut overrides = overrides.clone();
-        overrides.retain(|path, _| {
-            !ResolvedPath::new(path).is_ok_and(|path| path.identity() == pinned.identity())
-        });
-        overrides.insert(buffer.file.path().to_path_buf(), buffer.text.to_string());
+        let overrides = overrides.replacing(pinned.clone(), buffer.text.to_string());
         let files = DirectoryFiles::discover(directory, &overrides).map_err(|error| {
             DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error))
         })?;
@@ -1008,8 +1004,76 @@ pub fn find_duplicate_declarations_in_analysis(
     duplicate_groups(occurrences)
 }
 
-/// In-memory source snapshots keyed by the edited file path.
-pub type SourceOverrides = IndexMap<PathBuf, String>;
+/// In-memory source snapshots keyed by pinned filesystem identity.
+///
+/// Identical text under multiple spellings retains the first spelling.
+/// Conflicting text must be rejected before a snapshot can be used for analysis.
+/// Retargeting a leaf symlink after construction can give a later lookup a new
+/// identity, which falls back to disk for that analysis pass.
+#[derive(Clone, Default)]
+pub struct SourceOverrides {
+    entries: IndexMap<CanonicalPath, (ResolvedPath, String)>,
+}
+
+/// Two spellings of one file supplied different source text.
+#[derive(Debug, thiserror::Error)]
+#[error("Conflicting source overrides for {first} and {second}")]
+pub struct SourceOverrideConflict {
+    pub first: DisplayPath,
+    pub second: DisplayPath,
+}
+
+impl SourceOverrides {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn single(path: ResolvedPath, text: String) -> Self {
+        let mut overrides = Self::new();
+        overrides.entries.insert(path.identity(), (path, text));
+        overrides
+    }
+
+    pub fn try_from_entries(
+        entries: impl IntoIterator<Item = (ResolvedPath, String)>,
+    ) -> Result<Self, SourceOverrideConflict> {
+        let mut overrides = Self::new();
+        for (path, text) in entries {
+            match overrides.entries.entry(path.identity()) {
+                indexmap::map::Entry::Vacant(entry) => {
+                    entry.insert((path, text));
+                }
+                indexmap::map::Entry::Occupied(entry) => {
+                    let (first, existing) = entry.get();
+                    if existing != &text {
+                        return Err(SourceOverrideConflict {
+                            first: first.display().clone(),
+                            second: path.display().clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(overrides)
+    }
+
+    // Only the parser-owned buffer may replace text already in a snapshot.
+    pub(crate) fn replacing(&self, path: ResolvedPath, text: String) -> Self {
+        let mut overrides = self.clone();
+        overrides.entries.insert(path.identity(), (path, text));
+        overrides
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&ResolvedPath, &str)> {
+        self.entries
+            .values()
+            .map(|(path, text)| (path, text.as_str()))
+    }
+
+    pub(crate) fn get(&self, identity: &CanonicalPath) -> Option<&str> {
+        self.entries.get(identity).map(|(_, text)| text.as_str())
+    }
+}
 
 /// The complete, sorted listing of one directory, including unsaved buffers.
 /// Paths remain OS paths throughout discovery; filename encoding never decides
@@ -1024,15 +1088,14 @@ impl DirectoryFiles {
         overrides: &SourceOverrides,
     ) -> std::io::Result<Self> {
         let mut paths = directory.crn_files()?;
-        for path in overrides.keys() {
-            let parent = path
+        for (path, _) in overrides.iter() {
+            if path
                 .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            if ResolvedPath::new(parent)?.identity() != directory.identity() {
+                .is_none_or(|parent| parent.identity() != directory.identity())
+            {
                 continue;
             }
-            let name = path.file_name().ok_or_else(|| {
+            let name = path.display().file_name().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "source override must name a file",
@@ -1113,24 +1176,10 @@ pub(crate) fn read_source_with_overrides(
     path: &ResolvedPath,
     overrides: &SourceOverrides,
 ) -> std::io::Result<String> {
-    for (source, text) in overrides {
-        if *source == path.source_label()
-            || ResolvedPath::new(source).is_ok_and(|source| source.identity() == path.identity())
-        {
-            return Ok(text.clone());
-        }
+    if let Some(text) = overrides.get(&path.identity()) {
+        return Ok(text.to_string());
     }
     path.read_to_string()
-}
-
-fn filename_source_overrides(
-    dir: &ResolvedPath,
-    overrides: &IndexMap<String, String>,
-) -> SourceOverrides {
-    overrides
-        .iter()
-        .map(|(name, text)| (dir.source_label().join(name), text.clone()))
-        .collect()
 }
 
 pub fn find_duplicate_declarations_in_source(
@@ -1508,7 +1557,7 @@ pub fn parse_directory(
     dir: &ResolvedPath,
     config: &ProviderContext,
 ) -> Result<ParsedRootDirectory, String> {
-    parse_directory_with_overrides(dir, config, &IndexMap::new())
+    parse_directory_with_overrides(dir, config, &SourceOverrides::new())
 }
 
 /// Inspect declarations for completion/discovery without demanding their values.
@@ -1520,7 +1569,7 @@ pub fn parse_directory_for_bootstrap(
     parse_directory_with_overrides_impl(
         dir,
         config,
-        &IndexMap::new(),
+        &SourceOverrides::new(),
         ResolutionContext::issue(ResolutionPhase::Bootstrap),
         &SchemaRegistry::new(),
     )
@@ -1528,34 +1577,21 @@ pub fn parse_directory_for_bootstrap(
     .map_err(|error| error.to_string())
 }
 
-/// Parse declaration metadata with optional editor overrides, retaining all value roots.
+/// Parse declaration metadata with identity-keyed [`SourceOverrides`], retaining
+/// all value roots.
 pub fn parse_directory_for_metadata(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
+    overrides: &SourceOverrides,
     schemas: &SchemaRegistry,
 ) -> Result<ParsedRootDirectory, String> {
     parse_directory_for_metadata_report(dir, config, overrides, schemas)
         .map_err(|error| error.to_string())
 }
 
-/// Metadata loading with the original parser failure retained for diagnostics.
+/// Load declaration metadata with identity-keyed [`SourceOverrides`], retaining
+/// the original parser failure for diagnostics.
 pub fn parse_directory_for_metadata_report(
-    dir: &ResolvedPath,
-    config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
-    schemas: &SchemaRegistry,
-) -> Result<ParsedRootDirectory, DirectoryParseFailure> {
-    parse_directory_for_metadata_with_source_overrides_report(
-        dir,
-        config,
-        &filename_source_overrides(dir, overrides),
-        schemas,
-    )
-}
-
-/// Metadata discovery with OS-path editor snapshots, including non-UTF-8 names.
-pub fn parse_directory_for_metadata_with_source_overrides_report(
     dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &SourceOverrides,
@@ -1571,21 +1607,19 @@ pub fn parse_directory_for_metadata_with_source_overrides_report(
     .map(|result| result.parsed)
 }
 
-/// Like [`parse_directory`] but takes an `overrides` map from **file name**
-/// (e.g. `"main.crn"`) to source text. Files present in the map are parsed
-/// from the override text; the rest are read from disk.
+/// Parse and merge a directory in strict mode with identity-keyed [`SourceOverrides`].
 ///
-/// LSP uses this to analyze the open document's in-memory buffer alongside
-/// the on-disk siblings, so edits show diagnostics before the user saves.
+/// Files present in `overrides` use their snapshot text; other files are read
+/// from disk. Uses an empty schema registry and returns failures as strings.
 pub fn parse_directory_with_overrides(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
+    overrides: &SourceOverrides,
 ) -> Result<ParsedRootDirectory, String> {
     parse_directory_with_overrides_impl(
         dir,
         config,
-        &filename_source_overrides(dir, overrides),
+        overrides,
         strict_resolution_context(),
         &SchemaRegistry::new(),
     )
@@ -1779,33 +1813,20 @@ impl DirectoryParseResult {
 pub fn parse_directory_with_overrides_and_diagnostics(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
+    overrides: &SourceOverrides,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     parse_directory_with_overrides_impl(
         dir,
         config,
-        &filename_source_overrides(dir, overrides),
+        overrides,
         diagnostics_resolution_context(),
         &SchemaRegistry::new(),
     )
 }
 
+/// Diagnostic-preserving directory parsing with identity-keyed [`SourceOverrides`]
+/// and the supplied schemas.
 pub fn parse_directory_with_overrides_and_diagnostics_with_schemas(
-    dir: &ResolvedPath,
-    config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
-    schemas: &SchemaRegistry,
-) -> Result<DirectoryParseResult, DirectoryParseFailure> {
-    parse_directory_with_source_overrides_and_diagnostics_with_schemas(
-        dir,
-        config,
-        &filename_source_overrides(dir, overrides),
-        schemas,
-    )
-}
-
-/// Directory analysis retaining OS-path override identities without encoding loss.
-pub fn parse_directory_with_source_overrides_and_diagnostics_with_schemas(
     dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &SourceOverrides,
@@ -2567,6 +2588,209 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn source_override_conflicting_aliases() {
+        // A leading `./` survives Path equality, unlike an interior `./`.
+        let temp = tempfile::tempdir_in(".").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let directory = temp.path().strip_prefix(&cwd).unwrap();
+        let root = ResolvedPath::new(directory).unwrap();
+        let file = root.join("f.crn").unwrap();
+        let alias = ResolvedPath::new(Path::new(".").join(file.source_label())).unwrap();
+        assert_eq!(file.identity(), alias.identity());
+        assert_ne!(file.source_label(), alias.source_label());
+        let first_text = "let value = 'A'\n";
+        let second_text = "let value = 'B'\n";
+        for (first, second) in [(&file, &alias), (&alias, &file)] {
+            let conflict = SourceOverrides::try_from_entries([
+                (first.clone(), first_text.to_string()),
+                (second.clone(), second_text.to_string()),
+            ])
+            .err()
+            .expect("conflicting aliases must fail before directory parsing");
+            assert_eq!(&conflict.first, first.display());
+            assert_eq!(&conflict.second, second.display());
+            let display = conflict.to_string();
+            assert!(display.contains(&first.display().to_string()));
+            assert!(display.contains(&second.display().to_string()));
+            for rendered in [display, format!("{conflict:?}")] {
+                assert!(!rendered.contains(first_text.trim_end()));
+                assert!(!rendered.contains(second_text.trim_end()));
+            }
+        }
+    }
+
+    #[test]
+    fn source_override_identical_aliases_keep_first_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = ResolvedPath::new(temp.path()).unwrap();
+        let file = root.join("f.crn").unwrap();
+        let alias = ResolvedPath::new(temp.path().join("./f.crn")).unwrap();
+        let text = "let value = 'buffer'\n";
+        for (first, second) in [(&file, &alias), (&alias, &file)] {
+            let overrides = SourceOverrides::try_from_entries([
+                (first.clone(), text.to_string()),
+                (second.clone(), text.to_string()),
+            ])
+            .unwrap();
+            assert_eq!(overrides.iter().count(), 1);
+            assert_eq!(
+                overrides.iter().next().unwrap().0.display(),
+                first.display()
+            );
+            assert_eq!(read_source_with_overrides(&file, &overrides).unwrap(), text);
+            assert_eq!(
+                read_source_with_overrides(&alias, &overrides).unwrap(),
+                text
+            );
+
+            let result = parse_directory_with_overrides_and_diagnostics_with_schemas(
+                &root,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                &overrides,
+                &SchemaRegistry::new(),
+            )
+            .unwrap();
+            assert_eq!(result.source_files.len(), 1);
+            assert_eq!(
+                result.parsed.parsed().variables.get("value"),
+                Some(&Value::Concrete(crate::resource::ConcreteValue::String(
+                    "buffer".into()
+                )))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_override_symlink_aliases_share_one_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("target.crn"), "on disk").unwrap();
+        std::os::unix::fs::symlink("target.crn", temp.path().join("link.crn")).unwrap();
+        let root = ResolvedPath::new(temp.path()).unwrap();
+        let target = root.join("target.crn").unwrap();
+        let link = root.join("link.crn").unwrap();
+        let text = "in memory";
+        for (first, second) in [(&target, &link), (&link, &target)] {
+            let overrides = SourceOverrides::try_from_entries([
+                (first.clone(), text.to_string()),
+                (second.clone(), text.to_string()),
+            ])
+            .unwrap();
+            assert_eq!(overrides.iter().count(), 1);
+            assert_eq!(
+                overrides.iter().next().unwrap().0.display(),
+                first.display()
+            );
+            assert_eq!(
+                read_source_with_overrides(&target, &overrides).unwrap(),
+                text
+            );
+            assert_eq!(read_source_with_overrides(&link, &overrides).unwrap(), text);
+
+            let conflict = SourceOverrides::try_from_entries([
+                (first.clone(), text.to_string()),
+                (second.clone(), "different text".to_string()),
+            ])
+            .err()
+            .expect("symlink aliases must also reject conflicting text");
+            assert_eq!(&conflict.first, first.display());
+            assert_eq!(&conflict.second, second.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_override_retargeted_leaf_falls_back_to_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("before.crn"), "old disk text").unwrap();
+        fs::write(temp.path().join("after.crn"), "new disk text").unwrap();
+        let alias = temp.path().join("link.crn");
+        std::os::unix::fs::symlink("before.crn", &alias).unwrap();
+        let pinned = ResolvedPath::new(&alias).unwrap();
+        let overrides = SourceOverrides::single(pinned.clone(), "buffer text".to_string());
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("after.crn", &alias).unwrap();
+
+        assert_eq!(
+            read_source_with_overrides(&pinned, &overrides).unwrap(),
+            "buffer text"
+        );
+        assert_eq!(
+            read_source_with_overrides(&ResolvedPath::new(&alias).unwrap(), &overrides).unwrap(),
+            "new disk text"
+        );
+    }
+
+    #[test]
+    fn source_override_snapshot_buffer_replaces_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = ResolvedPath::new(temp.path()).unwrap();
+        let file = root.join("f.crn").unwrap();
+        let alias = ResolvedPath::new(temp.path().join("./f.crn")).unwrap();
+        let overrides = SourceOverrides::single(alias, "let value = 'A'\n".to_string());
+        let text = "let value = 'B'\n";
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let buffer = ParsedSourceBuffer::parse(text, &file.source_label(), &context).unwrap();
+
+        let snapshot = DirectoryBufferSnapshot::capture(&root, buffer, &overrides).unwrap();
+        assert_eq!(snapshot.sources.len(), 1);
+        assert_eq!(
+            snapshot.sources[snapshot.member.index].text.as_deref(),
+            Some(text)
+        );
+        let schemas = SchemaRegistry::new();
+        let configuration = load_buffer_configuration_in_directory(snapshot, &schemas, &context);
+        assert_eq!(
+            configuration.parsed().variables.get("value"),
+            Some(&Value::Concrete(crate::resource::ConcreteValue::String(
+                "B".into()
+            )))
+        );
+        assert_eq!(
+            read_source_with_overrides(&file, &overrides).unwrap(),
+            "let value = 'A'\n"
+        );
+    }
+
+    #[test]
+    fn source_override_discovery_keeps_directory_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = ResolvedPath::new(temp.path()).unwrap();
+        let file = root.join("new.crn").unwrap();
+        assert!(!temp.path().join("new.crn").exists());
+        let alias = ResolvedPath::new(temp.path().join("./new.crn")).unwrap();
+        let text = "let fresh = 'unsaved'\n";
+        let overrides = SourceOverrides::single(alias, text.to_string());
+        let files = DirectoryFiles::discover(&root, &overrides)
+            .unwrap()
+            .into_paths();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].display(), file.display());
+
+        let result = parse_directory_with_overrides_and_diagnostics_with_schemas(
+            &root,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            &overrides,
+            &SchemaRegistry::new(),
+        )
+        .unwrap();
+        assert_eq!(result.source_files.len(), 1);
+        assert_eq!(result.source_files[0].0.display(), file.display());
+        let semantic = result.semantic_file(&file.source_label()).unwrap();
+        let declaration = semantic
+            .parser_binding_metadata
+            .syntax()
+            .declarations()
+            .iter()
+            .find(|declaration| declaration.name() == "fresh")
+            .unwrap();
+        assert_eq!(
+            declaration.location().file().path().as_os_str(),
+            file.source_label().as_os_str()
+        );
+    }
+
+    #[test]
     fn conversion_parse_diagnostic_uses_the_shared_message_shape() {
         let path = Path::new("conversion-shape.crn");
         let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
@@ -2625,9 +2849,12 @@ mod tests {
         let root = ResolvedPath::new(&directory).unwrap();
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
-        let parsed =
-            parse_directory_with_overrides_and_diagnostics(&root, &context, &IndexMap::new())
-                .unwrap();
+        let parsed = parse_directory_with_overrides_and_diagnostics(
+            &root,
+            &context,
+            &SourceOverrides::new(),
+        )
+        .unwrap();
 
         assert!(parsed.semantic_file(&main_path).is_some());
         assert_eq!(
@@ -4198,7 +4425,7 @@ awscc.ec2.SecurityGroup {
         let directory = parse_directory_with_overrides_and_diagnostics(
             &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            &IndexMap::new(),
+            &SourceOverrides::new(),
         )
         .expect("directory parse");
         let semantic = directory.semantic_file(&main_path).expect("semantic file");

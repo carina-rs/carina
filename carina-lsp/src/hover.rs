@@ -362,6 +362,26 @@ impl HoverProvider {
     ) -> Option<Hover> {
         let word = doc.word_at(position)?;
         let text = doc.text();
+        if let Some(context) = crate::backend_configuration::context(&text, position) {
+            use carina_core::validation::admission::configuration::backend::BackendKind;
+            let kind = match context {
+                crate::backend_configuration::Context::Header => BackendKind::from_name(&word),
+                crate::backend_configuration::Context::Fields { kind, field } => {
+                    field.filter(|name| *name == word).map(|_| kind)
+                }
+            };
+            if let Some(kind) = kind
+                && (word == kind.name() || kind.fields().any(|(name, _, _)| name == word))
+            {
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: kind.documentation(),
+                    }),
+                    range: None,
+                });
+            }
+        }
         let enclosing_block = enclosing_block(&text, position);
 
         // Check for resource type hover
@@ -712,9 +732,12 @@ impl HoverProvider {
             "import" => Some(
                 "## import\n\nAdopts an existing cloud resource into Carina's state.\n\n```carina\nimport {\n    to = awscc.ec2.Vpc 'imported_vpc'\n    id = 'vpc-0123456789abcdef0'\n}\n```",
             ),
-            "backend" => Some(
-                "## backend\n\nConfigures the state backend for storing resource state.\n\n```carina\nbackend s3 {\n    bucket = \"my-carina-state\"\n    key    = \"prod/carina.crnstate\"\n    region = aws.Region.ap_northeast_1\n}\n```",
-            ),
+            "backend" => {
+                Some({
+                    static DESCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                    DESCRIPTION.get_or_init(|| carina_core::validation::admission::configuration::backend::BackendKind::ALL.into_iter().map(|kind| kind.documentation()).collect::<Vec<_>>().join("\n\n")).as_str()
+                })
+            }
             "read" => Some(
                 "## read\n\nReads an existing resource as a data source without managing it.\n\n```carina\nlet my_vpc = read aws.ec2.Vpc {\n    name = \"existing-vpc\"\n}\n```",
             ),
@@ -1552,6 +1575,52 @@ mod tests {
         assert!(HoverProvider::keyword_description("backend").is_some());
         let desc = HoverProvider::keyword_description("backend").unwrap();
         assert!(desc.contains("backend"));
+    }
+
+    #[test]
+    fn github_admission_hover_describes_backend_and_fields() {
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        let source = "backend github {\n  repository = 'owner/repo'\n  branch = 'states/prod'\n  path = 's.json'\n}";
+        let doc = Document::new(
+            source.to_owned(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        for word in ["github", "repository", "branch", "path"] {
+            let hover = hover_markdown(&provider, &doc, hover_position(source, word, 0), None)
+                .unwrap_or_else(|| panic!("missing hover for {word}"));
+            assert!(hover.contains(word), "{hover}");
+        }
+    }
+
+    #[test]
+    fn github_admission_hover_ignores_backend_words_in_values_and_comments() {
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        let source = "backend github {\n  repository = 'repository'\n  branch = 'branch'\n  path = branch\n  // branch\n}";
+        let doc = Document::new(
+            source.into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        for (word, occurrence) in [
+            ("repository", 1),
+            ("branch", 1),
+            ("branch", 2),
+            ("branch", 3),
+        ] {
+            assert!(
+                hover_markdown(
+                    &provider,
+                    &doc,
+                    hover_position(source, word, occurrence),
+                    None
+                )
+                .is_none(),
+                "{word} occurrence {occurrence}"
+            );
+        }
     }
 
     #[test]

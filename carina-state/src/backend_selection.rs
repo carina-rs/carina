@@ -219,8 +219,142 @@ impl VerifiedMutationBackendSelection {
             })
     }
 
-    pub async fn resolve(&self) -> BackendResult<Box<dyn crate::StateBackend>> {
-        crate::backends::create_backend(&self.configured).await
+    pub async fn resolve(
+        &self,
+        shutdown: &carina_core::shutdown::ShutdownToken,
+    ) -> BackendResult<PublishedBackend> {
+        let backend = crate::backends::create_backend(&self.configured).await?;
+        PublishedBackend::publish(backend.into(), shutdown)
+    }
+}
+
+/// An opened mutation backend with its cleanup limits published to its command.
+/// Only verified mutation resolution constructs this capability in production.
+/// Cleanup entry points retain it so a bare backend cannot bypass publication.
+///
+/// ```compile_fail
+/// use carina_state::PublishedBackend;
+/// let _ = PublishedBackend { backend: todo!(), shutdown: todo!() };
+/// ```
+#[derive(Clone)]
+pub struct PublishedBackend {
+    backend: std::sync::Arc<dyn crate::StateBackend>,
+    shutdown: carina_core::shutdown::ShutdownToken,
+}
+
+/// Permission to use cancellation cleanup after publishing the command budget.
+/// Only [`PublishedBackend`] issues permits, tied to its lifetime and deadline.
+///
+/// External backend implementations receive a permit but cannot construct one:
+///
+/// ```compile_fail
+/// use carina_state::{CleanupPermit, PublishedBackend};
+/// fn forge(backend: &PublishedBackend) -> CleanupPermit<'_> {
+///     CleanupPermit::new(backend)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_state::{CleanupPermit, PublishedBackend};
+/// fn forge(published: &PublishedBackend) -> CleanupPermit<'_> {
+///     CleanupPermit { published, deadline: None }
+/// }
+/// ```
+pub struct CleanupPermit<'a> {
+    published: &'a PublishedBackend,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl<'a> CleanupPermit<'a> {
+    pub(crate) fn new(published: &'a PublishedBackend) -> Self {
+        Self {
+            published,
+            deadline: published.shutdown.cleanup_deadline(),
+        }
+    }
+
+    pub fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        self.published.cleanup_budget()
+    }
+
+    /// `None` until cleanup priority starts; graceful cleanup retains its own I/O limit.
+    pub fn cleanup_deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+}
+
+impl PublishedBackend {
+    fn publish(
+        backend: std::sync::Arc<dyn crate::StateBackend>,
+        shutdown: &carina_core::shutdown::ShutdownToken,
+    ) -> BackendResult<Self> {
+        shutdown
+            .publish_cleanup_budget(backend.cleanup_budget())
+            .map_err(|_| {
+                BackendError::Configuration(
+                    "command cleanup budget was already published for another backend".into(),
+                )
+            })?;
+        Ok(Self {
+            backend,
+            shutdown: shutdown.clone(),
+        })
+    }
+
+    pub fn shutdown(&self) -> &carina_core::shutdown::ShutdownToken {
+        &self.shutdown
+    }
+
+    pub fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        self.shutdown.cleanup_budget()
+    }
+
+    pub fn shared_backend(&self) -> std::sync::Arc<dyn crate::StateBackend> {
+        std::sync::Arc::clone(&self.backend)
+    }
+
+    pub async fn write_state_for_cleanup(&self, state: &crate::StateFile) -> BackendResult<()> {
+        self.backend
+            .write_state_for_cleanup(state, &CleanupPermit::new(self))
+            .await
+    }
+
+    pub async fn write_state_locked_for_cleanup(
+        &self,
+        state: &crate::StateFile,
+        lock: &crate::LockInfo,
+    ) -> BackendResult<()> {
+        self.backend
+            .write_state_locked_for_cleanup(state, lock, &CleanupPermit::new(self))
+            .await
+    }
+
+    pub async fn release_lock_for_cleanup(&self, lock: &crate::LockInfo) -> BackendResult<()> {
+        self.backend
+            .release_lock_for_cleanup(lock, &CleanupPermit::new(self))
+            .await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(
+        backend: std::sync::Arc<dyn crate::StateBackend>,
+        shutdown: &carina_core::shutdown::ShutdownToken,
+    ) -> Self {
+        Self::publish(backend, shutdown).expect("test backend cleanup publication")
+    }
+}
+
+impl AsRef<dyn crate::StateBackend> for PublishedBackend {
+    fn as_ref(&self) -> &(dyn crate::StateBackend + 'static) {
+        self.backend.as_ref()
+    }
+}
+
+impl std::ops::Deref for PublishedBackend {
+    type Target = dyn crate::StateBackend;
+
+    fn deref(&self) -> &Self::Target {
+        self.backend.as_ref()
     }
 }
 
@@ -487,6 +621,9 @@ impl ConfiguredBackend {
     }
     pub(crate) async fn open(&self) -> BackendResult<Box<dyn crate::StateBackend>> {
         match self.config() {
+            BackendConfig::GitHub(settings) => Ok(Box::new(
+                crate::backends::GitHubBackend::from_config(settings).await?,
+            )),
             BackendConfig::S3(settings) => Ok(Box::new(
                 crate::backends::S3Backend::from_config(settings).await?,
             )),
@@ -513,6 +650,10 @@ async fn resolve_migration_backend(
     base: &ResolvedPath,
 ) -> BackendResult<(Box<dyn crate::StateBackend>, Option<ResolvedPath>)> {
     match config {
+        BackendConfig::GitHub(settings) => Ok((
+            Box::new(crate::backends::GitHubBackend::from_config(settings).await?),
+            None,
+        )),
         BackendConfig::Local(settings) => {
             let location = settings.pin_address(base)?;
             let path = location.path().clone();
@@ -571,6 +712,37 @@ mod tests {
     use carina_core::resource::{ConcreteValue, Value};
 
     use super::*;
+
+    #[tokio::test]
+    async fn mutation_resolution_publishes_before_issuing_cleanup_capability() {
+        let project = tempfile::tempdir().unwrap();
+        let project = ResolvedPath::new(project.path()).unwrap();
+        let config = local_config("state.json");
+        BackendLock::for_config(Some(&config))
+            .unwrap()
+            .save(&project)
+            .unwrap();
+        let MutationBackendSelection::Verified(selected) =
+            BackendSelection::verified_for_mutation(&project, Some(&config)).unwrap()
+        else {
+            panic!("matching backend lock must verify");
+        };
+        let token = carina_core::shutdown::ShutdownToken::running();
+        let backend = selected.resolve(&token).await.unwrap();
+        assert_eq!(
+            backend.cleanup_budget(),
+            carina_core::shutdown::CleanupBudget::TWO_SECOND
+        );
+        assert!(
+            token
+                .publish_cleanup_budget(carina_core::shutdown::CleanupBudget::new(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(8)
+                ))
+                .is_err(),
+            "resolution must have already published the local budget"
+        );
+    }
 
     fn local_config(path: &str) -> ParserBackendConfig {
         ParserBackendConfig {

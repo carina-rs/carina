@@ -335,6 +335,10 @@ impl LocalBackend {
 
 #[async_trait]
 impl StateBackend for LocalBackend {
+    fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
         let Some((bytes, state_location)) = self.read_state_file().await? else {
             return Ok(None);
@@ -706,7 +710,7 @@ mod tests {
         };
         match crate::BackendConfig::try_from(&raw).unwrap() {
             crate::BackendConfig::Local(settings) => settings,
-            crate::BackendConfig::S3(_) => unreachable!(),
+            crate::BackendConfig::S3(_) | crate::BackendConfig::GitHub(_) => unreachable!(),
         }
     }
 
@@ -1237,7 +1241,7 @@ mod tests {
 
         assert_eq!(renewed.id(), lock.id());
         assert_eq!(renewed.operation(), lock.operation());
-        assert!(renewed.expires() > lock.created());
+        assert!(renewed.expires() > lock.last_updated());
         assert!(!renewed.is_expired());
 
         backend.release_lock(&renewed).await.unwrap();

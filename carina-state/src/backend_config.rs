@@ -9,13 +9,14 @@ use carina_core::resource::{
 use carina_core::validation::admission::{
     configuration::{
         AdmittedConfiguration,
-        backend::{self, BackendKind},
+        backend::{self, BackendSettings},
     },
     kind::BackendAttribute,
 };
 use std::collections::HashMap;
 
 pub use backend::{BackendAttributeError, BackendConfigError, BackendConfigErrors};
+pub use backend::{GitBranch, GitHubBackendSettings, LeasePath, RepositorySlug, StatePath};
 
 use crate::backend::{LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
 
@@ -79,6 +80,7 @@ use crate::backend::{LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
 pub enum BackendConfig {
     S3(S3BackendSettings),
     Local(LocalBackendSettings),
+    GitHub(GitHubBackendSettings),
 }
 
 impl BackendConfig {
@@ -99,7 +101,7 @@ impl BackendConfig {
     pub fn as_s3(&self) -> Option<&S3BackendSettings> {
         match self {
             Self::S3(settings) => Some(settings),
-            Self::Local(_) => None,
+            Self::Local(_) | Self::GitHub(_) => None,
         }
     }
 
@@ -107,6 +109,28 @@ impl BackendConfig {
     /// plans. Enum values use API spelling.
     pub fn to_parser_config(&self) -> parser::BackendConfig<NoPlaceholder, AbsoluteBindingAddress> {
         match self {
+            Self::GitHub(settings) => parser::BackendConfig {
+                backend_type: "github".into(),
+                attributes: [
+                    (
+                        "repository".to_string(),
+                        Value::Concrete(ConcreteValue::String(
+                            settings.repository().as_str().into(),
+                        )),
+                    ),
+                    (
+                        "branch".to_string(),
+                        Value::Concrete(ConcreteValue::String(settings.branch().as_str().into())),
+                    ),
+                    (
+                        "path".to_string(),
+                        Value::Concrete(ConcreteValue::String(settings.path().as_str().into())),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                attribute_spans: Default::default(),
+            },
             Self::S3(settings) => {
                 let mut attributes = HashMap::from([
                     (
@@ -186,6 +210,11 @@ pub struct S3BackendSettings {
 }
 
 impl S3BackendSettings {
+    /// Cleanup retains a one-second flush cutoff and two seconds total.
+    pub fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     pub(crate) fn from_url_parts(bucket: String, key: String) -> Result<Self, BackendConfigError> {
         let raw = parser::BackendConfig::<NoPlaceholder> {
             backend_type: S3_BACKEND_TYPE.into(),
@@ -386,8 +415,9 @@ impl LocalBackendSettings {
 
 impl From<AdmittedConfiguration<BackendAttribute>> for BackendConfig {
     fn from(configuration: AdmittedConfiguration<BackendAttribute>) -> Self {
-        match configuration.backend_kind() {
-            BackendKind::S3 => Self::S3(S3BackendSettings {
+        match configuration.backend_settings() {
+            BackendSettings::GitHub(settings) => Self::GitHub(settings.clone()),
+            BackendSettings::S3 => Self::S3(S3BackendSettings {
                 bucket: configuration
                     .string("bucket")
                     .expect("required backend bucket")
@@ -400,7 +430,7 @@ impl From<AdmittedConfiguration<BackendAttribute>> for BackendConfig {
                 encrypt: configuration.boolean("encrypt"),
                 auto_create: configuration.boolean("auto_create"),
             }),
-            BackendKind::Local => Self::Local(LocalBackendSettings {
+            BackendSettings::Local => Self::Local(LocalBackendSettings {
                 path: configuration.string("path").cloned(),
             }),
         }
@@ -433,7 +463,7 @@ mod tests {
     fn s3_region(source: &str) -> String {
         match resolve(source).expect("backend must resolve") {
             BackendConfig::S3(settings) => settings.region().unwrap().to_string(),
-            BackendConfig::Local(_) => panic!("expected s3 backend"),
+            BackendConfig::Local(_) | BackendConfig::GitHub(_) => panic!("expected s3 backend"),
         }
     }
 

@@ -515,7 +515,7 @@ mod condition_timing {
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             &carina_core::paths::ResolvedPath::new(directory).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            &indexmap::IndexMap::new(),
+            &Default::default(),
         )
         .map(|parsed| parsed.parsed.into_parsed())
         .map_err(|error| {

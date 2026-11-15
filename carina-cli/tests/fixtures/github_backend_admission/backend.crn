@@ -1,0 +1,5 @@
+backend github {
+  repository = 'owner'
+  branch = ''
+  path = 'states/../prod.json'
+}

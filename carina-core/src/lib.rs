@@ -48,6 +48,7 @@ pub mod execution_authority;
 pub mod executor;
 pub mod explicit;
 pub mod formatter;
+pub mod github_auth;
 pub mod heredoc;
 pub mod hint;
 pub mod identifier;

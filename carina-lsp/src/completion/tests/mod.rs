@@ -11,6 +11,19 @@ use carina_core::schema::{
 mod basic;
 mod extended;
 
+#[test]
+fn github_admission_completion_uses_backend_declarations() {
+    let items = schema_selection_completions("backend | ");
+    assert!(items.iter().any(|item| item.label == "github"), "{items:?}");
+    let items = schema_selection_completions("backend github {\n  |\n}");
+    for field in ["repository", "branch", "path"] {
+        assert!(
+            items.iter().any(|item| item.label == field),
+            "{field}: {items:?}"
+        );
+    }
+}
+
 fn schema_selector(path: &str, kind: SchemaKind) -> Option<SchemaSelector> {
     let prefix = match kind {
         SchemaKind::Resource => "",
@@ -776,4 +789,76 @@ pub(super) fn test_provider_with_enum_shadow_schema() -> CompletionProvider {
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(EnumShadowFactory)];
     let schemas = carina_core::provider::collect_schemas(&factories);
     CompletionProvider::new(Arc::new(schemas), vec!["awscc".to_string()], vec![], vec![])
+}
+
+fn backend_value_fixture(source: &str) -> Vec<CompletionItem> {
+    let cursor = source.find('|').unwrap();
+    let source = source.replacen('|', "", 1);
+    let position = crate::position::byte_offset_to_position(&source, cursor).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("backend.crn"), &source).unwrap();
+    std::fs::write(
+        directory.path().join("values.crn"),
+        "let state_bucket = 'infra-state'\nlet state_path = 'state.json'\n",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    let doc = Document::new_with_path(
+        source,
+        directory.path().join("backend.crn"),
+        Arc::new(ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    test_provider_with_enum_and_regions().complete_for_test(&doc, position, Some(directory.path()))
+}
+
+#[test]
+fn github_round1_backend_s3_region_value_completion_in_multifile_directory() {
+    let items = backend_value_fixture(
+        "backend s3 {\n  bucket = state_bucket\n  key = 'state.json'\n  region = aws.Region.|\n}",
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item.label == "aws.Region.ap_northeast_1"),
+        "{items:?}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|item| item.kind == Some(CompletionItemKind::FIELD)),
+        "{items:?}"
+    );
+}
+
+#[test]
+fn github_round1_backend_value_completes_sibling_let_references() {
+    for source in [
+        "backend s3 {\n  bucket = state_|\n  key = 'state.json'\n}",
+        "backend github {\n  repository = 'owner/repo'\n  branch = 'state'\n  path = state_|\n}",
+        "backend local {\n  path = state_|\n}",
+    ] {
+        let items = backend_value_fixture(source);
+        assert!(
+            items.iter().any(|item| item.label == "state_path"),
+            "{source}: {items:?}"
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.kind == Some(CompletionItemKind::FIELD)),
+            "{items:?}"
+        );
+    }
+}
+
+#[test]
+fn github_round1_backend_value_still_completes_env() {
+    let items =
+        backend_value_fixture("backend s3 {\n  bucket = env(state_|)\n  key = 'state.json'\n}");
+    assert!(
+        items.iter().any(|item| item.label == "state_bucket"),
+        "{items:?}"
+    );
 }

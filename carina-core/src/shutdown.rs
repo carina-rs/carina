@@ -8,22 +8,72 @@
 //! ```
 
 use std::future::Future;
-#[cfg(any(test, feature = "test-shutdown"))]
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-// GitHub Actions cancellation is a fixed
-// SIGINT -> 7.5s -> SIGTERM -> 2.5s -> SIGKILL sequence. Keep Carina's hard
-// cleanup deadline inside the unconfigurable SIGTERM-to-SIGKILL window.
-pub const CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
+// The default fits GitHub Actions' 2.5s SIGTERM-to-SIGKILL window.
+// Backends can publish longer limits; an external SIGKILL still cuts them off.
+pub const CLEANUP_DEADLINE: Duration = CleanupBudget::TWO_SECOND.total();
 
-// Reserve the second half of the two-second budget for lock release. State
-// persistence and lock release are both remote operations for S3 backends;
-// an even split prevents either operation from consuming the other's entire
-// opportunity while retaining 500ms before GitHub Actions sends SIGKILL.
-const STATE_FLUSH_BUDGET: Duration = Duration::from_secs(1);
+/// Backend cleanup limits, counted from cleanup priority (the second signal).
+///
+/// The flush cutoff is measured from cleanup priority, leaving time for lock
+/// release. Backend-internal I/O timeouts are separate from these limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CleanupBudget {
+    state_flush: Duration,
+    total: Duration,
+    reason: Option<CleanupWaitReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupWaitReason {
+    GitHubCommits,
+}
+
+impl CleanupBudget {
+    pub const TWO_SECOND: Self = Self::new(Duration::from_secs(1), Duration::from_secs(2));
+
+    /// Require a nonzero flush window and reserve time for lock release.
+    pub const fn new(state_flush: Duration, total: Duration) -> Self {
+        assert!(!state_flush.is_zero() && state_flush.as_nanos() < total.as_nanos());
+        Self {
+            state_flush,
+            total,
+            reason: None,
+        }
+    }
+
+    pub const fn with_reason(mut self, reason: CleanupWaitReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub const fn state_flush(self) -> Duration {
+        self.state_flush
+    }
+
+    pub const fn total(self) -> Duration {
+        self.total
+    }
+}
+
+#[derive(Debug, Default)]
+struct PublishedCleanupBudget {
+    budget: OnceLock<CleanupBudget>,
+    published: CancellationToken,
+}
+
+impl PublishedCleanupBudget {
+    fn current(&self) -> CleanupBudget {
+        self.budget
+            .get()
+            .copied()
+            .unwrap_or(CleanupBudget::TWO_SECOND)
+    }
+}
 
 /// The command-visible shutdown phase.
 ///
@@ -107,14 +157,15 @@ pub enum ShutdownExitReason {
 
 /// Read-only shutdown state passed through command and executor APIs.
 ///
-/// A token always carries graceful cancellation, cleanup priority, and the
-/// state-flush cutoff. A command cannot construct a token missing an escalation
+/// A token always carries graceful cancellation, cleanup priority, and its
+/// start time. A command cannot construct a token missing an escalation
 /// phase and cannot advance any phase itself.
 #[derive(Clone, Debug)]
 pub struct ShutdownToken {
     graceful: CancellationToken,
     cleanup_priority: CancellationToken,
-    state_flush_budget_expired: CancellationToken,
+    cleanup_started: Arc<OnceLock<tokio::time::Instant>>,
+    cleanup_budget: Arc<PublishedCleanupBudget>,
     #[cfg(any(test, feature = "test-shutdown"))]
     test_channel_identity: Arc<()>,
 }
@@ -134,23 +185,27 @@ pub struct GracefulShutdownTrigger {
 struct ShutdownTrigger {
     graceful: CancellationToken,
     cleanup_priority: CancellationToken,
-    state_flush_budget_expired: CancellationToken,
+    cleanup_started: Arc<OnceLock<tokio::time::Instant>>,
+    cleanup_budget: Arc<PublishedCleanupBudget>,
 }
 
 fn shutdown_channel() -> (ShutdownTrigger, ShutdownToken) {
     let graceful = CancellationToken::new();
     let cleanup_priority = CancellationToken::new();
-    let state_flush_budget_expired = CancellationToken::new();
+    let cleanup_started = Arc::new(OnceLock::new());
+    let cleanup_budget = Arc::new(PublishedCleanupBudget::default());
     (
         ShutdownTrigger {
             graceful: graceful.clone(),
             cleanup_priority: cleanup_priority.clone(),
-            state_flush_budget_expired: state_flush_budget_expired.clone(),
+            cleanup_started: Arc::clone(&cleanup_started),
+            cleanup_budget: Arc::clone(&cleanup_budget),
         },
         ShutdownToken {
             graceful,
             cleanup_priority,
-            state_flush_budget_expired,
+            cleanup_started,
+            cleanup_budget,
             #[cfg(any(test, feature = "test-shutdown"))]
             test_channel_identity: Arc::new(()),
         },
@@ -163,14 +218,11 @@ impl ShutdownTrigger {
     }
 
     fn prioritize_cleanup(&self) {
+        self.cleanup_started.get_or_init(tokio::time::Instant::now);
         // Cleanup priority is a strict escalation of graceful shutdown. Firing
         // both makes "priority without cancellation" unrepresentable.
         self.graceful.cancel();
         self.cleanup_priority.cancel();
-    }
-
-    fn expire_state_flush_budget(&self) {
-        self.state_flush_budget_expired.cancel();
     }
 }
 
@@ -194,7 +246,8 @@ impl ShutdownToken {
             Self {
                 graceful,
                 cleanup_priority: self.cleanup_priority.clone(),
-                state_flush_budget_expired: self.state_flush_budget_expired.clone(),
+                cleanup_started: Arc::clone(&self.cleanup_started),
+                cleanup_budget: Arc::clone(&self.cleanup_budget),
                 #[cfg(any(test, feature = "test-shutdown"))]
                 test_channel_identity: Arc::clone(&self.test_channel_identity),
             },
@@ -222,9 +275,36 @@ impl ShutdownToken {
         self.graceful.cancelled().await;
     }
 
-    /// Wait until state flushing must yield the remaining budget to lock release.
-    pub async fn state_flush_budget_expired(&self) {
-        self.state_flush_budget_expired.cancelled().await;
+    /// Publish this command's backend limits once, shared by all child tokens.
+    /// Reopening the same kind of backend is harmless; changing limits is rejected.
+    pub fn publish_cleanup_budget(&self, budget: CleanupBudget) -> Result<(), CleanupBudget> {
+        match self.cleanup_budget.budget.set(budget) {
+            Ok(()) => {
+                self.cleanup_budget.published.cancel();
+                Ok(())
+            }
+            Err(_) if self.cleanup_budget.current() == budget => Ok(()),
+            Err(rejected) => Err(rejected),
+        }
+    }
+
+    pub fn cleanup_budget(&self) -> CleanupBudget {
+        self.cleanup_budget.current()
+    }
+
+    /// Absolute supervisor deadline, anchored to the start of cleanup priority.
+    pub fn cleanup_deadline(&self) -> Option<tokio::time::Instant> {
+        self.cleanup_started
+            .get()
+            .map(|started| *started + self.cleanup_budget().total())
+    }
+
+    /// Wait until this backend's flush budget must yield to lock release.
+    /// A late finalizer receives only the time remaining since cleanup priority.
+    pub async fn state_flush_budget_expired(&self, budget: CleanupBudget) {
+        self.cleanup_priority.cancelled().await;
+        let started = self.cleanup_started.get().expect("cleanup priority start");
+        tokio::time::sleep_until(*started + budget.state_flush()).await;
     }
 }
 
@@ -348,11 +428,15 @@ where
     X: ExitProcess,
     Fut: Future<Output = T>,
 {
-    let state_flush_budget = tokio::time::sleep(STATE_FLUSH_BUDGET);
-    tokio::pin!(state_flush_budget);
-    let cleanup_deadline = tokio::time::sleep(CLEANUP_DEADLINE);
+    let started = trigger
+        .cleanup_started
+        .get()
+        .expect("cleanup priority start");
+    let mut budget = trigger.cleanup_budget.current();
+    eprintln!("{}", cleanup_wait_message(budget));
+    let cleanup_deadline = tokio::time::sleep_until(*started + budget.total());
     tokio::pin!(cleanup_deadline);
-    let mut state_flush_budget_open = true;
+    let mut awaiting_publication = true;
 
     loop {
         tokio::select! {
@@ -375,18 +459,26 @@ where
                 }
                 events_open = false;
             }
-            _ = &mut state_flush_budget, if state_flush_budget_open => {
-                state_flush_budget_open = false;
-                eprintln!(
-                    "State flush budget expired after {}; reserving time for state lock release.",
-                    duration_for_log(STATE_FLUSH_BUDGET)
-                );
-                trigger.expire_state_flush_budget();
+            _ = trigger.cleanup_budget.published.cancelled(), if awaiting_publication => {
+                awaiting_publication = false;
+                let latest = trigger.cleanup_budget.current();
+                if latest != budget {
+                    budget = latest;
+                    cleanup_deadline.as_mut().reset(*started + budget.total());
+                    eprintln!("{}", cleanup_wait_message(budget));
+                }
             }
             _ = &mut cleanup_deadline => {
+                // Publication can race the timer becoming ready on another thread.
+                let latest = trigger.cleanup_budget.current();
+                if latest != budget {
+                    budget = latest;
+                    cleanup_deadline.as_mut().reset(*started + budget.total());
+                    continue;
+                }
                 eprintln!(
                     "Cleanup deadline expired after {}; exiting.",
-                    duration_for_log(CLEANUP_DEADLINE)
+                    duration_for_log(budget.total())
                 );
                 exit.exit(130);
                 return Supervised::ExitRequested(ShutdownExitReason::DeadlineExpired);
@@ -399,7 +491,20 @@ fn log_received_signal(signal: ShutdownSignal) {
     eprintln!("\nReceived shutdown signal: {signal:?}.");
 }
 
-fn duration_for_log(duration: Duration) -> String {
+fn cleanup_wait_message(budget: CleanupBudget) -> String {
+    let reason = match budget.reason {
+        Some(CleanupWaitReason::GitHubCommits) => {
+            " (GitHub backend: each state or lock write is a separate commit)"
+        }
+        None => "",
+    };
+    format!(
+        "Waiting up to {} for state and lock cleanup{reason}.",
+        duration_for_log(budget.total())
+    )
+}
+
+pub fn duration_for_log(duration: Duration) -> String {
     if duration.subsec_nanos() == 0 {
         let seconds = duration.as_secs();
         let unit = if seconds == 1 { "second" } else { "seconds" };
@@ -440,10 +545,6 @@ pub mod testing {
         pub fn prioritize_cleanup(&self) {
             self.0.prioritize_cleanup();
         }
-
-        pub fn expire_state_flush_budget(&self) {
-            self.0.expire_state_flush_budget();
-        }
     }
 }
 
@@ -451,6 +552,116 @@ pub mod testing {
 mod tests {
     use super::testing::cleanup_priority_requested;
     use super::*;
+
+    #[test]
+    fn per_backend_cleanup_limits_and_publication_are_validated() {
+        let budget = CleanupBudget::new(Duration::from_secs(5), Duration::from_secs(8));
+        assert_eq!(budget.state_flush(), Duration::from_secs(5));
+        assert_eq!(budget.total(), Duration::from_secs(8));
+        for (flush, total) in [(0, 2), (1, 0), (2, 2), (3, 2)] {
+            assert!(
+                std::panic::catch_unwind(|| CleanupBudget::new(
+                    Duration::from_secs(flush),
+                    Duration::from_secs(total)
+                ))
+                .is_err()
+            );
+        }
+        let token = ShutdownToken::running();
+        let (_, child) = token.with_graceful_shutdown_trigger();
+        child.publish_cleanup_budget(budget).unwrap();
+        // Resolving another handle cannot replace the command's published limits.
+        assert!(
+            token
+                .publish_cleanup_budget(CleanupBudget::TWO_SECOND)
+                .is_err()
+        );
+        assert_eq!(token.cleanup_budget(), budget);
+    }
+
+    #[test]
+    fn cleanup_wait_messages_use_the_published_budget_and_typed_reason() {
+        assert_eq!(
+            cleanup_wait_message(CleanupBudget::TWO_SECOND),
+            "Waiting up to 2 seconds for state and lock cleanup."
+        );
+        let github = CleanupBudget::new(Duration::from_secs(5), Duration::from_secs(8))
+            .with_reason(CleanupWaitReason::GitHubCommits);
+        assert_eq!(
+            cleanup_wait_message(github),
+            "Waiting up to 8 seconds for state and lock cleanup (GitHub backend: each state or lock write is a separate commit)."
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_rechecks_budget_published_after_cleanup_priority() {
+        struct NoEvents;
+        impl ShutdownEvents for NoEvents {
+            async fn recv(&mut self) -> Option<ShutdownSignal> {
+                std::future::pending().await
+            }
+        }
+        struct Exit;
+        impl ExitProcess for Exit {
+            fn exit(&self, code: i32) {
+                assert_eq!(code, 130);
+            }
+        }
+        let github = CleanupBudget::new(Duration::from_secs(5), Duration::from_secs(8));
+        for (budget, publish_after) in [
+            (CleanupBudget::TWO_SECOND, None),
+            (github, Some(Duration::ZERO)),
+            (github, Some(Duration::from_secs(1))),
+            // A late publication must also shorten the default timer correctly.
+            (
+                CleanupBudget::new(Duration::from_millis(200), Duration::from_millis(500)),
+                Some(Duration::from_millis(100)),
+            ),
+        ] {
+            let (trigger, token) = shutdown_channel();
+            if publish_after == Some(Duration::ZERO) {
+                token.publish_cleanup_budget(budget).unwrap();
+            }
+            trigger.prioritize_cleanup();
+            let started = tokio::time::Instant::now();
+            let command = async move {
+                if let Some(delay) = publish_after {
+                    tokio::time::sleep(delay).await;
+                    token.publish_cleanup_budget(budget).unwrap();
+                }
+                std::future::pending::<()>().await;
+            };
+            tokio::pin!(command);
+            let result =
+                finish_cleanup_before_exit(&mut command, &mut NoEvents, true, &trigger, &Exit)
+                    .await;
+            assert!(matches!(
+                result,
+                Supervised::ExitRequested(ShutdownExitReason::DeadlineExpired)
+            ));
+            assert_eq!(started.elapsed(), budget.total());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_flush_cutoff_starts_only_at_cleanup_priority_and_survives_child_tokens() {
+        let (trigger, token) = shutdown_channel();
+        let (_, child) = token.with_graceful_shutdown_trigger();
+        let budget = CleanupBudget::new(Duration::from_millis(400), Duration::from_secs(2));
+        trigger.request_graceful_shutdown();
+        tokio::select! {
+            biased;
+            _ = child.state_flush_budget_expired(budget) => panic!("graceful shutdown must allow draining"),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+
+        trigger.prioritize_cleanup();
+        tokio::time::advance(Duration::from_millis(300)).await;
+        trigger.prioritize_cleanup();
+        let start = tokio::time::Instant::now();
+        child.state_flush_budget_expired(budget).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(100));
+    }
 
     #[test]
     fn cleanup_deadline_fits_the_github_actions_sigterm_window() {

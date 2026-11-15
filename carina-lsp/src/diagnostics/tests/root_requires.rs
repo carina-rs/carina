@@ -54,14 +54,9 @@ fn round3_non_utf8_editor_file_keeps_its_authored_path() {
     }
     let document = create_document_at("arguments { n: Int }\n", path.clone());
     let pinned = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
-    let name = path.file_name().unwrap().to_string_lossy();
     let merged = test_engine()
         .with_run_for_test(|run| {
-            run.parse_and_resolve_merged_with_buffer(
-                &document.for_diagnostics().unwrap(),
-                Some(&name),
-                &pinned,
-            )
+            run.parse_and_resolve_merged_with_buffer(&document.for_diagnostics().unwrap(), &pinned)
         })
         .unwrap();
     let syntax =

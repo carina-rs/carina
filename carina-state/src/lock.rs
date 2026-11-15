@@ -2,11 +2,29 @@
 
 use std::time::Duration as StdDuration;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Default lock timeout in seconds (60 minutes).
 pub const DEFAULT_LOCK_TIMEOUT_SECS: i64 = 3600;
+
+/// Render the last acquisition or renewal in UTC, truncating to whole seconds.
+pub fn format_lock_last_updated(timestamp: &DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Render the lock expiry in UTC, rounding up to whole seconds.
+/// If rounding would overflow, format the original timestamp instead.
+pub fn format_lock_expiry(timestamp: &DateTime<Utc>) -> String {
+    let rounded = if timestamp.timestamp_subsec_nanos() == 0 {
+        *timestamp
+    } else {
+        timestamp
+            .checked_add_signed(Duration::seconds(1))
+            .unwrap_or(*timestamp)
+    };
+    rounded.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
 
 fn default_renewal_ttl() -> StdDuration {
     StdDuration::from_secs(DEFAULT_LOCK_TIMEOUT_SECS as u64)
@@ -25,8 +43,9 @@ pub struct LockInfo {
     operation: String,
     /// Who acquired the lock (username@hostname).
     who: String,
-    /// When the lock was created or most recently renewed.
-    created: DateTime<Utc>,
+    /// When the last acquisition or renewal occurred.
+    #[serde(rename = "created")]
+    last_updated: DateTime<Utc>,
     /// When the lock expires.
     expires: DateTime<Utc>,
     /// In-memory TTL used for subsequent renewals.
@@ -39,7 +58,8 @@ struct LockInfoFile {
     id: String,
     operation: String,
     who: String,
-    created: DateTime<Utc>,
+    #[serde(rename = "created")]
+    last_updated: DateTime<Utc>,
     expires: DateTime<Utc>,
 }
 
@@ -62,7 +82,7 @@ impl LockInfo {
             id: uuid::Uuid::new_v4().to_string(),
             operation: operation.into(),
             who: get_lock_owner(),
-            created: now,
+            last_updated: now,
             expires: now + Duration::seconds(timeout_secs),
             renewal_ttl,
         }
@@ -83,9 +103,9 @@ impl LockInfo {
         &self.who
     }
 
-    /// Return when this lock was created or most recently renewed.
-    pub fn created(&self) -> DateTime<Utc> {
-        self.created
+    /// Return when the last acquisition or renewal occurred.
+    pub fn last_updated(&self) -> DateTime<Utc> {
+        self.last_updated
     }
 
     /// Return when this lock expires.
@@ -120,7 +140,7 @@ impl LockInfo {
             id: file.id,
             operation: file.operation,
             who: file.who,
-            created: file.created,
+            last_updated: file.last_updated,
             expires: file.expires,
             renewal_ttl: default_renewal_ttl(),
         }
@@ -128,7 +148,7 @@ impl LockInfo {
 
     /// Create a renewed lock with a fresh expiration timestamp.
     ///
-    /// The lock ID, operation, and owner remain the same; only the `created`
+    /// The lock ID, operation, and owner remain the same; only the `last_updated`
     /// and `expires` fields are refreshed.
     pub(crate) fn renewed(&self) -> Self {
         self.renewed_at(Utc::now())
@@ -141,7 +161,7 @@ impl LockInfo {
             id: self.id.clone(),
             operation: self.operation.clone(),
             who: self.who.clone(),
-            created: now,
+            last_updated: now,
             expires: now + renewal_ttl,
             renewal_ttl: self.renewal_ttl,
         }
@@ -151,6 +171,12 @@ impl LockInfo {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(operation: impl Into<String>) -> Self {
         Self::new(operation)
+    }
+
+    /// Fabricate a lock from fixed persisted metadata for diagnostic tests.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test_from_json(json: &str) -> serde_json::Result<Self> {
+        Self::from_json_str(json)
     }
 
     /// Fabricate a lock with a short TTL for heartbeat tests.
@@ -163,7 +189,7 @@ impl LockInfo {
             id: uuid::Uuid::new_v4().to_string(),
             operation: operation.into(),
             who: get_lock_owner(),
-            created: now,
+            last_updated: now,
             expires: now + timeout,
             renewal_ttl: timeout
                 .to_std()
@@ -203,12 +229,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_format_lock_last_updated_truncates_subseconds() {
+        for timestamp in [
+            "2026-11-15T17:12:03.000+09:00",
+            "2026-11-15T17:12:03.987+09:00",
+        ] {
+            let timestamp = DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(format_lock_last_updated(&timestamp), "2026-11-15T08:12:03Z");
+        }
+    }
+
+    #[test]
+    fn test_format_lock_expiry_rounds_up_subseconds() {
+        for (timestamp, expected) in [
+            ("2026-11-15T18:12:03.000+09:00", "2026-11-15T09:12:03Z"),
+            ("2026-11-15T18:12:03.987+09:00", "2026-11-15T09:12:04Z"),
+            (
+                "2026-11-15T18:12:03.000000001+09:00",
+                "2026-11-15T09:12:04Z",
+            ),
+            ("2026-11-15T23:59:59.987Z", "2026-11-16T00:00:00Z"),
+        ] {
+            let timestamp = DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(format_lock_expiry(&timestamp), expected);
+        }
+    }
+
+    #[test]
+    fn test_format_lock_expiry_handles_max_timestamp() {
+        let timestamp = DateTime::<Utc>::MAX_UTC;
+        assert!(timestamp.timestamp_subsec_nanos() > 0);
+        assert_eq!(format_lock_expiry(&timestamp), "+262142-12-31T23:59:59Z");
+    }
+
+    #[test]
     fn test_lock_info_new() {
         let lock = LockInfo::new("apply");
         assert_eq!(lock.operation(), "apply");
         assert!(!lock.id().is_empty());
         assert!(!lock.who().is_empty());
-        assert!(lock.expires() > lock.created());
+        assert!(lock.expires() > lock.last_updated());
     }
 
     #[test]
@@ -234,11 +298,13 @@ mod tests {
     #[test]
     fn test_lock_info_renewed() {
         let lock = LockInfo::for_test_with_timeout("apply", StdDuration::from_secs(10));
-        let renewed = lock.renewed();
+        let renewal_time = lock.last_updated() + Duration::seconds(1);
+        let renewed = lock.renewed_at(renewal_time);
 
         assert_eq!(renewed.id(), lock.id());
         assert_eq!(renewed.operation(), lock.operation());
         assert_eq!(renewed.who(), lock.who());
+        assert_eq!(renewed.last_updated(), renewal_time);
         assert!(renewed.expires() > lock.expires());
     }
 
@@ -251,6 +317,47 @@ mod tests {
         assert_eq!(deserialized.id(), lock.id());
         assert_eq!(deserialized.operation(), lock.operation());
         assert_eq!(deserialized.who(), lock.who());
+        assert_eq!(deserialized.last_updated(), lock.last_updated());
+        assert_eq!(deserialized.expires(), lock.expires());
         assert_eq!(deserialized.renewal_ttl(), default_renewal_ttl());
+    }
+
+    #[test]
+    fn test_lock_info_round_trip_preserves_created_json_key() {
+        let lock = LockInfo::new("apply");
+        let json = serde_json::to_value(&lock).unwrap();
+        assert_eq!(
+            json["created"],
+            serde_json::to_value(lock.last_updated()).unwrap()
+        );
+        assert!(json.get("last_updated").is_none());
+        assert!(json.get("renewal_ttl").is_none());
+        let round_tripped = LockInfo::from_json_str(&json.to_string()).unwrap();
+        assert_eq!(round_tripped.last_updated(), lock.last_updated());
+        assert_eq!(round_tripped.expires(), lock.expires());
+
+        let legacy_json = r#"{
+            "id": "legacy-lock",
+            "operation": "apply",
+            "who": "user@host",
+            "created": "2026-11-15T17:12:03.123456+09:00",
+            "expires": "2026-11-15T18:12:03.987654+09:00"
+        }"#;
+        let legacy = LockInfo::from_json_str(legacy_json).unwrap();
+        assert_eq!(legacy.id(), "legacy-lock");
+        assert_eq!(legacy.operation(), "apply");
+        assert_eq!(legacy.who(), "user@host");
+        assert_eq!(
+            legacy.last_updated().to_rfc3339(),
+            "2026-11-15T08:12:03.123456+00:00"
+        );
+        assert_eq!(
+            legacy.expires().to_rfc3339(),
+            "2026-11-15T09:12:03.987654+00:00"
+        );
+        assert_eq!(legacy.renewal_ttl(), default_renewal_ttl());
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(json["created"], "2026-11-15T08:12:03.123456Z");
+        assert!(json.get("last_updated").is_none());
     }
 }

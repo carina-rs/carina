@@ -140,7 +140,7 @@ When stderr is a terminal, Carina shows a spinner for each running effect. Other
 
 ### State Locking Errors
 
-If the state is already locked by another process, Carina displays the lock holder and lock ID, and suggests using `carina force-unlock` if the lock is stale.
+If the state is already locked by another process, Carina displays the lock holder, lock ID, operation, and last update and expiry times in UTC. The message explains that a previous run may have been interrupted before releasing the lock; if so, the lock expires on its own at the displayed time. A running process keeps extending its lock's expiry. If no other run is using the state, it suggests `carina force-unlock` to release the lock sooner.
 
 ## Bootstrap
 
