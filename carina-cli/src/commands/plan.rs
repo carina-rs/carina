@@ -5136,15 +5136,7 @@ impl std::fmt::Display for PlanSaveError {
     }
 }
 
-impl std::error::Error for PlanSaveError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(match self {
-            Self::Serialization(error) => error,
-            Self::CompositionSourceIdentity(error) => error,
-            Self::ProviderEvidence(error) => error,
-        })
-    }
-}
+impl std::error::Error for PlanSaveError {}
 
 fn build_plan_file<E>(
     path: &ResolvedPath,
@@ -7561,6 +7553,46 @@ mod load_upstream_states_tests {
     use carina_core::parser::{ProviderConfiguration, ProviderConfigurations};
     #[cfg(test)]
     use std::fs;
+
+    #[tokio::test]
+    async fn live_upstream_read_accepts_unrelativizable_caller() {
+        let directory = tempfile::tempdir().unwrap();
+        let upstream = directory.path().join("upstream_source");
+        let downstream = directory.path().join("consumer");
+        fs::create_dir(&upstream).unwrap();
+        fs::create_dir(&downstream).unwrap();
+        fs::write(
+            upstream.join("main.crn"),
+            include_str!(
+                "../../tests/fixtures/require_placement_boundaries/upstream_source/main.crn"
+            ),
+        )
+        .unwrap();
+        write_state(&upstream, &[("account_id", serde_json::json!("123"))]);
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let caller = carina_core::parser::parse_file(
+            include_str!(
+                "../../tests/fixtures/require_placement_boundaries/upstream_consumer/main.crn"
+            ),
+            Path::new(""),
+            &context,
+        )
+        .unwrap();
+        let result = load_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
+            &caller.upstream_states,
+            &ResolvedPath::new(&downstream).unwrap(),
+            &context,
+            &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .expect("a diagnostic caller must not block a real state read");
+        assert_eq!(
+            result["prior"]["account_id"],
+            Value::Concrete(ConcreteValue::String("123".into()))
+        );
+    }
 
     #[tokio::test]
     async fn round4_loader_defers_unknown_types_without_changing_static_discovery() {
@@ -10719,6 +10751,19 @@ mod plan_serialization_error_tests {
         Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
             path,
         }))
+    }
+
+    #[test]
+    fn plan_save_error_chain_renders_its_transparent_message_once() {
+        let error = super::PlanSaveError::ProviderEvidence(
+            super::ProviderEvidenceError::MissingProviderArtifact {
+                provider: "mock".into(),
+            },
+        );
+        assert_eq!(
+            crate::error::format_error_with_source_chain(&error),
+            error.to_string()
+        );
     }
 
     #[test]

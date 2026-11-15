@@ -705,6 +705,7 @@ pub trait DirectoryDeclarationEvidence {
     fn location(&self) -> &parser::DeclarationLocation;
     fn utf16_columns(&self) -> (u32, u32);
     fn related_message(&self) -> String;
+    fn note(&self) -> String;
 }
 
 impl DirectoryDeclarationEvidence for ModuleEvidence {
@@ -720,6 +721,9 @@ impl DirectoryDeclarationEvidence for ModuleEvidence {
     fn related_message(&self) -> String {
         self.related_message()
     }
+    fn note(&self) -> String {
+        self.note()
+    }
 }
 impl DirectoryDeclarationEvidence for RootEvidence {
     fn file_locator(&self) -> &crate::paths::PersistedPath {
@@ -733,6 +737,9 @@ impl DirectoryDeclarationEvidence for RootEvidence {
     }
     fn related_message(&self) -> String {
         self.related_message().into()
+    }
+    fn note(&self) -> String {
+        self.note()
     }
 }
 
@@ -923,21 +930,25 @@ impl RootEvidence {
 /// and require nodes. There is no arbitrary RequireScope setter outside parsing.
 #[derive(Clone)]
 pub(crate) struct DirectoryRequireScope(DirectoryVerdict);
+/// Absence has its own sealed witness and cannot be assigned to a require node.
+pub(crate) enum DirectoryRequireNodes {
+    Absent(DirectoryWithoutEvidence),
+    Present(parser::retained::RequireScope),
+}
 impl DirectoryRequireScope {
-    pub(crate) fn into_parts(self) -> (DirectoryVerdict, parser::retained::RequireScope) {
+    pub(crate) fn into_parts(self) -> (DirectoryVerdict, DirectoryRequireNodes) {
         use parser::retained::RequireScope;
-        let scope = match &self.0 {
-            DirectoryVerdict::Unknown(_) => RequireScope::Unknown,
-            // A neutral inventory has no require nodes: a require would itself
-            // supply module evidence. Keep the file's distinct verdict; this
-            // unused default scope grants no node a placement/evaluation verdict.
-            DirectoryVerdict::NoEvidence(_) => RequireScope::Unknown,
-            DirectoryVerdict::Root(root) => RequireScope::UnvalidatedDirectory(root.clone()),
+        let nodes = match &self.0 {
+            DirectoryVerdict::Unknown(()) => DirectoryRequireNodes::Present(RequireScope::Unknown),
+            DirectoryVerdict::NoEvidence(absent) => DirectoryRequireNodes::Absent(absent.clone()),
+            DirectoryVerdict::Root(root) => {
+                DirectoryRequireNodes::Present(RequireScope::UnvalidatedDirectory(root.clone()))
+            }
             DirectoryVerdict::ModuleTemplate(template) => {
-                RequireScope::ModuleTemplate(template.clone())
+                DirectoryRequireNodes::Present(RequireScope::ModuleTemplate(template.clone()))
             }
         };
-        (self.0, scope)
+        (self.0, nodes)
     }
 }
 
@@ -1076,6 +1087,15 @@ impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
 }
 
 impl<E> RootDirectoryParse<E> {
+    /// Syntax placement findings remain available when value analysis fails.
+    pub fn configuration_placement_diagnostics(
+        &self,
+    ) -> Vec<parser::Located<crate::validation::ConfigurationPlacementDiagnostic>> {
+        crate::validation::placement_diagnostics_for_inventory(
+            self.parsed.parser_binding_metadata.syntax(),
+        )
+    }
+
     fn with_resolution(
         parsed: crate::parser::File<E>,
         resolution: ResolutionContext,
@@ -1116,8 +1136,8 @@ impl<E> RootDirectoryParse<E> {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    /// Preserve an already-issued verdict, or load the fixture's real sibling
-    /// inventories. Synthetic AST-only tests may supply no authored blocks.
+    /// Preserve an already-issued verdict. Synthetic AST-only tests may supply
+    /// no authored blocks; other fixtures must pass their source or directory.
     pub fn from_parsed_for_test(parsed: crate::parser::File<E>) -> Self
     where
         E: crate::parser::ExportParamLike,
@@ -1126,8 +1146,9 @@ impl<E> RootDirectoryParse<E> {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    /// Admit a source-backed unit fixture through a real sibling inventory,
-    /// preserving the AST's original labels and transformations.
+    /// Admit an inline source fixture through its own directory inventory,
+    /// preserving the AST's original labels and transformations. Fixtures with
+    /// sibling files must use `from_parsed_in_directory_for_test` instead.
     pub fn from_parsed_source_for_test(parsed: crate::parser::File<E>, source: &str) -> Self
     where
         E: crate::parser::ExportParamLike,
@@ -1153,22 +1174,6 @@ impl<E> RootDirectoryParse<E> {
         if let Some(verdict) = issued {
             return Self::with_resolution(parsed, strict_resolution_context(), verdict);
         }
-        let syntax = parsed.parser_binding_metadata.syntax();
-        let source = syntax
-            .configuration_blocks()
-            .first()
-            .map(|block| block.location())
-            .or_else(|| {
-                syntax
-                    .declarations()
-                    .first()
-                    .map(|declaration| declaration.location())
-            })
-            .map(|location| location.file().path());
-        if let Some(source) = source.filter(|source| source.is_file()) {
-            let directory = ResolvedPath::new(source.parent().expect("fixture parent")).unwrap();
-            return Self::from_parsed_in_directory_for_test(parsed, &directory);
-        }
         if let Some(source) = authored_source {
             let fixture = tempfile::tempdir().unwrap();
             std::fs::write(fixture.path().join("main.crn"), source).unwrap();
@@ -1178,8 +1183,12 @@ impl<E> RootDirectoryParse<E> {
             );
         }
         assert!(
-            syntax.configuration_blocks().is_empty(),
-            "authored configuration blocks need a real sibling fixture; use from_parsed_in_directory_for_test"
+            parsed
+                .parser_binding_metadata
+                .syntax()
+                .configuration_blocks()
+                .is_empty(),
+            "authored configuration blocks need an explicit source or directory; use from_parsed_source_for_test or from_parsed_in_directory_for_test"
         );
         // AST-only unit fixtures have no authored configuration declarations.
         // Even this neutral authority comes from the ordinary directory issuer.
@@ -3511,9 +3520,79 @@ mod tests {
     use crate::resource::Value;
     use std::fs;
 
+    #[test]
+    fn source_fixture_authority_ignores_diagnostic_label_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = "arguments { count: Int }\n";
+        let file = directory.path().join("main.crn");
+        let missing = directory.path().join("missing.crn");
+        fs::write(&file, source).unwrap();
+        fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for label in [
+            file.as_path(),
+            Path::new("wiring_test.crn"),
+            missing.as_path(),
+        ] {
+            let parsed = parser::parse_file(source, label, &context).unwrap();
+            let fixture = ParsedRootDirectory::from_parsed_source_for_test(parsed, source);
+            assert!(matches!(
+                fixture.complete_directory_verdict(),
+                DirectoryVerdict::ModuleTemplate(_)
+            ));
+            assert_eq!(
+                fixture
+                    .parsed()
+                    .parser_binding_metadata
+                    .syntax()
+                    .configuration_blocks()[0]
+                    .location()
+                    .file()
+                    .path(),
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn ast_only_fixture_does_not_load_diagnostic_label_siblings() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("main.crn");
+        let source = "let count = 1\n";
+        fs::write(&file, source).unwrap();
+        fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+        let parsed = parser::parse_file(
+            source,
+            &file,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let fixture = ParsedRootDirectory::from_parsed_for_test(parsed);
+        assert!(matches!(
+            fixture.complete_directory_verdict(),
+            DirectoryVerdict::NoEvidence(_)
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "authored configuration blocks need an explicit source or directory")]
+    fn authored_fixture_requires_explicit_authority_even_when_its_label_is_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("main.crn");
+        let source = "provider mock {}\n";
+        fs::write(&file, source).unwrap();
+        let parsed = parser::parse_file(
+            source,
+            &file,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let _fixture = ParsedRootDirectory::from_parsed_for_test(parsed);
+    }
+
     #[cfg(unix)]
     #[test]
-    fn round23_authored_buffer_view_does_not_pin_its_leaf() {
+    fn authored_buffer_view_does_not_pin_its_leaf() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("main.crn");
         std::os::unix::fs::symlink("main.crn", &path).unwrap();
@@ -3533,7 +3612,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn round23_unpinnable_leaf_keeps_unsaved_sibling_override_evidence() {
+    fn unpinnable_leaf_keeps_unsaved_sibling_override_evidence() {
         let directory = tempfile::tempdir().unwrap();
         let leaf = directory.path().join("main.crn");
         std::os::unix::fs::symlink("main.crn", &leaf).unwrap();

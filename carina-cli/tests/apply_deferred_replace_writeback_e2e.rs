@@ -353,8 +353,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String("carina.state.json".into())),
             )]))
-            .into_iter()
-            .collect(),
+            .into(),
             attribute_spans: Default::default(),
         })
         .into(),
@@ -497,8 +496,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String("carina.state.json".into())),
             )]))
-            .into_iter()
-            .collect(),
+            .into(),
             attribute_spans: Default::default(),
         })
         .into(),

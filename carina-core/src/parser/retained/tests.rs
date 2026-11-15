@@ -1333,3 +1333,27 @@ fn merging_another_directory_cannot_adopt_its_verdict() {
         crate::config_loader::DirectoryVerdict::Unknown(())
     ));
 }
+
+#[test]
+fn no_evidence_has_no_require_node_scope() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("main.crn"), "let neutral = 1\n").unwrap();
+    let parsed = crate::config_loader::parse_directory(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &config(),
+    )
+    .unwrap();
+    assert!(matches!(
+        parsed.parsed().directory_verdict(),
+        crate::config_loader::DirectoryVerdict::NoEvidence(_)
+    ));
+    assert!(
+        parsed
+            .parsed()
+            .parser_binding_metadata
+            .syntax()
+            .expressions()
+            .require_scope
+            .is_none()
+    );
+}

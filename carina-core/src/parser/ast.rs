@@ -5929,44 +5929,6 @@ impl<P: ValueKind> BackendConfig<P, RelativeBindingName> {
     }
 }
 
-/// A diagnostic caller projected from its parser-owned source location.
-#[derive(Debug, Clone)]
-pub struct UpstreamCallSite {
-    file: PathBuf,
-    line: usize,
-    column: usize,
-}
-impl UpstreamCallSite {
-    pub fn from_location(
-        location: &super::DeclarationLocation,
-        root: &crate::paths::ResolvedPath,
-    ) -> std::io::Result<Self> {
-        let file = crate::paths::PersistedPath::new(location.file().path())?
-            .lexical_relative_to(root.persisted_path())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "upstream caller cannot be expressed relative to its project",
-                )
-            })?
-            .into_source_path();
-        Ok(Self {
-            file,
-            line: location.span().start_line(),
-            column: location.span().start_column(),
-        })
-    }
-    pub(crate) fn prefix(&self, root: &crate::paths::ResolvedPath) -> String {
-        let label = crate::paths::DisplayPath::for_diagnostics_from(&self.file, root).to_string();
-        let label = if label.starts_with("..") {
-            label
-        } else {
-            format!("./{label}")
-        };
-        format!("{label}:{}:{}: ", self.line, self.column)
-    }
-}
-
 #[cfg(any(test, feature = "test-utils"))]
 pub fn upstream_caller_for_test() -> super::DeclarationLocation {
     super::parse_file(

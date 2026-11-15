@@ -3733,8 +3733,7 @@ mod tests {
                 "bucket".into(),
                 Value::Concrete(ConcreteValue::String(name.into())),
             )]))
-            .into_iter()
-            .collect(),
+            .into(),
             attribute_spans: Default::default(),
         });
         parsed

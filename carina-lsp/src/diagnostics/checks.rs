@@ -1221,8 +1221,8 @@ impl DiagnosticRun<'_> {
                         &rejection.detail().root_evidence(),
                     );
                 }
-                if let Some(evidence) = finding.detail().module_evidence() {
-                    super::attach_directory_evidence(&mut diagnostic, evidence);
+                if let Some(rejection) = finding.detail().module_template_rejection() {
+                    super::attach_directory_evidence(&mut diagnostic, rejection);
                 }
                 Some(diagnostic)
             })

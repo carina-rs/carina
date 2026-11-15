@@ -121,8 +121,8 @@ pub use ast::{
     ResourceMut, ResourceRef, ResourceTypePath, RootBindingResolvedFile,
     RootBindingResolvedInferredFile, RootBindingResolvedParsedFile, SavedDeferredForExpression,
     ShapeMismatch, SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TopLevelResourceRef,
-    TypeExpr, UntilPredicateAst, UpstreamCallSite, UpstreamState, UseStatement, UserFunction,
-    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
+    TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody,
+    ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub(crate) use ast::{
     BareBindingSource, DeclarationSource, DeferredForResourceExpressionError, ParsedBareBindingUse,

@@ -245,6 +245,10 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
         AppError::ModuleResolution(failure) => {
             return module_error_diagnostics(failure.individual_errors());
         }
+        AppError::UpstreamSourceRejected(rejection) => Diagnostic {
+            location: rejection.caller_location().map(Location::authored),
+            ..Diagnostic::new(rejection.diagnostic_message(), "error")
+        },
         AppError::UpstreamResolution(finding) => {
             if let Some(error) = finding.detail().parse_failure() {
                 if let Some(element) = error.element_diagnostic() {

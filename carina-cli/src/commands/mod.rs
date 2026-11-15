@@ -792,16 +792,15 @@ fn validate_and_resolve_configuration(
         );
     }
 
-    // Export inference refreshes retained judgements. Share a post-retry tree
-    // between placement, backend admission and the remaining analysis consumers.
+    // Export inference refreshes retained judgements. Placement depends only on
+    // the syntax inventory and remains available if value analysis fails.
     let analysis = parsed.analysis();
-    if let Ok(analysis) = &analysis {
-        errors.extend(
-            carina_core::validation::configuration_placement_diagnostics(analysis.tree())
-                .into_iter()
-                .map(|finding| AppError::RootDeclaration(Box::new(finding))),
-        );
-    }
+    errors.extend(
+        parsed
+            .configuration_placement_diagnostics()
+            .into_iter()
+            .map(|finding| AppError::RootDeclaration(Box::new(finding))),
+    );
 
     errors.extend(access.check_provider_configuration(ctx, parsed.parsed()));
 
@@ -1250,12 +1249,12 @@ fn validate_and_resolve_configuration(
         }
         errors.extend(validate_wait_bindings_with_ctx(ctx, analysis));
         errors.extend(validate_deferred_populate_refs_with_ctx(ctx, analysis));
-        errors.extend(
-            upstream_resolve_errors
-                .iter()
-                .cloned()
-                .map(|error| AppError::UpstreamResolution(Box::new(error))),
-        );
+        errors.extend(upstream_resolve_errors.iter().cloned().map(|finding| {
+            match finding.detail().module_template_rejection() {
+                Some(rejection) => AppError::UpstreamSourceRejected(Box::new(rejection.clone())),
+                None => AppError::UpstreamResolution(Box::new(finding)),
+            }
+        }));
 
         let export_value_bindings =
             carina_core::binding_index::ResolvedBindings::for_expanded_validation(parsed);
@@ -1719,6 +1718,17 @@ mod tests {
         let parsed =
             carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
         validate_and_resolve_errors(&parsed, &base, &providers, skip_resource_validation, &[])
+    }
+
+    #[test]
+    fn placement_findings_survive_analysis_failure() {
+        let errors = validation_with_missing_resource_provenance("arguments { count: Int }", true);
+        assert_eq!(errors.len(), 2, "{errors:#?}");
+        assert!(errors[0].to_string().contains("arguments blocks are only valid inside module definitions, not in root configurations."), "{errors:#?}");
+        assert!(matches!(
+            errors.last(),
+            Some(AppError::AnalysisInvariant(_))
+        ));
     }
 
     #[test]

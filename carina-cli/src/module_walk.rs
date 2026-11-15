@@ -326,7 +326,7 @@ mod unavailable_tests {
 mod rejected_import_tests {
     use super::*;
     #[test]
-    fn round15_every_rejected_import_is_rendered_once() {
+    fn every_rejected_import_is_rendered_once() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("not-a-directory.crn"), "// file\n").unwrap();
         std::fs::create_dir(directory.path().join("empty")).unwrap();

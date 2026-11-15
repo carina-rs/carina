@@ -20,7 +20,7 @@ struct Directory {
 }
 
 #[test]
-fn round17_single_file_import_keeps_error_severity_and_call_site() {
+fn single_file_import_keeps_error_severity_and_call_site() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     fs::create_dir_all(project.join("modules")).unwrap();
@@ -2150,7 +2150,7 @@ fn incomplete_root_directory_reports_only_the_sibling_load_failure() {
     }
 }
 
-fn round12_write_upstream_provider(directory: &Directory, value: &str) -> String {
+fn write_upstream_provider(directory: &Directory, value: &str) -> String {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap();
@@ -2168,18 +2168,18 @@ fn round12_write_upstream_provider(directory: &Directory, value: &str) -> String
     source
 }
 
-fn round12_upstream_provider_fixture() -> (Directory, PathBuf) {
+fn upstream_provider_fixture() -> (Directory, PathBuf) {
     let directory = Directory::new("true");
     directory.clear_root_require();
     success(&directory.run(&["apply", "--auto-approve", "."]));
     // The native mock has no configuration fields. Its WASM counterpart
     // declares this field and ignores it during provider initialization.
-    let source = round12_write_upstream_provider(&directory, "'seed'");
+    let source = write_upstream_provider(&directory, "'seed'");
     success(&directory.run(&["init", ".", "--accept-egress", &source]));
     let upstream = directory.project.parent().unwrap().join("mod");
     fs::create_dir(&upstream).unwrap();
     fs::write(upstream.join("locals.crn"), "// independent sibling\n").unwrap();
-    round12_write_upstream_provider(&directory, "prior.value ?? 'fallback'");
+    write_upstream_provider(&directory, "prior.value ?? 'fallback'");
     fs::write(
         directory.project.join("upstream.crn"),
         "let prior = upstream_state { source = '../mod' }\n",
@@ -2193,7 +2193,7 @@ fn round12_upstream_provider_fixture() -> (Directory, PathBuf) {
     (directory, upstream)
 }
 
-fn round12_write_upstream_state(upstream: &std::path::Path) {
+fn write_upstream_state(upstream: &std::path::Path) {
     let mut state = serde_json::to_value(carina_state::StateFile::new()).unwrap();
     state["exports"] = json!({"value": "published"});
     fs::write(
@@ -2203,7 +2203,7 @@ fn round12_write_upstream_state(upstream: &std::path::Path) {
     .unwrap();
 }
 
-fn round12_assert_template_rejection(output: &Output, kind: &str, evidence_dir: &std::path::Path) {
+fn assert_live_template_rejection(output: &Output, kind: &str, evidence_dir: &std::path::Path) {
     assert_template_rejection(output, kind, evidence_dir, true);
 }
 
@@ -2235,20 +2235,20 @@ fn assert_template_rejection(
     assert!(!stderr.contains("PRIVATE_GUARD"), "{stderr}");
 }
 
-fn round12_template_blocks_state_command(args: &[&str]) {
+fn template_blocks_state_command(args: &[&str]) {
     for (declaration, kind) in [
         ("require false, 'PRIVATE_GUARD'", "require statement"),
         ("arguments {}", "arguments block"),
     ] {
         for state in ["absent", "present", "corrupt"] {
-            let (directory, upstream) = round12_upstream_provider_fixture();
+            let (directory, upstream) = upstream_provider_fixture();
             fs::write(
                 upstream.join("declarations.crn"),
                 format!("// authored module\n{declaration}\n"),
             )
             .unwrap();
             match state {
-                "present" => round12_write_upstream_state(&upstream),
+                "present" => write_upstream_state(&upstream),
                 "corrupt" => {
                     fs::write(upstream.join("carina.state.json"), "invalid state sentinel").unwrap()
                 }
@@ -2262,7 +2262,7 @@ fn round12_template_blocks_state_command(args: &[&str]) {
             ];
             let before = paths.each_ref().map(|path| fs::read(path).ok());
             let output = directory.run(args);
-            round12_assert_template_rejection(&output, kind, std::path::Path::new("../mod"));
+            assert_live_template_rejection(&output, kind, std::path::Path::new("../mod"));
             assert!(!output_text(&output).contains("invalid state sentinel"));
             assert_eq!(before, paths.each_ref().map(|path| fs::read(path).ok()));
         }
@@ -2270,22 +2270,22 @@ fn round12_template_blocks_state_command(args: &[&str]) {
 }
 
 #[test]
-fn round12_upstream_template_blocks_destroy_before_state_read() {
-    round12_template_blocks_state_command(&["destroy", "--auto-approve", "."]);
+fn upstream_template_blocks_destroy_before_state_read() {
+    template_blocks_state_command(&["destroy", "--auto-approve", "."]);
 }
 
 #[test]
-fn round12_upstream_template_blocks_state_refresh_before_state_read() {
-    round12_template_blocks_state_command(&["state", "refresh", "."]);
+fn upstream_template_blocks_state_refresh_before_state_read() {
+    template_blocks_state_command(&["state", "refresh", "."]);
 }
 
 #[test]
-fn round12_upstream_template_plan_and_live_apply_render_evidence() {
+fn upstream_template_plan_and_live_apply_render_evidence() {
     for (declaration, kind) in [
         ("require false, 'PRIVATE_GUARD'", "require statement"),
         ("arguments {}", "arguments block"),
     ] {
-        let (directory, upstream) = round12_upstream_provider_fixture();
+        let (directory, upstream) = upstream_provider_fixture();
         fs::write(
             upstream.join("declarations.crn"),
             format!("// authored module\n{declaration}\n"),
@@ -2297,7 +2297,7 @@ fn round12_upstream_template_plan_and_live_apply_render_evidence() {
             &["apply", "--auto-approve", "."],
         ] {
             let output = directory.run(args);
-            round12_assert_template_rejection(&output, kind, std::path::Path::new("../mod"));
+            assert_live_template_rejection(&output, kind, std::path::Path::new("../mod"));
             assert!(output.stdout.is_empty(), "{}", output_text(&output));
             assert_eq!(
                 String::from_utf8_lossy(&output.stderr),
@@ -2311,18 +2311,18 @@ fn round12_upstream_template_plan_and_live_apply_render_evidence() {
 }
 
 #[test]
-fn round12_saved_plan_apply_rejects_current_upstream_template() {
+fn saved_plan_apply_rejects_current_upstream_template() {
     for (declaration, kind) in [
         ("require false, 'PRIVATE_GUARD'", "require statement"),
         ("arguments {}", "arguments block"),
     ] {
-        let (directory, upstream) = round12_upstream_provider_fixture();
+        let (directory, upstream) = upstream_provider_fixture();
         fs::write(
             upstream.join("declarations.crn"),
             "exports { value: String = 'published' }\n",
         )
         .unwrap();
-        round12_write_upstream_state(&upstream);
+        write_upstream_state(&upstream);
         success(&directory.run(&["plan", "--out", "saved.plan", "."]));
         fs::write(
             upstream.join("declarations.crn"),
@@ -2348,14 +2348,14 @@ fn round12_saved_plan_apply_rejects_current_upstream_template() {
 }
 
 #[test]
-fn round21_saved_plan_rejection_keeps_evidence_without_caller_when_config_cannot_load() {
-    let (directory, upstream) = round12_upstream_provider_fixture();
+fn saved_plan_rejection_keeps_evidence_without_caller_when_config_cannot_load() {
+    let (directory, upstream) = upstream_provider_fixture();
     fs::write(
         upstream.join("declarations.crn"),
         "exports { value: String = 'published' }\n",
     )
     .unwrap();
-    round12_write_upstream_state(&upstream);
+    write_upstream_state(&upstream);
     success(&directory.run(&["plan", "--out", "saved.plan", "."]));
     fs::write(
         upstream.join("declarations.crn"),
@@ -2381,13 +2381,13 @@ fn round21_saved_plan_rejection_keeps_evidence_without_caller_when_config_cannot
 }
 
 #[test]
-fn round12_secret_provider_keeps_template_evidence_without_map_keys() {
+fn secret_provider_keeps_template_evidence_without_map_keys() {
     for args in [
         &["destroy", "--auto-approve", "."][..],
         &["state", "refresh", "."],
     ] {
-        let (directory, upstream) = round12_upstream_provider_fixture();
-        round12_write_upstream_provider(
+        let (directory, upstream) = upstream_provider_fixture();
+        write_upstream_provider(
             &directory,
             "secret({ PRIVATE_UPSTREAM_MAP_KEY = prior.value ?? 'fallback' }).PRIVATE_UPSTREAM_MAP_KEY",
         );
@@ -2404,18 +2404,14 @@ fn round12_secret_provider_keeps_template_evidence_without_map_keys() {
         ];
         let before = paths.each_ref().map(|path| fs::read(path).unwrap());
         let output = directory.run(args);
-        round12_assert_template_rejection(
-            &output,
-            "arguments block",
-            std::path::Path::new("../mod"),
-        );
+        assert_live_template_rejection(&output, "arguments block", std::path::Path::new("../mod"));
         assert!(!output_text(&output).contains("PRIVATE_UPSTREAM_MAP_KEY"));
         assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
     }
 }
 
 #[test]
-fn round12_placement_keeps_the_block_location_in_human_json_and_lsp() {
+fn placement_keeps_the_block_location_in_human_json_and_lsp() {
     for (block, width) in [("arguments", 9), ("attributes", 10)] {
         let directory = Directory::new("true");
         directory.clear_root_require();
@@ -2467,14 +2463,14 @@ fn round12_placement_keeps_the_block_location_in_human_json_and_lsp() {
 }
 
 #[test]
-fn round21_saved_upstream_uses_format_46_without_caller() {
-    let (directory, upstream) = round12_upstream_provider_fixture();
+fn saved_upstream_uses_format_46_without_caller() {
+    let (directory, upstream) = upstream_provider_fixture();
     fs::write(
         upstream.join("declarations.crn"),
         "exports { value: String = 'published' }\n",
     )
     .unwrap();
-    round12_write_upstream_state(&upstream);
+    write_upstream_state(&upstream);
     success(&directory.run(&[
         "plan",
         "--out",
@@ -2491,7 +2487,7 @@ fn round21_saved_upstream_uses_format_46_without_caller() {
 }
 
 #[test]
-fn round19_nested_single_file_import_preserves_root_and_module_owners() {
+fn nested_single_file_import_preserves_root_and_module_owners() {
     let directory = Directory::new("true");
     directory.clear_root_require();
     fs::write(
@@ -2531,7 +2527,7 @@ fn round19_nested_single_file_import_preserves_root_and_module_owners() {
 }
 
 #[test]
-fn round21_backend_failure_aggregates_independent_sibling_errors_like_main() {
+fn backend_failure_aggregates_independent_sibling_errors_like_main() {
     let temp = tempfile::tempdir().unwrap();
     let directory = Directory {
         project: temp.path().join("project"),
@@ -2574,5 +2570,123 @@ fn round21_backend_failure_aggregates_independent_sibling_errors_like_main() {
             {"message":"function 'backend_bucket': return value: expected String, got bool (true)","severity":"error","code":null,"location":{"file":"functions.crn","range":{"start":{"line":1,"column":31},"end":{"line":1,"column":35}}}},
             {"message":"keys() argument must be a Map, got String","severity":"error","code":null,"location":{"file":"functions.crn","range":{"start":{"line":2,"column":38},"end":{"line":2,"column":49}}}}
         ])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn absolute_upstream_template_agrees_across_commands_and_symlink_entry() {
+    let (mut directory, upstream) = upstream_provider_fixture();
+    fs::write(
+        upstream.join("declarations.crn"),
+        include_str!("fixtures/require_placement_boundaries/upstream_template/main.crn"),
+    )
+    .unwrap();
+    fs::write(
+        directory.project.join("upstream.crn"),
+        include_str!("fixtures/require_placement_boundaries/upstream_template_consumer/main.crn")
+            .replace("../upstream_template", &upstream.display().to_string()),
+    )
+    .unwrap();
+    let alias = directory.project.parent().unwrap().join("linked-project");
+    std::os::unix::fs::symlink(&directory.project, &alias).unwrap();
+    for project in [directory.project.clone(), alias] {
+        directory.project = project;
+        let message = format!(
+            "upstream_state `prior`: source `{}` is a module definition and has no state to read",
+            upstream.display()
+        );
+        let note = "Note: directory is a module definition because of the arguments block at ../mod/declarations.crn:1.";
+        for args in [
+            vec!["validate", "."],
+            vec!["plan", "."],
+            vec!["destroy", "--auto-approve", "."],
+        ] {
+            let output = directory.run(&args);
+            assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.starts_with(&format!("Error: ./upstream.crn:1:39: {message}")),
+                "{stderr}"
+            );
+            assert!(stderr.ends_with(&format!("  {note}\n")), "{stderr}");
+            assert_eq!(
+                stderr.matches("./upstream.crn:1:39:").count(),
+                1,
+                "{stderr}"
+            );
+        }
+        let output = directory.run(&["validate", "--json", "."]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["errors"][0]["message"], format!("{message}\n{note}"));
+        assert_eq!(report["errors"][0]["location"]["file"], "upstream.crn");
+        let path = directory.project.join("upstream.crn");
+        let source = fs::read_to_string(&path).unwrap();
+        let diagnostics = DiagnosticEngine::without_loaded_provider_schemas(
+            carina_core::EnvironmentSnapshot::empty(),
+        )
+        .analyze(
+            &Document::new_with_path(
+                source,
+                path.clone(),
+                Arc::new(carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            ),
+            Some(&path),
+        );
+        let finding = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == message)
+            .unwrap();
+        assert_eq!(finding.range.start, Position::new(0, 38));
+        assert_eq!(
+            finding.related_information.as_ref().unwrap()[0]
+                .location
+                .uri,
+            tower_lsp::lsp_types::Url::from_file_path(upstream.join("declarations.crn")).unwrap()
+        );
+    }
+}
+
+#[test]
+fn saved_plan_missing_unused_upstream_keeps_main_stderr() {
+    let directory = Directory::new("true");
+    directory.clear_root_require();
+    let upstream = directory.project.parent().unwrap().join("upstream_source");
+    fs::create_dir(&upstream).unwrap();
+    fs::write(
+        upstream.join("main.crn"),
+        include_str!("fixtures/require_placement_boundaries/upstream_source/main.crn"),
+    )
+    .unwrap();
+    fs::remove_file(directory.project.join("providers.crn")).unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        include_str!("fixtures/require_placement_boundaries/upstream_consumer/main.crn")
+            .replace(" comment = prior.account_id", ""),
+    )
+    .unwrap();
+    success(&directory.run(&["plan", "--out", "saved.json", "."]));
+    let plan = fs::read(directory.project.join("saved.json")).unwrap();
+    let provider_state = fs::read(directory.home.join("mock-state.json")).ok();
+    fs::remove_dir_all(&upstream).unwrap();
+    let io_error = fs::metadata(&upstream).unwrap_err();
+    let output = directory.run(&["apply", "--auto-approve", "saved.json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "Error: upstream_state 'prior': cannot resolve source '../upstream_source': {io_error}\n"
+        )
+    );
+    assert_eq!(
+        fs::read(directory.project.join("saved.json")).unwrap(),
+        plan
+    );
+    assert!(!directory.project.join("carina.state.json").exists());
+    assert_eq!(
+        fs::read(directory.home.join("mock-state.json")).ok(),
+        provider_state
     );
 }

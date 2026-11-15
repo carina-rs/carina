@@ -190,6 +190,40 @@ pub enum InferenceError {
     CyclicVirtualBinding { cycle: Vec<String> },
 }
 
+impl InferenceError {
+    pub fn require_outside_module(
+        &self,
+    ) -> Option<&crate::module_resolver::RequireOutsideModuleDiagnostic> {
+        match self {
+            Self::RequireOutsideModule(rejection) => Some(rejection),
+            Self::InsideSecret {}
+            | Self::SecretAssignmentMismatch { types: _ }
+            | Self::MissingEvidence(_)
+            | Self::UnknownType { reason: _ }
+            | Self::SchemaResolution { error: _ }
+            | Self::TypeResolution { error: _ }
+            | Self::HeterogeneousCollection { types: _ }
+            | Self::IncompatibleCoalesceTypes { types: _ }
+            | Self::InvalidIntegerArithmeticOperand {
+                op: _,
+                side: _,
+                actual: _,
+                operator_span: _,
+            }
+            | Self::UnknownBinding { binding: _ }
+            | Self::UnknownAttribute {
+                binding: _,
+                attribute: _,
+            }
+            | Self::InvalidAccess {
+                base_type: _,
+                step: _,
+            }
+            | Self::CyclicVirtualBinding { cycle: _ } => None,
+        }
+    }
+}
+
 /// Keep public type context and remove names, paths and value payloads.
 impl crate::resource::InsideSecret for InferenceError {
     fn inside_secret(self) -> Self {

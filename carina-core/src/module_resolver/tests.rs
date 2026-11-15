@@ -247,8 +247,11 @@ fn resolve_modules(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                    .admit(&crate::schema::SchemaRegistry::new(), session),
+                crate::config_loader::ParsedRootDirectory::from_parsed_in_directory_for_test(
+                    parsed,
+                    &crate::paths::ResolvedPath::new(base_dir).unwrap(),
+                )
+                .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(base_dir).unwrap(),
             )
             .map_err(Box::new)
@@ -355,8 +358,11 @@ fn resolve_modules_with_config(
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     crate::validation::deferred_types::with_session_for_test(config, |session| {
         super::resolve_modules_with_providerless_config(
-            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                .admit(schemas, session),
+            crate::config_loader::ParsedRootDirectory::from_parsed_in_directory_for_test(
+                parsed,
+                &crate::paths::ResolvedPath::new(base_dir).unwrap(),
+            )
+            .admit(schemas, session),
             &crate::paths::ResolvedPath::new(base_dir).unwrap(),
         )
         .map_err(Box::new)

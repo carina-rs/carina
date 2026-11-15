@@ -1885,20 +1885,18 @@ mod tests {
     #[test]
     fn backend_identity_error_retains_typed_source() {
         use std::error::Error;
-        let configuration: crate::parser::ExpandedInferredFile =
-            crate::parser::ExpandedInferredFile {
-                backend: Some(crate::parser::BackendConfig {
-                    backend_type: "s3".into(),
-                    attributes: (HashMap::<String, _>::from([(
-                        "bucket".into(),
-                        Value::Concrete(ConcreteValue::String("".into())),
-                    )]))
-                    .into_iter()
-                    .collect(),
-                    attribute_spans: Default::default(),
-                }),
-                ..Default::default()
-            };
+        let configuration = crate::parser::ExpandedInferredFile {
+            backend: Some(crate::parser::BackendConfig {
+                backend_type: "s3".into(),
+                attributes: (HashMap::<String, _>::from([(
+                    "bucket".into(),
+                    Value::Concrete(ConcreteValue::String("".into())),
+                )]))
+                .into(),
+                attribute_spans: Default::default(),
+            }),
+            ..Default::default()
+        };
         let error = ResolvedInitialDeletePlan::from_backend_configuration(
             &configuration,
             "mock",

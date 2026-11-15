@@ -1,0 +1,1 @@
+let prior = upstream_state { source = '../upstream_template' }

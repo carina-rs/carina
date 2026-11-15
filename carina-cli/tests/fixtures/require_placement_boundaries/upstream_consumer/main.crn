@@ -1,0 +1,4 @@
+backend local { path = 'carina.state.json' }
+provider mock {}
+let prior = upstream_state { source = '../upstream_source' }
+mock.test.resource { name = 'root' comment = prior.account_id }

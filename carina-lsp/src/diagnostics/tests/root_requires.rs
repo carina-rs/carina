@@ -3,7 +3,7 @@ use tower_lsp::lsp_types::{Position, Range};
 
 #[cfg(unix)]
 #[test]
-fn round23_unpinnable_leaf_keeps_root_placement_once_and_unknown_defers() {
+fn unpinnable_leaf_keeps_root_placement_once_and_unknown_defers() {
     for (evidence, evidence_end) in [
         (None, 0),
         (Some("provider mock {}\n"), 13),
@@ -82,7 +82,7 @@ fn round23_unpinnable_leaf_keeps_root_placement_once_and_unknown_defers() {
 
 #[cfg(unix)]
 #[test]
-fn round23_unpinnable_buffer_root_keeps_placement_without_backend_recovery() {
+fn unpinnable_buffer_root_keeps_placement_without_backend_recovery() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("main.crn");
     std::os::unix::fs::symlink("main.crn", &path).unwrap();
@@ -1085,7 +1085,7 @@ fn unsaved_backend_decides_root_without_recovering_schema_checks() {
 }
 
 #[test]
-fn round21_partial_root_does_not_recover_backend_schema_checks() {
+fn partial_root_does_not_recover_backend_schema_checks() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("broken.crn"), "let broken =\n").unwrap();
     let path = directory.path().join("backend.crn");
@@ -1096,7 +1096,7 @@ fn round21_partial_root_does_not_recover_backend_schema_checks() {
 }
 
 #[test]
-fn round21_unknown_keeps_mains_missing_provider_schema_diagnostic() {
+fn unknown_keeps_mains_missing_provider_schema_diagnostic() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("broken.crn"), "let broken =\n").unwrap();
     let path = directory.path().join("main.crn");
@@ -1113,4 +1113,64 @@ fn round21_unknown_keeps_mains_missing_provider_schema_diagnostic() {
         diagnostics[0].range,
         Range::new(Position::new(0, 0), Position::new(0, 19))
     );
+}
+
+#[test]
+fn mixed_root_arguments_keep_legacy_placeholder_boundary() {
+    for split in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.crn");
+        let source = if split {
+            std::fs::write(
+                directory.path().join("arguments.crn"),
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../carina-cli/tests/fixtures/require_placement_boundaries/mixed_directory/arguments.crn")),
+            )
+            .unwrap();
+            std::fs::write(directory.path().join("providers.crn"), include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../carina-cli/tests/fixtures/require_placement_boundaries/mixed_directory/providers.crn"))).unwrap();
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../carina-cli/tests/fixtures/require_placement_boundaries/mixed_directory/main.crn"
+            ))
+        } else {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../carina-cli/tests/fixtures/require_placement_boundaries/mixed_single/main.crn"
+            ))
+        };
+        std::fs::write(&path, source).unwrap();
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unresolved module argument")),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn providerless_loop_directives_keep_legacy_placeholder_boundary() {
+    let provider = "Provider 'mock' has no loaded schema for this file: no provider block for it was found in this file's configuration.";
+    for (values, expected) in [
+        ("missing", vec![provider.to_string()]),
+        ("prior.flags", vec![provider.to_string()]),
+        ("[true]", vec![provider.to_string()]),
+        ("[true, false]", vec![provider.to_string(), provider.to_string()]),
+        ("[missing]", vec!["directives.prevent_destroy must resolve to a Bool for resource `mock.test.resource.<pending>`; got Enum".to_string(), provider.to_string()]),
+        ("['one']", vec!["directives.prevent_destroy must resolve to a Bool for resource `mock.test.resource.<pending>`; got String".to_string(), provider.to_string()]),
+    ] {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../carina-cli/tests/fixtures/require_placement_boundaries/providerless_loop/main.crn")).replace("in missing", &format!("in {values}"));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.crn");
+        std::fs::write(&path, &source).unwrap();
+        std::fs::write(directory.path().join("broken.crn"), include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../carina-cli/tests/fixtures/require_placement_boundaries/providerless_loop/broken.crn"))).unwrap();
+        for diagnostics in [
+            test_engine().analyze(&create_document(&source), None),
+            test_engine().analyze(&create_document_at(&source, path.clone()), Some(&path)),
+        ] {
+            assert_eq!(diagnostics.iter().map(|diagnostic| diagnostic.message.clone()).collect::<Vec<_>>(), expected, "{values}: {diagnostics:#?}");
+            assert!(diagnostics.iter().all(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)));
+        }
+    }
 }

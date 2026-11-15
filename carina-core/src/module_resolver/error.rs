@@ -1108,7 +1108,7 @@ mod tests {
     use crate::parser::ProviderContext;
 
     #[test]
-    fn round12_root_evidence_decomposition_crosses_nested_wrappers() {
+    fn root_evidence_decomposition_crosses_nested_wrappers() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
         std::fs::write(directory.path().join("locals.crn"), "// sibling\n").unwrap();

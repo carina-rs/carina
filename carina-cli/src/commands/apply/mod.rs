@@ -978,10 +978,13 @@ async fn verify_upstream_snapshot(
             identity.source().metadata()?;
             Ok(identity)
         })
-        .map_err(|error| AppError::UpstreamSourceResolution {
-            binding: source.binding.to_string(),
-            source_path: source.source.clone(),
-            error,
+        .map_err(|error| {
+            AppError::Config(format!(
+                "upstream_state '{}': cannot resolve source '{}': {}",
+                source.binding,
+                source.source.display(),
+                error
+            ))
         });
         let loaded = super::plan::load_selected_upstream_identities(
             wiring.runtime(),
@@ -1076,6 +1079,32 @@ fn diff_upstream_snapshot(
 mod upstream_snapshot_tests {
     use super::*;
     use carina_core::upstream_exports::remote_bindings_for_test;
+
+    #[tokio::test]
+    async fn saved_upstream_missing_source_keeps_main_config_error() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let wiring = crate::wiring::WiringContext::new_for_test(&runtime, vec![], &[]);
+        let sources = [crate::commands::plan::UpstreamSource {
+            binding: carina_core::resource::absolute_binding_address_for_test("b"),
+            source: "p".into(),
+        }];
+        let error = verify_upstream_snapshot(
+            &wiring,
+            &sources,
+            &HashMap::new(),
+            &ResolvedPath::new(root.path()).unwrap(),
+            ApplyTarget::Project(root.path()),
+        )
+        .await
+        .unwrap_err();
+        let io_error = std::fs::metadata(root.path().join("p")).unwrap_err();
+        assert_eq!(
+            crate::error::format_error_with_source_chain(&error),
+            format!("upstream_state 'b': cannot resolve source 'p': {io_error}")
+        );
+        assert!(matches!(error, AppError::Config(_)), "{error:?}");
+    }
 
     #[test]
     fn round2_4_wrapped_admission_failure_remains_drift() {

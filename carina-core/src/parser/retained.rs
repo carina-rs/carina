@@ -1175,11 +1175,16 @@ pub(crate) fn set_directory_require_scope<E, D, B: BindingAddress>(
     file.parser_binding_metadata
         .syntax
         .install_directory_verdict(scope.clone());
-    let (_, scope) = scope.into_parts();
-    file.parser_binding_metadata
-        .syntax
-        .expressions_mut()
-        .set_require_scope(scope);
+    let (_, nodes) = scope.into_parts();
+    let expressions = file.parser_binding_metadata.syntax.expressions_mut();
+    match nodes {
+        crate::config_loader::DirectoryRequireNodes::Absent(_no_require_nodes) => {
+            expressions.require_scope = None;
+        }
+        crate::config_loader::DirectoryRequireNodes::Present(scope) => {
+            expressions.set_require_scope(scope);
+        }
+    }
 }
 
 #[cfg(test)]

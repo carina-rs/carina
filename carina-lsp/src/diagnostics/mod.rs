@@ -240,52 +240,53 @@ fn render_analysis_resolution_error(
     }
 }
 
-/// An unknown directory grants no expanded-root readiness. Keep declared
-/// argument placeholders provisional while ordinary expression checks run;
-/// this does not mint template scope or exempt unknown requires from inference.
-fn parser_placeholder_boundary(
-    verdict: &carina_core::config_loader::DirectoryVerdict,
-) -> carina_core::parser::ParserPlaceholderBoundary {
-    use carina_core::config_loader::DirectoryVerdict;
-    use carina_core::parser::ParserPlaceholderBoundary;
-    match verdict {
-        DirectoryVerdict::Root(_) | DirectoryVerdict::NoEvidence(_) => {
-            ParserPlaceholderBoundary::ExpandedFile
-        }
-        DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::Unknown(_) => {
-            ParserPlaceholderBoundary::ModuleDefinition
-        }
-    }
+enum DirectoryEvidencePresentation {
+    Related(tower_lsp::lsp_types::DiagnosticRelatedInformation),
+    Note(String),
 }
 
-/// The verdict supplies both the source and UTF-16 columns from its sealed
-/// snapshot, including unsaved siblings. Rendering never rereads evidence.
+fn directory_evidence_presentation(
+    evidence: &impl carina_core::config_loader::DirectoryDeclarationEvidence,
+) -> DirectoryEvidencePresentation {
+    let location = evidence.location();
+    let (start, end) = evidence.utf16_columns();
+    let uri = match tower_lsp::lsp_types::Url::from_file_path(evidence.file_locator().to_path_buf())
+    {
+        Ok(uri) => uri,
+        Err(()) => return DirectoryEvidencePresentation::Note(evidence.note()),
+    };
+    // URL parsing removes dot segments while retaining percent-encoded OS bytes.
+    let uri = match tower_lsp::lsp_types::Url::parse(uri.as_str()) {
+        Ok(uri) => uri,
+        Err(_error) => return DirectoryEvidencePresentation::Note(evidence.note()),
+    };
+    let span = location.span();
+    DirectoryEvidencePresentation::Related(tower_lsp::lsp_types::DiagnosticRelatedInformation {
+        location: tower_lsp::lsp_types::Location {
+            uri,
+            range: Range::new(
+                Position::new((span.start_line() - 1) as u32, start),
+                Position::new((span.end_line() - 1) as u32, end),
+            ),
+        },
+        message: evidence.related_message(),
+    })
+}
+
+/// Render the sealed evidence snapshot as related information or a visible note.
 fn attach_directory_evidence(
     diagnostic: &mut Diagnostic,
     evidence: &impl carina_core::config_loader::DirectoryDeclarationEvidence,
 ) {
-    let location = evidence.location();
-    let (start, end) = evidence.utf16_columns();
-    let file = evidence.file_locator();
-    let Ok(uri) = tower_lsp::lsp_types::Url::from_file_path(file.to_path_buf()) else {
-        return;
-    };
-    // URL parsing removes dot segments while retaining percent-encoded OS bytes.
-    let Ok(uri) = tower_lsp::lsp_types::Url::parse(uri.as_str()) else {
-        return;
-    };
-    let span = location.span();
-    diagnostic.related_information =
-        Some(vec![tower_lsp::lsp_types::DiagnosticRelatedInformation {
-            location: tower_lsp::lsp_types::Location {
-                uri,
-                range: Range::new(
-                    Position::new((span.start_line() - 1) as u32, start),
-                    Position::new((span.end_line() - 1) as u32, end),
-                ),
-            },
-            message: evidence.related_message(),
-        }]);
+    match directory_evidence_presentation(evidence) {
+        DirectoryEvidencePresentation::Related(related) => {
+            diagnostic.related_information = Some(vec![related]);
+        }
+        DirectoryEvidencePresentation::Note(note) => {
+            diagnostic.message.push_str("\nNote: ");
+            diagnostic.message.push_str(&note);
+        }
+    }
 }
 
 fn parser_span_range(doc: &Document, span: SourceSpan) -> Option<Range> {
@@ -1167,8 +1168,14 @@ impl DiagnosticRun<'_> {
             diagnostics.extend(self.check_mixed_tag_key_styles(doc, base, &result.directory, tree));
         }
         if let Some(boundary_file) = current_parsed {
-            let boundary =
-                parser_placeholder_boundary(merged.unwrap_or(boundary_file).directory_verdict());
+            let boundary_file_for_scope = merged.unwrap_or(boundary_file);
+            let boundary = if !boundary_file_for_scope.arguments.is_empty()
+                || !boundary_file_for_scope.attribute_params.is_empty()
+            {
+                carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+            } else {
+                carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+            };
             if let Some(merged) = merged {
                 diagnostics.extend(self.check_expansion_boundary(
                     doc,
@@ -1428,8 +1435,14 @@ impl DiagnosticRun<'_> {
             // back to the buffer parse only when directory merging failed. This
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
-            let directive_boundary =
-                parser_placeholder_boundary(merged.unwrap_or(parsed).directory_verdict());
+            let directive_file = merged.unwrap_or(parsed);
+            let directive_boundary = if !directive_file.arguments.is_empty()
+                || !directive_file.attribute_params.is_empty()
+            {
+                carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+            } else {
+                carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+            };
             let directive_errors = if let Some(graph) = expanded_graph {
                 graph.directive_resolution_errors(
                     directive_boundary,
@@ -1488,12 +1501,7 @@ impl DiagnosticRun<'_> {
                 };
             let expression_report = pre_expansion_configuration.judged().report();
             for finding in expression_report.findings() {
-                let root = match finding.detail() {
-                    carina_core::static_type::InferenceError::RequireOutsideModule(root) => {
-                        Some(root)
-                    }
-                    _ => None,
-                };
+                let root = finding.detail().require_outside_module();
                 let message =
                     root.map_or_else(|| finding.detail().to_string(), |root| root.lsp_message());
                 if let Some(mut diagnostic) =

@@ -1185,43 +1185,10 @@ fn placement_finding_display(
     )
 }
 
-fn root_require_rejection(
-    error: &carina_core::static_type::InferenceError,
-) -> Option<&carina_core::module_resolver::RequireOutsideModuleDiagnostic> {
-    use carina_core::static_type::InferenceError;
-    match error {
-        InferenceError::RequireOutsideModule(rejection) => Some(rejection),
-        InferenceError::InsideSecret {}
-        | InferenceError::SecretAssignmentMismatch { types: _ }
-        | InferenceError::MissingEvidence(_)
-        | InferenceError::UnknownType { reason: _ }
-        | InferenceError::SchemaResolution { error: _ }
-        | InferenceError::TypeResolution { error: _ }
-        | InferenceError::HeterogeneousCollection { types: _ }
-        | InferenceError::IncompatibleCoalesceTypes { types: _ }
-        | InferenceError::InvalidIntegerArithmeticOperand {
-            op: _,
-            side: _,
-            actual: _,
-            operator_span: _,
-        }
-        | InferenceError::UnknownBinding { binding: _ }
-        | InferenceError::UnknownAttribute {
-            binding: _,
-            attribute: _,
-        }
-        | InferenceError::InvalidAccess {
-            base_type: _,
-            step: _,
-        }
-        | InferenceError::CyclicVirtualBinding { cycle: _ } => None,
-    }
-}
-
 fn expression_source_label(
     finding: &carina_core::parser::Located<carina_core::static_type::InferenceError>,
 ) -> String {
-    match root_require_rejection(finding.detail()) {
+    match finding.detail().require_outside_module() {
         Some(_) => {
             carina_core::paths::DisplayPath::for_diagnostics(finding.location().file().path())
                 .to_string()
@@ -2067,7 +2034,7 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
             }
             lines
         }
-        AppError::ExpressionType(finding) => match root_require_rejection(finding.detail()) {
+        AppError::ExpressionType(finding) => match finding.detail().require_outside_module() {
             Some(rejection) => vec![
                 HumanErrorLine::Message(format!(
                     "{} at line {}\n{}",

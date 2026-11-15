@@ -8387,7 +8387,7 @@ pub fn configuration_placement_diagnostics<
     placement_diagnostics_for_inventory(tree.syntax())
 }
 
-fn placement_diagnostics_for_inventory<B: BindingAddress>(
+pub(crate) fn placement_diagnostics_for_inventory<B: BindingAddress>(
     syntax: &crate::parser::SyntaxInventory<B>,
 ) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
     use crate::config_loader::DirectoryVerdict;

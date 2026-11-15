@@ -1,0 +1,1 @@
+for flag in missing { mock.test.resource { name = 'one' directives { prevent_destroy = flag } } }

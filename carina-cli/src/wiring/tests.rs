@@ -2684,7 +2684,14 @@ fn parse(
     input: &str,
     config: &carina_core::parser::ProviderContext,
 ) -> Result<carina_core::parser::ParsedFile, carina_core::parser::ParseError> {
-    carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)
+    carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config).map(
+        |parsed| {
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
+                parsed, input,
+            )
+            .into_parsed()
+        },
+    )
 }
 
 fn pathless_test_type(
