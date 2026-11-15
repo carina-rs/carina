@@ -435,11 +435,6 @@ mod tests {
                 binding: "producer".into(),
             }),
             ConsumerInferredUncheckedReason::NotInferable(
-                NotInferableReason::PlaceholderTypeUnavailable {
-                    placeholder: "pending".into(),
-                },
-            ),
-            ConsumerInferredUncheckedReason::NotInferable(
                 NotInferableReason::CustomTypeSchemaUnavailable {
                     identity: crate::schema::TypeIdentity::from_schema_type(
                         "unavailable",

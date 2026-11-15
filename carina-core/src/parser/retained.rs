@@ -6741,8 +6741,7 @@ mod judgement {
             )),
             Err(InferenceIssue::NotInferable(
                 reason @ (NotInferableReason::ValueDependent { .. }
-                | NotInferableReason::NonInferableBinding { .. }
-                | NotInferableReason::PlaceholderTypeUnavailable { .. }),
+                | NotInferableReason::NonInferableBinding { .. }),
             )) => ExprJudgement::ValueDependent {
                 reason,
                 shape: None,

@@ -3206,7 +3206,6 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
         | Err(crate::static_type::InferenceIssue::NotInferable(
             crate::static_type::NotInferableReason::MissingValue
             | crate::static_type::NotInferableReason::ValueDependent { .. }
-            | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
             | crate::static_type::NotInferableReason::NonInferableBinding { .. }
             | crate::static_type::NotInferableReason::SchemaUnavailable { .. }
             | crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
@@ -6536,7 +6535,6 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         | Err(crate::static_type::InferenceIssue::NotInferable(
             crate::static_type::NotInferableReason::MissingValue
             | crate::static_type::NotInferableReason::ValueDependent { .. }
-            | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
             | crate::static_type::NotInferableReason::NonInferableBinding { .. }
             | crate::static_type::NotInferableReason::SchemaUnavailable { .. }
             | crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },

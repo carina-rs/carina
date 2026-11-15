@@ -25,19 +25,15 @@ use crate::static_type::{
     ExportStaticType, InferenceIssue, InferredUncheckedReason, NotInferableReason, StaticType,
 };
 
-/// One entry in the binding map. Resource bindings (`let <name> = <provider>.<resource> { ... }`)
-/// carry the provider/resource type and are inferred through; `upstream_state`
-/// bindings are recognized by name but cannot be projected to a `TypeExpr`
-/// today (the export's type lives in the upstream's `parsed.export_params`,
-/// which the inferer doesn't recursively resolve here). Distinguishing the
-/// two lets the inferer turn a true typo (`mian.vpc_id`) into a hard error
-/// while still passing through `upstream_state`-derived references.
+/// Binding classification for authored expression judgement in
+/// [`crate::parser::retained`]. Resource bindings identify the provider and
+/// resource schema used for attribute lookup; external and module-call
+/// bindings keep their names in scope before their values are available.
 ///
-/// `Virtual` carries the attribute map of a module-call's
-/// composition resource so an `exports` reference of the form
-/// `<module_call>.<attr>` can transitively infer through the bound
-/// expression on the module's `attributes { ... }` block, instead of
-/// failing with `unknown binding` (#2493).
+/// `Virtual` records the attributes exposed by an expanded module call's
+/// composition resource. The retained judge checks attribute names against
+/// this map and derives their types from authored module-output evidence
+/// (#2493).
 #[derive(Debug, Clone)]
 pub enum InferenceBinding<
     P: PlaceholderKind = NoPlaceholder,
@@ -151,15 +147,11 @@ pub fn bindings_from_parts<S, P: PlaceholderKind + PartialEq, B: BindingAddress>
     for us in upstream_states {
         out.insert(us.binding.to_string(), InferenceBinding::UpstreamState);
     }
-    // carina#3181: managed resources and data sources both carry a
-    // provider identity, so each maps to `InferenceBinding::Resource`
-    // (a `read`-bound `${data_source.attr}` still resolves its type via
-    // a schema lookup). Virtual resources synthesised by module-call
-    // expansion (`expand_module_call`) carry no provider identity — their
-    // attributes are projections from the module's `attributes { ... }`
-    // block — so they are tagged `Virtual` and `infer_resource_ref`
-    // recurses into the bound expression instead of a schema lookup that
-    // would always fail. #2493.
+    // carina#3181: managed resources and data sources have a provider
+    // identity and use `InferenceBinding::Resource` for schema attribute
+    // lookup. Expanded module-call compositions have no provider identity;
+    // their `Virtual` binding records exposed attributes. `parser::retained`
+    // resolves their types from authored module-output judgements. #2493.
     for resource in resources {
         let Some(name) = &resource.binding else {
             continue;
@@ -964,9 +956,7 @@ where
         let retry = match &parameter.static_type {
             ExportStaticType::Inferred(StaticType::Unchecked(
                 InferredUncheckedReason::NotInferable(
-                    NotInferableReason::MissingValue
-                    | NotInferableReason::ValueDependent { .. }
-                    | NotInferableReason::PlaceholderTypeUnavailable { .. },
+                    NotInferableReason::MissingValue | NotInferableReason::ValueDependent { .. },
                 ),
             )) => false,
             ExportStaticType::Inferred(StaticType::Unchecked(
