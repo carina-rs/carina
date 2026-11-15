@@ -21,8 +21,8 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use crate::document::DiagnosticDocument as Document;
 use crate::position;
 use carina_core::identifier::{
-    CanonicalAttributeValues, CanonicalResource, PrefixCanonicalized, SuffixSource,
-    canonicalize_file_prefixes,
+    CanonicalAttributeValues, CanonicalResource, PrefixCanonicalized, ResourceProjection,
+    SuffixSource, canonicalize_file_prefixes,
 };
 use carina_core::parser::{ParseError, ProviderConfig, SourceSpan, WarningKind};
 use carina_core::paths::PathIdentity;
@@ -170,6 +170,37 @@ fn analysis_result<T>(
             }
             None
         }
+    }
+}
+
+fn semantic_tree_for_values<'f>(
+    file: &'f carina_core::parser::ParsedFile,
+) -> Option<carina_core::parser::AnalysisTree<'f>> {
+    // Main treats this optional value view as unavailable on analysis failure;
+    // the primary document/directory checks already own visible diagnostics.
+    carina_core::parser::AnalysisTree::try_from_file(file).ok()
+}
+
+fn select_resource_projection<X, D>(
+    owner: &CanonicalResource<'_, X, D, RelativeBindingName>,
+    semantic: Option<&carina_core::parser::AnalysisTree<'_>>,
+    authored: &carina_core::parser::AnalysisTree<'_>,
+) -> ResourceProjection<RelativeBindingName>
+where
+    D: carina_core::parser::DeferredForPhaseTraversal<
+            ParserPlaceholder,
+            ParserPlaceholder,
+            RelativeBindingName,
+        >,
+{
+    match semantic.map(|source| owner.project_values(source)) {
+        Some(ResourceProjection::Matched(projection)) => ResourceProjection::Matched(projection),
+        // A duplicate source occurrence cannot be repaired by choosing a
+        // different view. Existing parser/declaration checks own its findings.
+        Some(ResourceProjection::Ambiguous) => ResourceProjection::Ambiguous,
+        // Main used the buffer's values when the per-file semantic view was
+        // unavailable or had no corresponding resource. Never use merged values.
+        Some(ResourceProjection::NoMatch) | None => owner.project_values(authored),
     }
 }
 
@@ -2369,7 +2400,7 @@ impl DiagnosticRun<'_> {
             // keys, generated values, schema and admission authority.
             let semantic_tree = current_file_path
                 .and_then(|path| directory.as_ref()?.semantic_file(path))
-                .and_then(|file| analysis_tree(doc, file, &mut diagnostics));
+                .and_then(semantic_tree_for_values);
             // Syntax correspondence is checked against the document's own
             // parser locations, even when its source label cannot bind an owner
             // in the canonical directory view.
@@ -2496,23 +2527,19 @@ impl DiagnosticRun<'_> {
                     .filter(|resource| resource.location().file().path() == doc.source_file())
                 {
                     let key = rref.authored_instance_key();
-                    let authored_source = tree.project_resources().find(|source| {
-                        key.as_ref()
-                            .zip(source.authored_instance_key())
-                            .is_some_and(|(owner, source)| owner.same_source_instance(&source))
-                    });
-                    let authored_calls = authored_source
-                        .map(|source| {
-                            source
-                                .attributes()
-                                .iter()
-                                .filter(|(_, value)| {
-                                    carina_core::parser::contains_function_call(value)
-                                })
-                                .map(|(name, _)| name.clone())
-                                .collect::<HashSet<_>>()
-                        })
-                        .unwrap_or_default();
+                    let authored_calls = match rref.project_values(tree) {
+                        ResourceProjection::Matched(source) => source
+                            .values()
+                            .iter()
+                            .filter(|(_, value)| carina_core::parser::contains_function_call(value))
+                            .map(|(name, _)| name.clone())
+                            .collect::<HashSet<_>>(),
+                        // Main had no resource to render without an authored
+                        // declaration. Core matches unique deferred templates
+                        // for instances materialized only in the merged view.
+                        ResourceProjection::NoMatch => continue,
+                        ResourceProjection::Ambiguous => continue,
+                    };
                     let uses_composition_output = rref.references().iter().any(|reference| {
                         pre_expansion_input.module_calls.iter().any(|call| {
                             call.binding_name.as_ref().is_some_and(|binding| {
@@ -2578,21 +2605,12 @@ impl DiagnosticRun<'_> {
                     } else {
                         #[cfg(feature = "test-utils")]
                         replay_coverage::reached(AdmissionPath::Relative);
-                        let source = semantic_tree
-                            .as_ref()
-                            .unwrap_or(tree)
-                            .project_resources()
-                            .find(|source| {
-                                key.as_ref()
-                                    .zip(source.authored_instance_key())
-                                    .is_some_and(|(owner, source)| {
-                                        owner.same_source_instance(&source)
-                                    })
-                            });
-                        let values = source.map_or_else(
-                            || rref.values(),
-                            |source| rref.project_values(&source.attributes()),
-                        );
+                        let values =
+                            match select_resource_projection(rref, semantic_tree.as_ref(), tree) {
+                                ResourceProjection::Matched(projection) => projection.into_values(),
+                                ResourceProjection::NoMatch => continue,
+                                ResourceProjection::Ambiguous => continue,
+                            };
                         let inputs = select_admission_inputs(
                             rref,
                             &values,
@@ -2611,8 +2629,9 @@ impl DiagnosticRun<'_> {
                     }
                 }
             }
-            // Materialized instances share authored diagnostic locations. Keep
-            // distinct findings while presenting an identical finding once.
+            // Keep distinct findings for instances of one declaration (loop
+            // elements, module instances rendered in the module's own file),
+            // presenting an identical finding once.
             let mut resource_diagnostics = Vec::new();
             for diagnostic in diagnostics.drain(resource_diagnostics_start..) {
                 if !resource_diagnostics.contains(&diagnostic) {

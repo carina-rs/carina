@@ -10,8 +10,9 @@ pub use diagnostics::{
     legacy_loop_move_target_diagnostics,
 };
 pub use prefix::{
-    CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, ModuleResolvedFileRead,
-    PrefixCanonicalized, PrefixFileRead, SuffixSource, canonicalize_file_prefixes,
+    CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, MatchedResourceProjection,
+    ModuleResolvedFileRead, PrefixCanonicalized, PrefixFileRead, ResourceProjection, SuffixSource,
+    canonicalize_file_prefixes,
 };
 pub(crate) use prefix::{
     CanonicalSchemaInputs, CanonicalSchemaResource, canonicalize_prefix_values,

@@ -1424,9 +1424,14 @@ impl<B: BindingAddress> AuthoredResourceInstanceKey<'_, B> {
         &self,
         other: &AuthoredResourceInstanceKey<'_, C>,
     ) -> bool {
-        self.declaration == other.declaration
-            && self.element == other.element
-            && self.module_scope == other.module_scope
+        self.same_source_declaration(other) && self.element == other.element
+    }
+
+    pub(crate) fn same_source_declaration<C: BindingAddress>(
+        &self,
+        other: &AuthoredResourceInstanceKey<'_, C>,
+    ) -> bool {
+        self.declaration == other.declaration && self.module_scope == other.module_scope
     }
 }
 

@@ -311,6 +311,36 @@ pub struct CanonicalAttributeValues<P: PlaceholderKind, B: BindingAddress> {
     values: IndexMap<String, Value<P, B>>,
     pub(crate) declaration: DeclarationIdentity,
 }
+
+/// Correspondence between a canonical owner and a complete per-file view.
+pub enum ResourceProjection<B: BindingAddress> {
+    Matched(MatchedResourceProjection<B>),
+    NoMatch,
+    Ambiguous,
+}
+
+/// A unique source projection, constructed only by the core matcher.
+///
+/// A caller-owned value map cannot claim correspondence:
+/// ```compile_fail,E0451
+/// use carina_core::{identifier::{CanonicalAttributeValues, MatchedResourceProjection}, resource::{ParserPlaceholder, RelativeBindingName}};
+/// fn forge(values: CanonicalAttributeValues<ParserPlaceholder, RelativeBindingName>) -> MatchedResourceProjection<RelativeBindingName> {
+///     MatchedResourceProjection { values }
+/// }
+/// ```
+pub struct MatchedResourceProjection<B: BindingAddress> {
+    values: CanonicalAttributeValues<ParserPlaceholder, B>,
+}
+
+impl<B: BindingAddress> MatchedResourceProjection<B> {
+    pub fn values(&self) -> &CanonicalAttributeValues<ParserPlaceholder, B> {
+        &self.values
+    }
+
+    pub fn into_values(self) -> CanonicalAttributeValues<ParserPlaceholder, B> {
+        self.values
+    }
+}
 pub(crate) struct CanonicalSchemaInputs<
     'f,
     P: PlaceholderKind,
@@ -507,7 +537,60 @@ where
     /// Project ordinary values onto this owner's canonical keys. Generated
     /// values retain their producer's projection, including its prefix suffix.
     /// A projection cannot introduce keys or restore consumed companions.
-    pub fn project_values(
+    /// Exact same-phase instance addresses include their binding address. When
+    /// only the merged view materialized a loop, its unique per-file deferred
+    /// declaration supplies the original body projection instead.
+    ///
+    /// Arbitrary maps must use the separate caller-value path:
+    /// ```compile_fail,E0308
+    /// use carina_core::{identifier::CanonicalResource, parser::{ParsedDeferredForPhase, ParsedExportParam}, resource::{ParserPlaceholder, RelativeBindingName, Value}};
+    /// fn raw(owner: &CanonicalResource<'_, ParsedExportParam, ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>, RelativeBindingName>, values: &indexmap::IndexMap<String, Value<ParserPlaceholder, RelativeBindingName>>) {
+    ///     let _ = owner.project_values(values);
+    /// }
+    /// ```
+    pub fn project_values<E, S>(
+        &self,
+        source: &AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, S, B, E>,
+    ) -> ResourceProjection<B>
+    where
+        S: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let Some(key) = self.authored_instance_key() else {
+            return ResourceProjection::NoMatch;
+        };
+        let mut exact = source
+            .project_resources()
+            .filter(|source| source.authored_instance_key().as_ref() == Some(&key));
+        let selected = match (exact.next(), exact.next()) {
+            (Some(_), Some(_)) => return ResourceProjection::Ambiguous,
+            (Some(source), None) => Some(source),
+            (None, _) => None,
+        };
+        let selected = match selected {
+            Some(source) => Some(source),
+            None => {
+                let mut templates = source.project_resources().filter(|source| {
+                    source.kind() == crate::parser::AnalysisItemKind::DeferredResource
+                        && source
+                            .authored_instance_key()
+                            .is_some_and(|source| key.same_source_declaration(&source))
+                });
+                match (templates.next(), templates.next()) {
+                    (Some(_), Some(_)) => return ResourceProjection::Ambiguous,
+                    (Some(source), None) => Some(source),
+                    (None, _) => None,
+                }
+            }
+        };
+        match selected {
+            Some(source) => ResourceProjection::Matched(MatchedResourceProjection {
+                values: self.project_selected_values(&source.attributes()),
+            }),
+            None => ResourceProjection::NoMatch,
+        }
+    }
+
+    fn project_selected_values(
         &self,
         values: &IndexMap<String, Value<ParserPlaceholder, B>>,
     ) -> CanonicalAttributeValues<ParserPlaceholder, B> {
@@ -1164,6 +1247,155 @@ mod tests {
     }
 
     #[test]
+    fn prefix_projection_second_file_keeps_declaration_address() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("a.crn"),
+            "let input = 'second'\nlet first = mock.Sink { name = 'first' }\n",
+        )
+        .unwrap();
+        let source = "let second = mock.Sink { name = upper(input) }\n";
+        let path = directory.path().join("z.crn");
+        std::fs::write(&path, source).unwrap();
+        let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let merged = crate::config_loader::parse_directory(&root, &context)
+            .unwrap()
+            .into_parsed();
+        let canonical =
+            canonicalize_file_prefixes(merged, &schemas, SuffixSource::Preview).judge(&context);
+        let owners = canonical.analysis_tree().unwrap();
+        let owner = owners
+            .resources()
+            .find(|resource| {
+                resource
+                    .binding_address()
+                    .is_some_and(|binding| binding.as_str() == "second")
+            })
+            .unwrap();
+        let file = crate::parser::parse_file(source, &path, &context).unwrap();
+        let tree = AnalysisTree::try_from_file(&file).unwrap();
+        let per_file = tree.project_resources().next().unwrap();
+        assert!(
+            owner
+                .authored_instance_key()
+                .unwrap()
+                .same_source_instance(&per_file.authored_instance_key().unwrap()),
+            "declaration addresses must be local to each source file"
+        );
+    }
+
+    #[test]
+    fn prefix_projection_preserves_named_loop_instances() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve(
+            "let sinks = for item in ['a', 'b'] { mock.Sink { name = item } }\n",
+        )
+        .unwrap();
+        let canonical = canonicalize_file_prefixes(parsed.clone(), &schemas, SuffixSource::Preview)
+            .judge(&context);
+        let owners = canonical.analysis_tree().unwrap();
+        let source = AnalysisTree::try_from_file(&parsed).unwrap();
+        assert_eq!(owners.resources().count(), 2);
+        for owner in owners.resources() {
+            let projected = match owner.project_values(&source) {
+                ResourceProjection::Matched(projection) => projection.into_values(),
+                ResourceProjection::NoMatch | ResourceProjection::Ambiguous => {
+                    panic!("a materialized element has one per-file source")
+                }
+            };
+            assert_eq!(
+                projected["name"],
+                owner.values()["name"],
+                "source matching must preserve the element's own value"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_projection_reports_missing_source() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve("mock.Sink { name = 'folded' }").unwrap();
+        let canonical =
+            canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview).judge(&context);
+        let owners = canonical.analysis_tree().unwrap();
+        let owner = owners.resources().next().unwrap();
+        let source = crate::parser::parse_file(
+            "mock.Sink { name = 'foreign' }",
+            std::path::Path::new("other.crn"),
+            &context,
+        )
+        .unwrap();
+        let source = AnalysisTree::try_from_file(&source).unwrap();
+        assert!(matches!(
+            owner.project_values(&source),
+            ResourceProjection::NoMatch
+        ));
+    }
+
+    #[test]
+    fn prefix_projection_reports_ambiguous_source() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve("mock.Sink { name = 'folded' }").unwrap();
+        let canonical = canonicalize_file_prefixes(parsed.clone(), &schemas, SuffixSource::Preview)
+            .judge(&context);
+        let owners = canonical.analysis_tree().unwrap();
+        let owner = owners.resources().next().unwrap();
+        let mut source = parsed;
+        let duplicate = source.resources[0].clone();
+        source.resources.push(duplicate); // allow: direct — fixture test inspection
+        let source = AnalysisTree::try_from_file(&source).unwrap();
+        assert!(
+            matches!(owner.project_values(&source), ResourceProjection::Ambiguous),
+            "two source occurrences cannot be reduced to the first"
+        );
+    }
+
+    #[test]
+    fn prefix_projection_uses_unique_deferred_template() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("values.crn"),
+            "let items = ['a', 'b']\n",
+        )
+        .unwrap();
+        let source = "let sinks = for item in items { mock.Sink { name = item } }\n";
+        let path = directory.path().join("main.crn");
+        std::fs::write(&path, source).unwrap();
+        let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let merged = crate::config_loader::parse_directory(&root, &context)
+            .unwrap()
+            .into_parsed();
+        let canonical =
+            canonicalize_file_prefixes(merged, &schemas, SuffixSource::Preview).judge(&context);
+        let owners = canonical.analysis_tree().unwrap();
+        assert_eq!(owners.resources().count(), 2);
+        let source = crate::parser::parse_file(source, &path, &context).unwrap();
+        let source = AnalysisTree::try_from_file(&source).unwrap();
+        let template = source.project_resources().next().unwrap();
+        assert_eq!(
+            template.kind(),
+            crate::parser::AnalysisItemKind::DeferredResource
+        );
+        for owner in owners.resources() {
+            let projected = match owner.project_values(&source) {
+                ResourceProjection::Matched(projection) => projection.into_values(),
+                ResourceProjection::NoMatch | ResourceProjection::Ambiguous => {
+                    panic!("a unique deferred declaration supplies the per-file value")
+                }
+            };
+            assert_eq!(projected["name"], template.attributes()["name"]);
+            assert_ne!(projected["name"], owner.values()["name"]);
+        }
+    }
+
+    #[test]
     fn prefix_canonicalization_preview_retains_authored_reference_slot() {
         let schemas = schemas();
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
@@ -1203,21 +1435,18 @@ mod tests {
             "name",
             vec![],
         );
-        let projected = owner.project_values(&IndexMap::from([
-            (
-                "name_prefix".into(),
-                Value::Concrete(ConcreteValue::String("raw".into())),
-            ),
-            (
-                "name".into(),
-                Value::Concrete(ConcreteValue::String("replacement".into())),
-            ),
-            ("other".into(), reference.clone()),
-            (
-                "foreign".into(),
-                Value::Concrete(ConcreteValue::String("not an owner key".into())),
-            ),
-        ]));
+        let source = crate::parser::parse_file(
+            "let sink = mock.Sink { name_prefix = 'raw'\n name = 'replacement'\n other = source.name\n foreign = 'not an owner key' }",
+            owner.location().file().path(),
+            &context,
+        ).unwrap();
+        let source = AnalysisTree::try_from_file(&source).unwrap();
+        let projected = match owner.project_values(&source) {
+            ResourceProjection::Matched(projection) => projection.into_values(),
+            ResourceProjection::NoMatch | ResourceProjection::Ambiguous => {
+                panic!("per-file source must match")
+            }
+        };
         assert_eq!(projected["name"], owner.attributes()["name"]);
         assert_eq!(projected["other"], reference);
         assert_eq!(projected.len(), 2);
