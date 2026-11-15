@@ -854,7 +854,7 @@ impl DiagnosticRun<'_> {
         base_path: &carina_core::paths::ResolvedPath,
         overrides: &carina_core::config_loader::SourceOverrides,
     ) -> Result<MergedParseResult, carina_core::config_loader::DirectoryParseFailure> {
-        let result = carina_core::config_loader::parse_directory_with_source_overrides_and_diagnostics_with_schemas(
+        let result = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics_with_schemas(
             base_path,
             self.provider_context.catalog(),
             overrides,
@@ -1069,14 +1069,13 @@ impl DiagnosticRun<'_> {
         base_path: &carina_core::paths::ResolvedPath,
         overrides: &carina_core::config_loader::SourceOverrides,
     ) -> Option<carina_core::parser::AnalysisResolutionError> {
-        let merged =
-            carina_core::config_loader::parse_directory_for_metadata_with_source_overrides_report(
-                base_path,
-                self.provider_context.catalog(),
-                overrides,
-                &self.schemas,
-            )
-            .ok()?;
+        let merged = carina_core::config_loader::parse_directory_for_metadata_report(
+            base_path,
+            self.provider_context.catalog(),
+            overrides,
+            &self.schemas,
+        )
+        .ok()?;
         let module_resolution =
             carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
                 &merged,

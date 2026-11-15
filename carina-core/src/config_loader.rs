@@ -1577,7 +1577,8 @@ pub fn parse_directory_for_bootstrap(
     .map_err(|error| error.to_string())
 }
 
-/// Parse declaration metadata with optional editor overrides, retaining all value roots.
+/// Parse declaration metadata with identity-keyed [`SourceOverrides`], retaining
+/// all value roots.
 pub fn parse_directory_for_metadata(
     dir: &ResolvedPath,
     config: &ProviderContext,
@@ -1588,18 +1589,9 @@ pub fn parse_directory_for_metadata(
         .map_err(|error| error.to_string())
 }
 
-/// Metadata loading with the original parser failure retained for diagnostics.
+/// Load declaration metadata with identity-keyed [`SourceOverrides`], retaining
+/// the original parser failure for diagnostics.
 pub fn parse_directory_for_metadata_report(
-    dir: &ResolvedPath,
-    config: &ProviderContext,
-    overrides: &SourceOverrides,
-    schemas: &SchemaRegistry,
-) -> Result<ParsedRootDirectory, DirectoryParseFailure> {
-    parse_directory_for_metadata_with_source_overrides_report(dir, config, overrides, schemas)
-}
-
-/// Metadata discovery with OS-path editor snapshots, including non-UTF-8 names.
-pub fn parse_directory_for_metadata_with_source_overrides_report(
     dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &SourceOverrides,
@@ -1615,12 +1607,10 @@ pub fn parse_directory_for_metadata_with_source_overrides_report(
     .map(|result| result.parsed)
 }
 
-/// Like [`parse_directory`] but takes source snapshots keyed by file identity.
-/// Files present in the snapshot are parsed from its text; the rest are read
-/// from disk.
+/// Parse and merge a directory in strict mode with identity-keyed [`SourceOverrides`].
 ///
-/// LSP uses this to analyze the open document's in-memory buffer alongside
-/// the on-disk siblings, so edits show diagnostics before the user saves.
+/// Files present in `overrides` use their snapshot text; other files are read
+/// from disk. Uses an empty schema registry and returns failures as strings.
 pub fn parse_directory_with_overrides(
     dir: &ResolvedPath,
     config: &ProviderContext,
@@ -1834,19 +1824,9 @@ pub fn parse_directory_with_overrides_and_diagnostics(
     )
 }
 
+/// Diagnostic-preserving directory parsing with identity-keyed [`SourceOverrides`]
+/// and the supplied schemas.
 pub fn parse_directory_with_overrides_and_diagnostics_with_schemas(
-    dir: &ResolvedPath,
-    config: &ProviderContext,
-    overrides: &SourceOverrides,
-    schemas: &SchemaRegistry,
-) -> Result<DirectoryParseResult, DirectoryParseFailure> {
-    parse_directory_with_source_overrides_and_diagnostics_with_schemas(
-        dir, config, overrides, schemas,
-    )
-}
-
-/// Directory analysis retaining OS-path override identities without encoding loss.
-pub fn parse_directory_with_source_overrides_and_diagnostics_with_schemas(
     dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &SourceOverrides,
@@ -2663,7 +2643,7 @@ mod tests {
                 text
             );
 
-            let result = parse_directory_with_source_overrides_and_diagnostics_with_schemas(
+            let result = parse_directory_with_overrides_and_diagnostics_with_schemas(
                 &root,
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 &overrides,
@@ -2787,7 +2767,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].display(), file.display());
 
-        let result = parse_directory_with_source_overrides_and_diagnostics_with_schemas(
+        let result = parse_directory_with_overrides_and_diagnostics_with_schemas(
             &root,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             &overrides,
