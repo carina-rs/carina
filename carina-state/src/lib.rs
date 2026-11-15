@@ -79,8 +79,8 @@ pub use refresh::{
 // Re-export main types for convenience
 pub use backend::{
     BackendError, BackendResult, InvalidResourceIdentityError, LOCAL_BACKEND_TYPE, RawState,
-    S3_BACKEND_TYPE, StateBackend, StorageReadiness, StorageReadinessStatus, StorageUnavailable,
-    read_published_exports,
+    S3_BACKEND_TYPE, SaveFailureKind, StateBackend, StorageReadiness, StorageReadinessStatus,
+    StorageUnavailable, read_published_exports,
 };
 pub use backend_config::{
     BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors, GitBranch,

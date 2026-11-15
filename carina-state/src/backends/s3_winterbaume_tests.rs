@@ -837,6 +837,58 @@ async fn repeated_state_write_conflicts_are_bounded() {
     ));
 }
 
+#[tokio::test(start_paused = true)]
+async fn cleanup_state_put_timeout_retains_an_unconfirmed_outcome_after_commit() {
+    let landed = Arc::new(Notify::new());
+    let release = Arc::new(Semaphore::new(0));
+    let completed = Arc::new(Notify::new());
+    let backend = Arc::new(
+        mock_backend_with_service(DelayedStatePut {
+            inner: Arc::new(S3Service::new()),
+            delayed_serial: 1,
+            landed: landed.clone(),
+            release: release.clone(),
+            completed: completed.clone(),
+            state_puts: Arc::new(AtomicUsize::new(0)),
+            state_heads: Arc::new(AtomicUsize::new(0)),
+        })
+        .await,
+    );
+    create_bucket_and_seed_empty_state(&backend).await;
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    let mut state = backend.read_state().await.unwrap().unwrap().into_state();
+    state.increment_serial();
+    let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
+    let published = crate::PublishedBackend::for_test(backend.clone(), &shutdown);
+    trigger.prioritize_cleanup();
+    let error = published
+        .write_state_locked_for_cleanup(&state, &lock)
+        .await
+        .unwrap_err();
+    landed.notified().await;
+    assert_eq!(
+        error.save_failure_kind(),
+        crate::SaveFailureKind::Unconfirmed,
+        "a dispatched state PUT timeout must retain a typed unconfirmed outcome: {error:?}"
+    );
+    release.add_permits(1);
+    completed.notified().await;
+    assert_eq!(
+        backend
+            .read_state()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_state()
+            .serial,
+        1
+    );
+    published.release_lock_for_cleanup(&lock).await.unwrap();
+    let next = backend.acquire_lock("verify release").await.unwrap();
+    assert_ne!(next.id(), lock.id());
+    backend.release_lock(&next).await.unwrap();
+}
+
 #[tokio::test]
 async fn cleanup_locked_write_with_cached_state_etag_uses_three_s3_calls() {
     let enabled = Arc::new(AtomicBool::new(false));

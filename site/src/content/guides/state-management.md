@@ -267,10 +267,15 @@ the outcome remains uncertain or a mutation times out, Carina returns the
 error and remembers the uncertain write in memory. A mismatched blob
 acknowledgement also retains this uncertainty. The next mutation in the same
 process resolves it with a Contents metadata read (plus the root access check
-if the path is absent): a blob SHA
-matching the exact sent bytes is treated as our write, the prior SHA
-means it did not commit, and a different SHA is a conflict. An acquisition or
-renewal recovered this way recognizes its own lock UUID. Other lost replies
+if the path is absent): a blob SHA matching the exact sent bytes is treated
+as our write. Observing the prior SHA means the PUT has not committed yet;
+it can still commit after that observation. Carina keeps the pending sent SHA
+until it is observed or superseded. If a later conditional mutation conflicts
+and observes that pending SHA, Carina adopts it and retries the same mutation
+within the existing retry limit and deadline. This also lets release delete
+our own late renewal, checking both the pending SHA and our lock UUID.
+A different SHA remains a conflict. An acquisition or renewal recovered this
+way recognizes its own lock UUID. Other lost replies
 can also be recovered within the original deadline. For a release or
 force-unlock with a lost reply, an absent lease or a different lock UUID
 confirms release and preserves any successor's lease.
@@ -303,6 +308,11 @@ flush receives only the time remaining since the second signal. When its limit
 expires, Carina attempts lock release. GitHub bounds each save and release by
 the time remaining until 500ms before the supervisor deadline. A third signal
 exits immediately.
+
+If a dispatched state save times out at the backend's I/O limit before the
+flush cutoff, cleanup reports that the save could not be confirmed and tells
+you to run `carina state refresh`. A definite write denial still reports a
+state flush failure.
 
 GitHub writes each state or lock change as a separate commit. Measured GitHub
 latencies were PUT p50 0.93s, p95 1.33s, max 1.88s; DELETE p50

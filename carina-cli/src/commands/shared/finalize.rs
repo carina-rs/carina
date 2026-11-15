@@ -2,7 +2,7 @@ use crate::error::AppError;
 use crate::output_style::Colorize;
 use carina_core::hint::ProjectCommand;
 use carina_core::shutdown::{CleanupBudget, ShutdownPhase, ShutdownToken, duration_for_log};
-use carina_state::PublishedBackend;
+use carina_state::{PublishedBackend, SaveFailureKind};
 use std::future::Future;
 use std::path::Path;
 
@@ -142,16 +142,8 @@ where
         }
     };
     let finalize = make_finalize(persistence);
-    let Some(finalize_result) = await_state_flush_stage(
-        finalize,
-        shutdown,
-        backend.cleanup_budget(),
-        execution_cancelled,
-        "flushing state...",
-        "state flushed.",
-        "state flush failed",
-    )
-    .await
+    let Some(finalize_result) =
+        await_state_flush_stage(finalize, context, execution_cancelled).await
     else {
         eprintln!(
             "{}",
@@ -216,19 +208,16 @@ where
     result
 }
 
-async fn await_state_flush_stage<T, E, F>(
+async fn await_state_flush_stage<T, F>(
     future: F,
-    shutdown: &ShutdownToken,
-    budget: CleanupBudget,
+    context: FinalizationContext<'_>,
     already_cancelled: bool,
-    started: &str,
-    completed: &str,
-    failed: &str,
-) -> Option<Result<T, E>>
+) -> Option<Result<T, AppError>>
 where
-    F: Future<Output = Result<T, E>>,
-    E: std::fmt::Display,
+    F: Future<Output = Result<T, AppError>>,
 {
+    let shutdown = context.backend.shutdown();
+    let budget = context.backend.cleanup_budget();
     tokio::pin!(future);
     let cutoff = shutdown.state_flush_budget_expired(budget);
     tokio::pin!(cutoff);
@@ -236,7 +225,7 @@ where
     match mode {
         CleanupStageMode::Normal => {}
         CleanupStageMode::CancellationCleanup => {
-            eprintln!("Cancellation cleanup: {started}");
+            eprintln!("Cancellation cleanup: flushing state...");
         }
     }
 
@@ -247,19 +236,33 @@ where
             _ = &mut cutoff => break None,
             _ = shutdown.cancelled(), if matches!(mode, CleanupStageMode::Normal) => {
                 mode = CleanupStageMode::CancellationCleanup;
-                eprintln!("Cancellation cleanup: {started}");
+                eprintln!("Cancellation cleanup: flushing state...");
             }
         }
     };
 
     match shutdown.phase() {
-        ShutdownPhase::Running => {}
-        ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
+        ShutdownPhase::Running if !already_cancelled => {}
+        ShutdownPhase::Running | ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
             if let Some(stage_result) = result.as_ref() {
-                eprintln!(
-                    "{}",
-                    cleanup_stage_terminal_message(stage_result, completed, failed)
-                );
+                let failure = match stage_result {
+                    Err(AppError::Backend(error)) => Some(error.save_failure_kind()),
+                    Err(AppError::ProjectBackend(error)) => {
+                        Some(error.backend_error().save_failure_kind())
+                    }
+                    Ok(_) | Err(_) => None,
+                };
+                let message = match failure {
+                    Some(SaveFailureKind::Unconfirmed) => {
+                        state_flush_timeout_message(budget, context.project_dir)
+                    }
+                    Some(SaveFailureKind::Failed) | None => cleanup_stage_terminal_message(
+                        stage_result,
+                        "state flushed.",
+                        "state flush failed",
+                    ),
+                };
+                eprintln!("{}", message);
             }
         }
     }
@@ -316,6 +319,117 @@ mod tests {
             ),
             "Cancellation cleanup: state lock release failed: simulated S3 timeout"
         );
+    }
+
+    #[test]
+    fn cleanup_backend_deadline_prints_unconfirmed_save_hint_but_denial_stays_failed() {
+        const CHILD: &str = "CARINA_ROUND12_CLEANUP_SAVE_ERROR";
+        let Ok(scenario) = std::env::var(CHILD) else {
+            for scenario in ["deadline", "transport_deadline", "s3_timeout", "denied"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "commands::shared::finalize::tests::cleanup_backend_deadline_prints_unconfirmed_save_hint_but_denial_stays_failed", "--nocapture"])
+                    .env(CHILD, scenario)
+                    .output().unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success(),
+                    "{scenario}: {stderr}\n{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(
+                    stderr.contains("Cancellation cleanup: state lock released."),
+                    "{stderr}"
+                );
+                if scenario == "denied" {
+                    assert!(stderr.contains("Cancellation cleanup: state flush failed: GitHub token needs Contents write"), "{stderr}");
+                    assert!(
+                        !stderr.contains("state save could not be confirmed"),
+                        "{stderr}"
+                    );
+                } else {
+                    let flush = if scenario == "s3_timeout" {
+                        "1 second"
+                    } else {
+                        "5 seconds"
+                    };
+                    assert!(stderr.contains(&format!("Cancellation cleanup: the state save could not be confirmed within {flush}; continuing to state lock release. Run `carina state refresh 'infra/team project'` to reconcile state with the provider.")), "{scenario}: {stderr}");
+                    assert!(!stderr.contains("state flush failed"), "{stderr}");
+                }
+            }
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let error: carina_state::BackendError = match scenario.as_str() {
+                    "deadline" => carina_state::GitHubError::MutationDeadline.into(),
+                    "transport_deadline" => carina_state::GitHubError::MutationTransportDeadline {
+                        error: "offline timeout after dispatch".into(),
+                    }
+                    .into(),
+                    "s3_timeout" => carina_state::BackendError::UnconfirmedStateSave {
+                        error: Box::new(carina_state::BackendError::Io(
+                            "offline S3 state PUT timeout".into(),
+                        )),
+                    },
+                    "denied" => carina_state::GitHubError::ContentsWriteDenied {
+                        target: "owner/repo".into(),
+                    }
+                    .into(),
+                    _ => panic!("unknown cleanup scenario"),
+                };
+                let latency = if scenario == "s3_timeout" {
+                    Duration::from_millis(100)
+                } else {
+                    Duration::from_millis(1500)
+                };
+                let mut backend = LatencyBackend::with_latencies(latency, Duration::ZERO);
+                backend.cleanup_budget = if scenario == "s3_timeout" {
+                    CleanupBudget::TWO_SECOND
+                } else {
+                    CleanupBudget::new(Duration::from_secs(5), Duration::from_secs(8))
+                };
+                *backend.save_error.lock().unwrap() = Some(error);
+                let backend = Arc::new(backend);
+                let (trigger, shutdown) = shutdown_channel();
+                let published = PublishedBackend::for_test(backend.clone(), &shutdown);
+                let lock = LockInfo::for_test("apply");
+                let mut state = StateFile::new();
+                trigger.prioritize_cleanup();
+                let start = tokio::time::Instant::now();
+                let context = FinalizationContext::new(&published, Path::new("infra/team project"));
+                let result = finalize_after_execute(
+                    context,
+                    |mode| {
+                        crate::commands::apply::save_state_locked_after_execute(
+                            backend.as_ref(),
+                            &lock,
+                            &mut state,
+                            mode,
+                        )
+                    },
+                    true,
+                )
+                .await;
+                assert!(matches!(result, Err(AppError::Interrupted)));
+                assert_eq!(
+                    start.elapsed(),
+                    latency * 3,
+                    "the backend error must precede the CLI cutoff"
+                );
+                assert!(!backend.state_written.load(Ordering::SeqCst));
+                assert_eq!(
+                    backend.operations.lock().unwrap().last(),
+                    Some(&"cleanup state PUT")
+                );
+                release_lock_after_execute(context, StateLockRef::Held(&lock))
+                    .await
+                    .unwrap();
+                assert!(!backend.lock_held.load(Ordering::SeqCst));
+            });
     }
 
     #[tokio::test(start_paused = true)]
@@ -514,6 +628,7 @@ mod tests {
         operations: Arc<Mutex<Vec<&'static str>>>,
         state_written: AtomicBool,
         lock_held: AtomicBool,
+        save_error: Mutex<Option<carina_state::BackendError>>,
     }
 
     impl LatencyBackend {
@@ -532,6 +647,7 @@ mod tests {
                 operations: Arc::new(Mutex::new(Vec::new())),
                 state_written: AtomicBool::new(false),
                 lock_held: AtomicBool::new(true),
+                save_error: Mutex::new(None),
             }
         }
 
@@ -591,6 +707,9 @@ mod tests {
                 .await;
             self.operation("cleanup state PUT", self.state_operation_latency)
                 .await;
+            if let Some(error) = self.save_error.lock().unwrap().take() {
+                return Err(error);
+            }
             self.state_written.store(true, Ordering::SeqCst);
             assert!(self.lock_held.load(Ordering::SeqCst));
             let _ = lock;

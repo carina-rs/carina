@@ -1522,6 +1522,337 @@ struct LateMutation {
     resume: Arc<tokio::sync::Notify>,
     sender: Mutex<Option<tokio::sync::oneshot::Sender<GitHubResponse>>>,
 }
+
+/// The server keeps a dispatched PUT after its caller is aborted, then commits
+/// it immediately after the next resolving Contents GET returned the old SHA.
+struct CommitAfterRead {
+    fake: Fake,
+    path: &'static str,
+    started: tokio::sync::Notify,
+    armed: AtomicBool,
+    pending: Mutex<Option<GitHubRequest>>,
+    commit_after_read: AtomicBool,
+    foreign: Mutex<Option<Vec<u8>>>,
+    reconcile: bool,
+    lose_next_reply: AtomicBool,
+}
+impl CommitAfterRead {
+    fn new(fake: Fake, path: &'static str, reconcile: bool) -> Arc<Self> {
+        Arc::new(Self {
+            fake,
+            path,
+            started: tokio::sync::Notify::new(),
+            armed: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            commit_after_read: AtomicBool::new(false),
+            foreign: Mutex::new(None),
+            reconcile,
+            lose_next_reply: AtomicBool::new(false),
+        })
+    }
+}
+#[async_trait]
+impl GitHubTransport for CommitAfterRead {
+    async fn execute(
+        &self,
+        request: GitHubRequest,
+        deadline: Instant,
+    ) -> Result<GitHubResponse, GitHubError> {
+        let target = request.path == format!("/repos/owner/repo/contents/{}", self.path);
+        if target && request.method == Method::Put && self.armed.swap(false, Ordering::SeqCst) {
+            self.fake.0.lock().unwrap().requests.push(request.clone());
+            *self.pending.lock().unwrap() = Some(request);
+            self.started.notify_one();
+            return std::future::pending().await;
+        }
+        if target
+            && request.method != Method::Get
+            && self.lose_next_reply.swap(false, Ordering::SeqCst)
+        {
+            self.fake.0.lock().unwrap().requests.push(request);
+            return Err(GitHubError::Transport {
+                kind: "lost reply",
+                error: "offline".into(),
+            });
+        }
+        let resolving = target
+            && request.method == Method::Get
+            && self.commit_after_read.swap(false, Ordering::SeqCst);
+        let response = self.fake.execute(request, deadline).await?;
+        if resolving {
+            let pending = self.pending.lock().unwrap().take().unwrap();
+            let body = pending.body.unwrap();
+            let mut store = self.fake.0.lock().unwrap();
+            assert_eq!(
+                store.files.get(self.path).map(|bytes| blob(bytes)),
+                body.get("sha").and_then(Value::as_str).map(str::to_owned)
+            );
+            store.files.insert(
+                self.path.into(),
+                STANDARD.decode(body["content"].as_str().unwrap()).unwrap(),
+            );
+            store.commit();
+            if let Some(bytes) = self.foreign.lock().unwrap().take() {
+                store.files.insert(self.path.into(), bytes);
+                store.commit();
+            }
+            self.lose_next_reply.store(self.reconcile, Ordering::SeqCst);
+        }
+        Ok(response)
+    }
+}
+
+fn conditional_request_sequence(fake: &Fake) -> Vec<(Method, String, Option<String>)> {
+    fake.0
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .map(|request| {
+            let path = if request.path.contains("/compare/") {
+                "compare"
+            } else if request.path.contains("/branches/") {
+                "branch"
+            } else {
+                request.path.rsplit('/').next().unwrap()
+            };
+            (
+                request.method,
+                path.into(),
+                request
+                    .body
+                    .as_ref()
+                    .and_then(|body| body.get("sha"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+async fn cleanup_after_late_checkpoint(foreign: bool) {
+    for replacing in [false, true] {
+        for failure in [409, 422, 0] {
+            let fake = Fake::default();
+            let initial = StateFile::new();
+            if replacing {
+                fake.put("state.json", GitHubBackend::state_bytes(&initial).unwrap());
+            }
+            let transport = CommitAfterRead::new(fake.clone(), "state.json", failure == 0);
+            let backend = Arc::new(GitHubBackend::with_transport(settings(), transport.clone()));
+            backend.read_state().await.unwrap();
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            let prior = fake.bytes("state.json").map(|bytes| blob(&bytes));
+            let mut checkpoint = initial.clone();
+            checkpoint.serial = 1;
+            let sent = blob(&GitHubBackend::state_bytes(&checkpoint).unwrap());
+            transport.armed.store(true, Ordering::SeqCst);
+            let writer = backend.clone();
+            let held = LockInfo::from_json_slice(&serde_json::to_vec(&lock).unwrap()).unwrap();
+            let job =
+                tokio::spawn(async move { writer.write_state_locked(&checkpoint, &held).await });
+            transport.started.notified().await;
+            job.abort();
+            assert!(job.await.unwrap_err().is_cancelled());
+            let mut final_state = initial.clone();
+            final_state.serial = 2;
+            let mut winner = initial;
+            winner.serial = 3;
+            let winner_bytes = GitHubBackend::state_bytes(&winner).unwrap();
+            if foreign {
+                *transport.foreign.lock().unwrap() = Some(winner_bytes.clone());
+            }
+            fake.0.lock().unwrap().requests.clear();
+            fake.0.lock().unwrap().loser = failure.max(409);
+            transport.commit_after_read.store(true, Ordering::SeqCst);
+            let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
+            let published = crate::PublishedBackend::for_test(backend, &shutdown);
+            trigger.prioritize_cleanup();
+            let result = published
+                .write_state_locked_for_cleanup(&final_state, &lock)
+                .await;
+            let mut expected = vec![
+                (Method::Get, "branch".into(), None),
+                (Method::Get, "state.json".into(), None),
+            ];
+            if !replacing {
+                expected.push((Method::Get, "contents".into(), None));
+            }
+            expected.extend([
+                (Method::Get, "state.json.lock".into(), None),
+                (Method::Put, "state.json".into(), prior),
+                (Method::Get, "branch".into(), None),
+                (Method::Get, "state.json".into(), None),
+            ]);
+            if foreign {
+                assert!(result.is_err(), "a foreign SHA must never be adopted");
+                if failure == 409 || (failure == 422 && !replacing) {
+                    assert!(matches!(
+                        result,
+                        Err(BackendError::StateWriteConflict { .. })
+                    ));
+                }
+                assert_eq!(fake.bytes("state.json").unwrap(), winner_bytes);
+            } else {
+                result.expect("cleanup must adopt our late checkpoint and retry the final save");
+                expected.extend([
+                    (Method::Get, "state.json.lock".into(), None),
+                    (Method::Put, "state.json".into(), Some(sent)),
+                    (Method::Get, "compare".into(), None),
+                ]);
+                assert_eq!(
+                    fake.bytes("state.json").unwrap(),
+                    GitHubBackend::state_bytes(&final_state).unwrap()
+                );
+            }
+            assert_eq!(conditional_request_sequence(&fake), expected);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round12_cleanup_adopts_checkpoint_committed_after_resolving_get() {
+    cleanup_after_late_checkpoint(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round12_cleanup_rejects_foreign_state_after_resolving_get() {
+    cleanup_after_late_checkpoint(true).await;
+}
+
+async fn release_after_late_renew(foreign: bool) {
+    for failure in [409, 422, 0] {
+        let fake = Fake::default();
+        let transport = CommitAfterRead::new(fake.clone(), "state.json.lock", failure == 0);
+        let backend = Arc::new(GitHubBackend::with_transport(settings(), transport.clone()));
+        let lock = LockInfo::with_timeout("apply", 300);
+        fake.put("state.json.lock", serde_json::to_vec(&lock).unwrap());
+        let prior = blob(&fake.bytes("state.json.lock").unwrap());
+        transport.armed.store(true, Ordering::SeqCst);
+        let writer = backend.clone();
+        let held = LockInfo::from_json_slice(&serde_json::to_vec(&lock).unwrap()).unwrap();
+        let job = tokio::spawn(async move { writer.renew_lock(&held).await });
+        transport.started.notified().await;
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        let body = transport
+            .pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .body
+            .clone()
+            .unwrap();
+        let renewed = STANDARD.decode(body["content"].as_str().unwrap()).unwrap();
+        let sent = blob(&renewed);
+        assert_ne!(sent, prior);
+        // Even our UUID at an unrelated SHA is not evidence of the pending PUT.
+        let mut winner = serde_json::to_value(&lock).unwrap();
+        winner["operation"] = json!("foreign revision");
+        let winner = serde_json::to_vec(&winner).unwrap();
+        if foreign {
+            *transport.foreign.lock().unwrap() = Some(winner.clone());
+        }
+        fake.0.lock().unwrap().requests.clear();
+        fake.0.lock().unwrap().loser = failure.max(409);
+        transport.commit_after_read.store(true, Ordering::SeqCst);
+        let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
+        let published = crate::PublishedBackend::for_test(backend, &shutdown);
+        trigger.prioritize_cleanup();
+        let result = published.release_lock_for_cleanup(&lock).await;
+        let mut expected = vec![
+            (Method::Get, "state.json.lock".into(), None),
+            (Method::Delete, "state.json.lock".into(), Some(prior)),
+            (Method::Get, "branch".into(), None),
+            (Method::Get, "state.json.lock".into(), None),
+        ];
+        if foreign {
+            assert!(result.is_err(), "a foreign lease SHA must never be adopted");
+            if failure == 409 {
+                assert!(matches!(result, Err(BackendError::LockNotHeld(_))));
+            }
+            assert_eq!(fake.bytes("state.json.lock").unwrap(), winner);
+        } else {
+            result.expect("cleanup must adopt our late renew and retry DELETE");
+            expected.extend([
+                (Method::Delete, "state.json.lock".into(), Some(sent)),
+                (Method::Get, "compare".into(), None),
+            ]);
+            assert!(fake.bytes("state.json.lock").is_none());
+        }
+        assert_eq!(conditional_request_sequence(&fake), expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round12_cleanup_deletes_renew_committed_after_resolving_get() {
+    release_after_late_renew(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round12_cleanup_rejects_foreign_lease_after_resolving_get() {
+    release_after_late_renew(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round12_cleanup_save_classifies_dispatched_deadline_and_write_denial() {
+    for scenario in ["before dispatch", "after dispatch", "denied"] {
+        let fake = Fake::default();
+        let transport = CommitAfterRead::new(fake.clone(), "state.json", false);
+        let backend = Arc::new(GitHubBackend::with_transport(settings(), transport.clone()));
+        backend.read_state().await.unwrap();
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        fake.0.lock().unwrap().requests.clear();
+        match scenario {
+            "before dispatch" => fake.0.lock().unwrap().delay = Some(Duration::from_secs(10)),
+            "after dispatch" => transport.armed.store(true, Ordering::SeqCst),
+            "denied" => {
+                fake.0.lock().unwrap().mutation_response =
+                    Some(reply(403, json!({"message":"write denied"})))
+            }
+            _ => unreachable!(),
+        }
+        let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
+        let published = crate::PublishedBackend::for_test(backend, &shutdown);
+        trigger.prioritize_cleanup();
+        let error = published
+            .write_state_locked_for_cleanup(&StateFile::new(), &lock)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.save_failure_kind(),
+            if scenario == "after dispatch" {
+                crate::SaveFailureKind::Unconfirmed
+            } else {
+                crate::SaveFailureKind::Failed
+            }
+        );
+        assert_eq!(
+            fake.0
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .any(|r| r.method == Method::Put),
+            scenario != "before dispatch"
+        );
+        match scenario {
+            "before dispatch" => {
+                assert!(matches!(error, BackendError::GitHub(GitHubError::Deadline)))
+            }
+            "after dispatch" => assert!(matches!(
+                error,
+                BackendError::GitHub(GitHubError::MutationDeadline)
+            )),
+            "denied" => assert!(matches!(
+                error,
+                BackendError::GitHub(GitHubError::ContentsWriteDenied { .. })
+            )),
+            _ => unreachable!(),
+        }
+    }
+}
 #[async_trait]
 impl GitHubTransport for LateMutation {
     async fn execute(

@@ -131,6 +131,39 @@ pub enum GitHubError {
     MutationDeadline,
 }
 
+impl GitHubError {
+    pub(crate) fn save_failure_kind(&self) -> crate::SaveFailureKind {
+        match self {
+            Self::MutationDeadline | Self::MutationTransportDeadline { .. } => {
+                crate::SaveFailureKind::Unconfirmed
+            }
+            Self::Credentials(_)
+            | Self::CredentialsUnavailable { .. }
+            | Self::CredentialsDeadline { .. }
+            | Self::CredentialTask { .. }
+            | Self::Transport { .. }
+            | Self::TransportDeadline { .. }
+            | Self::Api { .. }
+            | Self::RepositoryNotFoundOrInaccessible { .. }
+            | Self::BranchNotFound { .. }
+            | Self::RepositoryArchivedOrDisabled { .. }
+            | Self::ContentsReadDenied { .. }
+            | Self::ContentsWriteDenied { .. }
+            | Self::RuleViolation { .. }
+            | Self::MalformedResponse
+            | Self::NonFile
+            | Self::CorruptLease
+            | Self::UnexpectedOutcome { .. }
+            | Self::Contention { .. }
+            | Self::StateDeletedConcurrently
+            | Self::RateLimited { .. }
+            | Self::TooLarge { .. }
+            | Self::CompareTooLarge { .. }
+            | Self::Deadline => crate::SaveFailureKind::Failed,
+        }
+    }
+}
+
 impl From<carina_core::github_auth::GitHubTokenError> for GitHubError {
     fn from(error: carina_core::github_auth::GitHubTokenError) -> Self {
         use carina_core::github_auth::GitHubTokenError;
@@ -357,12 +390,14 @@ enum Expected {
 #[derive(Clone)]
 struct AmbiguousWrite {
     prior: Option<BlobSha>,
-    sent: BlobSha,
+    // More than one PUT may have been abandoned against the same precondition.
+    // Observing prior does not prove that any of them stopped on the server.
+    sent: Vec<BlobSha>,
 }
 #[derive(Clone)]
 enum PendingLease {
     Write { id: String, write: AmbiguousWrite },
-    Delete { id: String },
+    Delete { id: String, sent: Vec<BlobSha> },
     Recreated { id: String },
 }
 enum Resolution {
@@ -372,7 +407,11 @@ enum Resolution {
 }
 impl AmbiguousWrite {
     fn resolve(&self, current: Option<&BlobSha>) -> Resolution {
-        if matching_write_is_ours(current, &self.sent) {
+        if self
+            .sent
+            .iter()
+            .any(|sent| matching_write_is_ours(current, sent))
+        {
             Resolution::Ours
         } else if current == self.prior.as_ref() {
             Resolution::Unchanged
@@ -382,9 +421,11 @@ impl AmbiguousWrite {
     }
 }
 
-/// Accepted, documented limitation: a lost reply concurrent with deletion or
-/// force-unlock can recover matching bytes even if the PUT recreated the path.
-/// A Git blob hash identifies bytes, not a fencing generation.
+/// A matching pending PUT is ours even if it commits after an observation of
+/// its prior SHA. Keep that intent until it is observed or superseded, so the
+/// next conditional mutation can adopt it and retry. Accepted limitation: a
+/// lost reply concurrent with deletion or force-unlock can recover matching
+/// bytes even if the PUT recreated the path. Blob hashes do not fence generations.
 fn matching_write_is_ours(current: Option<&BlobSha>, sent: &BlobSha) -> bool {
     current == Some(sent)
 }
@@ -436,6 +477,13 @@ enum Mutation<'a> {
     },
 }
 impl Mutation<'_> {
+    fn lease_id(&self) -> Option<&str> {
+        match self {
+            Self::CreateState { .. } | Self::ReplaceState { .. } => None,
+            Self::CreateLease { lock } | Self::TakeOverLease { lock, .. } => Some(lock.id()),
+            Self::RenewLease { id, .. } | Self::DeleteLease { id, .. } => Some(id),
+        }
+    }
     fn bytes(&self) -> BackendResult<Option<Cow<'_, [u8]>>> {
         match self {
             Self::CreateState { bytes, .. }
@@ -995,11 +1043,49 @@ impl GitHubBackend {
         }
         sha
     }
-    fn begin_mutation(&self, mutation: &Mutation<'_>, sent: &BlobSha) {
-        let write = AmbiguousWrite {
-            prior: mutation.expected().cloned(),
-            sent: sent.clone(),
+    fn mutation_precondition(&self, mutation: &Mutation<'_>) -> AmbiguousWrite {
+        let sent = match mutation.lease_id() {
+            None => match &*self.expected_state.lock().expect("state revision mutex") {
+                Expected::Ambiguous(write) => write.sent.clone(),
+                Expected::Unread | Expected::Known(_) => Vec::new(),
+            },
+            Some(id) => match self
+                .pending_lease
+                .lock()
+                .expect("lease revision mutex")
+                .as_ref()
+            {
+                Some(PendingLease::Write {
+                    id: pending_id,
+                    write,
+                }) if pending_id == id => write.sent.clone(),
+                Some(PendingLease::Delete {
+                    id: pending_id,
+                    sent,
+                }) if pending_id == id => sent.clone(),
+                Some(
+                    PendingLease::Write { .. }
+                    | PendingLease::Delete { .. }
+                    | PendingLease::Recreated { .. },
+                )
+                | None => Vec::new(),
+            },
         };
+        AmbiguousWrite {
+            prior: mutation.expected().cloned(),
+            sent,
+        }
+    }
+    fn begin_mutation(
+        &self,
+        mutation: &Mutation<'_>,
+        precondition: &AmbiguousWrite,
+        sent: &BlobSha,
+    ) {
+        let mut write = precondition.clone();
+        if !write.sent.contains(sent) {
+            write.sent.push(sent.clone());
+        }
         // Persist BEFORE awaiting dispatch: the outer timeout (or cancellation)
         // can drop this future before its error handler ever runs.
         match mutation {
@@ -1023,7 +1109,10 @@ impl GitHubBackend {
             }
             Mutation::DeleteLease { id, .. } => {
                 *self.pending_lease.lock().expect("lease revision mutex") =
-                    Some(PendingLease::Delete { id: (*id).into() });
+                    Some(PendingLease::Delete {
+                        id: (*id).into(),
+                        sent: precondition.sent.clone(),
+                    });
             }
         }
     }
@@ -1038,9 +1127,61 @@ impl GitHubBackend {
             }
         }
     }
-    fn reject_mutation(&self, mutation: &Mutation<'_>) {
-        self.remember_mutation(mutation, mutation.expected().cloned());
-        self.finish_mutation(mutation);
+    fn reject_mutation(&self, mutation: &Mutation<'_>, precondition: &AmbiguousWrite) {
+        // A definitive rejection settles only this attempt. Earlier abandoned
+        // PUTs still belong to the precondition knowledge.
+        match mutation.lease_id() {
+            None => {
+                *self.expected_state.lock().expect("state revision mutex") =
+                    if precondition.sent.is_empty() {
+                        Expected::Known(precondition.prior.clone())
+                    } else {
+                        Expected::Ambiguous(precondition.clone())
+                    };
+            }
+            Some(id) => {
+                *self.pending_lease.lock().expect("lease revision mutex") =
+                    if precondition.sent.is_empty() {
+                        None
+                    } else {
+                        Some(PendingLease::Write {
+                            id: id.into(),
+                            write: precondition.clone(),
+                        })
+                    };
+            }
+        }
+    }
+    fn adopt_pending_write(
+        &self,
+        mutation: &Mutation<'_>,
+        precondition: &mut AmbiguousWrite,
+        current: Option<&MutationObservation>,
+        request: &mut GitHubRequest,
+    ) -> BackendResult<bool> {
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if Some(current.sha()) == precondition.prior.as_ref()
+            || !precondition
+                .sent
+                .iter()
+                .any(|sent| matching_write_is_ours(Some(current.sha()), sent))
+        {
+            return Ok(false);
+        }
+        if let Some(id) = mutation.lease_id()
+            && current.lease()?.id() != id
+        {
+            return Ok(false);
+        }
+        // All pending PUTs used the previous precondition. This observed write
+        // supersedes it, so retry the same mutation against our newer blob.
+        precondition.prior = Some(current.sha().clone());
+        precondition.sent.clear();
+        request.body.as_mut().expect("mutation body")["sha"] = json!(current.sha().as_str());
+        self.reject_mutation(mutation, precondition);
+        Ok(true)
     }
     fn resolve_pending_lease(&self, current: Option<&BlobSha>) -> Option<(Resolution, String)> {
         let mut pending = self.pending_lease.lock().expect("lease revision mutex");
@@ -1048,7 +1189,7 @@ impl GitHubBackend {
             PendingLease::Write { id, write } => {
                 let resolution = write.resolve(current);
                 let id = id.clone();
-                if matches!(resolution, Resolution::Ours | Resolution::Unchanged) {
+                if matches!(resolution, Resolution::Ours) {
                     *pending = None;
                 }
                 Some((resolution, id))
@@ -1073,7 +1214,7 @@ impl GitHubBackend {
             .as_ref()
         {
             Some(
-                PendingLease::Delete { id: pending_id }
+                PendingLease::Delete { id: pending_id, .. }
                 | PendingLease::Recreated { id: pending_id },
             ) => pending_id == id,
             Some(PendingLease::Write { .. }) | None => false,
@@ -1157,20 +1298,20 @@ impl GitHubBackend {
             check_size(bytes.len())?;
         }
         let sent = blob_sha(bytes.as_deref().unwrap_or_default());
-        let expected = mutation.expected();
+        let mut precondition = self.mutation_precondition(&mutation);
         let mut body = json!({"message":message,"branch":self.settings.branch().as_str()});
-        if let Some(sha) = expected {
+        if let Some(sha) = precondition.prior.as_ref() {
             body["sha"] = json!(sha.as_str());
         }
         if let Some(bytes) = bytes.as_deref() {
             body["content"] = json!(STANDARD.encode(bytes));
         }
-        let request = GitHubRequest::mutation(method, self.contents_route(path), body);
+        let mut request = GitHubRequest::mutation(method, self.contents_route(path), body);
         for attempt in 1..=MAX_ATTEMPTS {
             if let Some(lock) = mutation.lease_to_verify() {
                 self.verify_owner(lock, operation).await?;
             }
-            self.begin_mutation(&mutation, &sent);
+            self.begin_mutation(&mutation, &precondition, &sent);
             let rate_retries_before = operation.rate_retries.load(Ordering::Relaxed);
             // A server failure can arrive after GitHub committed the mutation.
             // Reconcile it like a lost transport reply, retaining the persisted
@@ -1211,23 +1352,35 @@ impl GitHubBackend {
                 ) => {
                     if Instant::now() < operation.deadline
                         && let Ok(current) = self.observe_mutation(path, operation).await
-                        && mutation.reconciled(current.as_ref(), &sent)?
                     {
-                        let sha = self
-                            .remember_mutation(&mutation, current.map(|file| file.sha().clone()));
-                        self.finish_mutation(&mutation);
-                        return Ok(sha);
+                        if mutation.reconciled(current.as_ref(), &sent)? {
+                            let sha = self.remember_mutation(
+                                &mutation,
+                                current.map(|file| file.sha().clone()),
+                            );
+                            self.finish_mutation(&mutation);
+                            return Ok(sha);
+                        }
+                        if self.adopt_pending_write(
+                            &mutation,
+                            &mut precondition,
+                            current.as_ref(),
+                            &mut request,
+                        )? && attempt < MAX_ATTEMPTS
+                        {
+                            continue;
+                        }
                     }
                     return Err(error);
                 }
                 Err(error) => {
-                    self.reject_mutation(&mutation);
+                    self.reject_mutation(&mutation, &precondition);
                     return Err(error);
                 }
             };
             if response.status == 409 && classify_conflict(&response) == ConflictBody::RuleViolation
             {
-                self.reject_mutation(&mutation);
+                self.reject_mutation(&mutation, &precondition);
                 return Err(GitHubError::RuleViolation {
                     location: self.target(),
                     message: Self::api_message(&response),
@@ -1247,7 +1400,10 @@ impl GitHubBackend {
                     return Ok(None);
                 }
             }
-            if response.status == 409 || (response.status == 422 && method == Method::Put) {
+            if response.status == 409
+                || (response.status == 422
+                    && (method == Method::Put || !precondition.sent.is_empty()))
+            {
                 let current = self.observe_mutation(path, operation).await?;
                 // A definitive conflict is not a lost DELETE reply: preserve
                 // the typed loser if the lease was concurrently replaced.
@@ -1267,9 +1423,15 @@ impl GitHubBackend {
                     self.finish_mutation(&mutation);
                     return Ok(sha);
                 }
-                if response.status == 422 {
-                    self.reject_mutation(&mutation);
-                    if expected.is_none() && current.is_some() {
+                let adopted = self.adopt_pending_write(
+                    &mutation,
+                    &mut precondition,
+                    current.as_ref(),
+                    &mut request,
+                )?;
+                if response.status == 422 && !adopted {
+                    self.reject_mutation(&mutation, &precondition);
+                    if precondition.prior.is_none() && current.is_some() {
                         return Err(mutation.lost_race(current.as_ref(), attempt)?);
                     }
                     return Err(Self::api_error(&response));
@@ -1282,12 +1444,13 @@ impl GitHubBackend {
                     | Mutation::RenewLease { .. }
                     | Mutation::DeleteLease { .. } => false,
                 };
-                if current.as_ref().map(MutationObservation::sha) != expected && !vanished_takeover
+                if current.as_ref().map(MutationObservation::sha) != precondition.prior.as_ref()
+                    && !vanished_takeover
                 {
-                    self.reject_mutation(&mutation);
+                    self.reject_mutation(&mutation, &precondition);
                     return Err(mutation.lost_race(current.as_ref(), attempt)?);
                 }
-                self.reject_mutation(&mutation);
+                self.reject_mutation(&mutation, &precondition);
                 if attempt == MAX_ATTEMPTS {
                     return Err(GitHubError::Contention {
                         attempts: attempt,
@@ -1322,7 +1485,7 @@ impl GitHubBackend {
                 }
             }
             if !matches!(response.status, 200 | 201) {
-                self.reject_mutation(&mutation);
+                self.reject_mutation(&mutation, &precondition);
                 return Err(self.mutation_error(&response));
             }
             let malformed = || GitHubError::UnexpectedOutcome {
@@ -1463,18 +1626,21 @@ impl GitHubBackend {
                     .metadata_at(self.settings.path().into(), &commit, operation)
                     .await?
                     .map(|file| file.sha);
-                let conflict = match unresolved {
-                    Expected::Unread => sha.is_some(),
-                    Expected::Ambiguous(write) => {
-                        matches!(write.resolve(sha.as_ref()), Resolution::Conflict)
+                let resolved = match unresolved {
+                    Expected::Unread if sha.is_some() => {
+                        return Err(BackendError::StateWriteConflict { attempts: 1 });
                     }
+                    Expected::Unread => Expected::Known(None),
+                    Expected::Ambiguous(write) => match write.resolve(sha.as_ref()) {
+                        Resolution::Conflict => {
+                            return Err(BackendError::StateWriteConflict { attempts: 1 });
+                        }
+                        Resolution::Ours => Expected::Known(sha.clone()),
+                        Resolution::Unchanged => Expected::Ambiguous(write),
+                    },
                     Expected::Known(_) => unreachable!("known preconditions need no observation"),
                 };
-                if conflict {
-                    return Err(BackendError::StateWriteConflict { attempts: 1 });
-                }
-                *self.expected_state.lock().expect("state revision mutex") =
-                    Expected::Known(sha.clone());
+                *self.expected_state.lock().expect("state revision mutex") = resolved;
                 sha
             }
         };
@@ -1524,7 +1690,7 @@ impl GitHubBackend {
         let observed = self.lease(operation).await?;
         {
             let mut pending = self.pending_lease.lock().expect("lease revision mutex");
-            if matches!(pending.as_ref(), Some(PendingLease::Delete { id: pending_id }) if pending_id == id)
+            if matches!(pending.as_ref(), Some(PendingLease::Delete { id: pending_id, .. }) if pending_id == id)
                 && lease_released(id, observed.as_ref().map(|(lock, _)| lock))
             {
                 *pending = None;

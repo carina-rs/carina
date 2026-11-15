@@ -167,9 +167,21 @@ pub struct UpstreamExportReadError {
     pub error: BackendError,
 }
 
+/// How cleanup should report a failed state save.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SaveFailureKind {
+    /// A dispatched write may have committed; reconciliation is needed.
+    Unconfirmed,
+    /// Report the backend's ordinary failure diagnostic.
+    Failed,
+}
+
 /// Errors that can occur when interacting with a state backend
 #[derive(Debug, Error)]
 pub enum BackendError {
+    /// The transport could not confirm the outcome of a dispatched state PUT.
+    #[error("{error}")]
+    UnconfirmedStateSave { error: Box<BackendError> },
     #[error(transparent)]
     GitHub(#[from] crate::GitHubError),
     #[error(transparent)]
@@ -581,6 +593,42 @@ fn write_cause_line(out: &mut String, source: &(dyn std::error::Error + 'static)
 }
 
 impl BackendError {
+    /// Classify cleanup save failures without inspecting rendered diagnostics.
+    /// Keep this match exhaustive so new backend failures require a decision.
+    pub fn save_failure_kind(&self) -> SaveFailureKind {
+        match self {
+            Self::UnconfirmedStateSave { .. } => SaveFailureKind::Unconfirmed,
+            Self::GitHub(error) => error.save_failure_kind(),
+            Self::StateRead { error, .. } | Self::UnreadableBackendAddress { error, .. } => {
+                error.save_failure_kind()
+            }
+            Self::UpstreamExportRead(error) => error.error.save_failure_kind(),
+            Self::GitHubUrl(_)
+            | Self::Locked { .. }
+            | Self::LockNotFound(_)
+            | Self::LockMismatch { .. }
+            | Self::LockNotHeld(_)
+            | Self::InvalidConfig(_)
+            | Self::Configuration(_)
+            | Self::BucketNotFound(_)
+            | Self::InvalidState(_)
+            | Self::InvalidDestroyDependency(_)
+            | Self::LegacyDependencyMigration(_)
+            | Self::InvalidStateJson(_)
+            | Self::InvalidCanonicalBinding(_)
+            | Self::InvalidStateIdentity { .. }
+            | Self::InvalidResourceIdentity(_)
+            | Self::StateVersionTooNew { .. }
+            | Self::ExportsVersionTooNew { .. }
+            | Self::LineageMismatch { .. }
+            | Self::StateWriteConflict { .. }
+            | Self::LocateLocal(_)
+            | Self::Io(_)
+            | Self::Aws(_)
+            | Self::Serialization(_) => SaveFailureKind::Failed,
+        }
+    }
+
     /// Create a Locked error from a LockInfo
     pub fn locked(lock: &LockInfo) -> Self {
         Self::Locked {
