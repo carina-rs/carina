@@ -805,6 +805,42 @@ impl RootDirectoryVerdict {
             },
         }
     }
+    /// Guaranteed nonempty root prohibition prefix, in provider/backend order.
+    pub(crate) fn import_prohibitions(
+        &self,
+    ) -> (
+        crate::module_resolver::ModuleProhibition,
+        Vec<crate::module_resolver::ModuleProhibition>,
+    ) {
+        use crate::module_resolver::ModuleProhibition;
+        match self.0.as_ref() {
+            RootDeclarations::Provider(provider) => (
+                ModuleProhibition::Provider {
+                    evidence: provider.evidence(),
+                },
+                Vec::new(),
+            ),
+            RootDeclarations::Backend { backend } => (
+                ModuleProhibition::Backend {
+                    evidence: backend.evidence(),
+                },
+                Vec::new(),
+            ),
+            RootDeclarations::Both {
+                first: _,
+                provider,
+                backend,
+            } => (
+                ModuleProhibition::Provider {
+                    evidence: provider.evidence(),
+                },
+                vec![ModuleProhibition::Backend {
+                    evidence: backend.evidence(),
+                }],
+            ),
+        }
+    }
+
     pub fn provider_evidence(&self) -> Option<RootEvidence> {
         match self.0.as_ref() {
             RootDeclarations::Provider(provider)

@@ -401,6 +401,7 @@ fn module_error_diagnostics(
                 ModuleErrorCallSource::Owners(calls) => {
                     calls.first().map(|call| call.module_name_location())
                 }
+                ModuleErrorCallSource::Import(location) => Some(location),
                 ModuleErrorCallSource::Unavailable => None,
             };
             let mut diagnostics = match finding.error {

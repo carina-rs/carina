@@ -15,10 +15,21 @@ use super::error::ModuleError;
 /// files were still separate.
 pub struct LoadedModule {
     directory: ResolvedPath,
-    verdict: crate::config_loader::CompleteDirectoryVerdict,
-    prohibitions: Option<ModuleProhibitions>,
     parsed: ParsedFile,
     pub duplicate_declarations: Vec<crate::config_loader::DuplicateDeclaration>,
+}
+
+/// Declaration source for hover, completion and call signatures. This is not
+/// evidence that the directory may be imported or its body expanded.
+#[derive(Debug)]
+pub struct ModuleSignatureSource {
+    parsed: ParsedFile,
+}
+
+impl ModuleSignatureSource {
+    pub fn parsed(&self) -> &ParsedFile {
+        &self.parsed
+    }
 }
 
 /// A preflight copy can originate only from a loader-produced module.
@@ -45,12 +56,6 @@ impl LoadedModule {
 
     pub(super) fn into_parsed(self) -> ParsedFile {
         self.parsed
-    }
-
-    /// Complete, loader-owned prohibition set. Static consumers may still
-    /// inspect a non-root template's signature without collecting it again.
-    pub fn import_prohibitions(&self) -> Option<&ModuleProhibitions> {
-        self.prohibitions.as_ref()
     }
 
     pub fn preflight(&self) -> ModuleTemplate {
@@ -129,6 +134,9 @@ pub enum ModuleLoadError {
         /// Imports remain available to the static walk without exposing the
         /// rejected directory's expressions or placement report.
         imports: Vec<crate::parser::UseStatement>,
+        /// A declaration-only consumer may recover this view explicitly. It
+        /// cannot be admitted as a successfully loaded module.
+        signature: Option<Box<ModuleSignatureSource>>,
     },
 }
 
@@ -176,39 +184,47 @@ pub struct ModuleProhibitions {
 }
 
 impl ModuleProhibitions {
-    /// The only producer for both Root and non-root imported directories.
-    fn collect(module: &LoadedModule) -> Option<Self> {
-        let root = match &module.verdict {
-            crate::config_loader::DirectoryVerdict::Root(root) => vec![
-                root.provider_evidence()
-                    .map(|evidence| ModuleProhibition::Provider { evidence }),
-                root.backend_evidence()
-                    .map(|evidence| ModuleProhibition::Backend { evidence }),
-            ],
+    /// Collect authored block presence once, before any body resolution. Root
+    /// evidence supplies a guaranteed first prohibition; empty blocks count.
+    fn collect(
+        parsed: &ParsedFile,
+        verdict: &crate::config_loader::CompleteDirectoryVerdict,
+    ) -> Option<Self> {
+        use crate::parser::ConfigurationBlock;
+        let mut body = [
+            (ConfigurationBlock::State, ModuleProhibition::State),
+            (
+                ConfigurationBlock::UpstreamState,
+                ModuleProhibition::UpstreamState,
+            ),
+            (ConfigurationBlock::Exports, ModuleProhibition::Exports),
+        ]
+        .into_iter()
+        .filter_map(|(kind, prohibition)| {
+            parsed
+                .parser_binding_metadata
+                .syntax()
+                .configuration_blocks()
+                .iter()
+                .any(|block| block.detail().kind() == kind)
+                .then_some(prohibition)
+        });
+        let (first, mut rest) = match verdict {
+            crate::config_loader::DirectoryVerdict::Root(root) => root.import_prohibitions(),
             crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
-            | crate::config_loader::DirectoryVerdict::NoEvidence(_) => Vec::new(),
+            | crate::config_loader::DirectoryVerdict::NoEvidence(_) => (body.next()?, Vec::new()),
             crate::config_loader::DirectoryVerdict::Unknown(unknown) => match *unknown {},
         };
-        let body = [
-            crate::validation::validate_no_state_blocks_in_module(module)
-                .err()
-                .map(|_| ModuleProhibition::State),
-            crate::validation::validate_no_upstream_states_in_module(module)
-                .err()
-                .map(|_| ModuleProhibition::UpstreamState),
-            crate::validation::validate_no_exports_in_module(module)
-                .err()
-                .map(|_| ModuleProhibition::Exports),
-        ];
-        let mut findings = root.into_iter().chain(body).flatten();
-        Some(Self {
-            first: findings.next()?,
-            rest: findings.collect(),
-        })
+        rest.extend(body);
+        Some(Self { first, rest })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &ModuleProhibition> {
         std::iter::once(&self.first).chain(&self.rest)
+    }
+
+    pub(super) fn into_parts(self) -> (ModuleProhibition, Vec<ModuleProhibition>) {
+        (self.first, self.rest)
     }
 
     pub fn into_errors(self) -> Vec<ModuleError> {
@@ -250,20 +266,29 @@ impl ModuleLoadError {
     pub(crate) fn into_error(self) -> ModuleError {
         match self {
             Self::Unavailable(error) => error,
-            Self::NotModule { error, imports: _ } => error.into_error(),
+            Self::NotModule {
+                error,
+                imports: _,
+                signature: _,
+            } => error.into_error(),
         }
     }
     pub fn into_errors(self) -> Vec<ModuleError> {
         match self {
             Self::Unavailable(ModuleError::Multiple(errors)) => errors.into_vec(),
             Self::Unavailable(error) => vec![error],
-            Self::NotModule { error, imports: _ } => error.into_errors(),
+            Self::NotModule {
+                error,
+                imports: _,
+                signature: _,
+            } => error.into_errors(),
         }
     }
     fn rejected(error: ModuleRejection) -> Self {
         Self::NotModule {
             error: Box::new(error),
             imports: Vec::new(),
+            signature: None,
         }
     }
 }
@@ -317,7 +342,53 @@ pub(crate) fn load_module_with_overrides(
         &crate::schema::SchemaRegistry::new(),
         &path.source_label(),
     )
-    .map(|loaded| loaded.parsed)
+    .map(|module| module.parsed)
+}
+
+pub(crate) fn load_signature_source_with_overrides(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<ParsedFile, ModuleLoadError> {
+    signature_source(load_imported_directory(
+        path,
+        config,
+        overrides,
+        &crate::schema::SchemaRegistry::new(),
+        &path.source_label(),
+    ))
+    .map(|source| source.parsed)
+}
+
+/// Inspect declarations without granting import or body-analysis authority.
+pub fn load_module_signature_with_schemas(
+    path: &ResolvedPath,
+    config: &ProviderContext,
+    schemas: &crate::schema::SchemaRegistry,
+    display_root: &std::path::Path,
+) -> Result<ModuleSignatureSource, ModuleLoadError> {
+    signature_source(load_imported_directory(
+        path,
+        config,
+        &Default::default(),
+        schemas,
+        display_root,
+    ))
+}
+
+fn signature_source(
+    result: Result<LoadedModule, ModuleLoadError>,
+) -> Result<ModuleSignatureSource, ModuleLoadError> {
+    match result {
+        Ok(module) => Ok(ModuleSignatureSource {
+            parsed: module.parsed,
+        }),
+        Err(ModuleLoadError::NotModule {
+            signature: Some(source),
+            ..
+        }) => Ok(*source),
+        Err(error) => Err(error),
+    }
 }
 
 /// The shared import boundary consumes the issued verdict before exposing a
@@ -344,17 +415,25 @@ pub(crate) fn load_imported_directory(
         .map_err(|e| Unavailable(ModuleError::Io(e)))?
         .read_all(overrides)
         .map_err(|e| Unavailable(ModuleError::Io(e.into_error())))?;
-    let parsed_files = inputs
-        .parse_from_root(config, display_root)
-        .map_err(|located| {
-            Unavailable(match located.source_file {
-                Some(path) => ModuleError::ParseInFile {
-                    path,
-                    error: Box::new(*located.error),
-                },
-                None => ModuleError::Parse(*located.error),
-            })
-        })?;
+    let unavailable = |located: crate::config_loader::LocatedParseError| {
+        Unavailable(match located.source_file {
+            Some(path) => ModuleError::ParseInFile {
+                path,
+                error: Box::new(*located.error),
+            },
+            None => ModuleError::Parse(*located.error),
+        })
+    };
+    let (parsed_files, body_error) = match inputs.parse_from_root(config, display_root) {
+        Ok(files) => (files, None),
+        Err(error) => {
+            let neutral = ProviderContext::new(config.environment.clone());
+            match inputs.parse_from_root(&neutral, display_root) {
+                Ok(files) => (files, Some(unavailable(error))),
+                Err(_) => return Err(unavailable(error)),
+            }
+        }
+    };
     if parsed_files.is_empty() {
         let label = dir_path.source_label();
         let display = ResolvedPath::new(display_root)
@@ -377,38 +456,29 @@ pub(crate) fn load_imported_directory(
     for (_, parsed) in parsed_files {
         crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
     }
-    let mut module = LoadedModule {
+    if let Some(prohibitions) = ModuleProhibitions::collect(&merged, &verdict) {
+        let imports = merged.uses.clone();
+        // Body analysis and expansion never receive prohibited directories.
+        // Static UI consumers request their declaration source explicitly.
+        // Match main's declaration availability, including argumented roots,
+        // without granting any body-analysis or expansion authority.
+        let signature = crate::validation::is_module_definition(&merged)
+            .then(|| Box::new(ModuleSignatureSource { parsed: merged }));
+        return Err(ModuleLoadError::NotModule {
+            error: Box::new(ModuleRejection::Prohibited(prohibitions)),
+            imports,
+            signature,
+        });
+    }
+    if let Some(error) = body_error {
+        return Err(error);
+    }
+    crate::parser::retained::judge_configuration(&mut merged, schemas, config);
+    let module = LoadedModule {
         directory: dir_path.clone(),
-        verdict,
         parsed: merged,
         duplicate_declarations,
-        prohibitions: None,
     };
-    module.prohibitions = ModuleProhibitions::collect(&module);
-    // The issued verdict is the importability decision. A root cannot escape
-    // rejection even if a public AST list is later changed: the evidence itself
-    // still identifies a prohibited root block.
-    match module.verdict {
-        crate::config_loader::DirectoryVerdict::Root(_) => {
-            let error = ModuleRejection::Prohibited(
-                module
-                    .prohibitions
-                    .take()
-                    .expect("root evidence prohibits import"),
-            );
-            return Err(ModuleLoadError::NotModule {
-                error: Box::new(error),
-                imports: module.parsed.uses,
-            });
-        }
-        // These snapshots remain available to signature/reference checking.
-        // State/upstream/exports prohibitions run in validation and expansion,
-        // preserving independent diagnostics from an otherwise importable body.
-        crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
-        | crate::config_loader::DirectoryVerdict::NoEvidence(_) => {}
-    }
-    let mut module = module;
-    crate::parser::retained::judge_configuration(&mut module.parsed, schemas, config);
     Ok(module)
 }
 
@@ -565,11 +635,14 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = load_module(
+        let source = load_module_signature_with_schemas(
             &crate::paths::ResolvedPath::new(dir).unwrap(),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            &crate::schema::SchemaRegistry::new(),
+            dir,
         )
-        .expect("module should load when arguments are declared");
+        .expect("a prohibited body still has a declaration source");
+        let parsed = source.parsed();
         assert_eq!(parsed.arguments.len(), 1);
         assert_eq!(parsed.arguments[0].name, "env");
         assert_eq!(parsed.export_params.len(), 1);
@@ -596,7 +669,10 @@ mod tests {
         )
         .err()
         .expect("root is not importable");
-        let errors = error.into_errors();
+        let errors = match &error {
+            ModuleLoadError::NotModule { error, .. } => error.clone().into_errors(),
+            _ => panic!("root"),
+        };
         assert!(matches!(
             errors[0].root_cause(),
             ModuleError::ProviderInModule { evidence: _ }
@@ -627,7 +703,7 @@ mod tests {
             errors[1].root_evidence().unwrap().related_message(),
             "This backend block makes the directory a root configuration."
         );
-        let combined = ModuleError::from_errors(errors).unwrap();
+        let combined = error.into_error();
         assert!(combined.root_evidence().is_some());
         assert_eq!(
             combined.lsp_message_relative_to(tmp.path()),
@@ -652,8 +728,9 @@ mod tests {
             &ResolvedPath::new(tmp.path()).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
-        .unwrap();
-        let errors = loaded.import_prohibitions().unwrap().clone().into_errors();
+        .err()
+        .expect("exports prohibit import");
+        let errors = loaded.into_errors();
         assert_eq!(errors.len(), 1);
         assert_eq!(
             errors[0].to_string(),
@@ -905,7 +982,7 @@ mod importability_tests {
 mod imported_snapshot_tests {
     use super::*;
     #[test]
-    fn importable_snapshot_keeps_non_root_prohibitions_for_the_validation_phase() {
+    fn prohibited_snapshot_is_not_importable_but_retains_a_signature_source() {
         for (name, source) in [
             ("exports.crn", "exports { value: Int = 1 }\n"),
             ("state.crn", "removed { from = mock.test.resource 'old' }\n"),
@@ -923,9 +1000,17 @@ mod imported_snapshot_tests {
             fs::write(directory.path().join(name), source).unwrap();
             let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
             assert!(
-                load_module(&ResolvedPath::new(directory.path()).unwrap(), &context).is_ok(),
-                "{name}: a successfully parsed non-root remains available to static signature/type consumers"
+                load_module(&ResolvedPath::new(directory.path()).unwrap(), &context).is_err(),
+                "{name}: a prohibited directory cannot be imported"
             );
+            let source = load_module_signature_with_schemas(
+                &ResolvedPath::new(directory.path()).unwrap(),
+                &context,
+                &crate::schema::SchemaRegistry::new(),
+                directory.path(),
+            )
+            .unwrap();
+            assert_eq!(source.parsed().arguments.len(), 1);
         }
     }
 }

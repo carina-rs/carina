@@ -458,17 +458,24 @@ impl HoverProvider {
 
         // Load the module to get its definition
         let module_path = base_path.join(&import_path).ok()?;
-        let module_parsed =
-            match carina_core::module_resolver::load_module(&module_path, doc.provider_context()) {
-                Ok(module) => module,
-                Err(
-                    carina_core::module_resolver::ModuleLoadError::NotModule {
-                        error: _,
-                        imports: _,
-                    }
-                    | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
-                ) => return None,
-            };
+        let module_parsed = match carina_core::module_resolver::load_module_signature_with_schemas(
+            &module_path,
+            doc.provider_context(),
+            &carina_core::schema::SchemaRegistry::new(),
+            &module_path.source_label(),
+        )
+        .map(|source| source.parsed().clone())
+        {
+            Ok(module) => module,
+            Err(
+                carina_core::module_resolver::ModuleLoadError::NotModule {
+                    error: _,
+                    imports: _,
+                    signature: _,
+                }
+                | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
+            ) => return None,
+        };
 
         let mut content = format!("## {}\n\n`{}`\n", word, import_path);
 
@@ -527,17 +534,24 @@ impl HoverProvider {
 
         // Load the module to get argument definitions
         let module_path = base_path.join(&import_path).ok()?;
-        let module_parsed =
-            match carina_core::module_resolver::load_module(&module_path, doc.provider_context()) {
-                Ok(module) => module,
-                Err(
-                    carina_core::module_resolver::ModuleLoadError::NotModule {
-                        error: _,
-                        imports: _,
-                    }
-                    | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
-                ) => return None,
-            };
+        let module_parsed = match carina_core::module_resolver::load_module_signature_with_schemas(
+            &module_path,
+            doc.provider_context(),
+            &carina_core::schema::SchemaRegistry::new(),
+            &module_path.source_label(),
+        )
+        .map(|source| source.parsed().clone())
+        {
+            Ok(module) => module,
+            Err(
+                carina_core::module_resolver::ModuleLoadError::NotModule {
+                    error: _,
+                    imports: _,
+                    signature: _,
+                }
+                | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
+            ) => return None,
+        };
 
         // Find the argument matching the word
         let arg = module_parsed.arguments.iter().find(|a| a.name == word)?;
@@ -1414,17 +1428,17 @@ mod tests {
             Arc::new(context),
         );
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
-        for (word, occurrence) in [("service", 1), ("name", 0)] {
+        for (word, occurrence, expected) in
+            [("service", 1, "## service"), ("name", 0, "## service.name")]
+        {
             let content = hover_markdown(
                 &provider,
                 &doc,
                 hover_position(source, word, occurrence),
                 Some(directory.path()),
-            );
-            assert!(
-                content.is_none(),
-                "root evidence must prevent module hover: {content:?}"
-            );
+            )
+            .expect("module hover must retain the captured environment");
+            assert!(content.contains(expected), "{content}");
         }
     }
 

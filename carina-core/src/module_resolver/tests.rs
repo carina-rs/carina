@@ -48,7 +48,31 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
 fn imported_prohibitions_remain_complete_on_every_resolver_load_and_retry() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../carina-cli/tests/fixtures/import_root_boundary");
-    for (root_evidence, arguments) in [(true, false), (false, false), (false, true)] {
+    for (root_evidence, arguments, body_error) in [
+        (true, false, ""),
+        (false, false, ""),
+        (false, true, ""),
+        (
+            true,
+            true,
+            "let a = 'present'\nlet broken = a ?? { inner = { leaf = 1 } }\n",
+        ),
+        (
+            false,
+            true,
+            "let a = 'present'\nlet broken = a ?? { inner = { leaf = 1 } }\n",
+        ),
+        (
+            true,
+            true,
+            "attributes { bad: TotallyMadeUpType = 'one' }\n",
+        ),
+        (
+            false,
+            true,
+            "attributes { bad: TotallyMadeUpType = 'one' }\n",
+        ),
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let module = directory.path().join("rooted");
         fs::create_dir(&module).unwrap();
@@ -61,6 +85,7 @@ fn imported_prohibitions_remain_complete_on_every_resolver_load_and_retry() {
         if arguments {
             fs::write(module.join("arguments.crn"), "arguments { n: Int = 1 }\n").unwrap();
         }
+        fs::write(module.join("errors.crn"), body_error).unwrap();
         let golden = if root_evidence {
             "five.lsp.json"
         } else {
@@ -7573,7 +7598,7 @@ fn test_load_module_directory_merges_sibling_files_with_main() {
     )
     .unwrap();
 
-    let parsed = load_module(
+    let parsed = load_module_from_directory(
         &crate::paths::ResolvedPath::new(&tmp_dir).unwrap(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
@@ -10967,7 +10992,7 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
     .unwrap();
     std::fs::write(&exports_path, "exports {\n  result: String = 'value'\n}\n").unwrap();
 
-    let parsed = load_directory_module(
+    let parsed = load_module_from_directory(
         &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )

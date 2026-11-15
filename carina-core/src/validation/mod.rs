@@ -8351,86 +8351,49 @@ pub(crate) fn placement_diagnostics_for_inventory<B: BindingAddress>(
 ) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
     use crate::config_loader::DirectoryVerdict;
     use crate::parser::ConfigurationBlock;
-    directory.syntax().configuration_blocks().iter().filter_map(|block| {
-        let (message, root) = match block.detail().kind() {
-            ConfigurationBlock::State if declares_module_placeholders => ("state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.", None),
-            ConfigurationBlock::UpstreamState if declares_module_placeholders => ("upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.", None),
-            ConfigurationBlock::Exports if declares_module_placeholders => ("exports blocks are not allowed inside modules. Define exports at the root configuration level.", None),
-            ConfigurationBlock::Arguments | ConfigurationBlock::Attributes => match block.detail().directory_verdict() {
-                Some(DirectoryVerdict::Root(root)) => (root_declaration_message(block.detail().kind())?, Some(root.clone())),
-                Some(DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::Unknown(()) | DirectoryVerdict::NoEvidence(_)) => return None,
-                None => return None,
-            },
-            ConfigurationBlock::State | ConfigurationBlock::UpstreamState | ConfigurationBlock::Exports | ConfigurationBlock::Provider | ConfigurationBlock::Backend | ConfigurationBlock::Require => return None,
-        };
-        Some(crate::parser::Located::new(block.location().clone(), ConfigurationPlacementDiagnostic { message, root }))
-    }).collect()
-}
-
-/// Check that a module file does not contain state blocks.
-///
-/// State changes should only be defined at the root configuration level, not
-/// inside explicitly imported modules.
-pub fn validate_no_state_blocks_in_module(
-    module: &crate::module_resolver::LoadedModule,
-) -> Result<(), String> {
-    if module
-        .parsed()
-        .parser_binding_metadata
+    directory
         .syntax()
         .configuration_blocks()
         .iter()
-        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::State)
-    {
-        return Err(
-            "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.".to_string(),
-        );
-    }
-    Ok(())
-}
-
-/// Check that a module file does not contain upstream state declarations.
-///
-/// Upstream state dependencies should only be defined at the root
-/// configuration level, not inside explicitly imported modules.
-pub fn validate_no_upstream_states_in_module(
-    module: &crate::module_resolver::LoadedModule,
-) -> Result<(), String> {
-    if module
-        .parsed()
-        .parser_binding_metadata
-        .syntax()
-        .configuration_blocks()
-        .iter()
-        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::UpstreamState)
-    {
-        return Err(
-            "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.".to_string(),
-        );
-    }
-    Ok(())
-}
-
-/// Check that a module file does not contain an exports block.
-///
-/// State exports should only be defined at the root configuration level, not
-/// inside explicitly imported modules.
-pub fn validate_no_exports_in_module(
-    module: &crate::module_resolver::LoadedModule,
-) -> Result<(), String> {
-    if module
-        .parsed()
-        .parser_binding_metadata
-        .syntax()
-        .configuration_blocks()
-        .iter()
-        .any(|block| block.detail().kind() == crate::parser::ConfigurationBlock::Exports)
-    {
-        return Err(
-            "exports blocks are not allowed inside modules. Define exports at the root configuration level.".to_string(),
-        );
-    }
-    Ok(())
+        .filter_map(|block| {
+            let (message, root) = match block.detail().kind() {
+                ConfigurationBlock::State if declares_module_placeholders => {
+                    (crate::module_resolver::ModuleError::STATE_IN_MODULE, None)
+                }
+                ConfigurationBlock::UpstreamState if declares_module_placeholders => (
+                    crate::module_resolver::ModuleError::UPSTREAM_STATE_IN_MODULE,
+                    None,
+                ),
+                ConfigurationBlock::Exports if declares_module_placeholders => {
+                    (crate::module_resolver::ModuleError::EXPORTS_IN_MODULE, None)
+                }
+                ConfigurationBlock::Arguments | ConfigurationBlock::Attributes => {
+                    match block.detail().directory_verdict() {
+                        Some(DirectoryVerdict::Root(root)) => (
+                            root_declaration_message(block.detail().kind())?,
+                            Some(root.clone()),
+                        ),
+                        Some(
+                            DirectoryVerdict::ModuleTemplate(_)
+                            | DirectoryVerdict::Unknown(())
+                            | DirectoryVerdict::NoEvidence(_),
+                        ) => return None,
+                        None => return None,
+                    }
+                }
+                ConfigurationBlock::State
+                | ConfigurationBlock::UpstreamState
+                | ConfigurationBlock::Exports
+                | ConfigurationBlock::Provider
+                | ConfigurationBlock::Backend
+                | ConfigurationBlock::Require => return None,
+            };
+            Some(crate::parser::Located::new(
+                block.location().clone(),
+                ConfigurationPlacementDiagnostic { message, root },
+            ))
+        })
+        .collect()
 }
 
 /// Stable semantic category used for source-aware deduplication.
@@ -9861,6 +9824,7 @@ impl ModuleCallChecker<'_> {
                 Err(ModuleLoadError::NotModule {
                     error: _,
                     imports: _,
+                    signature: _,
                 }) => None,
                 Err(ModuleLoadError::Unavailable(_)) => {
                     match crate::module_resolver::loader::load_module_with_overrides(
@@ -9877,6 +9841,7 @@ impl ModuleCallChecker<'_> {
                         Err(ModuleLoadError::NotModule {
                             error: _,
                             imports: _,
+                            signature: _,
                         }) => None,
                         Err(ModuleLoadError::Unavailable(_)) => None,
                     }

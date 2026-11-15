@@ -2423,11 +2423,26 @@ where
             }
             provider_attribute_locations.push(locations);
         }
+        let mut source_occurrences = std::collections::HashMap::<&B, usize>::new();
         let upstream_states = file
             .upstream_states
             .iter()
-            .map(|state| Located::new(state.caller.clone(), state))
-            .collect();
+            .map(|state| {
+                let occurrence = source_occurrences.entry(&state.binding).or_default();
+                let source = syntax
+                    .upstream_sources()
+                    .iter()
+                    .filter(|source| *source.detail() == state.binding)
+                    .nth(*occurrence)
+                    .ok_or_else(|| {
+                        AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                            element: format!("upstream source {}", state.binding),
+                        })
+                    })?;
+                *occurrence += 1;
+                Ok(Located::new(source.location().clone(), state))
+            })
+            .collect::<Result<_, AnalysisTreeError>>()?;
         let iterables = file
             .deferred_for_sites()
             .map(|site| {
@@ -3052,6 +3067,48 @@ pub(super) fn record_attribute_location_work(steps: usize) {
 #[cfg(test)]
 mod location_tests {
     use super::*;
+
+    #[test]
+    fn public_upstream_caller_does_not_replace_syntax_provenance() {
+        let context = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut file = super::super::parse_file(
+            "let prior = upstream_state { source = '../prior' }\nlet other = upstream_state { source = '../other' }\n",
+            std::path::Path::new("main.crn"), &context,
+        ).unwrap();
+        let authored = file.upstream_states[0].caller.clone();
+        file.upstream_states[0].caller = file.upstream_states[1].caller.clone();
+        let tree = AnalysisTree::try_from_file(&file)
+            .expect("diagnostic caller changes must not gate analysis");
+        assert_eq!(tree.upstream_states()[0].location(), &authored);
+        file.upstream_states[0].binding = "forged".into();
+        let error = AnalysisTree::try_from_file(&file)
+            .err()
+            .expect("a public caller cannot replace syntax membership");
+        assert!(
+            matches!(error.kind(), AnalysisTreeErrorKind::MissingSyntaxProvenance { element } if element == "upstream source forged")
+        );
+    }
+
+    #[test]
+    fn upstream_source_duplicates_keep_main_analysis_provenance() {
+        let context = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let file = super::super::parse_file(
+            "let prior = upstream_state { source = '../first' source = '../last' }\n",
+            std::path::Path::new("main.crn"),
+            &context,
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&file)
+            .expect("parser-produced duplicate sources retain main's analysis behavior");
+        assert_eq!(
+            file.upstream_states[0].source,
+            std::path::Path::new("../last")
+        );
+        assert_eq!(
+            tree.upstream_states()[0].location(),
+            file.parser_binding_metadata.syntax().upstream_sources()[0].location()
+        );
+    }
 
     #[test]
     fn aliased_collection_input_construction_updates_locations_in_one_pass() {

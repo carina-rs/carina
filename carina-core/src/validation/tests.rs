@@ -4201,14 +4201,15 @@ fn ref_type_mismatch_inside_for_body_is_rejected() {
 }
 
 // Placement checks consume the same immutable module selected by the loader.
-fn imported_placement_fixture(source: &str) -> crate::module_resolver::LoadedModule {
+fn imported_placement_fixture(
+    source: &str,
+) -> Result<crate::module_resolver::LoadedModule, crate::module_resolver::ModuleLoadError> {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("main.crn"), source).unwrap();
     crate::module_resolver::load_module_with_diagnostics(
         &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
-    .unwrap()
 }
 
 fn imported_root_block_error(
@@ -4271,7 +4272,7 @@ fn moved_in_module_with_arguments_errors() {
         "arguments { name: String }\nmoved { from = mock.test.Resource 'old' to = mock.test.Resource 'new' }\n",
     );
 
-    let result = validate_no_state_blocks_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert_eq!(
         result.unwrap_err(),
@@ -4285,7 +4286,7 @@ fn removed_in_module_with_arguments_errors() {
         "arguments { name: String }\nremoved { from = mock.test.Resource 'legacy' }\n",
     );
 
-    let result = validate_no_state_blocks_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert!(result.is_err());
 }
@@ -4296,7 +4297,7 @@ fn import_in_module_with_arguments_errors() {
         "arguments { name: String }\nimport { to = mock.test.Resource 'existing' id = 'resource-123' }\n",
     );
 
-    let result = validate_no_state_blocks_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert!(result.is_err());
 }
@@ -4307,7 +4308,7 @@ fn state_block_in_module_with_attributes_errors() {
         "attributes { resource_id: String = 'dummy' }\nmoved { from = mock.test.Resource 'old' to = mock.test.Resource 'new' }\n",
     );
 
-    let result = validate_no_state_blocks_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert!(result.is_err());
 }
@@ -4316,7 +4317,7 @@ fn state_block_in_module_with_attributes_errors() {
 fn module_without_state_blocks_ok() {
     let loaded = imported_placement_fixture("arguments { name: String }\n");
 
-    let result = validate_no_state_blocks_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert!(result.is_ok());
 }
@@ -4359,7 +4360,7 @@ fn upstream_state_in_module_with_arguments_errors() {
         "arguments { name: String }\nlet up = upstream_state { source = '../other' }\n",
     );
 
-    let result = validate_no_upstream_states_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert_eq!(
         result.unwrap_err(),
@@ -4373,7 +4374,7 @@ fn upstream_state_in_module_with_attributes_errors() {
         "attributes { resource_id: String = 'dummy' }\nlet up = upstream_state { source = '../other' }\n",
     );
 
-    let result = validate_no_upstream_states_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert!(result.is_err());
 }
@@ -4382,7 +4383,7 @@ fn upstream_state_in_module_with_attributes_errors() {
 fn module_without_upstream_state_ok() {
     let loaded = imported_placement_fixture("arguments { name: String }\n");
 
-    let result = validate_no_upstream_states_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert!(result.is_ok());
 }
@@ -4393,7 +4394,7 @@ fn exports_in_module_with_arguments_errors() {
         "arguments { name: String }\nexports { module_value = 'module' }\n",
     );
 
-    let result = validate_no_exports_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert_eq!(
         result.unwrap_err(),
@@ -4407,7 +4408,7 @@ fn exports_in_module_with_attributes_errors() {
         "attributes { resource_id: String = 'dummy' }\nexports { module_value = 'module' }\n",
     );
 
-    let result = validate_no_exports_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert!(result.is_err());
 }
@@ -4416,7 +4417,7 @@ fn exports_in_module_with_attributes_errors() {
 fn module_without_exports_ok() {
     let loaded = imported_placement_fixture("arguments { name: String }\n");
 
-    let result = validate_no_exports_in_module(&loaded);
+    let result = loaded.map(|_| ()).map_err(|error| error.to_string());
 
     assert!(result.is_ok());
 }

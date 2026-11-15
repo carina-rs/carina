@@ -644,9 +644,18 @@ impl DiagnosticRun<'_> {
         let Some(directory) = tree.syntax().issued_directory() else {
             return Vec::new();
         };
+        self.configuration_placement_diagnostics(doc, directory, tree.is_module_definition())
+    }
+
+    pub(super) fn configuration_placement_diagnostics(
+        &self,
+        doc: &Document,
+        directory: carina_core::config_loader::IssuedDirectory<'_>,
+        declares_module_placeholders: bool,
+    ) -> Vec<Diagnostic> {
         carina_core::validation::configuration_placement_diagnostics(
             directory,
-            tree.is_module_definition(),
+            declares_module_placeholders,
         )
         .iter()
         .filter_map(|finding| {
@@ -909,7 +918,7 @@ impl DiagnosticRun<'_> {
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
         let module_resolution =
-            carina_core::module_resolver::resolve_modules_with_all_import_diagnostics_and_overrides(
+            carina_core::module_resolver::resolve_modules_with_diagnostics_and_overrides(
                 result
                     .directory
                     .parsed

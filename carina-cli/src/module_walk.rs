@@ -13,7 +13,6 @@ pub(crate) struct LoadedModuleAtPath {
     diagnostic_base: ResolvedPath,
     module_path: ResolvedPath,
     loaded: LoadedModule,
-    owners: Vec<carina_core::parser::ModuleCallId>,
 }
 
 impl LoadedModuleAtPath {
@@ -31,16 +30,6 @@ impl LoadedModuleAtPath {
 
     pub(crate) fn loaded(&self) -> &LoadedModule {
         &self.loaded
-    }
-
-    pub(crate) fn import_diagnostic(&self, error: ModuleError) -> crate::error::AppError {
-        crate::error::AppError::ModuleImport {
-            path: self.diagnostic_label(),
-            error: std::sync::Arc::new(ModuleError::OwnedByCalls {
-                calls: self.owners.clone(),
-                error: Box::new(error),
-            }),
-        }
     }
 }
 
@@ -112,6 +101,7 @@ impl ModuleWalk {
                     diagnostic_path: Path::new(&import.path),
                     diagnostic_base: &base_dir,
                     owners: &owners,
+                    import_location: import.declaration_location(),
                 },
                 &mut visited,
                 &mut walk,
@@ -148,6 +138,7 @@ struct ModuleVisit<'a> {
     diagnostic_path: &'a Path,
     diagnostic_base: &'a ResolvedPath,
     owners: &'a [carina_core::parser::ModuleCallId],
+    import_location: &'a carina_core::parser::DeclarationLocation,
 }
 
 fn visit_module(
@@ -157,6 +148,7 @@ fn visit_module(
         diagnostic_path,
         diagnostic_base,
         owners,
+        import_location,
     }: ModuleVisit<'_>,
     visited: &mut HashSet<CanonicalPath>,
     walk: &mut ModuleWalk,
@@ -180,24 +172,27 @@ fn visit_module(
                 diagnostic_base: diagnostic_base.clone(),
                 module_path: module_path.clone(),
                 loaded,
-                owners: owners.to_vec(),
             });
             imports
         }
         // Preserve the existing static walk policy for unreadable/broken
         // modules. The strict resolver still reports these typed failures.
         Err(ModuleLoadError::Unavailable(_)) => return,
-        Err(ModuleLoadError::NotModule { error, imports }) => {
+        Err(ModuleLoadError::NotModule {
+            error,
+            imports,
+            signature: _,
+        }) => {
             match *error {
                 ModuleRejection::NotADirectory { path: _ } => {
                     walk.rejections.push(RejectedModuleAtPath {
                         label: DisplayPath::for_diagnostics_from(diagnostic_path, diagnostic_base),
-                        error: std::sync::Arc::new(ModuleError::OwnedByCalls {
-                            calls: owners.to_vec(),
-                            error: Box::new(ModuleError::NotADirectory {
+                        error: std::sync::Arc::new(
+                            ModuleError::NotADirectory {
                                 path: authored_import.to_owned(),
-                            }),
-                        }),
+                            }
+                            .with_import_owners(import_location.clone(), owners.to_vec()),
+                        ),
                         presentation: ImportPresentation::Resolution(diagnostic_base.clone()),
                     })
                 }
@@ -210,10 +205,12 @@ fn visit_module(
                                     diagnostic_path,
                                     diagnostic_base,
                                 ),
-                                error: std::sync::Arc::new(ModuleError::OwnedByCalls {
-                                    calls: owners.to_vec(),
-                                    error: Box::new(error),
-                                }),
+                                error: std::sync::Arc::new(
+                                    error.with_import_owners(
+                                        import_location.clone(),
+                                        owners.to_vec(),
+                                    ),
+                                ),
                                 presentation: ImportPresentation::Boundary,
                             }
                         }));
@@ -241,6 +238,7 @@ fn visit_module(
                 diagnostic_path: &child_diagnostic_path,
                 diagnostic_base,
                 owners,
+                import_location,
             },
             visited,
             walk,

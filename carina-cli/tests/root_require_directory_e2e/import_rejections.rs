@@ -143,3 +143,70 @@ fn rejected_imports_retain_the_json_call_site() {
     }
     assert!(missing_locations.is_empty(), "{missing_locations:#?}");
 }
+
+#[test]
+fn uncalled_prohibited_imports_pin_use_locations_on_every_transport() {
+    for root_evidence in [true, false] {
+        let directory = fixture();
+        if !root_evidence {
+            for name in ["providers.crn", "backend.crn"] {
+                fs::remove_file(directory._temp.path().join("rooted").join(name)).unwrap();
+            }
+        }
+        let use_source = "let m = use { source = \"../rooted\" }\n";
+        fs::write(directory.project.join("main.crn"), use_source).unwrap();
+        let prefix = if root_evidence { "five" } else { "three" };
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/import_root_boundary");
+        let mut expected: Value = serde_json::from_str(
+            &fs::read_to_string(fixture_path.join(format!("{prefix}.json"))).unwrap(),
+        )
+        .unwrap();
+        let source_span =
+            json!({"start": {"line": 1, "column": 1}, "end": {"line": 1, "column": 37}});
+        for error in expected["errors"].as_array_mut().unwrap() {
+            error["location"]["range"] = source_span.clone();
+        }
+        let mut lsp: Value = serde_json::from_str(
+            &fs::read_to_string(fixture_path.join(format!("{prefix}.lsp.json"))).unwrap(),
+        )
+        .unwrap();
+        for diagnostic in lsp.as_array_mut().unwrap() {
+            diagnostic["range"] =
+                json!({"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 36}});
+        }
+        assert_transports(
+            &directory,
+            &fs::read_to_string(fixture_path.join(format!("{prefix}.stderr"))).unwrap(),
+            &serde_json::to_string(&expected).unwrap(),
+            &serde_json::to_string(&lsp).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn prohibited_imports_precede_body_expression_and_type_errors_on_every_transport() {
+    for root_evidence in [true, false] {
+        for body_error in [
+            "let a = 'present'\nlet broken = a ?? { inner = { leaf = 1 } }\n",
+            "attributes { bad: TotallyMadeUpType = 'one' }\n",
+        ] {
+            let directory = fixture();
+            if !root_evidence {
+                for name in ["providers.crn", "backend.crn"] {
+                    fs::remove_file(directory._temp.path().join("rooted").join(name)).unwrap();
+                }
+            }
+            fs::write(directory._temp.path().join("rooted/errors.crn"), body_error).unwrap();
+            let prefix = if root_evidence { "five" } else { "three" };
+            let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/import_root_boundary");
+            assert_transports(
+                &directory,
+                &fs::read_to_string(fixture_path.join(format!("{prefix}.stderr"))).unwrap(),
+                &fs::read_to_string(fixture_path.join(format!("{prefix}.json"))).unwrap(),
+                &fs::read_to_string(fixture_path.join(format!("{prefix}.lsp.json"))).unwrap(),
+            );
+        }
+    }
+}

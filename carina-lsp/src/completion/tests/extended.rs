@@ -307,10 +307,7 @@ fn module_parameter_completion_uses_environment_snapshot() {
     );
     let items =
         test_provider().complete_for_test(&doc, Position::new(2, 2), Some(directory.path()));
-    assert!(
-        items.is_empty(),
-        "root evidence must prevent module parameters: {items:?}"
-    );
+    assert!(items.iter().any(|item| item.label == "name"), "{items:?}");
     let snippets = test_provider().top_level_completions(
         Position::new(0, 0),
         &doc.text(),
@@ -321,7 +318,10 @@ fn module_parameter_completion_uses_environment_snapshot() {
         .iter()
         .find(|item| item.label == "service")
         .unwrap();
-    assert_eq!(service.insert_text.as_deref(), Some("service {\n  ${1}\n}"));
+    assert_eq!(
+        service.insert_text.as_deref(),
+        Some("service {\n  name = ${1}\n}")
+    );
 }
 
 #[test]
@@ -5785,7 +5785,7 @@ fn bootstrap_module_argument_completion_ignores_unconsumed_lets() {
 }
 
 #[test]
-fn called_module_completion_uses_import_admission_for_empty_and_root_directories() {
+fn called_module_completion_distinguishes_empty_directories_from_root_signatures() {
     let directory = tempfile::tempdir().unwrap();
     let module = directory.path().join("module");
     std::fs::create_dir(&module).unwrap();
@@ -5821,8 +5821,8 @@ fn called_module_completion_uses_import_admission_for_empty_and_root_directories
         carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
             provider
                 .load_called_module("service", text, Some(&base), session)
-                .is_none()
+                .is_some()
         }),
-        "root directories are not importable"
+        "root declarations remain available without admitting their body"
     );
 }

@@ -247,9 +247,12 @@ impl ResidualModuleResolutionError {
         let mut findings: Vec<_> = tree.module_calls().filter(|call| match self.call_source() {
             ModuleErrorCallSource::Failing(identity) => identity == call.id(),
             ModuleErrorCallSource::Owners(owners) => owners.iter().any(|identity| identity == call.id()),
-            ModuleErrorCallSource::Unavailable => false,
+            ModuleErrorCallSource::Import(_) | ModuleErrorCallSource::Unavailable => false,
         }).filter(|call| !matches!(constraint_origin, Some(ConstraintOrigin::LiveCall(identity)) if identity == call.id()))
             .map(|call| crate::parser::Located::new(call.id().module_name_location().clone(), self)).collect();
+        if let ModuleErrorCallSource::Import(location) = self.call_source() {
+            findings.push(crate::parser::Located::new(location.clone(), self));
+        }
         if let ModuleError::ReferenceType(errors) = self.0.root_cause() {
             for error in errors.iter() {
                 if let crate::validation::ExpansionBoundaryReferenceError::ModuleCall(error) = error
@@ -287,6 +290,10 @@ impl ResidualModuleResolutionError {
             ModuleError::WithProviderTypeWarnings {
                 error: _,
                 warnings: _,
+            }
+            | ModuleError::AtImport {
+                location: _,
+                error: _,
             }
             | ModuleError::OwnedByCalls { calls: _, error: _ }
             | ModuleError::AtCall { call: _, error: _ }
@@ -424,10 +431,11 @@ impl ResidualModuleResolutionError {
             ModuleError::NotADirectory { path: _path } => {
                 Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
-            ModuleError::OwnedByCalls {
-                calls: _calls,
-                error: _error,
-            } => None,
+            ModuleError::AtImport {
+                location: _,
+                error: _,
+            }
+            | ModuleError::OwnedByCalls { calls: _, error: _ } => None,
             ModuleError::AtCall {
                 call: _call,
                 error: _error,
@@ -506,7 +514,11 @@ impl ResidualModuleResolutionError {
                 self.finding_owns_error(finding)
                     && finding.message().covers_unknown_argument(module, argument)
             }),
-            ModuleError::OwnedByCalls { calls: _, error: _ } => false,
+            ModuleError::AtImport {
+                location: _,
+                error: _,
+            }
+            | ModuleError::OwnedByCalls { calls: _, error: _ } => false,
             ModuleError::AtCall { call: _, error: _ } => false,
             ModuleError::NotFound(_) | ModuleError::NoConfigurationFiles { path: _ } => false,
             ModuleError::CircularImport(_) => false,
@@ -666,7 +678,7 @@ impl ResidualModuleResolutionError {
                 .root
                 .module_call()
                 .is_some_and(|root| calls.contains(root)),
-            ModuleErrorCallSource::Unavailable => false,
+            ModuleErrorCallSource::Import(_) | ModuleErrorCallSource::Unavailable => false,
         })
     }
 }
@@ -687,6 +699,14 @@ fn without_covered_reference_type_members(
                 .filter_map(|error| without_covered_reference_type_members(error, findings))
                 .collect(),
         ),
+        ModuleError::AtImport { location, error } => {
+            without_covered_reference_type_members(*error, findings).map(|error| {
+                ModuleError::AtImport {
+                    location,
+                    error: Box::new(error),
+                }
+            })
+        }
         ModuleError::OwnedByCalls { calls, error } => {
             without_covered_reference_type_members(*error, findings).map(|error| {
                 ModuleError::OwnedByCalls {
@@ -1406,10 +1426,6 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             &self.configuration_root,
         )
         .map_err(super::loader::ModuleLoadError::into_error)?;
-        let placement_error = module
-            .import_prohibitions()
-            .cloned()
-            .map(super::loader::ModuleProhibitions::into_error);
         let mut merged = module.into_parsed();
 
         // Preserve authored value trees while this file is a reusable
@@ -1438,9 +1454,6 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         if let Some(error) = merged.expression_report().first_error() {
             return Err(ModuleError::Parse(error));
         }
-        if let Some(error) = placement_error {
-            return Err(error);
-        }
         Ok(merged)
     }
 
@@ -1463,7 +1476,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
                     .filter(|call| call.module_name == import.alias)
                     .map(|call| call.id().clone())
                     .collect();
-                error.with_owning_calls(owning_calls)
+                error.with_import_owners(import.declaration_location().clone(), owning_calls)
             })?;
             self.imported_modules.insert(import.alias.clone(), module);
             self.module_paths
@@ -1491,7 +1504,12 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
                         .filter(|call| call.module_name == import.alias)
                         .map(|call| call.id().clone())
                         .collect();
-                    errors.push(error.with_owning_calls(owning_calls));
+                    errors.push(
+                        error.with_import_owners(
+                            import.declaration_location().clone(),
+                            owning_calls,
+                        ),
+                    );
                 }
             }
         }
@@ -2159,19 +2177,6 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase<ParserPlace
 }
 
 pub fn resolve_modules_with_diagnostics_and_overrides<
-    E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
->(
-    parsed: AdmittedRootDirectory<'_, E>,
-    base_dir: &ResolvedPath,
-    covered_findings: &[crate::validation::ModuleCallFinding],
-    overrides: &crate::config_loader::SourceOverrides,
-) -> ModuleResolutionReport<E::Absolute> {
-    resolve_modules_with_import_diagnostics(parsed, base_dir, covered_findings, overrides)
-}
-
-/// Compatibility entry point: every diagnostic resolver now retains the
-/// complete loader-owned prohibition set and its per-finding evidence.
-pub fn resolve_modules_with_all_import_diagnostics_and_overrides<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
 >(
     parsed: AdmittedRootDirectory<'_, E>,

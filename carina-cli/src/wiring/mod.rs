@@ -122,7 +122,7 @@ use carina_core::hint::ProjectCommand;
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
-use carina_core::module_resolver::{self, ModuleProhibition};
+use carina_core::module_resolver;
 use carina_core::name_override::{NameOverride, NameOverrideSource};
 use carina_core::parser::{
     ExpandedFile, ExpandedInferredExportParam, ExpandedInferredFile, ExpandedProviderConfig,
@@ -5293,42 +5293,14 @@ pub(crate) fn validate_module_internal_ref_types(
     }
 }
 
-/// Consume the loader's complete prohibition sets without rechecking bodies.
-/// Keep the established CLI order: rejected directories, then each loaded-body
-/// category across the depth-first module walk.
+/// Present the loader's prohibition sets in depth-first directory order.
+/// Prohibited bodies never enter the static validation walk.
 pub(crate) fn validate_module_boundaries(module_walk: &ModuleWalk) -> Vec<AppError> {
-    let mut errors = module_walk
+    module_walk
         .rejections()
         .iter()
         .map(crate::module_walk::RejectedModuleAtPath::diagnostic)
-        .collect::<Vec<_>>();
-    let mut body = module_walk
-        .iter()
-        .flat_map(|module| {
-            module
-                .loaded()
-                .import_prohibitions()
-                .into_iter()
-                .flat_map(move |prohibitions| {
-                    prohibitions
-                        .iter()
-                        .map(move |prohibition| (module, prohibition))
-                })
-        })
-        .collect::<Vec<_>>();
-    body.sort_by_key(|(_, prohibition)| match prohibition {
-        ModuleProhibition::Provider { evidence: _ } => 0,
-        ModuleProhibition::Backend { evidence: _ } => 1,
-        ModuleProhibition::State => 2,
-        ModuleProhibition::UpstreamState => 3,
-        ModuleProhibition::Exports => 4,
-    });
-    errors.extend(
-        body.into_iter().map(|(module, prohibition)| {
-            module.import_diagnostic(prohibition.clone().into_error())
-        }),
-    );
-    errors
+        .collect()
 }
 
 pub(crate) async fn get_provider_with_ctx(

@@ -449,7 +449,7 @@ impl CompletionProvider {
                     &self.schemas,
                 ),
         };
-        match carina_core::module_resolver::load_module_with_diagnostics_and_schemas(
+        match carina_core::module_resolver::load_module_signature_with_schemas(
             &module_path,
             &provider_context,
             &self.schemas,
@@ -460,6 +460,7 @@ impl CompletionProvider {
             | Err(carina_core::module_resolver::ModuleLoadError::NotModule {
                 error: _,
                 imports: _,
+                signature: _,
             }) => None,
         }
     }
@@ -668,8 +669,13 @@ impl CompletionProvider {
         if let Some(path) = import_path.as_deref()
             && let Some(base) = base_path
             && let Ok(module_path) = base.join(path)
-            && let Ok(parsed) =
-                carina_core::module_resolver::load_module(&module_path, provider_ctx)
+            && let Ok(parsed) = carina_core::module_resolver::load_module_signature_with_schemas(
+                &module_path,
+                provider_ctx,
+                &self.schemas,
+                &module_path.source_label(),
+            )
+            .map(|source| source.parsed().clone())
             && !parsed.arguments.is_empty()
         {
             let mut snippet = format!("{} {{\n", binding);

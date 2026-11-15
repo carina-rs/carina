@@ -947,58 +947,6 @@ impl DiagnosticRun<'_> {
         // substituted for its on-disk copy so diagnostics update on
         // keystrokes.
         let merged_attempt = base_path.map(|base| self.parse_merged_with_buffer(base, &overrides));
-        // A failed semantic parse can still have a complete declaration
-        // inventory. Admit that snapshot before any source-oriented consumer,
-        // then reuse its judged file for placement and expression reporting.
-        let recovery_configuration = match (
-            merged_attempt.as_ref(),
-            doc.parsed_buffer(),
-            buffer_analysis.as_ref(),
-        ) {
-            (Some(Ok(_)), _, _) | (_, None, _) | (_, _, None) => None,
-            (Some(Err(_)) | None, Some(buffer), Some(_)) => {
-                let isolated = || {
-                    carina_core::config_loader::load_buffer_configuration_without_directory(
-                        buffer,
-                        &self.schemas,
-                        self.provider_context,
-                    )
-                };
-                Some(match base_path {
-                    Some(base) => {
-                        match carina_core::config_loader::DirectoryBufferSnapshot::capture(
-                            base,
-                            buffer.clone(),
-                            &overrides,
-                        ) {
-                            Ok(snapshot) => {
-                                carina_core::config_loader::load_buffer_configuration_in_directory(
-                                    snapshot,
-                                    &self.schemas,
-                                    self.provider_context.catalog(),
-                                )
-                            }
-                            Err(error) => {
-                                log::debug!(
-                                    "using isolated buffer after directory capture failures: {error}"
-                                );
-                                isolated()
-                            }
-                        }
-                    }
-                    None => isolated(),
-                })
-            }
-        };
-        let buffer_parsed = recovery_configuration
-            .as_ref()
-            .map(|configuration| configuration.parsed())
-            .or(buffer_parsed);
-        let buffer_analysis = if recovery_configuration.is_some() {
-            buffer_parsed.and_then(|parsed| analysis_tree(doc, parsed, &mut diagnostics))
-        } else {
-            buffer_analysis
-        };
         let duplicates = match merged_attempt
             .as_ref()
             .and_then(|attempt| attempt.as_ref().ok())
@@ -1488,18 +1436,50 @@ impl DiagnosticRun<'_> {
                 }
             }
             let pre_expansion_input = merged.unwrap_or(parsed);
-            let fallback_configuration;
-            let pre_expansion_configuration =
-                if let Some(configuration) = recovery_configuration.as_ref() {
-                    configuration
-                } else {
-                    fallback_configuration = carina_core::config_loader::load_buffer_configuration(
-                        carina_core::config_loader::issue_buffer_configuration(pre_expansion_input),
-                        &self.schemas,
-                        self.provider_context.catalog(),
-                    );
-                    &fallback_configuration
-                };
+            // Recovery is needed only for issued placement/expression checks.
+            // Ordinary buffer checks above retain the original AnalysisTree.
+            let recovery_snapshot = if let (None, Some(base), Some(buffer)) =
+                (merged, base_path, doc.parsed_buffer())
+            {
+                carina_core::config_loader::DirectoryBufferSnapshot::capture(
+                    base,
+                    buffer.clone(),
+                    &overrides,
+                )
+                .ok()
+            } else {
+                None
+            };
+            let pre_expansion_configuration = if let Some(snapshot) = recovery_snapshot {
+                carina_core::config_loader::load_buffer_configuration_in_directory(
+                    snapshot,
+                    &self.schemas,
+                    self.provider_context.catalog(),
+                )
+            } else {
+                carina_core::config_loader::load_buffer_configuration(
+                    carina_core::config_loader::issue_buffer_configuration(pre_expansion_input),
+                    &self.schemas,
+                    self.provider_context.catalog(),
+                )
+            };
+            if merged.is_none()
+                && let Some(directory) = pre_expansion_configuration
+                    .parsed()
+                    .parser_binding_metadata
+                    .syntax()
+                    .issued_directory()
+            {
+                for diagnostic in self.configuration_placement_diagnostics(
+                    doc,
+                    directory,
+                    carina_core::validation::is_module_definition(pre_expansion_input),
+                ) {
+                    if !diagnostics.contains(&diagnostic) {
+                        diagnostics.push(diagnostic);
+                    }
+                }
+            }
             let expression_report = pre_expansion_configuration.judged().report();
             for finding in expression_report.findings() {
                 let root = finding.detail().require_outside_module();
