@@ -41,7 +41,8 @@ fn projection_selection_case(ambiguous: bool) {
         owner,
         Some(&source),
         if ambiguous { &authored } else { &source },
-    );
+    )
+    .0;
     if ambiguous {
         assert!(
             matches!(result, ResourceProjection::Ambiguous),
@@ -63,6 +64,53 @@ fn semantic_projection_miss_never_uses_merged_values() {
 #[test]
 fn semantic_projection_ambiguity_never_uses_first_source() {
     projection_selection_case(true);
+}
+
+#[test]
+fn semantic_projection_missing_owner_publishes_evidence_failure() {
+    projection_failure_is_visible(false);
+}
+
+#[test]
+fn semantic_projection_ambiguous_owner_publishes_evidence_failure() {
+    projection_failure_is_visible(true);
+}
+
+fn projection_failure_is_visible(ambiguous: bool) {
+    let doc = create_document("mock.Test { input = 'authored' }");
+    let public = doc.for_diagnostics().unwrap();
+    let tree = carina_core::parser::AnalysisTree::try_from_file(doc.parsed().unwrap()).unwrap();
+    let owner = tree.resources().next().unwrap();
+    let projection = if ambiguous {
+        ResourceProjection::<RelativeBindingName>::Ambiguous
+    } else {
+        ResourceProjection::NoMatch
+    };
+    let mut diagnostics = Vec::new();
+    assert!(
+        projection_or_diagnostic(
+            &public,
+            owner.id(),
+            owner.type_location(),
+            projection,
+            &mut diagnostics,
+        )
+        .is_none()
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "missing correspondence must fail closed"
+    );
+    assert_eq!(
+        diagnostics[0].message,
+        carina_core::parser::retained::MissingEvidence::for_resource(owner.id()).to_string()
+    );
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 0), Position::new(0, 9))
+    );
 }
 
 #[test]
@@ -100,7 +148,7 @@ fn semantic_projection_analysis_failure_keeps_main_silence() {
     let semantic = semantic_tree_for_values(&invalid);
     assert!(semantic.is_none());
     let authored = carina_core::parser::AnalysisTree::try_from_file(&authored).unwrap();
-    match select_resource_projection(owner, semantic.as_ref(), &authored) {
+    match select_resource_projection(owner, semantic.as_ref(), &authored).0 {
         ResourceProjection::Matched(projection) => assert_eq!(
             projection.values()["input"],
             carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(

@@ -181,11 +181,31 @@ fn semantic_tree_for_values<'f>(
     carina_core::parser::AnalysisTree::try_from_file(file).ok()
 }
 
+fn projection_or_diagnostic<B: BindingAddress>(
+    doc: &Document,
+    id: &carina_core::resource::ResourceId,
+    location: &carina_core::parser::DeclarationLocation,
+    projection: ResourceProjection<B>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<carina_core::identifier::MatchedResourceProjection<B>> {
+    admission_or_diagnostic(
+        doc,
+        location,
+        match projection {
+            ResourceProjection::Matched(projection) => Ok(Some(projection)),
+            ResourceProjection::NoMatch | ResourceProjection::Ambiguous => {
+                Err(carina_core::parser::retained::MissingEvidence::for_resource(id))
+            }
+        },
+        diagnostics,
+    )
+}
+
 fn select_resource_projection<X, D>(
     owner: &CanonicalResource<'_, X, D, RelativeBindingName>,
     semantic: Option<&carina_core::parser::AnalysisTree<'_>>,
     authored: &carina_core::parser::AnalysisTree<'_>,
-) -> ResourceProjection<RelativeBindingName>
+) -> (ResourceProjection<RelativeBindingName>, bool)
 where
     D: carina_core::parser::DeferredForPhaseTraversal<
             ParserPlaceholder,
@@ -194,13 +214,15 @@ where
         >,
 {
     match semantic.map(|source| owner.project_values(source)) {
-        Some(ResourceProjection::Matched(projection)) => ResourceProjection::Matched(projection),
+        Some(ResourceProjection::Matched(projection)) => {
+            (ResourceProjection::Matched(projection), true)
+        }
         // A duplicate source occurrence cannot be repaired by choosing a
         // different view. Existing parser/declaration checks own its findings.
-        Some(ResourceProjection::Ambiguous) => ResourceProjection::Ambiguous,
+        Some(ResourceProjection::Ambiguous) => (ResourceProjection::Ambiguous, false),
         // Main used the buffer's values when the per-file semantic view was
         // unavailable or had no corresponding resource. Never use merged values.
-        Some(ResourceProjection::NoMatch) | None => owner.project_values(authored),
+        Some(ResourceProjection::NoMatch) | None => (owner.project_values(authored), false),
     }
 }
 
@@ -769,6 +791,8 @@ impl DiagnosticRun<'_> {
         doc: &Document,
         rref: &CanonicalResource<'_, X, D, B>,
         resource_attributes: &CanonicalAttributeValues<ParserPlaceholder, B>,
+        evaluated_buffer_attributes: Option<&CanonicalAttributeValues<ParserPlaceholder, B>>,
+        has_semantic_values: bool,
         authored_calls: &HashSet<String>,
         expression_report: &carina_core::parser::retained::ExpressionReport<B>,
         outcome: carina_core::validation::admission::attributes::ResourceAdmissionOutcome<B>,
@@ -836,8 +860,39 @@ impl DiagnosticRun<'_> {
                     continue;
                 }
             };
-            let attr_value = authored_attr_value;
-            let typecheck_value = attr_value;
+            // Preserve main's two value views: admission uses the per-file
+            // semantic projection, while call guidance can use the separately
+            // evaluated buffer (including env()'s diagnostic sensitivity).
+            let attr_value = if authored_has_function_call {
+                has_semantic_values
+                    .then_some(authored_attr_value)
+                    .filter(|_| {
+                        validated_schema
+                            .effective_attribute_by_authored_name(attr_name)
+                            .is_some_and(|attribute| {
+                                let sink = carina_core::validation::expression_sink_type(
+                                    attribute.field_type(),
+                                    validated_schema.owner(),
+                                    validated_schema.schema().as_schema().defs(),
+                                );
+                                let expression = judged_expression
+                                    .for_sink(&sink, self.provider_context.catalog());
+                                expression.is_single_string_construction()
+                                    || expression.has_constructed_members()
+                            })
+                    })
+                    .or_else(|| {
+                        evaluated_buffer_attributes.and_then(|values| values.get(attr_name))
+                    })
+                    .unwrap_or(authored_attr_value)
+            } else {
+                authored_attr_value
+            };
+            let typecheck_value = if has_semantic_values {
+                authored_attr_value
+            } else {
+                attr_value
+            };
             // Resolve block_name to canonical attribute name
             let canonical_name = bn_map
                 .get(attr_name)
@@ -2401,6 +2456,24 @@ impl DiagnosticRun<'_> {
             let semantic_tree = current_file_path
                 .and_then(|path| directory.as_ref()?.semantic_file(path))
                 .and_then(semantic_tree_for_values);
+            // Main evaluates a separate buffer copy for function-call display;
+            // folding directory references into admission would change wording.
+            let evaluated_buffer = match carina_core::parser::resolve_resource_refs_from_analysis(
+                tree,
+                self.provider_context,
+            ) {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    if matches!(&error, carina_core::parser::AnalysisResolutionError::Diagnostic(finding)
+                        if matches!(finding.detail(), ParseError::SecretDerivedBackendAttribute { .. }))
+                    {
+                        diagnostics.extend(render_analysis_resolution_error(doc, &error));
+                    }
+                    None
+                }
+            };
+            let evaluated_buffer_tree =
+                evaluated_buffer.as_ref().and_then(semantic_tree_for_values);
             // Syntax correspondence is checked against the document's own
             // parser locations, even when its source label cannot bind an owner
             // in the canonical directory view.
@@ -2527,19 +2600,21 @@ impl DiagnosticRun<'_> {
                     .filter(|resource| resource.location().file().path() == doc.source_file())
                 {
                     let key = rref.authored_instance_key();
-                    let authored_calls = match rref.project_values(tree) {
-                        ResourceProjection::Matched(source) => source
-                            .values()
-                            .iter()
-                            .filter(|(_, value)| carina_core::parser::contains_function_call(value))
-                            .map(|(name, _)| name.clone())
-                            .collect::<HashSet<_>>(),
-                        // Main had no resource to render without an authored
-                        // declaration. Core matches unique deferred templates
-                        // for instances materialized only in the merged view.
-                        ResourceProjection::NoMatch => continue,
-                        ResourceProjection::Ambiguous => continue,
+                    let Some(authored_source) = projection_or_diagnostic(
+                        doc,
+                        rref.id(),
+                        rref.type_location(),
+                        rref.project_values(tree),
+                        &mut diagnostics,
+                    ) else {
+                        continue;
                     };
+                    let authored_calls = authored_source
+                        .values()
+                        .iter()
+                        .filter(|(_, value)| carina_core::parser::contains_function_call(value))
+                        .map(|(name, _)| name.clone())
+                        .collect::<HashSet<_>>();
                     let uses_composition_output = rref.references().iter().any(|reference| {
                         pre_expansion_input.module_calls.iter().any(|call| {
                             call.binding_name.as_ref().is_some_and(|binding| {
@@ -2592,6 +2667,8 @@ impl DiagnosticRun<'_> {
                                 doc,
                                 owner,
                                 &owner.values(),
+                                None,
+                                true,
                                 &authored_calls,
                                 inputs.configuration.report(),
                                 outcome,
@@ -2605,12 +2682,32 @@ impl DiagnosticRun<'_> {
                     } else {
                         #[cfg(feature = "test-utils")]
                         replay_coverage::reached(AdmissionPath::Relative);
-                        let values =
-                            match select_resource_projection(rref, semantic_tree.as_ref(), tree) {
-                                ResourceProjection::Matched(projection) => projection.into_values(),
-                                ResourceProjection::NoMatch => continue,
-                                ResourceProjection::Ambiguous => continue,
+                        let (projection, has_semantic_values) =
+                            select_resource_projection(rref, semantic_tree.as_ref(), tree);
+                        let Some(projection) = projection_or_diagnostic(
+                            doc,
+                            rref.id(),
+                            rref.type_location(),
+                            projection,
+                            &mut diagnostics,
+                        ) else {
+                            continue;
+                        };
+                        let values = projection.into_values();
+                        let evaluated_values = if let Some(source) = &evaluated_buffer_tree {
+                            let Some(projection) = projection_or_diagnostic(
+                                doc,
+                                rref.id(),
+                                rref.type_location(),
+                                rref.project_values(source),
+                                &mut diagnostics,
+                            ) else {
+                                continue;
                             };
+                            Some(projection.into_values())
+                        } else {
+                            None
+                        };
                         let inputs = select_admission_inputs(
                             rref,
                             &values,
@@ -2622,7 +2719,7 @@ impl DiagnosticRun<'_> {
                         match carina_core::validation::admission::attributes::ResourceAdmissionRequest::new(rref, rref.quoted_string_attrs(), inputs, ValidationEvaluation::relative_static(), &binding_index, self.provider_context) {
                             Ok(request) => {
                                 let outcome = conversion_validation.admit_resource(request);
-                                self.render_resource_admission(doc, rref, &values, &authored_calls, expression_report, outcome, &binding_error_sinks, &pending_resource_sinks, &provider_validation_deduplicator, &prior_diagnostics, &mut diagnostics);
+                                self.render_resource_admission(doc, rref, &values, evaluated_values.as_ref(), has_semantic_values, &authored_calls, expression_report, outcome, &binding_error_sinks, &pending_resource_sinks, &provider_validation_deduplicator, &prior_diagnostics, &mut diagnostics);
                             }
                             Err(error) => diagnostics.extend(render_merged(doc, &carina_core::parser::Located::new(rref.type_location().clone(), ()), DiagnosticSeverity::ERROR, error.to_string())),
                         }
