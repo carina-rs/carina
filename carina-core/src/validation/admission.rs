@@ -62,12 +62,6 @@
 //! fn forge() -> PlacedValue<ResourceAttribute> { PlacedValue { inner: unreachable!() } }
 //! ```
 //!
-//! ```
-//! use carina_core::{parser::ProviderContext, resource::ResourceId, schema::SchemaRegistry};
-//! fn descriptor(registry: &SchemaRegistry, id: &ResourceId, catalog: &ProviderContext) {
-//!     let _ = registry.resource_attribute_destination(id, "value", catalog);
-//! }
-//! ```
 //! ```compile_fail,E0451
 //! use carina_core::validation::admission::{Destination, kind::ResourceAttribute};
 //! fn forge() -> Destination<ResourceAttribute> {

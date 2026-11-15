@@ -672,12 +672,9 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         | ParseError::SecretDerivedBackendAttribute { .. }
         | ParseError::InterpolationNotAllowedInLiteralString { .. }
         | ParseError::InvalidResourceIdentity { .. }
-        | ParseError::UndefinedVariable(_)
         | ParseError::InvalidResourceType(_)
-        | ParseError::DuplicateModule(_)
         | ParseError::DuplicateBinding { .. }
         | ParseError::UndefinedIdentifier { .. }
-        | ParseError::ModuleNotFound(_)
         | ParseError::InternalError { .. }
         | ParseError::RecursiveFunction(_)
         | ParseError::CyclicLetBinding { .. }

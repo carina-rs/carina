@@ -262,10 +262,6 @@ impl<'a, B: BindingAddress> RuntimeTypeInput<'a, B> {
     pub(crate) fn value(&self) -> &'a Value<NoPlaceholder, B> {
         self.value
     }
-    #[cfg(test)]
-    pub(crate) fn computed_for_test(value: &'a Value<NoPlaceholder, B>) -> Self {
-        Self { value }
-    }
 }
 
 /// Infer with the same provider catalog that owns the binding/type check.

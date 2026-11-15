@@ -1,5 +1,6 @@
 use crate::binding_index::BindingIndex;
 use crate::schema::AttributeType as DraftType;
+use crate::validation::admission::{kind, tests::selected_destination};
 use crate::validation::named_annotation_tests::{identity, member, snapshot};
 use crate::validation::{deferred_types, resolve_file_type_exprs_report};
 use std::{collections::HashMap, sync::Arc};
@@ -22,10 +23,19 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
     .unwrap()
     .resolve_root_for_test();
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
-    let destination = snapshot
-        .schema_registry()
-        .resource_attribute_destination(&parsed.resources[1].id, "value1", context)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        snapshot
+            .schema_registry()
+            .get(
+                &parsed.resources[1].id.provider,
+                &parsed.resources[1].id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &parsed.resources[1].id,
+        "value1",
+        context,
+    );
     deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
         let reference = crate::resource::Value::root_resource_ref("source", "value0", vec![]);
         let (candidate, boundary) = Candidate::validation_classified(
@@ -101,10 +111,19 @@ fn round12_unknown_function_return_rechecks_destination_member_at_resolution() {
     .unwrap();
     let parsed = authored.resolve_root_for_test();
     let bindings = BindingIndex::from_parsed(&parsed, loaded.schema_registry(), context);
-    let destination = loaded
-        .schema_registry()
-        .resource_attribute_destination(&parsed.resources[1].id, "value1", context)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        loaded
+            .schema_registry()
+            .get(
+                &parsed.resources[1].id.provider,
+                &parsed.resources[1].id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &parsed.resources[1].id,
+        "value1",
+        context,
+    );
     for (length, accepted) in [(7, true), (20, false)] {
         let value = crate::resource::Value::Deferred(
             crate::resource::DeferredValue::ResolvedFunctionCall {

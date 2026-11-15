@@ -220,10 +220,6 @@ impl ResolvedUpstreamSource {
     pub fn upstream_states(&self) -> &[UpstreamState<RelativeBindingName>] {
         &self.upstream_states
     }
-    pub fn unavailable_reason(&self) -> Option<&str> {
-        self.surface.entries.as_ref().err().map(String::as_str)
-    }
-
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(binding: impl Into<String>, entries: Option<&UpstreamExportEntries>) -> Self {
         Self {
@@ -234,9 +230,7 @@ impl ResolvedUpstreamSource {
             backend: None,
             upstream_states: vec![],
             surface: SourceSurface {
-                entries: entries
-                    .cloned()
-                    .ok_or_else(|| "test fixture has no source surface".into()),
+                entries: entries.cloned(),
             },
         }
     }
@@ -244,7 +238,7 @@ impl ResolvedUpstreamSource {
 
 #[derive(Debug, Clone)]
 struct SourceSurface {
-    entries: Result<UpstreamExportEntries, String>,
+    entries: Option<UpstreamExportEntries>,
 }
 
 /// Discover admission authority from an actual loader-owned source snapshot.
@@ -256,18 +250,18 @@ fn resolve_upstream_source_surface(
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<SourceSurface, crate::parser::AnalysisTreeError> {
     let entries = match loaded.upstream_export_source(context.catalog(), schemas) {
-        Ok(parsed) => match resolve_upstream_exports_from_parsed(
+        Some(parsed) => match resolve_upstream_exports_from_parsed(
             parsed,
             source,
             context,
             Some(schemas),
             &Default::default(),
         ) {
-            Ok(entries) => Ok(entries),
+            Ok(entries) => Some(entries),
             Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
-            Err(reason) => Err(reason.to_string()),
+            Err(_) => None,
         },
-        Err(reason) => Err(reason),
+        None => None,
     };
     Ok(SourceSurface { entries })
 }

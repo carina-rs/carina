@@ -6320,14 +6320,18 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         "module argument must validate"
     );
 
-    crate::test_utils::ordinary_sink_findings_for_test(validate_attribute_params(
-        &[AttributeParameter::dummy(
-            "mode".to_string(),
-            Some(schema_type.clone()),
-            Some(authored()),
-        )],
-        &config,
-    ))
+    crate::test_utils::ordinary_sink_findings_for_test(
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            validate_attribute_params_with_context(
+                &[AttributeParameter::dummy(
+                    "mode".to_string(),
+                    Some(schema_type.clone()),
+                    Some(authored()),
+                )],
+                session,
+            )
+        }),
+    )
     .expect("attribute parameter must validate");
 
     let exports = [RuntimeInferredExportParam {
@@ -7076,7 +7080,6 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
             crate::schema::RefinedScalarKind::String,
         ),
     ]));
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas, &context);
 
     let call = ModuleCall::test(
         "consumer".to_string(),
@@ -7111,12 +7114,13 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         },
     )]);
 
-    let errors = validate_module_call_argument_ref_types_with_bindings(
-        &[call],
-        &imported_modules,
-        &HashSet::new(),
-        &bindings,
-    );
+    parsed.module_calls.push(call);
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas, &context);
+    let errors =
+        validate_expansion_boundary_ref_types_with_bindings(&parsed, &imported_modules, &bindings)
+            .err()
+            .map(|errors| errors.errors)
+            .unwrap_or_default();
 
     assert_eq!(
         errors.len(),
@@ -7150,11 +7154,6 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
     parsed
         .resources
         .push(Resource::with_provider("mock", "counter", "source", None).with_binding("source"));
-    let bindings = crate::binding_index::BindingIndex::from_parsed(
-        &parsed,
-        &schemas,
-        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
     let call = ModuleCall::test(
         "consumer".to_string(),
         None,
@@ -7178,12 +7177,14 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         },
     )]);
 
-    let errors = validate_module_call_argument_ref_types_with_bindings(
-        &[call],
-        &imported_modules,
-        &HashSet::new(),
-        &bindings,
-    );
+    parsed.module_calls.push(call);
+    let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas, &context);
+    let errors =
+        validate_expansion_boundary_ref_types_with_bindings(&parsed, &imported_modules, &bindings)
+            .err()
+            .map(|errors| errors.errors)
+            .unwrap_or_default();
 
     assert!(
         errors.is_empty(),
@@ -7655,7 +7656,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            check_export_values_pre_apply_providerless(
+            check_export_values_pre_apply(
                 std::slice::from_ref(&builtin),
                 &ResolvedBindings::default(),
                 session,
@@ -7692,7 +7693,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            check_export_values_pre_apply_providerless(
+            check_export_values_pre_apply(
                 std::slice::from_ref(&custom),
                 &ResolvedBindings::default(),
                 session,
@@ -7720,7 +7721,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            check_export_values_pre_apply_providerless(
+            check_export_values_pre_apply(
                 std::slice::from_ref(&builtin_custom),
                 &ResolvedBindings::default(),
                 session,
@@ -10541,7 +10542,7 @@ fn composition_error_identity_survives_symlink_retarget() {
 fn deferred_loop_placeholder_access_checks_after_materialization() {
     use crate::resource::{AccessMissPolicy, LoopSlot, PathSegment, apply_postfix_access};
     let parsed = ParsedFile::default();
-    let schemas = SchemaRegistry::new();
+    let mut schemas = SchemaRegistry::new();
     let provider = crate::parser::LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
     let inference = crate::parser::retained::value_dependent_judgement_for_test();
@@ -10571,6 +10572,15 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
         ),
         Ok(())
     );
+    schemas.insert(
+        "test",
+        PatternResourceSchema::new("Sink")
+            .attribute(
+                PatternAttributeSchema::optional("action", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
     for (action, assignable) in [
         (Value::Concrete(ConcreteValue::String("part".into())), true),
         (Value::Concrete(ConcreteValue::Int(42)), false),
@@ -10585,17 +10595,25 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
             AccessMissPolicy::Defer,
         )
         .unwrap();
-        let materialized = materialized.into_expanded().unwrap();
-        let result = check_runtime_value_type(
-            inference::RuntimeTypeInput::computed_for_test(&materialized),
-            crate::schema::TypeInSchema::schemaless(&expected).with_authority(
-                crate::schema::assignment_catalog_without_edges_for_test(),
-                crate::schema::SinkAuthority::Owner(&TEST_OWNER),
-            ),
-            &inference::InferenceBindings::new(),
-            &schemas,
-            &index,
-        );
+        let materialized = materialized
+            .resolve_root(&RootScope::new())
+            .into_expanded()
+            .unwrap();
+        let resource = crate::resource::Resource::<
+            crate::resource::ModuleSource,
+            crate::resource::NoPlaceholder,
+        >::with_provider("test", "Sink", "materialized", None)
+        .with_attribute("action", materialized);
+        let result =
+            crate::validation::deferred_types::with_session_for_test(&provider, |session| {
+                admission::attributes::admit_apply_resource(
+                    &resource,
+                    None,
+                    schemas.get_for(&resource).unwrap(),
+                    &crate::binding_index::ResolvedBindings::default(),
+                    session,
+                )
+            });
         assert_eq!(
             result.is_ok(),
             assignable,
