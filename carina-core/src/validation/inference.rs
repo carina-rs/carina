@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::parser::{ExportParamLike, TypeExpr};
 use crate::provider::ProviderLoadedSchemaRegistry;
-use crate::resource::{BindingAddress, NoPlaceholder, PlaceholderKind, RelativeBindingName, Value};
+use crate::resource::{BindingAddress, PlaceholderKind, RelativeBindingName};
 use crate::schema::{
     AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
     SchemaRegistry,
@@ -32,28 +32,22 @@ use crate::static_type::{
 ///
 /// `Virtual` records the attributes exposed by an expanded module call's
 /// composition resource. The retained judge checks attribute names against
-/// this map and derives their types from authored module-output evidence
+/// this set and derives their types from authored module-output evidence
 /// (#2493).
 #[derive(Debug, Clone)]
-pub enum InferenceBinding<
-    P: PlaceholderKind = NoPlaceholder,
-    B: BindingAddress = RelativeBindingName,
-> {
+pub enum InferenceBinding {
     Resource {
         provider: String,
         resource_type: String,
     },
     UpstreamState,
     Virtual {
-        attributes: indexmap::IndexMap<String, Value<P, B>>,
+        attributes: indexmap::IndexSet<String>,
     },
-    /// Module-call binding registered before module expansion.
-    /// Inference treats it like `UpstreamState` (known-but-non-
-    /// inferable) so a downstream `${<call>.<attr>}` doesn't fire a
-    /// false `unknown binding` at load time. Post-expansion the
-    /// matching `Virtual` resource lands in `parsed.resources` and
-    /// `bindings_from_parts` overwrites this entry with a `Virtual`
-    /// that can actually project to a `TypeExpr`. #2493.
+    /// Module-call binding registered before expansion. The retained judge
+    /// recognizes the name but needs authored module-output evidence to
+    /// derive attribute types. After expansion, [`bindings_from_parts`]
+    /// classifies the composition as `Virtual`. #2493.
     ModuleCall,
     /// A value parameter declared by an `arguments {}` block. Parser-side
     /// expressions carry a `Placeholder(ModuleArgument)` until the
@@ -66,15 +60,14 @@ pub enum InferenceBinding<
     UserFunction,
 }
 
-pub type InferenceBindings<P = NoPlaceholder, B = RelativeBindingName> =
-    HashMap<String, InferenceBinding<P, B>>;
+pub type InferenceBindings = HashMap<String, InferenceBinding>;
 
 /// Build an [`InferenceBindings`] map from a `ParsedFile`. Convenience
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
 pub fn bindings_from_parsed<E, P, T, D, B>(
     parsed: &crate::parser::File<E, P, T, D, B>,
-) -> InferenceBindings<P, B>
+) -> InferenceBindings
 where
     P: PlaceholderKind + PartialEq,
     T: PlaceholderKind,
@@ -90,14 +83,11 @@ where
         &parsed.compositions,
         &parsed.upstream_states,
     );
-    // Pre-expansion (load_configuration), `parsed.resources` does not
-    // yet hold the `Virtual` resources that `expand_module_call`
-    // synthesises for each module-call binding. Register the binding
-    // names here as `ModuleCall` so a downstream
-    // `${<call>.<attr>}` reference is treated as known-but-non-
-    // inferable (mirroring `upstream_state`) instead of falsely
-    // flagged as `unknown binding`. Post-expansion the `Virtual` arm
-    // takes over and resolves the type properly. #2493.
+    // Before module expansion, calls have no composition entries. Register
+    // their names as `ModuleCall` so the retained judge recognizes them
+    // before output evidence is available. After expansion,
+    // `bindings_from_parts` classifies the compositions as `Virtual`, and
+    // authored module-output judgements supply their attribute types. #2493.
     for call in &parsed.module_calls {
         if let Some(name) = &call.binding_name
             && !out.contains_key(name.as_str())
@@ -125,8 +115,8 @@ where
 ///
 /// Both resource bindings (`let <name> = <provider>.<resource> { ... }`)
 /// and `upstream_state` bindings (`let <name> = upstream_state { ... }`)
-/// are included; the latter are tagged so the inferer can distinguish
-/// "known but non-inferable" from a typo.
+/// are included, so the retained judge can distinguish a known external
+/// binding from an unknown name.
 ///
 /// Insert order is upstream-states first, resources second, so a
 /// resource binding wins on collision with an `upstream_state` of the
@@ -142,7 +132,7 @@ pub fn bindings_from_parts<S, P: PlaceholderKind + PartialEq, B: BindingAddress>
     data_sources: &[crate::resource::DataSource<S, P, B>],
     compositions: &[crate::resource::LiveComposition<P, B>],
     upstream_states: &[crate::parser::UpstreamState<B>],
-) -> InferenceBindings<P, B> {
+) -> InferenceBindings {
     let mut out = InferenceBindings::new();
     for us in upstream_states {
         out.insert(us.binding.to_string(), InferenceBinding::UpstreamState);
@@ -187,7 +177,8 @@ pub fn bindings_from_parts<S, P: PlaceholderKind + PartialEq, B: BindingAddress>
                     .signature
                     .attributes
                     .iter()
-                    .filter_map(|(k, attr)| attr.value().map(|value| (k.clone(), value)))
+                    .filter(|(_, attr)| attr.handle().is_none())
+                    .map(|(name, _)| name.clone())
                     .collect(),
             },
         );
@@ -337,11 +328,11 @@ fn inferred_scalar_kind(
     })
 }
 
-pub(crate) fn infer_declared_reference_type<P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn infer_declared_reference_type(
     binding: &str,
     attribute: &str,
     segments: &[crate::resource::PathSegment],
-    bindings: &InferenceBindings<P, B>,
+    bindings: &InferenceBindings,
     schemas: &SchemaRegistry,
 ) -> Result<TypeExpr, InferenceIssue> {
     match bindings.get(binding) {
@@ -1621,10 +1612,8 @@ mod tests {
 
     #[test]
     fn resource_ref_subscript_on_list_peels_one_layer() {
-        // `vpc.subnets[0]` against `subnets: List<String>` infers `String`,
-        // not `List<String>`. Without subscript handling the inferer
-        // would type the value as the collection itself and a
-        // downstream `: String` receiver would spuriously reject.
+        // Retained judgement follows `[0]` into the schema collection:
+        // `vpc.subnets[0]` against `subnets: List<String>` yields `String`.
         let list_str = PatternAttributeType::list(PatternAttributeType::string());
         let schema = PatternResourceSchema::new("ec2.Vpc")
             .attribute(PatternAttributeSchema::optional("subnets", list_str).build());
@@ -2058,19 +2047,10 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
 
     #[test]
     fn apply_inference_resolves_module_call_attribute_via_virtual_binding() {
-        // #2493: an `exports` value referencing `<module_call>.<attr>`
-        // (e.g. `role_arn = github_actions_carina.role_arn` where
-        // `let github_actions_carina = github_module {...}`) must
-        // retain the inner attribute's exact schema projection, including
-        // callback provenance. The module's `attributes { role_arn =
-        // role.arn }` block lets the type be inferred transitively
-        // through the module-call's composition resource (post-expansion)
-        // and the inner role's schema attribute.
-        //
-        // Pre-#2493 the inference walked `parsed.resources` only, missed
-        // the `Virtual` binding (which post-expansion exposes the
-        // module's attribute set), and surfaced a misleading
-        // "unknown binding" diagnostic.
+        // #2493: expanded module-output judgements must retain the inner
+        // schema attribute's exact type and callback provenance for exports.
+        // The composition registers its attribute names; retained judgement
+        // follows the authored module output to `role.vpc_id`.
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("child")).unwrap();
         std::fs::write(
@@ -2108,15 +2088,11 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
 
     #[test]
     fn apply_inference_treats_pre_expansion_module_call_binding_as_non_inferable() {
-        // #2493 load-time path: at `load_configuration` the parser has
-        // produced `parsed.module_calls` but module expansion hasn't
-        // run yet, so the composition resource isn't in `parsed.resources`
-        // and the bindings map can't see the module-call's projection.
-        // The inferer must treat the binding as known-but-non-inferable
-        // (mirroring `upstream_state`) so the export remains unchecked
-        // without a noisy `unknown binding` error. A post-expansion consumer
-        // such as the LSP can run inference against the `Virtual` arm exercised
-        // by the sibling test above; the CLI retry remains report-only.
+        // #2493: before expansion the call is registered as `ModuleCall`
+        // and has no authored output evidence. Export inference retains
+        // `NonInferableBinding` without an unknown-binding diagnostic.
+        // The sibling test exercises authored output judgement after
+        // expansion; loaded-schema retry preserves unchecked provenance.
         let parsed = crate::parser::parse_and_resolve("let github_module = use { source = './child' }\nlet github_actions_carina = github_module {}\nexports { role_arn = github_actions_carina.role_arn }").unwrap();
 
         let inferred = apply_inference(

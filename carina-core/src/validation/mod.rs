@@ -6393,7 +6393,7 @@ fn validate_deferred_for_iterable_types_with_bindings<
 >(
     tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     _schemas: &SchemaRegistry,
-    _bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
+    _bindings: &inference::InferenceBindings,
     provider_context: &ProviderContext,
 ) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();

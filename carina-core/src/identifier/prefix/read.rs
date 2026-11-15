@@ -97,9 +97,7 @@ where
     pub fn expression_report(&self) -> &'f crate::parser::retained::ExpressionReport<B> {
         self.file.expression_report()
     }
-    pub(crate) fn inference_bindings(
-        &self,
-    ) -> crate::validation::inference::InferenceBindings<ParserPlaceholder, B> {
+    pub(crate) fn inference_bindings(&self) -> crate::validation::inference::InferenceBindings {
         crate::validation::inference::bindings_from_parsed(self.file)
     }
     pub(crate) fn module_resource_ref_declaration(
