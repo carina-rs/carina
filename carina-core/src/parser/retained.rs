@@ -2947,8 +2947,6 @@ pub use judgement::{
     JudgedExprData, NoConversion, NoTypeProjection, OrdinaryJudgedExpr,
     ProviderAuthorityUnavailable, SinkJudgedExpr, TypeProjection, admit_expression,
 };
-#[cfg(test)]
-pub(crate) use judgement::{EmptyCoalesceDefault, coalesce_type};
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
     judgement::constraint_fixture()

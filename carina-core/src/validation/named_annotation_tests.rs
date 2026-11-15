@@ -1511,41 +1511,33 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
 #[test]
 fn coalesce_and_collection_inference_share_the_identity_layer() {
     let snapshot = snapshot(vec![("p", vec![member(1, 64, None), member(1, 128, None)])]);
-    let bindings = inference::InferenceBindings::from([(
-        "source".into(),
-        inference::InferenceBinding::Resource {
-            provider: "p".into(),
-            resource_type: "Values".into(),
-        },
-    )]);
-    let first = Value::resource_ref("source", "value0", Vec::new());
-    let second = Value::resource_ref("source", "value1", Vec::new());
+    let context = snapshot.provider_context().as_provider_context();
     let canonical = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
-    for (value, expected) in [
+    for (expression, expected) in [
+        ("source.value0 ?? source.value1", canonical.clone()),
         (
-            Value::Deferred(crate::resource::DeferredValue::Coalesce {
-                value: Box::new(first.clone()),
-                default: Box::new(second.clone()),
-            }),
-            canonical.clone(),
-        ),
-        (
-            list(vec![first.clone(), second.clone()]),
+            "[source.value0, source.value1]",
             TypeExpr::List(Box::new(canonical.clone())),
         ),
         (
-            map(IndexMap::from([("a".into(), first), ("b".into(), second)])),
+            "{ a = source.value0 b = source.value1 }",
             TypeExpr::Map(Box::new(canonical)),
         ),
     ] {
-        let inferred = inference::infer_projected_type(
-            &value,
-            &bindings,
-            snapshot.schema_registry(),
-            snapshot.provider_context().as_provider_context(),
+        let parsed = crate::parser::parse(
+            &format!("let source = p.Values {{}}\nlet result = {expression}\n"),
+            context,
         )
         .unwrap();
-        assert_eq!(inferred, expected);
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            snapshot.schema_registry(),
+            context,
+        );
+        let inferred = report
+            .binding(&crate::resource::RelativeBindingName::new("result"))
+            .unwrap();
+        assert_eq!(inferred.static_type(), Ok(&expected), "{expression}");
     }
 }
 
@@ -1650,62 +1642,36 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
 }
 
 #[test]
-fn production_inference_compares_identity_only_value_types() {
+fn authored_function_calls_retain_dotted_return_annotations() {
     let snapshot = snapshot(vec![("p", vec![member(1, 64, None), member(1, 128, None)])]);
-    let first = typed_function_result(inference::attribute_type_to_type_expr(
-        declaration(&snapshot, "p", 0),
-        "p",
-    ));
-    let second = typed_function_result(inference::attribute_type_to_type_expr(
-        declaration(&snapshot, "p", 1),
-        "p",
-    ));
-    let values = [
-        Value::Deferred(crate::resource::DeferredValue::Coalesce {
-            value: Box::new(first.clone()),
-            default: Box::new(second.clone()),
-        }),
-        list(vec![first.clone(), second.clone()]),
-        map(IndexMap::from([
-            ("a".into(), first.clone()),
-            ("b".into(), second.clone()),
-        ])),
-        Value::Deferred(crate::resource::DeferredValue::ModuleIf(Box::new(
-            crate::parser::DeferredValueIf::new(
-                crate::parser::DeferredIfCondition::new(
-                    Value::Deferred(crate::resource::DeferredValue::Placeholder(
-                        ParserPlaceholder::ModuleArgument {
-                            name: "flag".into(),
-                            diagnostic: Default::default(),
-                        },
-                    )),
-                    "main.crn".into(),
-                    1,
-                ),
-                first,
-                second,
-            ),
-        ))),
-    ];
-    for value in values {
-        let inferred = inference::infer_projected_type(
-            &value,
-            &inference::InferenceBindings::new(),
-            snapshot.schema_registry(),
-            snapshot.provider_context().as_provider_context(),
-        )
+    let context = snapshot.provider_context().as_provider_context();
+    let declared = TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "iam.Role.Name"));
+    for (expression, expected) in [
+        ("first() ?? second()", declared.clone()),
+        (
+            "[first(), second()]",
+            TypeExpr::List(Box::new(declared.clone())),
+        ),
+        (
+            "{ a = first() b = second() }",
+            TypeExpr::Map(Box::new(declared.clone())),
+        ),
+        ("if flag { first() } else { second() }", declared),
+    ] {
+        let mut parsed = crate::parser::parse(&format!("arguments {{ flag: Bool }}\nlet source = p.Values {{}}\nfn first(): aws.iam.Role.Name {{ source.value0 }}\nfn second(): aws.iam.Role.Name {{ source.value1 }}\nlet result = {expression}\n"), context).unwrap();
+        deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
+            resolve_file_type_exprs_report(&mut parsed, session, None)
+        })
         .unwrap();
-        let canonical = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
-        let expected = match &value {
-            Value::Concrete(crate::resource::ConcreteValue::List(_)) => {
-                TypeExpr::List(Box::new(canonical))
-            }
-            Value::Concrete(crate::resource::ConcreteValue::Map(_)) => {
-                TypeExpr::Map(Box::new(canonical))
-            }
-            _ => canonical,
-        };
-        assert_eq!(inferred, expected);
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            snapshot.schema_registry(),
+            context,
+        );
+        let inferred = report
+            .binding(&crate::resource::RelativeBindingName::new("result"))
+            .unwrap();
+        assert_eq!(inferred.static_type(), Ok(&expected), "{expression}");
     }
 }
 
@@ -1901,13 +1867,13 @@ fn integer_operand_mismatches_do_not_hide_a_named_strings_constraints() {
         context,
     )
     .unwrap();
-    let error = inference::infer_projected_type(
-        &parsed.variables["result"],
-        &inference::bindings_from_parsed(&parsed),
-        snapshot.schema_registry(),
-        context,
-    )
-    .unwrap_err();
+    let report =
+        crate::parser::retained::judge_expressions(&parsed, snapshot.schema_registry(), context);
+    let error = report
+        .binding(&crate::resource::RelativeBindingName::new("result"))
+        .unwrap()
+        .static_type()
+        .unwrap_err();
     assert_eq!(
         error.to_string(),
         "operator '+': left operand must be Int, got Int (length 1..=16)"

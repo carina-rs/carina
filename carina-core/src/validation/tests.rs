@@ -744,37 +744,46 @@ fn ref_validation_rejects_missing_provenance_without_panicking() {
 
 #[test]
 fn deferred_iterable_shape_classifies_concrete_list_without_placeholder_type() {
-    let shape = deferred_iterable_shape(
-        &Value::Concrete(ConcreteValue::List(Vec::new())),
-        &inference::InferenceBindings::new(),
-        &SchemaRegistry::new(),
-    )
-    .expect("concrete list shape");
-
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse("let result = []", &context).unwrap();
+    let report =
+        crate::parser::retained::judge_expressions(&parsed, &SchemaRegistry::new(), &context);
+    let expression = report
+        .binding(&crate::resource::RelativeBindingName::new("result"))
+        .unwrap();
+    let sink = TypeExpr::List(Box::new(TypeExpr::String));
+    let shape = deferred_iterable_shape_for_phase(&expression.for_sink(&sink, &context))
+        .expect("authored iterable shape");
     assert_eq!(shape, DeferredIterableShape::List);
 }
 
 #[test]
 fn deferred_iterable_shape_classifies_concrete_map_without_placeholder_type() {
-    let shape = deferred_iterable_shape(
-        &Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-        &inference::InferenceBindings::new(),
-        &SchemaRegistry::new(),
-    )
-    .expect("concrete map shape");
-
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse("let result = {}", &context).unwrap();
+    let report =
+        crate::parser::retained::judge_expressions(&parsed, &SchemaRegistry::new(), &context);
+    let expression = report
+        .binding(&crate::resource::RelativeBindingName::new("result"))
+        .unwrap();
+    let sink = TypeExpr::Map(Box::new(TypeExpr::String));
+    let shape = deferred_iterable_shape_for_phase(&expression.for_sink(&sink, &context))
+        .expect("authored iterable shape");
     assert_eq!(shape, DeferredIterableShape::Map);
 }
 
 #[test]
 fn deferred_iterable_shape_preserves_non_iterable_scalar_type() {
-    let shape = deferred_iterable_shape(
-        &Value::Concrete(ConcreteValue::Int(1)),
-        &inference::InferenceBindings::new(),
-        &SchemaRegistry::new(),
-    )
-    .expect("concrete scalar shape");
-
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse("let result = 1", &context).unwrap();
+    let report =
+        crate::parser::retained::judge_expressions(&parsed, &SchemaRegistry::new(), &context);
+    let expression = report
+        .binding(&crate::resource::RelativeBindingName::new("result"))
+        .unwrap();
+    let sink = TypeExpr::List(Box::new(TypeExpr::String));
+    let shape = deferred_iterable_shape_for_phase(&expression.for_sink(&sink, &context))
+        .expect("authored iterable shape");
     assert_eq!(shape, DeferredIterableShape::NonIterable(TypeExpr::Int));
 }
 

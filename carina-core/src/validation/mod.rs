@@ -6274,29 +6274,6 @@ impl From<crate::parser::retained::CollectionKind> for DeferredIterableShape {
     }
 }
 
-#[cfg(test)]
-fn deferred_iterable_shape(
-    value: &Value,
-    bindings: &inference::InferenceBindings<ParserPlaceholder>,
-    schemas: &SchemaRegistry,
-) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
-    match value {
-        GenericValue::Concrete(crate::resource::ConcreteValue::List(_)) => {
-            Ok(DeferredIterableShape::List)
-        }
-        GenericValue::Concrete(crate::resource::ConcreteValue::Map(_)) => {
-            Ok(DeferredIterableShape::Map)
-        }
-        _ => inference::infer_projected_type(
-            value,
-            bindings,
-            schemas,
-            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        )
-        .map(iterable_shape_from_type),
-    }
-}
-
 fn deferred_iterable_shape_for_phase(
     expression: &crate::parser::retained::SinkJudgedExpr<'_>,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {

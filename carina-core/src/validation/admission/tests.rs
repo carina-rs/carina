@@ -74,22 +74,31 @@ fn selected_destination<K: AssignmentKind>(
     attribute: &str,
     catalog: &ProviderContext,
 ) -> Destination<K> {
+    try_selected_destination(schema, id, attribute, catalog).unwrap()
+}
+
+fn try_selected_destination<K: AssignmentKind>(
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
+    id: &crate::resource::ResourceId,
+    attribute: &str,
+    catalog: &ProviderContext,
+) -> Result<Destination<K>, String> {
     let effective = schema
         .effective_attribute_by_authored_name(attribute)
-        .unwrap();
+        .ok_or_else(|| format!("unknown attribute '{attribute}' on {id}"))?;
     let ordinal = schema
         .schema()
         .as_schema()
         .attributes()
         .keys()
         .position(|name| name == effective.name())
-        .unwrap();
-    schema.admission_selected_attribute_for_test(
+        .ok_or_else(|| format!("unknown attribute '{attribute}' on {id}"))?;
+    Ok(schema.admission_selected_attribute_for_test(
         id,
         attribute,
         crate::schema::value_validation::SchemaAttribute { ordinal, effective },
         catalog,
-    )
+    ))
 }
 
 fn text(value: &str) -> Value {
@@ -3386,22 +3395,8 @@ pub(crate) fn check_conversion_pending_discharge(
             crate::schema::SchemaKind::Resource,
         )
         .ok_or_else(|| format!("schema unavailable for {}", sink.id()))?;
-    let effective = schema
-        .effective_attribute_by_authored_name("target")
-        .ok_or_else(|| format!("unknown attribute 'target' on {}", sink.id()))?;
-    let ordinal = schema
-        .schema()
-        .as_schema()
-        .attributes()
-        .keys()
-        .position(|name| name == effective.name())
-        .ok_or_else(|| format!("unknown attribute 'target' on {}", sink.id()))?;
-    let destination = schema.admission_selected_attribute_for_test::<kind::ResourceAttribute>(
-        sink.id(),
-        "target",
-        crate::schema::value_validation::SchemaAttribute { ordinal, effective },
-        catalog,
-    );
+    let destination =
+        try_selected_destination::<kind::ResourceAttribute>(schema, sink.id(), "target", catalog)?;
     with_session_for_test(catalog, |session| {
         let (candidate, context) =
             Candidate::validation_slot(slot, proof, Some(&bindings), session)
