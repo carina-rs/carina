@@ -64,17 +64,7 @@ pub(crate) fn builtin_cidr_subnet<B: BindingAddress>(
         }
     };
 
-    let result =
-        calculate_cidr_subnet(prefix_str.expose_plaintext(), newbits, netnum).map_err(|error| {
-            if prefix_str.is_diagnostic_sensitive() {
-                format!(
-                    "cidr_subnet() failed for prefix {}",
-                    prefix_str.diagnostic_display()
-                )
-            } else {
-                error
-            }
-        })?;
+    let result = calculate_cidr_subnet(prefix_str.expose_plaintext(), newbits, netnum)?;
     Ok(Value::Concrete(ConcreteValue::String(
         ValueString::derived_from(result, [prefix_str]),
     )))
@@ -177,7 +167,7 @@ mod tests {
             let error = crate::builtins::evaluate_builtin_with_config_to_value(
                 "cidr_subnet",
                 &[
-                    value.clone(),
+                    value,
                     Value::Concrete(ConcreteValue::Int(newbits)),
                     Value::Concrete(ConcreteValue::Int(netnum)),
                 ],
@@ -186,31 +176,6 @@ mod tests {
             .unwrap_err();
             assert!(!error.contains(prefix), "{error}");
             assert_eq!(error, crate::resource::INSIDE_SECRET_MESSAGE);
-
-            let mut dispatched = [crate::resource::Resource::new("test", "prefix-input")
-                .with_attribute("prefix", value)
-                .into_provider_resource()];
-            crate::executor::normalized::unwrap_dispatch_desired(&mut dispatched);
-            let arguments = [
-                dispatched[0].attributes.shift_remove("prefix").unwrap(),
-                Value::Concrete(ConcreteValue::Int(newbits)),
-                Value::Concrete(ConcreteValue::Int(netnum)),
-            ];
-            let known = arguments
-                .iter()
-                .map(|value| {
-                    value
-                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                        .unwrap()
-                        .into_classification()
-                        .into_known()
-                        .unwrap()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                super::builtin_cidr_subnet(&known).unwrap_err(),
-                "cidr_subnet() failed for prefix (secret)"
-            );
         }
     }
 

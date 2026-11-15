@@ -278,9 +278,11 @@ pub use carina_provider_protocol::types::{
 
 /// Count and element policies enforced together when walking a list.
 ///
-/// Elements containing secrets are skipped for uniqueness, like unresolved elements, to avoid
-/// revealing equality. The same applies when a secret encloses the list.
-/// Provider output and persisted state skip uniqueness as well; length
+/// Elements containing Secret wrappers or diagnostic-sensitive strings are
+/// skipped for uniqueness to avoid revealing equality. This includes flagged
+/// strings after dispatch removes their wrappers, and a secret enclosing the list.
+/// Unresolved elements are skipped as well.
+/// `Desired(ProviderOutput)` and `State` purposes skip uniqueness; length
 /// constraints always apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListConstraints {
@@ -1182,8 +1184,8 @@ impl<R: PatternForm> ProviderPopulatedStructFieldBuilder<R> {
 pub enum LeafPathSegment {
     StructField(String),
     ListIndex(usize),
-    // Preserve producer sensitivity through every diagnostic rendering of a
-    // selected key; serde and key identity retain their existing string form.
+    // Keep string metadata alongside the key's runtime and serde spelling.
+    // Diagnostic callers choose the visibility of the path.
     MapKey(crate::resource::ValueString),
 }
 
@@ -5322,9 +5324,10 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
 }
 
 /// Compare the ordinary JSON of a value canonicalized with its successful fit
-/// for the active purpose. Unresolved elements and elements containing secrets
-/// are not comparable: even a masked duplicate would reveal equality. The provider remains the final
-/// authority for them.
+/// for the active purpose. Unresolved elements, elements containing Secret
+/// wrappers, and dispatch-unwrapped diagnostic-sensitive strings are not
+/// comparable: even a masked duplicate would reveal equality. The provider
+/// remains the final authority for them.
 /// Canonicalization preserves integer/float spellings and struct block aliases,
 /// so those spellings remain distinct keys: uniqueness can miss duplicates but
 /// must never invent them (including by rounding large integers to floats).
@@ -5340,7 +5343,7 @@ impl KnownListElement {
         defs: &BTreeMap<String, CompiledAttributeType>,
         purpose: CanonicalizationPurpose<'_>,
     ) -> Option<Self> {
-        if crate::value::contains_secret(value) {
+        if crate::value::contains_secret(value) || value.contains_diagnostic_sensitive_string() {
             return None;
         }
         crate::value::canonical_json_with_fit(value.clone(), fit, defs, purpose).map(Self)

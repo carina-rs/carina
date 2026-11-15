@@ -32,11 +32,10 @@ pub(crate) fn builtin_env<B: BindingAddress>(
         .and_then(|value| value.to_str())
         .map(|s| Value::Concrete(ConcreteValue::String(s.into())))
         .ok_or_else(|| {
-            let literal = name.diagnostic_literal();
-            match literal {
-                Some(name) => format!("environment variable '{name}' is not set"),
-                None => "environment variable named by a sensitive value is not set".to_string(),
-            }
+            format!(
+                "environment variable '{}' is not set",
+                name.expose_plaintext()
+            )
         })?;
     Ok(value)
 }

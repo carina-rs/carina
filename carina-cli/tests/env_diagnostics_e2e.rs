@@ -103,6 +103,121 @@ fn env_validation_directory_cli_text_json_and_lsp_preserves_secret_boundary() {
 }
 
 #[test]
+fn secret_builtin_failures_use_payload_boundary_in_cli_and_lsp() {
+    let factories: Vec<Box<dyn ProviderFactory>> =
+        vec![Box::new(carina_provider_mock::ConfiguredBuiltinMock::new(
+            Default::default(),
+            carina_provider_mock::MockScope::memory(),
+        ))];
+    let providers = loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        SchemaRegistry::new(),
+        EnvironmentSnapshot::empty(),
+    );
+    let context = Arc::new(providers.provider_context().as_provider_context().clone());
+    let engine = DiagnosticEngine::new(Arc::new(providers), vec!["mock".into()]);
+
+    for (builtin, expression, private_literal) in [
+        (
+            "env",
+            "env(secret('F12_ENV_NAME_NOT_SET'))",
+            "F12_ENV_NAME_NOT_SET",
+        ),
+        (
+            "map",
+            "map(secret('.F12_MAP_PRIVATE_KEY'), [{}])",
+            "F12_MAP_PRIVATE_KEY",
+        ),
+        (
+            "cidr_subnet",
+            "cidr_subnet(secret('F12_CIDR_PRIVATE_PREFIX'), 1, 0)",
+            "F12_CIDR_PRIVATE_PREFIX",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let provider_path = directory.path().join("providers.crn");
+        std::fs::write(&provider_path, "provider mock {}\n").unwrap();
+        let path = directory.path().join("main.crn");
+        let source = format!("let value = {expression}\n");
+        std::fs::write(&path, &source).unwrap();
+        let expected = format!("{builtin}(): invalid value inside secret(...)");
+
+        for json in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_carina"));
+            command
+                .current_dir(directory.path())
+                .args(["validate", "."])
+                .env("NO_COLOR", "1")
+                .env_remove("CLICOLOR_FORCE")
+                .env_remove("F12_ENV_NAME_NOT_SET");
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            for rendered in [&stdout, &stderr] {
+                assert!(
+                    !rendered
+                        .to_ascii_lowercase()
+                        .contains(&private_literal.to_ascii_lowercase()),
+                    "{builtin}, json={json}: {rendered}"
+                );
+            }
+            assert_eq!(output.status.code(), Some(1), "{builtin}: {stdout}{stderr}");
+            if json {
+                assert_eq!(stderr, "", "{builtin}");
+                let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+                let messages = report["errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|error| error["message"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(messages, [expected.as_str()], "{builtin}: {report}");
+            } else {
+                assert_eq!(
+                    stderr,
+                    format!("Error: ./main.crn:1:5: Invalid expression at line 1: {expected}\n"),
+                    "{builtin}: {stdout}"
+                );
+            }
+        }
+
+        let provider_document = Document::new_with_path(
+            std::fs::read_to_string(&provider_path).unwrap(),
+            provider_path.clone(),
+            context.clone(),
+        );
+        let provider_diagnostics = engine.analyze(&provider_document, Some(&provider_path));
+        assert!(provider_diagnostics.is_empty(), "{provider_diagnostics:#?}");
+        let document = Document::new_with_path(source, path.clone(), context.clone());
+        let diagnostics = engine.analyze(&document, Some(&path));
+        assert!(
+            !format!("{diagnostics:#?}")
+                .to_ascii_lowercase()
+                .contains(&private_literal.to_ascii_lowercase()),
+            "{builtin}: {diagnostics:#?}"
+        );
+        let mut expected_lsp = vec![
+            expected.clone(),
+            format!("Invalid expression at line 1: {expected}"),
+        ];
+        if builtin == "map" {
+            expected_lsp.push("Consider using pipe form for 'map': data |> map(...)".into());
+        }
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            expected_lsp,
+            "{builtin}"
+        );
+    }
+}
+
+#[test]
 fn real_secret_directory_reachability_preserves_diagnostic_boundaries() {
     #[derive(serde::Deserialize)]
     struct ExpectedCase {

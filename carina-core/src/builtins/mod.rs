@@ -1000,30 +1000,22 @@ mod tests {
             .unwrap_err(),
             "cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')"
         );
-        // Payload construction marks strings; keep that protection
-        // even when a later handler sees only the derived (unwrapped) string.
-        let joined = evaluate_builtin_to_value(
-            "join",
-            &[
-                string(""),
-                Value::Concrete(ConcreteValue::List(vec![secret(string("private-prefix"))])),
-            ],
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let error = crate::parser::parse_file(
+            "let value = cidr_subnet(join('', [secret('private-prefix')]), 1, 0)",
+            std::path::Path::new("test.crn"),
+            &config,
         )
-        .unwrap();
-        let Value::Deferred(DeferredValue::Secret(payload)) = joined else {
-            panic!("join must be secret")
-        };
-        let error = evaluate_builtin_to_value(
-            "cidr_subnet",
-            &[
-                payload.expose_plaintext().clone(),
-                Value::Concrete(ConcreteValue::Int(1)),
-                Value::Concrete(ConcreteValue::Int(0)),
-            ],
-        )
+        .and_then(|mut parsed| {
+            crate::parser::resolve_resource_refs_with_config(&mut parsed, &config)?;
+            Ok(parsed)
+        })
         .unwrap_err();
-        assert_eq!(error, "cidr_subnet() failed for prefix (secret)");
-        assert!(!error.contains("private-prefix"));
+        assert_eq!(
+            error.to_string(),
+            "test.crn:1:5: Invalid expression at line 1: cidr_subnet(): invalid value inside secret(...)"
+        );
+        assert!(!format!("{error:?} {error}").contains("private-prefix"));
     }
 
     #[test]

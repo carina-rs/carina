@@ -5,6 +5,157 @@ use crate::schema::{AttributeSchema, AttributeType, ResourceSchema as DraftSchem
 const PLAINTEXT: &str = "apply-admission-secret-plaintext";
 const MAP_KEY: &str = "apply-admission-private-map-key";
 
+#[derive(Clone, Copy)]
+enum UniqueListEntry {
+    Resource,
+    DataSource,
+}
+
+async fn prepare_parsed_unique_list(
+    expression: &str,
+    entry: UniqueListEntry,
+) -> Result<(), ProviderPreparationError> {
+    let parser = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut parsed = crate::parser::parse(&format!("let value = {expression}"), &parser).unwrap();
+    crate::parser::resolve_resource_refs_with_config(&mut parsed, &parser).unwrap();
+    let value = parsed
+        .variables
+        .shift_remove("value")
+        .unwrap()
+        .resolve_root(&crate::resource::RootScope::new())
+        .into_expanded()
+        .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    for schema in [
+        DraftSchema::new("UniqueStrings"),
+        DraftSchema::new("UniqueStrings").as_data_source(),
+    ] {
+        schemas.insert(
+            "test",
+            schema
+                .attribute(
+                    AttributeSchema::required(
+                        "value",
+                        AttributeType::refined_list(
+                            AttributeType::string(),
+                            true,
+                            None,
+                            crate::schema::ListElements::Unique,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+    }
+    let bindings = ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |session| {
+            let context = ProviderPreparationContext::for_test(
+                &bindings,
+                &gate,
+                &[],
+                &crate::provider::NoopNormalizer,
+                &schemas,
+                session,
+            );
+            match entry {
+                UniqueListEntry::Resource => prepare_provider_ready_resource(
+                    Resource::with_provider("test", "UniqueStrings", "item", None)
+                        .with_attribute("value", value),
+                    &context,
+                )
+                .await
+                .map(|_| ()),
+                UniqueListEntry::DataSource => prepare_provider_ready_data_source(
+                    DataSource::with_provider("test", "UniqueStrings", "item", None)
+                        .with_attribute("value", value),
+                    &context,
+                )
+                .map(|_| ()),
+            }
+        },
+    )
+    .await
+}
+
+async fn assert_unique_dispatch_succeeds(expression: &str, entry: UniqueListEntry) {
+    assert_eq!(
+        prepare_parsed_unique_list(expression, entry)
+            .await
+            .map_err(|error| error.to_string()),
+        Ok(())
+    );
+}
+
+async fn assert_ordinary_dispatch_duplicate(entry: UniqueListEntry) {
+    let error = prepare_parsed_unique_list("['a', 'a']", entry)
+        .await
+        .unwrap_err();
+    let ProviderPreparationError::ValueConstraint { mut errors, .. } = error else {
+        panic!("expected an ordinary duplicate finding: {error:?}");
+    };
+    let actual = errors
+        .0
+        .take_attribute("value")
+        .unwrap()
+        .into_located()
+        .into_iter()
+        .map(|(path, error)| (path.to_string(), error.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [(
+            "[1]".to_string(),
+            "Duplicate list element 'a' at index 1 (first at index 0)".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_resource_secret_elements() {
+    assert_unique_dispatch_succeeds("[secret('a'), secret('a')]", UniqueListEntry::Resource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_resource_whole_secret() {
+    assert_unique_dispatch_succeeds("secret(['a', 'a'])", UniqueListEntry::Resource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_resource_mixed_secret() {
+    assert_unique_dispatch_succeeds("[secret('a'), 'a']", UniqueListEntry::Resource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_resource_ordinary_duplicate() {
+    assert_ordinary_dispatch_duplicate(UniqueListEntry::Resource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_data_source_secret_elements() {
+    assert_unique_dispatch_succeeds("[secret('a'), secret('a')]", UniqueListEntry::DataSource)
+        .await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_data_source_whole_secret() {
+    assert_unique_dispatch_succeeds("secret(['a', 'a'])", UniqueListEntry::DataSource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_data_source_mixed_secret() {
+    assert_unique_dispatch_succeeds("[secret('a'), 'a']", UniqueListEntry::DataSource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_data_source_ordinary_duplicate() {
+    assert_ordinary_dispatch_duplicate(UniqueListEntry::DataSource).await;
+}
+
 fn text(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
 }

@@ -1640,6 +1640,7 @@ pub enum Subscript {
 impl Subscript {
     /// Append this subscript to `out` in canonical source form: `[0]` or
     /// `['k']`. String keys use the same literal encoder as `carina fmt`.
+    /// The enclosing payload or diagnostic scope controls secret visibility.
     pub fn append_to_dot_string(&self, out: &mut String) {
         use std::fmt::Write as _;
         match self {
@@ -1647,14 +1648,14 @@ impl Subscript {
                 let _ = write!(out, "[{}]", index);
             }
             Subscript::Str { key } => {
-                let _ = write!(out, "[{}]", key.diagnostic_display());
+                let _ = write!(out, "[{}]", display_string_literal(key.expose_plaintext()));
             }
         }
     }
 
-    /// Append the runtime path spelling. This is reserved for evaluation,
-    /// identity, serialization, and provider transport; diagnostics must use
-    /// [`Self::append_to_dot_string`] so a key from a secret payload stays masked.
+    /// Append the runtime path spelling for evaluation, identity, serialization,
+    /// and provider transport. [`Self::append_to_dot_string`] uses the canonical
+    /// DSL literal encoder instead; neither method controls secret visibility.
     pub fn append_to_plaintext_dot_string(&self, out: &mut String) {
         use std::fmt::Write as _;
         match self {
@@ -1687,8 +1688,7 @@ pub enum PathSegment {
 
 impl PathSegment {
     /// Append this segment in DSL source form (`.field`, `[0]`, or
-    /// `['key']`). Diagnostic-sensitive string keys stay redacted through
-    /// [`Subscript::append_to_dot_string`].
+    /// `['key']`).
     pub fn append_to_dot_string(&self, out: &mut String) {
         match self {
             Self::Field { name } => {
@@ -1706,8 +1706,7 @@ impl PathSegment {
         out
     }
 
-    /// Return this segment in runtime source form, exposing a string
-    /// subscript only for internal identity and hashing paths.
+    /// Return this segment in the runtime spelling used by identity and hashing.
     pub(crate) fn to_plaintext_dot_string(&self) -> String {
         let mut out = String::new();
         match self {
@@ -3023,13 +3022,6 @@ impl ValueString {
     /// by the secret mechanism.
     pub fn diagnostic_literal(&self) -> Option<&str> {
         (!self.diagnostic_sensitive).then_some(self.plaintext.as_str())
-    }
-
-    /// Render a public string as a quoted DSL literal, or the shared secret mask.
-    pub fn diagnostic_display(&self) -> String {
-        self.diagnostic_literal()
-            .map(display_string_literal)
-            .unwrap_or_else(|| crate::schema::SECRET_VALUE_MASK.to_string())
     }
 
     /// Build a derived string and inherit the secret mechanism's marking from
