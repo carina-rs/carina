@@ -6152,10 +6152,8 @@ fn resource_admission_report<
     boundary: presentation::AdmissionBoundary,
 ) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
     let parsed = judged.parsed();
-    let registry = judged.schemas();
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
-    let inference_bindings = parsed.inference_bindings();
 
     // Validate declarations directly instead of relying on a later resource
     // attribute to happen to expose an expression. Keep the authored
@@ -6276,10 +6274,8 @@ fn resource_admission_report<
     )?;
 
     if parsed.deferred_for_sites().next().is_some() {
-        all_errors.extend(validate_deferred_for_iterable_types_with_bindings(
+        all_errors.extend(validate_deferred_for_iterable_types(
             &parsed.analysis_tree()?,
-            registry,
-            &inference_bindings,
             bindings.provider_context(),
         ));
     }
@@ -6365,37 +6361,18 @@ pub fn validate_module_iteration_shape<P: PlaceholderKind, B: BindingAddress>(
 /// apply for a loop that requires a list or map.
 ///
 /// ```compile_fail,E0308
-/// use carina_core::{parser::{ParsedFile, ProviderContext}, schema::SchemaRegistry, validation::validate_deferred_for_iterable_types};
+/// use carina_core::{parser::{ParsedFile, ProviderContext}, validation::validate_deferred_for_iterable_types};
 /// fn analyze(file: &ParsedFile, context: &ProviderContext) {
-///     validate_deferred_for_iterable_types(file, &SchemaRegistry::new(), context);
+///     validate_deferred_for_iterable_types(file, context);
 /// }
 /// ```
-pub fn validate_deferred_for_iterable_types<D, B: BindingAddress>(
-    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
-    schemas: &SchemaRegistry,
+pub fn validate_deferred_for_iterable_types<D, B: BindingAddress, E>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     provider_context: &ProviderContext,
 ) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    validate_deferred_for_iterable_types_with_bindings(
-        tree,
-        schemas,
-        &tree.inference_bindings(),
-        provider_context,
-    )
-}
-
-fn validate_deferred_for_iterable_types_with_bindings<
-    E,
-    B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
->(
-    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
-    _schemas: &SchemaRegistry,
-    _bindings: &inference::InferenceBindings,
-    provider_context: &ProviderContext,
-) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();
     for deferred in tree.for_iterables() {
         let expected = match deferred.binding() {
