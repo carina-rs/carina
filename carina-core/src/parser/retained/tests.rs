@@ -10,6 +10,28 @@ fn config() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
 }
 
+#[test]
+fn expressions_equality_includes_authored_secrecy_argument_roots() {
+    let parsed =
+        crate::parser::parse_file("let value = 'public'", Path::new("equality.crn"), &config())
+            .unwrap();
+    let location = parsed
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .roots()[0]
+        .location()
+        .clone();
+    let original = Expressions::<RelativeBindingName>::default();
+    let mut changed = original.clone();
+    changed.secrecy_argument_roots.insert(
+        ExpressionLocation::new(ExpressionInstance::Root, &location),
+        "argument".into(),
+    );
+    assert_eq!(original, original.clone());
+    assert_ne!(original, changed);
+}
+
 fn assert_round4_buffer_membership(buffer_text: &str, disk_text: &str, expected_template: bool) {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("guards.crn");

@@ -939,6 +939,7 @@ pub(in crate::parser) fn resource_slots(
     };
     let instance = ExpansionInstanceId::fresh();
     let mut slots = AuthoredSlots::default();
+    slots.set_instance(instance);
     slots.set_declaration(
         captures
             .resource_declarations
@@ -1015,14 +1016,32 @@ pub struct Expressions<B: BindingAddress = RelativeBindingName> {
 
 impl<B: BindingAddress> PartialEq for Expressions<B> {
     fn eq(&self, other: &Self) -> bool {
-        self.roots == other.roots
-            && self.definitions == other.definitions
-            && self.report == other.report
-            && self.arguments == other.arguments
-            && self.secrecy_arguments == other.secrecy_arguments
-            && self.secrecy_argument_modules == other.secrecy_argument_modules
-            && self.secrecy_calls == other.secrecy_calls
-            && self.instance == other.instance
+        // Captures, projection caches and template admission metadata are
+        // transient authority rather than expression value semantics.
+        let Self {
+            roots,
+            definitions,
+            report,
+            arguments,
+            secrecy_arguments,
+            secrecy_argument_modules,
+            secrecy_argument_roots,
+            secrecy_calls,
+            instance,
+            require_scope: _,
+            captures: _,
+            projections: _,
+            template_placements: _,
+        } = self;
+        roots == &other.roots
+            && definitions == &other.definitions
+            && report == &other.report
+            && arguments == &other.arguments
+            && secrecy_arguments == &other.secrecy_arguments
+            && secrecy_argument_modules == &other.secrecy_argument_modules
+            && secrecy_argument_roots == &other.secrecy_argument_roots
+            && secrecy_calls == &other.secrecy_calls
+            && instance == &other.instance
     }
 }
 

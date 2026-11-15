@@ -100,7 +100,7 @@ let sink = mock.test.Resource {
     );
     assert_eq!(
         uniform(&attribute(&report, "sink", "tags")),
-        Some(Secrecy::Secret)
+        Uniformity::Known(Secrecy::Secret)
     );
 }
 
@@ -202,6 +202,178 @@ let sink = mock.test.Resource {
     );
     assert_eq!(report.findings().len(), 1, "{report:?}");
     assert!(report.admitted().is_none());
+}
+
+#[test]
+fn empty_collections_agree_with_public_and_secret_alternatives() {
+    let mut schemas = schemas();
+    schemas.insert(
+        "mock",
+        Schema::new("test.Collections")
+            .attribute(Attribute::optional("list", Type::list(Type::string())).build())
+            .attribute(Attribute::optional("map", Type::map(Type::string())).build())
+            .validate()
+            .unwrap(),
+    );
+    for (value, expected) in [
+        ("secret('x')", Secrecy::Secret),
+        ("'public'", Secrecy::Public),
+    ] {
+        let list = format!("[{value}] ?? []");
+        let map = format!("{{ k = {value} }} ?? {{}}");
+        let file = parsed(&format!(
+            "let sink = mock.test.Collections {{ list = {list} map = {map} }}"
+        ));
+        let report = secrecy_report(&file, &schemas);
+        assert!(report.findings().is_empty(), "{list}, {map}: {report:?}");
+        assert!(!report.is_pending(), "{report:?}");
+        assert!(report.admitted().is_some());
+        for name in ["list", "map"] {
+            assert_eq!(attribute(&report, "sink", name).secrecy(), expected);
+        }
+    }
+
+    // Keep the left values deferred through a provider-populated attribute.
+    // Treating the empty defaults as Public would reject these Secret lefts.
+    let file = parsed(
+        r#"
+let pending = mock.test.Resource {}
+let src = mock.test.Collections {
+  list = secret([pending.identifier])
+  map = secret({ k = pending.identifier })
+}
+let sink = mock.test.Collections { list = src.list ?? [] map = src.map ?? {} }
+"#,
+    );
+    let report = secrecy_report(&file, &schemas);
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(!report.is_pending(), "{report:?}");
+    assert!(report.admitted().is_some());
+    for binding in ["src", "sink"] {
+        for name in ["list", "map"] {
+            assert_eq!(
+                attribute(&report, binding, name),
+                Evidence::Leaf(Secrecy::Secret)
+            );
+        }
+    }
+
+    let file = parsed(
+        "mock.test.Collections { list = ['public'] ?? [secret('x')] map = { k = 'public' } ?? { k = secret('x') } }",
+    );
+    let report = secrecy_report(&file, &schemas);
+    assert_eq!(report.findings().len(), 2, "{report:?}");
+    assert!(
+        report
+            .findings()
+            .iter()
+            .all(|finding| matches!(finding.cause(), DerivationError::MixedAlternatives(_)))
+    );
+    assert!(report.admitted().is_none());
+}
+
+#[test]
+fn attribute_less_module_resources_keep_distinct_expansion_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("child")).unwrap();
+    std::fs::write(
+        directory.path().join("child/main.crn"),
+        // The loader needs a module signature; the resource still has no attributes.
+        "arguments { unused: String = 'default' }\nmock.test.Resource {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "provider mock {}\nlet child = use { source = './child' }\nlet first = child {}\nlet second = child {}\n",
+    ).unwrap();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let context = context();
+    let schemas = schemas();
+    let root = crate::config_loader::load_configuration_with_config(&base, &context, &schemas)
+        .unwrap()
+        .parsed;
+    let expanded = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            root, &base, session, &schemas,
+        )
+        .unwrap()
+    });
+    let report = crate::config_loader::load_buffer_configuration(&expanded, &schemas, &context)
+        .judged()
+        .secrecy()
+        .clone();
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(!report.is_pending(), "{report:?}");
+    assert_eq!(report.rows.len(), 2, "{report:?}");
+    let mut rows = report.rows.values();
+    let first = rows.next().unwrap();
+    let second = rows.next().unwrap();
+    assert_eq!(first.declaration, second.declaration);
+    assert_ne!(
+        first.instance.expect("first resource instance"),
+        second.instance.expect("second resource instance")
+    );
+    assert!(first.attributes.is_empty() && second.attributes.is_empty());
+    assert!(report.admitted().is_some());
+}
+
+#[test]
+fn direct_and_referenced_attribute_walks_share_the_slot_environment() {
+    let report = report(
+        "let token = secret('canary')\nlet seed = mock.test.Resource { name = 'seed' comment = token }\nlet sink = mock.test.Resource { name = 'sink' comment = seed.comment }\n",
+    );
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(report.admitted().is_some());
+    let stats = report
+        .traversals()
+        .iter()
+        .find(|stats| stats.attribute == "comment" && stats.reference_visits == 2)
+        .expect("the sink encounters seed.comment and token");
+    assert_eq!(
+        stats.memo_hits, 1,
+        "the direct token walk must populate the same memo key"
+    );
+    assert_eq!(stats.maximum_depth, 2);
+}
+
+#[test]
+fn repeated_errors_block_memo_admission_and_deduplicate_only_in_the_report() {
+    let file = parsed(
+        "let invalid = secret('public' ?? secret('canary'))\nmock.test.Resource { comment = join('', [invalid, invalid, invalid]) }\n",
+    );
+    let schemas = schemas();
+    let syntax = crate::parser::retained::judge_expressions(&file, &schemas, &context());
+    let owner = Owner {
+        syntax: &syntax,
+        schemas: &schemas,
+        resources: IndexMap::new(),
+        upstream: HashSet::new(),
+        memo: RefCell::default(),
+        empty_environment: Arc::default(),
+    };
+    let resource = &file.resources[0];
+    let slot = resource.authored_slots.get("comment").unwrap();
+    let source = syntax
+        .secrecy_root(&resource.id, slot.secrecy_node())
+        .unwrap();
+    let mut walk = Walk::new(&owner, "comment".into(), source.location().clone());
+    assert_eq!(
+        walk.run(Thunk {
+            source: Source::Syntax(source),
+            environment: owner.empty_environment.clone(),
+        }),
+        Some(Evidence::Leaf(Secrecy::Secret))
+    );
+    assert_eq!(walk.visits, 3);
+    assert_eq!(
+        walk.memo_hits, 0,
+        "no traversal with a repeated error may enter the memo"
+    );
+    assert_eq!(walk.findings.len(), 3);
+    assert!(owner.memo.borrow().is_empty());
+    let mut report = SecrecyReport::default();
+    report.add_findings(walk.findings);
+    assert_eq!(report.findings().len(), 1);
 }
 
 #[test]

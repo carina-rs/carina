@@ -1588,6 +1588,8 @@ pub struct AuthoredSlots<B: BindingAddress = RelativeBindingName> {
     synthetic: indexmap::IndexMap<String, SyntheticSource>,
     declaration: Option<SlotDeclarationId>,
     input_origin: Option<SlotDeclarationId>,
+    /// Resource expansion identity, retained even when there are no attributes.
+    instance: Option<ExpansionInstanceId>,
 }
 // Admission metadata is not part of a resource's value semantics.
 impl<B: BindingAddress> PartialEq for AuthoredSlots<B> {
@@ -1609,6 +1611,7 @@ impl<B: BindingAddress> Default for AuthoredSlots<B> {
             synthetic: Default::default(),
             declaration: None,
             input_origin: None,
+            instance: None,
         }
     }
 }
@@ -1622,6 +1625,12 @@ impl<B: BindingAddress> AuthoredSlots<B> {
 
     pub fn declaration_id(&self) -> Option<&SlotDeclarationId> {
         self.declaration.as_ref()
+    }
+    pub(crate) fn instance(&self) -> Option<ExpansionInstanceId> {
+        self.instance
+    }
+    pub(super) fn set_instance(&mut self, instance: ExpansionInstanceId) {
+        self.instance = Some(instance);
     }
     pub(crate) fn projection_generation(&self) -> Option<ProjectionGeneration> {
         self.slots
@@ -1755,6 +1764,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
     }
     pub(crate) fn reinstance(&mut self) {
         let instance = ExpansionInstanceId::fresh();
+        self.set_instance(instance);
         for slot in self.slots.values_mut() {
             slot.instance = instance;
             slot.occurrence = UseId::fresh();
@@ -1778,6 +1788,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             synthetic: self.synthetic,
             declaration: self.declaration,
             input_origin: self.input_origin,
+            instance: self.instance,
             slots: self
                 .slots
                 .into_iter()

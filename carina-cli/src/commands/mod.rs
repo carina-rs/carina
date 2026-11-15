@@ -467,6 +467,19 @@ impl ResolvedConfig {
     }
 }
 
+fn extend_secrecy_errors(
+    errors: &mut impl Extend<AppError>,
+    report: &carina_core::secrecy::SecrecyReport,
+) {
+    errors.extend(
+        report
+            .findings()
+            .iter()
+            .cloned()
+            .map(|finding| AppError::Secrecy(Box::new(finding))),
+    );
+}
+
 fn extend_binding_use_errors(
     errors: &mut impl Extend<AppError>,
     report: &carina_core::validation::BindingUseReport,
@@ -839,15 +852,7 @@ fn validate_and_resolve_configuration(
         enriched_context.catalog(),
     );
     let expression_report = configuration.judged().report();
-    errors.extend(
-        configuration
-            .judged()
-            .secrecy()
-            .findings()
-            .iter()
-            .cloned()
-            .map(|finding| AppError::Secrecy(Box::new(finding))),
-    );
+    extend_secrecy_errors(errors, configuration.judged().secrecy());
     errors.extend(
         expression_report
             .findings()
@@ -1125,15 +1130,7 @@ fn validate_and_resolve_configuration(
         ctx.schemas(),
         enriched_context.catalog(),
     );
-    errors.extend(
-        configuration
-            .judged()
-            .secrecy()
-            .findings()
-            .iter()
-            .cloned()
-            .map(|finding| AppError::Secrecy(Box::new(finding))),
-    );
+    extend_secrecy_errors(errors, configuration.judged().secrecy());
     let binding_use_report = carina_core::validation::check_expanded_bare_binding_uses(
         &enriched_context.type_context(configuration.judged(), &imported_module_signatures),
     );

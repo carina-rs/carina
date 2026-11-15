@@ -199,6 +199,53 @@ fn module_instances_report_authored_operator_with_secret_call_context() {
 }
 
 #[test]
+fn unsaved_module_lines_supply_the_related_range() {
+    let fixture = fixtures::fixture("module_instances");
+    let root_path = fixture.path().join("main.crn");
+    let module_path = fixture.path().join("module/main.crn");
+    let disk = std::fs::read_to_string(&module_path).unwrap();
+    // Shift the authored operator and put a non-BMP character before it.
+    let edited = format!("// unsaved header\n\n{}", disk.replace("??", "/* 😀 */ ??"));
+    let document = |path: &Path, text: String| {
+        Document::new_with_path(
+            text,
+            path.to_path_buf(),
+            Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+        )
+    };
+    let root = document(&root_path, std::fs::read_to_string(&root_path).unwrap());
+    let module = document(&module_path, edited.clone());
+    let diagnostics = engine().analyze_with_open_documents(&root, Some(&root_path), &[&module]);
+    let findings = diagnostics
+        .iter()
+        .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
+        .collect::<Vec<_>>();
+    assert_eq!(findings.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        findings[0].range,
+        lsp_range(fixture.path(), fixtures::SECRET_CALL)
+    );
+    let operator = edited.find("??").unwrap();
+    let prefix = &edited[..operator];
+    let start = Position::new(
+        prefix.bytes().filter(|byte| *byte == b'\n').count() as u32,
+        prefix.rsplit('\n').next().unwrap().encode_utf16().count() as u32,
+    );
+    let related = findings[0].related_information.as_ref().unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].location.range,
+        Range::new(start, Position::new(start.line, start.character + 2))
+    );
+    assert_eq!(
+        CanonicalPath::new(related[0].location.uri.to_file_path().unwrap()).unwrap(),
+        CanonicalPath::new(&module_path).unwrap()
+    );
+    assert_eq!(std::fs::read_to_string(&module_path).unwrap(), disk);
+    assert_no_payload(&diagnostics);
+}
+
+#[test]
 fn module_dependent_if_keeps_cli_authored_operator_and_secret_call_context() {
     let fixture = fixtures::module_if_fixture();
     assert_module_findings(&fixture, fixtures::MODULE_IF_FINDING);

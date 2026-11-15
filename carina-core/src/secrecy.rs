@@ -13,22 +13,14 @@ use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, ParserPlaceholder,
     PathSegment, ResourceId, Subscript, Value,
 };
-use crate::schema::SchemaRegistry;
+use crate::schema::{SchemaKind, SchemaRegistry};
 
 pub const MAX_REFERENCE_DEPTH: usize = 128;
 pub const MAX_REFERENCE_VISITS: usize = 4096;
 
-enum DepthStep {
-    Reference,
-    Expression,
-}
-
-/// The counting policy lives here. Counting only references would leave
-/// Expression steps at `depth`, without changing traversal or memo handling.
-fn depth_after_step(depth: usize, step: DepthStep) -> usize {
-    match step {
-        DepthStep::Reference | DepthStep::Expression => depth + 1,
-    }
+/// References and expression steps share this counting policy.
+fn depth_after_step(depth: usize) -> usize {
+    depth + 1
 }
 
 /// The only leaves admitted into runtime evidence.
@@ -92,11 +84,8 @@ impl Evidence {
     }
 }
 
-fn aggregate<'a>(values: impl Iterator<Item = &'a Evidence>) -> Secrecy {
-    if values
-        .into_iter()
-        .any(|value| value.secrecy() == Secrecy::Secret)
-    {
+fn aggregate<'a>(mut values: impl Iterator<Item = &'a Evidence>) -> Secrecy {
+    if values.any(|value| value.secrecy() == Secrecy::Secret) {
         Secrecy::Secret
     } else {
         Secrecy::Public
@@ -294,10 +283,26 @@ impl SecrecyReport {
             }
         }
     }
-    pub(crate) fn mark_pending(&mut self) {
-        self.pending = true;
-    }
 
+    fn inspect_source<B: BindingAddress>(
+        &mut self,
+        owner: &Owner<'_, B>,
+        attribute: String,
+        location: DeclarationLocation,
+        source: ExprValue<ParserPlaceholder, B>,
+        environment: Arc<Environment<B>>,
+    ) -> Option<Evidence> {
+        let mut walk = Walk::new(owner, attribute, location).in_source(&source);
+        let evidence = walk.run(Thunk {
+            source: Source::Syntax(source),
+            environment,
+        });
+        #[cfg(test)]
+        self.record(&walk);
+        self.pending |= walk.pending_validation;
+        self.add_findings(walk.findings);
+        evidence
+    }
     // Only successful binding admission calls this. Incomplete buffers,
     // pending schemas and uninstantiated templates cannot mint a graph.
     pub(crate) fn admitted(&self) -> Option<ValidatedSecrecyGraph> {
@@ -400,7 +405,7 @@ struct Memo {
 struct ResourceSource<B: BindingAddress> {
     provider: String,
     resource_type: String,
-    read: bool,
+    kind: SchemaKind,
     attributes: IndexMap<String, Thunk<B>>,
 }
 
@@ -448,25 +453,17 @@ where
         .iter_all_resources()
         .chain(file.deferred_for_phase.analysis_resource_refs())
     {
-        let (slots, read) = match resource {
-            ResourceRef::Resource(resource) => (&resource.authored_slots, false),
-            ResourceRef::DataSource(source) => (&source.authored_slots, true),
+        let (slots, kind) = match resource {
+            ResourceRef::Resource(resource) => (&resource.authored_slots, SchemaKind::Resource),
+            ResourceRef::DataSource(source) => (&source.authored_slots, SchemaKind::DataSource),
             ResourceRef::Deferred {
                 resource,
                 deferred: _,
-            } => (&resource.as_resource().authored_slots, false),
+            } => (&resource.as_resource().authored_slots, SchemaKind::Resource),
             ResourceRef::LiveComposition(_) => continue,
         };
         if schemas
-            .get(
-                &resource.id().provider,
-                &resource.id().resource_type,
-                if read {
-                    crate::schema::SchemaKind::DataSource
-                } else {
-                    crate::schema::SchemaKind::Resource
-                },
-            )
+            .get(&resource.id().provider, &resource.id().resource_type, kind)
             .is_none()
         {
             report.pending = true;
@@ -497,7 +494,7 @@ where
                 ResourceSource {
                     provider: resource.id().provider.clone(),
                     resource_type: resource.id().resource_type.clone(),
-                    read,
+                    kind,
                     attributes,
                 },
             );
@@ -532,7 +529,7 @@ where
         if !seen.insert((resource.id().clone(), declaration.clone())) {
             continue;
         }
-        let instance = slots.iter().next().map(|(_, slot)| slot.instance());
+        let instance = slots.instance();
         if let Some(previous) =
             declarations.insert((declaration.clone(), instance), resource.id().clone())
             && previous != *resource.id()
@@ -555,15 +552,14 @@ where
             let location = syntax
                 .secrecy_attribute_location(resource.id(), slot.secrecy_node())
                 .unwrap_or_else(|| source.location().clone());
-            let mut walk = Walk::new(&owner, name.to_string(), location).in_source(&source);
-            let evidence = walk.run(Thunk {
-                environment: Environment::for_slot(slot, &source, &owner.empty_environment),
-                source: Source::Syntax(source),
-            });
-            #[cfg(test)]
-            report.record(&walk);
-            report.pending |= walk.pending_validation;
-            report.add_findings(walk.findings);
+            let environment = resource
+                .binding_address()
+                .and_then(|binding| owner.resources.get(binding))
+                .and_then(|resource| resource.attributes.get(name.transport_identity()))
+                .map(|source| source.environment.clone())
+                .unwrap_or_else(|| Environment::for_slot(slot, &source, &owner.empty_environment));
+            let evidence =
+                report.inspect_source(&owner, name.to_string(), location, source, environment);
             match evidence {
                 Some(evidence) => {
                     attributes.insert(name.transport_identity().to_string(), evidence);
@@ -603,16 +599,13 @@ where
                 ) {
                     continue;
                 }
-                let mut walk =
-                    Walk::new(&owner, name.to_string(), sink.location().clone()).in_source(value);
-                walk.run(Thunk {
-                    source: Source::Syntax(value.clone()),
-                    environment: owner.empty_environment.clone(),
-                });
-                #[cfg(test)]
-                report.record(&walk);
-                report.pending |= walk.pending_validation;
-                report.add_findings(walk.findings);
+                report.inspect_source(
+                    &owner,
+                    name.to_string(),
+                    sink.location().clone(),
+                    value.clone(),
+                    owner.empty_environment.clone(),
+                );
             }
         }
     }
@@ -654,15 +647,13 @@ where
     // Call arguments survive expansion as authored uses even when no module
     // call remains in the runtime file. Recheck them in the complete scope.
     for (name, source) in syntax.secrecy_arguments_authored() {
-        let mut walk = Walk::new(&owner, name, source.location().clone()).in_source(&source);
-        walk.run(Thunk {
-            source: Source::Syntax(source),
-            environment: owner.empty_environment.clone(),
-        });
-        #[cfg(test)]
-        report.record(&walk);
-        report.pending |= walk.pending_validation;
-        report.add_findings(walk.findings);
+        report.inspect_source(
+            &owner,
+            name,
+            source.location().clone(),
+            source,
+            owner.empty_environment.clone(),
+        );
     }
 
     // Call arguments, value lets and outputs also retain their pre-folding
@@ -673,16 +664,13 @@ where
             if let Some(location) = call.id().argument_value_location(name)
                 && let Some(source) = syntax.secrecy_at(location)
             {
-                let mut walk =
-                    Walk::new(&owner, name.to_string(), location.clone()).in_source(&source);
-                walk.run(Thunk {
-                    source: Source::Syntax(source),
-                    environment: owner.empty_environment.clone(),
-                });
-                #[cfg(test)]
-                report.record(&walk);
-                report.pending |= walk.pending_validation;
-                report.add_findings(walk.findings);
+                report.inspect_source(
+                    &owner,
+                    name.to_string(),
+                    location.clone(),
+                    source,
+                    owner.empty_environment.clone(),
+                );
             }
         }
     }
@@ -697,24 +685,17 @@ where
             && !syntax.secrecy_is_structural(location)
             && let Some(source) = syntax.secrecy_at(location)
         {
-            let mut walk = Walk::new(
+            report.inspect_source(
                 &owner,
                 declaration.detail().name().to_string(),
                 location.clone(),
-            )
-            .in_source(&source);
-            walk.run(Thunk {
-                source: Source::Syntax(source),
-                environment: owner.empty_environment.clone(),
-            });
-            #[cfg(test)]
-            report.record(&walk);
-            report.pending |= walk.pending_validation;
-            report.add_findings(walk.findings);
+                source,
+                owner.empty_environment.clone(),
+            );
         }
     }
     if syntax.has_failed_expressions() {
-        report.mark_pending();
+        report.pending = true;
     }
     report
 }
@@ -772,9 +753,7 @@ enum Operation {
     Last,
     Alternatives {
         operator: Alternatives,
-        location: DeclarationLocation,
-        call: Option<CallSite>,
-        authored: bool,
+        origin: Option<(DeclarationLocation, Option<CallSite>)>,
     },
     If {
         selected: Option<usize>,
@@ -800,7 +779,6 @@ struct Walk<'a, B: BindingAddress> {
     attribute_location: DeclarationLocation,
     call_site: Option<CallSite>,
     findings: Vec<Finding>,
-    finding_keys: HashSet<Finding>,
     visits: usize,
     #[cfg(test)]
     memo_hits: usize,
@@ -819,7 +797,6 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             attribute_location: location,
             call_site: None,
             findings: Vec::new(),
-            finding_keys: HashSet::new(),
             visits: 0,
             #[cfg(test)]
             memo_hits: 0,
@@ -845,15 +822,14 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         call: Option<CallSite>,
         cause: DerivationError,
     ) {
-        let finding = Finding {
+        // Count every occurrence so the reference memo gate also sees errors
+        // already reported elsewhere in this walk. The report deduplicates.
+        self.findings.push(Finding {
             attribute: self.attribute.clone(),
             location,
             call_site: call,
             cause,
-        };
-        if self.finding_keys.insert(finding.clone()) {
-            self.findings.push(finding);
-        }
+        });
     }
     fn limit(&mut self, kind: LimitKind) {
         if !self.limited {
@@ -1008,13 +984,11 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             | Operation::Map(_)
             | Operation::Alternatives {
                 operator: _,
-                location: _,
-                call: _,
-                authored: _,
+                origin: _,
             }
             | Operation::If { selected: _ }
             | Operation::Selection { path: _ }
-            | Operation::Key => depth_after_step(depth, DepthStep::Expression),
+            | Operation::Key => depth_after_step(depth),
             Operation::Secret | Operation::Last | Operation::Pending => depth,
         };
         // Transparent wrappers must pass selection to their result child.
@@ -1052,14 +1026,13 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             values.push(None);
             return;
         }
-        let next_depth = depth_after_step(depth, DepthStep::Reference);
-        self.max_depth = self.max_depth.max(next_depth);
+        let next_depth = depth_after_step(depth);
         if next_depth >= MAX_REFERENCE_DEPTH {
+            self.max_depth = self.max_depth.max(next_depth);
             self.limit(LimitKind::Depth);
             values.push(None);
             return;
         }
-        self.max_depth = self.max_depth.max(next_depth);
         let source = self
             .owner
             .reference_source(&binding, &path, environment.clone());
@@ -1075,6 +1048,8 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             path: path.clone(),
         };
         let memo = self.owner.memo.borrow().get(&key).cloned();
+        let reached_depth = next_depth + memo.as_ref().map_or(0, |memo| memo.relative_depth);
+        self.max_depth = self.max_depth.max(reached_depth.min(MAX_REFERENCE_DEPTH));
         if let Some(memo) = memo {
             #[cfg(test)]
             {
@@ -1082,14 +1057,10 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             }
             // This encounter was charged before consulting the memo. Reusing
             // a complete subtree does not re-expand its internal DAG edges.
-            self.max_depth = self
-                .max_depth
-                .max((next_depth + memo.relative_depth).min(MAX_REFERENCE_DEPTH));
-            if next_depth + memo.relative_depth >= MAX_REFERENCE_DEPTH {
+            if reached_depth >= MAX_REFERENCE_DEPTH {
                 self.limit(LimitKind::Depth);
                 values.push(None);
             } else {
-                self.max_depth = self.max_depth.max(next_depth + memo.relative_depth);
                 values.push(Some(memo.evidence));
             }
             return;
@@ -1191,12 +1162,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                 };
                 match expression.secrecy_kind() {
                     ExprKind::Binding(binding) => {
-                        if !self.owner.resources.contains_key(binding)
-                            && self.owner.syntax.secrecy_definition(binding).is_none()
-                            && self.owner.syntax.secrecy_argument(binding).is_none()
-                            && !self.owner.upstream.contains(binding)
-                            && self.owner.syntax.secrecy_literal(&expression)
-                        {
+                        if self.local_literal(binding, &expression) {
                             values.push(Some(Evidence::Leaf(Secrecy::Public)));
                         } else {
                             self.reference(binding.clone(), path, environment, depth, work, values);
@@ -1207,16 +1173,12 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         attribute,
                         segments,
                     } => {
-                        if !self.owner.resources.contains_key(binding)
-                            && self.owner.syntax.secrecy_definition(binding).is_none()
-                            && self.owner.syntax.secrecy_argument(binding).is_none()
-                            && !self.owner.upstream.contains(binding)
+                        if self.local_literal(binding, &expression)
                             && self
                                 .owner
                                 .syntax
                                 .secrecy_output(binding, attribute)
                                 .is_none()
-                            && self.owner.syntax.secrecy_literal(&expression)
                         {
                             values.push(Some(Evidence::Leaf(Secrecy::Public)));
                             return;
@@ -1261,13 +1223,13 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     ExprKind::Coalesce => self.schedule(
                         Operation::Alternatives {
                             operator: Alternatives::Coalesce,
-                            authored: true,
-                            location: expression.secrecy_operator().clone(),
-                            call: self
-                                .owner
-                                .syntax
-                                .secrecy_call(expression.secrecy_instance())
-                                .cloned(),
+                            origin: Some((
+                                expression.secrecy_operator().clone(),
+                                self.owner
+                                    .syntax
+                                    .secrecy_call(expression.secrecy_instance())
+                                    .cloned(),
+                            )),
                         },
                         children(),
                         path,
@@ -1297,13 +1259,13 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                             self.schedule(
                                 Operation::Alternatives {
                                     operator: Alternatives::Lookup,
-                                    authored: true,
-                                    location: expression.location().clone(),
-                                    call: self
-                                        .owner
-                                        .syntax
-                                        .secrecy_call(expression.secrecy_instance())
-                                        .cloned(),
+                                    origin: Some((
+                                        expression.location().clone(),
+                                        self.owner
+                                            .syntax
+                                            .secrecy_call(expression.secrecy_instance())
+                                            .cloned(),
+                                    )),
                                 },
                                 children(),
                                 path,
@@ -1434,6 +1396,14 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             }
         }
     }
+    fn local_literal(&self, binding: &B, expression: &ExprValue<ParserPlaceholder, B>) -> bool {
+        !self.owner.resources.contains_key(binding)
+            && self.owner.syntax.secrecy_definition(binding).is_none()
+            && self.owner.syntax.secrecy_argument(binding).is_none()
+            && !self.owner.upstream.contains(binding)
+            && self.owner.syntax.secrecy_literal(expression)
+    }
+
     fn known_boolean(&self, input: &Thunk<B>) -> Option<bool> {
         let mut thunk = input.clone();
         let mut bindings = HashSet::new();
@@ -1451,38 +1421,35 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     continue;
                 }
                 Source::Value(value) => {
-                    if let Value::Deferred(DeferredValue::Placeholder(
-                        ParserPlaceholder::ModuleArgument {
-                            name,
-                            diagnostic: _,
-                        },
-                    )) = value.as_ref()
-                    {
-                        let module = thunk.environment.module.as_ref()?;
-                        let binding = crate::resource::binding_address::binding_selected_attribute(
-                            module, name,
-                        );
-                        let argument = self.owner.syntax.secrecy_argument(&binding)?;
+                    let substitution = match value.as_ref() {
+                        Value::Deferred(DeferredValue::Placeholder(
+                            ParserPlaceholder::ModuleArgument {
+                                name,
+                                diagnostic: _,
+                            },
+                        )) => {
+                            let binding =
+                                crate::resource::binding_address::binding_selected_attribute(
+                                    thunk.environment.module.as_ref()?,
+                                    name,
+                                );
+                            let argument = self.owner.syntax.secrecy_argument(&binding)?;
+                            Some((binding, argument))
+                        }
+                        Value::Deferred(DeferredValue::BindingRef { binding }) => self
+                            .owner
+                            .syntax
+                            .secrecy_argument(binding)
+                            .map(|argument| (binding.clone(), argument)),
+                        _ => None,
+                    };
+                    if let Some((binding, argument)) = substitution {
                         if !bindings.insert(binding.clone()) {
                             return None;
                         }
                         thunk.source = Source::Value(Arc::new(argument.clone()));
                         thunk.environment = Arc::new(Environment {
                             module: self.owner.syntax.secrecy_argument_module(&binding).cloned(),
-                            ..(*thunk.environment).clone()
-                        });
-                        continue;
-                    }
-                    if let Value::Deferred(DeferredValue::BindingRef { binding }) = value.as_ref()
-                        && let Some(argument) = self.owner.syntax.secrecy_argument(binding)
-                    {
-                        if !bindings.insert(binding.clone()) {
-                            return None;
-                        }
-                        let module = self.owner.syntax.secrecy_argument_module(binding).cloned();
-                        thunk.source = Source::Value(Arc::new(argument.clone()));
-                        thunk.environment = Arc::new(Environment {
-                            module,
                             ..(*thunk.environment).clone()
                         });
                         continue;
@@ -1561,19 +1528,29 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             work,
             values: _,
         } = context;
-        let booleans = arguments
-            .iter()
-            .map(|argument| self.known_boolean(argument))
-            .collect();
-        work.push(Work::Call {
+        self.push_call(arguments, depth, work, |booleans, arguments| Work::Call {
             function,
             count: arguments.len(),
             booleans,
-            arguments: arguments.clone(),
+            arguments,
             environment,
             path,
             depth,
         });
+    }
+
+    fn push_call(
+        &self,
+        arguments: Vec<Thunk<B>>,
+        depth: usize,
+        work: &mut Vec<Work<B>>,
+        call: impl FnOnce(Vec<Option<bool>>, Vec<Thunk<B>>) -> Work<B>,
+    ) {
+        let booleans = arguments
+            .iter()
+            .map(|argument| self.known_boolean(argument))
+            .collect();
+        work.push(call(booleans, arguments.clone()));
         work.extend(arguments.into_iter().rev().map(|thunk| Work::Enter {
             thunk,
             path: Vec::new(),
@@ -1716,9 +1693,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                 DeferredValue::Coalesce { value, default } => self.schedule(
                     Operation::Alternatives {
                         operator: Alternatives::Coalesce,
-                        authored: false,
-                        location: self.attribute_location.clone(),
-                        call: None,
+                        origin: None,
                     },
                     [thunk(value), thunk(default)],
                     path,
@@ -1763,9 +1738,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     } else if name.as_str() == "lookup" {
                         Operation::Alternatives {
                             operator: Alternatives::Lookup,
-                            authored: false,
-                            location: self.attribute_location.clone(),
-                            call: None,
+                            origin: None,
                         }
                     } else {
                         Operation::Propagate
@@ -1810,25 +1783,18 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         .iter()
                         .map(|argument| thunk(argument.walker_value()))
                         .collect::<Vec<_>>();
-                    let booleans = arguments
-                        .iter()
-                        .map(|argument| self.known_boolean(argument))
-                        .collect();
-                    work.push(Work::ValueCall {
-                        function: lexical_function,
-                        functions: lexical_functions,
-                        count: arguments.len(),
-                        booleans,
-                        arguments: arguments.clone(),
-                        environment,
-                        path,
-                        depth,
+                    self.push_call(arguments, depth, work, |booleans, arguments| {
+                        Work::ValueCall {
+                            function: lexical_function,
+                            functions: lexical_functions,
+                            count: arguments.len(),
+                            booleans,
+                            arguments,
+                            environment,
+                            path,
+                            depth,
+                        }
                     });
-                    work.extend(arguments.into_iter().rev().map(|thunk| Work::Enter {
-                        thunk,
-                        path: Vec::new(),
-                        depth,
-                    }));
                 }
                 DeferredValue::Access(access) => {
                     let path = std::iter::once(access.step().clone()).chain(path).collect();
@@ -2019,12 +1985,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         .then(|| first.clone())
                 }
             },
-            Operation::Alternatives {
-                operator,
-                location,
-                call,
-                authored,
-            } => {
+            Operation::Alternatives { operator, origin } => {
                 let alternatives = match operator {
                     Alternatives::Coalesce => children.iter_mut().map(Option::take).collect(),
                     Alternatives::Lookup => {
@@ -2048,7 +2009,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         // The retained authored occurrence owns this error.
                         // Replayed argument Values have no operator identity
                         // and cannot invent another location or grant proof.
-                        if authored {
+                        if let Some((location, call)) = origin {
                             self.finding(
                                 location,
                                 call,
@@ -2094,17 +2055,11 @@ impl<B: BindingAddress> Owner<'_, B> {
             );
         }
         if let Some(resource) = self.resources.get(binding) {
+            let schema =
+                self.schemas
+                    .get(&resource.provider, &resource.resource_type, resource.kind);
             let Some(step) = path.first() else {
-                let kind = if resource.read {
-                    crate::schema::SchemaKind::DataSource
-                } else {
-                    crate::schema::SchemaKind::Resource
-                };
-                return if self
-                    .schemas
-                    .get(&resource.provider, &resource.resource_type, kind)
-                    .is_some()
-                {
+                return if schema.is_some() {
                     ReferenceSource::Handle
                 } else {
                     ReferenceSource::Pending
@@ -2119,24 +2074,12 @@ impl<B: BindingAddress> Owner<'_, B> {
                     index: Subscript::Int { index: _ },
                 } => None,
             };
-            if !resource.read
+            if resource.kind == SchemaKind::Resource
                 && let Some(source) = name.and_then(|name| resource.attributes.get(name))
             {
                 return ReferenceSource::Source(source.clone(), path[1..].to_vec());
             }
-            if self
-                .schemas
-                .get(
-                    &resource.provider,
-                    &resource.resource_type,
-                    if resource.read {
-                        crate::schema::SchemaKind::DataSource
-                    } else {
-                        crate::schema::SchemaKind::Resource
-                    },
-                )
-                .is_none()
-            {
+            if schema.is_none() {
                 return ReferenceSource::Pending;
             }
             let ty = crate::parser::TypeExpr::Ref(crate::parser::ResourceTypePath::new(
@@ -2184,21 +2127,32 @@ enum Agreement {
     Pending,
 }
 
-fn uniform(value: &Evidence) -> Option<Secrecy> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Uniformity {
+    Empty,
+    Known(Secrecy),
+    Mixed,
+}
+
+fn uniform(value: &Evidence) -> Uniformity {
     match value {
-        Evidence::Leaf(secrecy) => Some(*secrecy),
+        Evidence::Leaf(secrecy) => Uniformity::Known(*secrecy),
         Evidence::Map(fields) => uniform_members(fields.values()),
         Evidence::List(elements) => uniform_members(elements.iter()),
     }
 }
-fn uniform_members<'a>(mut values: impl Iterator<Item = &'a Evidence>) -> Option<Secrecy> {
-    let first = values
-        .next()
-        .map(uniform)
-        .unwrap_or(Some(Secrecy::Public))?;
-    values
-        .all(|value| uniform(value) == Some(first))
-        .then_some(first)
+fn uniform_members<'a>(values: impl Iterator<Item = &'a Evidence>) -> Uniformity {
+    values.fold(Uniformity::Empty, |common, value| {
+        match (common, uniform(value)) {
+            (Uniformity::Empty, other) | (other, Uniformity::Empty) => other,
+            (Uniformity::Known(left), Uniformity::Known(right)) if left == right => {
+                Uniformity::Known(left)
+            }
+            (Uniformity::Known(_), Uniformity::Known(_))
+            | (Uniformity::Mixed, _)
+            | (_, Uniformity::Mixed) => Uniformity::Mixed,
+        }
+    })
 }
 fn agreement(values: impl IntoIterator<Item = Evidence>) -> Agreement {
     let mut values = values.into_iter();
@@ -2219,15 +2173,14 @@ fn pair_agreement(left: &Evidence, right: &Evidence) -> Agreement {
         return Agreement::Known(left.clone());
     }
     match (uniform(left), uniform(right)) {
-        (Some(left), Some(right)) if left == right => {
+        (Uniformity::Empty, _) => return Agreement::Known(right.clone()),
+        (_, Uniformity::Empty) => return Agreement::Known(left.clone()),
+        (Uniformity::Known(left), Uniformity::Known(right)) if left == right => {
             return Agreement::Known(Evidence::Leaf(left));
         }
-        (Some(_), Some(_)) => return Agreement::Mixed,
-        (Some(Secrecy::Secret), None)
-        | (Some(Secrecy::Public), None)
-        | (None, Some(Secrecy::Secret))
-        | (None, Some(Secrecy::Public)) => return Agreement::Mixed,
-        (None, None) => {}
+        (Uniformity::Known(_), Uniformity::Known(_) | Uniformity::Mixed)
+        | (Uniformity::Mixed, Uniformity::Known(_)) => return Agreement::Mixed,
+        (Uniformity::Mixed, Uniformity::Mixed) => {}
     }
     match (left, right) {
         (Evidence::Map(left), Evidence::Map(right)) if left.keys().eq(right.keys()) => {

@@ -12,7 +12,7 @@ mod tests;
 
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -336,7 +336,31 @@ fn render_merged<F: MergedFinding>(
     })
 }
 
-fn render_secrecy(doc: &Document, finding: &carina_core::secrecy::Finding) -> Option<Diagnostic> {
+fn secrecy_related_position(source: &str, line: usize, column: usize) -> Option<Position> {
+    let line = line.checked_sub(1)?;
+    let column = column.checked_sub(1)?;
+    let text = source.lines().nth(line)?;
+    Some(Position::new(
+        u32::try_from(line).ok()?,
+        position::char_offset_to_utf16_offset(text, column),
+    ))
+}
+
+fn secrecy_related_message(cause: &carina_core::secrecy::DerivationError, name: &str) -> String {
+    use carina_core::secrecy::DerivationError;
+    let description = match cause {
+        DerivationError::MixedAlternatives(_) => "Authored alternative",
+        DerivationError::LimitReached(_) => "Secrecy derivation limit reached",
+        DerivationError::RecursiveFunction(_) => "Recursive function",
+    };
+    format!("{description} in module instance '{name}'")
+}
+
+fn render_secrecy(
+    doc: &Document,
+    finding: &carina_core::secrecy::Finding,
+    open_sources: &[(PathBuf, String)],
+) -> Option<Diagnostic> {
     let authored = finding.location();
     if authored.file().path() == doc.source_file() {
         return render_merged(
@@ -356,29 +380,30 @@ fn render_secrecy(doc: &Document, finding: &carina_core::secrecy::Finding) -> Op
         DiagnosticSeverity::ERROR,
         finding.message(),
     )?;
-    let source = std::fs::read_to_string(authored.file().path()).ok()?;
-    let position = |line: usize, column: usize| {
-        let text = source.lines().nth(line - 1)?;
-        Some(Position::new(
-            u32::try_from(line - 1).ok()?,
-            text.chars()
-                .take(column - 1)
-                .map(|character| character.len_utf16() as u32)
-                .sum(),
-        ))
-    };
-    let span = authored.span();
-    diagnostic.related_information =
-        Some(vec![tower_lsp::lsp_types::DiagnosticRelatedInformation {
+    // A related location is optional. Failure to read or map it must never
+    // suppress the diagnostic at the caller's valid location.
+    let related = || {
+        let identity = PathIdentity::new(authored.file().path());
+        let source = match open_sources
+            .iter()
+            .find(|(path, _)| PathIdentity::new(path) == identity)
+        {
+            Some((_, source)) => std::borrow::Cow::Borrowed(source.as_str()),
+            None => std::borrow::Cow::Owned(std::fs::read_to_string(authored.file().path()).ok()?),
+        };
+        let span = authored.span();
+        Some(tower_lsp::lsp_types::DiagnosticRelatedInformation {
             location: tower_lsp::lsp_types::Location {
                 uri: tower_lsp::lsp_types::Url::from_file_path(authored.file().path()).ok()?,
                 range: Range::new(
-                    position(span.start_line(), span.start_column())?,
-                    position(span.end_line(), span.end_column())?,
+                    secrecy_related_position(&source, span.start_line(), span.start_column())?,
+                    secrecy_related_position(&source, span.end_line(), span.end_column())?,
                 ),
             },
-            message: format!("Authored alternative in module instance '{}'", call.name),
-        }]);
+            message: secrecy_related_message(finding.cause(), &call.name),
+        })
+    };
+    diagnostic.related_information = related().map(|related| vec![related]);
     Some(diagnostic)
 }
 
@@ -733,6 +758,7 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for LspTypeC
 pub(super) struct DiagnosticRun<'a> {
     engine: &'a DiagnosticEngine,
     provider_context: &'a dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    open_sources: &'a [(PathBuf, String)],
 }
 
 impl std::ops::Deref for DiagnosticRun<'_> {
@@ -926,15 +952,39 @@ impl DiagnosticRun<'_> {
         });
         // Resolve the document through the pinned base once, then share its
         // snapshot across directory, module, upstream and recovery analysis.
-        let overrides = if let Some(base) = base_path {
+        let current_override = if let Some(base) = base_path {
             current_file_name
                 .and_then(|file_name| base.join(file_name).ok())
-                .map(|path| carina_core::config_loader::SourceOverrides::single(path, text.clone()))
+                .map(|path| (path, text.clone()))
         } else {
             None
         };
-        // Keep directory checks available when only the document leaf fails.
-        let overrides = overrides.unwrap_or_else(carina_core::config_loader::SourceOverrides::new);
+        // Parsing and related ranges share the same snapshot of every open
+        // file. The current document's parsed text takes precedence.
+        let current_identity = PathIdentity::new(doc.source_file());
+        let entries = self
+            .open_sources
+            .iter()
+            .filter(|(path, _)| PathIdentity::new(path) != current_identity)
+            .filter_map(|(path, text)| {
+                carina_core::paths::ResolvedPath::new(path)
+                    .ok()
+                    .map(|path| (path, text.clone()))
+            })
+            .chain(current_override);
+        let overrides = match carina_core::config_loader::SourceOverrides::try_from_entries(entries)
+        {
+            Ok(overrides) => overrides,
+            Err(error) => {
+                diagnostics.push(Diagnostic {
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("carina".into()),
+                    message: error.to_string(),
+                    ..Default::default()
+                });
+                return diagnostics;
+            }
+        };
         let current_file_name = current_file_name.map(|name| name.to_string_lossy());
         let current_file_name = current_file_name.as_deref();
 
@@ -1558,7 +1608,7 @@ impl DiagnosticRun<'_> {
                 |configuration| configuration.judged().secrecy(),
             );
             for finding in secrecy_report.findings() {
-                if let Some(diagnostic) = render_secrecy(doc, finding)
+                if let Some(diagnostic) = render_secrecy(doc, finding, self.open_sources)
                     && !diagnostics.contains(&diagnostic)
                 {
                     diagnostics.push(diagnostic);
@@ -2896,6 +2946,7 @@ impl DiagnosticEngine {
                 produce(&DiagnosticRun {
                     engine: self,
                     provider_context: session,
+                    open_sources: &[],
                 })
             },
         )
@@ -2910,6 +2961,30 @@ impl DiagnosticEngine {
         &self,
         raw: &crate::document::Document,
         current_file_path: Option<&Path>,
+    ) -> Vec<Diagnostic> {
+        self.analyze_with_open_documents(raw, current_file_path, &[])
+    }
+
+    /// Analyze against a snapshot of the open editor buffers, including imported
+    /// module sources used for authored diagnostic locations.
+    pub fn analyze_with_open_documents(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_documents: &[&crate::document::Document],
+    ) -> Vec<Diagnostic> {
+        let open_sources = open_documents
+            .iter()
+            .map(|doc| (doc.source_file().to_path_buf(), doc.text()))
+            .collect::<Vec<_>>();
+        self.analyze_with_open_sources(raw, current_file_path, &open_sources)
+    }
+
+    pub(crate) fn analyze_with_open_sources(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_sources: &[(PathBuf, String)],
     ) -> Vec<Diagnostic> {
         let doc = match raw.for_diagnostics() {
             Ok(doc) => doc,
@@ -2936,6 +3011,7 @@ impl DiagnosticEngine {
                 DiagnosticRun {
                     engine: self,
                     provider_context: session,
+                    open_sources,
                 }
                 .collect_diagnostics(&doc, current_file_path)
             });

@@ -731,12 +731,21 @@ async fn publish_diagnostics_for(
     providers: &tokio::sync::RwLock<ProviderStates>,
     uri: Url,
 ) {
+    let open_sources = documents
+        .iter()
+        .map(|entry| (entry.source_file().to_path_buf(), entry.text()))
+        .collect::<Vec<_>>();
     let Some(doc) = documents.get(&uri) else {
         return;
     };
     let current_file_path = uri.to_file_path().ok();
     let guard = providers.read().await;
-    let diagnostics = analyze_document(&guard, &doc, current_file_path.as_deref());
+    let diagnostics = analyze_document_with_open_sources(
+        &guard,
+        &doc,
+        current_file_path.as_deref(),
+        &open_sources,
+    );
     drop(guard);
 
     client.publish_diagnostics(uri, diagnostics, None).await;
@@ -803,11 +812,22 @@ pub fn analyze_document(
     document: &Document,
     current_file_path: Option<&Path>,
 ) -> Vec<Diagnostic> {
+    analyze_document_with_open_sources(states, document, current_file_path, &[])
+}
+
+fn analyze_document_with_open_sources(
+    states: &ProviderStates,
+    document: &Document,
+    current_file_path: Option<&Path>,
+    open_sources: &[(PathBuf, String)],
+) -> Vec<Diagnostic> {
     let state = current_file_path
         .and_then(Path::parent)
         .map(|path| states.state_for_path(path))
         .unwrap_or(&states.empty);
-    state.diagnostic_engine.analyze(document, current_file_path)
+    state
+        .diagnostic_engine
+        .analyze_with_open_sources(document, current_file_path, open_sources)
 }
 
 #[derive(Debug, PartialEq, Eq)]
