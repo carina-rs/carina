@@ -561,11 +561,11 @@ fn legacy_findings_result(
     }
 }
 pub fn legacy_validate_resources<
-    E,
+    E: Clone,
     P: crate::resource::PlaceholderKind,
     T: crate::resource::PlaceholderKind,
     B: crate::resource::BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B> + Clone,
 >(
     parsed: &crate::parser::File<E, P, T, D, B>,
     registry: &crate::schema::SchemaRegistry,

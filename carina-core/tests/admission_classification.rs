@@ -78,3 +78,97 @@ fn reported_inputs_are_classified_from_their_own_values() {
 fn projected_inputs_are_classified_from_their_own_values() {
     rejects_invalid_product_value(true);
 }
+
+#[test]
+fn raw_file_validation_prefix_matches_value_only_admission() {
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Test")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = parse_file_and_resolve(
+        "mock.Test { name_prefix = 'x' }",
+        std::path::Path::new("main.crn"),
+        &context,
+    )
+    .unwrap();
+    let expected = carina_core::test_utils::admit_resource_attributes(
+        schemas
+            .get("mock", "Test", carina_core::schema::SchemaKind::Resource)
+            .unwrap(),
+        &parsed.resources[0].attributes,
+        &|_| true,
+        &Default::default(),
+    );
+    assert!(
+        expected.is_ok(),
+        "the value-only path recognizes this companion: {expected:?}"
+    );
+    let actual = carina_core::validation::validate_resources(
+        &parsed,
+        &schemas,
+        &std::collections::HashSet::from(["mock".into()]),
+        &context,
+        &mut Vec::new(),
+    );
+    assert!(
+        actual.is_ok(),
+        "raw-file validation must agree with the value-only path: {actual:?}"
+    );
+}
+
+#[test]
+fn raw_file_validation_retains_typed_prefix_failures() {
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Test")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    for (source, message) in [
+        (
+            "mock.Test { name_prefix = '' }",
+            "'name_prefix' cannot be empty",
+        ),
+        (
+            "mock.Test { name = 'a'\nname_prefix = 'x' }",
+            "cannot specify both 'name_prefix' and 'name'",
+        ),
+    ] {
+        let parsed =
+            parse_file_and_resolve(source, std::path::Path::new("main.crn"), &context).unwrap();
+        let findings = carina_core::validation::validate_resources(
+            &parsed,
+            &schemas,
+            &std::collections::HashSet::from(["mock".into()]),
+            &context,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let errors: Vec<_> = findings
+            .iter()
+            .filter_map(|finding| match finding {
+                carina_core::validation::PresentedFinding::Ordinary(
+                    carina_core::validation::OrdinaryFinding::Resource(finding),
+                ) => finding.type_error(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "{findings:?}");
+        assert!(
+            matches!(
+                errors[0],
+                carina_core::schema::TypeError::AttributePrefix(_)
+            ),
+            "{errors:?}"
+        );
+        assert!(errors[0].to_string().contains(message), "{errors:?}");
+    }
+}

@@ -2880,7 +2880,6 @@ fn round13_cross_owner_same_identity_defers_in_reference_and_declared_admission(
 fn round2_plain_reference_skips_expression_callback() {
     use crate::parser::ProviderContext;
     use crate::resource::RelativeBindingName;
-    use crate::resource::knowledge::{KnowledgeContext, collect_classified_attributes};
     use crate::validation::admission::{attributes, kind};
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let mut schemas = crate::schema::SchemaRegistry::new();
@@ -2902,20 +2901,19 @@ fn round2_plain_reference_skips_expression_callback() {
         "let source = mock.Source {}\nlet sink = mock.Sink { input = source.output }",
     )
     .unwrap();
-    let judged = crate::parser::retained::JudgedFile::new(parsed, &schemas, &config);
-    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let canonical = crate::identifier::canonicalize_file_prefixes(
+        parsed,
+        &schemas,
+        crate::identifier::SuffixSource::Preview,
+    );
+    let judged = canonical.judge(&config);
+    let tree = judged.analysis_tree().unwrap();
     let resource = tree
         .project_resources()
         .find(|resource| resource.id().resource_type == "Sink")
         .unwrap();
-    let bindings =
-        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
-    let values = resource.attributes();
-    let classified = collect_classified_attributes(
-        values.iter().map(|(name, value)| (name.clone(), value)),
-        &KnowledgeContext::validation(),
-        |_, error| panic!("{error}"),
-    );
+    let bindings = judged.parsed().binding_index(&config);
+    let values = resource.values();
     let actual: Vec<String> =
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
             let check =
@@ -2937,9 +2935,8 @@ fn round2_plain_reference_skips_expression_callback() {
                     })
                 };
             let result = attributes::admit_validation_attributes::<kind::ResourceAttribute, _, _>(
-                resource.schema(&schemas).unwrap(),
+                resource.resource_schema(),
                 resource.id(),
-                &classified,
                 resource.quoted_string_attrs(),
                 Some(&bindings),
                 session,
@@ -2947,13 +2944,16 @@ fn round2_plain_reference_skips_expression_callback() {
                 None,
                 attributes::SchemaInputAuthority::new(
                     resource.authored_slots().unwrap(),
+                    &values,
                     judged.report(),
                     &mut Default::default(),
                 ),
             );
+            assert!(result.classification_diagnostics.0.is_empty());
             result
+                .values
                 .errors()
-                .chain(result.symbolic_errors().map(|(_, _, error)| error))
+                .chain(result.values.symbolic_errors().map(|(_, _, error)| error))
                 .map(ToString::to_string)
                 .collect()
         });

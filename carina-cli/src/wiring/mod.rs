@@ -3526,11 +3526,11 @@ fn block_name_errors<T: fmt::Display>(conflicts: impl IntoIterator<Item = T>) ->
 
 #[cfg(test)]
 pub fn validate_resources_with_ctx<
-    E,
+    E: Clone,
     P: PlaceholderKind,
     T: PlaceholderKind,
     B: BindingAddress,
-    D: carina_core::parser::DeferredForPhaseTraversal<P, T, B>,
+    D: carina_core::parser::DeferredForPhaseTraversal<P, T, B> + Clone,
 >(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E, P, T, D, B>,
@@ -3828,7 +3828,7 @@ fn resolve_config_names_with_ctx<'s, E>(
 ) -> Result<ParserCanonicalResourcePair<'s, E>, Vec<AppError>> {
     ParserCanonicalResourcePair::resolve_block_names(access, parsed, unresolved, ctx.schemas())
         .map_err(block_name_errors)?
-        .resolve_attr_prefixes_report(ctx.schemas())
+        .resolve_attr_prefixes_report()
         .map_err(|errors| {
             errors
                 .into_iter()

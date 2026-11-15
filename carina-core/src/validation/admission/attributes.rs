@@ -381,26 +381,30 @@ type ValidationAssignmentCheck<'a, P, B> = Option<
     ) -> Result<crate::schema::value_validation::AssignmentFindings, TypeError>,
 >;
 
-pub(crate) struct SchemaInputAuthority<'a, B: BindingAddress> {
-    source: SchemaInputSource<'a, B>,
+pub(crate) struct SchemaInputAuthority<'a, P: PlaceholderKind, B: BindingAddress> {
+    source: SchemaInputSource<'a, P, B>,
     report: &'a crate::parser::retained::ExpressionReport<B>,
     coverage: &'a mut WalkCoverage,
 }
-enum SchemaInputSource<'a, B: BindingAddress> {
-    Programmatic,
-    Authored(&'a crate::parser::retained::AuthoredSlots<B>),
+enum SchemaInputSource<'a, P: PlaceholderKind, B: BindingAddress> {
+    Programmatic(&'a crate::identifier::CanonicalAttributeValues<P, B>),
+    Authored {
+        slots: &'a crate::parser::retained::AuthoredSlots<B>,
+        values: &'a crate::identifier::CanonicalAttributeValues<P, B>,
+    },
 }
-impl<'a, B: BindingAddress> SchemaInputAuthority<'a, B> {
+impl<'a, P: PlaceholderKind, B: BindingAddress> SchemaInputAuthority<'a, P, B> {
     pub(crate) fn new(
         slots: &'a crate::parser::retained::AuthoredSlots<B>,
+        values: &'a crate::identifier::CanonicalAttributeValues<P, B>,
         report: &'a crate::parser::retained::ExpressionReport<B>,
         coverage: &'a mut WalkCoverage,
     ) -> Self {
         // Only the producer's lack of authored storage grants value-only
         // authority. An attribute lookup failure cannot construct this state.
         let source = match slots.declaration_id() {
-            Some(_) => SchemaInputSource::Authored(slots),
-            None => SchemaInputSource::Programmatic,
+            Some(_) => SchemaInputSource::Authored { slots, values },
+            None => SchemaInputSource::Programmatic(values),
         };
         Self {
             source,
@@ -419,7 +423,6 @@ pub(crate) fn admit_validation_attributes<
 >(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     id: &ResourceId,
-    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
     quoted: &std::collections::HashSet<String>,
     bindings: Option<&BindingIndex<'_, B>>,
     session: &dyn ProviderTypeCheckContext,
@@ -427,46 +430,37 @@ pub(crate) fn admit_validation_attributes<
     declarations: Option<
         &std::collections::HashMap<String, (String, crate::binding_index::DeclaredValueSource)>,
     >,
-    authority: SchemaInputAuthority<'_, B>,
-) -> crate::schema::ResourceValueValidation {
+    authority: SchemaInputAuthority<'_, P, B>,
+) -> ResourceAdmissionOutcome<B> {
     let SchemaInputAuthority {
         source,
         report,
         coverage,
     } = authority;
-    let slots = match source {
-        SchemaInputSource::Programmatic => {
-            let values = attributes
-                .iter()
-                .map(|(name, proof)| {
-                    (
-                        name.clone(),
-                        crate::resource::knowledge::ClassifiedRef::from(proof)
-                            .diagnostic_value()
-                            .clone(),
-                    )
-                })
-                .collect();
-            return match crate::identifier::canonicalize_prefix_values(
+    let (slots, values) = match source {
+        SchemaInputSource::Programmatic(values) => (None, values),
+        SchemaInputSource::Authored { slots, values } => (Some(slots), values),
+    };
+    let mut classification_errors = Vec::new();
+    let attributes = crate::resource::knowledge::collect_classified_attributes(
+        values.iter().map(|(name, value)| (name.clone(), value)),
+        &crate::resource::knowledge::KnowledgeContext::validation(),
+        |name, error| classification_errors.push((name.to_owned(), error)),
+    );
+    let classification_diagnostics = ClassificationDiagnostics(classification_errors);
+    let Some(slots) = slots else {
+        return ResourceAdmissionOutcome {
+            values: admit_classified_value_only_attributes::<K, P, B>(
                 schema,
                 id,
-                values,
-                crate::identifier::SuffixSource::Preview,
-            ) {
-                Ok(values) => {
-                    admit_value_only_attributes::<K, P, B>(schema, id, &values, quoted, session)
-                }
-                Err(errors) => crate::schema::ResourceValueValidation::from_errors(
-                    errors
-                        .into_iter()
-                        .map(|error| TypeError::AttributePrefix(Box::new(error)))
-                        .collect(),
-                ),
-            };
-        }
-        SchemaInputSource::Authored(slots) => slots,
+                &attributes,
+                quoted,
+                session,
+            ),
+            classification_diagnostics,
+        };
     };
-    let missing = inputs::missing_schema_inputs(slots, attributes, report);
+    let missing = inputs::missing_schema_inputs(slots, &attributes, report);
     let candidate = |name: &str, proof| {
         if let Some(projection) = slots.projected_phase(name) {
             return Ok(Box::new(Candidate::validation_projected(
@@ -501,7 +495,7 @@ pub(crate) fn admit_validation_attributes<
     let findings = admit_validation_attributes_with_input::<K, P, B>(
         schema,
         id,
-        attributes,
+        &attributes,
         attributes.iter(),
         quoted,
         bindings,
@@ -514,7 +508,10 @@ pub(crate) fn admit_validation_attributes<
         },
     );
     *coverage = visits.into_inner();
-    missing.finish(findings, coverage)
+    ResourceAdmissionOutcome {
+        values: missing.finish(findings, coverage),
+        classification_diagnostics,
+    }
 }
 
 /// Programmatic values enter a NoAuthored walk, with no callback or conversion
@@ -536,8 +533,28 @@ pub(crate) fn admit_value_only_attributes<
         &crate::resource::knowledge::KnowledgeContext::validation(),
         |name, error| classification_errors.push((name.to_owned(), TypeError::from(error))),
     );
-    let mut report = schema.schema().as_schema().validate_admission_report(
-        &attributes,
+    let mut report =
+        admit_classified_value_only_attributes::<K, P, B>(schema, id, &attributes, quoted, session);
+    for (name, error) in classification_errors {
+        report.push_attribute_error(&name, error);
+    }
+    report
+}
+
+// Both callers classified a witnessed map, never an arbitrary authored map.
+fn admit_classified_value_only_attributes<
+    K: RechecksResolved,
+    P: PlaceholderKind,
+    B: BindingAddress,
+>(
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
+    id: &ResourceId,
+    attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
+    quoted: &std::collections::HashSet<String>,
+    session: &dyn ProviderTypeCheckContext,
+) -> crate::schema::ResourceValueValidation {
+    schema.schema().as_schema().validate_admission_report(
+        attributes,
         attributes.iter(),
         &|name| quoted.contains(name),
         &crate::schema::value_validation::AttributeAdmission {
@@ -557,11 +574,7 @@ pub(crate) fn admit_value_only_attributes<
             },
             unknown: None,
         },
-    );
-    for (name, error) in classification_errors {
-        report.push_attribute_error(&name, error);
-    }
-    report
+    )
 }
 
 type ValidationCandidateFactory<'a, P, B> =

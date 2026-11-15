@@ -122,7 +122,6 @@ impl<'s, E> ParserCanonicalResourcePair<'s, E> {
     }
     pub(crate) fn resolve_attr_prefixes_report(
         self,
-        _schemas: &SchemaRegistry,
     ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixError>> {
         if self.parsed.prefix_errors().is_empty() {
             Ok(self)

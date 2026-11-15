@@ -9,10 +9,12 @@ pub use diagnostics::{
     anonymous_identity_diagnostics, attribute_derived_conflict_diagnostics,
     legacy_loop_move_target_diagnostics,
 };
-pub(crate) use prefix::canonicalize_prefix_values;
 pub use prefix::{
     CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, ModuleResolvedFileRead,
     PrefixCanonicalized, PrefixFileRead, SuffixSource, canonicalize_file_prefixes,
+};
+pub(crate) use prefix::{
+    CanonicalSchemaInputs, CanonicalSchemaResource, canonicalize_prefix_values,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1500,6 +1502,9 @@ pub struct AttributePrefixError {
     location: Option<crate::parser::DeclarationLocation>,
 }
 impl AttributePrefixError {
+    pub(crate) fn resource_id(&self) -> &ResourceId {
+        &self.resource
+    }
     pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
         self.location.as_ref()
     }

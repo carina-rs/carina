@@ -6,7 +6,7 @@ use super::{
 use crate::parser::retained::JudgedFile;
 use crate::parser::{
     AnalysisResourceRef, AnalysisTree, AnalysisTreeError, DeferredForPhaseTraversal,
-    ExportParamLike, File, ProviderContext,
+    ExportParamLike, File, ProviderContext, ResourceRef,
 };
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, ModuleSource, ParserPlaceholder, PlaceholderKind,
@@ -161,6 +161,123 @@ pub struct CanonicalAttributeValues<P: PlaceholderKind, B: BindingAddress> {
     values: IndexMap<String, Value<P, B>>,
     pub(crate) declaration: DeclarationIdentity,
 }
+pub(crate) struct CanonicalSchemaInputs<
+    'f,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    B: BindingAddress,
+> {
+    pub is_module_definition: bool,
+    pub resources: Vec<CanonicalSchemaResource<'f, P, T, B>>,
+}
+
+// Whole-file schema validation also visits data sources and deferred templates.
+// Only the canonical file can project these inputs; excluded kinds retain their
+// original keys, exactly as in the CLI canonicalization pass.
+pub(crate) enum CanonicalSchemaResource<
+    'f,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    B: BindingAddress,
+> {
+    Resource(&'f Resource<ModuleSource, P, B>, SchemaValues<'f, P, B>),
+    DataSource(
+        &'f crate::resource::DataSource<ModuleSource, P, B>,
+        SchemaValues<'f, P, B>,
+    ),
+    Deferred(&'f Resource<ModuleSource, T, B>, SchemaValues<'f, T, B>),
+}
+type SchemaValues<'f, P, B> =
+    Option<(OwnerBoundResourceSchema<'f>, CanonicalAttributeValues<P, B>)>;
+
+fn schema_validation_resources<
+    'f,
+    X,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    D,
+    B: BindingAddress,
+>(
+    file: &'f File<X, P, T, D, B>,
+    schemas: &'f SchemaRegistry,
+    rejected: &[usize],
+) -> CanonicalSchemaInputs<'f, P, T, B>
+where
+    D: DeferredForPhaseTraversal<P, T, B>,
+{
+    fn values<P: PlaceholderKind, B: BindingAddress>(
+        schema: OwnerBoundResourceSchema<'_>,
+        attributes: &IndexMap<String, Value<P, B>>,
+    ) -> CanonicalAttributeValues<P, B> {
+        CanonicalAttributeValues {
+            values: attributes.clone(),
+            declaration: declaration_identity(schema),
+        }
+    }
+    let resources = file
+        .iter_all_resources()
+        .filter_map(|resource| match resource {
+            ResourceRef::LiveComposition(_) => None,
+            ResourceRef::Resource(resource) => {
+                if rejected
+                    .iter()
+                    .any(|index| std::ptr::eq(&file.resources[*index], resource))
+                {
+                    return None;
+                }
+                Some(CanonicalSchemaResource::Resource(
+                    resource,
+                    schemas
+                        .get_for(resource)
+                        .map(|schema| (schema, values(schema, &resource.attributes))),
+                ))
+            }
+            ResourceRef::DataSource(resource) => Some(CanonicalSchemaResource::DataSource(
+                resource,
+                schemas
+                    .get_for_data_source(resource)
+                    .map(|schema| (schema, values(schema, &resource.attributes))),
+            )),
+            ResourceRef::Deferred { resource, .. } => Some(CanonicalSchemaResource::Deferred(
+                resource.as_resource(),
+                schemas
+                    .get_for(resource.as_resource())
+                    .map(|schema| (schema, values(schema, resource.attributes()))),
+            )),
+        })
+        .collect();
+    CanonicalSchemaInputs {
+        is_module_definition: crate::validation::is_module_definition(file),
+        resources,
+    }
+}
+
+impl<X, P: PlaceholderKind, T: PlaceholderKind, D, B: BindingAddress>
+    PrefixCanonicalized<'_, File<X, P, T, D, B>>
+where
+    D: DeferredForPhaseTraversal<P, T, B>,
+{
+    pub(crate) fn schema_validation_resources(&self) -> CanonicalSchemaInputs<'_, P, T, B> {
+        schema_validation_resources(&self.file, self.schemas, &self.rejected)
+    }
+    pub(crate) fn validation_report(
+        &self,
+        context: &ProviderContext,
+    ) -> crate::parser::retained::ExpressionReport<B> {
+        let existing = self
+            .file
+            .parser_binding_metadata
+            .syntax()
+            .expressions()
+            .admission_report();
+        if existing.has_authored_judgement() {
+            existing.clone()
+        } else {
+            crate::parser::retained::judge_expressions(&self.file, self.schemas, context)
+        }
+    }
+}
+
 impl<P: PlaceholderKind, B: BindingAddress> Deref for CanonicalAttributeValues<P, B> {
     type Target = IndexMap<String, Value<P, B>>;
     fn deref(&self) -> &Self::Target {
@@ -227,6 +344,8 @@ where
         }
     }
     /// Caller projections stay open for #4400; their keys must still be resolved.
+    /// This projection uses the deterministic preview suffix (`00000000`),
+    /// and must not supply the CLI's generated resource names.
     pub fn with_values(
         &self,
         values: &IndexMap<String, Value<ParserPlaceholder, B>>,
@@ -326,6 +445,11 @@ where
     X: ExportParamLike<ParserPlaceholder, B>,
     D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    pub(crate) fn schema_validation_resources(
+        &self,
+    ) -> CanonicalSchemaInputs<'_, ParserPlaceholder, ParserPlaceholder, B> {
+        schema_validation_resources(self.file.file(), self.schemas, &self.rejected)
+    }
     pub(crate) fn admission_report(&self) -> &crate::parser::retained::ExpressionReport<B> {
         self.file
             .file()
