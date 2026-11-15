@@ -82,6 +82,9 @@ fn state_put_error(
 ) -> BackendError {
     use aws_sdk_s3::error::SdkError;
     let outcome = match &error {
+        SdkError::ServiceError(context) if context.raw().status().is_server_error() => {
+            crate::SaveFailureKind::Unconfirmed
+        }
         SdkError::ConstructionFailure(_) | SdkError::ServiceError(_) => {
             crate::SaveFailureKind::Failed
         }
@@ -1349,6 +1352,62 @@ mod tests {
             status.try_into().unwrap(),
             aws_smithy_types::body::SdkBody::empty(),
         )
+    }
+
+    #[test]
+    fn round13_s3_dispatched_put_5xx_service_errors_are_unconfirmed() {
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        let settings =
+            S3BackendSettings::from_url_parts("test-bucket".into(), "state.json".into()).unwrap();
+        for (status, code) in [
+            (500, "InternalError"),
+            (503, "SlowDown"),
+            (503, "ServiceUnavailable"),
+        ] {
+            let error = state_put_error(
+                SdkError::service_error(
+                    PutObjectError::generic(ErrorMetadata::builder().code(code).build()),
+                    head_bucket_http_response(status),
+                ),
+                &settings,
+            );
+            assert!(
+                matches!(&error, BackendError::UnconfirmedStateSave { .. }),
+                "HTTP {status} {code}: {error:?}"
+            );
+            assert_eq!(
+                error.save_failure_kind(),
+                crate::SaveFailureKind::Unconfirmed
+            );
+        }
+    }
+
+    #[test]
+    fn round13_s3_rejected_or_undispatched_put_is_a_definite_failure() {
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        let settings =
+            S3BackendSettings::from_url_parts("test-bucket".into(), "state.json".into()).unwrap();
+        for (status, code) in [
+            (400, "InvalidRequest"),
+            (403, "AccessDenied"),
+            (412, "PreconditionFailed"),
+            (429, "TooManyRequests"),
+        ] {
+            let error = state_put_error(
+                SdkError::service_error(
+                    PutObjectError::generic(ErrorMetadata::builder().code(code).build()),
+                    head_bucket_http_response(status),
+                ),
+                &settings,
+            );
+            assert!(matches!(&error, BackendError::Aws(_)), "{error:?}");
+            assert_eq!(error.save_failure_kind(), crate::SaveFailureKind::Failed);
+        }
+        assert_eq!(
+            state_put_error(SdkError::construction_failure("not dispatched"), &settings)
+                .save_failure_kind(),
+            crate::SaveFailureKind::Failed
+        );
     }
 
     #[test]

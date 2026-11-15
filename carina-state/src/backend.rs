@@ -598,12 +598,12 @@ impl BackendError {
     pub fn save_failure_kind(&self) -> SaveFailureKind {
         match self {
             Self::UnconfirmedStateSave { .. } => SaveFailureKind::Unconfirmed,
-            Self::GitHub(error) => error.save_failure_kind(),
             Self::StateRead { error, .. } | Self::UnreadableBackendAddress { error, .. } => {
                 error.save_failure_kind()
             }
             Self::UpstreamExportRead(error) => error.error.save_failure_kind(),
-            Self::GitHubUrl(_)
+            Self::GitHub(_)
+            | Self::GitHubUrl(_)
             | Self::Locked { .. }
             | Self::LockNotFound(_)
             | Self::LockMismatch { .. }

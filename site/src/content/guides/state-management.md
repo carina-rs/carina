@@ -309,10 +309,11 @@ expires, Carina attempts lock release. GitHub bounds each save and release by
 the time remaining until 500ms before the supervisor deadline. A third signal
 exits immediately.
 
-If a dispatched state save times out at the backend's I/O limit before the
-flush cutoff, cleanup reports that the save could not be confirmed and tells
-you to run `carina state refresh`. A definite write denial still reports a
-state flush failure.
+Whenever a dispatched state save's outcome is unknown, cleanup reports that
+the save could not be confirmed and tells you to run `carina state refresh`.
+This includes timeouts, lost transport replies, server errors, and failed
+post-commit verification. A definite write denial still reports a state flush
+failure.
 
 GitHub writes each state or lock change as a separate commit. Measured GitHub
 latencies were PUT p50 0.93s, p95 1.33s, max 1.88s; DELETE p50

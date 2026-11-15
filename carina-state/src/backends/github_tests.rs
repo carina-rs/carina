@@ -22,6 +22,7 @@ struct Store {
     root_status: Option<u16>,
     mutation_response: Option<GitHubResponse>,
     mutation_responses: VecDeque<GitHubResponse>,
+    mutation_error: Option<GitHubError>,
     requires_pull_request: bool,
     files: BTreeMap<String, Vec<u8>>,
     history: BTreeMap<String, BTreeMap<String, Vec<u8>>>,
@@ -38,6 +39,7 @@ struct Store {
     wrong_blob_sha: bool,
     two_winners: bool,
     compare_response: Option<Value>,
+    compare_error: Option<GitHubError>,
     fail_read_after_commit: bool,
     after_commit_error: Option<GitHubError>,
     after_commit_response: Option<GitHubResponse>,
@@ -110,7 +112,7 @@ async fn github_round3_state_timeout_is_resolved_by_one_metadata_read_on_the_nex
             state.serial = 1;
             let start = Instant::now();
             assert!(matches!(
-                backend.write_state(&state).await,
+                unconfirmed_save(backend.write_state(&state).await),
                 Err(BackendError::GitHub(GitHubError::MutationDeadline))
             ));
             assert_eq!(start.elapsed(), Duration::from_secs(30));
@@ -327,6 +329,11 @@ async fn github_round3_lost_reply_resurrection_keeps_the_existing_matching_bytes
         } else {
             backend.write_state(&StateFile::new()).await
         };
+        let result = if lease {
+            result
+        } else {
+            unconfirmed_save(result)
+        };
         assert!(matches!(
             result,
             Err(BackendError::GitHub(GitHubError::MutationDeadline))
@@ -493,7 +500,7 @@ async fn github_round3_compare_has_an_independent_one_mib_limit_and_committed_er
         fake.0.lock().unwrap().compare_response = Some(comparison);
         let result = backend.write_state(&StateFile::new()).await;
         if overflow {
-            let error = result.unwrap_err();
+            let error = unconfirmed_save(result).unwrap_err();
             assert!(matches!(
                 &error,
                 BackendError::GitHub(GitHubError::CompareTooLarge {
@@ -554,6 +561,14 @@ fn reply(status: u16, body: Value) -> GitHubResponse {
         status,
         headers: BTreeMap::new(),
         body: serde_json::to_vec(&body).unwrap(),
+    }
+}
+/// Preserve the protocol assertions while requiring the dispatched-save wrapper.
+fn unconfirmed_save<T>(result: BackendResult<T>) -> BackendResult<T> {
+    match result {
+        Err(BackendError::UnconfirmedStateSave { error }) => Err(*error),
+        Err(error) => panic!("expected an unconfirmed state save, got {error:?}"),
+        Ok(_) => panic!("expected an unconfirmed state save, got success"),
     }
 }
 fn conflict(status: u16, message: &str) -> GitHubResponse {
@@ -677,6 +692,11 @@ impl GitHubTransport for Fake {
             let mut store = self.0.lock().unwrap();
             store.requests.push(request.clone());
             if request.method != Method::Get
+                && let Some(error) = store.mutation_error.take()
+            {
+                return Err(error);
+            }
+            if request.method != Method::Get
                 && let Some(response) = store
                     .mutation_responses
                     .pop_front()
@@ -728,6 +748,9 @@ impl GitHubTransport for Fake {
         if let Some(comparison) = request.path.strip_prefix("/repos/owner/repo/compare/") {
             assert_eq!(request.method, Method::Get);
             assert!(request.reference.is_none());
+            if let Some(error) = store.compare_error.take() {
+                return Err(error);
+            }
             let base = comparison
                 .strip_suffix("...states%2Fprod")
                 .expect("encoded compare branch");
@@ -1112,7 +1135,7 @@ async fn github_unexpected_success_non_file_and_malformed_responses_stop_operati
             s.two_winners = !malformed;
         }
         assert!(matches!(
-            fake.backend().write_state(&StateFile::new()).await,
+            unconfirmed_save(fake.backend().write_state(&StateFile::new()).await),
             Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
         ));
     }
@@ -1269,6 +1292,7 @@ async fn github_late_cleanup_saves_observe_absolute_supervisor_margin() {
                     "{result:?}"
                 );
             } else {
+                let result = unconfirmed_save(result);
                 assert!(
                     matches!(
                         result,
@@ -1559,7 +1583,7 @@ impl GitHubTransport for CommitAfterRead {
         deadline: Instant,
     ) -> Result<GitHubResponse, GitHubError> {
         let target = request.path == format!("/repos/owner/repo/contents/{}", self.path);
-        if target && request.method == Method::Put && self.armed.swap(false, Ordering::SeqCst) {
+        if target && request.method != Method::Get && self.armed.swap(false, Ordering::SeqCst) {
             self.fake.0.lock().unwrap().requests.push(request.clone());
             *self.pending.lock().unwrap() = Some(request);
             self.started.notify_one();
@@ -1842,8 +1866,8 @@ async fn github_round12_cleanup_save_classifies_dispatched_deadline_and_write_de
                 assert!(matches!(error, BackendError::GitHub(GitHubError::Deadline)))
             }
             "after dispatch" => assert!(matches!(
-                error,
-                BackendError::GitHub(GitHubError::MutationDeadline)
+                unconfirmed_save::<()>(Err(error)),
+                Err(BackendError::GitHub(GitHubError::MutationDeadline))
             )),
             "denied" => assert!(matches!(
                 error,
@@ -1853,6 +1877,219 @@ async fn github_round12_cleanup_save_classifies_dispatched_deadline_and_write_de
         }
     }
 }
+
+async fn round13_cleanup_save_error(
+    backend: Arc<GitHubBackend>,
+    lock: &LockInfo,
+    state: &StateFile,
+) -> BackendError {
+    let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
+    let published = crate::PublishedBackend::for_test(backend, &shutdown);
+    trigger.prioritize_cleanup();
+    published
+        .write_state_locked_for_cleanup(state, lock)
+        .await
+        .unwrap_err()
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round13_cleanup_put_5xx_with_prior_still_visible_is_unconfirmed() {
+    for replacing in [false, true] {
+        for status in [500, 502, 503, 504] {
+            let fake = Fake::default();
+            let backend = Arc::new(fake.backend());
+            if replacing {
+                backend.write_state(&StateFile::new()).await.unwrap();
+            }
+            backend.read_state().await.unwrap();
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            let prior = fake.bytes("state.json");
+            fake.0.lock().unwrap().mutation_response = Some(reply(
+                status,
+                json!({"message":"reply lost before outcome was known"}),
+            ));
+            let error = round13_cleanup_save_error(backend, &lock, &StateFile::new()).await;
+            assert!(
+                matches!(
+                    &error,
+                    BackendError::UnconfirmedStateSave { error }
+                        if matches!(error.as_ref(), BackendError::GitHub(GitHubError::Api { status: actual, .. }) if *actual == status)
+                ),
+                "{error:?}"
+            );
+            assert_eq!(fake.bytes("state.json"), prior);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round13_cleanup_transport_reset_after_dispatch_is_unconfirmed() {
+    let fake = Fake::default();
+    let backend = Arc::new(fake.backend());
+    backend.read_state().await.unwrap();
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    fake.0.lock().unwrap().mutation_error = Some(GitHubError::Transport {
+        kind: "reset after request body",
+        error: "offline injected connection reset".into(),
+    });
+    let error = round13_cleanup_save_error(backend, &lock, &StateFile::new()).await;
+    assert!(
+        matches!(
+            &error,
+            BackendError::UnconfirmedStateSave { error }
+                if matches!(error.as_ref(), BackendError::GitHub(GitHubError::Transport { .. }))
+        ),
+        "{error:?}"
+    );
+    assert!(fake.bytes("state.json").is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round13_cleanup_failed_reconciliation_after_commit_is_unconfirmed() {
+    for transport_reset in [false, true] {
+        let fake = Fake::default();
+        let backend = Arc::new(fake.backend());
+        backend.read_state().await.unwrap();
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        {
+            let mut store = fake.0.lock().unwrap();
+            store.fail_read_after_commit = true;
+            if transport_reset {
+                store.after_commit_error = Some(GitHubError::Transport {
+                    kind: "reset after request body",
+                    error: "offline injected connection reset".into(),
+                });
+            } else {
+                store.after_commit_response = Some(reply(502, json!({"message":"lost reply"})));
+            }
+        }
+        let state = StateFile::new();
+        let error = round13_cleanup_save_error(backend, &lock, &state).await;
+        assert!(
+            matches!(&error, BackendError::UnconfirmedStateSave { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            fake.bytes("state.json").unwrap(),
+            GitHubBackend::state_bytes(&state).unwrap()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round13_cleanup_compare_failure_after_200_is_unconfirmed() {
+    for failure in ["transport", "5xx", "oversize", "unexpected"] {
+        let fake = Fake::default();
+        let backend = Arc::new(fake.backend());
+        let mut state = StateFile::new();
+        backend.write_state(&state).await.unwrap();
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        {
+            let mut store = fake.0.lock().unwrap();
+            match failure {
+                "transport" => {
+                    store.compare_error = Some(GitHubError::Transport {
+                        kind: "compare reset",
+                        error: "offline injected connection reset".into(),
+                    })
+                }
+                "5xx" => store.fail_read_after_commit = true,
+                "oversize" => {
+                    store.compare_response = Some(json!({
+                        "status":"identical", "ahead_by":0, "behind_by":0,
+                        "files":[{"patch":"x".repeat(MAX_COMPARE_BYTES)}]
+                    }))
+                }
+                "unexpected" => {
+                    store.compare_response = Some(json!({
+                        "status":"diverged", "ahead_by":1, "behind_by":1
+                    }))
+                }
+                _ => unreachable!(),
+            }
+        }
+        state.serial = 1;
+        let error = round13_cleanup_save_error(backend, &lock, &state).await;
+        assert!(
+            matches!(&error, BackendError::UnconfirmedStateSave { .. }),
+            "{failure}: {error:?}"
+        );
+        assert_eq!(
+            fake.bytes("state.json").unwrap(),
+            GitHubBackend::state_bytes(&state).unwrap()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round13_release_resolves_committed_renew_before_delete_precondition() {
+    let fake = Fake::default();
+    let transport = LostReply::new(fake.clone(), Method::Put, true);
+    let backend = GitHubBackend::with_transport(settings(), transport.clone());
+    let lock = backend.acquire_lock("apply").await.unwrap();
+    transport.arm();
+    assert!(backend.renew_lock(&lock).await.is_err());
+    assert!(backend.pending_lease.lock().unwrap().is_some());
+    fake.0.lock().unwrap().mutation_response = Some(reply(403, json!({"message":"write denied"})));
+    assert!(matches!(
+        backend.release_lock(&lock).await,
+        Err(BackendError::GitHub(
+            GitHubError::ContentsWriteDenied { .. }
+        ))
+    ));
+    assert!(
+        backend.pending_lease.lock().unwrap().is_none(),
+        "the committed renewal must be resolved before the rejected DELETE"
+    );
+    backend.renew_lock(&lock).await.unwrap();
+    backend.release_lock(&lock).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round13_rejected_second_delete_preserves_aborted_first_delete() {
+    for status in [403, 409, 422] {
+        let fake = Fake::default();
+        let transport = CommitAfterRead::new(fake.clone(), "state.json.lock", false);
+        let backend = Arc::new(GitHubBackend::with_transport(settings(), transport.clone()));
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        transport.armed.store(true, Ordering::SeqCst);
+        let writer = backend.clone();
+        let held = LockInfo::from_json_slice(&serde_json::to_vec(&lock).unwrap()).unwrap();
+        let job = tokio::spawn(async move { writer.release_lock(&held).await });
+        transport.started.notified().await;
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        // Every attempt in the second release is definitively rejected.
+        fake.0.lock().unwrap().mutation_responses = (0..MAX_ATTEMPTS)
+            .map(|_| reply(status, json!({"message":"write rejected"})))
+            .collect();
+        assert!(backend.release_lock(&lock).await.is_err());
+        assert!(
+            backend.lease_is_revoked(lock.id()),
+            "HTTP {status} erased the earlier DELETE"
+        );
+        fake.0.lock().unwrap().requests.clear();
+        assert!(matches!(
+            backend.renew_lock(&lock).await,
+            Err(BackendError::LockNotHeld(_))
+        ));
+        assert!(fake.0.lock().unwrap().requests.is_empty());
+        // The server can still finish DELETE #1 after DELETE #2's rejection.
+        fake.0.lock().unwrap().mutation_responses.clear();
+        let request = transport.pending.lock().unwrap().take().unwrap();
+        assert_eq!(
+            fake.execute(request, Instant::now() + OPERATION_BUDGET)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        assert!(fake.bytes("state.json.lock").is_none());
+        backend.release_lock(&lock).await.unwrap();
+        assert!(!backend.lease_is_revoked(lock.id()));
+    }
+}
+
 #[async_trait]
 impl GitHubTransport for LateMutation {
     async fn execute(
@@ -2521,7 +2758,7 @@ async fn github_round2_success_caches_sha_before_a_failed_verification() {
     fake.0.lock().unwrap().fail_read_after_commit = true;
     state.serial = 1;
     assert!(matches!(
-        backend.write_state(&state).await,
+        unconfirmed_save(backend.write_state(&state).await),
         Err(BackendError::GitHub(GitHubError::Api { status: 503, .. }))
     ));
     state.serial = 2;
@@ -2597,7 +2834,7 @@ async fn github_round2_compare_rejects_a_detached_acknowledgement_with_matching_
     let fake = Fake::default();
     fake.0.lock().unwrap().two_winners = true;
     assert!(matches!(
-        fake.backend().write_state(&StateFile::new()).await,
+        unconfirmed_save(fake.backend().write_state(&StateFile::new()).await),
         Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
     ));
 }
@@ -2616,7 +2853,7 @@ async fn github_round2_compare_rejects_non_reachable_statuses() {
             Some(json!({"status":status,"ahead_by":1,"behind_by":behind}));
         assert!(
             matches!(
-                fake.backend().write_state(&StateFile::new()).await,
+                unconfirmed_save(fake.backend().write_state(&StateFile::new()).await),
                 Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
             ),
             "{status}, behind={behind}"
@@ -2861,7 +3098,7 @@ async fn github_round2_acknowledged_blob_sha_must_match_the_exact_sent_bytes() {
     let backend = fake.backend();
     fake.0.lock().unwrap().wrong_blob_sha = true;
     assert!(matches!(
-        backend.write_state(&StateFile::new()).await,
+        unconfirmed_save(backend.write_state(&StateFile::new()).await),
         Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
     ));
     fake.0.lock().unwrap().wrong_blob_sha = false;
@@ -3041,7 +3278,7 @@ async fn github_round4_mismatched_ack_never_adopts_a_third_writers_state() {
         let mut state = StateFile::new();
         state.serial = 1;
         assert!(matches!(
-            backend.write_state(&state).await,
+            unconfirmed_save(backend.write_state(&state).await),
             Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
         ));
         fake.0.lock().unwrap().wrong_blob_sha = false;
@@ -3541,8 +3778,10 @@ async fn github_round5_committed_server_error_preserves_state_intent_for_the_nex
                 store.fail_read_after_commit = true;
             }
             state.serial = 1;
-            assert!(matches!(backend.write_state(&state).await,
-                Err(BackendError::GitHub(GitHubError::Api { status: actual, .. })) if actual == status));
+            assert!(
+                matches!(unconfirmed_save(backend.write_state(&state).await),
+                Err(BackendError::GitHub(GitHubError::Api { status: actual, .. })) if actual == status)
+            );
             assert_eq!(
                 fake.bytes("state.json").unwrap(),
                 carina_core::utils::pretty_with_newline_bytes(&state).unwrap()
@@ -3850,7 +4089,7 @@ async fn github_round4_mutation_rate_limits_keep_the_round2_classification() {
             let error = if delete {
                 backend.release_lock(&lock).await.unwrap_err()
             } else {
-                backend.write_state(&StateFile::new()).await.unwrap_err()
+                unconfirmed_save(backend.write_state(&StateFile::new()).await).unwrap_err()
             };
             assert!(
                 matches!(error, BackendError::GitHub(GitHubError::RateLimited { status: found, .. }) if found == status)
@@ -3898,6 +4137,11 @@ async fn github_round10_large_cleanup_reconciliation_never_downloads_raw_state()
                         carina_core::utils::pretty_with_newline_bytes(&state).unwrap()
                     );
                 } else {
+                    let result = if status >= 500 {
+                        unconfirmed_save(result)
+                    } else {
+                        result
+                    };
                     assert!(matches!(
                         result,
                         Err(BackendError::GitHub(GitHubError::Api { status: code, .. }))

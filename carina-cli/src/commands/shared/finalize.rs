@@ -365,11 +365,17 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let error: carina_state::BackendError = match scenario.as_str() {
-                    "deadline" => carina_state::GitHubError::MutationDeadline.into(),
-                    "transport_deadline" => carina_state::GitHubError::MutationTransportDeadline {
-                        error: "offline timeout after dispatch".into(),
-                    }
-                    .into(),
+                    "deadline" => carina_state::BackendError::UnconfirmedStateSave {
+                        error: Box::new(carina_state::GitHubError::MutationDeadline.into()),
+                    },
+                    "transport_deadline" => carina_state::BackendError::UnconfirmedStateSave {
+                        error: Box::new(
+                            carina_state::GitHubError::MutationTransportDeadline {
+                                error: "offline timeout after dispatch".into(),
+                            }
+                            .into(),
+                        ),
+                    },
                     "s3_timeout" => carina_state::BackendError::UnconfirmedStateSave {
                         error: Box::new(carina_state::BackendError::Io(
                             "offline S3 state PUT timeout".into(),
