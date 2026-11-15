@@ -973,19 +973,19 @@ fn module_call_findings_for_test(
     parsed: &ParsedFile,
     signatures: &crate::module_resolver::ResolvedModuleSignatures,
     provider_context: &LoadedProviderContext,
+    schemas: &SchemaRegistry,
 ) -> Vec<ModuleCallFinding> {
-    let schemas = SchemaRegistry::new();
     let mut fixture = parsed.clone();
     crate::parser::retained::judge_configuration(
         &mut fixture,
-        &schemas,
+        schemas,
         provider_context.as_provider_context(),
     );
     let parsed = &fixture;
     let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
         crate::config_loader::load_buffer_configuration(
             parsed,
-            &schemas,
+            schemas,
             provider_context.as_provider_context(),
         )
         .judged(),
@@ -994,9 +994,9 @@ fn module_call_findings_for_test(
     ));
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         parsed,
-        &schemas,
+        schemas,
         signatures,
-        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        provider_context.as_provider_context(),
     );
     crate::validation::deferred_types::with_session_for_test(provider_context, |session| {
         check_module_calls(ModuleCallCheckInput {
@@ -1005,7 +1005,7 @@ fn module_call_findings_for_test(
             base_dir: Some(&crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap()),
             imported_signatures: signatures,
             provider_context: session,
-            schemas: &schemas,
+            schemas,
             binding_use_report: &binding_use_report,
             bindings: &bindings,
             reference_checks: ModuleCallReferenceChecks::Enabled,
@@ -2791,7 +2791,8 @@ fn module_call_diagnostics_preserve_symlink_parent_source_spelling() {
             requires: Vec::new(),
         },
     )]);
-    let findings = module_call_findings_for_test(&parsed, &signatures, &provider);
+    let findings =
+        module_call_findings_for_test(&parsed, &signatures, &provider, &SchemaRegistry::new());
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].anchor().source_file.path(), path);
     assert_eq!(
@@ -5612,7 +5613,8 @@ fn check_module_calls_rejects_custom_type() {
         },
     );
 
-    let findings = module_call_findings_for_test(&parsed, &imported_modules, &config);
+    let findings =
+        module_call_findings_for_test(&parsed, &imported_modules, &config, &SchemaRegistry::new());
     assert!(
         findings.iter().any(|finding| finding
             .message()
@@ -5653,6 +5655,7 @@ fn check_module_calls_rejects_literal_union_mismatch() {
         &parsed,
         &imported_modules,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
 
     assert!(
@@ -5695,7 +5698,12 @@ fn check_module_calls_reports_parameter_type_resolution_errors() {
     )]);
     let provider_context = context_with_known_custom_types(HashSet::new());
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &provider_context);
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &provider_context,
+        &SchemaRegistry::new(),
+    );
 
     assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
     assert!(
@@ -5751,7 +5759,12 @@ fn check_module_calls_reports_unnameable_signature_type_resolution_errors() {
         },
     )]);
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &provider_context);
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &provider_context,
+        &SchemaRegistry::new(),
+    );
 
     assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
     assert!(
@@ -5866,6 +5879,7 @@ let inst = m { n = 'abc' }
         &parsed,
         &imported_modules,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     let finding = findings
         .first()
@@ -5908,6 +5922,7 @@ child {}
         &parsed,
         &signatures,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     let first_call = &parsed.module_calls[0];
     let second_call = &parsed.module_calls[1];
@@ -5981,6 +5996,7 @@ for item in ["first", "second"] {
         &parsed,
         &signatures,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     let mismatches = findings
         .iter()
@@ -6028,6 +6044,7 @@ child { values = [vpc] }
         &parsed,
         &signatures,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
 
     assert_eq!(
@@ -6236,6 +6253,7 @@ fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() 
         &parsed,
         &imported_modules,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     assert!(
         findings.is_empty(),
@@ -6316,7 +6334,13 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         },
     )]);
     assert!(
-        module_call_findings_for_test(&module_parsed, &imported_modules, &config).is_empty(),
+        module_call_findings_for_test(
+            &module_parsed,
+            &imported_modules,
+            &config,
+            &SchemaRegistry::new()
+        )
+        .is_empty(),
         "module argument must validate"
     );
 
@@ -7061,13 +7085,6 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         .expect("schema fixture must be valid"),
     );
 
-    let mut parsed = empty_parsed();
-    parsed
-        .resources
-        .push(Resource::with_provider("aws", "ec2.Subnet", "a", None).with_binding("a"));
-    parsed
-        .resources
-        .push(Resource::with_provider("aws", "ec2.SecurityGroup", "web", None).with_binding("web"));
     let context = context_with_accepting_custom_type_resolver(HashSet::from([
         crate::parser::OwnedTypeIdentity::provider(
             "aws",
@@ -7081,17 +7098,10 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         ),
     ]));
 
-    let call = ModuleCall::test(
-        "consumer".to_string(),
-        Some("instance".to_string()),
-        module_arguments([(
-            "subnet_ids".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![
-                Value::resource_ref("a".to_string(), "subnet_id".to_string(), vec![]),
-                Value::resource_ref("web".to_string(), "group_id".to_string(), vec![]),
-            ])),
-        )]),
-    );
+    let parsed = crate::parser::parse(
+        "let a = aws.ec2.Subnet {}\nlet web = aws.ec2.SecurityGroup {}\nlet consumer = use { source = './consumer' }\nlet instance = consumer { subnet_ids = [a.subnet_id, web.group_id] }\n",
+        &context,
+    ).unwrap();
     let imported_modules = HashMap::from([(
         "consumer".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -7114,20 +7124,14 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         },
     )]);
 
-    parsed.module_calls.push(call);
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas, &context);
-    let errors =
-        validate_expansion_boundary_ref_types_with_bindings(&parsed, &imported_modules, &bindings)
-            .err()
-            .map(|errors| errors.errors)
-            .unwrap_or_default();
+    let errors = module_call_findings_for_test(&parsed, &imported_modules, &context, &schemas);
 
     assert_eq!(
         errors.len(),
         1,
         "only the SecurityGroup Id should fail the list element sink: {errors:?}",
     );
-    let err = errors[0].to_string();
+    let err = errors[0].message().to_string();
     assert!(
         err.contains("argument 'subnet_ids'")
             && err.contains("expected aws.ec2.Subnet.Id")
@@ -7150,18 +7154,11 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let mut parsed = empty_parsed();
-    parsed
-        .resources
-        .push(Resource::with_provider("mock", "counter", "source", None).with_binding("source"));
-    let call = ModuleCall::test(
-        "consumer".to_string(),
-        None,
-        module_arguments([(
-            "number".to_string(),
-            Value::resource_ref("source", "count", Vec::new()),
-        )]),
-    );
+    let context = LoadedProviderContext::empty_for_test();
+    let parsed = crate::parser::parse(
+        "let source = mock.counter {}\nlet consumer = use { source = './consumer' }\nconsumer { number = source.count }\n",
+        &context,
+    ).unwrap();
     let imported_modules = HashMap::from([(
         "consumer".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -7177,14 +7174,7 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         },
     )]);
 
-    parsed.module_calls.push(call);
-    let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas, &context);
-    let errors =
-        validate_expansion_boundary_ref_types_with_bindings(&parsed, &imported_modules, &bindings)
-            .err()
-            .map(|errors| errors.errors)
-            .unwrap_or_default();
+    let errors = module_call_findings_for_test(&parsed, &imported_modules, &context, &schemas);
 
     assert!(
         errors.is_empty(),
@@ -10777,6 +10767,7 @@ fn module_argument_fallback_requires_authored_evidence() {
         &parsed,
         &signatures,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     assert!(
         findings

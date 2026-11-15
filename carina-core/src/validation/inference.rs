@@ -9,19 +9,17 @@
 //! re-derive it. See `notes/specs/2026-05-03-typeexpr-stage2-design.md`.
 //!
 //! Export types come exclusively from the authored expression report produced
-//! by the loader/expander. Value-based inference is a separate API requiring
-//! `RuntimeTypeInput`, which state readers provide. It cannot accept authored
-//! or expanded configuration projections.
+//! by the loader/expander.
 
 use std::collections::HashMap;
 
+#[cfg(test)]
 use crate::builtins::{Builtin, BuiltinResultTyping};
 use crate::parser::{ExportParamLike, TypeExpr};
 use crate::provider::ProviderLoadedSchemaRegistry;
-use crate::resource::{
-    BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, PlaceholderKind,
-    RelativeBindingName, Value,
-};
+use crate::resource::{BindingAddress, NoPlaceholder, PlaceholderKind, RelativeBindingName, Value};
+#[cfg(test)]
+use crate::resource::{ConcreteValue, DeferredValue};
 use crate::schema::{
     AttrTypeKind, CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
     SchemaRegistry,
@@ -216,55 +214,8 @@ pub fn bindings_from_parts<S, P: PlaceholderKind + PartialEq, B: BindingAddress>
     out
 }
 
-/// Infer a value received from runtime/state, where no authored syntax exists.
-/// Authored expressions must consume `JudgedExpr::static_type` instead.
-///
-/// ```compile_fail,E0308
-/// use carina_core::{resource::AuthoredValue, validation::inference::{infer_runtime_type, InferenceBindings},
-///     schema::SchemaRegistry, parser::ProviderContext};
-/// fn bypass(value: &AuthoredValue, config: &ProviderContext) {
-///     infer_runtime_type(value, &InferenceBindings::new(), &SchemaRegistry::new(), config);
-/// }
-/// ```
-///
-/// Even a placeholder-free authored projection is not runtime provenance.
-///
-/// ```compile_fail,E0308
-/// use carina_core::{resource::ExpandedValue, validation::inference::{infer_runtime_type, InferenceBindings},
-///     schema::SchemaRegistry, parser::ProviderContext};
-/// fn bypass(value: &ExpandedValue, config: &ProviderContext) {
-///     infer_runtime_type(value, &InferenceBindings::new(), &SchemaRegistry::new(), config);
-/// }
-/// ```
-pub fn infer_runtime_type<B: BindingAddress>(
-    input: RuntimeTypeInput<'_, B>,
-    bindings: &InferenceBindings<NoPlaceholder, B>,
-    schemas: &SchemaRegistry,
-    provider_context: &crate::parser::ProviderContext,
-) -> Result<TypeExpr, InferenceIssue> {
-    infer_projected_type(input.value(), bindings, schemas, provider_context)
-}
-
-/// Runtime provenance for value-based inference. Expanded authored values
-/// cannot be supplied directly; state readers provide this input.
-#[derive(Clone, Copy)]
-pub struct RuntimeTypeInput<'a, B: BindingAddress = crate::resource::AbsoluteBindingAddress> {
-    value: &'a Value<NoPlaceholder, B>,
-}
-
-impl<'a> RuntimeTypeInput<'a> {
-    pub fn state_attribute(state: &'a crate::resource::State, name: &str) -> Option<Self> {
-        state.attributes.get(name).map(|value| Self { value })
-    }
-}
-
-impl<'a, B: BindingAddress> RuntimeTypeInput<'a, B> {
-    pub(crate) fn value(&self) -> &'a Value<NoPlaceholder, B> {
-        self.value
-    }
-}
-
 /// Infer with the same provider catalog that owns the binding/type check.
+#[cfg(test)]
 pub(super) fn infer_projected_type<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &InferenceBindings<P, B>,
@@ -289,6 +240,7 @@ struct InferenceSchemaContext<'a> {
     provider_context: &'a crate::parser::ProviderContext,
 }
 
+#[cfg(test)]
 fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> InferenceError {
     InferenceError::HeterogeneousCollection {
         types: crate::schema::MismatchTypeNames::for_type_exprs(first, next),
@@ -303,6 +255,7 @@ fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> Inferenc
 /// `Virtual` recursion returns, so unrelated sibling traversals (two
 /// list elements that each resolve through different `Virtual`
 /// bindings) do not see each other.
+#[cfg(test)]
 fn infer_projected_type_with_visiting<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     bindings: &InferenceBindings<P, B>,
@@ -607,6 +560,7 @@ fn inferred_scalar_kind(
     })
 }
 
+#[cfg(test)]
 fn infer_collection<'a, I, F, P, B>(
     items: I,
     bindings: &InferenceBindings<P, B>,
@@ -647,6 +601,7 @@ where
     Ok(wrap(Box::new(first)))
 }
 
+#[cfg(test)]
 fn infer_resource_ref_with_visiting<P: PlaceholderKind, B: BindingAddress>(
     binding: &str,
     attribute: &str,
@@ -1047,6 +1002,7 @@ pub(super) fn attribute_type_to_type_expr(
     }
 }
 
+#[cfg(test)]
 fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
     name: &str,
     args: &[crate::resource::FunctionArgument<P, B>],

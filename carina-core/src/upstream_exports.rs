@@ -249,19 +249,18 @@ fn resolve_upstream_source_surface(
     context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<SourceSurface, crate::parser::AnalysisTreeError> {
-    let entries = match loaded.upstream_export_source(context.catalog(), schemas) {
-        Some(parsed) => match resolve_upstream_exports_from_parsed(
-            parsed,
-            source,
-            context,
-            Some(schemas),
-            &Default::default(),
-        ) {
-            Ok(entries) => Some(entries),
-            Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
-            Err(_) => None,
-        },
-        None => None,
+    let Some(parsed) = loaded.upstream_export_source(context.catalog(), schemas) else {
+        return Ok(SourceSurface { entries: None });
+    };
+    let entries = match resolve_upstream_exports_from_parsed(
+        parsed,
+        source,
+        context,
+        Some(schemas),
+        &Default::default(),
+    ) {
+        Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
+        result => result.ok(),
     };
     Ok(SourceSurface { entries })
 }

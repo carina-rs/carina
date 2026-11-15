@@ -499,8 +499,11 @@ fn parse_type_expr_atom(
             // SchemaType and rejects unknown dotted paths.
             let mut ref_inner = inner.into_inner();
             let path_str = next_pair(&mut ref_inner, "resource type path", "type ref")?.as_str();
-            let path = ResourceTypePath::parse(path_str)
-                .expect("resource_type_path grammar requires at least two parts");
+            let path =
+                ResourceTypePath::parse(path_str).ok_or_else(|| ParseError::InternalError {
+                    expected: "resource type path".to_string(),
+                    context: "type ref".to_string(),
+                })?;
             Ok(TypeExpr::DottedUnresolved(path))
         }
         Rule::type_struct => {

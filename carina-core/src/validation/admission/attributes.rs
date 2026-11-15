@@ -38,7 +38,18 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
         Destination::catalogued(identity(self, id, catalog), name.into())
     }
 
-    pub(super) fn admission_selected_attribute<K: AssignmentKind>(
+    #[cfg(test)]
+    pub(super) fn admission_selected_attribute_for_test<K: AssignmentKind>(
+        self,
+        id: &ResourceId,
+        attribute: &str,
+        selected: crate::schema::value_validation::SchemaAttribute<'_>,
+        catalog: &ProviderContext,
+    ) -> Destination<K> {
+        self.admission_selected_attribute(id, attribute, selected, catalog)
+    }
+
+    fn admission_selected_attribute<K: AssignmentKind>(
         self,
         id: &ResourceId,
         attribute: &str,

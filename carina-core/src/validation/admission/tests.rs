@@ -84,7 +84,7 @@ fn selected_destination<K: AssignmentKind>(
         .keys()
         .position(|name| name == effective.name())
         .unwrap();
-    schema.admission_selected_attribute(
+    schema.admission_selected_attribute_for_test(
         id,
         attribute,
         crate::schema::value_validation::SchemaAttribute { ordinal, effective },
@@ -3379,16 +3379,27 @@ pub(crate) fn check_conversion_pending_discharge(
         .map_err(|e| e.to_string())?
         .into_classification();
     let bindings = BindingIndex::from_parsed(judged.file(), schemas, catalog);
-    let destination = selected_destination::<kind::ResourceAttribute>(
-        schemas
-            .get(
-                &sink.id().provider,
-                &sink.id().resource_type,
-                crate::schema::SchemaKind::Resource,
-            )
-            .unwrap(),
+    let schema = schemas
+        .get(
+            &sink.id().provider,
+            &sink.id().resource_type,
+            crate::schema::SchemaKind::Resource,
+        )
+        .ok_or_else(|| format!("schema unavailable for {}", sink.id()))?;
+    let effective = schema
+        .effective_attribute_by_authored_name("target")
+        .ok_or_else(|| format!("unknown attribute 'target' on {}", sink.id()))?;
+    let ordinal = schema
+        .schema()
+        .as_schema()
+        .attributes()
+        .keys()
+        .position(|name| name == effective.name())
+        .ok_or_else(|| format!("unknown attribute 'target' on {}", sink.id()))?;
+    let destination = schema.admission_selected_attribute_for_test::<kind::ResourceAttribute>(
         sink.id(),
         "target",
+        crate::schema::value_validation::SchemaAttribute { ordinal, effective },
         catalog,
     );
     with_session_for_test(catalog, |session| {

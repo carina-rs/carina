@@ -2941,15 +2941,14 @@ fn access_step(pair: Pair<'_, Rule>) -> Option<PathSegment> {
 use judgement::ConversionEvidence;
 pub(crate) use judgement::judge_expressions;
 pub(in crate::parser) use judgement::unjudged as missing_judgement;
-pub(crate) use judgement::{
-    AdmissionContext, EmptyCoalesceDefault, admit_ordinary_with_context, admit_with_context,
-    coalesce_type,
-};
+pub(crate) use judgement::{AdmissionContext, admit_ordinary_with_context, admit_with_context};
 pub use judgement::{
     CollectionKind, ExpressionAdmission, ExpressionCheckOwner, ExpressionReport, JudgedExpr,
     JudgedExprData, NoConversion, NoTypeProjection, OrdinaryJudgedExpr,
     ProviderAuthorityUnavailable, SinkJudgedExpr, TypeProjection, admit_expression,
 };
+#[cfg(test)]
+pub(crate) use judgement::{EmptyCoalesceDefault, coalesce_type};
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
     judgement::constraint_fixture()
