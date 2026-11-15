@@ -737,6 +737,8 @@ impl DiagnosticRun<'_> {
         &self,
         doc: &Document,
         rref: &CanonicalResource<'_, X, D, B>,
+        resource_attributes: &CanonicalAttributeValues<ParserPlaceholder, B>,
+        authored_calls: &HashSet<String>,
         expression_report: &carina_core::parser::retained::ExpressionReport<B>,
         outcome: carina_core::validation::admission::attributes::ResourceAdmissionOutcome<B>,
         binding_error_sinks: &HashSet<(carina_core::resource::ResourceId, String)>,
@@ -748,7 +750,6 @@ impl DiagnosticRun<'_> {
         D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let resource_id = rref.id();
-        let resource_attributes = rref.attributes();
         let resource_quoted_string_attrs = rref.quoted_string_attrs();
         let validated_schema = rref.resource_schema();
         let schema = validated_schema.as_schema();
@@ -787,9 +788,7 @@ impl DiagnosticRun<'_> {
             .map(String::as_str)
             .collect::<HashSet<_>>();
         for (attr_name, authored_attr_value) in resource_attributes.iter() {
-            let authored_has_function_call = rref
-                .authored_attribute_has_function_call(attr_name)
-                .unwrap_or(false);
+            let authored_has_function_call = authored_calls.contains(attr_name);
             let location =
                 rref.attribute_value_location(attr_name, &carina_core::schema::FieldPath::new());
             let judged_expression = expression_report.expression(location);
@@ -2105,6 +2104,15 @@ impl DiagnosticRun<'_> {
                 .parsed()
                 .bare_binding_uses()
                 .uses()
+                // Main's suppression applies to uses authored in this buffer.
+                // Directory-only recognition still supplies binding findings,
+                // but must not consume the buffer's separate schema finding.
+                // Suppression keys themselves always come from this canonical view.
+                .filter(|use_site| {
+                    parsed.bare_binding_uses().uses().any(|authored| {
+                        carina_core::validation::same_authored_use(authored, use_site)
+                    })
+                })
                 .filter(|use_site| {
                     pre_expansion_configuration
                         .parsed()
@@ -2355,6 +2363,38 @@ impl DiagnosticRun<'_> {
                 pre_expansion_configuration.analysis_tree(),
                 &mut diagnostics,
             );
+            // Keep main's per-file semantic projection: a sibling's concrete
+            // value must not replace an authored reference before admission.
+            // This tree supplies values only; the canonical owner supplies all
+            // keys, generated values, schema and admission authority.
+            let semantic_tree = current_file_path
+                .and_then(|path| directory.as_ref()?.semantic_file(path))
+                .and_then(|file| analysis_tree(doc, file, &mut diagnostics));
+            // Syntax correspondence is checked against the document's own
+            // parser locations, even when its source label cannot bind an owner
+            // in the canonical directory view.
+            for resource in tree.project_resources() {
+                if resource.schema(&self.schemas).is_none() {
+                    continue;
+                }
+                for name in resource.attributes().keys() {
+                    let location = resource
+                        .attribute_value_location(name, &carina_core::schema::FieldPath::new());
+                    if let Err(error) = expression_report.expression(location) {
+                        let finding = carina_core::parser::Located::new(location.clone(), error);
+                        if let Some(diagnostic) = render_merged(
+                            doc,
+                            &finding,
+                            DiagnosticSeverity::ERROR,
+                            finding.detail().to_string(),
+                        ) && !prior_diagnostics.contains(&diagnostic)
+                            && !diagnostics.contains(&diagnostic)
+                        {
+                            diagnostics.push(diagnostic);
+                        }
+                    }
+                }
+            }
             if let (Some(inputs), Some(canonical_tree)) = (
                 expanded_validation_inputs.as_ref(),
                 expanded_validation_tree.as_ref(),
@@ -2441,6 +2481,7 @@ impl DiagnosticRun<'_> {
             if let Some(configuration) = &expanded_configuration {
                 publish_prefix_errors(doc, configuration, &mut diagnostics);
             }
+            let resource_diagnostics_start = diagnostics.len();
             if let Some(authored_tree) = &authored_tree {
                 for resource in authored_tree
                     .project_resource_refs()
@@ -2454,6 +2495,24 @@ impl DiagnosticRun<'_> {
                     .project_resources()
                     .filter(|resource| resource.location().file().path() == doc.source_file())
                 {
+                    let key = rref.authored_instance_key();
+                    let authored_source = tree.project_resources().find(|source| {
+                        key.as_ref()
+                            .zip(source.authored_instance_key())
+                            .is_some_and(|(owner, source)| owner.same_source_instance(&source))
+                    });
+                    let authored_calls = authored_source
+                        .map(|source| {
+                            source
+                                .attributes()
+                                .iter()
+                                .filter(|(_, value)| {
+                                    carina_core::parser::contains_function_call(value)
+                                })
+                                .map(|(name, _)| name.clone())
+                                .collect::<HashSet<_>>()
+                        })
+                        .unwrap_or_default();
                     let uses_composition_output = rref.references().iter().any(|reference| {
                         pre_expansion_input.module_calls.iter().any(|call| {
                             call.binding_name.as_ref().is_some_and(|binding| {
@@ -2462,7 +2521,6 @@ impl DiagnosticRun<'_> {
                         })
                     });
                     // Preserve the composition-only route; compare existing source-instance identities across phases.
-                    let key = rref.authored_instance_key();
                     let selected = expanded_validation_inputs
                         .as_ref()
                         .filter(|_| uses_composition_output)
@@ -2506,6 +2564,8 @@ impl DiagnosticRun<'_> {
                             self.render_resource_admission(
                                 doc,
                                 owner,
+                                &owner.values(),
+                                &authored_calls,
                                 inputs.configuration.report(),
                                 outcome,
                                 &binding_error_sinks,
@@ -2518,7 +2578,21 @@ impl DiagnosticRun<'_> {
                     } else {
                         #[cfg(feature = "test-utils")]
                         replay_coverage::reached(AdmissionPath::Relative);
-                        let values = rref.values();
+                        let source = semantic_tree
+                            .as_ref()
+                            .unwrap_or(tree)
+                            .project_resources()
+                            .find(|source| {
+                                key.as_ref()
+                                    .zip(source.authored_instance_key())
+                                    .is_some_and(|(owner, source)| {
+                                        owner.same_source_instance(&source)
+                                    })
+                            });
+                        let values = source.map_or_else(
+                            || rref.values(),
+                            |source| rref.project_values(&source.attributes()),
+                        );
                         let inputs = select_admission_inputs(
                             rref,
                             &values,
@@ -2530,13 +2604,22 @@ impl DiagnosticRun<'_> {
                         match carina_core::validation::admission::attributes::ResourceAdmissionRequest::new(rref, rref.quoted_string_attrs(), inputs, ValidationEvaluation::relative_static(), &binding_index, self.provider_context) {
                             Ok(request) => {
                                 let outcome = conversion_validation.admit_resource(request);
-                                self.render_resource_admission(doc, rref, expression_report, outcome, &binding_error_sinks, &pending_resource_sinks, &provider_validation_deduplicator, &prior_diagnostics, &mut diagnostics);
+                                self.render_resource_admission(doc, rref, &values, &authored_calls, expression_report, outcome, &binding_error_sinks, &pending_resource_sinks, &provider_validation_deduplicator, &prior_diagnostics, &mut diagnostics);
                             }
                             Err(error) => diagnostics.extend(render_merged(doc, &carina_core::parser::Located::new(rref.type_location().clone(), ()), DiagnosticSeverity::ERROR, error.to_string())),
                         }
                     }
                 }
             }
+            // Materialized instances share authored diagnostic locations. Keep
+            // distinct findings while presenting an identical finding once.
+            let mut resource_diagnostics = Vec::new();
+            for diagnostic in diagnostics.drain(resource_diagnostics_start..) {
+                if !resource_diagnostics.contains(&diagnostic) {
+                    resource_diagnostics.push(diagnostic);
+                }
+            }
+            diagnostics.extend(resource_diagnostics);
 
             if let Some(inputs) = &expanded_validation_inputs {
                 let remaining = conversion_validation.admit_remaining_resources(

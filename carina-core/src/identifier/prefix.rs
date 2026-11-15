@@ -481,17 +481,6 @@ impl<'f, X, D, B: BindingAddress> CanonicalResource<'f, X, D, B>
 where
     D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    /// Syntax-only guidance reads the retained source, never a resolved value.
-    pub fn authored_attribute_has_function_call(
-        &self,
-        name: &str,
-    ) -> Result<bool, crate::parser::retained::MissingEvidence> {
-        Ok(self
-            .resource
-            .authored_slot(name)?
-            .cursor()?
-            .contains_function_call())
-    }
     pub fn module_source(&self) -> Option<&'f ModuleSource> {
         self.resource.module_source()
     }
@@ -512,6 +501,30 @@ where
     pub fn values(&self) -> CanonicalAttributeValues<ParserPlaceholder, B> {
         CanonicalAttributeValues {
             values: self.resource.attributes().into_owned(),
+            declaration: declaration_identity(self.schema),
+        }
+    }
+    /// Project ordinary values onto this owner's canonical keys. Generated
+    /// values retain their producer's projection, including its prefix suffix.
+    /// A projection cannot introduce keys or restore consumed companions.
+    pub fn project_values(
+        &self,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
+    ) -> CanonicalAttributeValues<ParserPlaceholder, B> {
+        CanonicalAttributeValues {
+            values: self
+                .resource
+                .attributes()
+                .iter()
+                .map(|(name, value)| {
+                    let projected = if self.resource.projected_phase(name).is_some() {
+                        value
+                    } else {
+                        values.get(name).unwrap_or(value)
+                    };
+                    (name.clone(), projected.clone())
+                })
+                .collect(),
             declaration: declaration_identity(self.schema),
         }
     }
@@ -1155,7 +1168,7 @@ mod tests {
         let schemas = schemas();
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse_and_resolve(
-            "let p = 'lit'\nlet sink = mock.Sink { name_prefix = p }\n",
+            "let p = 'lit'\nlet sink = mock.Sink { name_prefix = p\n other = 'resolved' }\n",
         )
         .unwrap();
         let original = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &context);
@@ -1185,6 +1198,31 @@ mod tests {
         );
         assert!(owner.projected_phase("name").is_some());
         assert!(owner.authored_slot("name").is_err());
+        let reference = Value::resource_ref(
+            crate::resource::RelativeBindingName::new("source"),
+            "name",
+            vec![],
+        );
+        let projected = owner.project_values(&IndexMap::from([
+            (
+                "name_prefix".into(),
+                Value::Concrete(ConcreteValue::String("raw".into())),
+            ),
+            (
+                "name".into(),
+                Value::Concrete(ConcreteValue::String("replacement".into())),
+            ),
+            ("other".into(), reference.clone()),
+            (
+                "foreign".into(),
+                Value::Concrete(ConcreteValue::String("not an owner key".into())),
+            ),
+        ]));
+        assert_eq!(projected["name"], owner.attributes()["name"]);
+        assert_eq!(projected["other"], reference);
+        assert_eq!(projected.len(), 2);
+        assert!(!projected.contains_key("name_prefix"));
+        assert!(!projected.contains_key("foreign"));
         let again = canonical.judge(&context);
         assert_eq!(
             again.file().resources[0].attributes,

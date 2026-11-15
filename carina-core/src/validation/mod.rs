@@ -1952,7 +1952,9 @@ fn same_authored_finding(left: &BindingUseFinding, right: &BindingUseFinding) ->
     same_authored_use(&left.use_site, &right.use_site) && left.error == right.error
 }
 
-fn same_authored_use(
+/// Compare diagnostic source occurrences across parser views. This does not
+/// grant the node/use/instance authority required for authored admission.
+pub fn same_authored_use(
     left: &crate::parser::BareBindingUse,
     right: &crate::parser::BareBindingUse,
 ) -> bool {
