@@ -549,3 +549,78 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
         "unrelated delete must not be falsely absorbed"
     );
 }
+
+#[test]
+fn issue_4418_promote_renders_deferred_effect_identity() {
+    let producer = Resource::with_provider("aws", "acm.Certificate", "cert-identity", None)
+        .with_root_binding("cert");
+    let graph = crate::resolved_graph::resolve_expanded_graph(
+        crate::parser::ExpandedParsedFile {
+            resources: vec![producer.clone()],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .unwrap();
+    let (template, dependencies) = graph
+        .compile_deferred_for(deferred_replace_test_target())
+        .unwrap();
+    let expected = template.deferred_effect_id().to_string();
+    let producer = ResolvedResource::new(producer.into_value_snapshot());
+    let id = producer.resolved_id();
+    let old = crate::effect::DeferredReplaceDelete {
+        id: id.clone(),
+        generation: EffectGeneration::Current,
+        identifier: fixture_applied_identifier("old-cert"),
+        directives: Default::default(),
+        binding: producer.binding.clone(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: Default::default(),
+    };
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "aws",
+        crate::schema::PatternResourceSchema::new("acm.Certificate")
+            .with_conflicting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    let replacement = resolve_replacement(
+        ReplacementRequest::new(producer, NonEmptyDeletes::try_new(vec![old]).unwrap()),
+        &registry,
+    )
+    .unwrap();
+    let mut pending = HashMap::from([(
+        id,
+        ReplacementGroup {
+            replacement,
+            changed_create_only: ChangedCreateOnly::new(vec!["name".into()]).unwrap(),
+            cascade_ref_hints: Vec::new(),
+            consumer_updates: Default::default(),
+        },
+    )]);
+    let dependents = CascadeDependents::new(
+        &[],
+        ResolvedDeferredCreateTargets(vec![CompiledDeferredCreate {
+            template,
+            dependencies,
+        }]),
+    );
+    let mut plan = Plan::new();
+    assert!(
+        promote_referenced_replaces_to_cbd(&mut plan, &mut pending, &dependents, &registry)
+            .is_break()
+    );
+    let message = plan.errors()[0]
+        .display_with_project_dir(std::path::Path::new("."))
+        .to_string();
+    println!("DEFERRED DEPENDENT: {message}");
+    assert!(
+        message.ends_with(&format!(
+            "create_before_destroy required by dependent `{expected}`"
+        )),
+        "{message}"
+    );
+}

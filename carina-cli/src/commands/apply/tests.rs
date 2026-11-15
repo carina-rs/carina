@@ -1661,6 +1661,12 @@ fn checked_exports(
                 params,
                 &carina_core::binding_index::ResolvedBindings::default(),
                 session,
+                carina_core::parser::retained::ProjectedPhase::plan_context::<
+                    carina_core::resource::NoPlaceholder,
+                    carina_core::resource::AbsoluteBindingAddress,
+                >(&carina_core::resource::knowledge::KnowledgeContext::plan(
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                )),
             )
         },
     )
@@ -1985,7 +1991,7 @@ async fn saved_configuration_decode_failure_returns_command_error_without_panick
     let runtime = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let mut document: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/module_binding_wire_compat/carina.v45.plan.json"
+        "../../../tests/fixtures/module_binding_wire_compat/carina.v46.plan.json"
     ))
     .unwrap();
     document["sorted_resources"] = serde_json::json!("invalid saved configuration");
@@ -3022,6 +3028,41 @@ async fn bootstrap_reloaded_snapshot_feeds_fresh_provider_resolution() {
         ))),
         "the lock-held provider must ignore stale pre-reload bootstrap inputs"
     );
+}
+
+#[test]
+fn bootstrap_reload_rejects_unknown_directive_keys() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let fixture = tempfile::tempdir().unwrap();
+    let path = carina_core::paths::ResolvedPath::new(fixture.path()).unwrap();
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    std::fs::write(fixture.path().join("main.crn"), "provider mock {}\n").unwrap();
+    let loaded = load_configuration_with_config(&path, &config, &SchemaRegistry::new()).unwrap();
+    let providers = ProviderLoad::load(
+        &runtime,
+        &loaded.parsed.providers,
+        &path,
+        &mut crate::commands::human_provider_notices(runtime.color_mode()),
+    )
+    .unwrap();
+    let wiring = ValidatedWiring::from_load_for_test(providers);
+    let validated = validated_reload_owner_for_test(&wiring);
+    std::fs::write(
+        fixture.path().join("resources.crn"),
+        "mock.test.resource {\n  name = 'example'\n  directives {\n    prevent_destory = true\n  }\n}\n",
+    )
+    .unwrap();
+    let error = reload_apply_configuration_after_bootstrap(
+        &path,
+        &path,
+        &config,
+        validated,
+        loaded.unresolved_parsed,
+    )
+    .expect_err("post-bootstrap reload must reject invalid directives even with skip=true");
+    let message = crate::error::format_error_with_source_chain(&error);
+    assert!(message.contains("resources.crn:4:5: Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?"), "{message}");
+    assert_eq!(message.matches("Unknown directive").count(), 1, "{message}");
 }
 
 #[test]
@@ -10798,7 +10839,7 @@ mod saved_plan_version_tests {
                 &error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 40,
-                    expected: 45,
+                    expected: 46,
                     ..
                 }
             ),
@@ -10856,7 +10897,7 @@ mod saved_plan_version_tests {
 
     #[test]
     fn replacement_admission_requests_require_current_plan_format() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 45);
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 46);
     }
 
     #[tokio::test]
@@ -10905,6 +10946,7 @@ mod saved_plan_version_tests {
 
     #[tokio::test]
     async fn format_38_saved_plan_is_rejected_before_source_identity_decode() {
+        let current_version = crate::commands::plan::PlanFile::CURRENT_VERSION;
         let (_dir, plan_path, mut json) = replacement_plan_json();
         json["version"] = serde_json::json!(38);
         json.as_object_mut().unwrap().remove("source_identity");
@@ -10912,7 +10954,9 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 45)"),
+            message.contains(&format!(
+                "Unsupported plan file version: 38 (expected {current_version})"
+            )),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");
@@ -11028,7 +11072,39 @@ mod saved_plan_version_tests {
                 error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 43,
-                    expected: 45,
+                    expected: 46,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_4418_format_45_fails_gate_before_dependent_payload_decode() {
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let dir = TempDir::new().unwrap();
+        let plan_path = dir.path().join("format-45.json");
+        std::fs::write(&plan_path, br#"{"version":45,"timestamp":"2026-11-14T00:00:00Z","source_path":"infra","plan":{"effects":"invalid old dependent payload"}}"#).unwrap();
+        let error = crate::commands::apply::run_apply_from_plan(
+            &runtime,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::error::AppError::UnsupportedPlanVersion {
+                    found: 45,
+                    expected: 46,
                     ..
                 }
             ),
@@ -11042,12 +11118,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            45,
-            "carina#4386 requires format 45 for checked validation strings",
+            46,
+            "carina#4418 requires format 46 for ordered non-empty dependent sets",
         );
-        let previous = 44;
+        let previous = 45;
 
-        for older_version in [previous, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

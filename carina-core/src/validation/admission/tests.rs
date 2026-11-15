@@ -6,6 +6,9 @@ use crate::schema::{
 use crate::validation::deferred_types::with_session_for_test;
 use std::collections::HashMap;
 
+#[path = "tests/slot_inputs.rs"]
+mod slot_inputs;
+
 #[path = "tests/seam_round4.rs"]
 mod seam_round4;
 
@@ -48,6 +51,12 @@ fn count_admission_work<R>(operation: impl FnOnce() -> R) -> (R, AdmissionWork) 
     let _reset = Reset(ADMISSION_WORK.replace(Some(AdmissionWork::default())));
     let result = operation();
     (result, ADMISSION_WORK.get().unwrap())
+}
+
+pub(super) fn without_admission_work<R>(operation: impl FnOnce() -> R) -> R {
+    let (result, work) = count_admission_work(operation);
+    assert_eq!(work, AdmissionWork::default());
+    result
 }
 
 fn text(value: &str) -> Value {
@@ -139,6 +148,7 @@ fn validate<K: AssignmentKind>(
             .into_classification(),
         Some(bindings),
         session,
+        crate::test_utils::no_conversion_proof(),
     );
     admit(destination, candidate, &context)
 }
@@ -229,23 +239,22 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                 .unwrap();
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
             let inputs = attributes::ResourceAttributeInputs::new(resource);
-            let attributes = inputs.classify(&KnowledgeContext::validation(), |_, error| {
-                panic!("classification: {error:?}")
-            });
             with_session_for_test(&catalog, |session| {
                 let (findings, work) = count_admission_work(|| {
-                    attributes::resource_attribute_admissions(
+                    let outcome = attributes::resource_attribute_admissions(
                         resource,
                         judged.file(),
                         resource.schema(&schemas).unwrap(),
-                        &attributes,
                         resource.quoted_string_attrs(),
-                        &inputs,
+                        inputs,
+                        crate::validation::admission::attributes::ValidationEvaluation::None,
                         &bindings,
                         session,
                         &schemas,
                         &mut Default::default(),
-                    )
+                    );
+                    assert!(outcome.classification_diagnostics.0.is_empty());
+                    outcome.values
                 });
                 assert_eq!(findings.errors().count(), 0, "{leaf}: {findings:?}");
                 assert_eq!(
@@ -360,6 +369,7 @@ fn ambiguous_union_checks_members<K: AssignmentKind + std::fmt::Debug>() {
                                 .into_classification(),
                             Some(bindings),
                             session,
+                            crate::test_utils::no_conversion_proof(),
                         );
                         let judgement =
                             assignment::judge_with_findings(&destination, &candidate, &context);
@@ -399,6 +409,7 @@ fn replacing_candidate_value_carries_all_original_obligations() {
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 let original = candidate.clone();
                 let resolved = text("fits");
@@ -484,6 +495,7 @@ fn needs_local_without_pending_sites_remains_pending() {
                         .into_classification(),
                     None,
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 let local_check = |_: &CompiledAttributeType,
                                    _: &crate::resource::Value<
@@ -545,7 +557,7 @@ fn resource_callers_admit_wider_same_identity_references() {
             let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
             let configuration =
                 crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
-            crate::validation::validate_resources(
+            crate::test_utils::legacy_validate_resources(
                 &parsed,
                 schemas,
                 &std::collections::HashSet::from(["test".into()]),
@@ -841,6 +853,7 @@ fn declared_reference_defers_same_identity_local_constraints_at_resource_sink() 
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 context.declaration = Some(("argument", &declared));
                 let pending = admit(destination, candidate, &context)
@@ -1411,6 +1424,7 @@ fn candidate_cannot_use_another_candidates_boundary_proof() {
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 let (_, context) = Candidate::validation_classified(
                     second
@@ -1419,6 +1433,7 @@ fn candidate_cannot_use_another_candidates_boundary_proof() {
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 assert!(admit(destination, candidate, &context).is_err());
             })
@@ -2808,6 +2823,7 @@ fn round13_cross_owner_same_identity_defers_in_reference_and_declared_admission(
                         .into_classification(),
                     Some(&bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 if as_declared {
                     boundary.declaration = Some(("argument", &declared));
@@ -2919,6 +2935,11 @@ fn round2_plain_reference_skips_expression_callback() {
                 session,
                 Some(&check),
                 None,
+                attributes::SchemaInputAuthority::new(
+                    resource.authored_slots().unwrap(),
+                    judged.report(),
+                    &mut Default::default(),
+                ),
             );
             result
                 .errors()
@@ -3216,4 +3237,103 @@ fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
         coverage.owns_finding(),
         "LSP must suppress the same hook finding"
     );
+}
+
+pub(crate) fn check_conversion_pending_discharge(
+    catalog: &crate::parser::ProviderContext,
+    schemas: &crate::schema::SchemaRegistry,
+    at_apply: Option<(&str, bool)>,
+) -> Result<(), String> {
+    let source = "let producer = mock.Source {}\nlet converted = producer.output as mock.Name\nlet sink = mock.Sink { target = converted }";
+    let parsed = crate::parser::parse_file(source, std::path::Path::new("conversion.crn"), catalog)
+        .map_err(|error| format!("normal parse rejected authored source: {error}"))?
+        .resolve_root_for_test();
+    let configuration = crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+    let judged = configuration.judged();
+    let tree =
+        crate::parser::AnalysisTree::try_from_file(judged.file()).map_err(|e| e.to_string())?;
+    let sink = tree
+        .resources()
+        .find(|resource| resource.binding() == Some("sink"))
+        .ok_or("parsed sink is missing")?;
+    let slot = sink.authored_slot("target").map_err(|e| e.to_string())?;
+    let value = slot
+        .projection()
+        .ok_or("parsed target projection is missing")?;
+    let proof = value
+        .knowledge(&KnowledgeContext::validation())
+        .map_err(|e| e.to_string())?
+        .into_classification();
+    let bindings = BindingIndex::from_parsed(judged.file(), schemas, catalog);
+    let destination = schemas
+        .resource_attribute_destination(sink.id(), "target", catalog)
+        .map_err(|e| e.to_string())?;
+    with_session_for_test(catalog, |session| {
+        let (candidate, context) =
+            Candidate::validation_slot(slot, proof, Some(&bindings), session)
+                .map_err(|e| format!("slot admission: {e:?}"))?;
+        let admission = admit(&destination, candidate, &context)
+            .map_err(|e| format!("expected pending conversion admission: {e:?}"))?;
+        let pending = match admission {
+            crate::validation::admission::Admission::Pending(pending) => pending,
+            crate::validation::admission::Admission::Ready(placed) => {
+                return Err(format!(
+                    "unknown operand was placed before apply: {placed:?}"
+                ));
+            }
+        };
+        let obligation = pending.local_obligation();
+        assert!(
+            obligation.is_some(),
+            "conversion did not retain its NeedsLocal obligation: {pending:?}"
+        );
+        assert_eq!(
+            obligation.map(|local| local.paths()),
+            Some(
+                &[crate::schema::LeafPath::from_segments([
+                    crate::schema::LeafPathSegment::StructField("target".into()),
+                ])][..]
+            )
+        );
+        if let Some((text, accepted)) = at_apply {
+            let mut resolved = ResolvedBindings::default();
+            resolved.set(
+                "producer",
+                std::collections::HashMap::from([(
+                    "output".into(),
+                    Value::Concrete(crate::resource::ConcreteValue::String(text.into())),
+                )]),
+                crate::binding_index::BindingValueSource::Local,
+            );
+            let actual = crate::resolver::resolve_ref_value(
+                &Value::root_resource_ref("producer", "output", vec![]),
+                &resolved,
+                session,
+            )
+            .map_err(|error| error.to_string())?;
+            let resource = crate::resource::Resource::with_provider("mock", "Sink", "sink", None)
+                .with_attribute("target", actual);
+            let placed = crate::validation::admission::attributes::admit_apply_resource(
+                &resource,
+                None,
+                schemas.get_for(&resource).unwrap(),
+                &resolved,
+                session,
+            );
+            assert_eq!(placed.is_ok(), accepted, "apply value {text:?}: {placed:?}");
+            if placed.is_ok() {
+                let value = crate::resolver::resolve_ref_value(
+                    &resource.attributes["target"],
+                    &resolved,
+                    session,
+                )
+                .map_err(|error| error.to_string())?;
+                assert_eq!(
+                    &value,
+                    &Value::Concrete(crate::resource::ConcreteValue::String(text.into()))
+                );
+            }
+        }
+        Ok(())
+    })
 }

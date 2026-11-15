@@ -209,7 +209,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// let report = loaded.judged();
 /// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let escaped = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
-///     check_type_expr_value_providerless(&expected, &value, session.catalog(), expression)
+///     check_type_expr_value_providerless(&expected, &value, session.catalog(), (expression).ordinary().unwrap())
 /// });
 /// ```
 /// ```
@@ -223,7 +223,7 @@ impl dyn ProviderTypeCheckContext + '_ {
 /// let report = loaded.judged();
 /// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
 /// let result = TypeCheckSession::run(&ProviderContext::new(carina_core::EnvironmentSnapshot::empty()), |session| {
-///     check_type_expr_value_providerless(&expected, &value, session.catalog(), expression)
+///     check_type_expr_value_providerless(&expected, &value, session.catalog(), (expression).ordinary().unwrap())
 ///         .record_deferred(session).unwrap();
 /// });
 /// result.publish(&mut Vec::new());
@@ -833,7 +833,9 @@ mod tests {
                     &expected,
                     &value,
                     context.catalog(),
-                    &crate::parser::retained::value_dependent_judgement_for_test(),
+                    crate::parser::retained::value_dependent_judgement_for_test()
+                        .ordinary()
+                        .unwrap(),
                 )
                 .record_at(
                     context,
@@ -1065,9 +1067,11 @@ mod partial_catalog_tests {
                         .is_empty()
                 );
                 assert!(
-                    crate::validation::validate_attribute_params_with_context(
-                        &parsed.attribute_params,
-                        context
+                    crate::test_utils::ordinary_sink_findings_for_test(
+                        crate::validation::validate_attribute_params_with_context(
+                            &parsed.attribute_params,
+                            context
+                        )
                     )
                     .is_err(),
                     "a loaded owner's missing evidence must be an error, not a deferred warning"
@@ -1101,9 +1105,11 @@ mod partial_catalog_tests {
                     crate::validation::resolve_file_type_exprs(&mut parsed, context).unwrap();
                 assert_eq!(errors.len(), expected_errors, "{source}: {errors:#?}");
                 if errors.is_empty() {
-                    crate::validation::validate_attribute_params_with_context(
-                        &parsed.attribute_params,
-                        context,
+                    crate::test_utils::ordinary_sink_findings_for_test(
+                        crate::validation::validate_attribute_params_with_context(
+                            &parsed.attribute_params,
+                            context,
+                        ),
                     )
                     .unwrap();
                 }

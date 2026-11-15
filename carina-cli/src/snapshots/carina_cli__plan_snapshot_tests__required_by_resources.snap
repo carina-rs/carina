@@ -1,0 +1,5 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+aws.acm.Certificate.cert: resource type 'aws.acm.Certificate' does not support create_before_destroy: the replacement cannot coexist with the original; create_before_destroy required by dependents `aws.acm.CertificateValidation.alpha`, `aws.acm.CertificateValidation.zeta`

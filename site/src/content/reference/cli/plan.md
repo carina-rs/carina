@@ -35,7 +35,10 @@ Display the plan in an interactive TUI (terminal user interface) mode. Allows na
 
 Save the plan to a JSON file for later use with `carina apply`. The saved plan includes the effects, resource definitions, provider configurations, state metadata for drift detection, and the identity (SHA-256, source and version) and schema fingerprints of the providers it was computed with. Re-run `carina plan --out` after re-installing or upgrading a provider: `carina apply` rejects a saved plan whose providers no longer match (see [Applying a Saved Plan](/reference/cli/apply/#applying-a-saved-plan)).
 
-Saved-plan format 45 supersedes 44 and retains quoted condition string literals,
+Saved-plan format 46 supersedes 45 and stores every replacement dependent in
+identity order. Required dependent lists cannot be empty. Diagnostics use the
+existing 8 KiB truncation limit; saved plans retain the full set.
+The format retains quoted condition string literals,
 `require` messages, and wait RHS strings so decoding can reject interpolation.
 It retains v13 schema fingerprints and
 identity/member constraint layers. Older plans must be regenerated. It retains

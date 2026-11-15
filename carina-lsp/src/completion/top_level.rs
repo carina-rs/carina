@@ -452,7 +452,7 @@ impl CompletionProvider {
         carina_core::config_loader::parse_directory_for_metadata(
             &module_path,
             &provider_context,
-            &indexmap::IndexMap::new(),
+            &Default::default(),
             &self.schemas,
         )
         .ok()

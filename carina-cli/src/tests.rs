@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_45_for_checked_validation_strings() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 45);
+fn saved_plan_version_is_46_for_ordered_dependents() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 46);
 }
 
 #[test]
@@ -295,6 +295,12 @@ fn checked_exports(
                 params,
                 &carina_core::binding_index::ResolvedBindings::default(),
                 session,
+                carina_core::parser::retained::ProjectedPhase::plan_context::<
+                    carina_core::resource::NoPlaceholder,
+                    carina_core::resource::AbsoluteBindingAddress,
+                >(&carina_core::resource::knowledge::KnowledgeContext::plan(
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                )),
             )
         },
     )

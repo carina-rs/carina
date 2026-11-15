@@ -1,4 +1,5 @@
 use super::*;
+use tower_lsp::lsp_types::InsertTextFormat;
 
 #[test]
 #[ignore = "requires provider schemas"]
@@ -2670,17 +2671,123 @@ fn directives_block_completion_includes_all_six_keys() {
         None,
     );
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
-    for key in [
-        "force_delete",
-        "create_before_destroy",
-        "prevent_destroy",
-        "depends_on",
-        "ignore_changes",
-        "provider",
+    let expected = [
+        (
+            "create_before_destroy",
+            "Create the replacement before destroying the old resource",
+            "create_before_destroy = ",
+            None,
+        ),
+        (
+            "depends_on",
+            "Explicit ordering edges to sibling let bindings",
+            "depends_on = [$0]",
+            Some(InsertTextFormat::SNIPPET),
+        ),
+        (
+            "force_delete",
+            "Force-delete the resource (e.g., non-empty S3 buckets)",
+            "force_delete = ",
+            None,
+        ),
+        (
+            "ignore_changes",
+            "Preserve externally managed attribute paths on update",
+            "ignore_changes = [$0]",
+            Some(InsertTextFormat::SNIPPET),
+        ),
+        (
+            "prevent_destroy",
+            "Block any plan that would destroy this resource",
+            "prevent_destroy = ",
+            None,
+        ),
+        (
+            "provider",
+            "Route this resource to a named provider instance \
+             (`let <name> = provider <kind> { ... }`)",
+            "provider = ",
+            None,
+        ),
+    ];
+    assert_eq!(labels, expected.map(|(label, ..)| label));
+    assert_eq!(
+        completions.len(),
+        carina_core::resource::ResourceDirective::ALL.len()
+    );
+    for (item, (_, detail, insert, format)) in completions.iter().zip(expected) {
+        assert_eq!(item.kind, Some(CompletionItemKind::PROPERTY));
+        assert_eq!(item.detail.as_deref(), Some(detail));
+        assert_eq!(item.insert_text.as_deref(), Some(insert));
+        assert_eq!(item.insert_text_format, format);
+        let command = item.command.as_ref().unwrap();
+        assert_eq!(command.title, "Trigger Suggest");
+        assert_eq!(command.command, "editor.action.triggerSuggest");
+        assert!(command.arguments.is_none());
+    }
+}
+
+#[test]
+fn directive_value_completions_decode_quoted_keys() {
+    let provider = test_provider_single_attr();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("providers.crn"),
+        "let alternate = provider test {}\n",
+    )
+    .unwrap();
+    for (key, value, expected) in [
+        ("depends_on", "[]", "role"),
+        ("ignore_changes", "[]", "attr"),
+        ("provider", "", "alternate"),
     ] {
+        let mut baseline = None;
+        for quote in ["", "'", "\""] {
+            let source = format!(
+                "let alternate = provider test {{}}\nlet role = test.foo.bar {{ attr = 'r' }}\nlet bucket = test.foo.bar {{\n  directives {{\n    {quote}{key}{quote} = {value}\n  }}\n}}\n"
+            );
+            let column = 4 + quote.len() * 2 + key.len() + 3 + usize::from(value == "[]");
+            let context = provider.get_completion_context(&source, Position::new(4, column as u32));
+            let expected_context = match key {
+                "depends_on" => {
+                    matches!(context, CompletionContext::InsideDirectivesDependsOnList { current_binding: Some(ref binding) } if binding == "bucket")
+                }
+                "ignore_changes" => matches!(
+                    context,
+                    CompletionContext::InsideDirectivesIgnoreChangesList { .. }
+                ),
+                "provider" => matches!(context, CompletionContext::InsideDirectivesProviderValue),
+                _ => unreachable!(),
+            };
+            assert!(expected_context, "{quote}{key}{quote}: {context:?}");
+            let completions = provider.complete_for_test(
+                &create_document(&source),
+                Position::new(4, column as u32),
+                Some(directory.path()),
+            );
+            let labels: Vec<_> = completions.iter().map(|item| item.label.clone()).collect();
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "{quote}{key}{quote}: {labels:?}"
+            );
+            if let Some(baseline) = &baseline {
+                assert_eq!(&labels, baseline, "{quote}{key}{quote}");
+            } else {
+                baseline = Some(labels);
+            }
+        }
+    }
+}
+
+#[test]
+fn directive_completions_require_a_direct_child_of_the_directives_block() {
+    let provider = test_provider_single_attr();
+    let doc = create_document("test.foo.bar {\n  directives {\n    foo {\n      \n    }\n  }\n}\n");
+    let completions = provider.complete_for_test(&doc, Position::new(3, 6), None);
+    for (key, _) in carina_core::resource::ResourceDirective::ALL {
         assert!(
-            labels.contains(&key),
-            "directives block completion missing `{key}`; got {labels:?}"
+            !completions.iter().any(|item| item.label == *key),
+            "nested block offered directive {key}: {completions:?}"
         );
     }
 }

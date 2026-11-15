@@ -699,14 +699,8 @@ fn render_edges(out: &mut String, model: &GraphModel, layout: &Layout, render_st
     edges.sort_by_key(|(edge, is_reference)| {
         let node_key = |id: &GraphNodeId| {
             model.node(id).map_or_else(
-                || (String::new(), String::new(), id.stable_key()),
-                |node| {
-                    (
-                        node.resource_type.clone(),
-                        node.label.clone(),
-                        id.stable_key(),
-                    )
-                },
+                || (String::new(), String::new(), id.clone()),
+                |node| (node.resource_type.clone(), node.label.clone(), id.clone()),
             )
         };
         (*is_reference, node_key(&edge.from), node_key(&edge.to))

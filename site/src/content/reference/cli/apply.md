@@ -59,9 +59,10 @@ A saved plan also records the providers it was computed with: for each provider,
 
 Saved plans are tied to the plan-file format of the Carina version that wrote them. A plan written by another version is rejected with `Unsupported plan file version`; create it again with `carina plan --out`.
 
-The current saved-plan format is `45`, superseding `44`, with quoted condition
-string literals, `require` messages, and wait RHS strings checked for interpolation
-during decoding. It retains v13 schema
+The current saved-plan format is `46`, superseding `45`, with non-empty dependent
+lists ordered by system identity. It retains quoted condition string literals,
+`require` messages, and wait RHS strings checked for interpolation during decoding.
+It retains v13 schema
 fingerprints and identity/member constraint layers. It retains replacement
 history and dependency requirements so apply can
 revalidate replacement order against each target's schema. It also retains
@@ -139,7 +140,7 @@ When stderr is a terminal, Carina shows a spinner for each running effect. Other
 
 ### State Locking Errors
 
-If the state is already locked by another process, Carina displays the lock holder and lock ID, and suggests using `carina force-unlock` if the lock is stale.
+If the state is already locked by another process, Carina displays the lock holder, lock ID, operation, and last update and expiry times in UTC. The message explains that a previous run may have been interrupted before releasing the lock; if so, the lock expires on its own at the displayed time. A running process keeps extending its lock's expiry. If no other run is using the state, it suggests `carina force-unlock` to release the lock sooner.
 
 ## Bootstrap
 

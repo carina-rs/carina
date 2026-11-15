@@ -6,10 +6,11 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::eval_value::{EvalValue, ParsedSinkValue, UnexpandedStructuralHandleKind};
-use crate::parser::context::{
-    ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
-};
+use crate::parser::context::{ExpressionMode, ParseContext, first_inner, next_pair};
 use crate::parser::error::ParseError;
+use crate::parser::resource_body::{
+    BlockContent, BlockContents, DirectiveBlock, DirectiveEntry, ResourceBody, ResourceDirectives,
+};
 use crate::parser::util::expression_is_plain_string_literal;
 use crate::parser::{BoundDeferredTarget, Rule};
 use crate::parser::{
@@ -19,8 +20,8 @@ use crate::parser::{parse_expression, parse_expression_eval, parse_expression_in
 use crate::resource::{
     AuthoredConcreteValue as ConcreteValue, AuthoredDeferredValue as DeferredValue,
     AuthoredDirectives as Directives, DiagnosticSourceLocations, DirectiveExpr, LoopElementOrigin,
-    LoopProvenance, ParsedIgnorePath, ParsedIgnorePathSegment, RelativeBindingName, ResourceId,
-    ResourceIdentity, UnexpandedDependencyFields,
+    LoopProvenance, ParsedIgnorePath, ParsedIgnorePathSegment, RelativeBindingName,
+    ResourceDirective, ResourceId, ResourceIdentity, UnexpandedDependencyFields,
 };
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
@@ -59,17 +60,13 @@ pub(crate) fn parse_resource_for_target(
     preprocessed_file: &crate::parser::PreprocessedFile,
     source_file: &std::path::Path,
 ) -> Result<Resource, ParseError> {
-    let context = match pair.as_rule() {
-        Rule::anonymous_resource => "anonymous resource",
-        _ => "resource expression",
-    };
     let declaration =
         crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
     let syntax = pair.clone();
-    let mut iter = pair.into_inner();
-    let namespaced_type = next_pair(&mut iter, "resource type", context)?
-        .as_str()
-        .to_string();
+    let (resource_type, contents) = ResourceBody::from_pair(pair)
+        .expect("resource parser requires a resource body")
+        .into_parts(preprocessed_file, source_file);
+    let namespaced_type = resource_type.as_str().to_string();
 
     // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
@@ -94,22 +91,28 @@ pub(crate) fn parse_resource_for_target(
             target.template_resource_id(provider, &resource_type, None)
         }
     };
-    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
+    let mode = ExpressionMode::resource(
+        provisional_id.clone(),
+        source_file,
+        preprocessed_file,
+        ctx.authored_resource_declaration(&syntax),
+    );
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
     let parsed_contents = parse_block_contents_with_quoted(
-        iter,
+        contents,
         ctx,
         &mode,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
-    let authored_slots = ctx.authored_resource_slots(
+    let mut authored_slots = ctx.authored_resource_slots(
         &syntax,
         &parsed_contents.sinks,
         &parsed_contents.attributes,
         crate::schema::SchemaKind::Resource,
     )?;
+    authored_slots.set_input_origin(mode.resource_input_origin());
     let attributes = parsed_contents.attributes;
     let ParsedDirectives {
         directives,
@@ -182,7 +185,7 @@ pub(crate) fn parse_block_contents_with_mode(
     mode: &ExpressionMode<'_>,
 ) -> Result<Option<IndexMap<String, Value>>, ParseError> {
     let contents = parse_block_contents_with_quoted(
-        pairs,
+        BlockContents::ordinary(pairs),
         ctx,
         mode,
         &mut None,
@@ -216,7 +219,7 @@ pub(in crate::parser) enum ReservedAttributeNamePolicy {
 /// build `Resource.quoted_string_attrs` for enum-attribute diagnostics
 /// (#2094 / #2229) without re-walking the pest tree.
 fn parse_block_contents_with_quoted(
-    pairs: pest::iterators::Pairs<Rule>,
+    contents: BlockContents<'_>,
     ctx: &ParseContext,
     mode: &ExpressionMode<'_>,
     quoted_out: &mut Option<HashSet<String>>,
@@ -237,7 +240,24 @@ fn parse_block_contents_with_quoted(
     let mut pending = false;
     let mut pending_names = HashSet::new();
 
-    for content_pair in pairs {
+    for content in contents {
+        let content_pair = match content {
+            BlockContent::Ordinary(pair) => pair,
+            BlockContent::Directives(block) => {
+                // Keep the first block, including when it is empty. The
+                // inventory reports duplicates and inspects every block;
+                // later blocks cannot overwrite or evaluate runtime settings.
+                match block.classification() {
+                    DirectiveBlock::First => {
+                        check_directives_depends_on_elements(&block)?;
+                        check_directives_provider_value(&block)?;
+                        directives = Some(parse_directives(block, &local_ctx)?);
+                    }
+                    DirectiveBlock::Duplicate(_finding) => {}
+                }
+                continue;
+            }
+        };
         match content_pair.as_rule() {
             Rule::block_content => {
                 let inner = first_inner(content_pair, "block content item", "block content")?;
@@ -263,7 +283,10 @@ fn parse_block_contents_with_quoted(
                         let key_pair =
                             next_pair(&mut attr_inner, "attribute name", "block content")?;
                         let key_span = key_pair.as_span();
-                        let key = extract_key_string(key_pair.clone())?;
+                        let key = match ctx.key_string(key_pair.clone())? {
+                            crate::parser::context::ParsedKey::Literal(key) => key,
+                            crate::parser::context::ParsedKey::Rejected => continue,
+                        };
                         reject_reserved_resource_attribute(
                             &key,
                             key_span,
@@ -293,12 +316,6 @@ fn parse_block_contents_with_quoted(
                         let block_name_pair =
                             next_pair(&mut block_inner, "block name", "nested block")?;
                         let block_name = block_name_pair.as_str().to_string();
-                        if block_name == "directives" {
-                            check_directives_depends_on_elements(block_inner.clone())?;
-                            check_directives_provider_value(block_inner.clone())?;
-                            directives = Some(parse_directives(block_inner, &local_ctx)?);
-                            continue;
-                        }
                         // Recursively parse nested block contents (supports arbitrary depth)
                         let authored_count = authored_nested_blocks
                             .entry(block_name.clone())
@@ -309,7 +326,7 @@ fn parse_block_contents_with_quoted(
                             .at_named_child(block_name.clone(), &block_name_pair)
                             .at_list_index(block_index);
                         let block_contents = parse_block_contents_with_quoted(
-                            block_inner,
+                            BlockContents::ordinary(block_inner),
                             &local_ctx,
                             &block_mode,
                             &mut None,
@@ -334,7 +351,10 @@ fn parse_block_contents_with_quoted(
                 let mut attr_inner = content_pair.into_inner();
                 let key_pair = next_pair(&mut attr_inner, "attribute name", "block content")?;
                 let key_span = key_pair.as_span();
-                let key = extract_key_string(key_pair.clone())?;
+                let key = match ctx.key_string(key_pair.clone())? {
+                    crate::parser::context::ParsedKey::Literal(key) => key,
+                    crate::parser::context::ParsedKey::Rejected => continue,
+                };
                 reject_reserved_resource_attribute(&key, key_span, reserved_attribute_names)?;
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);
@@ -435,11 +455,10 @@ pub(crate) fn parse_read_resource_expr(
     let declaration =
         crate::parser::DeclarationProvenance::from_pair(&pair, preprocessed_file, source_file);
     let syntax = pair.clone();
-    let mut inner = pair.into_inner();
-
-    let namespaced_type = next_pair(&mut inner, "resource type", "read resource expression")?
-        .as_str()
-        .to_string();
+    let (resource_type, contents) = ResourceBody::from_pair(pair)
+        .expect("read parser requires a resource body")
+        .into_parts(preprocessed_file, source_file);
+    let namespaced_type = resource_type.as_str().to_string();
 
     // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
@@ -457,22 +476,28 @@ pub(crate) fn parse_read_resource_expr(
         ResourceIdentity::new(binding_name.to_string()),
         None,
     );
-    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
+    let mode = ExpressionMode::resource(
+        provisional_id.clone(),
+        source_file,
+        preprocessed_file,
+        ctx.authored_resource_declaration(&syntax),
+    );
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
     let parsed_contents = parse_block_contents_with_quoted(
-        inner,
+        contents,
         ctx,
         &mode,
         &mut quoted_out,
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
-    let authored_slots = ctx.authored_resource_slots(
+    let mut authored_slots = ctx.authored_resource_slots(
         &syntax,
         &parsed_contents.sinks,
         &parsed_contents.attributes,
         crate::schema::SchemaKind::DataSource,
     )?;
+    authored_slots.set_input_origin(mode.resource_input_origin());
     let attributes = parsed_contents.attributes;
     let ParsedDirectives {
         directives,
@@ -504,46 +529,34 @@ pub(crate) fn parse_read_resource_expr(
 }
 
 fn parse_directives(
-    pairs: pest::iterators::Pairs<Rule>,
+    block: ResourceDirectives<'_>,
     ctx: &ParseContext,
 ) -> Result<ParsedDirectives, ParseError> {
     let mut parsed_directives = ParsedDirectives::default();
 
-    for content_pair in pairs {
-        let attr = match content_pair.as_rule() {
-            Rule::block_content => {
-                first_inner(content_pair, "block content item", "directives block")?
-            }
-            Rule::attribute => content_pair,
-            _ => continue,
+    for (attr, entry) in block.entries() {
+        let directive = match entry {
+            DirectiveEntry::Valid(directive) => *directive,
+            DirectiveEntry::Invalid(_finding) => continue,
         };
-        if attr.as_rule() != Rule::attribute {
-            continue;
-        }
 
         let mut attr_inner = attr.into_inner();
-        let key = ctx.authored_key(next_pair(
-            &mut attr_inner,
-            "attribute name",
-            "directives block",
-        )?);
+        let _key = next_pair(&mut attr_inner, "attribute name", "directives block")?;
         let value_pair = next_pair(&mut attr_inner, "attribute value", "directives block")?;
         let line = value_pair.line_col().0;
 
-        if let Some(directive) = key.lifecycle_directive() {
-            let source = ctx.directive_value_source_span(&value_pair);
-            let value = parse_expression(value_pair, ctx)?
-                .projection()
-                .expect("materialized parser expression")
-                .clone();
-            parsed_directives
-                .directives
-                .set(directive, DirectiveExpr::new(value, source));
-            continue;
-        }
-
-        match key {
-            key if key.matches("ignore_changes") => {
+        match directive {
+            ResourceDirective::Lifecycle(directive) => {
+                let source = ctx.directive_value_source_span(&value_pair);
+                let value = parse_expression(value_pair, ctx)?
+                    .projection()
+                    .expect("materialized parser expression")
+                    .clone();
+                parsed_directives
+                    .directives
+                    .set(directive, DirectiveExpr::new(value, source));
+            }
+            ResourceDirective::IgnoreChanges => {
                 let primary =
                     crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
                         ParseError::InvalidExpression {
@@ -571,7 +584,7 @@ fn parse_directives(
                     .map(|element| parse_ignore_change_path(element, ctx))
                     .collect::<Result<Vec<_>, _>>()?;
             }
-            key if key.matches("depends_on") => {
+            ResourceDirective::DependsOn => {
                 let primary =
                     crate::parser::util::unwrap_to_primary(value_pair).ok_or_else(|| {
                         ParseError::InvalidExpression {
@@ -607,7 +620,7 @@ fn parse_directives(
                 parsed_directives.directives.depends_on_diagnostic_sources =
                     DiagnosticSourceLocations::authored(ctx.source_file(), source_lines);
             }
-            key if key.matches("provider") => {
+            ResourceDirective::Provider => {
                 let eval = parse_expression_eval(value_pair, ctx)?;
                 parsed_directives.directives.provider_instance = Some(eval_as_binding_name(
                     eval,
@@ -616,7 +629,6 @@ fn parse_directives(
                     BindingNameUse::Provider,
                 )?);
             }
-            _ => {}
         }
     }
 
@@ -771,23 +783,15 @@ fn eval_as_binding_name(
 /// reject any `depends_on = [...]` element that is a string literal — bare
 /// binding identifiers and string literals collapse to the same `Value`
 /// later, so this is the only place we can tell `[role]` from `["role"]`.
-fn check_directives_depends_on_elements(
-    directives_inner: pest::iterators::Pairs<Rule>,
-) -> Result<(), ParseError> {
-    for content_pair in directives_inner {
-        let attr = match content_pair.as_rule() {
-            Rule::block_content => {
-                first_inner(content_pair, "block content item", "block content")?
-            }
-            Rule::attribute => content_pair,
-            _ => continue,
+fn check_directives_depends_on_elements(block: &ResourceDirectives<'_>) -> Result<(), ParseError> {
+    for (attr, entry) in block.entries() {
+        let directive = match entry {
+            DirectiveEntry::Valid(directive) => *directive,
+            DirectiveEntry::Invalid(_finding) => continue,
         };
-        if attr.as_rule() != Rule::attribute {
-            continue;
-        }
         let mut attr_inner = attr.into_inner();
-        let key_pair = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
-        if key_pair.as_str() != "depends_on" {
+        let _key = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
+        if directive != ResourceDirective::DependsOn {
             continue;
         }
         let value_pair = next_pair(&mut attr_inner, "attribute value", "directives attribute")?;
@@ -822,23 +826,15 @@ fn check_directives_depends_on_elements(
 
 /// Reject `provider = "<string>"` at the pest layer, where a quoted literal
 /// remains distinguishable from a bare binding identifier.
-fn check_directives_provider_value(
-    directives_inner: pest::iterators::Pairs<Rule>,
-) -> Result<(), ParseError> {
-    for content_pair in directives_inner {
-        let attr = match content_pair.as_rule() {
-            Rule::block_content => {
-                first_inner(content_pair, "block content item", "block content")?
-            }
-            Rule::attribute => content_pair,
-            _ => continue,
+fn check_directives_provider_value(block: &ResourceDirectives<'_>) -> Result<(), ParseError> {
+    for (attr, entry) in block.entries() {
+        let directive = match entry {
+            DirectiveEntry::Valid(directive) => *directive,
+            DirectiveEntry::Invalid(_finding) => continue,
         };
-        if attr.as_rule() != Rule::attribute {
-            continue;
-        }
         let mut attr_inner = attr.into_inner();
-        let key_pair = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
-        if key_pair.as_str() != "provider" {
+        let _key = next_pair(&mut attr_inner, "attribute name", "directives attribute")?;
+        if directive != ResourceDirective::Provider {
             continue;
         }
         let value_pair = next_pair(&mut attr_inner, "attribute value", "directives attribute")?;
@@ -853,4 +849,225 @@ fn check_directives_provider_value(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{ProviderContext, parse_file};
+    use std::path::Path;
+
+    #[test]
+    fn nested_directives_remain_ordinary_attributes_at_every_depth() {
+        for header in [
+            "mock.test.resource",
+            "let named = mock.test.resource",
+            "let observed = read mock.test.resource",
+        ] {
+            for nested in [
+                "directives { value = true }",
+                "inner { directives { value = true } }",
+                "directives { provider = 'ordinary' depends_on = ['ordinary'] value = true }",
+                "directives { value = true } directives { value = false }",
+            ] {
+                let source = format!("{header} {{ config {{ {nested} }} }}");
+                let parsed = parse_file(
+                    &source,
+                    Path::new("resources.crn"),
+                    &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                )
+                .unwrap();
+                let attributes = if header.contains("read ") {
+                    &parsed.data_sources[0].attributes
+                } else {
+                    &parsed.resources[0].attributes
+                };
+                let mut value = &attributes["config"];
+                for key in if nested.starts_with("inner") {
+                    vec!["inner", "directives", "value"]
+                } else {
+                    vec!["directives", "value"]
+                } {
+                    let Value::Concrete(ConcreteValue::List(blocks)) = value else {
+                        panic!("expected nested blocks: {source}: {value:?}");
+                    };
+                    let Value::Concrete(ConcreteValue::Map(fields)) = &blocks[0] else {
+                        panic!("expected nested attributes: {source}");
+                    };
+                    value = fields.get(key).unwrap_or_else(|| {
+                        panic!("lost nested attribute {key}: {source}: {fields:?}")
+                    });
+                }
+                assert_eq!(value, &Value::Concrete(ConcreteValue::Bool(true)));
+            }
+        }
+    }
+
+    #[test]
+    fn directive_classifications_travel_with_blocks_without_context_inventory() {
+        let source = "mock.test.resource {\n  name = 'example'\n  directives {\n    'prevent_destroy' = true\n    prevent_destory = absent\n    unsupported {}\n    let ignored = absent\n  }\n  directives { force_delete = absent }\n}\n";
+        let path = Path::new("resources.crn");
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let file = std::sync::Arc::new(crate::parser::preprocess_file(source).unwrap());
+        let pair = file
+            .parse()
+            .unwrap()
+            .flatten()
+            .find(|pair| pair.as_rule() == Rule::anonymous_resource)
+            .unwrap();
+        let ctx = ParseContext::new(&config, path, file.clone());
+        let resource = parse_anonymous_resource(pair, &ctx, &file, path)
+            .expect("a fresh context needs no detached directive inventory");
+        let mut lifecycle_count = 0;
+        resource.directives.clone().map_expressions(|expression| {
+            lifecycle_count += 1;
+            assert_eq!(
+                expression.value(),
+                &Value::Concrete(ConcreteValue::Bool(true))
+            );
+        });
+        assert_eq!(lifecycle_count, 1);
+        assert!(resource.directives.force_delete.is_none());
+
+        let metadata = crate::parser::parse_syntax_inventory(source, path).unwrap();
+        let findings = crate::validation::resource_directive_findings(&metadata);
+        assert_eq!(findings.len(), 4, "{findings:?}");
+        assert_eq!(
+            findings[0].detail().to_string(),
+            "Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?"
+        );
+        assert_eq!(
+            findings[3].detail().to_string(),
+            "Duplicate attribute 'directives' (first defined on line 3)"
+        );
+    }
+
+    #[test]
+    fn quoted_directive_keys_use_the_ordinary_attribute_identity() {
+        for quote in ['\'', '"'] {
+            let source = format!(
+                "let parent = mock.test.resource {{ name = 'parent' }}\n\
+                 mock.test.resource {{\n\
+                   name = 'child'\n\
+                   directives {{\n\
+                     {quote}force_delete{quote} = true\n\
+                     {quote}create_before_destroy{quote} = true\n\
+                     {quote}prevent_destroy{quote} = true\n\
+                     {quote}ignore_changes{quote} = [name]\n\
+                     {quote}depends_on{quote} = [parent]\n\
+                     {quote}provider{quote} = alternate\n\
+                   }}\n\
+                 }}\n"
+            );
+            let parsed = parse_file(
+                &source,
+                Path::new("resources.crn"),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            assert!(
+                crate::validation::resource_directive_findings(&parsed.parser_binding_metadata)
+                    .is_empty()
+            );
+            let child = &parsed.resources[1];
+            let mut lifecycle_count = 0;
+            child.directives.clone().map_expressions(|expression| {
+                lifecycle_count += 1;
+                assert_eq!(
+                    expression.value(),
+                    &Value::Concrete(ConcreteValue::Bool(true))
+                );
+            });
+            assert_eq!(lifecycle_count, 3);
+            assert_eq!(child.directives.ignore_changes.len(), 1);
+            assert!(!child.dependencies.depends_on.is_empty());
+            assert_eq!(
+                child.directives.provider_instance.as_deref(),
+                Some("alternate")
+            );
+            for kind in [
+                crate::parser::elements::ElementKind::Provider,
+                crate::parser::elements::ElementKind::IgnoreChanges,
+            ] {
+                assert!(child.declaration.elements().get(kind).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_directives_keep_the_first_block_and_collect_the_second_name() {
+        for header in [
+            "mock.test.resource",
+            "let named = mock.test.resource",
+            "let observed = read mock.test.resource",
+        ] {
+            let source = format!(
+                "{header} {{\n  directives {{ prevent_destroy = true }}\n  directives {{ prevent_destroy = false force_delete = absent }}\n}}\n"
+            );
+            let parsed = parse_file(
+                &source,
+                Path::new("resources.crn"),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .expect("duplicate blocks are collected without evaluating the second block");
+            let findings =
+                crate::validation::resource_directive_findings(&parsed.parser_binding_metadata);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(
+                findings[0].detail().to_string(),
+                "Duplicate attribute 'directives' (first defined on line 2)"
+            );
+            let directives = if header.contains("read ") {
+                &parsed.data_sources[0].directives
+            } else {
+                &parsed.resources[0].directives
+            };
+            let mut values = Vec::new();
+            directives
+                .clone()
+                .map_expressions(|expression| values.push(expression.value().clone()));
+            assert_eq!(values, [Value::Concrete(ConcreteValue::Bool(true))]);
+            let location = findings[0].location();
+            assert_eq!(location.file().path(), Path::new("resources.crn"));
+            assert_eq!(
+                (location.span().start_line(), location.span().start_column()),
+                (3, 3)
+            );
+            assert_eq!(
+                (location.span().end_line(), location.span().end_column()),
+                (3, 13)
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_directives_in_unevaluated_resources_are_rejected() {
+        for wrapper in ["let empty = for n in []", "let hidden = if false"] {
+            let source = format!(
+                "{wrapper} {{\n  mock.test.resource {{\n    directives {{}}\n    directives {{}}\n  }}\n}}\n"
+            );
+            let parsed = parse_file(
+                &source,
+                Path::new("resources.crn"),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .expect("duplicate blocks must not abort the inventory");
+            let findings =
+                crate::validation::resource_directive_findings(&parsed.parser_binding_metadata);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            assert_eq!(
+                findings[0].detail().to_string(),
+                "Duplicate attribute 'directives' (first defined on line 3)"
+            );
+            let location = findings[0].location();
+            assert_eq!(
+                (location.span().start_line(), location.span().start_column()),
+                (4, 5)
+            );
+            assert_eq!(
+                (location.span().end_line(), location.span().end_column()),
+                (4, 15)
+            );
+        }
+    }
 }

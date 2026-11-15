@@ -1241,7 +1241,7 @@ mod tests {
 
         assert_eq!(renewed.id(), lock.id());
         assert_eq!(renewed.operation(), lock.operation());
-        assert!(renewed.expires() > lock.created());
+        assert!(renewed.expires() > lock.last_updated());
         assert!(!renewed.is_expired());
 
         backend.release_lock(&renewed).await.unwrap();

@@ -334,14 +334,28 @@ fn lint_result(
                 .into_iter()
                 .map(|error| error.to_string())
                 .collect::<Vec<_>>();
+            let mut conversion_validation = carina_core::validation::ConversionValidation::<
+                std::convert::Infallible,
+            >::for_file(&parsed);
             if type_findings.is_empty()
                 && let Err(error) = carina_core::validation::validate_attribute_params_with_context(
                     &parsed.attribute_params,
                     catalog,
                 )
+                .into_validation(
+                    &mut conversion_validation,
+                    carina_core::validation::FindingSubject::Root,
+                )
             {
                 type_findings.push(error);
             }
+            type_findings.extend(
+                conversion_validation
+                    .complete()
+                    .into_presented()
+                    .into_iter()
+                    .map(|finding| finding.to_string()),
+            );
             if type_findings.is_empty()
                 && let Err(error) = parsed.resolve_resource_refs_in_session(catalog)
             {
@@ -350,7 +364,7 @@ fn lint_result(
             for module in module_walk.iter() {
                 type_findings.extend(
                     carina_core::validation::resolve_file_type_exprs(
-                        &mut module.loaded().parsed.clone(),
+                        &mut module.loaded().parsed().clone(),
                         catalog,
                     )?
                     .into_iter()

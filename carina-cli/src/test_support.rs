@@ -393,6 +393,35 @@ pub async fn run_plan_with_factories(
     )
     .await
 }
+/// Exercise JSON and saved-plan output through the real plan command.
+pub async fn run_saved_json_plan_with_factories(
+    runtime: &CommandRuntime,
+    path: &std::path::Path,
+    out: &std::path::Path,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+) -> Result<bool, crate::error::AppError> {
+    crate::commands::plan::run_plan_using(
+        runtime,
+        path,
+        Some(out),
+        None,
+        None,
+        crate::DetailLevel::None,
+        false,
+        false,
+        true,
+        false,
+        false,
+        &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+        |runtime, providers, _| {
+            Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                runtime, factories, providers,
+            ))
+        },
+    )
+    .await
+}
+
 pub async fn run_detailed_plan_with_factories(
     runtime: &CommandRuntime,
     path: &std::path::Path,

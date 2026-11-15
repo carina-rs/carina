@@ -4,10 +4,11 @@ use async_trait::async_trait;
 use carina_core::hint::ProjectCommand;
 use carina_core::paths::DisplayPath;
 use carina_core::resource::{AbsoluteBindingAddress, ResourceIdentityError};
+use chrono::{DateTime, Utc};
 use std::path::Path;
 use thiserror::Error;
 
-use crate::lock::LockInfo;
+use crate::lock::{LockInfo, format_lock_expiry, format_lock_last_updated};
 use crate::state::{self, LoadedState, PublishedExports, StateFile};
 
 /// A persisted resource row whose identity cannot be represented by the
@@ -176,11 +177,18 @@ pub enum BackendError {
     #[error(transparent)]
     UpstreamExportRead(Box<UpstreamExportReadError>),
     /// The state is locked by another process
-    #[error("State is locked by {who} (lock ID: {lock_id}, operation: {operation})")]
+    #[error(
+        "State is locked by {who} (lock ID: {lock_id}, operation: {operation}, last updated {last_updated}, expires {expires}).",
+        last_updated = format_lock_last_updated(.last_updated),
+        expires = format_lock_expiry(.expires)
+    )]
     Locked {
         lock_id: String,
         who: String,
         operation: String,
+        /// Time of the lock's last acquisition or renewal.
+        last_updated: DateTime<Utc>,
+        expires: DateTime<Utc>,
     },
 
     /// The lock was not found (for release/force-unlock operations)
@@ -579,6 +587,8 @@ impl BackendError {
             lock_id: lock.id().to_owned(),
             who: lock.who().to_owned(),
             operation: lock.operation().to_owned(),
+            last_updated: lock.last_updated(),
+            expires: lock.expires(),
         }
     }
 
@@ -1011,13 +1021,36 @@ mod tests {
                 lock_id,
                 who,
                 operation,
+                last_updated,
+                expires,
             } => {
                 assert_eq!(lock_id, lock.id());
                 assert_eq!(who, lock.who());
                 assert_eq!(operation, "apply");
+                assert_eq!(last_updated, lock.last_updated());
+                assert_eq!(expires, lock.expires());
             }
             _ => panic!("Expected Locked error"),
         }
+    }
+
+    #[test]
+    fn test_backend_error_locked_display_includes_utc_times() {
+        let lock = LockInfo::from_json_str(
+            r#"{
+                "id": "lock-123",
+                "who": "another process",
+                "operation": "apply",
+                "created": "2026-11-15T17:12:03.123456+09:00",
+                "expires": "2026-11-15T18:12:03.987654+09:00"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            BackendError::locked(&lock).to_string(),
+            "State is locked by another process (lock ID: lock-123, operation: apply, last updated 2026-11-15T08:12:03Z, expires 2026-11-15T09:12:04Z)."
+        );
     }
 
     #[test]

@@ -17,6 +17,8 @@ const V2_SECRET_PREFIX: &str = "$argon2id$";
 
 #[test]
 fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
+    use carina_cli::commands::plan::PlanFile;
+
     let scenario =
         Scenario::new("backend local { path = 'carina.state.json' }\nprovider mock {}\n");
     scenario.write_root_file("main.crn", "backend local { path = 'carina.state.json' }\nprovider mock {}\nlet vpc = mock.test.resource { name = 'vpc' }\nlet checked = use { source = './checked' }\nchecked { r = vpc }\n");
@@ -27,15 +29,20 @@ fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
     assert_success("save literal constraint", &scenario.plan());
     let original = read_json(&scenario.project.join("plan.json"));
     let current_version = original["version"].clone();
-    assert_eq!(current_version, 45);
+    assert_eq!(current_version, PlanFile::CURRENT_VERSION);
+    let previous_version = PlanFile::CURRENT_VERSION - 1;
+    let old_version_error = format!(
+        "Unsupported plan file version: {previous_version} (expected {})",
+        PlanFile::CURRENT_VERSION
+    );
     let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
     let provider_before = fs::read(&scenario.mock_state).ok();
 
     for (version, string, expected) in [
         (
-            Value::from(44),
+            Value::from(previous_version),
             "${secret('CANARY_4386')}",
-            "Unsupported plan file version: 44",
+            old_version_error.as_str(),
         ),
         (
             current_version.clone(),
@@ -52,9 +59,7 @@ fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
         document["version"] = version;
         document["compositions"][0]["pending_constraints"][0]["expression"]["Compare"]["rhs"]["String"] =
             Value::from(string);
-        let decode =
-            serde_json::from_value::<carina_cli::commands::plan::PlanFile>(document.clone())
-                .unwrap_err();
+        let decode = serde_json::from_value::<PlanFile>(document.clone()).unwrap_err();
         // The plan reader retains JSON coordinates, but has no project command.
         assert!(
             decode
@@ -3509,8 +3514,8 @@ fn current_saved_plan_root_and_nested_hashes_round_trip_byte_for_byte() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, SnapshotLeaf, Value as SnapshotTree,
     };
-    assert_eq!(PlanFile::CURRENT_VERSION, 45);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v45.plan.json");
+    assert_eq!(PlanFile::CURRENT_VERSION, 46);
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v46.plan.json");
     let plan: PlanFile = serde_json::from_str(fixture).unwrap();
     assert_eq!(
         carina_core::utils::pretty_with_newline(&plan).unwrap(),

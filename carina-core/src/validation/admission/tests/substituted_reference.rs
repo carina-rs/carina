@@ -215,8 +215,12 @@ fn substituted_concrete_references_do_not_add_local_or_schema_deferrals() {
             .resource_attribute_destination(resource.id(), "value", catalog)
             .unwrap();
         with_session_for_test(catalog, |session| {
-            let (baseline, baseline_context) =
-                Candidate::validation_classified(proof.clone(), Some(&bindings), session);
+            let (baseline, baseline_context) = Candidate::validation_classified(
+                proof.clone(),
+                Some(&bindings),
+                session,
+                crate::test_utils::no_conversion_proof(),
+            );
             let baseline =
                 assignment::judge_with_findings(&destination, &baseline, &baseline_context)
                     .unwrap();

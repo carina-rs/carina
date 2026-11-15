@@ -14555,7 +14555,13 @@ async fn deferred_reversed_history(coexisting_child: bool) {
                 error.cause,
                 crate::plan::CreateBeforeDestroyError::ReplacementCannotCoexist(_)
             ));
-            assert_eq!(error.required_by.as_deref(), Some("test.cert"));
+            assert_eq!(
+                error.required_by,
+                Some(
+                    crate::replacement::Dependent::new(ResolvedResourceId::new(parent_id.clone()))
+                        .into()
+                )
+            );
             return;
         }
     };

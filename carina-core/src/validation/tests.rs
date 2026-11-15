@@ -1,3 +1,4 @@
+use crate::test_utils::legacy_validate_resources as validate_resources;
 static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
     std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 
@@ -245,8 +246,13 @@ fn single_reference_integer_interpolation_checks_resolved_string_constraints() {
             resolved,
             RuntimeValue::Concrete(RuntimeConcreteValue::String(port.to_string().into()))
         );
-        let checked = typecheck::check_type_expr_value(&expected, &resolved, &config, expression)
-            .require_provider_schemas();
+        let checked = typecheck::check_type_expr_value(
+            &expected,
+            &resolved,
+            &config,
+            (expression).ordinary().unwrap(),
+        )
+        .require_provider_schemas();
         assert_eq!(checked.is_ok(), accepted, "{port}: {checked:?}");
     }
     assert!(
@@ -301,6 +307,74 @@ fn planning_resolution_requires_a_successful_judgement() {
         resolve_bare_binding_uses(invalid, &schemas, &provider, &signatures),
         Err(ResolveFileError::Expression(_))
     ));
+}
+
+#[test]
+fn resource_resolution_rejects_unknown_directive_keys_in_session() {
+    let schemas = SchemaRegistry::new();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+    let parsed = crate::parser::parse_and_resolve(
+        "mock.test.resource {\n  directives {\n    prevent_destory = true\n  }\n}\n",
+    )
+    .unwrap()
+    .resolve_root(&RootScope::new());
+    let (file, ()) = parsed.map_deferred_for_phase(|templates| {
+        assert!(templates.is_empty());
+        (Vec::new(), ())
+    });
+    let result = deferred_types::with_session_for_test(&config, |session| {
+        resolve_bare_binding_uses_in_session(file, &schemas, session, &signatures)
+    });
+    let error = result.expect_err("invalid directives cannot produce a ResolvedFile");
+    assert_eq!(
+        error.to_string(),
+        "test.crn:3:5: Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?"
+    );
+}
+
+#[test]
+fn module_directive_findings_reach_root_resource_resolution_once() {
+    for calls in [1, 2] {
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(
+            child.join("main.crn"),
+            "arguments { name: String }\nmock.test.resource {\n  name = name\n  directives {\n    prevent_destory = true\n  }\n}\n",
+        )
+        .unwrap();
+        let mut source = "let child = use { source = './child' }\n".to_string();
+        for index in 0..calls {
+            source.push_str(&format!("child {{ name = 'instance-{index}' }}\n"));
+        }
+        std::fs::write(directory.path().join("main.crn"), source).unwrap();
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let schemas = SchemaRegistry::new();
+        let loaded =
+            crate::config_loader::load_configuration_with_config(&path, &config, &schemas).unwrap();
+        deferred_types::with_session_for_test(&config, |session| {
+            let file = crate::module_resolver::resolve_modules_with_providerless_config(
+                loaded.parsed,
+                &path,
+                session,
+                &schemas,
+            )
+            .unwrap();
+            let findings = resource_directive_findings(&file.parser_binding_metadata);
+            assert_eq!(findings.len(), 1, "{calls} calls: {findings:?}");
+            assert_eq!(findings[0].location().file().path(), child.join("main.crn"));
+            let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+            let error = resolve_bare_binding_uses_in_session(file, &schemas, session, &signatures)
+                .expect_err("called-module findings must reach finish_binding_resolution");
+            assert!(
+                error
+                    .to_string()
+                    .contains("main.crn:5:5: Unknown directive 'prevent_destory'")
+            );
+        });
+    }
 }
 
 #[test]
@@ -605,7 +679,9 @@ fn rendered_typecheck_result(
         type_expr,
         value,
         typecheck::TypecheckProviderContext::for_parser(config),
-        &crate::parser::retained::value_dependent_judgement_for_test(),
+        crate::parser::retained::value_dependent_judgement_for_test()
+            .ordinary()
+            .unwrap(),
     )
     .require_provider_schemas()
     .err()
@@ -2092,7 +2168,9 @@ fn unloaded_schema_nominals_defer_values_and_resolve_when_catalog_loads() {
         &ty,
         &value,
         typecheck::TypecheckProviderContext::for_parser(&context),
-        &crate::parser::retained::value_dependent_judgement_for_test(),
+        crate::parser::retained::value_dependent_judgement_for_test()
+            .ordinary()
+            .unwrap(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -4581,7 +4659,9 @@ fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
             typecheck::TypecheckProviderContext::for_parser(&ProviderContext::new(
                 crate::EnvironmentSnapshot::empty(),
             )),
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         )
         .require_provider_schemas()
         .expect_err("the declared scalar kind must be checked before its validator");
@@ -6240,14 +6320,14 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         "module argument must validate"
     );
 
-    validate_attribute_params(
+    crate::test_utils::ordinary_sink_findings_for_test(validate_attribute_params(
         &[AttributeParameter::dummy(
             "mode".to_string(),
             Some(schema_type.clone()),
             Some(authored()),
         )],
         &config,
-    )
+    ))
     .expect("attribute parameter must validate");
 
     let exports = [RuntimeInferredExportParam {
@@ -6262,7 +6342,17 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         ),
     }];
     crate::validation::deferred_types::with_session_for_test(&config, |session| {
-        check_export_values_pre_apply(&exports, &ResolvedBindings::default(), session)
+        check_export_values_pre_apply(
+            &exports,
+            &ResolvedBindings::default(),
+            session,
+            crate::parser::retained::ProjectedPhase::plan_context::<
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+            >(&crate::resource::knowledge::KnowledgeContext::plan(
+                &ResolvedBindings::default(),
+            )),
+        )
     })
     .expect("export must validate");
 
@@ -7538,6 +7628,12 @@ fn resolve_and_validate_expanded_export_params(
             exports,
             &crate::binding_index::ResolvedBindings::default(),
             session,
+            crate::parser::retained::ProjectedPhase::plan_context::<
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+            >(&crate::resource::knowledge::KnowledgeContext::plan(
+                &crate::binding_index::ResolvedBindings::default(),
+            )),
         )
     })
     .map(|_| ())
@@ -7563,6 +7659,12 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
                 std::slice::from_ref(&builtin),
                 &ResolvedBindings::default(),
                 session,
+                crate::parser::retained::ProjectedPhase::plan_context::<
+                    crate::resource::NoPlaceholder,
+                    crate::resource::AbsoluteBindingAddress,
+                >(&crate::resource::knowledge::KnowledgeContext::plan(
+                    &ResolvedBindings::default(),
+                )),
             )
         },
     )
@@ -7594,6 +7696,12 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
                 std::slice::from_ref(&custom),
                 &ResolvedBindings::default(),
                 session,
+                crate::parser::retained::ProjectedPhase::plan_context::<
+                    crate::resource::NoPlaceholder,
+                    crate::resource::AbsoluteBindingAddress,
+                >(&crate::resource::knowledge::KnowledgeContext::plan(
+                    &ResolvedBindings::default(),
+                )),
             )
         },
     )
@@ -7616,6 +7724,12 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
                 std::slice::from_ref(&builtin_custom),
                 &ResolvedBindings::default(),
                 session,
+                crate::parser::retained::ProjectedPhase::plan_context::<
+                    crate::resource::NoPlaceholder,
+                    crate::resource::AbsoluteBindingAddress,
+                >(&crate::resource::knowledge::KnowledgeContext::plan(
+                    &ResolvedBindings::default(),
+                )),
             )
         },
     )
@@ -7886,7 +8000,14 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
         loaded_context_for_test(ProviderContext::new(crate::EnvironmentSnapshot::empty()));
     let pre_apply =
         crate::validation::deferred_types::with_session_for_test(&provider_context, |session| {
-            check_export_values_pre_apply(&exports, &bindings("alpha-id"), session)
+            check_export_values_pre_apply(
+                &exports,
+                &bindings("alpha-id"),
+                session,
+                crate::parser::retained::ProjectedPhase::plan_context(
+                    &crate::resource::knowledge::KnowledgeContext::plan(&bindings("alpha-id")),
+                ),
+            )
         })
         .expect("pre-apply export check");
     assert_eq!(
@@ -7898,7 +8019,14 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
 
     let post_apply =
         crate::validation::deferred_types::with_session_for_test(&provider_context, |session| {
-            resolve_export_values_post_apply(&pre_apply, &bindings("beta-id"), session)
+            resolve_export_values_post_apply(
+                &pre_apply,
+                &bindings("beta-id"),
+                session,
+                crate::parser::retained::ProjectedPhase::apply_context(
+                    &crate::resource::knowledge::KnowledgeContext::apply(&bindings("beta-id")),
+                ),
+            )
         })
         .expect("post-apply export resolution");
     assert_eq!(
@@ -10698,6 +10826,12 @@ fn bare_binding_precheck_preserves_rejection_after_constant_folding() {
             RefSink::TypeExpr(&expected),
             &context,
             &|path| ModuleCallDiagnosticPath::Authored(path.to_owned()),
+            &OrdinaryUseSource::Judged(
+                binding_use_expression(&record.authored, &context)
+                    .unwrap()
+                    .ordinary()
+                    .unwrap(),
+            ),
         )
         .expect("a folded value must not overturn rejected admission");
         assert!(
@@ -11349,9 +11483,14 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
             "{expression} must remain pending"
         );
         assert!(
-            typecheck::check_type_expr_value(&expected, &authored, &config, evidence)
-                .require_provider_schemas()
-                .is_ok(),
+            typecheck::check_type_expr_value(
+                &expected,
+                &authored,
+                &config,
+                (evidence).ordinary().unwrap()
+            )
+            .require_provider_schemas()
+            .is_ok(),
             "{expression}"
         );
         for (input, accepted) in [("abc", true), ("abcd", false), ("123", false)] {
@@ -11375,8 +11514,13 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
                 crate::resolver::resolve_ref_value_with_config(&authored, &bindings, session)
             })
             .unwrap();
-            let checked = typecheck::check_type_expr_value(&expected, &resolved, &config, evidence)
-                .require_provider_schemas();
+            let checked = typecheck::check_type_expr_value(
+                &expected,
+                &resolved,
+                &config,
+                (evidence).ordinary().unwrap(),
+            )
+            .require_provider_schemas();
             assert_eq!(
                 checked.is_ok(),
                 accepted,

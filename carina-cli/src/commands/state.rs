@@ -38,6 +38,7 @@ use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
 use carina_core::value::{RenderedKey, render_value};
+use carina_state::lock::format_lock_expiry;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedKey, LoadedOrphans,
     LocalStateFile, LockInfo, ResourceState, RowBasis, StateBackend, StateFile, StateUrl,
@@ -66,23 +67,23 @@ use carina_core::hint::ProjectCommand;
 
 /// Convert a lock acquisition error into an `AppError`.
 ///
-/// For `Locked` errors, includes a hint about `force-unlock`.
+/// For `Locked` errors, explains interrupted runs and includes a `force-unlock` hint.
 /// All other backend errors are passed through as `AppError::Backend`.
 pub fn map_lock_error(e: BackendError, project_dir: &Path) -> AppError {
-    match e {
+    match &e {
         BackendError::Locked {
-            who,
-            lock_id,
-            operation,
-        } => AppError::Config(format!(
-            "State is locked by {} (lock ID: {}, operation: {})\n\
-             If you believe this is stale, run: `{}`",
-            who,
-            lock_id,
-            operation,
-            ProjectCommand::new("force-unlock", project_dir).with_argument(lock_id.as_str())
-        )),
-        other => AppError::Backend(other),
+            lock_id, expires, ..
+        } => {
+            let message = e.to_string();
+            let expires = format_lock_expiry(expires);
+            AppError::Config(format!(
+                "{message}\n\
+                 A previous run may have been stopped before it released the lock (for example, a CI job cancelled during cleanup); if so, the lock expires on its own at {expires}.\n\
+                 If no other run is using this state, run: `{}`",
+                ProjectCommand::new("force-unlock", project_dir).with_argument(lock_id.as_str())
+            ))
+        }
+        _ => AppError::Backend(e),
     }
 }
 
@@ -2270,6 +2271,11 @@ pub(crate) async fn run_state_refresh_locked(
                         &parsed.export_params,
                         &export_bindings,
                         session,
+                        carina_core::parser::retained::ProjectedPhase::apply_context(
+                            &carina_core::resource::knowledge::KnowledgeContext::apply(
+                                &export_bindings,
+                            ),
+                        ),
                     )
                     .map_err(AppError::Validation)
                 },
@@ -4569,21 +4575,42 @@ mod tests {
         .expect("an unrelated module constraint cannot block an absent data-source phase");
     }
 
+    fn fixed_lock_info() -> LockInfo {
+        LockInfo::for_test_from_json(
+            r#"{
+                "id": "lock-123",
+                "who": "another process",
+                "operation": "apply",
+                "created": "2026-11-15T17:12:03.123456+09:00",
+                "expires": "2026-11-15T18:12:03.987654+09:00"
+            }"#,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn map_lock_error_includes_non_default_project_dir_in_force_unlock_hint() {
-        let error = map_lock_error(
-            BackendError::Locked {
-                who: "another process".to_string(),
-                lock_id: "lock-123".to_string(),
-                operation: "apply".to_string(),
-            },
-            Path::new("infra/foo"),
-        );
+    fn map_lock_error_explains_interrupted_run_with_utc_times() {
+        let lock = fixed_lock_info();
+        let error = map_lock_error(BackendError::locked(&lock), Path::new("."));
 
         assert_eq!(
             error.to_string(),
-            "State is locked by another process (lock ID: lock-123, operation: apply)\n\
-             If you believe this is stale, run: `carina force-unlock lock-123 infra/foo`"
+            "State is locked by another process (lock ID: lock-123, operation: apply, last updated 2026-11-15T08:12:03Z, expires 2026-11-15T09:12:04Z).\n\
+             A previous run may have been stopped before it released the lock (for example, a CI job cancelled during cleanup); if so, the lock expires on its own at 2026-11-15T09:12:04Z.\n\
+             If no other run is using this state, run: `carina force-unlock lock-123`"
+        );
+    }
+
+    #[test]
+    fn map_lock_error_includes_non_default_project_dir_in_force_unlock_hint() {
+        let lock = fixed_lock_info();
+        let error = map_lock_error(BackendError::locked(&lock), Path::new("infra/foo"));
+
+        assert_eq!(
+            error.to_string(),
+            "State is locked by another process (lock ID: lock-123, operation: apply, last updated 2026-11-15T08:12:03Z, expires 2026-11-15T09:12:04Z).\n\
+             A previous run may have been stopped before it released the lock (for example, a CI job cancelled during cleanup); if so, the lock expires on its own at 2026-11-15T09:12:04Z.\n\
+             If no other run is using this state, run: `carina force-unlock lock-123 infra/foo`"
         );
     }
 

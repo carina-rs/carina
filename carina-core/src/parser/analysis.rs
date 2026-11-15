@@ -97,6 +97,22 @@ impl DeclarationLocation {
         }
     }
 
+    pub(in crate::parser) fn conversion_expression(
+        expression: &pest::iterators::Pair<'_, Rule>,
+        target: &pest::iterators::Pair<'_, Rule>,
+        file: &PreprocessedFile,
+        source_file: &Path,
+    ) -> Self {
+        Self {
+            file: SourceFileId::new(source_file.to_path_buf()),
+            span: SourceSpan::from_preprocessed_range(
+                expression.as_span().start(),
+                target.as_span().end(),
+                file,
+            ),
+        }
+    }
+
     pub(in crate::parser) fn expression_node(
         pair: &pest::iterators::Pair<'_, Rule>,
         file: &PreprocessedFile,
@@ -117,6 +133,7 @@ impl DeclarationLocation {
             pair.as_rule(),
             Rule::interpolation
                 | Rule::let_binding
+                | Rule::local_binding
                 | Rule::resource_expr
                 | Rule::anonymous_resource
                 | Rule::read_resource_expr
@@ -1415,6 +1432,15 @@ where
         }
     }
 
+    pub(crate) fn module_source(&self) -> Option<&'a ModuleSource> {
+        match self.resource {
+            ResourceRef::Resource(resource) => resource.module_source.as_ref(),
+            ResourceRef::DataSource(source) => source.module_source.as_ref(),
+            ResourceRef::Deferred { resource, .. } => resource.as_resource().module_source.as_ref(),
+            ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
     pub(crate) fn authored_slots(&self) -> Option<&'a super::retained::AuthoredSlots<B>> {
         match self.resource {
             ResourceRef::Resource(resource) => Some(&resource.authored_slots),
@@ -1424,6 +1450,16 @@ where
         }
     }
 
+    pub(crate) fn precheck_identity(&self) -> Option<super::ResourcePrecheckIdentity> {
+        Some(super::ResourcePrecheckIdentity {
+            origin: self.authored_slots()?.input_origin()?,
+            instance: self
+                .module_source()
+                .and_then(crate::resource::ModuleSource::identity_scope)
+                .map(|scope| super::retained::ExpressionInstance::for_scope(&scope))
+                .unwrap_or(super::retained::ExpressionInstance::Root),
+        })
+    }
     pub fn authored_declaration_id(&self) -> Option<&'a super::retained::SlotDeclarationId> {
         self.authored_slots()?.declaration_id()
     }
@@ -1455,7 +1491,10 @@ where
             })
     }
 
-    pub(crate) fn projected_phase(&self, name: &str) -> Option<super::retained::ProjectedPhase> {
+    pub(crate) fn projected_phase(
+        &self,
+        name: &str,
+    ) -> Option<super::retained::ValidationProjection> {
         self.authored_slots()?.projected_phase(name)
     }
 
@@ -2818,6 +2857,14 @@ where
 
     pub fn for_iterables(&self) -> &[AnalysisForRef<'a, P, B>] {
         &self.iterables
+    }
+
+    pub(crate) fn admission_report(&self) -> &super::retained::ExpressionReport<B> {
+        self.file
+            .parser_binding_metadata
+            .syntax()
+            .expressions()
+            .admission_report()
     }
 
     pub fn resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {

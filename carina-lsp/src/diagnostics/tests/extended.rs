@@ -1786,7 +1786,7 @@ fn render_value_type_error(
                         type_expr,
                         value,
                         provider_context,
-                        expression,
+                        (expression).ordinary().unwrap(),
                     )
                     .require_provider_schemas()
                 }
@@ -1794,7 +1794,7 @@ fn render_value_type_error(
                     type_expr,
                     value,
                     &engine.provider_context,
-                    expression,
+                    (expression).ordinary().unwrap(),
                 )
                 .record_deferred(session),
             };
@@ -2624,7 +2624,7 @@ let orphan = mock.test.resource {
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            &indexmap::IndexMap::new(),
+            &Default::default(),
         );
     assert!(
         directory_parse.is_err(),
@@ -2642,6 +2642,45 @@ let orphan = mock.test.resource {
     assert!(
         unused.iter().all(|binding| binding != "orphan"),
         "diagnostics: {diagnostics:#?}",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_override_leaf_failure_preserves_directory_unused_binding_filter() {
+    let schemas = authored_binding_regression_schemas();
+    let engine = custom_engine(schemas);
+    let fixture = tempfile::tempdir().unwrap();
+    let source = "let bucket = mock.test.resource { name = 'bucket' }\n";
+    std::fs::write(
+        fixture.path().join("consumer.crn"),
+        "mock.test.resource { name = bucket.name }\n",
+    )
+    .unwrap();
+    let path = fixture.path().join("main.crn");
+    std::os::unix::fs::symlink("main.crn", &path).unwrap();
+    let base = carina_core::paths::ResolvedPath::new(fixture.path()).unwrap();
+    assert!(base.join("main.crn").is_err());
+    let directory_failure =
+        carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+            &base,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &Default::default(),
+        )
+        .err()
+        .expect("the looping document leaf must fail directory discovery");
+    assert!(directory_failure.io_error().is_some());
+
+    let document = create_document_at(source, path.clone());
+    assert_eq!(
+        unused_binding_names(&engine.analyze(&document, None)),
+        vec!["bucket".to_string()],
+        "the control must exercise the unused-binding check"
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    assert!(
+        unused_binding_names(&diagnostics).is_empty(),
+        "failed document resolution must retain directory context for sibling uses: {diagnostics:#?}"
     );
 }
 
@@ -3083,7 +3122,7 @@ mock.test.Thing {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("module source parses");
-    let core_error = carina_core::validation::validate_resources(
+    let core_error = carina_core::test_utils::legacy_validate_resources(
         &parsed,
         &schemas,
         &std::collections::HashSet::from(["mock".to_string()]),
@@ -8781,6 +8820,11 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                         &engine.schemas,
                         &[],
                     )
+                    .into_validation(
+                        &mut carina_core::test_utils::conversion_validation::<
+                            std::convert::Infallible,
+                        >(),
+                    )
                 },
             )
         }
@@ -8794,6 +8838,11 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                         session,
                         &engine.schemas,
                         &[],
+                    )
+                    .into_validation(
+                        &mut carina_core::test_utils::conversion_validation::<
+                            std::convert::Infallible,
+                        >(),
                     )
                 },
             )
@@ -10264,7 +10313,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
     use carina_core::binding_index::{BindingIndex, BindingValueSource, ResolvedBindings};
     use carina_core::resource::knowledge::KnowledgeContext;
     use carina_core::resource::{ConcreteValue, Value};
-    use carina_core::validation::admission::{Candidate, admit};
+    use carina_core::validation::admission::admit;
     let engine = named_annotation_engine(128);
     let parsed = carina_core::parser::parse_file(
         "provider aws {}\nlet source = aws.NameSource {}\nlet role = aws.iam.Role { role_name = source.name }\n",
@@ -10288,7 +10337,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                         .resolve_root_for_test(),
                 },
             );
-            let (candidate, boundary) = Candidate::validation_classified(
+            let (candidate, boundary) = carina_core::test_utils::classified_candidate_for_test(
                 reference
                     .knowledge(&KnowledgeContext::validation())
                     .unwrap()
@@ -10301,7 +10350,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                 .ready()
                 .expect_err("the reference must be pending");
             let literal = Value::Concrete(ConcreteValue::String("A".repeat(65).into()));
-            let (candidate, boundary) = Candidate::validation_classified(
+            let (candidate, boundary) = carina_core::test_utils::classified_candidate_for_test(
                 literal
                     .knowledge(&KnowledgeContext::validation())
                     .unwrap()
@@ -13662,15 +13711,13 @@ provider awscc {
     std::fs::write(root.path().join("providers.crn"), providers).unwrap();
 
     let engine = test_engine();
-    let doc = create_document(providers);
+    let base = carina_core::paths::ResolvedPath::new(root.path()).unwrap();
+    let overrides = carina_core::config_loader::SourceOverrides::single(
+        base.join("providers.crn").unwrap(),
+        providers.to_string(),
+    );
     let finalize_error = engine
-        .with_run_for_test(|run| {
-            run.finalize_provider_diagnostic(
-                &doc.for_diagnostics().expect("public fixture"),
-                Some("providers.crn"),
-                &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
-            )
-        })
+        .with_run_for_test(|run| run.finalize_provider_diagnostic(&base, &overrides))
         .expect("independent provider finalization must survive a module witness failure");
     assert!(finalize_error.to_string().contains("default_tags"));
 
@@ -13704,14 +13751,14 @@ let instance = module { count = 'wrong' }
     std::fs::write(root.path().join("providers.crn"), providers).unwrap();
 
     let engine = test_engine();
-    let doc = create_document(providers);
+    let base = carina_core::paths::ResolvedPath::new(root.path()).unwrap();
+    let overrides = carina_core::config_loader::SourceOverrides::single(
+        base.join("providers.crn").unwrap(),
+        providers.to_string(),
+    );
     assert!(
         engine
-            .with_run_for_test(|run| run.finalize_provider_diagnostic(
-                &doc.for_diagnostics().expect("public fixture"),
-                Some("providers.crn"),
-                &carina_core::paths::ResolvedPath::new(root.path()).unwrap()
-            ))
+            .with_run_for_test(|run| run.finalize_provider_diagnostic(&base, &overrides))
             .is_none(),
         "a provider value downstream of failed expansion cannot be finalized independently"
     );
@@ -15697,7 +15744,6 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position()
         .with_run_for_test(|run| {
             run.parse_and_resolve_merged_with_buffer(
                 &call_doc.for_diagnostics().expect("public fixture"),
-                Some("call.crn"),
                 &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
             )
         })
@@ -16651,7 +16697,7 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            &indexmap::IndexMap::new(),
+            &Default::default(),
         )
         .expect("directory fixture must parse");
     let (_, parsed_source) = merged_result
@@ -17961,7 +18007,7 @@ fn widening_member_obligation_parity(decoded: bool) {
         StringIdentityLayer, StringMemberConstraints, StructField, TypeIdentity,
         ValidatedConfigSchema,
     };
-    use carina_core::validation::admission::{Candidate, admit};
+    use carina_core::validation::admission::admit;
 
     let declaration = |ty: AttributeType| {
         if !decoded {
@@ -18043,7 +18089,7 @@ fn widening_member_obligation_parity(decoded: bool) {
             .unwrap()
     };
     let providers = std::collections::HashSet::from(["aws".into(), "awscc".into()]);
-    carina_core::validation::validate_resources(
+    carina_core::test_utils::legacy_validate_resources(
         &parse(source),
         &engine.schemas,
         &providers,
@@ -18094,7 +18140,7 @@ fn widening_member_obligation_parity(decoded: bool) {
         &engine.provider_context,
         |session| {
             let judge = |value: &Value| {
-                let (candidate, boundary) = Candidate::validation_classified(
+                let (candidate, boundary) = carina_core::test_utils::classified_candidate_for_test(
                     value
                         .knowledge(&KnowledgeContext::validation())
                         .unwrap()
@@ -18122,7 +18168,7 @@ fn widening_member_obligation_parity(decoded: bool) {
                 let literal_source =
                     source.replace("producer.arn", &serde_json::to_string(raw).unwrap());
                 let diagnostics = engine.analyze(&create_document(&literal_source), None);
-                let checked = carina_core::validation::validate_resources(
+                let checked = carina_core::test_utils::legacy_validate_resources(
                     &parse(&literal_source),
                     &engine.schemas,
                     &providers,

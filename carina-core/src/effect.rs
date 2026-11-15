@@ -438,7 +438,7 @@ pub struct DeferredReplacePayload<S = ModuleSource, V: PlanValueKind = NoPlaceho
     dependency_template: crate::resource::DeferredDependencyTemplate,
     request: crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>,
     preview: Option<crate::replacement::ReplacementOrder>,
-    required_children: Vec<(ResolvedResourceId, String)>,
+    required_children: Vec<(ResolvedResourceId, crate::replacement::Dependents)>,
 }
 impl<S: PartialEq, V: PlanValueKind> PartialEq for DeferredReplacePayload<S, V> {
     fn eq(&self, other: &Self) -> bool {
@@ -473,8 +473,19 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
     pub fn dependency_template(&self) -> &crate::resource::DeferredDependencyTemplate {
         &self.dependency_template
     }
-    pub(crate) fn required_children(&self) -> &[(ResolvedResourceId, String)] {
-        &self.required_children
+    pub(crate) fn all_required_by(&self) -> Option<crate::replacement::Dependents> {
+        crate::replacement::Dependents::try_from_iter(
+            self.request
+                .required_by()
+                .into_iter()
+                .chain(
+                    self.required_children
+                        .iter()
+                        .map(|(_, dependents)| dependents),
+                )
+                .flat_map(|dependents| dependents.iter().cloned()),
+        )
+        .ok()
     }
     pub(crate) fn unadmitted_request_mut(
         &mut self,
@@ -485,7 +496,7 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
     }
     pub(crate) fn require_create_first_with_lineage(
         &mut self,
-        requirements: &HashMap<ResolvedResourceId, String>,
+        requirements: &crate::replacement::CreateFirstRequirements,
         lineage: &crate::replacement::ReplacementLineage,
     ) {
         self.preview = None;
@@ -501,20 +512,30 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
                     .iter_mut()
                     .find(|(id, _)| crate::replacement::same_state_row(id, &target))
                 {
-                    *previous = dependent.to_owned();
+                    previous.extend(dependent.iter().cloned());
                 } else {
                     self.required_children.push((target, dependent.to_owned()));
                 }
             }
         }
     }
-    pub(crate) fn required_by_child(&self, id: &ResolvedResourceId) -> Option<&str> {
-        self.request.required_by().or_else(|| {
-            self.required_children
-                .iter()
-                .find(|(child, _)| crate::replacement::same_state_row(child, id))
-                .map(|(_, dependent)| dependent.as_str())
-        })
+    pub(crate) fn required_by_child(
+        &self,
+        id: &ResolvedResourceId,
+    ) -> Option<crate::replacement::Dependents> {
+        crate::replacement::Dependents::try_from_iter(
+            self.request
+                .required_by()
+                .into_iter()
+                .chain(
+                    self.required_children
+                        .iter()
+                        .filter(|(child, _)| crate::replacement::same_state_row(child, id))
+                        .map(|(_, dependents)| dependents),
+                )
+                .flat_map(|dependents| dependents.iter().cloned()),
+        )
+        .ok()
     }
 
     fn projected_target_id(&self, old: &ResolvedResourceId) -> ResolvedResourceId {
@@ -669,9 +690,9 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
         struct Wire<S, V: PlanValueKind> {
             deletes: NonEmptyDeletes,
             #[serde(default)]
-            required_by: Option<String>,
+            required_by: Option<crate::replacement::Dependents>,
             #[serde(default)]
-            required_children: Vec<(ResolvedResourceId, String)>,
+            required_children: Vec<(ResolvedResourceId, crate::replacement::Dependents)>,
             id: ResolvedResourceId,
             template: Box<DeferredForExpression<S, V, V::Template>>,
             dependency_template: crate::resource::DeferredDependencyTemplate,
@@ -3576,13 +3597,152 @@ mod tests {
     }
 
     #[test]
+    fn issue_4418_deferred_child_and_template_reasons_union_across_routes_and_updates() {
+        use crate::replacement::{Dependent, Dependents, ReplacementLineage};
+        let Effect::DeferredReplace(mut payload) = deferred_replace_effect() else {
+            unreachable!()
+        };
+        let child = payload.deletes[0].id.clone();
+        let dependent =
+            |identity| Dependent::new(ResolvedResourceId::with_identity("test.Consumer", identity));
+        let a = dependent("a");
+        let b = dependent("b");
+        let c = dependent("c");
+        for (id, reason) in [
+            (child.clone(), b.clone()),
+            (child.clone(), a.clone()),
+            (payload.id().clone(), c.clone()),
+        ] {
+            payload.require_create_first_with_lineage(
+                &HashMap::from([(id, std::collections::BTreeSet::from([reason]))]),
+                &ReplacementLineage::default(),
+            );
+        }
+        assert_eq!(payload.required_children.len(), 1);
+        let mut alias = child.as_inner().clone();
+        alias.provider_instance = Some("other-route".into());
+        payload
+            .required_children
+            .push((ResolvedResourceId::new(alias), a.clone().into()));
+        let expected = Dependents::try_from_iter([a, b, c]).unwrap();
+        assert_eq!(payload.required_by_child(&child), Some(expected.clone()));
+        assert_eq!(payload.all_required_by(), Some(expected));
+    }
+
+    #[test]
+    fn issue_4418_deferred_preflight_is_presence_only_and_wire_rejects_empty_sets() {
+        use crate::replacement::{Dependent, ReplacementLineage};
+        let Effect::DeferredReplace(mut base) = deferred_replace_effect() else {
+            unreachable!()
+        };
+        let mut authored: crate::resource::AuthoredDirectives<
+            crate::resource::AbsoluteBindingAddress,
+        > = Default::default();
+        authored.create_before_destroy = Some(crate::resource::DirectiveExpr::new(
+            crate::resource::Value::<crate::resource::ParserPlaceholder>::Deferred(
+                crate::resource::DeferredValue::Placeholder(
+                    crate::resource::ParserPlaceholder::Loop(crate::resource::LoopSlot::Value),
+                ),
+            ),
+            crate::resource::DiagnosticSourceSpan::authored("main.crn".into(), 1, 1, 1, 5),
+        ));
+        let per_element = authored
+            .into_loop_template(
+                base.template.template_resource_id(),
+                crate::resource::ProviderDirectiveSchema::Unavailable,
+                None,
+            )
+            .unwrap()
+            .create_before_destroy;
+        assert!(matches!(
+            per_element,
+            crate::resource::LoopDirective::PerElement(_)
+        ));
+        base.unadmitted_request_mut()
+            .template
+            .template_directives_mut()
+            .create_before_destroy = per_element;
+        let mut unrequired = base.clone();
+        assert!(
+            unrequired
+                .preflight(&crate::schema::SchemaRegistry::new())
+                .is_ok(),
+            "an unrequired per-element directive waits for materialization"
+        );
+        let mut one = base.clone();
+        let mut many = base;
+        let child = one.deletes[0].id.clone();
+        let a = Dependent::new(ResolvedResourceId::with_identity("test.Consumer", "a"));
+        let b = Dependent::new(ResolvedResourceId::with_identity("test.Consumer", "b"));
+        one.require_create_first_with_lineage(
+            &HashMap::from([(child.clone(), std::collections::BTreeSet::from([a.clone()]))]),
+            &ReplacementLineage::default(),
+        );
+        many.require_create_first_with_lineage(
+            &HashMap::from([(child, std::collections::BTreeSet::from([b, a]))]),
+            &ReplacementLineage::default(),
+        );
+        for coexisting in [true, false] {
+            let schema = PatternResourceSchema::new("route53.Record");
+            let mut registry = crate::schema::SchemaRegistry::new();
+            registry.insert(
+                "",
+                if coexisting {
+                    schema.with_coexisting_replacement()
+                } else {
+                    schema.with_conflicting_replacement()
+                }
+                .validate()
+                .unwrap(),
+            );
+            let one_result = one.preflight(&registry);
+            let many_result = many.preflight(&registry);
+            assert_eq!(one_result.is_ok(), coexisting);
+            assert_eq!(one_result, many_result);
+            assert_eq!(one.preview, many.preview);
+            assert_eq!(one.display_glyph(), many.display_glyph());
+        }
+        let mut one_wire = serde_json::to_value(&one).unwrap();
+        let mut many_wire = serde_json::to_value(&many).unwrap();
+        assert_ne!(one_wire, many_wire);
+        one_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("required_children");
+        many_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("required_children");
+        assert_eq!(one_wire, many_wire);
+        for field in ["required_by", "required_children"] {
+            let mut wire = serde_json::to_value(&many).unwrap();
+            if field == "required_by" {
+                wire["required_by"] = serde_json::json!([]);
+            } else {
+                wire["required_children"][0][1] = serde_json::json!([]);
+            }
+            let error = serde_json::from_value::<DeferredReplacePayload<SavedModuleSource>>(wire)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("empty ordered set"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn review3_4283_deferred_requirements_invalidate_preview() {
         let Effect::DeferredReplace(mut payload) = deferred_replace_effect() else {
             unreachable!();
         };
         assert_eq!(payload.display_glyph(), "-/+");
         payload.require_create_first_with_lineage(
-            &HashMap::from([(payload.deletes[0].id.clone(), "dependent".to_owned())]),
+            &HashMap::from([(
+                payload.deletes[0].id.clone(),
+                std::collections::BTreeSet::from([crate::replacement::Dependent::new(
+                    ResolvedResourceId::with_identity("test.Consumer", "dependent"),
+                )]),
+            )]),
             &crate::replacement::ReplacementLineage::default(),
         );
         assert_eq!(payload.display_glyph(), "~");

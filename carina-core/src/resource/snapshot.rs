@@ -160,7 +160,7 @@ where
 /// let loaded = carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &context);
 /// let report = loaded.judged();
 /// let expression = report.report().binding(&carina_core::resource::RelativeBindingName::new("value")).unwrap();
-/// check_type_expr_value_providerless(&TypeExpr::String,&snapshot,&context,expression);
+/// check_type_expr_value_providerless(&TypeExpr::String,&snapshot,&context,expression.ordinary().unwrap());
 /// ```
 ///
 /// ```compile_fail

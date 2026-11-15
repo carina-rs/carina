@@ -185,6 +185,15 @@ impl Diagnostic {
 
 /// Central conversion for residual application errors. Typed branches retain
 /// their own message authorities; the fallback uses the terminal's safe chain.
+fn presented_error_diagnostics(error: &crate::error::PresentedAppError) -> Vec<Diagnostic> {
+    match error {
+        crate::error::PresentedAppError::Ordinary(error) => error_diagnostics(error),
+        crate::error::PresentedAppError::Conversion(finding) => vec![Diagnostic {
+            code: Some(finding.code().to_owned()),
+            ..Diagnostic::located(finding.message().to_owned(), finding.location())
+        }],
+    }
+}
 fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
     let diagnostic = match error {
         AppError::ProviderConfigInvariant(error) => {
@@ -303,6 +312,9 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
         AppError::ExpressionType(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
+        AppError::ResourceDirective(finding) => {
+            Diagnostic::located(finding.detail().to_string(), finding.location())
+        }
         AppError::DependsOn(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
@@ -316,6 +328,7 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
         AppError::ResourceAdmission(finding) => Diagnostic {
+            code: finding.code().map(str::to_owned),
             location: finding.location().map(Location::authored),
             ..Diagnostic::new(finding.message(), "error")
         },
@@ -461,7 +474,9 @@ impl ValidateReport {
     #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn into_result(self, exit_code: i32) -> Result<(), AppError> {
         match self.outcome {
-            Outcome::Failure(errors) => Err(crate::commands::collapse_errors(errors.into_vec())),
+            Outcome::Failure(errors) => Err(crate::commands::collapse_presented_errors(
+                errors.into_vec(),
+            )),
             Outcome::Success(_) if exit_code == 0 => Ok(()),
             Outcome::Success(_) => {
                 Err(AppError::Config("Failed to write validation output".into()))
@@ -469,15 +484,15 @@ impl ValidateReport {
         }
     }
     fn failure(error: AppError) -> Self {
-        Self::finish(Vec::new(), vec![error], Vec::new(), Vec::new())
+        Self::finish(Vec::new(), vec![error.into()], Vec::new(), Vec::new())
     }
     fn finish(
         resources: Vec<String>,
-        errors: Vec<AppError>,
+        errors: Vec<crate::error::PresentedAppError>,
         warnings: Vec<Warning>,
         events: Vec<HumanEvent>,
     ) -> Self {
-        let outcome = match NonEmptyValidationErrors::try_from(errors) {
+        let outcome = match NonEmptyValidationErrors::from_presented(errors) {
             Ok(errors) => Outcome::Failure(errors),
             Err(_) => Outcome::Success(resources),
         };
@@ -496,7 +511,7 @@ impl ValidateReport {
                 errors
                     .as_slice()
                     .iter()
-                    .flat_map(error_diagnostics)
+                    .flat_map(presented_error_diagnostics)
                     .collect(),
             ),
         };
@@ -512,10 +527,12 @@ impl ValidateReport {
         match &self.outcome {
             Outcome::Success(_) => 0,
             Outcome::Failure(errors)
-                if errors
-                    .as_slice()
-                    .iter()
-                    .any(|error| matches!(error, AppError::Interrupted)) =>
+                if errors.as_slice().iter().any(|error| {
+                    matches!(
+                        error,
+                        crate::error::PresentedAppError::Ordinary(AppError::Interrupted)
+                    )
+                }) =>
             {
                 130
             }
@@ -579,10 +596,13 @@ impl ValidateReport {
             Outcome::Failure(errors) => {
                 let prefix = "Error:".red(color).bold(color).to_string();
                 for error in errors.as_slice() {
-                    if matches!(error, AppError::Interrupted) {
+                    if matches!(
+                        error,
+                        crate::error::PresentedAppError::Ordinary(AppError::Interrupted)
+                    ) {
                         continue;
                     }
-                    for line in format_error_with_source_chain(error).lines() {
+                    for line in error.diagnostic_text().lines() {
                         writeln!(stderr, "{prefix} {line}")?;
                     }
                 }
@@ -732,7 +752,12 @@ fn collect_configuration(
                 );
             }
             warnings.extend(parser_warnings.into_iter().map(Warning::Parse));
-            return ValidateReport::finish(Vec::new(), errors, warnings, events);
+            return ValidateReport::finish(
+                Vec::new(),
+                errors.into_iter().map(Into::into).collect(),
+                warnings,
+                events,
+            );
         }
     };
     let parsed = &loaded.parsed;
@@ -741,9 +766,9 @@ fn collect_configuration(
         Ok(findings) => errors.extend(
             findings
                 .into_iter()
-                .map(|finding| AppError::UpstreamSource(Box::new(finding))),
+                .map(|finding| AppError::UpstreamSource(Box::new(finding)).into()),
         ),
-        Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+        Err(error) => errors.push(AppError::AnalysisInvariant(error).into()),
     }
     let mut warnings = Vec::new();
     let mut events = Vec::new();
@@ -773,11 +798,11 @@ fn collect_configuration(
     let (providers, load_error) = match providers {
         Ok(providers) => providers,
         Err(error) => {
-            errors.push(error);
+            errors.push(error.into());
             return ValidateReport::finish(Vec::new(), errors, warnings, events);
         }
     };
-    errors.extend(load_error);
+    errors.extend(load_error.map(Into::into));
     let parts = providers
         .validation_report(parsed, project, false, &loaded.duplicate_declarations)
         .check_authored_inputs()
@@ -790,7 +815,7 @@ fn collect_configuration(
     let (result, schemas) = collect_parts(parts, &mut errors, &mut warnings, &mut events);
     match carina_core::validation::unused_binding_findings(&loaded.authored_bindings, schemas) {
         Ok(findings) => warnings.extend(findings.into_iter().map(Warning::Unused)),
-        Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+        Err(error) => errors.push(AppError::AnalysisInvariant(error).into()),
     }
     let parsed = match result {
         Some(parsed) => parsed,
@@ -822,7 +847,7 @@ fn add_warning(
 
 fn collect_parts<'a, T>(
     parts: ValidationReportParts<'a, T>,
-    errors: &mut Vec<AppError>,
+    errors: &mut Vec<crate::error::PresentedAppError>,
     warnings: &mut Vec<Warning>,
     events: &mut Vec<HumanEvent>,
 ) -> (Option<T>, &'a carina_core::schema::SchemaRegistry) {
@@ -898,7 +923,11 @@ pub(super) fn test_diagnostics(report: ValidateReport) -> super::ValidateDiagnos
     let json = serde_json::to_value(report.output()).expect("safe validation output");
     let errors = match report.outcome {
         Outcome::Success(_) => Vec::new(),
-        Outcome::Failure(errors) => errors.into_vec(),
+        Outcome::Failure(errors) => errors
+            .into_vec()
+            .into_iter()
+            .map(crate::error::PresentedAppError::into_rendered)
+            .collect(),
     };
     let mut diagnostics = super::ValidateDiagnostics {
         errors,

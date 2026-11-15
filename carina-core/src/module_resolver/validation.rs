@@ -101,7 +101,7 @@ pub(crate) struct ConstraintDeclaration<P: PlaceholderKind, B: BindingAddress> {
 }
 
 /// The sole declaration collector, shared by expansion and direct evaluator
-/// callers. Locations stay live-only; pending module records retain format 45.
+/// callers. Locations stay live-only and are omitted from saved-plan records.
 pub(crate) fn collect_constraint_declarations<P: PlaceholderKind, B: BindingAddress>(
     arguments: &[ArgumentParameter<crate::parser::TypeExpr, P, B>],
     requires: &[RequireBlock<P, B>],
