@@ -2052,9 +2052,10 @@ impl DiagnosticRun<'_> {
             let expanded_configuration = expanded_canonical
                 .as_ref()
                 .map(|graph| graph.judge(self.provider_context.catalog()));
-            let expanded_validation_tree = expanded_configuration
-                .as_ref()
-                .and_then(|configuration| configuration.analysis_tree().ok());
+            let expanded_validation_tree =
+                expanded_configuration.as_ref().and_then(|configuration| {
+                    analysis_result(doc, configuration.analysis_tree(), &mut diagnostics)
+                });
             let expanded_validation_inputs =
                 expanded_configuration.as_ref().and_then(|configuration| {
                     let tree = expanded_validation_tree.as_ref()?;
@@ -2346,7 +2347,11 @@ impl DiagnosticRun<'_> {
             if let Some(configuration) = &expanded_configuration {
                 conversion_validation.include(configuration.judged().report());
             }
-            let authored_tree = pre_expansion_configuration.analysis_tree().ok();
+            let authored_tree = analysis_result(
+                doc,
+                pre_expansion_configuration.analysis_tree(),
+                &mut diagnostics,
+            );
             if let (Some(inputs), Some(canonical_tree)) = (
                 expanded_validation_inputs.as_ref(),
                 expanded_validation_tree.as_ref(),

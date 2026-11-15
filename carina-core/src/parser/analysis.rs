@@ -715,6 +715,11 @@ pub enum AnalysisTreeErrorKind {
         kind: AnalysisItemKind,
         id: ResourceId,
     },
+    #[error("resource {id} has a schema but was not visited by prefix canonicalization")]
+    UncanonicalizedResource {
+        id: Box<ResourceId>,
+        declaration: Option<DeclarationLocation>,
+    },
     #[error("missing declaration provenance for wait {binding}")]
     MissingWaitProvenance { binding: String },
     #[error("missing {element} provenance in {}", declaration.file().path().display())]

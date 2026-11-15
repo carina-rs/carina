@@ -5382,6 +5382,7 @@ enum ResourceAdmissionDetail {
     Arithmetic(Box<crate::parser::Located<IntegerArithmeticTypeFinding>>),
     Iterable(Box<crate::parser::Located<DeferredForIterableTypeDiagnostic>>),
     UnavailableSchema(AnonymousResourceSchemaError),
+    AnalysisInvariant(Box<crate::parser::AnalysisTreeError>),
     Message,
 }
 
@@ -5396,6 +5397,29 @@ impl ResourceAdmissionFinding {
             .collect::<Vec<_>>()
             .join("\n");
         self
+    }
+    fn prefix(error: &crate::identifier::AttributePrefixError) -> Self {
+        let mut finding = Self::schema(
+            error.resource_id(),
+            None,
+            &TypeError::AttributePrefix(Box::new(error.clone())),
+        );
+        finding.human = error.to_string();
+        finding.location = error.location().cloned();
+        finding
+    }
+    fn analysis(error: crate::parser::AnalysisTreeError) -> Self {
+        let location = match error.kind() {
+            crate::parser::AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration, ..
+            } => declaration.clone(),
+            _ => None,
+        };
+        Self {
+            human: error.to_string(),
+            detail: ResourceAdmissionDetail::AnalysisInvariant(Box::new(error)),
+            location,
+        }
     }
     fn schema(
         resource: &crate::resource::ResourceId,
@@ -5419,6 +5443,7 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::AnalysisInvariant(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5428,6 +5453,7 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::AnalysisInvariant(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5437,6 +5463,7 @@ impl ResourceAdmissionFinding {
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::AnalysisInvariant(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5462,6 +5489,7 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::Iterable(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::UnavailableSchema(error) => error.to_string(),
+            ResourceAdmissionDetail::AnalysisInvariant(error) => error.to_string(),
             ResourceAdmissionDetail::Message => self.human.clone(),
         }
     }
@@ -5510,6 +5538,7 @@ impl std::fmt::Display for ResourceAdmissionFinding {
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::AnalysisInvariant(_)
             | ResourceAdmissionDetail::Message => formatter.write_str(&self.human),
         }
     }
@@ -5709,31 +5738,26 @@ pub fn validate_resources<
     let mut findings = canonical
         .prefix_errors()
         .iter()
-        .map(|error| {
-            let mut finding = ResourceAdmissionFinding::schema(
-                error.resource_id(),
-                None,
-                &TypeError::AttributePrefix(Box::new(error.clone())),
-            );
-            finding.human = error.to_string();
-            finding.location = error.location().cloned();
-            finding
-        })
+        .map(ResourceAdmissionFinding::prefix)
         .collect::<Vec<_>>();
-    findings.extend(run.walk_in(FindingSubject::Root, |coverage| {
-        resource_values_report(
-            canonical.schema_validation_resources(),
-            canonical.schemas(),
-            known_providers,
-            provider_context,
-            None,
-            diagnostics,
-            ValueAdmission {
-                report: &report,
-                coverage,
-            },
-        )
-    }));
+    match canonical.schema_validation_resources() {
+        Ok(inputs) => findings.extend(run.walk_in(FindingSubject::Root, |coverage| {
+            resource_values_report(
+                inputs,
+                canonical.schemas(),
+                known_providers,
+                provider_context,
+                None,
+                diagnostics,
+                ValueAdmission {
+                    report: &report,
+                    coverage,
+                },
+            )
+        })),
+        Err(error) => findings.push(ResourceAdmissionFinding::analysis(error)),
+    }
+
     run.ordinary(findings, FindingSubject::Root);
     let findings = run.complete().into_presented();
     if findings.is_empty() {
@@ -5906,7 +5930,7 @@ pub fn resource_reference_findings_in<
         &subject,
         presentation::AdmissionBoundary::Live,
     )?;
-    run.ordinary(report.references.0, subject);
+    run.ordinary(report.findings.0, subject);
     Ok(())
 }
 
@@ -5939,7 +5963,7 @@ pub fn resource_reference_preflight_findings_in<F: ValidationClientError>(
         &subject,
         presentation::AdmissionBoundary::Preflight,
     )?;
-    run.ordinary(report.references.0, subject);
+    run.ordinary(report.findings.0, subject);
     Ok(())
 }
 
@@ -5993,7 +6017,7 @@ pub fn resource_admission_findings_in<
         run,
         &subject,
     )?;
-    run.ordinary(report.references.0, subject);
+    run.ordinary(report.findings.0, subject);
     Ok(())
 }
 
@@ -6021,9 +6045,10 @@ fn complete_resource_admission_report<
         subject,
         presentation::AdmissionBoundary::Live,
     )?;
+    let inputs = judged.schema_validation_resources()?;
     let mut findings = run.walk_in(subject.clone(), |coverage| {
         resource_values_report(
-            judged.schema_validation_resources(),
+            inputs,
             judged.schemas(),
             known_providers,
             bindings.provider_context(),
@@ -6059,8 +6084,8 @@ fn complete_resource_admission_report<
             );
         }
     }
-    findings.extend(report.references.0);
-    report.references = ResourceAdmissionFindings(findings);
+    findings.extend(report.findings.0);
+    report.findings = ResourceAdmissionFindings(findings);
     Ok(report)
 }
 
@@ -6073,7 +6098,26 @@ fn publish_admission_diagnostics<T>(
 
 struct ResourceAdmissionReport {
     attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
-    references: ResourceAdmissionFindings,
+    // Required prefix rejections and reference findings have one consuming exit.
+    findings: ResourceAdmissionFindings,
+}
+impl ResourceAdmissionReport {
+    fn new<F>(
+        file: &crate::identifier::PrefixCanonicalized<'_, F>,
+        attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
+        mut references: ResourceAdmissionFindings,
+    ) -> Self {
+        let mut findings = file
+            .prefix_errors()
+            .iter()
+            .map(ResourceAdmissionFinding::prefix)
+            .collect::<Vec<_>>();
+        findings.append(&mut references.0);
+        Self {
+            attributes,
+            findings: ResourceAdmissionFindings(findings),
+        }
+    }
 }
 /// Recover the lexical type of a bare value that became an entire reference
 /// attribute during expansion. The runtime reference stays absolute; only its
@@ -6277,10 +6321,7 @@ fn resource_admission_report<
         ));
     }
 
-    Ok(ResourceAdmissionReport {
-        attributes,
-        references: all_errors,
-    })
+    Ok(ResourceAdmissionReport::new(judged, attributes, all_errors))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

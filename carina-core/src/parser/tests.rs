@@ -447,7 +447,8 @@ fn analysis_tree_rejects_unlocated_data_wait_and_nested_declarations() {
             }
             error @ (AnalysisTreeErrorKind::InsideSecret
             | AnalysisTreeErrorKind::MissingElementProvenance { .. }
-            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }) => {
+            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }
+            | AnalysisTreeErrorKind::UncanonicalizedResource { .. }) => {
                 panic!("unexpected element invariant: {error}")
             }
         }

@@ -13,6 +13,10 @@ use carina_lsp::factories::{build_factories, install_prober};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 async fn editor_diagnostics(root: &Path) -> Vec<Diagnostic> {
+    editor_diagnostics_for(root, None).await
+}
+
+async fn editor_diagnostics_for(root: &Path, member: Option<&str>) -> Vec<Diagnostic> {
     let home = tempfile::tempdir().unwrap();
     let dirs = UserDirs::under(home.path());
     let builder: FactoryBuilder =
@@ -26,7 +30,11 @@ async fn editor_diagnostics(root: &Path) -> Vec<Diagnostic> {
     );
     let states = states.into_inner();
     let mut findings = Vec::new();
-    for name in ["providers.crn", "backend.crn", "main.crn"] {
+    let files = member.map_or_else(
+        || vec!["providers.crn", "backend.crn", "main.crn"],
+        |file| vec![file],
+    );
+    for name in files {
         let path = root.join(name);
         let document = Document::new_with_path(
             std::fs::read_to_string(&path).unwrap(),
@@ -34,7 +42,7 @@ async fn editor_diagnostics(root: &Path) -> Vec<Diagnostic> {
             Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
         );
         let diagnostics = analyze_document(&states, &document, Some(&path));
-        if name != "main.crn" {
+        if member.is_none() && name != "main.crn" {
             assert!(diagnostics.is_empty(), "{name}: {diagnostics:#?}");
         }
         findings.extend(diagnostics);
@@ -191,9 +199,14 @@ impl PrefixDirectory {
     }
 
     fn cli(&self, native: bool) -> serde_json::Value {
+        self.cli_at(".", native)
+    }
+
+    fn cli_at(&self, relative: &str, native: bool) -> serde_json::Value {
+        let directory = self.0.path().join(relative);
         if native {
             return carina_cli::commands::validate::validate_diagnostics_with_factories(
-                &carina_core::paths::ResolvedPath::new(self.0.path()).unwrap(),
+                &carina_core::paths::ResolvedPath::new(&directory).unwrap(),
                 carina_cli::wiring::LoadedProviderFactory::for_test(vec![Box::new(PrefixFactory)]),
                 Default::default(),
             )
@@ -201,8 +214,8 @@ impl PrefixDirectory {
         }
         let output = Command::new(env!("CARGO_BIN_EXE_carina"))
             .args(["validate", "--json"])
-            .arg(self.0.path())
-            .current_dir(self.0.path())
+            .arg(&directory)
+            .current_dir(&directory)
             .env("NO_COLOR", "1")
             .output()
             .unwrap();
@@ -741,4 +754,103 @@ async fn prefix_companion_root_static_if_matches_validate() {
     let lsp = fixture.lsp(true).await;
     assert_eq!(cli["status"], "ok", "{cli:#}");
     assert!(error_messages(&lsp).is_empty(), "{lsp:#?}");
+}
+
+async fn assert_unselected_prefix_rejection(attributes: &str, expected: &str) {
+    let source = format!(
+        "let src = mock.test.resource {{ name = 'source' }}\nlet r = if enabled {{\n  mock.test.resource {{\n    {attributes}\n    tags = src.name\n  }}\n}}\n"
+    );
+    let fixture = PrefixDirectory::new(&[
+        (
+            "main.crn",
+            "let child = use { source = './child' }\nlet instance = child { enabled = false }\n",
+        ),
+        ("child/arguments.crn", "arguments { enabled: Bool }\n"),
+        ("child/main.crn", &source),
+    ]);
+    let cli = fixture.cli(false);
+    assert_eq!(
+        cli["status"], "error",
+        "a rejected, unselected template owner cannot make validation succeed: {cli:#}"
+    );
+    let errors = cli["errors"].as_array().unwrap();
+    let finding = errors
+        .iter()
+        .find(|finding| {
+            finding["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(expected))
+        })
+        .unwrap_or_else(|| panic!("prefix rejection must be retained: {cli:#}"));
+    assert!(
+        finding["location"]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("child/main.crn"),
+        "{finding:#}"
+    );
+    assert_eq!(
+        finding["location"]["range"]["start"]["line"], 3,
+        "{finding:#}"
+    );
+}
+
+#[tokio::test]
+async fn prefix_companion_unselected_module_if_empty_prefix_is_reported() {
+    assert_unselected_prefix_rejection("name_prefix = ''", "'name_prefix' cannot be empty").await;
+}
+
+#[tokio::test]
+async fn prefix_companion_unselected_module_if_conflict_is_reported() {
+    assert_unselected_prefix_rejection(
+        "name = 'fixed'\n    name_prefix = 'bad'",
+        "cannot specify both 'name_prefix' and 'name'",
+    )
+    .await;
+}
+
+async fn assert_standalone_module_prefix(attributes: &str, expected: Option<&str>) {
+    let source =
+        format!("let r = if enabled {{\n  mock.test.resource {{\n    {attributes}\n  }}\n}}\n");
+    let fixture = PrefixDirectory::new(&[
+        ("main.crn", ""),
+        ("child/arguments.crn", "arguments { enabled: Bool }\n"),
+        ("child/main.crn", &source),
+    ]);
+    let cli = fixture.cli_at("child", false);
+    let lsp = editor_diagnostics_for(fixture.0.path(), Some("child/main.crn")).await;
+    match expected {
+        None => {
+            assert_eq!(cli["status"], "ok", "{cli:#}");
+            assert!(error_messages(&lsp).is_empty(), "{lsp:#?}");
+        }
+        Some(expected) => {
+            assert_eq!(cli["status"], "error", "{cli:#}");
+            let errors = cli["errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 1, "{cli:#}");
+            let message = errors[0]["message"].as_str().unwrap();
+            assert!(message.contains(expected), "{cli:#}");
+            assert_eq!(error_messages(&lsp), [message], "{lsp:#?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn prefix_companion_standalone_module_if_valid_matches_lsp() {
+    assert_standalone_module_prefix("name_prefix = 'ok'", None).await;
+}
+
+#[tokio::test]
+async fn prefix_companion_standalone_module_if_empty_matches_lsp() {
+    assert_standalone_module_prefix("name_prefix = ''", Some("'name_prefix' cannot be empty"))
+        .await;
+}
+
+#[tokio::test]
+async fn prefix_companion_standalone_module_if_conflict_matches_lsp() {
+    assert_standalone_module_prefix(
+        "name = 'fixed'\n    name_prefix = 'bad'",
+        Some("cannot specify both 'name_prefix' and 'name'"),
+    )
+    .await;
 }

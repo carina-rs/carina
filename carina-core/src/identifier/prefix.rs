@@ -174,6 +174,24 @@ where
         .collect()
 }
 
+fn membership_status(
+    members: &std::collections::HashMap<*const ResourceId, bool>,
+    id: &ResourceId,
+    schema: Option<OwnerBoundResourceSchema<'_>>,
+    declaration: Option<&crate::parser::DeclarationLocation>,
+) -> Result<Option<bool>, AnalysisTreeError> {
+    let status = members.get(&std::ptr::from_ref(id)).copied();
+    if status.is_none() && schema.is_some() {
+        return Err(AnalysisTreeError::new(
+            crate::parser::AnalysisTreeErrorKind::UncanonicalizedResource {
+                id: Box::new(id.clone()),
+                declaration: declaration.cloned(),
+            },
+        ));
+    }
+    Ok(status)
+}
+
 impl<F: std::fmt::Debug> std::fmt::Debug for PrefixCanonicalized<'_, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrefixCanonicalized")
@@ -333,7 +351,7 @@ fn schema_validation_resources<
     file: &'f File<X, P, T, D, B>,
     schemas: &'f SchemaRegistry,
     visits: &[OwnerVisit],
-) -> CanonicalSchemaInputs<'f, P, T, B>
+) -> Result<CanonicalSchemaInputs<'f, P, T, B>, AnalysisTreeError>
 where
     D: DeferredForPhaseTraversal<P, T, B>,
 {
@@ -347,35 +365,61 @@ where
         }
     }
     let members = visited_members(file, visits);
-    let resources = file
-        .iter_all_resources()
-        .filter(|resource| members.get(&std::ptr::from_ref(resource.id())) == Some(&false))
-        .filter_map(|resource| match resource {
-            ResourceRef::LiveComposition(_) => None,
-            ResourceRef::Resource(resource) => Some(CanonicalSchemaResource::Resource(
-                resource,
-                schemas
-                    .get_for(resource)
-                    .map(|schema| (schema, values(schema, &resource.attributes))),
-            )),
-            ResourceRef::DataSource(resource) => Some(CanonicalSchemaResource::DataSource(
-                resource,
-                schemas
-                    .get_for_data_source(resource)
-                    .map(|schema| (schema, values(schema, &resource.attributes))),
-            )),
-            ResourceRef::Deferred { resource, .. } => Some(CanonicalSchemaResource::Deferred(
-                resource.as_resource(),
-                schemas
-                    .get_for(resource.as_resource())
-                    .map(|schema| (schema, values(schema, resource.attributes()))),
-            )),
-        })
-        .collect();
-    CanonicalSchemaInputs {
+    let mut resources = Vec::new();
+    for resource in file.iter_all_resources() {
+        match resource {
+            ResourceRef::LiveComposition(_) => {}
+            ResourceRef::Resource(resource) => {
+                let schema = schemas.get_for(resource);
+                if membership_status(
+                    &members,
+                    &resource.id,
+                    schema,
+                    resource.declaration.location(),
+                )? == Some(false)
+                {
+                    resources.push(CanonicalSchemaResource::Resource(
+                        resource,
+                        schema.map(|schema| (schema, values(schema, &resource.attributes))),
+                    ));
+                }
+            }
+            ResourceRef::DataSource(resource) => {
+                let schema = schemas.get_for_data_source(resource);
+                if membership_status(
+                    &members,
+                    &resource.id,
+                    schema,
+                    resource.declaration.location(),
+                )? == Some(false)
+                {
+                    resources.push(CanonicalSchemaResource::DataSource(
+                        resource,
+                        schema.map(|schema| (schema, values(schema, &resource.attributes))),
+                    ));
+                }
+            }
+            ResourceRef::Deferred { resource, .. } => {
+                let schema = schemas.get_for(resource.as_resource());
+                if membership_status(
+                    &members,
+                    resource.id(),
+                    schema,
+                    resource.as_resource().declaration.location(),
+                )? == Some(false)
+                {
+                    resources.push(CanonicalSchemaResource::Deferred(
+                        resource.as_resource(),
+                        schema.map(|schema| (schema, values(schema, resource.attributes()))),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(CanonicalSchemaInputs {
         is_module_definition: crate::validation::is_module_definition(file),
         resources,
-    }
+    })
 }
 
 impl<X, P: PlaceholderKind, T: PlaceholderKind, D, B: BindingAddress>
@@ -383,7 +427,9 @@ impl<X, P: PlaceholderKind, T: PlaceholderKind, D, B: BindingAddress>
 where
     D: DeferredForPhaseTraversal<P, T, B>,
 {
-    pub(crate) fn schema_validation_resources(&self) -> CanonicalSchemaInputs<'_, P, T, B> {
+    pub(crate) fn schema_validation_resources(
+        &self,
+    ) -> Result<CanonicalSchemaInputs<'_, P, T, B>, AnalysisTreeError> {
         schema_validation_resources(&self.file, self.schemas, &self.visits)
     }
     pub(crate) fn validation_report(
@@ -573,7 +619,8 @@ where
 {
     pub(crate) fn schema_validation_resources(
         &self,
-    ) -> CanonicalSchemaInputs<'_, ParserPlaceholder, ParserPlaceholder, B> {
+    ) -> Result<CanonicalSchemaInputs<'_, ParserPlaceholder, ParserPlaceholder, B>, AnalysisTreeError>
+    {
         schema_validation_resources(self.file.file(), self.schemas, &self.visits)
     }
     pub(crate) fn admission_report(&self) -> &crate::parser::retained::ExpressionReport<B> {
@@ -662,10 +709,10 @@ where
             .into_resources()
             .into_iter()
             .map(|resource| {
-                match (
-                    members.get(&std::ptr::from_ref(resource.id())),
-                    resource.schema(self.schemas),
-                ) {
+                let schema = resource.schema(self.schemas);
+                let status =
+                    membership_status(&members, resource.id(), schema, Some(resource.location()))?;
+                Ok(match (status, schema) {
                     (Some(false), Some(schema)) => CanonicalItem::Bound(CanonicalResource {
                         resource,
                         file,
@@ -674,9 +721,9 @@ where
                     }),
                     (Some(true), Some(_schema)) => CanonicalItem::Rejected(resource),
                     (None, _) | (_, None) => CanonicalItem::Unavailable(resource),
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnalysisTreeError>>()?;
         Ok(CanonicalAnalysisTree {
             resources,
             top_level_resource_count,
@@ -969,16 +1016,87 @@ mod tests {
         let mut canonical = canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview);
         canonical.file.resources.push(unvisited);
         let judged = canonical.judge(&context);
-        let tree = judged.analysis_tree().unwrap();
-        assert_eq!(tree.project_resource_refs().count(), 2);
+        let error = match judged.analysis_tree() {
+            Err(error) => error,
+            Ok(_) => panic!("unvisited owner was silently accepted"),
+        };
+        assert!(matches!(
+            error.kind(),
+            crate::parser::AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: Some(_),
+                ..
+            }
+        ));
+        let error = match judged.schema_validation_resources() {
+            Err(error) => error,
+            Ok(_) => panic!("unvisited owner received canonical values"),
+        };
+        assert!(matches!(
+            error.kind(),
+            crate::parser::AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prefix_preflight_rejections_are_typed_and_located() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("arguments.crn"),
+            "arguments { enabled: Bool }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("main.crn"),
+            "let r = if enabled {\n  mock.Sink { name_prefix = '' }\n}\n",
+        )
+        .unwrap();
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let loaded = crate::module_resolver::load_module_with_diagnostics_and_schemas(
+            &path, &context, &schemas,
+        )
+        .unwrap();
+        let template = loaded.preflight().judge(&schemas, &context);
         assert_eq!(
-            (
-                tree.resources().count(),
-                judged.schema_validation_resources().resources.len()
-            ),
-            (1, 1),
-            "neither the tree nor schema validation can authorize an unvisited owner (even with the same pending ResourceId)",
+            template
+                .judged()
+                .analysis_tree()
+                .unwrap()
+                .resources()
+                .count(),
+            0
         );
+        let bindings = template.judged().parsed().binding_index(&context);
+        let mut run = crate::validation::ConversionValidation::<std::convert::Infallible>::new(
+            template.judged().report(),
+        );
+        crate::validation::resource_reference_preflight_findings_in(
+            &mut run,
+            &template,
+            &bindings,
+            &mut Vec::new(),
+            crate::validation::FindingSubject::Root,
+        )
+        .unwrap();
+        let findings = run.complete().into_presented();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let finding = match findings.iter().next().unwrap() {
+            crate::validation::PresentedFinding::Ordinary(
+                crate::validation::OrdinaryFinding::Resource(finding),
+            ) => finding,
+            other => panic!("a typed resource rejection is required: {other:?}"),
+        };
+        assert!(matches!(
+            finding.type_error(),
+            Some(crate::schema::TypeError::AttributePrefix(_))
+        ));
+        let location = finding.location().expect("authored rejection location");
+        assert_eq!(location.file().path(), directory.path().join("main.crn"));
+        assert_eq!(location.span().start_line(), 2);
     }
 
     #[test]
