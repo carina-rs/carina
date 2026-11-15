@@ -157,7 +157,7 @@ async fn dispatch_unique_string_list_data_source_ordinary_duplicate() {
 }
 
 #[test]
-fn dispatch_normalization_roundtrip_keeps_provider_debug_mask() {
+fn prepared_data_source_attributes_identity_batch_keeps_debug_mask() {
     let parser = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed =
         crate::parser::parse("let value = secret('normalization-private-token')", &parser).unwrap();
@@ -189,6 +189,8 @@ fn dispatch_normalization_roundtrip_keeps_provider_debug_mask() {
             session,
         );
         let ready = prepare_provider_ready_data_source(source, &context).unwrap();
+        // Copy prepared data-source attributes into a resource and return an
+        // unchanged NormalizationBatch; this does not call ConfiguredNormalizer.
         let mut resource =
             Resource::with_provider("test", "Sink", "item", None).into_provider_resource();
         resource.attributes = ready.attributes.clone();

@@ -89,6 +89,8 @@ fn received_secret_errors_are_masked_in_cli_create_and_data_source_read() {
 fn observed_data_source_events_mask_changed_values_at_secret_paths() {
     const NAME: &str =
         "flag_observability::observed_data_source_events_mask_changed_values_at_secret_paths";
+    // The read fixture receives `strings` as ConcreteValue::StringList, so
+    // protected_paths uses its StringList arm for this union-typed input.
     if let Some(stderr) = in_child(NAME, || plan_failure_using(Failure::DataSourceEvents, true)) {
         assert!(!stderr.contains(SECRET), "{stderr}");
         assert!(

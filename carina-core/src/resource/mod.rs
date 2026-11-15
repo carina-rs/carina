@@ -2968,16 +2968,15 @@ pub enum Value<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBinding
 pub type AuthoredValue = Value<ParserPlaceholder, RelativeBindingName>;
 pub type ExpandedValue = Value<NoPlaceholder, AbsoluteBindingAddress>;
 
-/// A runtime string together with provenance used exclusively to make
-/// diagnostic rendering safe.
+/// A runtime string with a display flag set by the secret mechanism's payload
+/// marking and the three diagnostic placeholder constructors in `references.rs`.
+/// Derived strings inherit the flag from their string inputs.
 ///
-/// The provenance bit is deliberately absent from equality, hashing, and the
-/// serde representation. A string marked by the secret mechanism retains its
-/// runtime behavior in evaluation, plans, state, diffs, and provider payloads,
-/// while diagnostic code cannot accidentally format its plaintext. There is
-/// deliberately no `Display` implementation; `Debug` is redacted, and code
-/// that genuinely needs the bytes at an execution or serialization boundary
-/// must opt in through [`Self::expose_plaintext`].
+/// The flag is read by the list-uniqueness check at dispatch admission, the
+/// provider text inventory in `provider_text.rs`, provider event path collection
+/// in `provider_text/events.rs`, and this type's `Debug` implementation. It is
+/// absent from equality, hashing, and the serde representation. This type has
+/// no `Display` implementation.
 #[derive(Clone)]
 pub struct ValueString {
     plaintext: String,
@@ -2985,7 +2984,7 @@ pub struct ValueString {
 }
 
 impl ValueString {
-    /// Construct an ordinary authored/runtime string.
+    /// Construct a string with the display flag unset.
     pub fn plain(plaintext: impl Into<String>) -> Self {
         Self {
             plaintext: plaintext.into(),
@@ -2993,9 +2992,8 @@ impl ValueString {
         }
     }
 
-    /// Construct a string whose contents must never be included in a
-    /// diagnostic. Kept crate-private for the secret mechanism and already-masked
-    /// diagnostic placeholders.
+    /// Construct a flagged string, used by the three diagnostic placeholder
+    /// constructors in `references.rs`.
     pub(crate) fn diagnostic_sensitive(plaintext: impl Into<String>) -> Self {
         Self {
             plaintext: plaintext.into(),
@@ -3003,23 +3001,22 @@ impl ValueString {
         }
     }
 
-    /// Expose runtime bytes for evaluation, serialization, provider transport,
-    /// or a diagnostic builder whose caller owns secret-error replacement.
+    /// Return the string's plaintext.
     pub fn expose_plaintext(&self) -> &str {
         &self.plaintext
     }
 
-    /// Consume this value at an evaluation/serialization boundary.
+    /// Consume this value and return its plaintext.
     pub fn into_plaintext(self) -> String {
         self.plaintext
     }
 
+    /// Return whether the display flag is set.
     pub fn is_diagnostic_sensitive(&self) -> bool {
         self.diagnostic_sensitive
     }
 
-    /// Return a diagnostic-safe authored literal, or `None` for a string marked
-    /// by the secret mechanism.
+    /// Return the plaintext when the display flag is unset, or `None` when set.
     pub fn diagnostic_literal(&self) -> Option<&str> {
         (!self.diagnostic_sensitive).then_some(self.plaintext.as_str())
     }
