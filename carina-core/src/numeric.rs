@@ -39,6 +39,16 @@ pub(crate) fn compare_int_float(i: i64, f: FiniteF64) -> Ordering {
     }
 }
 
+/// Prove integer and float intervals disjoint without rounding their endpoints.
+pub(crate) fn int_float_ranges_disjoint(
+    (integer_min, integer_max): (Option<i64>, Option<i64>),
+    (float_min, float_max): (Option<FiniteF64>, Option<FiniteF64>),
+) -> bool {
+    float_min.is_some_and(|min| compare_int_float(integer_max.unwrap_or(i64::MAX), min).is_lt())
+        || float_max
+            .is_some_and(|max| compare_int_float(integer_min.unwrap_or(i64::MIN), max).is_gt())
+}
+
 /// Convert only integers that have an exact float representation.
 pub(crate) fn int_to_exact_f64(i: i64) -> Option<FiniteF64> {
     // The exact comparison below permits returning this candidate only if no rounding occurred.

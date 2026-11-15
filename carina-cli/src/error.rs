@@ -1195,6 +1195,8 @@ fn root_require_rejection(
         | InferenceError::SecretAssignmentMismatch { types: _ }
         | InferenceError::MissingEvidence(_)
         | InferenceError::UnknownType { reason: _ }
+        | InferenceError::SchemaResolution { error: _ }
+        | InferenceError::TypeResolution { error: _ }
         | InferenceError::HeterogeneousCollection { types: _ }
         | InferenceError::IncompatibleCoalesceTypes { types: _ }
         | InferenceError::InvalidIntegerArithmeticOperand {
@@ -1716,6 +1718,10 @@ pub enum AppError {
         Box<carina_core::parser::Located<carina_core::validation::depends_on::DependsOnDiagnostic>>,
     ),
     #[error("{0}")]
+    ResourceDirective(
+        Box<carina_core::parser::Located<carina_core::validation::ResourceDirectiveFinding>>,
+    ),
+    #[error("{0}")]
     Wait(Box<carina_core::parser::Located<carina_core::validation::wait::WaitDiagnostic>>),
     #[error("{0}")]
     DeferredPopulate(
@@ -1893,6 +1899,14 @@ impl From<crate::commands::init::InitError> for AppError {
 impl From<carina_core::validation::ExportBoundaryError> for AppError {
     fn from(error: carina_core::validation::ExportBoundaryError) -> Self {
         Self::ExportBoundary(Box::new(error))
+    }
+}
+
+impl carina_core::validation::ValidationClientFailure for AppError {}
+
+impl carina_core::validation::ValidationClientError for AppError {
+    fn kind(&self) -> carina_core::validation::ClientFindingKind {
+        carina_core::validation::ClientFindingKind::Error
     }
 }
 
@@ -2275,6 +2289,7 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
         | AppError::ModuleCall(_)
         | AppError::TypeResolution(_)
         | AppError::AnalysisInvariant(_)
+        | AppError::ResourceDirective(_)
         | AppError::DependsOn(_)
         | AppError::Wait(_)
         | AppError::DeferredPopulate(_)
@@ -3336,6 +3351,57 @@ mod tests {
             out.contains("Expected:    111111111111, 222222222222 (allowed_account_ids)"),
             "expected list missing: {out}"
         );
+    }
+}
+
+/// Final presentation only. This type deliberately does not implement
+/// ValidationClientFailure: a conversion cannot stop authored admission.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::error::{AppError, PresentedAppError};
+/// fn stop(run: &mut carina_core::validation::ConversionValidation<AppError>, finding: PresentedAppError) {
+///     run.fail(finding);
+/// }
+/// ```
+#[derive(Debug, thiserror::Error)]
+pub enum PresentedAppError {
+    #[error(transparent)]
+    Ordinary(AppError),
+    #[error("{0}")]
+    Conversion(Box<carina_core::validation::PresentedConversion>),
+}
+impl From<AppError> for PresentedAppError {
+    fn from(error: AppError) -> Self {
+        Self::Ordinary(error)
+    }
+}
+impl PresentedAppError {
+    pub(crate) fn diagnostic_text(&self) -> String {
+        match self {
+            Self::Ordinary(error) => format_error_with_source_chain(error),
+            Self::Conversion(error) => error.to_string(),
+        }
+    }
+    pub(crate) fn into_rendered(self) -> AppError {
+        match self {
+            Self::Ordinary(error) => error,
+            Self::Conversion(error) => AppError::Validation(error.to_string()),
+        }
+    }
+    pub(crate) fn from_presented<E: carina_core::validation::ValidationClientError>(
+        finding: carina_core::validation::PresentedFinding<E>,
+        client: impl FnOnce(E) -> AppError,
+    ) -> Self {
+        use carina_core::validation::{OrdinaryFinding, PresentedFinding};
+        match finding {
+            PresentedFinding::Ordinary(OrdinaryFinding::Resource(error)) => {
+                Self::Ordinary(AppError::ResourceAdmission(error))
+            }
+            PresentedFinding::Ordinary(OrdinaryFinding::Client(error)) => {
+                Self::Ordinary(client(*error))
+            }
+            PresentedFinding::Conversion(error) => Self::Conversion(Box::new(error)),
+        }
     }
 }
 

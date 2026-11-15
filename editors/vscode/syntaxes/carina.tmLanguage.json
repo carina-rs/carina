@@ -63,7 +63,7 @@
         },
         {
           "name": "keyword.control.carina",
-          "match": "\\b(for|in|if|else)\\b"
+          "match": "\\b(for|in|if|else|as)\\b"
         },
         {
           "name": "keyword.other.carina",

@@ -201,7 +201,9 @@ impl Formatter {
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {
-                    if matches!(token.text.as_str(), ">>" | "+" | "-" | "*" | "/" | "%") {
+                    if matches!(token.text.as_str(), ">>" | "+" | "-" | "*" | "/" | "%")
+                        || token.rule == Some(super::super::parser::Rule::as_keyword)
+                    {
                         self.write_binary_operator(&token.text);
                     } else {
                         self.write_token(&token.text);

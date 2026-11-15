@@ -16,14 +16,85 @@ use super::error::ModuleError;
 pub struct LoadedModule {
     directory: ResolvedPath,
     verdict: crate::config_loader::CompleteDirectoryVerdict,
-    pub parsed: ParsedFile,
+    parsed: ParsedFile,
     pub duplicate_declarations: Vec<crate::config_loader::DuplicateDeclaration>,
 }
 
+/// A preflight copy can originate only from a loader-produced module.
+/// Its mutable operations resolve declarations without replacing its syntax.
+pub struct ModuleTemplate {
+    parsed: ParsedFile,
+}
+
+/// Judgement evidence for the separate module-template preflight boundary.
+/// Root configuration judgements cannot enter this boundary.
+pub struct ModuleTemplatePreflight<'a> {
+    configuration: crate::config_loader::BufferConfiguration<'a>,
+}
+
 impl LoadedModule {
-    /// Directory selected by the module loader, pinned before parsing its siblings.
+    /// Directory pinned by the loader before parsing its siblings.
     pub fn directory(&self) -> &ResolvedPath {
         &self.directory
+    }
+
+    pub fn parsed(&self) -> &ParsedFile {
+        &self.parsed
+    }
+
+    pub(super) fn into_parsed(self) -> ParsedFile {
+        self.parsed
+    }
+
+    pub fn preflight(&self) -> ModuleTemplate {
+        ModuleTemplate {
+            parsed: self.parsed.clone(),
+        }
+    }
+}
+
+impl ModuleTemplate {
+    pub fn parsed(&self) -> &ParsedFile {
+        &self.parsed
+    }
+
+    pub fn resolve_type_exprs(
+        &mut self,
+        context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Result<
+        Vec<crate::parser::Located<crate::validation::TypeResolutionDiagnostic>>,
+        crate::parser::AnalysisTreeError,
+    > {
+        crate::validation::resolve_file_type_exprs(&mut self.parsed, context)
+    }
+
+    pub fn judge<'a>(
+        &self,
+        schemas: &'a crate::schema::SchemaRegistry,
+        context: &ProviderContext,
+    ) -> ModuleTemplatePreflight<'a> {
+        ModuleTemplatePreflight {
+            configuration: crate::config_loader::load_buffer_configuration(
+                &self.parsed,
+                schemas,
+                context,
+            ),
+        }
+    }
+}
+
+impl ModuleTemplatePreflight<'_> {
+    pub fn judged(
+        &self,
+    ) -> &crate::parser::retained::JudgedFile<
+        '_,
+        crate::parser::ParsedExportParam,
+        crate::parser::ParsedDeferredForPhase<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
+    > {
+        self.configuration.judged()
     }
 }
 

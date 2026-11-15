@@ -853,6 +853,14 @@ where
                                 &[],
                                 &carina_core::binding_index::ResolvedBindings::default(),
                                 session,
+                                carina_core::parser::retained::ProjectedPhase::plan_context::<
+                                    carina_core::resource::NoPlaceholder,
+                                    carina_core::resource::AbsoluteBindingAddress,
+                                >(
+                                    &carina_core::resource::knowledge::KnowledgeContext::plan(
+                                        &carina_core::binding_index::ResolvedBindings::default(),
+                                    ),
+                                ),
                             )
                         },
                     )
@@ -1674,6 +1682,35 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn r11_fixture_plan_skip_validation_keeps_judge_conversion_errors() {
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let directory = tempfile::tempdir().unwrap();
+        for suffix in ["", " as aws.route53.RecordType"] {
+            fs::write(directory.path().join("main.crn"), format!("provider aws {{ region = 'us-east-1' }}\nlet record = aws.route53.RecordSet {{ hosted_zone_id = 'zone' name = 'example.test' type = aws.route53.RecordType.cname{suffix} }}\n")).unwrap();
+            if suffix.is_empty() {
+                let fixture = build_plan_from_fixture_path(&runtime, directory.path()).unwrap();
+                assert_eq!(fixture.desired_resources.len(), 1);
+            } else {
+                let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    build_plan_from_fixture_path(&runtime, directory.path())
+                }));
+                let panic = rejected
+                    .err()
+                    .expect("skipping resource admission cannot skip a Judge error");
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap();
+                assert!(
+                    message.contains("conversion target must be a loaded named scalar type"),
+                    "{message}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn round1_8_corrupt_fixture_export_is_not_an_absent_snapshot() {

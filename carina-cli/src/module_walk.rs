@@ -159,7 +159,7 @@ fn visit_module(
         &diagnostic_base.source_label(),
     ) {
         Ok(loaded) => {
-            let imports = loaded.parsed.uses.clone();
+            let imports = loaded.parsed().uses.clone();
             walk.modules.push(LoadedModuleAtPath {
                 diagnostic_path: diagnostic_path.to_path_buf(),
                 diagnostic_base: diagnostic_base.clone(),

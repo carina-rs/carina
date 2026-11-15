@@ -34,11 +34,11 @@ pub fn admit_resource_attribute_report<
         .cloned()
         .collect();
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        crate::validation::admission::attributes::admit_validation_attributes::<
+        crate::validation::admission::attributes::admit_value_only_attributes::<
             crate::validation::admission::kind::ResourceAttribute,
             P,
             B,
-        >(schema, &id, attributes, &quoted, None, session, None, None)
+        >(schema, &id, attributes, &quoted, session)
     })
 }
 
@@ -430,4 +430,181 @@ pub fn resolved_provider_configs(
 ) -> crate::parser::ResolvedProviderConfigs {
     crate::parser::ResolvedProviderConfigs::from_test_configs(configs.to_vec())
         .expect("execution fixture provider configs must be known")
+}
+
+/// An actual conversion-free Judge result for programmatic admission fixtures.
+pub fn no_conversion_proof() -> crate::parser::retained::NoConversion {
+    static PROOF: std::sync::OnceLock<crate::parser::retained::NoConversion> =
+        std::sync::OnceLock::new();
+    *PROOF.get_or_init(|| {
+        let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed =
+            crate::parser::parse_file("let proof = 0", std::path::Path::new("proof.crn"), &catalog)
+                .expect("plain proof fixture");
+        let schemas = crate::schema::SchemaRegistry::new();
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        configuration
+            .judged()
+            .report()
+            .binding(&crate::resource::RelativeBindingName::new("proof"))
+            .expect("proof judgement")
+            .no_conversion()
+            .expect("no conversion")
+    })
+}
+
+/// Raw classified fixtures have no authored source. Production authored inputs
+/// must use the slot/source-bearing candidate constructors instead.
+pub fn classified_candidate_for_test<
+    'a,
+    P: crate::resource::PlaceholderKind,
+    B: crate::resource::BindingAddress,
+>(
+    classification: crate::resource::knowledge::Classification<'a, P, B>,
+    bindings: Option<&'a crate::binding_index::BindingIndex<'a, B>>,
+    provider: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> (
+    crate::validation::admission::Candidate<P, B>,
+    crate::validation::admission::AdmissionContext<'a, P, B>,
+) {
+    crate::validation::admission::Candidate::validation_classified(
+        classification,
+        bindings,
+        provider,
+        no_conversion_proof(),
+    )
+}
+
+/// Final test renderer after the consuming presentation boundary. Production
+/// core APIs cannot stringify the mixed findings aggregate.
+pub fn render_presented_for_test<E: crate::validation::ValidationClientError>(
+    findings: &crate::validation::PresentedFindings<E>,
+) -> String {
+    findings
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+#[derive(Debug)]
+pub struct LegacyPresentedFindings(pub(crate) crate::validation::PresentedFindings, String);
+impl LegacyPresentedFindings {
+    pub fn lines(&self) -> std::str::Lines<'_> {
+        self.1.lines()
+    }
+}
+impl std::ops::Deref for LegacyPresentedFindings {
+    type Target = crate::validation::PresentedFindings;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::fmt::Display for LegacyPresentedFindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+impl std::error::Error for LegacyPresentedFindings {}
+#[derive(Debug, thiserror::Error)]
+pub enum LegacyValidationError {
+    #[error(transparent)]
+    AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
+    #[error(transparent)]
+    Validation(LegacyPresentedFindings),
+}
+fn legacy_findings_result(
+    result: Result<crate::validation::PresentedFindings, crate::parser::AnalysisTreeError>,
+) -> Result<(), LegacyValidationError> {
+    let findings = result?;
+    let rendered = render_presented_for_test(&findings);
+    if findings.is_empty() {
+        Ok(())
+    } else {
+        Err(LegacyValidationError::Validation(LegacyPresentedFindings(
+            findings, rendered,
+        )))
+    }
+}
+pub fn legacy_validate_resources<
+    E,
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+    B: crate::resource::BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
+    registry: &crate::schema::SchemaRegistry,
+    known: &std::collections::HashSet<String>,
+    context: &crate::parser::ProviderContext,
+    diagnostics: &mut dyn crate::validation::deferred_types::ProviderTypeCheckSink,
+) -> Result<(), String> {
+    crate::validation::validate_resources(parsed, registry, known, context, diagnostics)
+        .map_err(|findings| render_presented_for_test(&findings))
+}
+pub fn legacy_validate_resource_ref_types<
+    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
+    B: crate::resource::BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+>(
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    _: &std::collections::HashSet<String>,
+    bindings: &crate::binding_index::BindingIndex<'_, B>,
+    diagnostics: &mut dyn crate::validation::deferred_types::ProviderTypeCheckSink,
+) -> Result<(), LegacyValidationError> {
+    legacy_findings_result(crate::validation::resource_reference_findings(
+        judged,
+        bindings,
+        diagnostics,
+    ))
+}
+pub fn legacy_validate_resource_admissions<
+    E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
+    B: crate::resource::BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+>(
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &crate::binding_index::BindingIndex<'_, B>,
+    known: &std::collections::HashSet<String>,
+    diagnostics: &mut dyn crate::validation::deferred_types::ProviderTypeCheckSink,
+) -> Result<(), LegacyValidationError> {
+    legacy_findings_result(crate::validation::resource_admission_findings(
+        judged,
+        bindings,
+        known,
+        diagnostics,
+    ))
+}
+
+/// Adapt an ordinary-only fixture to the source-proof API. Conversion cases
+/// must exercise the production run and presentation driver instead.
+pub fn ordinary_sink_findings_for_test<T>(findings: crate::validation::SinkFindings<T>) -> T {
+    findings.expect_ordinary_for_test()
+}
+
+pub fn ordinary_sink_result_for_test<T, E>(
+    result: Result<T, crate::parser::retained::SinkRejection<E>>,
+) -> Result<T, E> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(crate::parser::retained::SinkRejection::Ordinary(error)) => Err(error),
+        Err(crate::parser::retained::SinkRejection::Conversion(_)) => {
+            panic!("conversion fixture must use the production validation driver")
+        }
+    }
+}
+
+/// Start an isolated collector for fixtures that do not own a parsed document.
+/// Production clients start from a directory, Judge report, or parse failure.
+pub fn conversion_validation<E: crate::validation::ValidationClientError>()
+-> crate::validation::ConversionValidation<E> {
+    crate::validation::ConversionValidation::for_test()
 }

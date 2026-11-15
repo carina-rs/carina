@@ -90,7 +90,10 @@ fn assert_empty_template(blocks: &str) {
                 parsed.clone().admit(&schemas, session),
                 &path,
                 &[],
-            ),
+            )
+            .into_validation(&mut crate::test_utils::conversion_validation::<
+                std::convert::Infallible,
+            >()),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
         assert!(matches!(
@@ -98,7 +101,10 @@ fn assert_empty_template(blocks: &str) {
                 parsed.clone().admit(&schemas, session),
                 &path,
                 &[],
-            ),
+            )
+            .into_validation(&mut crate::test_utils::conversion_validation::<
+                std::convert::Infallible,
+            >()),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
     });
@@ -202,7 +208,10 @@ fn direct_template_scope_in_all_resolver_entry_points() {
                 parsed.clone().admit(&schemas, session),
                 &path,
                 &[],
-            ),
+            )
+            .into_validation(&mut crate::test_utils::conversion_validation::<
+                std::convert::Infallible,
+            >()),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
         assert!(matches!(
@@ -210,7 +219,10 @@ fn direct_template_scope_in_all_resolver_entry_points() {
                 parsed.clone().admit(&schemas, session),
                 &path,
                 &[],
-            ),
+            )
+            .into_validation(&mut crate::test_utils::conversion_validation::<
+                std::convert::Infallible,
+            >()),
             super::ModuleResolutionDiagnosticResult::Expanded { .. }
         ));
     });
@@ -1439,6 +1451,9 @@ let forwarded = inner { flag = flag }
                 &crate::paths::ResolvedPath::new(&outer_dir).unwrap(),
                 &[],
             )
+            .into_validation(&mut crate::test_utils::conversion_validation::<
+                std::convert::Infallible,
+            >())
         },
     );
 
@@ -12028,6 +12043,9 @@ fn root_require_has_only_the_expression_report_carrier() {
             } else {
                 super::resolve_modules_with_diagnostics(admitted, &base, &[])
             };
+            let result = result.into_validation(&mut crate::test_utils::conversion_validation::<
+                std::convert::Infallible,
+            >());
             let super::ModuleResolutionDiagnosticResult::Expanded { graph } = result else {
                 panic!("a root rejection belongs only to the retained expression report");
             };
@@ -12110,6 +12128,9 @@ fn module_require_diagnostic_keeps_direct_constraint_type_and_message() {
         let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
         let result =
             super::resolve_modules_with_diagnostics(parsed.admit(&schemas, session), &base, &[]);
+        let result = result.into_validation(&mut crate::test_utils::conversion_validation::<
+            std::convert::Infallible,
+        >());
         let super::ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors } = result
         else {
             panic!("the instantiated module require must fail");

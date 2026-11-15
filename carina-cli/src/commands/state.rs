@@ -2269,6 +2269,11 @@ pub(crate) async fn run_state_refresh_locked(
                         &parsed.export_params,
                         &export_bindings,
                         session,
+                        carina_core::parser::retained::ProjectedPhase::apply_context(
+                            &carina_core::resource::knowledge::KnowledgeContext::apply(
+                                &export_bindings,
+                            ),
+                        ),
                     )
                     .map_err(AppError::Validation)
                 },

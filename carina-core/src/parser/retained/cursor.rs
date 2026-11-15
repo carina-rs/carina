@@ -1,4 +1,6 @@
-//! Closed authored inputs, shared syntax/judgement snapshots and per-use coverage.
+//! Closed authored inputs and shared syntax/judgement snapshots.
+
+use super::NoConversion;
 
 use super::{
     AuthoredExpr, ConditionSnapshot, ExprKind, ExpressionInstance, ExpressionLocation,
@@ -94,6 +96,7 @@ fn fresh_identity() -> u64 {
 pub enum EdgeRole {
     SlotRoot,
     Parens,
+    ConvertOperand,
     IfBranch,
     CoalesceOperand,
     AliasDefinition,
@@ -111,10 +114,36 @@ pub enum EdgeRole {
     SequenceResult,
 }
 
+impl EdgeRole {
+    pub(crate) fn restricts_conversion(self) -> bool {
+        match self {
+            Self::SecretArgument
+            | Self::ConvertOperand
+            | Self::InterpolationPart
+            | Self::CallArgument
+            | Self::ArithmeticOperand
+            | Self::AccessBase
+            | Self::AccessIndex
+            | Self::MapKey
+            | Self::Condition => true,
+            Self::SlotRoot
+            | Self::Parens
+            | Self::IfBranch
+            | Self::CoalesceOperand
+            | Self::AliasDefinition
+            | Self::ListItem
+            | Self::MapValue
+            | Self::StructField
+            | Self::SequenceResult => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthoredForm {
     Forward,
     Parens,
+    Convert,
     Definition,
     Binding,
     Reference,
@@ -125,6 +154,7 @@ pub(crate) enum AuthoredForm {
     If,
     Coalesce,
     Computed,
+    Sink,
 }
 
 /// Syntax navigation shared by current and discarded assignment walks.
@@ -255,6 +285,9 @@ impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
         Ok(self)
     }
 
+    pub(super) fn conversion_role(&self) -> super::conversion::flow::PlacementRole {
+        self.node.conversion_role()
+    }
     pub fn node_id(&self) -> NodeId {
         self.node.id
     }
@@ -324,7 +357,7 @@ impl<'s, B: BindingAddress> JudgedNodeRef<'s, B> {
         self.node.location.clone()
     }
 
-    pub(in crate::parser::retained) fn kind(&self) -> &ExprKind<B> {
+    pub(crate) fn kind(&self) -> &ExprKind<B> {
         &self.node.kind
     }
 }
@@ -344,15 +377,24 @@ enum ProjectionVisit {
 pub struct AuthoredUse<'s, B: BindingAddress = RelativeBindingName> {
     node: JudgedNodeRef<'s, B>,
     occurrence: UseId,
+
     instance: ExpansionInstanceId,
     edge: EdgeRole,
     visit: ProjectionVisit,
+
+    restriction: Option<std::rc::Rc<ConversionRestriction<'s, B>>>,
 }
 
-type AuthoredUseIdentity = (NodeId, UseId, ExpansionInstanceId, ProjectionGeneration);
+#[derive(Debug, Clone)]
+struct ConversionRestriction<'s, B: BindingAddress> {
+    edge: EdgeRole,
+    owner: JudgedNodeRef<'s, B>,
+}
+
+pub(crate) type AuthoredUseIdentity = (NodeId, UseId, ExpansionInstanceId, ProjectionGeneration);
 
 impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
-    fn identity(&self) -> AuthoredUseIdentity {
+    pub(crate) fn identity(&self) -> AuthoredUseIdentity {
         (
             self.node.node.id,
             self.occurrence,
@@ -367,8 +409,10 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
 
     pub(crate) fn form(&self) -> AuthoredForm {
         match self.node.kind() {
-            ExprKind::Alias | ExprKind::Sink(_) | ExprKind::Sequence => AuthoredForm::Forward,
+            ExprKind::Alias | ExprKind::Sequence => AuthoredForm::Forward,
+            ExprKind::Sink { .. } => AuthoredForm::Sink,
             ExprKind::Parens => AuthoredForm::Parens,
+            ExprKind::Convert { .. } => AuthoredForm::Convert,
             ExprKind::Definition => AuthoredForm::Definition,
             ExprKind::Binding(_) => AuthoredForm::Binding,
             ExprKind::Reference { .. } => AuthoredForm::Reference,
@@ -461,8 +505,10 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                     self.node.node.id,
                     self.instance,
                 ),
+
                 instance: self.instance,
                 edge: EdgeRole::AliasDefinition,
+                restriction: self.inherited_restriction(EdgeRole::AliasDefinition),
                 visit: ProjectionVisit::Value,
             }
             .canonical()?,
@@ -476,8 +522,36 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
     pub(crate) fn navigation(&self) -> Result<AuthoredNavigation<'s, B>, MissingEvidence> {
         Ok(match self.form() {
             AuthoredForm::Forward if self.child_count() != 0 => AuthoredNavigation::Forward {
-                child: self.child(self.child_count() - 1, self.edge())?,
+                child: self.child(
+                    self.node
+                        .node
+                        .result_index()
+                        .unwrap_or(self.child_count() - 1),
+                    self.edge(),
+                )?,
                 authored: !matches!(self.node.kind(), ExprKind::Alias),
+            },
+            AuthoredForm::Sink => {
+                let child = self
+                    .node
+                    .node
+                    .sink_value()
+                    .ok_or_else(|| MissingEvidence::new("named sink value"))?;
+                let index = self
+                    .node
+                    .node
+                    .children
+                    .iter()
+                    .position(|candidate| candidate.node_id() == child.node_id())
+                    .ok_or_else(|| MissingEvidence::new("named sink child"))?;
+                AuthoredNavigation::Forward {
+                    child: self.child(index, self.edge())?,
+                    authored: true,
+                }
+            }
+            AuthoredForm::Convert => AuthoredNavigation::Forward {
+                child: self.child(0, EdgeRole::ConvertOperand)?,
+                authored: true,
             },
             AuthoredForm::Parens => AuthoredNavigation::Forward {
                 child: self.parens_operand()?,
@@ -509,10 +583,29 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             AuthoredForm::Secret => {
                 AuthoredNavigation::Secret(self.child(0, EdgeRole::SecretArgument)?)
             }
-            AuthoredForm::If => AuthoredNavigation::Alternatives {
-                first: 1,
-                edge: EdgeRole::IfBranch,
-            },
+            AuthoredForm::If => {
+                if self
+                    .child(
+                        self.node
+                            .node
+                            .condition_index()
+                            .ok_or_else(|| MissingEvidence::new("named if condition"))?,
+                        EdgeRole::Condition,
+                    )?
+                    .node()
+                    .judgement()
+                    .contains_any_conversion()
+                {
+                    // A condition is a computed position, not a value arm.
+                    // P1 owns its rejection; it cannot authorize arm selection.
+                    AuthoredNavigation::Covered
+                } else {
+                    AuthoredNavigation::Alternatives {
+                        first: 1,
+                        edge: EdgeRole::IfBranch,
+                    }
+                }
+            }
             AuthoredForm::Coalesce => AuthoredNavigation::Alternatives {
                 first: 0,
                 edge: EdgeRole::CoalesceOperand,
@@ -525,6 +618,13 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                 | ExprKind::Integer { .. }
                 | ExprKind::Access(_)
                 | ExprKind::DynamicAccess => AuthoredNavigation::Parts,
+                ExprKind::NestedBlock { .. } if self.node.judgement().contains_any_conversion() => {
+                    AuthoredNavigation::Forward {
+                        child: self.child(0, self.edge())?,
+                        authored: true,
+                    }
+                }
+                ExprKind::RequireCondition(_) => AuthoredNavigation::Covered,
                 _ => AuthoredNavigation::Covered,
             },
             AuthoredForm::Forward | AuthoredForm::Literal | AuthoredForm::Reference => {
@@ -538,6 +638,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             ExprKind::Interpolation { .. } => EdgeRole::InterpolationPart,
             ExprKind::Call(_) => EdgeRole::CallArgument,
             ExprKind::Integer { .. } => EdgeRole::ArithmeticOperand,
+            ExprKind::RequireCondition(_) => EdgeRole::Condition,
             ExprKind::Access(_) | ExprKind::DynamicAccess => {
                 if index == 0 {
                     EdgeRole::AccessBase
@@ -566,9 +667,8 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
         let condition = self
             .node
             .node
-            .children
-            .first()
-            .ok_or_else(|| MissingEvidence::new("if condition"))?;
+            .condition()
+            .ok_or_else(|| MissingEvidence::new("named if condition"))?;
         if let Some(selected) = self.node.conditions.get(condition.node_id()) {
             return Ok(selected);
         }
@@ -624,11 +724,50 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             } else {
                 self.occurrence
             },
+
             instance: self.instance,
             edge,
+            restriction: self.inherited_restriction(edge),
             visit: ProjectionVisit::Value,
         }
         .canonical()
+    }
+
+    pub(crate) fn placement_edge(&self) -> EdgeRole {
+        self.restriction
+            .as_ref()
+            .map_or(self.edge, |restriction| restriction.edge)
+    }
+    pub(crate) fn conversion_owner(&self) -> &JudgedNodeRef<'s, B> {
+        match &self.restriction {
+            Some(restriction) if matches!(restriction.owner.kind(), ExprKind::Convert { .. }) => {
+                &restriction.owner
+            }
+            Some(_) | None => &self.node,
+        }
+    }
+    fn inherited_restriction(
+        &self,
+        edge: EdgeRole,
+    ) -> Option<std::rc::Rc<ConversionRestriction<'s, B>>> {
+        match &self.restriction {
+            Some(restriction)
+                if edge == EdgeRole::ConvertOperand
+                    && !matches!(restriction.owner.kind(), ExprKind::Convert { .. }) =>
+            {
+                Some(std::rc::Rc::new(ConversionRestriction {
+                    edge: restriction.edge,
+                    owner: self.node.clone(),
+                }))
+            }
+            Some(restriction) => Some(restriction.clone()),
+            None => edge.restricts_conversion().then(|| {
+                std::rc::Rc::new(ConversionRestriction {
+                    edge,
+                    owner: self.node.clone(),
+                })
+            }),
+        }
     }
 
     pub fn node(&self) -> &JudgedNodeRef<'s, B> {
@@ -638,7 +777,6 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
     pub fn occurrence(&self) -> UseId {
         self.occurrence
     }
-
     pub fn instance(&self) -> ExpansionInstanceId {
         self.instance
     }
@@ -670,8 +808,78 @@ pub struct ProjectedPhase(ProjectedOrigin);
 enum ProjectedOrigin {
     Plan,
     Apply,
-    ClassifiedInput,
-    Synthetic(SyntheticSource),
+}
+
+/// A validation projection retains its source judgement. It cannot serve as
+/// operational authority, including when no authored cursor is available.
+#[derive(Debug, Clone)]
+pub(crate) struct ValidationProjection {
+    source: ValidationSource,
+}
+#[derive(Debug, Clone)]
+enum ValidationSource {
+    Judged(JudgedExpr),
+    Checked(NoConversion),
+}
+impl ValidationProjection {
+    pub(crate) fn judged(source: JudgedExpr) -> Self {
+        Self {
+            source: ValidationSource::Judged(source),
+        }
+    }
+    pub(crate) fn checked(proof: NoConversion) -> Self {
+        Self {
+            source: ValidationSource::Checked(proof),
+        }
+    }
+    /// Losing authored navigation cannot turn a carried conversion into an
+    /// ordinary value. Plain inputs keep the original correspondence error.
+    pub(crate) fn unavailable(
+        source: &JudgedExpr,
+        error: MissingEvidence,
+    ) -> Result<Self, MissingEvidence> {
+        match source.conversion_evidence() {
+            super::ConversionEvidence::Free(_) => Err(error),
+            super::ConversionEvidence::Carried(_) => Ok(Self::judged(source.clone())),
+        }
+    }
+    pub(crate) fn no_conversion(&self) -> Option<NoConversion> {
+        match &self.source {
+            ValidationSource::Judged(source) => source.no_conversion(),
+            ValidationSource::Checked(proof) => Some(*proof),
+        }
+    }
+    pub(super) fn evidence(&self) -> ProjectionEvidence<'_> {
+        match &self.source {
+            ValidationSource::Checked(proof) => ProjectionEvidence::Free(*proof),
+            ValidationSource::Judged(source) => match source.conversion_evidence() {
+                super::ConversionEvidence::Free(proof) => ProjectionEvidence::Free(proof),
+                super::ConversionEvidence::Carried(carried) => {
+                    ProjectionEvidence::Carried(source, carried)
+                }
+            },
+        }
+    }
+}
+pub(super) enum ProjectionEvidence<'a> {
+    Free(NoConversion),
+    Carried(
+        &'a JudgedExpr,
+        super::conversion::flow::CarriedConversion<'a>,
+    ),
+}
+#[derive(Debug, Clone)]
+pub(crate) enum ProjectionAuthority {
+    Operational(ProjectedPhase),
+    Validation(ValidationProjection),
+}
+impl ProjectionAuthority {
+    pub(crate) fn no_conversion(&self) -> Option<NoConversion> {
+        match self {
+            Self::Operational(phase) => Some(NoConversion::operational(*phase)),
+            Self::Validation(projection) => projection.no_conversion(),
+        }
+    }
 }
 
 /// The non-authored attribute producers on main. Variant payloads are sealed
@@ -683,12 +891,33 @@ pub(crate) enum SyntheticSource {
 }
 
 impl ProjectedPhase {
-    /// Explicit schema-only inputs supplied without an authored configuration
-    /// (e.g. programmatic declarations). Resource analysis never uses this path.
-    pub(crate) fn classified<P: PlaceholderKind, B: BindingAddress>(
-        _: &crate::resource::knowledge::Classification<'_, P, B>,
+    /// A projected export check retains its actual operational stage. A
+    /// validation KnowledgeContext cannot be passed to either constructor.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::{parser::retained::ProjectedPhase, resource::{NoPlaceholder, AbsoluteBindingAddress, knowledge::KnowledgeContext}};
+    /// let validation = KnowledgeContext::<NoPlaceholder, AbsoluteBindingAddress>::validation();
+    /// ProjectedPhase::plan_context(&validation);
+    /// ```
+    pub fn plan_context<P: PlaceholderKind, B: BindingAddress>(
+        _context: &crate::resource::knowledge::KnowledgeContext<
+            '_,
+            P,
+            B,
+            crate::resource::knowledge::Plan,
+        >,
     ) -> Self {
-        Self(ProjectedOrigin::ClassifiedInput)
+        Self(ProjectedOrigin::Plan)
+    }
+    pub fn apply_context<P: PlaceholderKind, B: BindingAddress>(
+        _context: &crate::resource::knowledge::KnowledgeContext<
+            '_,
+            P,
+            B,
+            crate::resource::knowledge::Apply,
+        >,
+    ) -> Self {
+        Self(ProjectedOrigin::Apply)
     }
 
     pub fn plan<P: PlaceholderKind, B: BindingAddress>(_proof: &PlanResolved<'_, P, B>) -> Self {
@@ -702,17 +931,13 @@ impl ProjectedPhase {
     ) -> Self {
         Self(ProjectedOrigin::Apply)
     }
-
-    pub(crate) fn synthetic(source: SyntheticSource) -> Self {
-        Self(ProjectedOrigin::Synthetic(source))
-    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) enum CursorKind<'s, B: BindingAddress = RelativeBindingName> {
     Authored(AuthoredUse<'s, B>),
     CoveredBy(AuthoredUse<'s, B>),
-    Projected(ProjectedPhase),
+    Projected(ProjectionAuthority),
 }
 
 /// Downstream code cannot manufacture a cursor phase.
@@ -761,7 +986,20 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
     }
     pub(crate) fn projected(phase: ProjectedPhase) -> Self {
         Self {
-            kind: CursorKind::Projected(phase),
+            kind: CursorKind::Projected(ProjectionAuthority::Operational(phase)),
+        }
+    }
+    pub(crate) fn validation_projected(source: ValidationProjection) -> Self {
+        Self {
+            kind: CursorKind::Projected(ProjectionAuthority::Validation(source)),
+        }
+    }
+    pub(crate) fn no_conversion(&self) -> Option<NoConversion> {
+        match &self.kind {
+            CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
+                usage.node().judgement().no_conversion()
+            }
+            CursorKind::Projected(authority) => authority.no_conversion(),
         }
     }
     pub(crate) fn covered_by(usage: AuthoredUse<'s, B>) -> Self {
@@ -838,7 +1076,7 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
             CursorKind::Authored(usage) | CursorKind::CoveredBy(usage) => {
                 Self::covered_by(usage.clone())
             }
-            CursorKind::Projected(phase) => Self::projected(*phase),
+            CursorKind::Projected(_) => self.clone(),
         }
     }
     pub(crate) fn child(&self, index: usize, edge: EdgeRole) -> Result<Self, MissingEvidence> {
@@ -992,6 +1230,17 @@ impl<B: BindingAddress> JudgedSlot<B> {
         }
     }
 
+    pub(crate) fn source_judgement(&self) -> Result<&JudgedExpr, MissingEvidence> {
+        self.source_judgement_in(&self.snapshot)
+    }
+    pub(crate) fn source_judgement_in<'a>(
+        &self,
+        report: &'a ExpressionReport<B>,
+    ) -> Result<&'a JudgedExpr, MissingEvidence> {
+        report
+            .node(&report.instance, self.root.id)
+            .ok_or_else(|| MissingEvidence::new("attribute source judgement"))
+    }
     pub fn cursor(&self) -> Result<AuthoredUse<'_, B>, MissingEvidence> {
         if let Some(error) = &self.snapshot_error {
             return Err(error.clone());
@@ -1015,9 +1264,12 @@ impl<B: BindingAddress> JudgedSlot<B> {
                 environment: self.snapshot.instance.clone(),
             },
             occurrence: self.occurrence,
+
             instance: self.instance,
             edge: EdgeRole::SlotRoot,
             visit: ProjectionVisit::Value,
+
+            restriction: None,
         }
         .canonical()
     }
@@ -1063,6 +1315,7 @@ impl<B: BindingAddress> JudgedSlot<B> {
 /// Ordinary compatibility checks have no authority to reach these slots.
 #[derive(Debug, Clone)]
 pub struct NoAuthoredEvidence {
+    precheck: Option<crate::parser::ResourcePrecheckIdentity>,
     resource: crate::resource::ResourceId,
     slots: Vec<UnreachedSlot>,
 }
@@ -1079,6 +1332,7 @@ impl NoAuthoredEvidence {
         let resource = source.id();
         let slots = source.authored_slots();
         Self {
+            precheck: source.precheck_identity(),
             resource: resource.clone(),
             slots: slots
                 .into_iter()
@@ -1097,6 +1351,10 @@ impl NoAuthoredEvidence {
                 })
                 .collect(),
         }
+    }
+
+    pub(crate) fn precheck_identity(&self) -> Option<crate::parser::ResourcePrecheckIdentity> {
+        self.precheck.clone()
     }
     pub fn resource_id(&self) -> &crate::resource::ResourceId {
         &self.resource
@@ -1211,6 +1469,8 @@ impl<B: BindingAddress> ExpressionReport<B> {
             }
             let role = match &usage.node.node.kind {
                 ExprKind::Parens => EdgeRole::Parens,
+                ExprKind::Convert { .. } => EdgeRole::ConvertOperand,
+                ExprKind::RequireCondition(_) => EdgeRole::Condition,
                 ExprKind::Definition => EdgeRole::AliasDefinition,
                 ExprKind::Secret => EdgeRole::SecretArgument,
                 ExprKind::List => EdgeRole::ListItem,
@@ -1221,7 +1481,28 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 ExprKind::Access(_) | ExprKind::DynamicAccess => EdgeRole::AccessBase,
                 ExprKind::If => EdgeRole::IfBranch,
                 ExprKind::Coalesce => EdgeRole::CoalesceOperand,
-                _ => usage.edge,
+                ExprKind::Scalar(_)
+                | ExprKind::Parameter(_)
+                | ExprKind::LoopSlot(_)
+                | ExprKind::UntypedParameter
+                | ExprKind::Binding(_)
+                | ExprKind::Reference { .. }
+                | ExprKind::NestedBlock { .. }
+                | ExprKind::EmptyInterpolation
+                | ExprKind::Sequence
+                | ExprKind::Alias
+                | ExprKind::Element
+                | ExprKind::Iterable
+                | ExprKind::Resource { .. }
+                | ExprKind::Sink { .. }
+                | ExprKind::For
+                | ExprKind::Wait
+                | ExprKind::Compose
+                | ExprKind::ModuleCall
+                | ExprKind::Boolean
+                | ExprKind::Declaration
+                | ExprKind::ProviderDeclaration
+                | ExprKind::Unsupported(_) => usage.edge,
             };
             for index in 0..usage.child_count() {
                 let child = if matches!(usage.navigation()?, AuthoredNavigation::Parts) {
@@ -1265,6 +1546,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 instance: root.instance,
                 edge: EdgeRole::SlotRoot,
                 visit: ProjectionVisit::Value,
+                restriction: None,
             };
             let usage = match usage.canonical() {
                 Ok(usage) => usage,
@@ -1292,6 +1574,7 @@ pub struct AuthoredSlots<B: BindingAddress = RelativeBindingName> {
     aliases: std::collections::HashMap<String, String>,
     synthetic: indexmap::IndexMap<String, SyntheticSource>,
     declaration: Option<SlotDeclarationId>,
+    input_origin: Option<SlotDeclarationId>,
 }
 // Admission metadata is not part of a resource's value semantics.
 impl<B: BindingAddress> PartialEq for AuthoredSlots<B> {
@@ -1312,6 +1595,7 @@ impl<B: BindingAddress> Default for AuthoredSlots<B> {
             aliases: Default::default(),
             synthetic: Default::default(),
             declaration: None,
+            input_origin: None,
         }
     }
 }
@@ -1326,17 +1610,45 @@ impl<B: BindingAddress> AuthoredSlots<B> {
     pub fn declaration_id(&self) -> Option<&SlotDeclarationId> {
         self.declaration.as_ref()
     }
+    pub(crate) fn projection_generation(&self) -> Option<ProjectionGeneration> {
+        self.slots
+            .values()
+            .map(|slot| slot.generation)
+            .reduce(ProjectionGeneration::latest)
+    }
+    pub(crate) fn set_input_origin(&mut self, origin: Option<SlotDeclarationId>) {
+        self.input_origin = origin;
+    }
+    pub(crate) fn input_origin(&self) -> Option<SlotDeclarationId> {
+        self.input_origin.clone()
+    }
     pub(super) fn set_declaration(&mut self, declaration: SlotDeclarationId) {
         self.declaration = Some(declaration);
     }
     pub(crate) fn record_synthetic(&mut self, name: String, source: SyntheticSource) {
         self.synthetic.insert(name, source);
     }
-    pub(crate) fn projected_phase(&self, name: &str) -> Option<ProjectedPhase> {
-        self.synthetic
-            .get(name)
-            .copied()
-            .map(ProjectedPhase::synthetic)
+    pub(crate) fn projected_phase(&self, name: &str) -> Option<ValidationProjection> {
+        self.synthetic.get(name).copied().map(|source| {
+            ValidationProjection::checked(
+                super::judgement::synthetic_judgement(source)
+                    .no_conversion()
+                    .expect("synthetic identifier judgement"),
+            )
+        })
+    }
+    pub(crate) fn carries_conversion(
+        &self,
+        report: &ExpressionReport<B>,
+    ) -> Result<bool, MissingEvidence> {
+        let mut carries = false;
+        for slot in self.slots.values() {
+            carries |= slot
+                .source_judgement_in(report)
+                .or_else(|_| slot.source_judgement())?
+                .contains_any_conversion();
+        }
+        Ok(carries)
     }
     pub fn get(&self, name: &str) -> Result<&JudgedSlot<B>, MissingEvidence> {
         self.slots
@@ -1358,6 +1670,12 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             environment: slot.snapshot.instance.clone(),
             conditions: slot.conditions.clone(),
         })
+    }
+
+    pub(crate) fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&crate::parser::AttributeKey, &JudgedSlot<B>)> {
+        self.slots.iter()
     }
 
     pub(crate) fn iter_mut(
@@ -1442,6 +1760,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             aliases: self.aliases,
             synthetic: self.synthetic,
             declaration: self.declaration,
+            input_origin: self.input_origin,
             slots: self
                 .slots
                 .into_iter()
@@ -1521,3 +1840,6 @@ impl AuthoredSlots {
         self.slots.insert(name, slot);
     }
 }
+
+#[cfg(test)]
+mod conversion_review_tests;

@@ -6696,6 +6696,9 @@ pub(crate) fn check_exports_pre_apply<D>(
                     input.export_params,
                     &bindings,
                     session,
+                    carina_core::parser::retained::ProjectedPhase::plan_context(
+                        &carina_core::resource::knowledge::KnowledgeContext::plan(&bindings),
+                    ),
                 )
             },
         ),
@@ -7661,6 +7664,11 @@ mod load_upstream_states_tests {
                             &parsed.export_params,
                             &bindings,
                             session,
+                            carina_core::parser::retained::ProjectedPhase::plan_context(
+                                &carina_core::resource::knowledge::KnowledgeContext::plan(
+                                    &bindings,
+                                ),
+                            ),
                         )
                     },
                 )
@@ -9462,6 +9470,9 @@ exports { region: String = "ap-northeast-1" }"#,
                     &parsed.export_params,
                     &export_bindings,
                     session,
+                    carina_core::parser::retained::ProjectedPhase::plan_context(
+                        &carina_core::resource::knowledge::KnowledgeContext::plan(&export_bindings),
+                    ),
                 )
             },
         )
@@ -10531,6 +10542,14 @@ mod export_diff_tests {
                     &params,
                     &carina_core::binding_index::ResolvedBindings::default(),
                     session,
+                    carina_core::parser::retained::ProjectedPhase::plan_context::<
+                        carina_core::resource::NoPlaceholder,
+                        carina_core::resource::AbsoluteBindingAddress,
+                    >(
+                        &carina_core::resource::knowledge::KnowledgeContext::plan(
+                            &carina_core::binding_index::ResolvedBindings::default(),
+                        ),
+                    ),
                 )
             },
         )
@@ -10624,7 +10643,14 @@ mod export_diff_tests {
         let resolved = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |session| {
-                carina_core::validation::check_export_values_pre_apply(&params, &bindings, session)
+                carina_core::validation::check_export_values_pre_apply(
+                    &params,
+                    &bindings,
+                    session,
+                    carina_core::parser::retained::ProjectedPhase::plan_context(
+                        &carina_core::resource::knowledge::KnowledgeContext::plan(&bindings),
+                    ),
+                )
             },
         )
         .expect("plain dotted string is a valid export");
@@ -10658,7 +10684,14 @@ mod export_diff_tests {
         let error = carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
             |session| {
-                carina_core::validation::check_export_values_pre_apply(&params, &bindings, session)
+                carina_core::validation::check_export_values_pre_apply(
+                    &params,
+                    &bindings,
+                    session,
+                    carina_core::parser::retained::ProjectedPhase::plan_context(
+                        &carina_core::resource::knowledge::KnowledgeContext::plan(&bindings),
+                    ),
+                )
             },
         )
         .expect_err("resolved secret reference must be rejected before display");

@@ -217,11 +217,27 @@ pub mod configuration;
 pub mod final_input;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::check_conversion_pending_discharge;
+
+#[cfg(test)]
+mod conversion_review_tests;
 
 pub use crate::schema::value_validation::WalkCoverage;
 use assignment::AssignmentVerdict;
-pub(crate) use assignment::LocalPath;
 pub use assignment::{AssignmentProof, ReferenceCandidate, SchemaObligation};
+pub(crate) use assignment::{LocalPath, ReferenceSource};
+
+pub(crate) fn conversion_local<K: AssignmentKind>(
+    path: &LeafPath,
+) -> crate::schema::value_validation::AssignmentFindings {
+    let mut findings = crate::schema::value_validation::AssignmentFindings::default();
+    match K::defer_reference_check(path) {
+        Some(local) => findings.local.push(local),
+        None => findings.schema.require_reference(),
+    }
+    findings
+}
 
 mod sealed {
     pub trait Sealed: Sized {}
@@ -528,6 +544,15 @@ impl<K: AssignmentKind> Destination<K> {
 
 /// A candidate is always paired with the exact proof consumed by its factory.
 /// There is deliberately no raw-value constructor or expression accessor.
+///
+/// A foreign conversion-free judgement cannot authorize a classified input.
+/// The raw-proof seam is crate-private even with test-utils enabled.
+/// ```compile_fail,E0624
+/// use carina_core::{parser::retained::NoConversion, resource::{ParserPlaceholder, RelativeBindingName, knowledge::Classification}, validation::{admission::Candidate, deferred_types::ProviderTypeCheckContext}};
+/// fn foreign<'a>(value: Classification<'a, ParserPlaceholder, RelativeBindingName>, provider: &'a dyn ProviderTypeCheckContext, proof: NoConversion) {
+///     Candidate::validation_classified(value, None, provider, proof);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate<P: PlaceholderKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress>
 {
@@ -542,10 +567,23 @@ struct CandidateObligations {
     schema: SchemaObligation,
 }
 
+/// Authority available only to the module-template admission entry.
+#[derive(Clone, Copy)]
+pub(crate) struct TemplatePreflight {
+    _private: (),
+}
+
 enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
     Validation(crate::resource::knowledge::Classification<'a, P, B>),
+    Template {
+        proof: crate::resource::knowledge::Classification<'a, P, B>,
+        boundary: TemplatePreflight,
+    },
     Plan(PlanResolved<'a, P, B>),
-    Apply(KnownValue<'a, P, B>),
+    Apply {
+        known: KnownValue<'a, P, B>,
+        phase: crate::parser::retained::ProjectedPhase,
+    },
 }
 
 /// Main's ordinary assignment work requires a current, expression-origin value.
@@ -559,6 +597,7 @@ type OrdinaryAssignmentCheck<'a, P, B> =
     ) -> Result<crate::schema::value_validation::AssignmentFindings, TypeError>;
 
 struct AssignmentChecks<'a, P: PlaceholderKind, B: BindingAddress> {
+    #[cfg(test)]
     authored: Option<crate::schema::value_validation::AssignmentCheck<'a, P, B>>,
     ordinary: Option<OrdinaryAssignmentCheck<'a, P, B>>,
 }
@@ -566,6 +605,7 @@ struct AssignmentChecks<'a, P: PlaceholderKind, B: BindingAddress> {
 impl<P: PlaceholderKind, B: BindingAddress> Default for AssignmentChecks<'_, P, B> {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
             authored: None,
             ordinary: None,
         }
@@ -581,28 +621,35 @@ pub struct AdmissionContext<
     proof: AdmissionProof<'a, P, B>,
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
-    assignment: AssignmentChecks<'a, P, B>,
     cursor: crate::parser::retained::AuthoredCursor<'a, B>,
+    assignment: AssignmentChecks<'a, P, B>,
+    scope: crate::schema::value_validation::AssignmentScope,
     coverage: std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
     untyped: Option<&'a dyn Fn() -> Vec<TypeError>>,
     declaration: Option<(&'a str, &'a crate::binding_index::DeclaredValueSource)>,
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
-    pub fn validation_classified<'a>(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn validation_classified<'a>(
         proof: crate::resource::knowledge::Classification<'a, P, B>,
         bindings: Option<&'a BindingIndex<'a, B>>,
         provider: &'a dyn ProviderTypeCheckContext,
+        no_conversion: crate::parser::retained::NoConversion,
     ) -> (Self, AdmissionContext<'a, P, B>) {
-        let phase = crate::parser::retained::ProjectedPhase::classified(&proof);
-        Self::validation_projected(proof, bindings, provider, phase)
+        Self::validation_projected(
+            proof,
+            bindings,
+            provider,
+            crate::parser::retained::ValidationProjection::checked(no_conversion),
+        )
     }
 
     fn validation_projected<'a>(
         proof: crate::resource::knowledge::Classification<'a, P, B>,
         bindings: Option<&'a BindingIndex<'a, B>>,
         provider: &'a dyn ProviderTypeCheckContext,
-        phase: crate::parser::retained::ProjectedPhase,
+        phase: crate::parser::retained::ValidationProjection,
     ) -> (Self, AdmissionContext<'a, P, B>) {
         let value = crate::resource::knowledge::ClassifiedRef::from(&proof)
             .diagnostic_value()
@@ -612,7 +659,7 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             AdmissionProof::Validation(proof),
             bindings,
             provider,
-            crate::parser::retained::AuthoredCursor::projected(phase),
+            crate::parser::retained::AuthoredCursor::validation_projected(phase),
         )
     }
 
@@ -640,7 +687,10 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         let proof = Self::known_at_apply(proof)?;
         Ok(Self::paired(
             proof.to_value(),
-            AdmissionProof::Apply(proof),
+            AdmissionProof::Apply {
+                known: proof,
+                phase,
+            },
             None,
             provider,
             crate::parser::retained::AuthoredCursor::projected(phase),
@@ -675,11 +725,15 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         let proof = Self::known_at_apply(proof)?;
         let context = AdmissionContext {
             identity: obligations.identity,
-            proof: AdmissionProof::Apply(proof.clone()),
+            proof: AdmissionProof::Apply {
+                known: proof.clone(),
+                phase,
+            },
             bindings: None,
             provider,
-            assignment: Default::default(),
             cursor: crate::parser::retained::AuthoredCursor::projected(phase),
+            assignment: Default::default(),
+            scope: crate::schema::value_validation::AssignmentScope::Full,
             coverage: Default::default(),
             untyped: None,
             declaration: None,
@@ -716,8 +770,9 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 proof,
                 bindings,
                 provider,
-                assignment: Default::default(),
                 cursor,
+                assignment: Default::default(),
+                scope: crate::schema::value_validation::AssignmentScope::Full,
                 coverage: Default::default(),
                 untyped: None,
                 declaration: None,
@@ -727,6 +782,48 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
 }
 
 impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
+    fn template_preflight_slot<'a>(
+        slot: &'a crate::parser::retained::JudgedSlot<B>,
+        proof: crate::resource::knowledge::Classification<
+            'a,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+        bindings: Option<&'a BindingIndex<'a, B>>,
+        provider: &'a dyn ProviderTypeCheckContext,
+    ) -> Result<
+        (
+            Self,
+            AdmissionContext<'a, crate::resource::ParserPlaceholder, B>,
+        ),
+        AdmissionErrors,
+    > {
+        let value = crate::resource::knowledge::ClassifiedRef::from(&proof).diagnostic_value();
+        if !slot
+            .projection()
+            .is_some_and(|projection| std::ptr::eq(projection, value))
+        {
+            return Err(seam_constraint(
+                crate::parser::retained::MissingEvidence::new(
+                    "template slot/projection proof pairing",
+                ),
+            ));
+        }
+        let cursor = crate::parser::retained::AuthoredCursor::authored(
+            slot.cursor().map_err(seam_constraint)?,
+        );
+        Ok(Self::paired(
+            value.clone(),
+            AdmissionProof::Template {
+                proof,
+                boundary: TemplatePreflight { _private: () },
+            },
+            bindings,
+            provider,
+            cursor,
+        ))
+    }
+
     /// Candidate, knowledge and authored cursor are sealed from one slot.
     fn validation_slot<'a>(
         slot: &'a crate::parser::retained::JudgedSlot<B>,
@@ -764,6 +861,21 @@ impl<B: BindingAddress> Candidate<crate::resource::ParserPlaceholder, B> {
 }
 
 impl<'a, P: PlaceholderKind, B: BindingAddress> AdmissionContext<'a, P, B> {
+    fn authored_policy<'c>(
+        &self,
+        live: crate::schema::value_validation::AuthoredAssignmentCheck<'c, P, B>,
+    ) -> crate::schema::value_validation::AuthoredChecks<'c, P, B> {
+        use crate::schema::value_validation::AuthoredChecks;
+        match &self.proof {
+            AdmissionProof::Validation(_) => AuthoredChecks::Validation(live),
+            AdmissionProof::Template { boundary, .. } => AuthoredChecks::Preflight(*boundary),
+            AdmissionProof::Plan(proof) => {
+                AuthoredChecks::Projected(crate::parser::retained::ProjectedPhase::plan(proof))
+            }
+            AdmissionProof::Apply { phase, .. } => AuthoredChecks::Projected(*phase),
+        }
+    }
+
     fn with_checks<'s>(
         self,
         assignment: AssignmentChecks<'s, P, B>,
@@ -780,13 +892,15 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> AdmissionContext<'a, P, B> {
 
     fn sites(&self) -> Vec<PendingSite<B>> {
         match &self.proof {
-            AdmissionProof::Validation(proof) => proof.sites().collect(),
+            AdmissionProof::Validation(proof) | AdmissionProof::Template { proof, .. } => {
+                proof.sites().collect()
+            }
             AdmissionProof::Plan(proof) => proof.knowledge().sites().collect(),
-            AdmissionProof::Apply(_) => vec![],
+            AdmissionProof::Apply { .. } => vec![],
         }
     }
     fn is_apply(&self) -> bool {
-        matches!(self.proof, AdmissionProof::Apply(_))
+        matches!(self.proof, AdmissionProof::Apply { .. })
     }
 }
 
@@ -879,7 +993,7 @@ pub enum Admission<
 }
 
 /// Reference lookup failures retain their original structured information.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum AdmissionReferenceError {
     #[error("{0}")]
     Authored(Box<crate::validation::ReferenceFinding>),
@@ -963,37 +1077,50 @@ impl std::fmt::Display for AdmissionFindings {
     }
 }
 
+/// Admission failures carry only ordinary resolution findings.
+/// Conversions leave through the validation report, never through this error.
+///
+/// ```compile_fail,E0277
+/// use carina_core::{resolver::ResolutionError, validation::admission::AdmissionErrors};
+/// fn erase(error: AdmissionErrors) -> ResolutionError { error.into() }
+/// ```
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("{operation} admission failed")] // error-chain: caller-renders-sources
+#[error("value admission failed")] // error-chain: caller-renders-sources
 pub struct AdmissionErrors {
     findings: Option<Box<crate::schema::ValueValidationFindings>>,
-    operation: AdmissionOperation,
     #[source]
     source: ResolutionError,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AdmissionOperation {
-    Value,
-    Conversion,
+/// Compatibility wrapper for main's ordinary resolution-error conversion API.
+/// Its source cannot carry an authored conversion channel.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("conversion admission failed")] // error-chain: caller-renders-sources
+pub struct OrdinaryAdmissionError {
+    #[source]
+    source: ResolutionError,
 }
-impl std::fmt::Display for AdmissionOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Value => "value",
-            Self::Conversion => "conversion",
-        })
+impl OrdinaryAdmissionError {
+    pub(crate) fn into_resolution_error(self) -> ResolutionError {
+        self.source
+    }
+    pub fn resolution_error(&self) -> &ResolutionError {
+        &self.source
+    }
+}
+impl From<OrdinaryAdmissionError> for ResolutionError {
+    fn from(error: OrdinaryAdmissionError) -> Self {
+        error.into_resolution_error()
     }
 }
 impl PartialEq for AdmissionErrors {
     fn eq(&self, other: &Self) -> bool {
-        self.operation == other.operation && self.source == other.source
+        self.source == other.source
     }
 }
 impl Eq for AdmissionErrors {}
 impl From<ResolutionError> for AdmissionErrors {
     fn from(source: ResolutionError) -> Self {
         Self {
-            operation: AdmissionOperation::Value,
             findings: None,
             source,
         }
@@ -1004,15 +1131,9 @@ impl<B: BindingAddress> From<KnowledgeError<B>> for AdmissionErrors {
         ResolutionError::from(error).into()
     }
 }
-impl From<AdmissionErrors> for ResolutionError {
-    fn from(error: AdmissionErrors) -> Self {
-        error.into_resolution_error()
-    }
-}
 impl crate::resource::InsideSecret for AdmissionErrors {
     fn inside_secret(self) -> Self {
         Self {
-            operation: self.operation,
             findings: self
                 .findings
                 .map(|findings| Box::new((*findings).inside_secret())),
@@ -1041,23 +1162,26 @@ fn join(root: &LeafPath, relative: &LeafPath) -> LeafPath {
 fn constraints(findings: Vec<AdmissionFinding>) -> AdmissionErrors {
     ResolutionError::AdmissionConstraints(Box::new(AdmissionFindings { findings })).into()
 }
+fn checked_constraints(
+    findings: Vec<AdmissionFinding>,
+    checked: crate::schema::ValueValidationFindings,
+) -> AdmissionErrors {
+    let ordinary = ResolutionError::AdmissionConstraints(Box::new(AdmissionFindings { findings }));
+    let source = ordinary;
+    AdmissionErrors {
+        findings: Some(Box::new(checked)),
+        source,
+    }
+}
 
 impl AdmissionErrors {
-    pub(crate) fn into_resolution_error(self) -> ResolutionError {
-        self.source
-    }
-
     pub(crate) fn take_findings(&mut self) -> Option<crate::schema::ValueValidationFindings> {
         self.findings.take().map(|findings| *findings)
     }
-    /// Preserve #4260's pinned error-chain label when conversion orchestration
-    /// rebases onto this shared wrapper. This grants no placement authority.
-    pub fn conversion(source: ResolutionError) -> Self {
-        Self {
-            operation: AdmissionOperation::Conversion,
-            findings: None,
-            source,
-        }
+    /// Preserve main's ordinary resolution-error label without granting an
+    /// authored admission error an erasing From/Into implementation.
+    pub fn conversion(source: ResolutionError) -> OrdinaryAdmissionError {
+        OrdinaryAdmissionError { source }
     }
     pub fn resolution_error(&self) -> &ResolutionError {
         &self.source
@@ -1180,10 +1304,12 @@ impl<K: AssignmentKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission<
         let mut candidate = self.inner.candidate;
         match self.inner.assignment {
             AssignmentVerdict::Proven(_) => {}
-            AssignmentVerdict::NeedsLocal(local) => candidate
-                .obligations
-                .schema
-                .extend(K::schema(&local).clone()),
+            AssignmentVerdict::NeedsLocal(local) => {
+                candidate
+                    .obligations
+                    .schema
+                    .extend(K::schema(&local).clone());
+            }
             AssignmentVerdict::NeedsSchema(schema) => candidate.obligations.schema.extend(schema),
         }
         let (candidate, boundary) = candidate.at_apply(

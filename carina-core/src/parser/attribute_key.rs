@@ -163,10 +163,6 @@ impl AttributeKey {
     ) -> Option<crate::schema::EffectiveAttribute<'a>> {
         schema.effective_attribute_by_authored_name(&self.identity)
     }
-
-    pub(super) fn lifecycle_directive(&self) -> Option<crate::resource::LifecycleDirective> {
-        crate::resource::LifecycleDirective::from_name(&self.identity)
-    }
 }
 
 impl From<String> for AttributeKey {

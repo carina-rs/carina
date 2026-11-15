@@ -455,7 +455,7 @@ impl CompletionProvider {
             &self.schemas,
             &module_path.source_label(),
         ) {
-            Ok(module) => Some(module.parsed),
+            Ok(module) => Some(module.parsed().clone()),
             Err(carina_core::module_resolver::ModuleLoadError::Unavailable(_))
             | Err(carina_core::module_resolver::ModuleLoadError::NotModule {
                 error: _,

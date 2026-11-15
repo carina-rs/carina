@@ -33,6 +33,7 @@ fn check_report_selection(with_empty_map: bool) {
         with_empty_map.then_some(&empty),
         &values,
         judged.report(),
+        carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
     );
     assert!(std::ptr::eq(selected, resource));
     let missing = inputs
@@ -139,8 +140,13 @@ fn round5_source_resource_missing_from_report_is_explicitly_unreached() {
     );
     let map = authored_validation_resources(&tree);
     let values = resource.attributes().into_owned();
-    let (selected, inputs) =
-        select_admission_inputs(resource, Some(&map), &values, sealed.judged().report());
+    let (selected, inputs) = select_admission_inputs(
+        resource,
+        Some(&map),
+        &values,
+        sealed.judged().report(),
+        carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
+    );
     let missing = inputs
         .authored_evidence()
         .expect_err("source syntax without a matching report is explicitly unavailable");
@@ -306,6 +312,7 @@ fn round6_report_fallback_records_the_matched_authored_slots() {
         Some(&map),
         &resource.attributes(),
         sealed.judged().report(),
+        carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
     );
     let expected = expected.authored_evidence().unwrap_err();
     let actual = actual.authored_evidence().unwrap_err();
@@ -359,7 +366,13 @@ fn round7_report_fallback_checks_expanded_resource_with_authored_unreached_slots
     let main_inputs = ResourceAttributeInputs::from_report(rref, &values, judged.report());
     let source_inputs = ResourceAttributeInputs::from_report(source, &values, judged.report());
     let map = authored_validation_resources(&authored_tree);
-    let (selected, inputs) = select_admission_inputs(rref, Some(&map), &values, judged.report());
+    let (selected, inputs) = select_admission_inputs(
+        rref,
+        Some(&map),
+        &values,
+        judged.report(),
+        carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
+    );
     let bindings =
         carina_core::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
     let admit = |resource, inputs: ResourceAttributeInputs<_>| {

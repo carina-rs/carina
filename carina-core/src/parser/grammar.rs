@@ -53,6 +53,20 @@ pub(super) fn complete_string_pair(source: &str) -> Result<pest::iterators::Pair
     Ok(pair)
 }
 
+/// Decode one complete literal attribute key using the runtime parser's rules.
+/// Editor features can use the same identity for bare and quoted assignments.
+pub fn decode_attribute_key(source: &str) -> Option<String> {
+    let pair = if source.starts_with(['\'', '"']) {
+        complete_string_pair(source).ok()?
+    } else {
+        CarinaParser::parse(Rule::identifier, source).ok()?.next()?
+    };
+    if pair.as_span().start() != 0 || pair.as_span().end() != source.len() {
+        return None;
+    }
+    super::context::extract_key_string(pair).ok()
+}
+
 /// The wait parser joins only identifiers and field accesses with dots. Check
 /// that same grammar and spelling when admitting a saved enum identifier.
 pub(crate) fn is_wait_enum_identifier(source: &str) -> bool {

@@ -20,7 +20,7 @@ name = "carina-lsp"
 path = "src/main.rs"
 
 [features]
-test-utils = []
+test-utils = ["carina-core/test-utils"]
 
 [dependencies]
 carina-core = { path = "../carina-core" }

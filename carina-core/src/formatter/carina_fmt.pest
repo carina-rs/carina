@@ -267,7 +267,10 @@ compose_expr = { additive_expr ~ (trivia* ~ compose_op ~ trivia* ~ additive_expr
 // Integer arithmetic. Keep these layers byte-for-byte equivalent in
 // precedence to the semantic grammar while retaining authored trivia.
 additive_expr = { multiplicative_expr ~ (trivia* ~ add_op ~ trivia* ~ multiplicative_expr)* }
-multiplicative_expr = { postfix_expr ~ (trivia* ~ multiplicative_op ~ trivia* ~ postfix_expr)* }
+multiplicative_expr = { conversion_expr ~ (trivia* ~ multiplicative_op ~ trivia* ~ conversion_expr)* }
+conversion_expr = { postfix_expr ~ (trivia* ~ as_keyword ~ trivia* ~ conversion_type_path)* }
+as_keyword = @{ "as" ~ !(ASCII_ALPHANUMERIC | "_") }
+conversion_type_path = @{ identifier ~ ("." ~ identifier)* }
 
 // Field/index access is a postfix operator on any primary value. Reference
 // primaries retain their existing suffix parsing for address fidelity.

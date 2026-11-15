@@ -892,8 +892,25 @@ impl<R: fmt::Debug, C> fmt::Debug for ValidatedConfig<R, C> {
 /// The inner vector is private and every constructor establishes the
 /// non-empty invariant, so a failed validation report cannot carry an empty
 /// diagnostic list.
+#[cfg(test)]
 #[derive(Debug)]
-pub(crate) struct NonEmptyValidationErrors(Vec<AppError>);
+pub(crate) struct OrdinaryErrorRefs<'a>(Vec<&'a AppError>);
+#[cfg(test)]
+impl<'a> OrdinaryErrorRefs<'a> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &'a AppError> + '_ {
+        self.0.iter().copied()
+    }
+}
+#[cfg(test)]
+impl<'a> std::ops::Deref for OrdinaryErrorRefs<'a> {
+    type Target = [&'a AppError];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct NonEmptyValidationErrors(Vec<crate::error::PresentedAppError>);
 
 #[derive(Debug)]
 pub(crate) struct EmptyValidationErrors;
@@ -905,22 +922,31 @@ impl TryFrom<Vec<AppError>> for NonEmptyValidationErrors {
         if errors.is_empty() {
             Err(EmptyValidationErrors)
         } else {
-            Ok(Self(errors))
+            Ok(Self(errors.into_iter().map(Into::into).collect()))
         }
     }
 }
 
 impl NonEmptyValidationErrors {
-    pub(crate) fn as_slice(&self) -> &[AppError] {
+    pub(crate) fn from_presented(
+        errors: Vec<crate::error::PresentedAppError>,
+    ) -> Result<Self, EmptyValidationErrors> {
+        if errors.is_empty() {
+            Err(EmptyValidationErrors)
+        } else {
+            Ok(Self(errors))
+        }
+    }
+    pub(crate) fn as_slice(&self) -> &[crate::error::PresentedAppError] {
         &self.0
     }
 
-    pub(crate) fn into_vec(self) -> Vec<AppError> {
+    pub(crate) fn into_vec(self) -> Vec<crate::error::PresentedAppError> {
         self.0
     }
 
     fn extend(&mut self, errors: impl IntoIterator<Item = AppError>) {
-        self.0.extend(errors);
+        self.0.extend(errors.into_iter().map(Into::into));
     }
 }
 
@@ -1020,27 +1046,51 @@ pub(crate) fn failed_validate_configuration(
                 carina_core::config_loader::find_crn_files_in_dir(path).unwrap_or_default()
             };
             for file in files {
-                if let Ok(source) = file.read_to_string()
-                    && let Ok(mut parsed) = carina_core::parser::parse_file(
-                        &source,
-                        &file.source_label(),
-                        session.catalog(),
-                    )
-                {
-                    parser_warnings.extend(parsed.warnings.iter().cloned().map(|mut warning| {
-                        warning
-                            .file
-                            .get_or_insert_with(|| file.source_label().display().to_string());
-                        warning
-                    }));
-                    match validation::resolve_file_type_exprs(&mut parsed, session) {
-                        Ok(findings) => errors.extend(
-                            findings
-                                .into_iter()
-                                .map(|finding| AppError::TypeResolution(Box::new(finding))),
-                        ),
-                        Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+                let Ok(source) = file.read_to_string() else {
+                    continue;
+                };
+                let mut parsed = match carina_core::parser::parse_file(
+                    &source,
+                    &file.source_label(),
+                    session.catalog(),
+                ) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        // Syntax findings survive value failures such as a
+                        // duplicate let, just as they do in editor buffers.
+                        if let Ok(metadata) = carina_core::parser::parse_syntax_inventory(
+                            &source,
+                            &file.source_label(),
+                        ) {
+                            errors.extend(
+                                validation::resource_directive_findings(&metadata)
+                                    .iter()
+                                    .cloned()
+                                    .map(|finding| AppError::ResourceDirective(Box::new(finding))),
+                            );
+                        }
+                        continue;
                     }
+                };
+                parser_warnings.extend(parsed.warnings.iter().cloned().map(|mut warning| {
+                    warning
+                        .file
+                        .get_or_insert_with(|| file.source_label().display().to_string());
+                    warning
+                }));
+                errors.extend(
+                    validation::resource_directive_findings(&parsed.parser_binding_metadata)
+                        .iter()
+                        .cloned()
+                        .map(|finding| AppError::ResourceDirective(Box::new(finding))),
+                );
+                match validation::resolve_file_type_exprs(&mut parsed, session) {
+                    Ok(findings) => errors.extend(
+                        findings
+                            .into_iter()
+                            .map(|finding| AppError::TypeResolution(Box::new(finding))),
+                    ),
+                    Err(error) => errors.push(AppError::AnalysisInvariant(error)),
                 }
             }
             (errors, parser_warnings)
@@ -1213,17 +1263,28 @@ impl<'a, T> ValidationReport<'a, T> {
             .collect()
     }
     #[cfg(test)]
-    pub(crate) fn errors(&self) -> &[AppError] {
-        match &self.result {
-            Ok(_) => &[],
-            Err(errors) => errors.as_slice(),
-        }
+    pub(crate) fn errors(&self) -> OrdinaryErrorRefs<'_> {
+        OrdinaryErrorRefs(match &self.result {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors
+                .as_slice()
+                .iter()
+                .filter_map(|error| match error {
+                    crate::error::PresentedAppError::Ordinary(error) => Some(error),
+                    crate::error::PresentedAppError::Conversion(_) => None,
+                })
+                .collect(),
+        })
     }
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_errors(self) -> Vec<AppError> {
         match self.into_parts().0 {
             Ok(_) => Vec::new(),
-            Err(errors) => errors.into_vec(),
+            Err(errors) => errors
+                .into_vec()
+                .into_iter()
+                .map(crate::error::PresentedAppError::into_rendered)
+                .collect(),
         }
     }
     #[cfg(any(test, feature = "test-utils"))]
@@ -1526,7 +1587,7 @@ fn resolve_config_pair_with_context(
         skip_resource_validation,
         duplicate_declarations,
     )
-    .map_err(|errors| crate::commands::collapse_errors(errors.into_vec()))
+    .map_err(|errors| crate::commands::collapse_presented_errors(errors.into_vec()))
 }
 
 fn binding_use_report_error(report: carina_core::validation::BindingUseReport) -> AppError {
@@ -1540,6 +1601,9 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
         }
         carina_core::validation::ResolveFileError::Expression(finding) => {
             AppError::ExpressionType(finding)
+        }
+        carina_core::validation::ResolveFileError::ResourceDirective(finding) => {
+            AppError::ResourceDirective(finding)
         }
         carina_core::validation::ResolveFileError::BindingUse(report) => {
             binding_use_report_error(report)
@@ -1781,7 +1845,9 @@ impl ProviderLoad {
         let parsed = match result {
             Ok(parsed) => parsed,
             Err(errors) => {
-                return Err(crate::commands::collapse_errors(errors.into_vec()));
+                return Err(crate::commands::collapse_presented_errors(
+                    errors.into_vec(),
+                ));
             }
         };
 
@@ -1817,7 +1883,9 @@ impl ProviderLoad {
         ) {
             Ok(canonical_resources) => canonical_resources,
             Err(errors) => {
-                return Err(crate::commands::collapse_errors(errors.into_vec()));
+                return Err(crate::commands::collapse_presented_errors(
+                    errors.into_vec(),
+                ));
             }
         };
         Ok(ValidatedConfig {
@@ -1932,7 +2000,7 @@ impl MigrationCheckProviderLoad {
         report.print_warnings();
         let (result, _schemas) = report.into_parts();
         let parsed = result
-            .map_err(|errors| crate::commands::collapse_errors(errors.into_vec()))?
+            .map_err(|errors| crate::commands::collapse_presented_errors(errors.into_vec()))?
             .into_file();
         Ok(MigrationCheckConfig {
             context,
@@ -1964,7 +2032,7 @@ impl CompleteProviderLoad {
             skip_resource_validation,
             duplicate_declarations,
         )
-        .map_err(|errors| crate::commands::collapse_errors(errors.into_vec()))?;
+        .map_err(|errors| crate::commands::collapse_presented_errors(errors.into_vec()))?;
         Ok(CheckedSavedPlanInputs {
             load: self,
             canonical_resources: Box::new(canonical_resources),
@@ -3450,6 +3518,7 @@ fn block_name_errors<T: fmt::Display>(conflicts: impl IntoIterator<Item = T>) ->
         .collect()
 }
 
+#[cfg(test)]
 pub fn validate_resources_with_ctx<
     E,
     P: PlaceholderKind,
@@ -3462,7 +3531,7 @@ pub fn validate_resources_with_ctx<
     provider_context: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
     let mut sink = CliTypeCheckSink { errors: Vec::new() };
-    let mut errors = lift_validation_result(validation::validate_resources(
+    let mut errors = lift_validation_result(carina_core::test_utils::legacy_validate_resources(
         parsed,
         ctx.schemas(),
         ctx.known_providers(),
@@ -3482,7 +3551,7 @@ pub fn validate_resource_admissions_with_ctx<
     ctx: &WiringContext,
     judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
-) -> Vec<AppError> {
+) -> Vec<crate::error::PresentedAppError> {
     let (errors, warnings) = resource_admission_report_with_ctx(ctx, judged, bindings);
     for warning in warnings {
         crate::commands::validate::print_provider_type_warning(&warning);
@@ -3498,7 +3567,10 @@ pub(crate) fn resource_admission_report_with_ctx<
     ctx: &WiringContext,
     judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
-) -> (Vec<AppError>, Vec<carina_core::parser::ParseWarning>) {
+) -> (
+    Vec<crate::error::PresentedAppError>,
+    Vec<carina_core::parser::ParseWarning>,
+) {
     let mut sink = ValidationReportSink {
         errors: Vec::new(),
         warnings: Vec::new(),
@@ -3511,14 +3583,44 @@ pub(crate) fn resource_admission_report_with_ctx<
     ) {
         Ok(findings) => findings
             .into_iter()
-            .map(|finding| AppError::ResourceAdmission(Box::new(finding)))
+            .map(|finding| {
+                crate::error::PresentedAppError::from_presented(finding, |never| match never {})
+            })
             .collect(),
         Err(error) => {
-            vec![AppError::AnalysisInvariant(error)]
+            vec![AppError::AnalysisInvariant(error).into()]
         }
     };
-    errors.extend(sink.errors);
+    errors.extend(sink.errors.into_iter().map(Into::into));
     (errors, sink.warnings)
+}
+
+pub(crate) fn resource_admission_report_in_run<
+    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    ctx: &WiringContext,
+    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &carina_core::binding_index::BindingIndex<'_, B>,
+    run: &mut validation::ConversionValidation<AppError>,
+) -> Vec<carina_core::parser::ParseWarning> {
+    let mut sink = ValidationReportSink {
+        errors: Vec::new(),
+        warnings: Vec::new(),
+    };
+    if let Err(error) = validation::resource_admission_findings_in(
+        run,
+        judged,
+        bindings,
+        ctx.known_providers(),
+        &mut sink,
+        validation::FindingSubject::Root,
+    ) {
+        run.push(AppError::AnalysisInvariant(error));
+    }
+    run.extend(sink.errors);
+    sink.warnings
 }
 
 /// Surface `directives.depends_on` analysis-pass error diagnostics as
@@ -3580,6 +3682,7 @@ pub fn validate_deferred_populate_refs_with_ctx<
         .collect()
 }
 
+#[cfg(test)]
 pub fn validate_resource_ref_types_with_ctx<
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
@@ -3601,7 +3704,7 @@ pub fn validate_resource_ref_types_with_ctx<
         {
             Ok(()) => Vec::new(),
             Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
-                split_validation_message(&message)
+                split_validation_message(&message.to_string())
             }
             Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
                 vec![AppError::AnalysisInvariant(error)]
@@ -5066,7 +5169,7 @@ pub(crate) fn validate_module_attribute_refs_after_expansion_failure(
 ) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        let mut parsed = module.loaded().parsed.clone();
+        let mut parsed = module.loaded().parsed().clone();
         let findings = match validation::resolve_file_type_exprs(&mut parsed, config) {
             Ok(findings) => findings,
             Err(error) => {
@@ -5105,13 +5208,14 @@ pub(crate) fn validate_module_internal_ref_types(
     module_walk: &ModuleWalk,
     config: &ValidationProviderCatalog<'_>,
     warnings: &mut Vec<carina_core::parser::ParseWarning>,
-) -> Vec<AppError> {
-    let mut errors = Vec::new();
+    errors: &mut validation::ConversionValidation<AppError>,
+) {
     for module in module_walk.iter() {
-        let mut parsed = module.loaded().parsed.clone();
+        let mut template = module.loaded().preflight();
+        let parsed = template.parsed();
         let prefix = module.diagnostic_label().to_string();
         let configuration = carina_core::config_loader::load_buffer_configuration(
-            &parsed,
+            parsed,
             ctx.schemas(),
             config.catalog(),
         );
@@ -5126,7 +5230,7 @@ pub(crate) fn validate_module_internal_ref_types(
         // Module expansion retains the established diagnostic for malformed
         // declarations. This pass only needs successful resolution so valid
         // dotted argument types can act as sources before expansion.
-        let findings = match validation::resolve_file_type_exprs(&mut parsed, config) {
+        let findings = match template.resolve_type_exprs(config) {
             Ok(findings) => findings,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
@@ -5141,35 +5245,34 @@ pub(crate) fn validate_module_internal_ref_types(
             continue;
         }
 
+        let parsed = template.parsed();
         let imported = module_resolver::load_resolved_module_signatures(
-            &parsed,
+            parsed,
             module.module_path(),
             config.catalog(),
         );
         let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-            &parsed, ctx.schemas(), None, &imported, config,
+            parsed, ctx.schemas(), None, &imported, config,
         );
-        let configuration = carina_core::config_loader::load_buffer_configuration(
-            &parsed,
-            ctx.schemas(),
-            config.catalog(),
-        );
+        let configuration = template.judge(ctx.schemas(), config.catalog());
         let mut sink = ValidationReportSink {
             errors: Vec::new(),
             warnings: Vec::new(),
         };
-        match validation::resource_reference_findings(configuration.judged(), &bindings, &mut sink)
-        {
-            Ok(findings) => errors.extend(findings.into_iter().map(|finding| {
-                AppError::ResourceAdmission(Box::new(finding.with_context(&prefix)))
-            })),
-            Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+        if let Err(error) = validation::resource_reference_preflight_findings_in(
+            errors,
+            &configuration,
+            &bindings,
+            &mut sink,
+            validation::FindingSubject::Module(prefix.clone()),
+        ) {
+            errors.push(AppError::AnalysisInvariant(error));
         }
         errors.extend(sink.errors);
         warnings.extend(sink.warnings);
         for parameter in &configuration.judged().file().attribute_params {
             let parameters = std::slice::from_ref(parameter);
-            let values = validation::attribute_value_findings(parameters, config);
+            let values = validation::query_attribute_value_findings(parameters, config);
             let references = validation::attribute_param_ref_findings(parameters, &bindings);
             if references.is_empty() {
                 errors.extend(values.into_iter().map(|finding| AppError::ParameterValue {
@@ -5188,7 +5291,6 @@ pub(crate) fn validate_module_internal_ref_types(
             }
         }
     }
-    errors
 }
 
 /// Every rejected load is rendered once; loaded bodies keep their independent

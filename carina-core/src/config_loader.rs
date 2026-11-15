@@ -1215,7 +1215,10 @@ impl<E> RootDirectoryParse<E> {
             .iter()
             .map(|(file, text)| {
                 (
-                    parser::parse_syntax_inventory(text, &file.source_label()).unwrap(),
+                    parser::parse_syntax_inventory(text, &file.source_label())
+                        .unwrap()
+                        .syntax()
+                        .clone(),
                     file.persisted_path(),
                 )
             })
@@ -1533,7 +1536,9 @@ impl DirectoryBufferSnapshot {
                     Some(buffer.parsed().parser_binding_metadata.syntax().clone())
                 } else {
                     text.as_deref().and_then(|text| {
-                        parser::parse_syntax_inventory(text, &file.source_label()).ok()
+                        parser::parse_syntax_inventory(text, &file.source_label())
+                            .ok()
+                            .map(|metadata| metadata.syntax().clone())
                     })
                 };
                 SnapshotSource { file, inventory }
@@ -1926,7 +1931,7 @@ pub fn find_duplicate_declarations_in_source(
         return Vec::new();
     };
     let mut occurrences = BTreeMap::new();
-    collect_inventory_declarations(path, &inventory, &mut occurrences);
+    collect_inventory_declarations(path, inventory.syntax(), &mut occurrences);
     duplicate_groups(occurrences)
 }
 
@@ -3455,6 +3460,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn conversion_parse_diagnostic_uses_the_shared_message_shape() {
+        let path = Path::new("conversion-shape.crn");
+        let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = parser::parse_file(
+            "let converted = if 42 as String { 'ok' } else { 'ok' }",
+            path,
+            &catalog,
+        )
+        .unwrap();
+        let schemas = SchemaRegistry::new();
+        let configuration = load_buffer_configuration(&parsed, &schemas, &catalog);
+        let judged = configuration.judged();
+        let tree = parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let bindings =
+            crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+        let mut validation =
+            crate::validation::ConversionValidation::<std::convert::Infallible>::new(
+                judged.report(),
+            );
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            validation
+                .admitted_resources(
+                    &tree,
+                    judged,
+                    &bindings,
+                    session,
+                    crate::validation::FindingSubject::Root,
+                )
+                .for_each(drop);
+        });
+        let presented = validation.complete().into_presented();
+        assert_eq!(presented.len(), 1);
+        let crate::validation::PresentedFinding::Conversion(conversion) =
+            presented.iter().next().unwrap()
+        else {
+            panic!("typed conversion exit");
+        };
+        let expected =
+            parser::Located::new(conversion.location().clone(), conversion.message()).to_string();
+        assert_eq!(conversion.to_string(), expected);
     }
 
     // macOS APFS rejects non-UTF-8 names.

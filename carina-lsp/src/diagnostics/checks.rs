@@ -889,6 +889,9 @@ impl DiagnosticRun<'_> {
         base_path: &carina_core::paths::ResolvedPath,
         upstream_exports: &carina_core::upstream_exports::UpstreamExports,
         source_overrides: &carina_core::config_loader::SourceOverrides,
+        conversion_validation: &mut carina_core::validation::ConversionValidation<
+            super::OrdinaryDiagnostic,
+        >,
     ) {
         let covered_findings = match carina_core::validation::check_module_calls_from_analysis(
             tree,
@@ -918,7 +921,7 @@ impl DiagnosticRun<'_> {
                 &covered_findings,
                 source_overrides,
             );
-        let module_resolution = match module_resolution {
+        let module_resolution = match module_resolution.into_validation(conversion_validation) {
             carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded {
                 mut graph,
             } => {
@@ -963,6 +966,7 @@ impl DiagnosticRun<'_> {
                         base_path,
                         &exports,
                         &overrides,
+                        &mut carina_core::test_utils::conversion_validation(),
                     ),
                     Err(error) => result.analysis_errors.push(error),
                 }
@@ -1096,30 +1100,20 @@ impl DiagnosticRun<'_> {
                 &self.schemas,
             )
             .ok()?;
-        let module_resolution =
-            carina_core::module_resolver::resolve_modules_with_all_import_diagnostics_and_overrides(
-                merged.clone().admit(&self.schemas, self.provider_context),
-                base_path,
-                &[],
-                &carina_core::config_loader::SourceOverrides::from([(
-                    doc.source_file().to_path_buf(),
-                    doc.text(),
-                )]),
-            );
-        if let carina_core::module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } =
-            module_resolution
-        {
-            let mut resolved = *graph;
-            if let Err(error) =
-                carina_core::parser::resolve_expanded_provider_unresolved_attributes_for_analysis(
-                    &mut resolved,
-                    self.provider_context.catalog(),
-                )
-            {
-                return Some(error);
+        // This is a projected provider-value query, not authored admission.
+        // It returns only provider finalization errors and publishes no AST
+        // findings from its deliberately separate metadata parse.
+        match carina_core::module_resolver::finalize_provider_metadata_with_module_overrides(
+            &merged,
+            base_path,
+            self.provider_context,
+            &self.schemas,
+            &overrides,
+        ) {
+            carina_core::module_resolver::ProviderMetadataResolution::Expanded(result) => {
+                return result.err();
             }
-            return carina_core::parser::finalize_provider_configs_for_analysis(&mut resolved)
-                .err();
+            carina_core::module_resolver::ProviderMetadataResolution::Unavailable => {}
         }
         let mut merged = merged.into_parsed();
         {
@@ -1417,8 +1411,8 @@ impl DiagnosticRun<'_> {
         semantic_view: &SemanticView<'_>,
         binding_index: &BindingIndex<'_>,
         known_bindings: &HashSet<String>,
-        _inference_bindings: &carina_core::validation::inference::InferenceBindings<
-            ParserPlaceholder,
+        conversion_validation: &mut carina_core::validation::ConversionValidation<
+            super::OrdinaryDiagnostic,
         >,
     ) -> Vec<Diagnostic> {
         let (parsed, tree) = authored;
@@ -1530,12 +1524,22 @@ impl DiagnosticRun<'_> {
                             continue;
                         }
                     };
+                    let source = match expression.ordinary() {
+                        Ok(source) => source,
+                        Err(rejection) => {
+                            conversion_validation.reject_sink(
+                                rejection,
+                                carina_core::validation::FindingSubject::Root,
+                            );
+                            continue;
+                        }
+                    };
                     let type_error = match self.provider_context.loaded_context() {
                         Some(provider_context) => typecheck::check_type_expr_value(
                             type_expr,
                             semantic_value,
                             provider_context,
-                            expression,
+                            source,
                         )
                         .require_provider_schemas()
                         .err(),
@@ -1543,7 +1547,7 @@ impl DiagnosticRun<'_> {
                             type_expr,
                             semantic_value,
                             self.provider_context.catalog(),
-                            expression,
+                            source,
                         )
                         .record_at(
                             self.provider_context,
@@ -1639,8 +1643,12 @@ impl DiagnosticRun<'_> {
         tree: &carina_core::parser::AnalysisTree<'_>,
         semantic_view: &SemanticView<'_>,
         value_bindings: &ResolvedBindings,
-        expanded: Option<&carina_core::parser::ModuleResolvedParsedFile>,
+        context: (
+            Option<&carina_core::parser::ModuleResolvedParsedFile>,
+            &mut carina_core::validation::ConversionValidation<super::OrdinaryDiagnostic>,
+        ),
     ) -> Vec<Diagnostic> {
+        let (expanded, conversion_validation) = context;
         let mut diagnostics = Vec::new();
         let name_location = |param: &ParsedExportParam| {
             tree.syntax()
@@ -1699,7 +1707,9 @@ impl DiagnosticRun<'_> {
                         candidate.source_file() == param.source_file()
                             && candidate.source_span() == param.source_span()
                     })
-                    .and_then(|semantic_param| self.export_value_error(semantic_param, bindings)),
+                    .and_then(|semantic_param| {
+                        self.export_value_error(semantic_param, bindings, conversion_validation)
+                    }),
                 None => {
                     let mut fallback;
                     let semantic_param = match semantic_view.lookup(param) {
@@ -1715,7 +1725,7 @@ impl DiagnosticRun<'_> {
                             &fallback
                         }
                     };
-                    self.export_value_error(semantic_param, value_bindings)
+                    self.export_value_error(semantic_param, value_bindings, conversion_validation)
                 }
             };
             if let Some(message) = message
@@ -1739,13 +1749,27 @@ impl DiagnosticRun<'_> {
         &self,
         param: &ParsedExportParam<ParserPlaceholder, B>,
         value_bindings: &GenericResolvedBindings<ParserPlaceholder, B>,
+        conversion_validation: &mut carina_core::validation::ConversionValidation<
+            super::OrdinaryDiagnostic,
+        >,
     ) -> Option<String> {
-        let error = carina_core::validation::check_export_values_pre_apply(
+        let error = carina_core::validation::check_export_values_for_validation(
             std::slice::from_ref(param),
             value_bindings,
             self.provider_context,
         )
-        .err();
+        .into_validation(
+            conversion_validation,
+            carina_core::validation::FindingSubject::Root,
+        )
+        .err()
+        .map(|findings| {
+            findings
+                .into_iter()
+                .map(|finding| finding.detail().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
         if param.judgement().is_ok_and(|expression| {
             expression.check_owner()
                 == carina_core::parser::retained::ExpressionCheckOwner::BindingIndex
@@ -1867,13 +1891,13 @@ impl DiagnosticRun<'_> {
     }
 
     /// Check authored references against directory-wide binding authority.
-    pub(super) fn check_undefined_references(
+    pub(super) fn undefined_reference_findings(
         &self,
-        doc: &Document,
         tree: &carina_core::parser::AnalysisTree<'_>,
         defined_bindings: &HashSet<String>,
         declared_providers: &HashSet<String>,
-    ) -> Vec<Diagnostic> {
+    ) -> Vec<carina_core::parser::Located<carina_core::resource::SecretDiagnosticError<String>>>
+    {
         let mut enum_namespaces = HashSet::new();
         for factory in self
             .factories
@@ -1911,12 +1935,7 @@ impl DiagnosticRun<'_> {
                         )
                     }),
                 );
-                render_merged(
-                    doc,
-                    &finding,
-                    DiagnosticSeverity::ERROR,
-                    finding.detail().to_string(),
-                )
+                Some(finding)
             })
             .collect()
     }

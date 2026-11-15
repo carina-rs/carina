@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::ValueDescription;
-use crate::parser::retained::{JudgedExpr, MissingEvidence};
+use crate::parser::retained::{JudgedExpr, MissingEvidence, OrdinaryJudgedExpr, SinkRejection};
 use crate::parser::{
     LoadedProviderContext, ProviderContext, TypeExpr, validate_builtin_custom_type,
     validate_schema_custom_type_with_context,
@@ -14,7 +14,7 @@ use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, PlaceholderK
 // enter the resolved branch; authored APIs always require JudgedExpr.
 #[derive(Clone, Copy)]
 enum ValueCheckEvidence<'a> {
-    Authored(&'a JudgedExpr),
+    Authored(OrdinaryJudgedExpr<'a>),
     Resolved,
     UpstreamExport,
 }
@@ -22,7 +22,7 @@ enum ValueCheckEvidence<'a> {
 impl<'a> ValueCheckEvidence<'a> {
     fn step(
         self,
-        f: impl FnOnce(&'a JudgedExpr) -> Result<&'a JudgedExpr, MissingEvidence>,
+        f: impl FnOnce(OrdinaryJudgedExpr<'a>) -> Result<OrdinaryJudgedExpr<'a>, MissingEvidence>,
     ) -> Result<Self, MissingEvidence> {
         match self {
             Self::Authored(expression) => f(expression).map(Self::Authored),
@@ -43,15 +43,16 @@ pub(crate) fn admit_function_expression(
     expression: &JudgedExpr,
     expected: &TypeExpr,
     config: &ProviderContext,
-) -> Result<crate::parser::retained::ExpressionAdmission, FunctionExpressionError> {
-    let sink = super::resolve_type_expr(expected, config)?;
+) -> Result<crate::parser::retained::ExpressionAdmission, SinkRejection<FunctionExpressionError>> {
+    let sink = super::resolve_type_expr(expected, config)
+        .map_err(|error| SinkRejection::Ordinary(FunctionExpressionError::Annotation(error)))?;
     crate::parser::retained::admit_with_context(
         expression,
         &sink,
         crate::parser::retained::AdmissionContext::Function,
         config,
     )
-    .map_err(Into::into)
+    .map_err(|error| error.map_ordinary(Into::into))
 }
 
 /// Provider authority available to internal value-checking pipelines.
@@ -121,7 +122,7 @@ impl<'a> TypecheckProviderContext<'a> {
         self,
         expected: &TypeExpr,
         value: &Value<P, B>,
-        inference: &JudgedExpr,
+        inference: OrdinaryJudgedExpr<'_>,
     ) -> Result<(), TypeExprValueError> {
         let check = check_type_expr_value_inner(expected, value, self, inference);
         if let Self::Session(session) = self
@@ -136,7 +137,7 @@ impl<'a> TypecheckProviderContext<'a> {
         self,
         expected: &TypeExpr,
         value: &Value<P, B>,
-        inference: &JudgedExpr,
+        inference: OrdinaryJudgedExpr<'_>,
         site: super::deferred_types::ProviderTypeCheckSite,
     ) -> Result<(), TypeExprValueError> {
         let check = check_type_expr_value_inner(expected, value, self, inference);
@@ -156,7 +157,7 @@ impl<'a> TypecheckProviderContext<'a> {
         self,
         expected: &TypeExpr,
         value: &Value<P, B>,
-        expression: &JudgedExpr,
+        expression: OrdinaryJudgedExpr<'_>,
         site: super::deferred_types::ProviderTypeCheckSite,
     ) -> Result<(), TypeExprValueError> {
         let check = check_type_expr_value_inner_with_mode(
@@ -590,7 +591,7 @@ pub fn check_type_expr_value<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
     config: &'s LoadedProviderContext,
-    inference: &JudgedExpr,
+    inference: OrdinaryJudgedExpr<'_>,
 ) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner_with_mode(
         expected,
@@ -610,7 +611,7 @@ pub fn check_type_expr_value_providerless<'s, P: PlaceholderKind, B: BindingAddr
     expected: &TypeExpr,
     value: &Value<P, B>,
     config: &'s ProviderContext,
-    inference: &JudgedExpr,
+    inference: OrdinaryJudgedExpr<'_>,
 ) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner_with_mode(
         expected,
@@ -631,7 +632,7 @@ fn check_type_expr_value_inner<'s, P: PlaceholderKind, B: BindingAddress>(
     expected: &TypeExpr,
     value: &Value<P, B>,
     config: TypecheckProviderContext<'s>,
-    inference: &JudgedExpr,
+    inference: OrdinaryJudgedExpr<'_>,
 ) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner_with_mode(
         expected,
@@ -707,9 +708,9 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
         return check_constraint_value(expected, value, config, inference, provider_custom_types);
     };
     let expression = expression.for_sink(expected, config);
-    let inference = ValueCheckEvidence::Authored(&expression);
-    let admission = crate::parser::retained::admit_with_context(
-        &expression,
+    let inference = ValueCheckEvidence::Authored(expression.source());
+    let admission = crate::parser::retained::admit_ordinary_with_context(
+        expression.source(),
         expected,
         crate::parser::retained::AdmissionContext::Assignment,
         config,
@@ -1194,7 +1195,7 @@ pub(crate) fn check_type_expr_value_with_context<'s, P: PlaceholderKind, B: Bind
     expected: &TypeExpr,
     value: &Value<P, B>,
     config: TypecheckProviderContext<'s>,
-    inference: &JudgedExpr,
+    inference: OrdinaryJudgedExpr<'_>,
 ) -> TypeExprValueCheck<'s> {
     check_type_expr_value_inner(expected, value, config, inference)
 }
@@ -1427,7 +1428,7 @@ mod tests {
             expected,
             value,
             TypecheckProviderContext::for_parser(&config),
-            &missing,
+            missing.ordinary().unwrap(),
         )
         .require_provider_schemas()
     }
@@ -1446,7 +1447,7 @@ mod tests {
             expected,
             &loaded.parsed().variables["result"],
             TypecheckProviderContext::for_parser(&config),
-            expression,
+            expression.ordinary().unwrap(),
         )
         .require_provider_schemas()
     }
@@ -1482,7 +1483,9 @@ mod tests {
             expected,
             value,
             TypecheckProviderContext::for_parser(config),
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         )
         .require_provider_schemas()
     }
@@ -1522,7 +1525,7 @@ mod tests {
             &expected,
             &parsed.variables["constructed"],
             TypecheckProviderContext::for_parser(&config),
-            report.expression(location).unwrap(),
+            (report.expression(location).unwrap()).ordinary().unwrap(),
         )
         .require_provider_schemas()
         .is_ok();
@@ -1550,7 +1553,9 @@ mod tests {
                 &sink,
                 &parsed.variables[name],
                 TypecheckProviderContext::for_parser(&config),
-                report.binding(&RelativeBindingName::new(name)).unwrap(),
+                (report.binding(&RelativeBindingName::new(name)).unwrap())
+                    .ordinary()
+                    .unwrap(),
             )
             .require_provider_schemas();
             assert!(result.is_ok(), "{name}: {result:?}");
@@ -1602,7 +1607,9 @@ mod tests {
                 expected,
                 value,
                 &config,
-                &crate::parser::retained::value_dependent_judgement_for_test(),
+                crate::parser::retained::value_dependent_judgement_for_test()
+                    .ordinary()
+                    .unwrap(),
             )
         };
         let value = Value::Concrete(ConcreteValue::Int(3));
@@ -1661,13 +1668,17 @@ mod tests {
             &expected,
             &value,
             TypecheckProviderContext::for_parser(&config),
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         );
         let providerless = check_type_expr_value_providerless(
             &expected,
             &value,
             &config,
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         );
         assert_eq!(providerless, unloaded);
         assert!(
@@ -1702,7 +1713,9 @@ mod tests {
                         &expected,
                         &value,
                         &config,
-                        &crate::parser::retained::value_dependent_judgement_for_test(),
+                        crate::parser::retained::value_dependent_judgement_for_test()
+                            .ordinary()
+                            .unwrap(),
                     ),
                     TypeExprValueCheck::Mismatch(_)
                 ),
@@ -1729,7 +1742,9 @@ mod tests {
             &expected,
             &string("account"),
             &config,
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         );
         assert!(
             matches!(&result, TypeExprValueCheck::Mismatch(_)),
@@ -1921,14 +1936,18 @@ mod tests {
             &expected,
             &value,
             TypecheckProviderContext::for_parser(&config),
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         )
         .require_provider_schemas();
         let providerless = check_type_expr_value_providerless(
             &expected,
             &value,
             &config,
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         );
 
         assert!(matches!(unloaded,
@@ -1962,7 +1981,9 @@ mod tests {
                 TypecheckProviderContext::for_session(session).check(
                     expected,
                     value,
-                    &crate::parser::retained::value_dependent_judgement_for_test(),
+                    crate::parser::retained::value_dependent_judgement_for_test()
+                        .ordinary()
+                        .unwrap(),
                 )
             },
         )

@@ -1967,6 +1967,97 @@ async fn run_apply_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_>,
 ) -> Result<(), AppError> {
+    run_apply_using(
+        ApplyInvocation {
+            runtime,
+            project,
+            project_argument,
+            auto_approve,
+            lock,
+            parallelism,
+            accept_legacy_name_overrides,
+            provider_context,
+            cancel,
+            observer_factory,
+        },
+        |runtime, providers, directory| {
+            ProviderLoad::load(
+                runtime,
+                providers,
+                directory,
+                &mut crate::commands::human_provider_notices(runtime.color_mode()),
+            )
+        },
+    )
+    .await
+}
+
+/// Exercise the complete apply pipeline with native mock factories, including
+/// validation, backend locking, final-input admission, dispatch and writeback.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn run_apply_with_factories_for_test(
+    runtime: &crate::runtime::CommandRuntime,
+    path: &Path,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+) -> Result<(), AppError> {
+    let project = ResolvedPath::new(path).map_err(|error| AppError::Config(error.to_string()))?;
+    let context = ProviderContext::new(runtime.environment().clone());
+    run_apply_using(
+        ApplyInvocation {
+            runtime,
+            project: &project,
+            project_argument: path,
+            auto_approve: true,
+            lock: true,
+            parallelism: crate::DEFAULT_PARALLELISM,
+            accept_legacy_name_overrides: false,
+            provider_context: &context,
+            cancel: ShutdownToken::running(),
+            observer_factory: &cli_observer_factory,
+        },
+        move |runtime, providers, _| {
+            Ok(ProviderLoad::for_test_with_provider_phase(
+                runtime, factories, providers,
+            ))
+        },
+    )
+    .await
+}
+
+struct ApplyInvocation<'a, 'observer> {
+    runtime: &'a crate::runtime::CommandRuntime,
+    project: &'a ResolvedPath,
+    project_argument: &'a Path,
+    auto_approve: bool,
+    lock: bool,
+    parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
+    provider_context: &'a ProviderContext,
+    cancel: ShutdownToken,
+    observer_factory: &'a ObserverFactory<'observer>,
+}
+
+/// The production apply command, with the same provider-loading seam as plan.
+async fn run_apply_using(
+    invocation: ApplyInvocation<'_, '_>,
+    load_providers: impl FnOnce(
+        &crate::runtime::CommandRuntime,
+        &[carina_core::parser::ProviderConfig<carina_core::resource::ParserPlaceholder>],
+        &ResolvedPath,
+    ) -> Result<ProviderLoad, AppError>,
+) -> Result<(), AppError> {
+    let ApplyInvocation {
+        runtime,
+        project,
+        project_argument,
+        auto_approve,
+        lock,
+        parallelism,
+        accept_legacy_name_overrides,
+        provider_context,
+        cancel,
+        observer_factory,
+    } = invocation;
     let path = project_argument;
     let loaded = load_configuration_with_config(
         project,
@@ -1979,12 +2070,7 @@ async fn run_apply_with_observer_factory(
     let backend_file = loaded.backend_file;
 
     let base_dir = project;
-    let providers = ProviderLoad::load(
-        runtime,
-        &parsed.providers,
-        base_dir,
-        &mut crate::commands::human_provider_notices(runtime.color_mode()),
-    )?;
+    let providers = load_providers(runtime, &parsed.providers, base_dir)?;
     let validated_config = providers.validate_config_pair(
         parsed,
         loaded.unresolved_parsed,

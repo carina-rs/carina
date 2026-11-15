@@ -6,20 +6,34 @@ type UseIdentity = (NodeId, UseId, ExpansionInstanceId, ProjectionGeneration);
 /// Keeping both streams in this bundle makes every existing container/union
 /// transfer carry them together. The empty case allocates nothing.
 #[derive(Clone, Default)]
-pub(super) struct SupplementalFindings(Option<Box<SupplementalData>>);
+pub(super) struct SupplementalFindings<C = crate::ConversionChannel>(
+    Option<Box<SupplementalData<C>>>,
+);
 
 #[derive(Clone, Default)]
-pub(super) struct SupplementalData {
-    pub(super) authored: AssignmentFindings,
+pub(super) struct SupplementalData<C = crate::ConversionChannel> {
+    pub(super) authored: AssignmentFindings<C>,
     pub(super) references: RecoveredReferences,
 }
 
-impl From<AssignmentFindings> for SupplementalFindings {
-    fn from(authored: AssignmentFindings) -> Self {
+impl<C: FindingsChannel> From<AssignmentFindings<C>> for SupplementalFindings<C> {
+    fn from(authored: AssignmentFindings<C>) -> Self {
         if authored.local.is_empty()
             && authored.schema.is_empty()
             && authored.errors.is_empty()
-            && authored.deferred.is_empty()
+            && authored.conversions.findings().is_empty()
+            && authored.claim_effect == ClaimEffect::None
+            && !authored.matched_destination
+            && {
+                #[cfg(test)]
+                {
+                    authored.deferred.is_empty()
+                }
+                #[cfg(not(test))]
+                {
+                    true
+                }
+            }
         {
             return Self::default();
         }
@@ -30,8 +44,8 @@ impl From<AssignmentFindings> for SupplementalFindings {
     }
 }
 
-impl SupplementalFindings {
-    fn data(&mut self) -> &mut SupplementalData {
+impl<C: FindingsChannel> SupplementalFindings<C> {
+    fn data(&mut self) -> &mut SupplementalData<C> {
         self.0.get_or_insert_with(Default::default)
     }
 
@@ -44,17 +58,27 @@ impl SupplementalFindings {
         data.references.0.extend(other.references.0);
     }
 
-    pub(super) fn into_parts(self) -> SupplementalData {
+    pub(super) fn into_parts(self) -> SupplementalData<C> {
         self.0.map(|data| *data).unwrap_or_default()
     }
 
-    pub(super) fn finish<P: ValueKind, B: BindingAddress>(
-        &mut self,
-        callbacks: &WalkCallbacks<'_, P, B>,
-    ) {
-        if let Some(data) = &mut self.0 {
-            callbacks.finish(&mut data.authored);
-        }
+    pub(super) fn claim_effect(&self) -> ClaimEffect {
+        self.0
+            .as_ref()
+            .map_or(ClaimEffect::None, |data| data.authored.claim_effect)
+    }
+    pub(super) fn matched_destination(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|data| data.authored.matched_destination)
+    }
+    pub(super) fn policy_errors(&self) -> &[(LeafPath, TypeError)] {
+        self.0.as_ref().map_or(&[], |data| &data.authored.errors)
+    }
+    pub(super) fn conversion_errors(&self) -> &[crate::ConversionError] {
+        self.0
+            .as_ref()
+            .map_or(&[], |data| data.authored.conversions.findings())
     }
 
     fn recover(&mut self, identity: UseIdentity, path: &FieldPath, error: TypeError) {
@@ -66,7 +90,18 @@ impl SupplementalFindings {
     }
 }
 
-impl InsideSecret for SupplementalFindings {
+impl<C: FindingsChannel> SupplementalFindings<C> {
+    pub(super) fn finish<P: ValueKind, B: BindingAddress, M: WalkMode<Channel = C>>(
+        &mut self,
+        callbacks: &WalkCallbacks<'_, P, B, M>,
+    ) {
+        if let Some(data) = &mut self.0 {
+            callbacks.finish(&mut data.authored);
+        }
+    }
+}
+
+impl<C: FindingsChannel> InsideSecret for SupplementalFindings<C> {
     fn inside_secret(self) -> Self {
         Self(self.0.map(|data| {
             Box::new(SupplementalData {
@@ -143,65 +178,92 @@ fn protect_reference_error(error: TypeError) -> TypeError {
 
 // A thin policy reference fits in the function pointer's unused vtable word.
 // Ordinary callbacks and their transport retain main's layout and ownership.
-pub(super) enum OrdinaryCheck<'a, P: ValueKind, B: BindingAddress> {
-    Direct(AssignmentCheck<'a, P, B>),
-    References(&'a ReferencePolicy<'a, P, B>),
+pub(super) enum OrdinaryCheck<'a, P: ValueKind, B: BindingAddress, C = crate::ConversionChannel> {
+    Direct(ProvenAssignmentCheck<'a, P, B, C>),
+    #[cfg(test)]
+    Observer(AssignmentCheck<'a, P, B, C>),
+    References(&'a ReferencePolicy<'a, P, B, C>),
 }
-impl<P: ValueKind, B: BindingAddress> Copy for OrdinaryCheck<'_, P, B> {}
-impl<P: ValueKind, B: BindingAddress> Clone for OrdinaryCheck<'_, P, B> {
+impl<P: ValueKind, B: BindingAddress, C> Copy for OrdinaryCheck<'_, P, B, C> {}
+impl<P: ValueKind, B: BindingAddress, C> Clone for OrdinaryCheck<'_, P, B, C> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<'a, P: ValueKind, B: BindingAddress> OrdinaryCheck<'a, P, B> {
-    pub(super) fn callback(self) -> AssignmentCheck<'a, P, B> {
+impl<'a, P: ValueKind, B: BindingAddress, C> OrdinaryCheck<'a, P, B, C> {
+    pub(super) fn call(
+        self,
+        attr: &CompiledAttributeType,
+        value: CheckValue<'_, P, B>,
+        path: &LeafPath,
+        cursor: AuthoredCursor<'_, B>,
+        proof: crate::parser::retained::NoConversion,
+    ) -> Result<AssignmentFindings<C>, TypeError> {
         match self {
-            Self::Direct(check) => check,
-            Self::References(policy) => policy.ordinary,
+            Self::Direct(check) => check(attr, value, path, cursor, proof),
+            #[cfg(test)]
+            Self::Observer(check) => check(attr, value, path, cursor),
+            Self::References(policy) => policy.ordinary.call(attr, value, path, cursor, proof),
         }
     }
 }
 
-pub(super) struct ReferencePolicy<'a, P: ValueKind, B: BindingAddress> {
-    ordinary: AssignmentCheck<'a, P, B>,
+#[cfg(test)]
+impl<'a, P: ValueKind, B: BindingAddress, C, F> From<&'a F> for OrdinaryCheck<'a, P, B, C>
+where
+    F: Fn(
+        &CompiledAttributeType,
+        CheckValue<'_, P, B>,
+        &LeafPath,
+        AuthoredCursor<'_, B>,
+    ) -> Result<AssignmentFindings<C>, TypeError>,
+{
+    fn from(callback: &'a F) -> Self {
+        Self::Observer(callback)
+    }
+}
+
+pub(super) struct ReferencePolicy<'a, P: ValueKind, B: BindingAddress, C = crate::ConversionChannel>
+{
+    ordinary: OrdinaryCheck<'a, P, B, C>,
     schema_source: &'a dyn Fn(&B) -> bool,
     reference: ReferenceJudge<'a, B>,
     scopes: std::cell::RefCell<Vec<UseIdentity>>,
 }
-impl<'a, P: ValueKind, B: BindingAddress> ReferencePolicy<'a, P, B> {
+impl<'a, P: ValueKind, B: BindingAddress, C> ReferencePolicy<'a, P, B, C> {
     pub(super) fn new(
-        ordinary: AssignmentCheck<'a, P, B>,
+        ordinary: impl Into<OrdinaryCheck<'a, P, B, C>>,
         reference: ReferenceCheck<'a, B>,
     ) -> Self {
         Self {
-            ordinary,
+            ordinary: ordinary.into(),
             schema_source: reference.schema_source,
             reference: reference.check,
             scopes: Default::default(),
         }
     }
-    fn enter(&self, identity: UseIdentity) -> ScopeGuard<'_, 'a, P, B> {
+    fn enter(&self, identity: UseIdentity) -> ScopeGuard<'_, 'a, P, B, C> {
         // Qualification excludes an identity already being judged. Establish
         // the declaration's scope before any ordinary union-member trial.
         self.scopes.borrow_mut().push(identity);
         ScopeGuard { policy: self }
     }
 }
-struct ScopeGuard<'s, 'a, P: ValueKind, B: BindingAddress> {
-    policy: &'s ReferencePolicy<'a, P, B>,
+struct ScopeGuard<'s, 'a, P: ValueKind, B: BindingAddress, C> {
+    policy: &'s ReferencePolicy<'a, P, B, C>,
 }
-impl<P: ValueKind, B: BindingAddress> Drop for ScopeGuard<'_, '_, P, B> {
+impl<P: ValueKind, B: BindingAddress, C> Drop for ScopeGuard<'_, '_, P, B, C> {
     fn drop(&mut self) {
         self.policy.scopes.borrow_mut().pop();
     }
 }
 
 #[derive(Default)]
-pub(super) struct ReferenceMemo<'a>(
-    std::cell::RefCell<HashMap<CheckedNode<'a>, std::rc::Rc<CheckedValue<'a>>>>,
+pub(super) struct ReferenceMemo<'a, M: WalkMode = NoAuthored>(
+    std::cell::RefCell<HashMap<CheckedNode<'a>, std::rc::Rc<WalkCheckedValue<'a, M>>>>,
 );
 
-impl<'a> ValueValidator<'a, '_> {
+impl<'a, M: WalkMode> ValueValidator<'a, '_, M> {
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     pub(super) fn walk_reference<
@@ -217,10 +279,10 @@ impl<'a> ValueValidator<'a, '_> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-        assignment: Option<&AssignmentWalk<'w, P, B>>,
-        extra: &mut AssignmentProbe,
+        assignment: Option<&WalkHandle<'w, P, B, M>>,
+        extra: &mut AssignmentProbe<M::Channel>,
         wrappers: &mut Vec<AuthoredCursor<'w, B>>,
-    ) -> Option<std::rc::Rc<CheckedValue<'a>>>
+    ) -> Option<std::rc::Rc<WalkCheckedValue<'a, M>>>
     where
         'a: 'w,
     {
@@ -228,6 +290,10 @@ impl<'a> ValueValidator<'a, '_> {
             return None;
         };
         let walk = assignment?;
+        // A wrapper's claim reaches its leaf through prepare; child steps reset it.
+        if walk.claim.is_claimed() {
+            return None;
+        }
         let OrdinaryCheck::References(policy) = walk.callbacks.ordinary else {
             return None;
         };
