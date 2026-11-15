@@ -66,13 +66,8 @@ pub enum InferenceBinding<
     Argument {
         type_expr: TypeExpr,
     },
-    /// A user-defined function whose call may remain deferred until provider
-    /// schemas are available. Its annotation is still enough authority to
-    /// infer an export without evaluating the call or dropping its pending
-    /// argument checks.
-    UserFunction {
-        return_type: Option<TypeExpr>,
-    },
+    /// A user-defined function binding. Authored syntax retains its signature.
+    UserFunction,
 }
 
 pub type InferenceBindings<P = NoPlaceholder, B = RelativeBindingName> =
@@ -122,9 +117,7 @@ where
     }
     for function in parsed.user_functions.values() {
         out.entry(function.name.clone())
-            .or_insert_with(|| InferenceBinding::UserFunction {
-                return_type: function.return_type.clone(),
-            });
+            .or_insert(InferenceBinding::UserFunction);
     }
     out
 }
@@ -1231,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_arithmetic_requires_proven_operands_but_accepts_typed_deferred_ints() {
+    fn integer_arithmetic_accepts_declared_and_resource_int_operands() {
         assert_eq!(
             judged_binding_type(
                 "arguments { source: Int }\nlet value = source + 1\nlet result = value",
@@ -1262,6 +1255,38 @@ mod tests {
             ),
             Ok(TypeExpr::Int)
         );
+    }
+
+    #[test]
+    fn self_referential_resource_attribute_uses_schema_type() {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            PatternResourceSchema::new("clock.Source")
+                .attribute(
+                    PatternAttributeSchema::optional("seconds", PatternAttributeType::int())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "let source = test.clock.Source { seconds = source.seconds }\nlet result = source.seconds",
+            std::path::Path::new("inference.crn"),
+            &context,
+        )
+        .unwrap();
+        let report = crate::parser::retained::judge_expressions(&parsed, &schemas, &context);
+
+        assert_eq!(
+            report
+                .binding(&RelativeBindingName::new("result"))
+                .unwrap()
+                .static_type(),
+            Ok(&TypeExpr::Int),
+        );
+        assert!(report.findings().is_empty());
     }
 
     #[test]
@@ -1371,6 +1396,23 @@ mod tests {
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert_eq!(r, Ok(TypeExpr::String));
+    }
+
+    #[test]
+    fn lookup_and_string_list_is_not_inferable() {
+        let inferred = judged_binding_type(
+            "let result = [lookup({ a = 'one' }, 'a', 'default'), 'extra']",
+            &SchemaRegistry::new(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        );
+        assert_eq!(
+            inferred,
+            Err(InferenceIssue::NotInferable(
+                NotInferableReason::ValueDependent {
+                    reason: "builtin return type depends on arguments".into(),
+                }
+            ))
+        );
     }
 
     #[test]
@@ -2124,10 +2166,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         );
     }
 
-    /// Convenience for the `Virtual`-binding cycle tests below.
-
     #[test]
-    fn virtual_binding_two_unrelated_visits_do_not_false_positive() {
+    fn sibling_map_field_references_infer_list_string() {
         let r = judged_binding_type(
             "let a = { x = 'hi' }\nlet b = { y = 'there' }\nlet result = [a.x,b.y]",
             &SchemaRegistry::new(),
@@ -2136,7 +2176,7 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         assert_eq!(
             r,
             Ok(TypeExpr::List(Box::new(TypeExpr::String))),
-            "sibling Virtual visits must not trigger a false cycle"
+            "sibling map field references must infer list(String)"
         );
     }
 }

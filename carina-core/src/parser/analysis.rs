@@ -3036,11 +3036,9 @@ where
                 });
         }
         for function in self.functions.values() {
-            bindings.entry(function.name.clone()).or_insert_with(|| {
-                InferenceBinding::UserFunction {
-                    return_type: function.return_type.clone(),
-                }
-            });
+            bindings
+                .entry(function.name.clone())
+                .or_insert(InferenceBinding::UserFunction);
         }
         bindings
     }

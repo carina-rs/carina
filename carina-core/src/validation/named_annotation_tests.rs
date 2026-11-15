@@ -1642,40 +1642,6 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
 }
 
 #[test]
-fn authored_function_calls_retain_dotted_return_annotations() {
-    let snapshot = snapshot(vec![("p", vec![member(1, 64, None), member(1, 128, None)])]);
-    let context = snapshot.provider_context().as_provider_context();
-    let declared = TypeExpr::DottedUnresolved(ResourceTypePath::new("aws", "iam.Role.Name"));
-    for (expression, expected) in [
-        ("first() ?? second()", declared.clone()),
-        (
-            "[first(), second()]",
-            TypeExpr::List(Box::new(declared.clone())),
-        ),
-        (
-            "{ a = first() b = second() }",
-            TypeExpr::Map(Box::new(declared.clone())),
-        ),
-        ("if flag { first() } else { second() }", declared),
-    ] {
-        let mut parsed = crate::parser::parse(&format!("arguments {{ flag: Bool }}\nlet source = p.Values {{}}\nfn first(): aws.iam.Role.Name {{ source.value0 }}\nfn second(): aws.iam.Role.Name {{ source.value1 }}\nlet result = {expression}\n"), context).unwrap();
-        deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
-            resolve_file_type_exprs_report(&mut parsed, session, None)
-        })
-        .unwrap();
-        let report = crate::parser::retained::judge_expressions(
-            &parsed,
-            snapshot.schema_registry(),
-            context,
-        );
-        let inferred = report
-            .binding(&crate::resource::RelativeBindingName::new("result"))
-            .unwrap();
-        assert_eq!(inferred.static_type(), Ok(&expected), "{expression}");
-    }
-}
-
-#[test]
 fn every_boundary_admits_same_identity_member_restrictions() {
     let snapshot = snapshot(vec![("p", vec![member(1, 128, None), member(1, 64, None)])]);
     let context = snapshot.provider_context().as_provider_context();

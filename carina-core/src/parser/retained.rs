@@ -5420,7 +5420,7 @@ mod judgement {
                         Some(InferenceBinding::Resource { .. }) | None => {
                             N::SchemaAttributeReference
                         }
-                        Some(InferenceBinding::UserFunction { .. }) => N::FunctionParameter,
+                        Some(InferenceBinding::UserFunction) => N::FunctionParameter,
                     };
                     E::NonCrossed(cut)
                 }
