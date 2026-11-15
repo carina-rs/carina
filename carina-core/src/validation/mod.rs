@@ -1295,7 +1295,6 @@ fn deferred_value_mismatch<B: BindingAddress>(
     source: ValueSource<'_, B>,
     expression: &crate::parser::retained::JudgedExprData,
     target: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
-    schemas: &SchemaRegistry,
     bindings: &BindingIndex<'_, B>,
     authored_binding: &str,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
@@ -1311,7 +1310,6 @@ fn deferred_value_mismatch<B: BindingAddress>(
                     },
                     expression,
                     target,
-                    schemas,
                     bindings,
                     authored_binding,
                     diagnostic_path,
@@ -1364,7 +1362,7 @@ fn deferred_value_mismatch<B: BindingAddress>(
             | crate::resource::DeferredValue::Secret(_)
             | crate::resource::DeferredValue::Unknown(_)
             | crate::resource::DeferredValue::Placeholder(_),
-        ) => check_deferred_access_type(value, target, expression, schemas, bindings)
+        ) => check_deferred_access_type(value, target, expression, bindings)
             .err()
             .map(|error| match error {
                 DeferredAccessTypeError::TypeMismatch {
@@ -1524,7 +1522,6 @@ fn precheck_value_source<B: BindingAddress>(
         },
         &expression,
         target,
-        context.schemas,
         &context.scope_bindings,
         &use_site.name,
         diagnostic_path,
@@ -3114,7 +3111,6 @@ pub fn check_deferred_access_type<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
     expression: &crate::parser::retained::JudgedExprData,
-    _schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), DeferredAccessTypeError> {
     let value = expression.assignment_value(value);
