@@ -401,7 +401,7 @@ async fn github_round3_lost_delete_transport_reply_recovers_in_the_same_call() {
                 let mut store = fake.0.lock().unwrap();
                 store.after_commit_error = Some(GitHubError::Transport {
                     kind: "lost delete reply",
-                    source: reqwest::Client::new()
+                    error: reqwest::Client::new()
                         .get("http://[invalid")
                         .build()
                         .unwrap_err(),
@@ -1654,7 +1654,7 @@ async fn github_readiness_confirms_archived_storage_is_unavailable_and_transport
         ) -> Result<GitHubResponse, GitHubError> {
             Err(GitHubError::Transport {
                 kind: "offline failure",
-                source: reqwest::Client::new()
+                error: reqwest::Client::new()
                     .get("http://[invalid")
                     .build()
                     .unwrap_err(),
@@ -1669,7 +1669,7 @@ async fn github_readiness_confirms_archived_storage_is_unavailable_and_transport
     assert!(backend.read_state().await.is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn github_cleanup_protocol_fits_the_flush_budget_with_fifty_ms_transport_latency() {
     let fake = Fake::default();
     fake.put("state.json", serde_json::to_vec(&StateFile::new()).unwrap());
@@ -2241,7 +2241,7 @@ async fn github_round2_committed_rate_limit_retry_conflict_is_already_applied() 
 async fn github_round2_lost_acquire_response_recovers_our_exact_lease() {
     let error = GitHubError::Transport {
         kind: "lost response",
-        source: reqwest::Client::new()
+        error: reqwest::Client::new()
             .get("http://[invalid")
             .build()
             .unwrap_err(),
@@ -2350,7 +2350,7 @@ async fn github_round2_deleted_state_update_reports_conflict_and_keeps_created_s
     backend.write_state(&state).await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn github_round2_fake_matches_deleted_sha_create_and_existing_missing_sha_validation() {
     let fake = Fake::default();
     fake.put("state.json", b"old".to_vec());
@@ -2525,14 +2525,11 @@ async fn github_round2_diagnostics_redact_queries_in_every_response_url_field() 
     fake.0.lock().unwrap().remove_before_mutation = true;
     let error = backend.renew_lock(&lock).await.unwrap_err();
     assert!(matches!(&error, BackendError::LockNotHeld(_)));
-    assert!(
-        BACKEND_LOGS
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|line| { line.contains("GitHub recreated lease cleanup could not be confirmed") })
-    );
+    assert!(BACKEND_LOGS.0.lock().unwrap().iter().any(|line| {
+        line.contains("GitHub recreated lease cleanup could not be confirmed")
+            && line.matches("cleanup failed").count() == 1
+            && line.contains("HTTP 503")
+    }));
     assert_safe_response_diagnostics(&error, &["cleanup-raw-secret"]);
 }
 
@@ -3365,7 +3362,7 @@ async fn github_round5_committed_delete_server_error_keeps_pending_release_until
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn github_round5_empty_tree_root_proves_absence_before_the_first_write() {
     for raw in [false, true] {
         let fake = Fake::default();
@@ -3536,6 +3533,156 @@ async fn github_round4_mutation_rate_limits_keep_the_round2_classification() {
             assert!(
                 matches!(error, BackendError::GitHub(GitHubError::RateLimited { status: found, .. }) if found == status)
             );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn github_round10_large_cleanup_reconciliation_never_downloads_raw_state() {
+    for status in [409, 422, 503] {
+        for committed in [false, true] {
+            for locked in [false, true] {
+                let fake = Fake::default();
+                let mut state = StateFile::new();
+                state.carina_version = "x".repeat(1_000_001);
+                fake.put("state.json", serde_json::to_vec(&state).unwrap());
+                let backend = fake.published_backend();
+                backend.read_state().await.unwrap();
+                let lock = if locked {
+                    Some(backend.acquire_lock("apply").await.unwrap())
+                } else {
+                    None
+                };
+                {
+                    let mut store = fake.0.lock().unwrap();
+                    store.requests.clear();
+                    let response = reply(status, json!({"message":"temporary failure"}));
+                    if committed {
+                        store.after_commit_response = Some(response);
+                    } else {
+                        store.mutation_response = Some(response);
+                    }
+                }
+                state.serial = 1;
+                let result = if let Some(lock) = &lock {
+                    backend.write_state_locked_for_cleanup(&state, lock).await
+                } else {
+                    backend.write_state_for_cleanup(&state).await
+                };
+                if committed || status == 409 {
+                    result.unwrap();
+                    assert_eq!(
+                        fake.bytes("state.json").unwrap(),
+                        carina_core::utils::pretty_with_newline_bytes(&state).unwrap()
+                    );
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(BackendError::GitHub(GitHubError::Api { status: code, .. }))
+                            if code == status
+                    ));
+                }
+                let store = fake.0.lock().unwrap();
+                assert!(
+                    store.requests.iter().all(|r| r.accept != RAW_MEDIA_TYPE),
+                    "status={status}, committed={committed}, locked={locked}"
+                );
+                assert!(store.requests.iter().any(|r| {
+                    r.method == Method::Get
+                        && r.path.ends_with("/contents/state.json")
+                        && r.reference
+                            .as_ref()
+                            .is_some_and(|sha| store.history.contains_key(sha))
+                }));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn github_round10_mismatched_lease_ack_retains_uncertainty_and_recovers_exact_bytes() {
+    for operation in ["create", "takeover", "renew"] {
+        for successor in [false, true] {
+            let fake = Fake::default();
+            let backend = fake.backend();
+            if operation == "takeover" {
+                let expired = LockInfo::with_timeout("expired", -1);
+                fake.put("state.json.lock", serde_json::to_vec(&expired).unwrap());
+            }
+            let held = if operation == "renew" {
+                Some(backend.acquire_lock("apply").await.unwrap())
+            } else {
+                None
+            };
+            fake.0.lock().unwrap().wrong_blob_sha = true;
+            let result = if let Some(lock) = &held {
+                backend.renew_lock(lock).await
+            } else {
+                backend.acquire_lock("apply").await
+            };
+            assert!(matches!(
+                result,
+                Err(BackendError::GitHub(GitHubError::UnexpectedOutcome { .. }))
+            ));
+            let sent = fake.bytes("state.json.lock").unwrap();
+            assert!(
+                backend.pending_lease.lock().unwrap().is_some(),
+                "{operation}"
+            );
+            fake.0.lock().unwrap().wrong_blob_sha = false;
+            if successor {
+                let other = LockInfo::new("successor");
+                fake.put("state.json.lock", serde_json::to_vec(&other).unwrap());
+            }
+            fake.0.lock().unwrap().requests.clear();
+            let recovered = backend.acquire_lock("apply").await;
+            if successor {
+                assert!(matches!(recovered, Err(BackendError::Locked { .. })));
+                assert!(backend.pending_lease.lock().unwrap().is_some());
+            } else {
+                assert_eq!(serde_json::to_vec(&recovered.unwrap()).unwrap(), sent);
+                assert!(backend.pending_lease.lock().unwrap().is_none());
+            }
+            assert!(
+                fake.0
+                    .lock()
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .all(|r| r.method == Method::Get)
+            );
+        }
+    }
+}
+
+#[test]
+fn github_round10_request_ids_render_without_option_debug() {
+    for request_id in [None, Some("request-123".to_string())] {
+        for error in [
+            GitHubError::Api {
+                status: 503,
+                body: "unavailable".into(),
+                request_id: request_id.clone(),
+            },
+            GitHubError::Contention {
+                attempts: 5,
+                message: "branch moved".into(),
+                request_id: request_id.clone(),
+            },
+        ] {
+            let display = error.to_string();
+            assert!(
+                !display.contains("Some(") && !display.contains("None"),
+                "{display}"
+            );
+            if let Some(id) = &request_id {
+                assert!(
+                    display.ends_with(&format!("(request ID: {id})")),
+                    "{display}"
+                );
+            } else {
+                assert!(!display.contains("request ID"), "{display}");
+            }
         }
     }
 }

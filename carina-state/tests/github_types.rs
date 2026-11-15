@@ -22,7 +22,7 @@ fn github_round1_url_variant_is_constructible_with_validated_fields() {
 }
 
 #[test]
-fn github_round1_credential_errors_keep_distinct_types_and_sources() {
+fn github_credential_errors_keep_distinct_types_and_terminal_details() {
     use carina_core::github_auth::GitHubTokenError;
     use carina_state::GitHubError;
     use std::error::Error;
@@ -30,6 +30,7 @@ fn github_round1_credential_errors_keep_distinct_types_and_sources() {
         (GitHubTokenError::Deadline, true),
         (GitHubTokenError::Unavailable, false),
     ] {
+        let detail = error.to_string();
         let mapped = GitHubError::from(error);
         assert_eq!(
             matches!(mapped, GitHubError::CredentialsDeadline { .. }),
@@ -39,13 +40,9 @@ fn github_round1_credential_errors_keep_distinct_types_and_sources() {
             matches!(mapped, GitHubError::CredentialsUnavailable { .. }),
             !deadline
         );
-        assert!(
-            mapped
-                .source()
-                .and_then(|source| source.downcast_ref::<GitHubTokenError>())
-                .is_some()
-        );
+        assert!(mapped.source().is_none());
         let message = mapped.to_string();
+        assert_eq!(message.matches(&detail).count(), 1, "{message}");
         assert!(
             message.contains("gh auth token --hostname github.com"),
             "{message}"
@@ -62,16 +59,15 @@ fn github_round1_credential_errors_keep_distinct_types_and_sources() {
 }
 
 #[test]
-fn github_round4_invalid_token_error_keeps_its_typed_source() {
+fn github_invalid_token_error_renders_its_terminal_detail_once() {
     use carina_core::github_auth::GitHubTokenError;
     use carina_state::GitHubError;
     use std::error::Error;
+    let detail = GitHubTokenError::InvalidCharacters.to_string();
     let error = GitHubError::from(GitHubTokenError::InvalidCharacters);
     assert!(matches!(error, GitHubError::CredentialsUnavailable { .. }));
-    assert!(matches!(
-        error.source().unwrap().downcast_ref::<GitHubTokenError>(),
-        Some(GitHubTokenError::InvalidCharacters)
-    ));
+    assert!(error.source().is_none());
+    assert_eq!(error.to_string().matches(&detail).count(), 1, "{error}");
     assert!(
         error
             .to_string()

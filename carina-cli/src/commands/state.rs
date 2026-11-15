@@ -50,7 +50,7 @@ use super::{
     verify_for_mutation,
 };
 use crate::commands::plan::{ReadOnlyProviderInputs, load_and_resolve_read_only_provider_configs};
-use crate::commands::shared::finalize::release_lock_after_execute;
+use crate::commands::shared::finalize::{FinalizationContext, release_lock_after_execute};
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::progress::{
     ProgressBackend, ProgressSink, RefreshPhase, emit_newline_on_interrupt,
@@ -668,7 +668,11 @@ pub async fn run_state_forget(
         cancel.clone(),
     )
     .await;
-    let release = release_lock_after_execute(&backend, StateLockRef::Held(&lock)).await;
+    let release = release_lock_after_execute(
+        FinalizationContext::new(&backend, path),
+        StateLockRef::Held(&lock),
+    )
+    .await;
     if release.is_ok() {
         println!("  {} Lock released", "✓".green(color_mode));
     }
@@ -1784,7 +1788,11 @@ pub async fn run_state_refresh(
     )
     .await;
 
-    let release_result = release_lock_after_execute(&backend, state_lock.as_ref()).await;
+    let release_result = release_lock_after_execute(
+        FinalizationContext::new(&backend, path),
+        state_lock.as_ref(),
+    )
+    .await;
     if state_lock.is_held()
         && release_result.is_ok()
         && matches!(op_result, Err(AppError::Interrupted))

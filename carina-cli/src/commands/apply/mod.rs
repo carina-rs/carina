@@ -59,7 +59,8 @@ use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
 };
 use crate::commands::shared::finalize::{
-    LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
+    FinalizationContext, LockCommandOutcome, StatePersistence, finalize_after_execute,
+    finish_lock_command,
 };
 use crate::commands::shared::incremental_state_saver::{
     FinalStateBase, IncrementalStateSaver, MidRunStateWriter,
@@ -2138,7 +2139,12 @@ async fn run_apply_using(
         accept_legacy_name_overrides,
     )
     .await;
-    let timing = finish_lock_command(color_mode, &backend, outcome).await?;
+    let timing = finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, path),
+        outcome,
+    )
+    .await?;
     if let Some(elapsed) = timing {
         println!("{}", format_total_apply_line(elapsed));
     }
@@ -3205,7 +3211,7 @@ async fn run_apply_locked_owned(
                 // tags out of `current` and surfaces a spurious `tags: (none) → ...`
                 // diff (refs awscc#206).
                 let skipped_exports = finalize_after_execute(
-                    &backend,
+                    FinalizationContext::new(&backend, project_display),
                     |persistence| {
                         finalize_apply(
                             color_mode,
@@ -3328,7 +3334,12 @@ async fn run_apply_locked_canonical(
         accept_legacy_name_overrides,
     )
     .await;
-    finish_lock_command(color_mode, &backend, outcome).await
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, project_dir),
+        outcome,
+    )
+    .await
 }
 
 fn ensure_saved_plan_backend_matches_current<'a>(
@@ -4130,9 +4141,13 @@ async fn run_apply_from_plan_with_observer_factory(
         accept_legacy_name_overrides,
     )
     .await;
-    let timing = finish_lock_command(color_mode, &backend, outcome)
-        .await
-        .map_err(|error| error.with_project_dir(&source_path))?;
+    let timing = finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, &source_path),
+        outcome,
+    )
+    .await
+    .map_err(|error| error.with_project_dir(&source_path))?;
     if let Some(elapsed) = timing {
         println!("{}", format_total_apply_line(elapsed));
     }
@@ -4734,7 +4749,7 @@ async fn run_apply_from_plan_locked_owned(
                     wait_aliases,
                 } = *context;
                 let skipped_exports = finalize_after_execute(
-                    &backend,
+                    FinalizationContext::new(&backend, project_dir),
                     |persistence| {
                         finalize_apply(
                             color_mode,
@@ -4819,7 +4834,7 @@ async fn run_apply_from_plan_locked(
         Err(error) => {
             return finish_lock_command(
                 color_mode,
-                &backend,
+                FinalizationContext::new(&backend, apply_target.source_dir()),
                 LockCommandOutcome::Kept {
                     result: Err(error),
                     lock,
@@ -4843,7 +4858,12 @@ async fn run_apply_from_plan_locked(
         accept_legacy_name_overrides,
     )
     .await;
-    finish_lock_command(color_mode, &backend, outcome).await
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, apply_target.source_dir()),
+        outcome,
+    )
+    .await
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -56,9 +56,9 @@ impl ReqwestTransport {
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|source| GitHubError::Transport {
+            .map_err(|error| GitHubError::Transport {
                 kind: "client construction",
-                source,
+                error: error.without_url(),
             })?;
         Ok(Self {
             client,
@@ -162,12 +162,13 @@ impl GitHubTransport for ReqwestTransport {
     }
 }
 fn transport_error(error: reqwest::Error, method: Method) -> GitHubError {
+    // Raw download URLs may carry GitHub-issued credentials in their query.
+    // Strip the URL before retaining the error in either Display or Debug.
+    let error = error.without_url();
     if error.is_timeout() {
         match method {
-            Method::Get => GitHubError::TransportDeadline { source: error },
-            Method::Put | Method::Delete => {
-                GitHubError::MutationTransportDeadline { source: error }
-            }
+            Method::Get => GitHubError::TransportDeadline { error },
+            Method::Put | Method::Delete => GitHubError::MutationTransportDeadline { error },
         }
     } else {
         GitHubError::Transport {
@@ -176,7 +177,7 @@ fn transport_error(error: reqwest::Error, method: Method) -> GitHubError {
             } else {
                 "request or response"
             },
-            source: error,
+            error,
         }
     }
 }
@@ -187,40 +188,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn github_round1_transport_error_keeps_the_reqwest_source() {
+    fn github_transport_error_renders_the_reqwest_detail_once() {
         use std::error::Error;
         let source = reqwest::Client::new()
             .get("http://[invalid")
             .build()
             .unwrap_err();
+        let detail = source.to_string();
         let error = transport_error(source, Method::Get);
-        assert!(
-            error
-                .source()
-                .and_then(|source| source.downcast_ref::<reqwest::Error>())
-                .is_some()
-        );
+        assert_eq!(error.to_string().matches(&detail).count(), 1, "{error}");
+        assert!(error.source().is_none());
     }
 
     #[tokio::test]
-    async fn github_round1_transport_timeout_keeps_the_reqwest_source() {
+    async fn github_transport_timeout_renders_the_reqwest_detail_once() {
         use std::error::Error;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("http://{}/?token=SECRET", listener.local_addr().unwrap());
+        // wall-clock-ok: a real loopback socket timeout produces reqwest's timeout error.
         let source = reqwest::Client::new()
-            .get(url)
+            .get(&url)
             .timeout(std::time::Duration::from_millis(20))
             .send()
             .await
             .unwrap_err();
         assert!(source.is_timeout());
         let error = transport_error(source, Method::Get);
-        assert!(
-            error
-                .source()
-                .and_then(|source| source.downcast_ref::<reqwest::Error>())
-                .is_some()
+        assert_eq!(
+            error.to_string().matches("error sending request").count(),
+            1,
+            "{error}"
         );
+        assert!(error.source().is_none());
+        assert!(!format!("{error:?} {error}").contains("SECRET"));
+    }
+
+    #[test]
+    fn github_round10_transport_error_never_retains_a_raw_url_token() {
+        let url = reqwest::Url::parse(
+            "https://raw.githubusercontent.com/owner/repo/state.json?token=SECRET",
+        )
+        .unwrap();
+        // Invalid headers fail while building the request, without dispatching it.
+        let source = reqwest::Client::new()
+            .get(url.clone())
+            .header("x-test", "invalid\nheader")
+            .build()
+            .unwrap_err()
+            .with_url(url);
+        assert!(source.to_string().contains("SECRET"));
+        let error = transport_error(source, Method::Get);
+        assert!(!error.to_string().contains("SECRET"), "{error}");
+        assert!(!format!("{error:?}").contains("SECRET"), "{error:?}");
     }
 
     #[test]
@@ -347,8 +366,9 @@ mod tests {
     #[tokio::test]
     async fn github_round4_transport_deadline_wording_describes_the_dispatched_method() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("http://{}/?token=SECRET", listener.local_addr().unwrap());
         for method in [Method::Get, Method::Put, Method::Delete] {
+            // wall-clock-ok: a real loopback socket timeout produces reqwest's timeout error.
             let source = reqwest::Client::new()
                 .get(&url)
                 .timeout(std::time::Duration::from_millis(20))
@@ -358,6 +378,7 @@ mod tests {
             assert!(source.is_timeout());
             let error = transport_error(source, method);
             let message = error.to_string();
+            assert!(!format!("{error:?} {error}").contains("SECRET"));
             assert_eq!(
                 message.contains("a dispatched mutation may have completed"),
                 method != Method::Get,

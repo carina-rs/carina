@@ -1,10 +1,28 @@
 use crate::error::AppError;
 use crate::output_style::Colorize;
+use carina_core::hint::ProjectCommand;
 use carina_core::shutdown::{CleanupBudget, ShutdownPhase, ShutdownToken, duration_for_log};
 use carina_state::PublishedBackend;
 use std::future::Future;
+use std::path::Path;
 
 use super::lock_heartbeat::{StateLock, StateLockRef};
+
+/// Project identity carried through state flushing and lock release.
+#[derive(Clone, Copy)]
+pub(crate) struct FinalizationContext<'a> {
+    backend: &'a PublishedBackend,
+    project_dir: &'a Path,
+}
+
+impl<'a> FinalizationContext<'a> {
+    pub(crate) fn new(backend: &'a PublishedBackend, project_dir: &'a Path) -> Self {
+        Self {
+            backend,
+            project_dir,
+        }
+    }
+}
 
 /// Result of a command that consumed its heartbeat outcome.
 ///
@@ -44,9 +62,10 @@ impl CleanupStageMode {
 }
 
 pub(crate) async fn release_lock_after_execute(
-    backend: &PublishedBackend,
+    context: FinalizationContext<'_>,
     lock: StateLockRef<'_>,
 ) -> Result<(), AppError> {
+    let backend = context.backend;
     let shutdown = backend.shutdown();
     let StateLockRef::Held(lock) = lock else {
         return Ok(());
@@ -74,7 +93,7 @@ pub(crate) async fn release_lock_after_execute(
 /// Finish a lock-owning command, releasing only when ownership survived.
 pub(crate) async fn finish_lock_command<T>(
     color_mode: crate::output_style::ColorMode,
-    backend: &PublishedBackend,
+    context: FinalizationContext<'_>,
     outcome: LockCommandOutcome<Result<T, AppError>>,
 ) -> Result<T, AppError> {
     let (result, lock) = match outcome {
@@ -82,7 +101,7 @@ pub(crate) async fn finish_lock_command<T>(
         LockCommandOutcome::Lost(error) => return Err(error),
     };
 
-    let release_result = release_lock_after_execute(backend, lock.as_ref()).await;
+    let release_result = release_lock_after_execute(context, lock.as_ref()).await;
     if lock.is_held()
         && release_result.is_ok()
         && (result.is_ok() || matches!(result, Err(AppError::Interrupted)))
@@ -106,7 +125,7 @@ pub(crate) async fn finish_lock_command<T>(
 /// On cancellation, `Interrupted` takes precedence so the user sees the
 /// interruption instead of a cleanup error. The finalize error is still logged.
 pub(crate) async fn finalize_after_execute<'a, T, MakeFinalize, F>(
-    backend: &'a PublishedBackend,
+    context: FinalizationContext<'a>,
     make_finalize: MakeFinalize,
     execution_cancelled: bool,
 ) -> Result<T, AppError>
@@ -114,6 +133,7 @@ where
     MakeFinalize: FnOnce(StatePersistence<'a>) -> F,
     F: Future<Output = Result<T, AppError>>,
 {
+    let backend = context.backend;
     let shutdown = backend.shutdown();
     let persistence = match shutdown.phase() {
         ShutdownPhase::Running if !execution_cancelled => StatePersistence::Normal,
@@ -134,8 +154,8 @@ where
     .await
     else {
         eprintln!(
-            "Cancellation cleanup: the state save could not be confirmed within {}; continuing to state lock release. Run `carina state refresh` to reconcile state with the provider.",
-            duration_for_log(backend.cleanup_budget().state_flush())
+            "{}",
+            state_flush_timeout_message(backend.cleanup_budget(), context.project_dir)
         );
         return Err(AppError::Interrupted);
     };
@@ -145,6 +165,14 @@ where
             Err(AppError::Interrupted)
         }
     }
+}
+
+fn state_flush_timeout_message(budget: CleanupBudget, project_dir: &Path) -> String {
+    let refresh = ProjectCommand::new("state refresh", project_dir);
+    format!(
+        "Cancellation cleanup: the state save could not be confirmed within {}; continuing to state lock release. Run `{refresh}` to reconcile state with the provider.",
+        duration_for_log(budget.state_flush())
+    )
 }
 
 async fn await_cleanup_stage<T, E, F>(
@@ -260,6 +288,23 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn cleanup_timeout_hint_preserves_cwd_wording_and_names_a_non_cwd_project() {
+        let budget = CleanupBudget::new(Duration::from_secs(5), Duration::from_secs(8));
+        let approved = "Cancellation cleanup: the state save could not be confirmed within 5 seconds; continuing to state lock release. Run `carina state refresh` to reconcile state with the provider.";
+        assert_eq!(
+            state_flush_timeout_message(budget, Path::new(".")),
+            approved
+        );
+        assert_eq!(
+            state_flush_timeout_message(budget, Path::new("infra/team project")),
+            approved.replace(
+                "carina state refresh",
+                "carina state refresh 'infra/team project'"
+            )
+        );
+    }
+
+    #[test]
     fn failed_cleanup_stage_has_an_explicit_terminal_log_line() {
         let result: Result<(), &str> = Err("simulated S3 timeout");
 
@@ -284,7 +329,7 @@ mod tests {
 
         tokio::time::timeout(CLEANUP_DEADLINE, async {
             let result = finalize_after_execute(
-                &published,
+                FinalizationContext::new(&published, Path::new(".")),
                 |mode| {
                     crate::commands::apply::save_state_locked_after_execute(
                         backend.as_ref(),
@@ -297,9 +342,12 @@ mod tests {
             )
             .await;
             assert!(matches!(result, Err(AppError::Interrupted)));
-            release_lock_after_execute(&published, StateLockRef::Held(&lock))
-                .await
-                .unwrap();
+            release_lock_after_execute(
+                FinalizationContext::new(&published, Path::new(".")),
+                StateLockRef::Held(&lock),
+            )
+            .await
+            .unwrap();
         })
         .await
         .expect("five slow-but-bounded cleanup operations must fit inside the 2s deadline");
@@ -332,7 +380,7 @@ mod tests {
 
         tokio::time::timeout(CLEANUP_DEADLINE, async {
             let result = finalize_after_execute(
-                &published,
+                FinalizationContext::new(&published, Path::new(".")),
                 |mode| {
                     crate::commands::apply::save_state_locked_after_execute(
                         backend.as_ref(),
@@ -345,9 +393,12 @@ mod tests {
             )
             .await;
             assert!(matches!(result, Err(AppError::Interrupted)));
-            release_lock_after_execute(&published, StateLockRef::Held(&lock))
-                .await
-                .unwrap();
+            release_lock_after_execute(
+                FinalizationContext::new(&published, Path::new(".")),
+                StateLockRef::Held(&lock),
+            )
+            .await
+            .unwrap();
         })
         .await
         .expect("state flush must yield the reserved lock-release slice");
@@ -384,7 +435,7 @@ mod tests {
 
             let start = tokio::time::Instant::now();
             let result = finalize_after_execute(
-                &published,
+                FinalizationContext::new(&published, Path::new(".")),
                 |mode| {
                     crate::commands::apply::save_state_locked_after_execute(
                         backend.as_ref(),
@@ -430,7 +481,7 @@ mod tests {
             trigger.prioritize_cleanup();
             let start = tokio::time::Instant::now();
             let result = finalize_after_execute(
-                &published,
+                FinalizationContext::new(&published, Path::new(".")),
                 |mode| {
                     crate::commands::apply::save_state_locked_after_execute(
                         backend.as_ref(),
@@ -443,9 +494,12 @@ mod tests {
             )
             .await;
             assert!(matches!(result, Err(AppError::Interrupted)));
-            release_lock_after_execute(&published, StateLockRef::Held(&lock))
-                .await
-                .unwrap();
+            release_lock_after_execute(
+                FinalizationContext::new(&published, Path::new(".")),
+                StateLockRef::Held(&lock),
+            )
+            .await
+            .unwrap();
             assert_eq!(start.elapsed(), elapsed);
             assert!(start.elapsed() < published.cleanup_budget().total());
             assert_eq!(backend.state_written.load(Ordering::SeqCst), saved);

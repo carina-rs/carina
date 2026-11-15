@@ -47,38 +47,28 @@ pub(crate) const JSON_MEDIA_TYPE: &str = "application/vnd.github+json";
 pub enum GitHubError {
     #[error("GitHub credentials unavailable: {0}")]
     Credentials(&'static str),
-    #[error("GitHub credentials unavailable: {source}")]
+    #[error("GitHub credentials unavailable: {error}")]
     CredentialsUnavailable {
-        #[source]
-        source: carina_core::github_auth::GitHubTokenError,
+        error: carina_core::github_auth::GitHubTokenError,
     },
-    #[error("GitHub credential lookup exceeded its deadline: {source}")]
+    #[error("GitHub credential lookup exceeded its deadline: {error}")]
     CredentialsDeadline {
-        #[source]
-        source: carina_core::github_auth::GitHubTokenError,
+        error: carina_core::github_auth::GitHubTokenError,
     },
-    #[error("GitHub credential lookup task failed: {source}")]
-    CredentialTask {
-        #[source]
-        source: tokio::task::JoinError,
-    },
-    #[error("GitHub transport failure ({kind})")]
+    #[error("GitHub credential lookup task failed: {error}")]
+    CredentialTask { error: tokio::task::JoinError },
+    #[error("GitHub transport failure ({kind}): {error}")]
     Transport {
         kind: &'static str,
-        #[source]
-        source: reqwest::Error,
+        error: reqwest::Error,
     },
-    #[error("GitHub operation deadline exceeded")]
-    TransportDeadline {
-        #[source]
-        source: reqwest::Error,
-    },
-    #[error("GitHub operation deadline exceeded; a dispatched mutation may have completed")]
-    MutationTransportDeadline {
-        #[source]
-        source: reqwest::Error,
-    },
-    #[error("GitHub API returned HTTP {status}: {body} (request ID: {request_id:?})")]
+    #[error("GitHub operation deadline exceeded: {error}")]
+    TransportDeadline { error: reqwest::Error },
+    #[error(
+        "GitHub operation deadline exceeded; a dispatched mutation may have completed: {error}"
+    )]
+    MutationTransportDeadline { error: reqwest::Error },
+    #[error("GitHub API returned HTTP {status}: {body}{id}", id = request_id_description(.request_id.as_deref()))]
     Api {
         status: u16,
         body: String,
@@ -115,7 +105,7 @@ pub enum GitHubError {
     #[error("Unexpected GitHub mutation outcome: {reason}")]
     UnexpectedOutcome { reason: &'static str },
     #[error(
-        "GitHub branch contention persisted after {attempts} attempts: {message} (request ID: {request_id:?})"
+        "GitHub branch contention persisted after {attempts} attempts: {message}{id}", id = request_id_description(.request_id.as_deref())
     )]
     Contention {
         attempts: usize,
@@ -145,14 +135,20 @@ pub enum GitHubError {
 }
 
 impl From<carina_core::github_auth::GitHubTokenError> for GitHubError {
-    fn from(source: carina_core::github_auth::GitHubTokenError) -> Self {
+    fn from(error: carina_core::github_auth::GitHubTokenError) -> Self {
         use carina_core::github_auth::GitHubTokenError;
-        match source {
-            GitHubTokenError::Deadline => Self::CredentialsDeadline { source },
+        match error {
+            GitHubTokenError::Deadline => Self::CredentialsDeadline { error },
             GitHubTokenError::Unavailable | GitHubTokenError::InvalidCharacters => {
-                Self::CredentialsUnavailable { source }
+                Self::CredentialsUnavailable { error }
             }
         }
+    }
+}
+
+impl From<tokio::task::JoinError> for GitHubError {
+    fn from(error: tokio::task::JoinError) -> Self {
+        Self::CredentialTask { error }
     }
 }
 
@@ -335,6 +331,24 @@ struct ObservedFile {
     sha: BlobSha,
     bytes: Vec<u8>,
 }
+
+enum MutationObservation {
+    State(BlobSha),
+    Lease { lock: LockInfo, sha: BlobSha },
+}
+impl MutationObservation {
+    fn sha(&self) -> &BlobSha {
+        match self {
+            Self::State(sha) | Self::Lease { sha, .. } => sha,
+        }
+    }
+    fn lease(&self) -> Result<&LockInfo, GitHubError> {
+        match self {
+            Self::Lease { lock, .. } => Ok(lock),
+            Self::State(_) => Err(GitHubError::MalformedResponse),
+        }
+    }
+}
 #[derive(Clone)]
 enum Expected {
     // No state was loaded by this backend. Only an absent path can be written
@@ -471,7 +485,7 @@ impl Mutation<'_> {
     }
     fn lost_race(
         &self,
-        current: Option<&ObservedFile>,
+        current: Option<&MutationObservation>,
         attempt: usize,
     ) -> BackendResult<BackendError> {
         Ok(match self {
@@ -479,29 +493,34 @@ impl Mutation<'_> {
                 BackendError::StateWriteConflict { attempts: attempt }
             }
             Self::CreateLease { lock } | Self::TakeOverLease { lock, .. } => match current {
-                Some(file) => BackendError::locked(&decode_lease(&file.bytes)?),
+                Some(file) => BackendError::locked(file.lease()?),
                 None => BackendError::LockNotHeld(lock.id().into()),
             },
             Self::RenewLease { id, .. } | Self::DeleteLease { id, .. } => {
                 if let Some(file) = current {
-                    decode_lease(&file.bytes)?;
+                    file.lease()?;
                 }
                 BackendError::LockNotHeld((*id).into())
             }
         })
     }
-    fn reconciled(&self, current: Option<&ObservedFile>, sent: &BlobSha) -> BackendResult<bool> {
+    fn reconciled(
+        &self,
+        current: Option<&MutationObservation>,
+        sent: &BlobSha,
+    ) -> BackendResult<bool> {
         match self {
             Self::CreateState { .. }
             | Self::ReplaceState { .. }
             | Self::CreateLease { .. }
             | Self::TakeOverLease { .. }
-            | Self::RenewLease { .. } => {
-                Ok(matching_write_is_ours(current.map(|file| &file.sha), sent))
-            }
+            | Self::RenewLease { .. } => Ok(matching_write_is_ours(
+                current.map(MutationObservation::sha),
+                sent,
+            )),
             Self::DeleteLease { id, .. } => {
-                let current = current.map(|file| decode_lease(&file.bytes)).transpose()?;
-                Ok(lease_released(id, current.as_ref()))
+                let current = current.map(MutationObservation::lease).transpose()?;
+                Ok(lease_released(id, current))
             }
         }
     }
@@ -529,7 +548,7 @@ impl GitHubBackend {
     pub(crate) async fn from_config(settings: &GitHubBackendSettings) -> BackendResult<Self> {
         let token = tokio::task::spawn_blocking(carina_core::github_auth::get_github_token)
             .await
-            .map_err(|source| GitHubError::CredentialTask { source })?
+            .map_err(GitHubError::from)?
             .map_err(GitHubError::from)?;
         Ok(Self::with_transport(
             settings.clone(),
@@ -587,10 +606,10 @@ impl GitHubBackend {
                     .execute(request.clone(), operation.deadline)
                     .await
                     .map_err(|error| match error {
-                        GitHubError::TransportDeadline { source }
+                        GitHubError::TransportDeadline { error }
                             if operation.mutation_dispatched.load(Ordering::Relaxed) =>
                         {
-                            GitHubError::MutationTransportDeadline { source }
+                            GitHubError::MutationTransportDeadline { error }
                         }
                         _ => error,
                     })
@@ -754,6 +773,32 @@ impl GitHubBackend {
         // one immutable ref; branch visibility alone does not prove Contents access.
         let commit = self.branch_snapshot(operation).await?;
         self.observe_at(path, &commit, operation).await
+    }
+    async fn observe_mutation(
+        &self,
+        path: ContentsPath<'_>,
+        operation: &Operation,
+    ) -> BackendResult<Option<MutationObservation>> {
+        let commit = self.branch_snapshot(operation).await?;
+        match path {
+            // Reconciliation only needs the state's precondition. Like write(),
+            // use metadata_at so large files never incur a raw download and a
+            // 404 still needs a readable root at this same immutable commit.
+            ContentsPath::State(_) => Ok(self
+                .metadata_at(path, &commit, operation)
+                .await?
+                .map(|file| MutationObservation::State(file.sha))),
+            ContentsPath::Lease(_) => self
+                .observe_at(path, &commit, operation)
+                .await?
+                .map(|file| {
+                    Ok(MutationObservation::Lease {
+                        lock: decode_lease(&file.bytes)?,
+                        sha: file.sha,
+                    })
+                })
+                .transpose(),
+        }
     }
     async fn verify_contents_readable(
         &self,
@@ -1168,10 +1213,11 @@ impl GitHubBackend {
                     ),
                 ) => {
                     if Instant::now() < operation.deadline
-                        && let Ok(current) = self.observe(path, operation).await
+                        && let Ok(current) = self.observe_mutation(path, operation).await
                         && mutation.reconciled(current.as_ref(), &sent)?
                     {
-                        let sha = self.remember_mutation(&mutation, current.map(|file| file.sha));
+                        let sha = self
+                            .remember_mutation(&mutation, current.map(|file| file.sha().clone()));
                         self.finish_mutation(&mutation);
                         return Ok(sha);
                     }
@@ -1198,14 +1244,14 @@ impl GitHubBackend {
                 && matches!(&mutation, Mutation::DeleteLease { .. })
                 && matches!(response.status, 404 | 409 | 422)
             {
-                let current = self.observe(path, operation).await?;
+                let current = self.observe_mutation(path, operation).await?;
                 if mutation.reconciled(current.as_ref(), &sent)? {
                     self.finish_mutation(&mutation);
                     return Ok(None);
                 }
             }
             if response.status == 409 || (response.status == 422 && method == Method::Put) {
-                let current = self.observe(path, operation).await?;
+                let current = self.observe_mutation(path, operation).await?;
                 // A definitive conflict is not a lost DELETE reply: preserve
                 // the typed loser if the lease was concurrently replaced.
                 let reconciled = match &mutation {
@@ -1219,7 +1265,8 @@ impl GitHubBackend {
                     Mutation::DeleteLease { .. } => false,
                 };
                 if reconciled {
-                    let sha = self.remember_mutation(&mutation, current.map(|file| file.sha));
+                    let sha =
+                        self.remember_mutation(&mutation, current.map(|file| file.sha().clone()));
                     self.finish_mutation(&mutation);
                     return Ok(sha);
                 }
@@ -1238,7 +1285,8 @@ impl GitHubBackend {
                     | Mutation::RenewLease { .. }
                     | Mutation::DeleteLease { .. } => false,
                 };
-                if current.as_ref().map(|file| &file.sha) != expected && !vanished_takeover {
+                if current.as_ref().map(MutationObservation::sha) != expected && !vanished_takeover
+                {
                     self.reject_mutation(&mutation);
                     return Err(mutation.lost_race(current.as_ref(), attempt)?);
                 }
@@ -1295,10 +1343,9 @@ impl GitHubBackend {
                     )
                     .map_err(|_| malformed())?;
                     if sha != sent {
-                        // Keep the state intent recorded before dispatch: the
-                        // next save must resolve prior/sent or report a conflict.
+                        // Keep the state or lease intent recorded before dispatch.
+                        // The next write resolves prior/sent or reports a conflict.
                         // Never adopt an acknowledgement for unrelated bytes.
-                        self.finish_mutation(&mutation);
                         return Err(GitHubError::UnexpectedOutcome {
                             reason: "acknowledged blob SHA differs from the requested bytes",
                         }
@@ -1347,7 +1394,7 @@ impl GitHubBackend {
                     Mutation::RenewLease { id, .. } => {
                         // A known 201 must roll back only our returned SHA,
                         // even when compare failed. DELETE cannot recur here.
-                        if Box::pin(self.conditional(
+                        if let Err(error) = Box::pin(self.conditional(
                             Mutation::DeleteLease {
                                 id,
                                 sha: &sent,
@@ -1356,10 +1403,9 @@ impl GitHubBackend {
                             operation,
                         ))
                         .await
-                        .is_err()
                         {
                             log::warn!(
-                                "GitHub recreated lease cleanup could not be confirmed; inspect the lock file (lock ID: {id})"
+                                "GitHub recreated lease cleanup could not be confirmed; inspect the lock file (lock ID: {id}): {error}"
                             );
                         }
                         Some(BackendError::LockNotHeld((*id).into()))
@@ -1612,6 +1658,12 @@ fn request_id(response: &GitHubResponse) -> Option<String> {
         .headers
         .get("x-github-request-id")
         .map(|id| redact_url_queries(id))
+}
+fn request_id_description(request_id: Option<&str>) -> String {
+    match request_id {
+        Some(id) => format!(" (request ID: {id})"),
+        None => String::new(),
+    }
 }
 // Response URLs can contain GitHub-issued raw tokens unrelated to our auth
 // token (M4). Redact every URL query before storing an API excerpt in an

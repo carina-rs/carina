@@ -316,7 +316,10 @@ mod tests {
                 let backend = carina_state::local_backend_for_test("unused.state.json");
                 let backend = carina_state::PublishedBackend::for_test(backend.into(), &shutdown);
                 let result = crate::commands::shared::finalize::finalize_after_execute(
-                    &backend,
+                    crate::commands::shared::finalize::FinalizationContext::new(
+                        &backend,
+                        std::path::Path::new("."),
+                    ),
                     |_| async move {
                         command_cleanup_started.notify_one();
                         std::future::pending::<Result<(), AppError>>().await

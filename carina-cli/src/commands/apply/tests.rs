@@ -5271,9 +5271,13 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
         false,
     )
     .await;
-    let error = finish_lock_command(fixture.runtime().color_mode(), &backend, outcome)
-        .await
-        .expect_err("unresolved provider configuration must not reach execution");
+    let error = finish_lock_command(
+        fixture.runtime().color_mode(),
+        FinalizationContext::new(&backend, tmp.path()),
+        outcome,
+    )
+    .await
+    .expect_err("unresolved provider configuration must not reach execution");
 
     assert!(
         matches!(&error, AppError::SavedProviderConfig { .. }),

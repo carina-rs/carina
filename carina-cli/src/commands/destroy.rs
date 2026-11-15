@@ -55,7 +55,8 @@ use crate::DetailLevel;
 use crate::commands::plan::collect_historical_display_attributes;
 use crate::commands::plan::load_and_resolve_read_only_provider_configs;
 use crate::commands::shared::finalize::{
-    LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
+    FinalizationContext, LockCommandOutcome, StatePersistence, finalize_after_execute,
+    finish_lock_command,
 };
 use crate::commands::shared::incremental_state_saver::{FinalStateBase, IncrementalStateSaver};
 use crate::commands::shared::lock_heartbeat::{
@@ -207,7 +208,12 @@ pub async fn run_destroy(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(color_mode, &backend, outcome).await?;
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, path),
+        outcome,
+    )
+    .await?;
 
     Ok(())
 }
@@ -247,7 +253,12 @@ pub async fn run_destroy_with_factories_for_test(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(runtime.color_mode(), &backend, outcome).await
+    finish_lock_command(
+        runtime.color_mode(),
+        FinalizationContext::new(&backend, path),
+        outcome,
+    )
+    .await
 }
 
 enum DestroyAfterHeartbeat {
@@ -1598,7 +1609,7 @@ validated_config.provider_plan())
                 println!("{}", "Saving state...".cyan(color_mode));
 
                 let finalize_result = finalize_after_execute(
-                    &backend,
+                    FinalizationContext::new(&backend, &base_dir.source_label()),
                     |persistence| {
                         finalize_destroy(
                             color_mode,
@@ -1689,7 +1700,7 @@ async fn run_destroy_locked(
         Err(error) => {
             return finish_lock_command(
                 color_mode,
-                &backend,
+                FinalizationContext::new(&backend, &base_dir.source_label()),
                 LockCommandOutcome::Kept {
                     result: Err(error),
                     lock,
@@ -1704,7 +1715,7 @@ async fn run_destroy_locked(
         Err(error) => {
             return finish_lock_command(
                 color_mode,
-                &backend,
+                FinalizationContext::new(&backend, &base_dir.source_label()),
                 LockCommandOutcome::Kept {
                     result: Err(error),
                     lock,
@@ -1727,7 +1738,12 @@ async fn run_destroy_locked(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(color_mode, &backend, outcome).await
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, &base_dir.source_label()),
+        outcome,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1761,7 +1777,12 @@ pub(crate) async fn run_destroy_locked_with_ctx(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(color_mode, &backend, outcome).await
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, &base_dir.source_label()),
+        outcome,
+    )
+    .await
 }
 
 #[cfg(test)]

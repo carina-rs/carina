@@ -403,9 +403,13 @@ async fn apply_saved(fixture: &ApplyCancellationFixture, cloud: &Cloud, saved_pl
         false,
     )
     .await;
-    finish_lock_command(fixture.runtime().color_mode(), &backend, outcome)
-        .await
-        .unwrap();
+    finish_lock_command(
+        fixture.runtime().color_mode(),
+        FinalizationContext::new(&backend, fixture.config_path()),
+        outcome,
+    )
+    .await
+    .unwrap();
 }
 async fn convergence(saved: bool) {
     Box::pin(convergence_with_binding(saved, true)).await;

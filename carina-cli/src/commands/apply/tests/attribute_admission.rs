@@ -170,7 +170,12 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
             false,
         )
         .await;
-        let result = finish_lock_command(fixture.runtime().color_mode(), &backend, outcome).await;
+        let result = finish_lock_command(
+            fixture.runtime().color_mode(),
+            FinalizationContext::new(&backend, fixture.config_path()),
+            outcome,
+        )
+        .await;
         {
             let creates = creates.lock().unwrap();
             assert_eq!(
