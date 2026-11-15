@@ -185,9 +185,14 @@ pub fn validate(dir: &Path, snapshot: &LoadedProviderSnapshot) -> Result<(), Str
     })?;
     carina_core::validation::validate_user_function_ref_types_with_bindings(parsed, &bindings)?;
     carina_core::test_utils::ordinary_sink_findings_for_test(
-        carina_core::validation::validate_attribute_params(
-            &parsed.attribute_params,
+        carina_core::validation::deferred_types::with_session_for_test(
             snapshot.provider_context(),
+            |session| {
+                carina_core::validation::validate_attribute_params_with_context(
+                    &parsed.attribute_params,
+                    session,
+                )
+            },
         ),
     )?;
     use carina_core::parser::ExportParamLike;

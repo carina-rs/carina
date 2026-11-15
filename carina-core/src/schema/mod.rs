@@ -7825,6 +7825,7 @@ fn format_union_alternatives_mismatch(failures: &UnionArmFailures) -> String {
 
 fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
     match error {
+        TypeError::AttributePrefix(_error) => false,
         TypeError::UnionAlternativesMismatch { .. } => true,
         TypeError::ListItemError { inner, .. }
         | TypeError::MapKeyError { inner, .. }
@@ -7884,6 +7885,9 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
+    #[error(transparent)]
+    AttributePrefix(Box<crate::identifier::AttributePrefixError>),
+
     #[error("Type mismatch: {types}")]
     TypeMismatch { types: MismatchTypeNames },
 
@@ -8294,6 +8298,7 @@ impl TypeError {
     /// New TypeError variants must choose a shape here before they compile.
     pub(crate) fn diagnostic_shape(&self) -> ValidationDiagnostic<'_> {
         match self {
+            Self::AttributePrefix(_error) => ValidationDiagnostic::Plain(self),
             Self::ValidationFailed { message } => ValidationDiagnostic::Reason {
                 prefix: "Validation failed: ".into(),
                 reason: message,
@@ -8380,6 +8385,7 @@ impl TypeError {
     /// consumers do not need variant-specific position recovery.
     pub fn attribute_name(&self) -> Option<&str> {
         match self {
+            TypeError::AttributePrefix(_error) => None,
             TypeError::InvalidEnumVariant { attribute, .. }
             | TypeError::PatternMismatch { attribute, .. }
             | TypeError::LengthOutOfRange { attribute, .. }
@@ -16759,6 +16765,7 @@ impl crate::resource::InsideSecret for FieldPath {
 impl crate::resource::InsideSecret for TypeError {
     fn inside_secret(self) -> Self {
         match self {
+            TypeError::AttributePrefix(error) => TypeError::AttributePrefix(error),
             TypeError::InvalidEnumVariant {
                 value_kind,
                 attribute,

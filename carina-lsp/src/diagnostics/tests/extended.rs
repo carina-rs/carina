@@ -3728,17 +3728,7 @@ fn suspension_deduplication_does_not_turn_validation_errors_into_success() {
             schema,
             &attributes
                 .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap(),
-                    )
-                })
+                .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
             &|_| false,
             &engine.provider_context.custom_types,
@@ -4060,17 +4050,7 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
             .expect("test schema must be owner-bound"),
         &attributes
             .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    value
-                        .knowledge(
-                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                        )
-                        .map(|proof| proof.into_classification())
-                        .unwrap(),
-                )
-            })
+            .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         &|name| name == "hosted_zone_id",
         &core_resolver,
@@ -18113,7 +18093,7 @@ fn widening_member_obligation_lsp_validate_parity(decoded: bool) {
     )
     .expect("validate must admit the widening and defer its destination member");
     let authored = parse(source);
-    let configuration = carina_core::config_loader::load_buffer_configuration(
+    let configuration = carina_core::test_utils::load_canonical_buffer_configuration(
         &authored,
         &engine.schemas,
         &engine.provider_context,

@@ -6293,14 +6293,6 @@ impl std::fmt::Display for ParserPlaceholder {
     }
 }
 
-/// The authority that can establish a parser/template placeholder's type.
-#[doc(hidden)]
-pub enum PlaceholderTypeAuthority<'a> {
-    Binding(&'a str),
-    AwaitingSubstitution,
-    MissingExpression,
-}
-
 /// Internal behavior shared by the three stage marker types.
 #[doc(hidden)]
 pub trait ValueKind: Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize {
@@ -6393,8 +6385,6 @@ mod evaluable_leaf {
 /// A leaf permitted in evaluation, validation, and expansion inputs.
 /// Snapshot leaves cannot implement this sealed trait.
 pub trait PlaceholderKind: ValueKind + evaluable_leaf::Sealed {
-    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_>;
-
     /// Persisted serde identity used for deferred-secret hash material.
     /// Display wording must not affect this representation.
     #[doc(hidden)]
@@ -6402,27 +6392,9 @@ pub trait PlaceholderKind: ValueKind + evaluable_leaf::Sealed {
         serde_json::to_value(self)
     }
 }
-impl PlaceholderKind for NoPlaceholder {
-    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
-        match *self {}
-    }
-}
-impl PlaceholderKind for ParserPlaceholder {
-    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
-        match self {
-            Self::FnParam { name } | Self::FnLocal { name } | Self::ModuleArgument { name, .. } => {
-                PlaceholderTypeAuthority::Binding(name)
-            }
-            Self::Loop(_) => PlaceholderTypeAuthority::AwaitingSubstitution,
-            Self::EmptyInterpolation { .. } => PlaceholderTypeAuthority::MissingExpression,
-        }
-    }
-}
-impl PlaceholderKind for LoopSlot {
-    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
-        PlaceholderTypeAuthority::AwaitingSubstitution
-    }
-}
+impl PlaceholderKind for NoPlaceholder {}
+impl PlaceholderKind for ParserPlaceholder {}
+impl PlaceholderKind for LoopSlot {}
 
 impl ValueKind for NoPlaceholder {
     fn construct_access<B: BindingAddress>(
