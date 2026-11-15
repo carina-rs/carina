@@ -4,9 +4,18 @@
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
 mod diagnostics;
+mod prefix;
 pub use diagnostics::{
     anonymous_identity_diagnostics, attribute_derived_conflict_diagnostics,
     legacy_loop_move_target_diagnostics,
+};
+pub use prefix::{
+    CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, MatchedResourceProjection,
+    ModuleResolvedFileRead, PrefixCanonicalized, PrefixFileRead, ResourceProjection, SuffixSource,
+    canonicalize_file_prefixes,
+};
+pub(crate) use prefix::{
+    CanonicalSchemaInputs, CanonicalSchemaResource, canonicalize_prefix_values,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -23,13 +32,12 @@ use crate::provider::{ComparisonResolutionError, ProviderFactory, ResourceCompar
 use crate::resource::{
     AnonymousIdentityModuleSource, ApplyTimeUnknown, BindingAddress, ConcreteValue, DataSource,
     DeferredValue, LegacyLoopAddress, LoopElementOrigin, PendingReRead, PlaceholderKind,
-    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value, ValueString,
+    ResolvedResourceId, Resource, ResourceId, ResourceIdentity, Value,
 };
 use crate::schema::{
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema, IdentityMode,
     IdentityPath, IdentityPathSegment, SchemaRegistry, Shape, ValidatedResourceSchema,
 };
-use crate::validation::is_string_compatible_type;
 use crate::value::{CanonicalizedProviderConfigs, CanonicalizedResources};
 
 /// Schema and runtime inputs for evaluating deferred identity attributes.
@@ -230,7 +238,9 @@ fn top_level_stable_hash_value<S, P: PlaceholderKind, B: BindingAddress, D>(
         return Some(format!("Prefix({prefix:?})"));
     }
 
-    let unresolved_prefix = format!("{attribute}_prefix");
+    // Identity intentionally describes authored deferred prefixes too. This is
+    // not companion recognition: the canonicalizer admits only concrete Strings.
+    let unresolved_prefix = prefix_companion_attribute(attribute);
     resource
         .attributes
         .get(&unresolved_prefix)
@@ -352,9 +362,11 @@ fn identity_path_input<'a, S, P: PlaceholderKind, B: BindingAddress, D>(
         if let Some(prefix) = resource.prefixes.get(path.attribute_name()) {
             return IdentityPathInput::GeneratedPrefix(prefix);
         }
+        // Stable identity also fingerprints unrecognized/deferred authored keys;
+        // changing this to admission eligibility would change persisted identity.
         if let Some(prefix) = resource
             .attributes
-            .get(&format!("{}_prefix", path.attribute_name()))
+            .get(&prefix_companion_attribute(path.attribute_name()))
         {
             return IdentityPathInput::AuthoredPrefix(prefix);
         }
@@ -1483,7 +1495,7 @@ pub(crate) fn consumed_prefix_companions<S, P: PlaceholderKind, B: BindingAddres
 pub(crate) struct ResourcePrefixSource(());
 
 /// One prefix failure, retaining resource ownership and authored provenance.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AttributePrefixError {
     resource: ResourceId,
     prefix: String,
@@ -1491,6 +1503,9 @@ pub struct AttributePrefixError {
     location: Option<crate::parser::DeclarationLocation>,
 }
 impl AttributePrefixError {
+    pub(crate) fn resource_id(&self) -> &ResourceId {
+        &self.resource
+    }
     pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
         self.location.as_ref()
     }
@@ -1542,91 +1557,7 @@ pub fn resolve_attr_prefix_findings<P: PlaceholderKind, B: BindingAddress>(
     resources: &mut [Resource<crate::resource::ModuleSource, P, B>],
     registry: &SchemaRegistry,
 ) -> Vec<AttributePrefixError> {
-    let mut all_errors = Vec::new();
-
-    for resource in resources.iter_mut() {
-        let schema = match registry.get_for(resource) {
-            Some(schema) => schema.schema().as_schema(),
-            None => continue, // Unknown resource type; validate_resources will catch this
-        };
-
-        // Collect prefix attributes to process
-        let prefix_attrs: Vec<(String, ValueString)> = resource
-            .attributes
-            .iter()
-            .filter_map(|(key, value)| {
-                if let Some(base_attr) = key.strip_suffix(PREFIX_COMPANION_SUFFIX)
-                    && let Value::Concrete(ConcreteValue::String(prefix_value)) = value
-                    && let Some(attr_schema) = schema.attributes.get(base_attr)
-                    && is_string_compatible_type(&attr_schema.attr_type, &schema.defs)
-                {
-                    return Some((base_attr.to_string(), prefix_value.clone()));
-                }
-                None
-            })
-            .collect();
-
-        for (base_attr, prefix_value) in prefix_attrs {
-            let prefix_key = prefix_companion_attribute(&base_attr);
-
-            // Error if prefix is empty
-            if prefix_value.expose_plaintext().is_empty() {
-                all_errors.push(AttributePrefixError {
-                    resource: resource.id.clone(),
-                    prefix: prefix_key,
-                    conflict: None,
-                    location: resource.declaration.location().cloned(),
-                });
-                continue;
-            }
-
-            // Error if both prefix and base attribute are specified
-            if resource.attributes.contains_key(&base_attr) {
-                all_errors.push(AttributePrefixError {
-                    resource: resource.id.clone(),
-                    prefix: prefix_key,
-                    conflict: Some(base_attr),
-                    location: resource.declaration.location().cloned(),
-                });
-                continue;
-            }
-
-            // Remove the _prefix attribute. `shift_remove` (not
-            // `swap_remove`) preserves the source-order of the rest of
-            // the attributes, which is the whole point of #2222.
-            resource.attributes.shift_remove(&prefix_key);
-            resource.declaration.rename_attribute_path(
-                &[crate::parser::AttributePathSegment::Attribute(prefix_key)],
-                &base_attr,
-            );
-
-            // Store prefix
-            resource.prefixes.insert(
-                base_attr.clone(),
-                prefix_value.expose_plaintext().to_owned(),
-            );
-
-            // Generate temporary name
-            let generated_name = ValueString::derived_from(
-                format!(
-                    "{}{}",
-                    prefix_value.expose_plaintext(),
-                    generate_random_suffix()
-                ),
-                [&prefix_value],
-            );
-            resource.authored_slots.record_synthetic(
-                base_attr.clone(),
-                crate::parser::retained::SyntheticSource::ResourcePrefix(ResourcePrefixSource(())),
-            );
-            resource.set_attr(
-                base_attr,
-                Value::Concrete(ConcreteValue::String(generated_name)),
-            );
-        }
-    }
-
-    all_errors
+    prefix::resolve_resources(resources, registry, SuffixSource::Random)
 }
 
 /// State information needed for prefix reconciliation.

@@ -21,17 +21,19 @@ fn schemas() -> crate::schema::SchemaRegistry {
 }
 
 fn output(
-    judged: &super::super::JudgedFile<
+    canonical: &crate::identifier::PrefixCanonicalized<
         '_,
-        crate::parser::ParsedExportParam,
-        crate::parser::ParsedDeferredForPhase,
+        super::super::JudgedFile<
+            '_,
+            crate::parser::ParsedExportParam,
+            crate::parser::ParsedDeferredForPhase,
+        >,
     >,
 ) -> Vec<String> {
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let bindings =
-        crate::binding_index::BindingIndex::from_parsed(judged.file(), judged.schemas(), &config);
+    let bindings = canonical.parsed().binding_index(&config);
     crate::validation::validate_resource_admissions(
-        judged,
+        canonical,
         &bindings,
         &std::collections::HashSet::from(["mock".into()]),
         &mut Vec::new(),
@@ -53,11 +55,18 @@ fn round2_missing_report_preserves_main_resource_error() {
     let schemas = schemas();
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse_and_resolve("mock.Test { first = 1 second = 2 }").unwrap();
-    let mut judged = super::super::JudgedFile::new(parsed, &schemas, &config);
-    let mut report = judged.report().clone();
-    Arc::make_mut(&mut report.resource_reports).clear();
-    super::super::attach_report(&mut judged.file, report);
-    compare("missing_report", output(&judged));
+    let mut canonical = crate::identifier::canonicalize_file_prefixes(
+        parsed,
+        &schemas,
+        crate::identifier::SuffixSource::Preview,
+    )
+    .judge(&config);
+    canonical.edit_judgement_for_test(|judged| {
+        let mut report = judged.report().clone();
+        Arc::make_mut(&mut report.resource_reports).clear();
+        super::super::attach_report(&mut judged.file, report);
+    });
+    compare("missing_report", output(&canonical));
 }
 
 #[test]
@@ -65,14 +74,21 @@ fn round2_unbound_alias_preserves_main_admission() {
     let schemas = schemas();
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse_and_resolve("mock.Test { items = ['value'] }").unwrap();
-    let mut judged = super::super::JudgedFile::new(parsed, &schemas, &config);
-    for resource in &mut judged.file.resources {
-        // allow: direct - test a producer's unbound slot alias
-        resource
-            .authored_slots
-            .unbind_alias_for_test("items", "item"); // SEAM_ONLY_FAULT
-    }
-    compare("unbound_alias", output(&judged));
+    let mut canonical = crate::identifier::canonicalize_file_prefixes(
+        parsed,
+        &schemas,
+        crate::identifier::SuffixSource::Preview,
+    )
+    .judge(&config);
+    canonical.edit_judgement_for_test(|judged| {
+        for resource in &mut judged.file.resources {
+            // allow: direct - test a producer's unbound slot alias
+            resource
+                .authored_slots
+                .unbind_alias_for_test("items", "item"); // SEAM_ONLY_FAULT
+        }
+    });
+    compare("unbound_alias", output(&canonical));
 }
 
 #[test]
@@ -80,6 +96,11 @@ fn round2_unknown_schema_preserves_main_diagnostics() {
     let schemas = schemas();
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse_and_resolve("mock.Unknown { first = 1 }").unwrap();
-    let judged = super::super::JudgedFile::new(parsed, &schemas, &config);
-    compare("unknown_schema", output(&judged));
+    let canonical = crate::identifier::canonicalize_file_prefixes(
+        parsed,
+        &schemas,
+        crate::identifier::SuffixSource::Preview,
+    )
+    .judge(&config);
+    compare("unknown_schema", output(&canonical));
 }

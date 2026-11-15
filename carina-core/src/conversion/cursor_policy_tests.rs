@@ -93,7 +93,7 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
         .unwrap()
         .resolve_root_for_test();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let bindings =
@@ -103,22 +103,21 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
     let mut resources = 0;
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         for resource in tree.resources() {
-            let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+            let inputs =
+                ResourceAttributeInputs::for_resource_for_test(resource, judged.report()).unwrap();
             let mut report = validation
                 .admit_resource(
-                    crate::validation::admission::attributes::ResourceAdmissionRequest {
+                    crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(
                         resource,
-                        parsed: judged.file(),
-                        schema: resource.schema(&schemas).unwrap(),
-
-                        quoted: resource.quoted_string_attrs(),
+                        judged.file(),
+                        resource.schema(&schemas).unwrap(),
+                        resource.quoted_string_attrs(),
                         inputs,
-                        evaluation:
-                            crate::validation::admission::attributes::ValidationEvaluation::None,
-                        bindings: &bindings,
+                        crate::validation::admission::attributes::ValidationEvaluation::None,
+                        &bindings,
                         session,
-                        schemas: &schemas,
-                    },
+                        &schemas,
+                    ),
                 )
                 .values;
             assert_eq!(report.errors().count(), 0, "conversion leaked into errors");
@@ -144,13 +143,14 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
     });
     assert_eq!(resources, 2);
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        validation.admit_remaining_resources(
-            &tree,
-            judged,
-            &bindings,
-            session,
-            crate::validation::admission::attributes::SlotPrechecks::Unreported,
-        );
+        validation
+            .admit_remaining_resources(
+                judged,
+                &bindings,
+                session,
+                crate::validation::admission::attributes::SlotPrechecks::Unreported,
+            )
+            .unwrap();
     });
     let conversions = validation.complete().into_presented();
     assert_eq!(conversion_errors(&conversions).len(), 1);
@@ -250,21 +250,21 @@ fn conversion_unrendered_coverage_does_not_repeat_native_map_key_or_value_checks
     .unwrap()
     .resolve_root_for_test();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
-    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let tree = judged.analysis_tree().unwrap();
     let resource = tree.resources().next().unwrap();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         crate::validation::admission::attributes::unrendered_resource_conversion_admissions(
             resource,
-            judged,
             &bindings,
             session,
             crate::validation::admission::attributes::SlotPrechecks::Unreported,
             &mut Default::default(),
-        );
+        )
+        .unwrap();
     });
     assert_eq!(
         keys.load(Ordering::SeqCst),
@@ -306,7 +306,8 @@ fn check(
     let parsed = crate::parser::parse_file(source, Path::new("b1.crn"), &catalog)
         .unwrap()
         .resolve_root_for_test();
-    let configuration = crate::config_loader::load_buffer_configuration(&parsed, schemas, &catalog);
+    let configuration =
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, schemas, &catalog);
     let judged = configuration.judged();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), schemas, &catalog);
@@ -447,7 +448,7 @@ fn r16_report_only_slot_reads_recorded_destination_then_checks_the_source() {
     .unwrap()
     .resolve_root_for_test();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree
@@ -455,11 +456,12 @@ fn r16_report_only_slot_reads_recorded_destination_then_checks_the_source() {
             .find(|resource| resource.binding() == Some("sink"))
             .unwrap();
         let values = resource.attributes().into_owned();
-        let inputs = crate::validation::admission::attributes::ResourceAttributeInputs::from_report(
-            resource,
-            &values,
-            judged.report(),
-        );
+        let inputs =
+            crate::validation::admission::attributes::ResourceAttributeInputs::from_report_for_test(
+                resource,
+                &values,
+                judged.report(),
+            );
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
@@ -467,31 +469,30 @@ fn r16_report_only_slot_reads_recorded_destination_then_checks_the_source() {
                 crate::validation::ConversionValidation::new(judged.report());
             let report = validation
                 .admit_resource(
-                    crate::validation::admission::attributes::ResourceAdmissionRequest {
+                    crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(
                         resource,
-                        parsed: judged.file(),
-                        schema: resource.schema(&schemas).unwrap(),
-
-                        quoted: resource.quoted_string_attrs(),
+                        judged.file(),
+                        resource.schema(&schemas).unwrap(),
+                        resource.quoted_string_attrs(),
                         inputs,
-                        evaluation:
-                            crate::validation::admission::attributes::ValidationEvaluation::None,
-                        bindings: &bindings,
+                        crate::validation::admission::attributes::ValidationEvaluation::None,
+                        &bindings,
                         session,
-                        schemas: &schemas,
-                    },
+                        &schemas,
+                    ),
                 )
                 .values;
             assert_eq!(report.errors().count(), 0, "{report:?}");
             assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
             crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-                validation.admit_remaining_resources(
-                    &tree,
-                    judged,
-                    &bindings,
-                    session,
-                    crate::validation::admission::attributes::SlotPrechecks::Unreported,
-                );
+                validation
+                    .admit_remaining_resources(
+                        judged,
+                        &bindings,
+                        session,
+                        crate::validation::admission::attributes::SlotPrechecks::Unreported,
+                    )
+                    .unwrap();
             });
             let conversions = validation.complete().into_presented();
             assert_eq!(
@@ -528,12 +529,13 @@ fn r11_stale_projection_can_only_reuse_an_already_recorded_static_verdict() {
         .unwrap()
         .resolve_root_for_test();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
         for instantiate in [false, true] {
-            let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+            let inputs =
+                ResourceAttributeInputs::for_resource_for_test(resource, judged.report()).unwrap();
             let mut changed = judged.file().clone();
             if instantiate {
                 changed.resources[0] = changed.resources[0].instantiate();
@@ -551,18 +553,7 @@ fn r11_stale_projection_can_only_reuse_an_already_recorded_static_verdict() {
                 crate::validation::ConversionValidation::new(judged.report());
             crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
                 let findings = run.admit_resource(
-                    crate::validation::admission::attributes::ResourceAdmissionRequest {
-                        resource,
-                        parsed: &changed,
-                        schema: resource.schema(&schemas).unwrap(),
-
-                        quoted: resource.quoted_string_attrs(),
-                        inputs,
-                        evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
-                        bindings: &bindings,
-                        session,
-                        schemas: &schemas,
-                    },
+                    crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(resource, &changed, resource.schema(&schemas).unwrap(), resource.quoted_string_attrs(), inputs, crate::validation::admission::attributes::ValidationEvaluation::None, &bindings, session, &schemas),
                 ).values;
                 assert_eq!(
                     findings.errors().count(),
@@ -622,8 +613,9 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                 )
                 .unwrap()
                 .resolve_root_for_test();
-                let configuration =
-                    crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+                let configuration = crate::test_utils::load_canonical_buffer_configuration(
+                    &parsed, &schemas, &catalog,
+                );
                 let judged = configuration.judged();
                 let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
                 let resource = tree.resources().next().unwrap();
@@ -650,9 +642,12 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                     ),
                 };
                 let values = indexmap::IndexMap::from([("target".into(), value)]);
-                let inputs =
-                    ResourceAttributeInputs::from_resolved(resource, &values, judged.report())
-                        .unwrap();
+                let inputs = ResourceAttributeInputs::from_resolved_for_test(
+                    resource,
+                    &values,
+                    judged.report(),
+                )
+                .unwrap();
                 assert!(match projection {
                     Projection::Pending => matches!(
                         values["target"]
@@ -685,18 +680,7 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                     crate::validation::ConversionValidation::new(judged.report());
                 crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
                     let findings = run.admit_resource(
-                        crate::validation::admission::attributes::ResourceAdmissionRequest {
-                            resource,
-                            parsed: judged.file(),
-                            schema: resource.schema(&schemas).unwrap(),
-
-                            quoted: resource.quoted_string_attrs(),
-                            inputs,
-                            evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
-                            bindings: &bindings,
-                            session,
-                            schemas: &schemas,
-                        },
+                        crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(resource, judged.file(), resource.schema(&schemas).unwrap(), resource.quoted_string_attrs(), inputs, crate::validation::admission::attributes::ValidationEvaluation::None, &bindings, session, &schemas),
                     ).values;
                     assert_eq!(
                         findings.errors().count(),
@@ -782,16 +766,17 @@ fn r9_syntax_with_values(
     .unwrap()
     .resolve_root_for_test();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
-    let inputs = crate::validation::admission::attributes::ResourceAttributeInputs::from_resolved(
-        resource,
-        &values,
-        judged.report(),
-    )
-    .unwrap();
+    let inputs =
+        crate::validation::admission::attributes::ResourceAttributeInputs::from_resolved_for_test(
+            resource,
+            &values,
+            judged.report(),
+        )
+        .unwrap();
     match projection {
         R9Projection::Pending => assert!(matches!(
             values["target"]
@@ -809,19 +794,17 @@ fn r9_syntax_with_values(
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         let findings = run
             .admit_resource(
-                crate::validation::admission::attributes::ResourceAdmissionRequest {
+                crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(
                     resource,
-                    parsed: judged.file(),
-                    schema: resource.schema(&schemas).unwrap(),
-
-                    quoted: resource.quoted_string_attrs(),
+                    judged.file(),
+                    resource.schema(&schemas).unwrap(),
+                    resource.quoted_string_attrs(),
                     inputs,
-                    evaluation:
-                        crate::validation::admission::attributes::ValidationEvaluation::None,
-                    bindings: &bindings,
+                    crate::validation::admission::attributes::ValidationEvaluation::None,
+                    &bindings,
                     session,
-                    schemas: &schemas,
-                },
+                    &schemas,
+                ),
             )
             .values;
         assert_eq!(findings.errors().count(), 0, "{findings:?}");
@@ -1006,7 +989,7 @@ fn r5b_pending_transport_requires_a_shape_compatible_destination() {
         .unwrap()
         .resolve_root_for_test();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
@@ -1019,7 +1002,8 @@ fn r5b_pending_transport_requires_a_shape_compatible_destination() {
             )),
         )]);
         let inputs =
-            ResourceAttributeInputs::from_resolved(resource, &values, judged.report()).unwrap();
+            ResourceAttributeInputs::from_resolved_for_test(resource, &values, judged.report())
+                .unwrap();
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         let mut run: crate::validation::ConversionValidation =
@@ -1027,19 +1011,17 @@ fn r5b_pending_transport_requires_a_shape_compatible_destination() {
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             let findings = run
                 .admit_resource(
-                    crate::validation::admission::attributes::ResourceAdmissionRequest {
+                    crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(
                         resource,
-                        parsed: judged.file(),
-                        schema: resource.schema(&schemas).unwrap(),
-
-                        quoted: resource.quoted_string_attrs(),
+                        judged.file(),
+                        resource.schema(&schemas).unwrap(),
+                        resource.quoted_string_attrs(),
                         inputs,
-                        evaluation:
-                            crate::validation::admission::attributes::ValidationEvaluation::None,
-                        bindings: &bindings,
+                        crate::validation::admission::attributes::ValidationEvaluation::None,
+                        &bindings,
                         session,
-                        schemas: &schemas,
-                    },
+                        &schemas,
+                    ),
                 )
                 .values;
             assert_eq!(
@@ -1313,7 +1295,7 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
         let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
         let parsed = crate::config_loader::parse_directory(&path, &catalog).unwrap();
         {
-            let configuration = crate::config_loader::load_buffer_configuration(
+            let configuration = crate::test_utils::load_canonical_buffer_configuration(
                 parsed.parsed(),
                 &schemas,
                 &catalog,
@@ -1336,8 +1318,9 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
             ) {
                 Ok(graph) => {
                     assert_eq!(case["expected"]["status"], "ok", "{}", case["name"]);
-                    let configuration =
-                        crate::config_loader::load_buffer_configuration(&graph, &schemas, &catalog);
+                    let configuration = crate::test_utils::load_canonical_buffer_configuration(
+                        &graph, &schemas, &catalog,
+                    );
                     let conversions = crate::validation::ConversionValidation::<
                         std::convert::Infallible,
                     >::new(configuration.judged().report())
@@ -1380,7 +1363,7 @@ fn r11_alias_uses_each_read_their_recorded_static_verdict() {
             .unwrap()
             .resolve_root_for_test();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings =
@@ -1391,36 +1374,31 @@ fn r11_alias_uses_each_read_their_recorded_static_verdict() {
             for resource in tree.resources() {
                 let values = resource.attributes().into_owned();
                 let inputs = if resource.binding() == Some("second") {
-                    ResourceAttributeInputs::from_report(resource, &values, judged.report())
+                    ResourceAttributeInputs::from_report_for_test(
+                        resource,
+                        &values,
+                        judged.report(),
+                    )
                 } else {
-                    ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap()
+                    ResourceAttributeInputs::for_resource_for_test(resource, judged.report())
+                        .unwrap()
                 };
                 let report = validation.admit_resource(
-                    crate::validation::admission::attributes::ResourceAdmissionRequest {
-                        resource,
-                        parsed: judged.file(),
-                        schema: resource.schema(&schemas).unwrap(),
-
-                        quoted: resource.quoted_string_attrs(),
-                        inputs,
-                        evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
-                        bindings: &bindings,
-                        session,
-                        schemas: &schemas,
-                    },
+                    crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(resource, judged.file(), resource.schema(&schemas).unwrap(), resource.quoted_string_attrs(), inputs, crate::validation::admission::attributes::ValidationEvaluation::None, &bindings, session, &schemas),
                 ).values;
                 assert_eq!(report.errors().count(), 0, "{report:?}");
                 assert_eq!(report.symbolic_errors().count(), 0, "{report:?}");
             }
         });
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-            validation.admit_remaining_resources(
-                &tree,
-                judged,
-                &bindings,
-                session,
-                crate::validation::admission::attributes::SlotPrechecks::Unreported,
-            );
+            validation
+                .admit_remaining_resources(
+                    judged,
+                    &bindings,
+                    session,
+                    crate::validation::admission::attributes::SlotPrechecks::Unreported,
+                )
+                .unwrap();
         });
         let conversions = validation.complete().into_presented();
         assert_eq!(conversions.len(), 0, "{source}\n{conversions:?}");
@@ -1474,21 +1452,22 @@ fn round5_partial_driver_retains_only_the_judged_slot_verdict() {
         )
         .unwrap();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
-        let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let _tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         let mut run: crate::validation::ConversionValidation =
             crate::validation::ConversionValidation::new(judged.report());
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-            let mut pass = run.admitted_resources(
-                &tree,
-                judged,
-                &bindings,
-                session,
-                crate::validation::FindingSubject::Root,
-            );
+            let mut pass = run
+                .admitted_resources(
+                    judged,
+                    &bindings,
+                    session,
+                    crate::validation::FindingSubject::Root,
+                )
+                .unwrap();
             assert!(pass.next().is_some());
             // Drop before exhaustion, even though this fixture has one resource.
         });
@@ -1521,21 +1500,22 @@ fn round5_an_unentered_document_has_no_sink_findings() {
         &catalog,
     )
     .unwrap();
-    let configuration = crate::config_loader::load_buffer_configuration(&other, &schemas, &catalog);
+    let configuration =
+        crate::test_utils::load_canonical_buffer_configuration(&other, &schemas, &catalog);
     let judged = configuration.judged();
-    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let _tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     let mut run: crate::validation::ConversionValidation =
         crate::validation::ConversionValidation::new(parsed.expression_report());
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         run.admitted_resources(
-            &tree,
             judged,
             &bindings,
             session,
             crate::validation::FindingSubject::Root,
         )
+        .unwrap()
         .for_each(drop);
     });
     let presented = run.complete().into_presented();
@@ -1707,7 +1687,7 @@ fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
         .unwrap()
         .resolve_root_for_test();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
@@ -1720,7 +1700,7 @@ fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
             )),
         )]);
         let inputs =
-            crate::validation::admission::attributes::ResourceAttributeInputs::from_resolved(
+            crate::validation::admission::attributes::ResourceAttributeInputs::from_resolved_for_test(
                 resource,
                 &values,
                 judged.report(),
@@ -1741,18 +1721,7 @@ fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
             &catalog,
             |session| {
                 let result = run.admit_resource(
-                    crate::validation::admission::attributes::ResourceAdmissionRequest {
-                        resource,
-                        parsed: judged.file(),
-                        schema: resource.schema(&schemas).unwrap(),
-
-                        quoted: resource.quoted_string_attrs(),
-                        inputs,
-                        evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
-                        bindings: &bindings,
-                        session,
-                        schemas: &schemas,
-                    },
+                    crate::validation::admission::attributes::ResourceAdmissionRequest::for_test(resource, judged.file(), resource.schema(&schemas).unwrap(), resource.quoted_string_attrs(), inputs, crate::validation::admission::attributes::ValidationEvaluation::None, &bindings, session, &schemas),
                 ).values;
                 result.errors().map(ToString::to_string).collect::<Vec<_>>()
             },
@@ -1856,7 +1825,7 @@ fn r11_judge_owned_static_conversion_failures_do_not_require_admission() {
             .unwrap()
             .resolve_root_for_test();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         // No resource admission walk: read-only and stopped runs still own
         // exactly main's Judge findings before a provider may be dispatched.
         let presented = crate::validation::ConversionValidation::<std::convert::Infallible>::new(
@@ -1890,7 +1859,7 @@ fn r11_walk_consumes_a_judge_verdict_without_resolving_the_target_again() {
         .unwrap()
         .resolve_root_for_test();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();

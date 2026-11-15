@@ -1124,16 +1124,16 @@ fn call_findings(
         },
     )]);
     let schemas = caller.schema_registry();
-    let configuration = crate::config_loader::load_buffer_configuration(
+    let configuration = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         schemas,
         context.as_provider_context(),
     );
-    let report = check_bare_binding_uses(&ValidationTypeContext::new(
-        configuration.judged(),
-        context,
-        &signatures,
-    ));
+    let report = check_bare_binding_uses(
+        &configuration
+            .judged()
+            .validation_context(context, &signatures),
+    );
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         &parsed,
         schemas,
@@ -1411,7 +1411,7 @@ fn computed_access_rejects_heterogeneous_collection_in_validation() {
         .expect("computed access fixture must parse");
         let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
         let result = validate_resource_ref_types(
-            crate::config_loader::load_buffer_configuration(
+            crate::test_utils::load_canonical_buffer_configuration(
                 &parsed,
                 snapshot.schema_registry(),
                 context,
@@ -1601,16 +1601,16 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
     )
     .unwrap();
     let signatures = HashMap::new();
-    let configuration = crate::config_loader::load_buffer_configuration(
+    let configuration = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         snapshot.schema_registry(),
         snapshot.provider_context().as_provider_context(),
     );
-    let report = check_bare_binding_uses(&ValidationTypeContext::new(
-        configuration.judged(),
-        snapshot.provider_context(),
-        &signatures,
-    ));
+    let report = check_bare_binding_uses(
+        &configuration
+            .judged()
+            .validation_context(snapshot.provider_context(), &signatures),
+    );
     assert!(
         report.findings().iter().any(|finding| finding
             .error
@@ -1660,7 +1660,7 @@ fn every_boundary_admits_same_identity_member_restrictions() {
     let parsed = inference::apply_inference(parsed, snapshot.schema_registry(), context);
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     validate_resource_ref_types(
-        crate::config_loader::load_buffer_configuration(
+        crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             snapshot.schema_registry(),
             context,
@@ -1784,7 +1784,7 @@ fn integer_result_mismatches_share_names_in_value_and_resource_checkers() {
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     let expected = "expected Int (range 1..=64), got Int (range unbounded)";
     let error = validate_resource_ref_types(
-        crate::config_loader::load_buffer_configuration(
+        crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             snapshot.schema_registry(),
             context,
@@ -1863,7 +1863,7 @@ fn integer_operand_mismatches_do_not_hide_a_named_strings_constraints() {
     parsed.variables.insert("result".into(), computed);
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     let error = validate_resource_ref_types(
-        crate::config_loader::load_buffer_configuration(
+        crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             snapshot.schema_registry(),
             context,
@@ -1948,17 +1948,17 @@ fn constructed_builtin_at_named_field(expression: &str, sink: DraftType) -> Resu
     .unwrap();
     crate::parser::resolve_resource_refs_with_config(&mut parsed, context.as_provider_context())
         .unwrap();
-    let configuration = crate::config_loader::load_buffer_configuration(
+    let configuration = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         loaded.schema_registry(),
         context.as_provider_context(),
     );
     let signatures = HashMap::new();
-    let uses = check_bare_binding_uses(&ValidationTypeContext::new(
-        configuration.judged(),
-        &context,
-        &signatures,
-    ));
+    let uses = check_bare_binding_uses(
+        &configuration
+            .judged()
+            .validation_context(&context, &signatures),
+    );
     let expected = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
     typecheck::check_type_expr_value(
         &expected,
@@ -2140,7 +2140,7 @@ fn issue_4282_review_split_coalesce_checks_literal_alternative() {
         context.as_provider_context(),
     )
     .unwrap();
-    let configuration = crate::config_loader::load_buffer_configuration(
+    let configuration = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         loaded.schema_registry(),
         context.as_provider_context(),
@@ -2398,7 +2398,7 @@ fn retained_read_types_do_not_claim_slot_member_bounds() {
         context,
     )
     .unwrap();
-    let configuration = crate::config_loader::load_buffer_configuration(
+    let configuration = crate::test_utils::load_canonical_buffer_configuration(
         &parsed,
         snapshot.schema_registry(),
         context,

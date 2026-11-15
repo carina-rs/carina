@@ -47,21 +47,21 @@ fn conversion_placement_findings_do_not_depend_on_report_node_maps() {
         Arc::make_mut(&mut report.nodes).clear();
         let schemas = crate::schema::SchemaRegistry::new();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
-        let tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let _tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         let mut validation = ConversionValidation::<std::convert::Infallible>::new(&report);
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             validation
                 .admitted_resources(
-                    &tree,
                     judged,
                     &bindings,
                     session,
                     crate::validation::FindingSubject::Root,
                 )
+                .unwrap()
                 .for_each(drop);
         });
         let conversions = validation.complete().into_presented();
@@ -183,7 +183,7 @@ fn conversion_discarded_union_claim_is_judged_once_and_covers_wrapped_leaf() {
     )
     .unwrap();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
     let tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -235,7 +235,7 @@ fn conversion_does_not_reclassify_an_int_as_a_string_construction() {
     .unwrap();
     let schemas = crate::schema::SchemaRegistry::new();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
     let syntax = judged
         .file()
@@ -316,7 +316,7 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
         )
         .unwrap();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
         let tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
@@ -393,12 +393,12 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             validation
                 .admitted_resources(
-                    &tree,
                     judged,
                     &bindings,
                     session,
                     crate::validation::FindingSubject::Root,
                 )
+                .unwrap()
                 .for_each(drop);
         });
         let presented = validation.complete().into_presented();
@@ -436,7 +436,7 @@ fn conversion_claim_preserves_ordinary_checks_below_a_rejected_wrapper() {
     )
     .unwrap();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
     let tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -492,12 +492,12 @@ fn conversion_claim_preserves_ordinary_checks_below_a_rejected_wrapper() {
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         validation
             .admitted_resources(
-                &tree,
                 judged,
                 &bindings,
                 session,
                 crate::validation::FindingSubject::Root,
             )
+            .unwrap()
             .for_each(drop);
     });
     let presented = validation.complete().into_presented();
@@ -683,7 +683,7 @@ fn round5_unclaimed_convert_cannot_reach_ordinary_value_admission() {
     )
     .unwrap();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
     let tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -837,7 +837,7 @@ fn r5b_unloaded_transport_destinations_decline_before_child_admission() {
         )
         .unwrap();
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
         let tree = super::super::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
@@ -983,7 +983,7 @@ fn r6_undefined_binding_has_only_its_ordinary_finding() {
     .unwrap();
     let schemas = crate::schema::SchemaRegistry::new();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let report = configuration.judged().report();
     // Iterable scope errors belong to main's merged identifier pass, not the
     // Judge's boundary diagnostics. The unresolved edge must add no echo.

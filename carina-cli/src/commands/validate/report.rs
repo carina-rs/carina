@@ -352,15 +352,32 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
             location: Some(Location::file(file)),
             ..Diagnostic::new(format_error_with_source_chain(error), "error")
         },
+        AppError::AnalysisInvariant(error) => analysis_invariant_diagnostic(error),
         AppError::AnalysisResolution(error) => match error.as_ref() {
             carina_core::parser::AnalysisResolutionError::Diagnostic(finding) => {
                 Diagnostic::located(finding.detail().diagnostic_message(), finding.location())
             }
-            _ => Diagnostic::new(format_error_with_source_chain(error.as_ref()), "error"),
+            carina_core::parser::AnalysisResolutionError::Invariant(error) => {
+                analysis_invariant_diagnostic(error)
+            }
         },
         _ => Diagnostic::new(format_error_with_source_chain(error), "error"),
     };
     vec![diagnostic]
+}
+
+fn analysis_invariant_diagnostic(error: &carina_core::parser::AnalysisTreeError) -> Diagnostic {
+    use carina_core::parser::AnalysisTreeDiagnostic;
+    match error.diagnostic() {
+        AnalysisTreeDiagnostic::Located(finding) => {
+            Diagnostic::located(error.to_string(), finding.location())
+        }
+        AnalysisTreeDiagnostic::File(finding) => Diagnostic {
+            location: Some(Location::file(finding.file().path())),
+            ..Diagnostic::new(error.to_string(), "error")
+        },
+        AnalysisTreeDiagnostic::Directory(_) => Diagnostic::new(error.to_string(), "error"),
+    }
 }
 
 fn module_error_diagnostics(
@@ -393,6 +410,7 @@ fn module_error_diagnostics(
                     .iter()
                     .map(|error| Diagnostic::new(error.to_string(), "error"))
                     .collect(),
+                ModuleError::AnalysisInvariant(error) => vec![analysis_invariant_diagnostic(error)],
                 error => vec![Diagnostic::new(error.to_string(), "error")],
             };
             for diagnostic in &mut diagnostics {
@@ -825,7 +843,7 @@ fn collect_configuration(
         return ValidateReport::finish(Vec::new(), errors, warnings, events);
     }
     ValidateReport::finish(
-        super::validated_entries(&parsed)
+        super::validated_entries(parsed.parsed().iter_all_resources())
             .iter()
             .map(ToString::to_string)
             .collect(),
