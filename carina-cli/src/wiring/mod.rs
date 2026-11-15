@@ -1622,13 +1622,13 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
 }
 
 fn require_expanded_config<E>(
-    file: &carina_core::parser::ModuleResolvedFile<E>,
+    file: carina_core::identifier::ModuleResolvedFileRead<'_, E>,
     base_dir: &ResolvedPath,
 ) -> Result<(), AppError>
 where
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress>,
 {
-    module_resolver::ensure_expanded_root_graph(file)
+    file.ensure_expanded_root_graph()
         .map_err(|error| AppError::Config(error.display_relative_to(&base_dir.source_label())))
 }
 
@@ -1641,8 +1641,7 @@ fn resolve_file_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>
     context: &WiringContext,
     catalog: &ValidationProviderCatalog<'_>,
 ) -> Result<carina_core::validation::ResolvedFile<E::Expanded>, AppError> {
-    let module_signatures =
-        module_resolver::load_resolved_module_signatures(&file, base_dir, catalog.catalog());
+    let module_signatures = file.parsed().module_signatures(base_dir, catalog.catalog());
     file.resolve_binding_uses(context.schemas(), catalog, &module_signatures)
         .map_err(resolve_file_error)
 }
@@ -1842,7 +1841,7 @@ impl ProviderLoad {
             duplicate_declarations,
             name_resolution,
             |parsed, catalog| {
-                require_expanded_config(&parsed, base_dir)?;
+                require_expanded_config(parsed.parsed(), base_dir)?;
                 resolve_file_binding_uses(parsed, base_dir, &self.context, catalog)
             },
         );
@@ -3708,12 +3707,16 @@ pub fn validate_resource_ref_types_with_ctx<
     judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
-    let parsed = judged.file();
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
-        parsed,
+    // A raw fixture enters the same canonicalization step as production.
+    let canonical = carina_core::test_utils::load_canonical_buffer_configuration(
+        judged.file(),
         ctx.schemas(),
         ctx.provider_context().as_provider_context(),
     );
+    let judged = &canonical;
+    let bindings = judged
+        .parsed()
+        .binding_index(ctx.provider_context().as_provider_context());
     let mut sink = CliTypeCheckSink { errors: Vec::new() };
     let mut errors =
         match validation::validate_resource_ref_types(judged, argument_names, &bindings, &mut sink)
@@ -5304,15 +5307,9 @@ pub(crate) fn validate_module_internal_ref_types(
         }
 
         let configuration = template.judge(ctx.schemas(), config.catalog());
-        let parsed = configuration.judged().file();
-        let imported = module_resolver::load_resolved_module_signatures(
-            parsed,
-            module.module_path(),
-            config.catalog(),
-        );
-        let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-            parsed, ctx.schemas(), None, &imported, config,
-        );
+        let parsed = configuration.judged().parsed();
+        let imported = parsed.module_signatures(module.module_path(), config.catalog());
+        let bindings = parsed.binding_index_in_session(None, &imported, config);
         let mut sink = ValidationReportSink {
             errors: Vec::new(),
             warnings: Vec::new(),
@@ -5328,7 +5325,7 @@ pub(crate) fn validate_module_internal_ref_types(
         }
         errors.extend(sink.errors);
         warnings.extend(sink.warnings);
-        for parameter in &configuration.judged().file().attribute_params {
+        for parameter in configuration.judged().parsed().attribute_params {
             let parameters = std::slice::from_ref(parameter);
             let values = validation::query_attribute_value_findings(parameters, config);
             let references = validation::attribute_param_ref_findings(parameters, &bindings);
@@ -11210,7 +11207,7 @@ pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
     parsed.resources = resources.to_vec();
     match resolve_file_names_with_ctx(&ctx, parsed) {
         Ok(canonical) => {
-            resources.clone_from_slice(&canonical.resources);
+            resources.clone_from_slice(canonical.parsed().resources);
             Ok(())
         }
         Err(errors) => errors_to_legacy_result(errors),

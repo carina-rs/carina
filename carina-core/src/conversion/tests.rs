@@ -368,8 +368,7 @@ where
             .map(|e| finding(e))
             .collect::<Vec<_>>();
         let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-        let context =
-            crate::validation::ValidationTypeContext::in_session(judged, session, &signatures);
+        let context = judged.validation_context_in_session(session, &signatures);
         let bare = crate::validation::check_expanded_bare_binding_uses(&context);
         findings.extend(bare.findings().iter().map(|e| finding(e)));
         let mut resources = Vec::new();

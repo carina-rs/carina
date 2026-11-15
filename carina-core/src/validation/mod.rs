@@ -5739,7 +5739,7 @@ fn validate_resources_from_report<
     let mut run: ConversionValidation = ConversionValidation::new(report);
     let findings = run.walk_in(FindingSubject::Root, |coverage| {
         resource_values_report(
-            parsed,
+            crate::identifier::PrefixFileRead::new(parsed, registry),
             registry,
             known_providers,
             provider_context,
@@ -5764,7 +5764,7 @@ fn resource_values_report<
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
     B: BindingAddress,
 >(
-    parsed: &crate::parser::File<E, P, T, D, B>,
+    parsed: crate::identifier::PrefixFileRead<'_, E, P, T, D, B>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
@@ -5780,7 +5780,7 @@ fn resource_values_report<
     // availability cannot be decided until its resources are expanded into a
     // root configuration. Keep every other schema/type check below active for
     // modules; only defer this provider-availability diagnostic.
-    if !is_module_definition(parsed) {
+    if !parsed.is_module_definition() {
         all_errors.extend(group_anonymous_resource_schema_errors(
             parsed
                 .iter_all_resources()
@@ -6051,7 +6051,7 @@ fn complete_resource_admission_report<
     )?;
     let mut findings = run.walk_in(subject.clone(), |coverage| {
         resource_values_report(
-            judged.file(),
+            judged.parsed(),
             judged.schemas(),
             known_providers,
             bindings.provider_context(),
@@ -6063,7 +6063,7 @@ fn complete_resource_admission_report<
             },
         )
     });
-    let tree = crate::parser::AnalysisTree::try_from_file(judged.file())?;
+    let tree = judged.parsed().analysis_tree()?;
     let mut resources = HashMap::new();
     for resource in tree.project_resources() {
         // Preserve the former find() policy if an earlier validation phase
@@ -6106,13 +6106,16 @@ struct ResourceAdmissionReport {
 /// Recover the lexical type of a bare value that became an entire reference
 /// attribute during expansion. The runtime reference stays absolute; only its
 /// module-body type retains the declaration and the original source together.
-fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
-    parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+pub(crate) fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
+    parsed: crate::identifier::PrefixFileRead<'a, E, ParserPlaceholder, ParserPlaceholder, D, B>,
     resource_id: &crate::resource::ResourceId,
     attribute: &str,
     value: &GenericValue<ParserPlaceholder, B>,
     bindings: &BindingIndex<'_, B>,
-) -> Option<(&'a str, crate::binding_index::DeclaredValueSource)> {
+) -> Option<(&'a str, crate::binding_index::DeclaredValueSource)>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     let GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path: source_path }) =
         value
     else {
@@ -6169,18 +6172,18 @@ fn resource_admission_report<
     subject: &FindingSubject,
     boundary: presentation::AdmissionBoundary,
 ) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
-    let parsed = judged.file();
+    let parsed = judged.parsed();
     let registry = judged.schemas();
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
-    let inference_bindings = inference::bindings_from_parsed(parsed);
+    let inference_bindings = parsed.inference_bindings();
 
     // Validate declarations directly instead of relying on a later resource
     // attribute to happen to expose an expression. Keep the authored
     // operator keys so a let substituted into an attribute is not reported a
     // second time by the schema-sink pass below.
     let mut declaration_arithmetic_findings = HashSet::new();
-    for finding in check_file_integer_arithmetic_values(judged, bindings) {
+    for finding in judged.integer_arithmetic_findings(bindings) {
         let message = finding.to_string();
         declaration_arithmetic_findings.insert((finding.location().clone(), message.clone()));
         all_errors.push(finding);
@@ -6295,7 +6298,7 @@ fn resource_admission_report<
 
     if parsed.deferred_for_sites().next().is_some() {
         all_errors.extend(validate_deferred_for_iterable_types_with_bindings(
-            &crate::parser::AnalysisTree::try_from_file(parsed)?,
+            &parsed.analysis_tree()?,
             registry,
             &inference_bindings,
             bindings.provider_context(),

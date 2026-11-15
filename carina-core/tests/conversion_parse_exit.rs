@@ -24,11 +24,7 @@ fn parser_conversion_rejections_wait_for_the_presented_exit() {
             &parsed, &schemas, &catalog,
         );
         let judged = configuration.judged();
-        let bindings = carina_core::binding_index::BindingIndex::from_parsed(
-            judged.file(),
-            &schemas,
-            &catalog,
-        );
+        let bindings = judged.parsed().binding_index(&catalog);
         let findings = validation::resource_admission_findings(
             judged,
             &bindings,

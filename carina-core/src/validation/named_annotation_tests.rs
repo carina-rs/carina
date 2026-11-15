@@ -1129,11 +1129,11 @@ fn call_findings(
         schemas,
         context.as_provider_context(),
     );
-    let report = check_bare_binding_uses(&ValidationTypeContext::new(
-        configuration.judged(),
-        context,
-        &signatures,
-    ));
+    let report = check_bare_binding_uses(
+        &configuration
+            .judged()
+            .validation_context(context, &signatures),
+    );
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         &parsed,
         schemas,
@@ -1614,11 +1614,11 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
         snapshot.schema_registry(),
         snapshot.provider_context().as_provider_context(),
     );
-    let report = check_bare_binding_uses(&ValidationTypeContext::new(
-        configuration.judged(),
-        snapshot.provider_context(),
-        &signatures,
-    ));
+    let report = check_bare_binding_uses(
+        &configuration
+            .judged()
+            .validation_context(snapshot.provider_context(), &signatures),
+    );
     assert!(
         report.findings().iter().any(|finding| finding
             .error
@@ -2022,11 +2022,11 @@ fn constructed_builtin_at_named_field(expression: &str, sink: DraftType) -> Resu
         context.as_provider_context(),
     );
     let signatures = HashMap::new();
-    let uses = check_bare_binding_uses(&ValidationTypeContext::new(
-        configuration.judged(),
-        &context,
-        &signatures,
-    ));
+    let uses = check_bare_binding_uses(
+        &configuration
+            .judged()
+            .validation_context(&context, &signatures),
+    );
     let expected = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
     typecheck::check_type_expr_value(
         &expected,

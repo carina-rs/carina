@@ -1664,7 +1664,11 @@ fn seam_generated_prefix_result_has_explicit_projection_authority() {
     let resource = tree.project_resources().next().unwrap();
     assert!(resource.projected_phase("name").is_some());
     assert!(resource.projected_phase("missing").is_none());
-    let (rows, _) = admit_all(judged, resource.schema(&schemas).unwrap(), &catalog);
+    let (rows, _) = admit_all(
+        &crate::parser::retained::JudgedFile::new(judged.file().clone(), &schemas, &catalog),
+        resource.schema(&schemas).unwrap(),
+        &catalog,
+    );
     for (findings, _) in rows {
         assert_eq!(findings.errors().count(), 0, "{findings:?}");
     }

@@ -11,8 +11,8 @@ pub use diagnostics::{
 };
 pub(crate) use prefix::canonicalize_prefix_values;
 pub use prefix::{
-    CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, PrefixCanonicalized,
-    SuffixSource, canonicalize_file_prefixes,
+    CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, ModuleResolvedFileRead,
+    PrefixCanonicalized, PrefixFileRead, SuffixSource, canonicalize_file_prefixes,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

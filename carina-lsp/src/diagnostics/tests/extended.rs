@@ -18004,7 +18004,7 @@ fn widening_member_obligation_lsp_validate_parity(decoded: bool) {
     )
     .expect("validate must admit the widening and defer its destination member");
     let authored = parse(source);
-    let configuration = carina_core::config_loader::load_buffer_configuration(
+    let configuration = carina_core::test_utils::load_canonical_buffer_configuration(
         &authored,
         &engine.schemas,
         &engine.provider_context,

@@ -691,11 +691,14 @@ impl DiagnosticRun<'_> {
 
     fn validation_inputs<'a, D>(
         &'a self,
-        configuration: &'a carina_core::parser::retained::JudgedFile<
+        configuration: &'a PrefixCanonicalized<
             '_,
-            carina_core::parser::ParsedExportParam,
-            D,
-            RelativeBindingName,
+            carina_core::parser::retained::JudgedFile<
+                '_,
+                carina_core::parser::ParsedExportParam,
+                D,
+                RelativeBindingName,
+            >,
         >,
         upstream_exports: &'a carina_core::upstream_exports::UpstreamExports,
         module_signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
@@ -707,23 +710,17 @@ impl DiagnosticRun<'_> {
                 RelativeBindingName,
             >,
     {
-        let binding_input = configuration.file();
-        let binding_index = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-            binding_input,
-            configuration.schemas(),
+        let binding_input = configuration.parsed();
+        let binding_index = binding_input.binding_index_in_session(
             Some(upstream_exports),
             module_signatures,
             self.provider_context,
         );
 
-        let context = carina_core::validation::ValidationTypeContext::in_session(
-            configuration,
-            self.provider_context,
-            module_signatures,
-        );
+        let context =
+            configuration.validation_context_in_session(self.provider_context, module_signatures);
         let binding_use_report = carina_core::validation::check_bare_binding_uses(&context);
-        let export_value_bindings =
-            carina_core::binding_index::ResolvedBindings::for_authored_validation(binding_input);
+        let export_value_bindings = binding_input.resolved_bindings();
         DiagnosticValidationInputs {
             binding_use_context: context,
             binding_index,
@@ -2004,15 +2001,7 @@ impl DiagnosticRun<'_> {
                     diagnostics.push(diagnostic);
                 }
             }
-            let semantic_view = checks::SemanticView::for_analysis(
-                if merged.is_none() {
-                    pre_expansion_configuration.parsed()
-                } else {
-                    parsed
-                },
-                merged,
-                base_path.is_some(),
-            );
+            let semantic_view = checks::SemanticView::for_analysis(merged, base_path.is_some());
             let empty_upstream_exports = Default::default();
             let upstream_exports = upstream_resolution
                 .as_ref()
@@ -2066,16 +2055,19 @@ impl DiagnosticRun<'_> {
             let expanded_validation_tree = expanded_configuration
                 .as_ref()
                 .and_then(|configuration| configuration.analysis_tree().ok());
-            let expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
-                let tree = expanded_validation_tree.as_ref()?;
-                Some(ExpandedDiagnosticValidationInputs {
-                    configuration,
-                    resources: tree.resources().collect(),
-                    binding_index: carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-                        configuration.file(), &self.schemas, Some(&expanded_upstream_exports), &module_signatures, self.provider_context,
-                    ),
-                })
-            });
+            let expanded_validation_inputs =
+                expanded_configuration.as_ref().and_then(|configuration| {
+                    let tree = expanded_validation_tree.as_ref()?;
+                    Some(ExpandedDiagnosticValidationInputs {
+                        configuration,
+                        resources: tree.resources().collect(),
+                        binding_index: configuration.parsed().binding_index_in_session(
+                            Some(&expanded_upstream_exports),
+                            &module_signatures,
+                            self.provider_context,
+                        ),
+                    })
+                });
             let DiagnosticValidationInputs {
                 binding_use_context,
                 binding_index,
@@ -2086,10 +2078,7 @@ impl DiagnosticRun<'_> {
             // even when no typed resource sink consumes them. Binding and
             // schema authority remains directory-wide, while source anchoring
             // comes from each authored operator.
-            for finding in carina_core::validation::check_file_integer_arithmetic_values(
-                pre_expansion_configuration.judged(),
-                &binding_index,
-            ) {
+            for finding in pre_expansion_configuration.integer_arithmetic_findings(&binding_index) {
                 if let Some(diagnostic) = render_merged(
                     doc,
                     &finding,
@@ -2109,16 +2098,17 @@ impl DiagnosticRun<'_> {
             // differently enriched bootstrap identity. Nested uses keep the
             // surrounding schema walk to validate unrelated sibling leaves.
             let binding_error_sinks = pre_expansion_configuration
-                .file()
+                .parsed()
                 .bare_binding_uses()
                 .uses()
                 .filter(|use_site| {
-                    carina_core::validation::binding_use_authority_owns_use(
-                        pre_expansion_configuration.file(),
-                        &binding_use_context,
-                        &binding_use_report,
-                        use_site,
-                    )
+                    pre_expansion_configuration
+                        .parsed()
+                        .binding_use_authority_owns_use(
+                            &binding_use_context,
+                            &binding_use_report,
+                            use_site,
+                        )
                 })
                 .filter_map(|use_site| match &use_site.owner {
                     carina_core::parser::BindingUseOwner::Resource(address) => Some((
@@ -2129,7 +2119,7 @@ impl DiagnosticRun<'_> {
                 })
                 .collect::<HashSet<_>>();
             let pending_resource_sinks = pre_expansion_configuration
-                .file()
+                .parsed()
                 .bare_binding_uses()
                 .pending_slots()
                 .filter_map(|slot| match &slot.owner {
@@ -2316,7 +2306,7 @@ impl DiagnosticRun<'_> {
             let expanded_reference_findings = match expanded_validation_inputs.as_ref() {
                 Some(inputs) => carina_core::validation::check_expanded_module_calls(
                     carina_core::validation::ExpandedModuleCallCheckInput::References {
-                        compositions: &inputs.configuration.file().compositions,
+                        compositions: inputs.configuration.parsed().compositions,
                         bindings: &inputs.binding_index,
                     },
                     self.provider_context.catalog(),
@@ -2376,7 +2366,7 @@ impl DiagnosticRun<'_> {
                 // Unknown schemas cannot produce admission owners. Preserve replay's
                 // observation of module resources declined before binding.
                 #[cfg(feature = "test-utils")]
-                for resource in &inputs.configuration.file().resources {
+                for resource in inputs.configuration.parsed().resources {
                     if !authored_ids.contains(&resource.id)
                         && matches!(
                             &resource.module_source,

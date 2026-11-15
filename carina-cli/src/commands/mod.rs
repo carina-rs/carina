@@ -308,6 +308,49 @@ pub(crate) fn duplicate_declaration_errors(
     errors
 }
 
+/// Read-only validation results used by integration fixtures. This inventory
+/// carries no file, judgement or admission authority.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug)]
+pub struct ValidationInventory {
+    pub resources: Vec<
+        carina_core::resource::Resource<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+    >,
+    pub compositions: Vec<
+        carina_core::resource::LiveComposition<
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+    >,
+    pub providers: Vec<
+        carina_core::parser::ProviderConfig<
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+    >,
+    pub wait_bindings:
+        Vec<carina_core::parser::WaitBinding<carina_core::resource::AbsoluteBindingAddress>>,
+}
+#[cfg(any(test, feature = "test-utils"))]
+fn validation_inventory(
+    canonical: carina_core::identifier::PrefixCanonicalized<
+        '_,
+        carina_core::parser::ModuleResolvedInferredFile,
+    >,
+) -> ValidationInventory {
+    let read = canonical.parsed();
+    ValidationInventory {
+        resources: read.resources.to_vec(),
+        compositions: read.compositions.to_vec(),
+        providers: read.providers.to_vec(),
+        wait_bindings: read.wait_bindings.to_vec(),
+    }
+}
+
 /// Test-support wrapper around the non-minting validation report.
 ///
 /// Fixtures supply directory-level uniqueness diagnostics as well as the
@@ -319,7 +362,7 @@ pub fn validate_and_resolve_with_config(
     providers: &ProviderLoad,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
+) -> Result<ValidationInventory, AppError> {
     providers
         .validation_report(
             parsed,
@@ -328,7 +371,7 @@ pub fn validate_and_resolve_with_config(
             duplicate_declarations,
         )
         .into_result()
-        .map(|canonical| (*canonical).clone())
+        .map(validation_inventory)
         .map_err(|errors| collapse_presented_errors(errors.into_vec()))
 }
 
@@ -358,7 +401,7 @@ pub fn validate_and_resolve_with_provider_load_for_test(
     base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
+) -> Result<ValidationInventory, AppError> {
     let (providers, load_error) = ProviderLoad::load_reporting(
         runtime,
         &parsed.providers,
@@ -376,7 +419,7 @@ pub fn validate_and_resolve_with_provider_load_for_test(
             duplicate_declarations,
         )
         .into_result()
-        .map(|canonical| (*canonical).clone())
+        .map(validation_inventory)
         .map_err(|errors| collapse_presented_errors(errors.into_vec()))
 }
 
@@ -436,9 +479,14 @@ pub(crate) enum ResolvedConfig<'s> {
 }
 
 impl<'s> ResolvedConfig<'s> {
-    fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
+    fn parsed(
+        &self,
+    ) -> carina_core::identifier::ModuleResolvedFileRead<
+        '_,
+        carina_core::parser::ModuleResolvedInferredExportParam,
+    > {
         match self {
-            Self::Evaluated { parsed, .. } => parsed,
+            Self::Evaluated { parsed, .. } => parsed.parsed(),
             Self::Paired { resources, .. } => resources.parsed(),
         }
     }
@@ -460,7 +508,7 @@ impl<'s> ResolvedConfig<'s> {
         ctx: &WiringContext,
         conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
     ) -> Result<Vec<AppError>, AppError> {
-        let providers = self.parsed().providers.clone();
+        let providers = self.parsed().providers.to_vec();
         match self {
             Self::Evaluated { parsed, .. } => {
                 let canonical_resources = parsed.canonicalize_values()?;
@@ -1178,16 +1226,13 @@ fn validate_and_resolve_configuration<'s>(
     // This is the sole parser-placeholder boundary. Standalone module
     // definitions intentionally retain typed module-argument slots until a
     // caller expands them; root configurations must be fully expanded.
-    let placeholder_boundary = if carina_core::validation::is_module_definition(parsed) {
+    let placeholder_boundary = if parsed.is_module_definition() {
         carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
     } else {
         carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
     };
-    let directive_errors = parsed.directive_resolution_errors(
-        placeholder_boundary,
-        ctx.schemas(),
-        enriched_context.catalog(),
-    );
+    let directive_errors =
+        parsed.directive_resolution_errors(placeholder_boundary, enriched_context.catalog());
     match directive_errors {
         Ok(directive_errors) => {
             for error in directive_errors {
@@ -1206,7 +1251,7 @@ fn validate_and_resolve_configuration<'s>(
     }
 
     let expanded_analysis = if !skip_resource_validation {
-        let analysis = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+        let analysis = match parsed.analysis_tree() {
             Ok(tree) => tree,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
@@ -1235,15 +1280,13 @@ fn validate_and_resolve_configuration<'s>(
         (Default::default(), Vec::new())
     };
 
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-        parsed,
-        ctx.schemas(),
+    let bindings = parsed.binding_index_in_session(
         Some(&upstream_exports),
         &imported_module_signatures,
         enriched_context,
     );
     if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
-        &parsed.export_params,
+        parsed.export_params,
         &bindings,
     ) {
         errors.extend(ref_errors.into_iter().map(AppError::from));
@@ -1272,10 +1315,9 @@ fn validate_and_resolve_configuration<'s>(
                 .map(|error| AppError::UpstreamResolution(Box::new(error))),
         );
 
-        let export_value_bindings =
-            carina_core::binding_index::ResolvedBindings::for_expanded_validation(parsed);
+        let export_value_bindings = parsed.resolved_bindings();
         let checked_export_values = carina_core::validation::check_export_values_for_validation(
-            &parsed.export_params,
+            parsed.export_params,
             &export_value_bindings,
             enriched_context,
         )
@@ -1286,7 +1328,7 @@ fn validate_and_resolve_configuration<'s>(
             errors,
             carina_core::validation::check_expanded_module_calls(
                 carina_core::validation::ExpandedModuleCallCheckInput::References {
-                    compositions: &parsed.compositions,
+                    compositions: parsed.compositions,
                     bindings: &bindings,
                 },
                 enriched_context.catalog(),
@@ -1308,7 +1350,7 @@ fn validate_and_resolve_configuration<'s>(
         );
         errors.extend(
             carina_core::validation::attribute_param_ref_findings(
-                &parsed.attribute_params,
+                parsed.attribute_params,
                 &bindings,
             )
             .into_iter()
@@ -1318,7 +1360,7 @@ fn validate_and_resolve_configuration<'s>(
             }),
         );
         let attribute_findings = carina_core::validation::attribute_value_findings(
-            &parsed.attribute_params,
+            parsed.attribute_params,
             enriched_context,
         )
         .into_validation(errors, carina_core::validation::FindingSubject::Root);
@@ -1361,8 +1403,8 @@ fn validate_and_resolve_configuration<'s>(
     // every repair the operator must make.
     errors.extend(
         carina_core::identifier::check_legacy_loop_move_targets(
-            &parsed.state_blocks,
-            &parsed.resources,
+            parsed.state_blocks,
+            parsed.resources,
         )
         .into_iter()
         .map(|error| AppError::AnonymousIdentity(error.into())),
@@ -1383,7 +1425,7 @@ fn validate_and_resolve_configuration<'s>(
     if !skip_resource_validation {
         // Identity assignment mutates the parsed resources. Seal their final
         // view only after the identity and move-target gate has succeeded.
-        let analysis = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+        let analysis = match parsed.analysis_tree() {
             Ok(tree) => tree,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));

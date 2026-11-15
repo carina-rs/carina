@@ -1,4 +1,5 @@
 //! The file that crossed prefix canonicalization is admission's authority.
+mod read;
 use super::{
     AttributePrefixError, ResourcePrefixSource, generate_random_suffix, prefix_companion_attribute,
 };
@@ -14,6 +15,7 @@ use crate::resource::{
 use crate::schema::{OwnerBoundResourceSchema, SchemaKind, SchemaRegistry};
 use crate::validation::admission::{DeclarationIdentity, attributes::declaration_identity};
 use indexmap::IndexMap;
+pub use read::{ModuleResolvedFileRead, PrefixFileRead};
 use std::ops::Deref;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,31 @@ impl SuffixSource {
 ///     canonicalize_file_prefixes(file, &schemas, SuffixSource::Preview)
 /// }
 /// ```
+/// The inner judgement cannot be detached from its canonicalization witness:
+/// ```compile_fail,E0614
+/// use carina_core::{identifier::PrefixCanonicalized, parser::{retained::JudgedFile, ParsedExportParam, ParsedDeferredForPhase}, resource::{ParserPlaceholder, RelativeBindingName}};
+/// type Judged<'s> = JudgedFile<'s, ParsedExportParam, ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>>;
+/// fn detach<'f, 's>(wrapper: &'f PrefixCanonicalized<'s, Judged<'s>>) -> &'f Judged<'s> {
+///     &**wrapper
+/// }
+/// ```
+/// A detached judgement cannot enter the resource admission driver:
+/// ```compile_fail,E0308
+/// use carina_core::{parser::{retained::JudgedFile, ParsedExportParam, ParsedDeferredForPhase}, resource::{ParserPlaceholder, RelativeBindingName}, binding_index::BindingIndex, validation::{ConversionValidation, FindingSubject, deferred_types::ProviderTypeCheckContext}};
+/// type Judged<'s> = JudgedFile<'s, ParsedExportParam, ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>>;
+/// fn bypass(file: &Judged<'_>, bindings: &BindingIndex<'_>, session: &dyn ProviderTypeCheckContext) {
+///     let mut run = ConversionValidation::<std::convert::Infallible>::new(file.report());
+///     let _ = run.admitted_resources(file, bindings, session, FindingSubject::Root);
+/// }
+/// ```
+/// Read views cannot be cloned into a file and canonicalized against another catalog:
+/// ```compile_fail,E0308
+/// use carina_core::{identifier::{PrefixCanonicalized, canonicalize_file_prefixes, SuffixSource}, parser::{retained::JudgedFile, ParsedExportParam, ParsedDeferredForPhase}, resource::{ParserPlaceholder, RelativeBindingName}, schema::SchemaRegistry};
+/// type Judged<'s> = JudgedFile<'s, ParsedExportParam, ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>>;
+/// fn reroute(wrapper: &PrefixCanonicalized<'_, Judged<'_>>, other: &SchemaRegistry) {
+///     let _ = canonicalize_file_prefixes(wrapper.parsed().clone(), other, SuffixSource::Preview);
+/// }
+/// ```
 #[derive(Clone)]
 pub struct PrefixCanonicalized<'s, F> {
     file: F,
@@ -62,12 +89,6 @@ impl<F: std::fmt::Debug> std::fmt::Debug for PrefixCanonicalized<'_, F> {
             .field("file", &self.file)
             .field("errors", &self.errors)
             .finish_non_exhaustive()
-    }
-}
-impl<F> Deref for PrefixCanonicalized<'_, F> {
-    type Target = F;
-    fn deref(&self) -> &F {
-        &self.file
     }
 }
 impl<'s, F> PrefixCanonicalized<'s, F> {
@@ -103,6 +124,9 @@ pub fn canonicalize_file_prefixes<
 impl<X, P: PlaceholderKind, T: PlaceholderKind, D, B: BindingAddress>
     PrefixCanonicalized<'_, File<X, P, T, D, B>>
 {
+    pub fn parsed(&self) -> PrefixFileRead<'_, X, P, T, D, B> {
+        PrefixFileRead::new(&self.file, self.schemas)
+    }
     pub fn canonicalize_values(
         &mut self,
     ) -> Result<
@@ -185,8 +209,10 @@ where
     pub fn resource_schema(&self) -> OwnerBoundResourceSchema<'f> {
         self.schema
     }
-    pub fn file(&self) -> &'f File<X, ParserPlaceholder, ParserPlaceholder, D, B> {
-        self.file
+    pub(crate) fn parsed(
+        &self,
+    ) -> PrefixFileRead<'f, X, ParserPlaceholder, ParserPlaceholder, D, B> {
+        PrefixFileRead::new(self.file, self.schemas)
     }
     pub fn schemas(&self) -> &'f SchemaRegistry {
         self.schemas
@@ -308,8 +334,49 @@ where
             .expressions()
             .admission_report()
     }
-    pub fn parsed(&self) -> &File<X, ParserPlaceholder, ParserPlaceholder, D, B> {
+    pub fn parsed(&self) -> PrefixFileRead<'_, X, ParserPlaceholder, ParserPlaceholder, D, B> {
+        PrefixFileRead::new(self.file.file(), self.schemas)
+    }
+    #[cfg(test)]
+    pub(crate) fn edit_judgement_for_test(
+        &mut self,
+        edit: impl FnOnce(&mut JudgedFile<'s, X, D, B>),
+    ) {
+        edit(&mut self.file);
+    }
+    #[cfg(test)]
+    pub(crate) fn file(&self) -> &File<X, ParserPlaceholder, ParserPlaceholder, D, B> {
         self.file.file()
+    }
+    pub fn report(&self) -> &crate::parser::retained::ExpressionReport<B> {
+        self.file.report()
+    }
+    pub fn validation_context_in_session<'f>(
+        &'f self,
+        session: &'f dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+        signatures: &'f crate::module_resolver::ResolvedModuleSignatures,
+    ) -> crate::validation::ValidationTypeContext<'f, B> {
+        crate::validation::ValidationTypeContext::in_session(&self.file, session, signatures)
+    }
+    pub fn validation_context<'f>(
+        &'f self,
+        provider: &'f crate::parser::LoadedProviderContext,
+        signatures: &'f crate::module_resolver::ResolvedModuleSignatures,
+    ) -> crate::validation::ValidationTypeContext<'f, B> {
+        crate::validation::ValidationTypeContext::new(&self.file, provider, signatures)
+    }
+    pub fn providerless_validation_context<'f>(
+        &'f self,
+        provider: &'f ProviderContext,
+        signatures: &'f crate::module_resolver::ResolvedModuleSignatures,
+    ) -> crate::validation::ValidationTypeContext<'f, B> {
+        crate::validation::ValidationTypeContext::new_providerless(&self.file, provider, signatures)
+    }
+    pub fn integer_arithmetic_findings(
+        &self,
+        bindings: &crate::binding_index::BindingIndex<'_, B>,
+    ) -> Vec<crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>> {
+        crate::validation::check_file_integer_arithmetic_values(&self.file, bindings)
     }
     pub fn judged(&self) -> &Self {
         self
@@ -355,6 +422,21 @@ where
             resources,
             top_level_resource_count,
         })
+    }
+}
+
+impl<'s, D, B: BindingAddress>
+    PrefixCanonicalized<
+        's,
+        JudgedFile<'s, crate::parser::ParsedExportParam<ParserPlaceholder, B>, D, B>,
+    >
+where
+    D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    pub fn inferred_export_params(
+        &self,
+    ) -> crate::validation::inference::SchemaCheckedExportParams<B> {
+        crate::validation::inference::infer_export_params(&self.file)
     }
 }
 
@@ -575,6 +657,40 @@ mod tests {
                 .unwrap(),
         );
         schemas
+    }
+
+    #[test]
+    fn prefix_read_view_admits_only_through_its_witness() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve("mock.Sink { name_prefix = 'ok' }").unwrap();
+        let canonical =
+            canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview).judge(&context);
+        let read = canonical.parsed();
+        assert!(read.resources[0].attributes.contains_key("name"));
+        assert!(!read.resources[0].attributes.contains_key("name_prefix"));
+        assert!(std::ptr::eq(read.expression_report(), canonical.report()));
+        let bindings = read.binding_index(&context);
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let mut run = crate::validation::ConversionValidation::<std::convert::Infallible>::new(
+                canonical.report(),
+            );
+            let steps = run
+                .admitted_resources(
+                    &canonical,
+                    &bindings,
+                    session,
+                    crate::validation::FindingSubject::Root,
+                )
+                .unwrap();
+            let mut count = 0;
+            for step in steps {
+                let (_, values) = step.into_parts();
+                assert_eq!(values.unwrap().unwrap().errors().count(), 0);
+                count += 1;
+            }
+            assert_eq!(count, 1);
+        });
     }
 
     #[test]

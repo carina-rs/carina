@@ -825,7 +825,7 @@ fn collect_configuration(
         return ValidateReport::finish(Vec::new(), errors, warnings, events);
     }
     ValidateReport::finish(
-        super::validated_entries(&parsed)
+        super::validated_entries(parsed.parsed().iter_all_resources())
             .iter()
             .map(ToString::to_string)
             .collect(),

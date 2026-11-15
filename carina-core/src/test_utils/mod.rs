@@ -585,19 +585,16 @@ pub fn legacy_validate_resource_ref_types<
             B,
         > + Clone,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        '_,
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     _: &std::collections::HashSet<String>,
     bindings: &crate::binding_index::BindingIndex<'_, B>,
     diagnostics: &mut dyn crate::validation::deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), LegacyValidationError> {
-    let canonical = crate::identifier::canonicalize_file_prefixes(
-        judged.file().clone(),
-        judged.schemas(),
-        crate::identifier::SuffixSource::Preview,
-    );
-    let canonical = canonical.judge(bindings.provider_context());
     legacy_findings_result(crate::validation::resource_reference_findings(
-        &canonical,
+        judged,
         bindings,
         diagnostics,
     ))
@@ -611,19 +608,16 @@ pub fn legacy_validate_resource_admissions<
             B,
         > + Clone,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        '_,
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &crate::binding_index::BindingIndex<'_, B>,
     known: &std::collections::HashSet<String>,
     diagnostics: &mut dyn crate::validation::deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), LegacyValidationError> {
-    let canonical = crate::identifier::canonicalize_file_prefixes(
-        judged.file().clone(),
-        judged.schemas(),
-        crate::identifier::SuffixSource::Preview,
-    );
-    let canonical = canonical.judge(bindings.provider_context());
     legacy_findings_result(crate::validation::resource_admission_findings(
-        &canonical,
+        judged,
         bindings,
         known,
         diagnostics,

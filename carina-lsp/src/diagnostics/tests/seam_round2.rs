@@ -57,11 +57,7 @@ fn check_report_selection(reported: bool) {
     } else {
         assert!(inputs.authored_evidence().is_ok());
     }
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
-        configuration.file(),
-        &schemas,
-        &config,
-    );
+    let bindings = configuration.parsed().binding_index(&config);
     let admit = |inputs| {
         let mut coverage = carina_core::validation::admission::WalkCoverage::default();
         let errors =
@@ -177,7 +173,7 @@ fn round2_lsp_missing_expanded_report_selects_main_fallback() {
             let configuration = carina_core::test_utils::load_canonical_buffer_configuration(
                 &graph, &schemas, &config,
             );
-            let mut instances = configuration.judged().file().clone();
+            let mut instances = graph.clone();
             for resource in &mut instances.resources {
                 // allow: direct - emulate an expanded instance absent from the original report
                 resource.id = carina_core::resource::ResourceId::with_provider_identity(
@@ -195,11 +191,7 @@ fn round2_lsp_missing_expanded_report_selects_main_fallback() {
             let mut inputs = ExpandedDiagnosticValidationInputs {
                 configuration: configuration.judged(),
                 resources: tree.resources().collect(),
-                binding_index: carina_core::binding_index::BindingIndex::from_parsed(
-                    configuration.judged().file(),
-                    &schemas,
-                    &config,
-                ),
+                binding_index: configuration.judged().parsed().binding_index(&config),
             };
             let resource = tree.resources().next().unwrap();
             let result = inputs.resource_admissions(resource.id(), session).unwrap();
@@ -241,11 +233,7 @@ fn canonical_lsp_caller_values_remain_open_but_keys_are_witnessed() {
         )]))
         .unwrap();
     let inputs = ResourceAttributeInputs::from_report(owner, &values, configuration.report());
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
-        configuration.file(),
-        &schemas,
-        &config,
-    );
+    let bindings = configuration.parsed().binding_index(&config);
     carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
         let request = ResourceAdmissionRequest::new(
             owner,
@@ -283,11 +271,7 @@ fn expanded_admission_missing_evidence_is_an_owner_diagnostic() {
     let mut resources = tree.resources();
     let owner = resources.next().unwrap();
     let other = resources.next().unwrap();
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
-        configuration.file(),
-        &schemas,
-        &config,
-    );
+    let bindings = configuration.parsed().binding_index(&config);
     let doc = create_document_at(source, path);
     carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
         // Correct owner construction cannot cause this invariant failure. Supply

@@ -246,10 +246,10 @@ fn conversion_sibling_coverage_preserves_ordinary_provider_callback_counts() {
 
 #[test]
 fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outcomes() {
+    use carina_core::validation::ConversionValidation;
     use carina_core::validation::admission::attributes::{
         ResourceAdmissionRequest, ResourceAttributeInputs,
     };
-    use carina_core::{binding_index::BindingIndex, validation::ConversionValidation};
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -281,7 +281,7 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
             let values = resource.values();
             let inputs = ResourceAttributeInputs::from_report(resource, &values, judged.report());
 
-            let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+            let bindings = judged.parsed().binding_index(&catalog);
             let mut validation: ConversionValidation = ConversionValidation::new(judged.report());
             carina_core::validation::deferred_types::with_session_for_test(&catalog, |session| {
                 let findings = validation.admit_resource(ResourceAdmissionRequest::new(resource, resource.quoted_string_attrs(), inputs,

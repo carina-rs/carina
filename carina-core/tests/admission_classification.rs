@@ -1,4 +1,3 @@
-use carina_core::binding_index::BindingIndex;
 use carina_core::parser::{ProviderContext, parse_file_and_resolve};
 use carina_core::resource::{ConcreteValue, Value};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
@@ -41,7 +40,7 @@ fn rejects_invalid_product_value(projected: bool) {
     } else {
         ResourceAttributeInputs::from_report(resource, &values, judged.report())
     };
-    let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+    let bindings = judged.parsed().binding_index(&catalog);
     with_session_for_test(&catalog, |session| {
         let findings = {
             let request = ResourceAdmissionRequest::new(

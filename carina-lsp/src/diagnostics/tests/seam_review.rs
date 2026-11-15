@@ -12,8 +12,7 @@ fn review_seam_loop_lookup_preserves_every_instance() {
     let schemas = SchemaRegistry::new();
     let configuration =
         carina_core::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
-    let tree =
-        carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
+    let tree = configuration.parsed().analysis_tree().unwrap();
     let resources: HashMap<_, _> = tree
         .resources()
         .filter_map(|resource| resource.authored_instance_key().map(|key| (key, resource)))
@@ -87,16 +86,12 @@ fn review_seam_expanded_admission_retains_instantiated_judgements() {
             &graph, &schemas, &catalog,
         );
         let judged = configuration.judged();
-        let instances = judged.file().clone();
+        let instances = &graph;
         let tree = judged.analysis_tree().unwrap();
         let mut inputs = ExpandedDiagnosticValidationInputs {
             configuration: judged,
             resources: tree.resources().collect(),
-            binding_index: carina_core::binding_index::BindingIndex::from_parsed(
-                judged.file(),
-                &schemas,
-                &catalog,
-            ),
+            binding_index: judged.parsed().binding_index(&catalog),
         };
         assert_eq!(instances.resources.len(), 2);
         for resource in &instances.resources {

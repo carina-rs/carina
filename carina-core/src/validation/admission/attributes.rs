@@ -736,7 +736,7 @@ where
 {
     resource:
         &'a crate::parser::AnalysisResourceRef<'file, ParserPlaceholder, ParserPlaceholder, D, B>,
-    parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    parsed: crate::identifier::PrefixFileRead<'a, E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schema: crate::schema::OwnerBoundResourceSchema<'a>,
     quoted: &'a std::collections::HashSet<String>,
     inputs: ResourceAttributeInputs<B>,
@@ -778,7 +778,7 @@ where
     ) -> Self {
         Self {
             resource,
-            parsed,
+            parsed: crate::identifier::PrefixFileRead::for_test(parsed, schemas),
             schema,
             quoted,
             inputs,
@@ -805,7 +805,7 @@ where
         }
         Ok(Self {
             resource: owner,
-            parsed: owner.file(),
+            parsed: owner.parsed(),
             schema,
             quoted,
             inputs,
@@ -967,7 +967,7 @@ pub(crate) fn resource_attribute_admissions_for_test<
     resource_admissions_for_pass::<LiveResource, _, _, _>(
         ResourceAdmissionRequest {
             resource,
-            parsed,
+            parsed: crate::identifier::PrefixFileRead::for_test(parsed, schemas),
             schema,
             quoted,
             inputs,
@@ -1000,13 +1000,7 @@ fn typed_resource_attribute_admissions<
         D,
         B,
     >,
-    parsed: &crate::parser::File<
-        E,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
+    parsed: crate::identifier::PrefixFileRead<'_, E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     attributes: &indexmap::IndexMap<
         String,
@@ -1058,14 +1052,9 @@ fn typed_resource_attribute_admissions<
             let value = expression.assignment_value(
                 crate::resource::knowledge::ClassifiedRef::from(proof).diagnostic_value(),
             );
-            Ok(crate::validation::module_resource_ref_declaration(
-                parsed,
-                resource.id(),
-                name,
-                value,
-                bindings,
-            )
-            .map(|(source_name, source)| (name.clone(), (source_name.to_owned(), source))))
+            Ok(parsed
+                .module_resource_ref_declaration(resource.id(), name, value, bindings)
+                .map(|(source_name, source)| (name.clone(), (source_name.to_owned(), source))))
         })
         .filter_map(|prepared| match prepared {
             Ok(declaration) => declaration,

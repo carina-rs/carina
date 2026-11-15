@@ -274,8 +274,12 @@ fn validation_views_borrow_the_produced_report() {
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
     let judged = crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config);
-    let first = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
-    let second = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
+    let first = judged
+        .judged()
+        .providerless_validation_context(&config, &signatures);
+    let second = judged
+        .judged()
+        .providerless_validation_context(&config, &signatures);
     assert!(std::ptr::eq(
         first.expression_report,
         second.expression_report
@@ -983,16 +987,15 @@ fn module_call_findings_for_test(
         provider_context.as_provider_context(),
     );
     let parsed = &fixture;
-    let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
-        crate::test_utils::load_canonical_buffer_configuration(
+    let binding_use_report = check_bare_binding_uses(
+        &crate::test_utils::load_canonical_buffer_configuration(
             parsed,
             &schemas,
             provider_context.as_provider_context(),
         )
-        .judged(),
-        provider_context,
-        signatures,
-    ));
+        .judged()
+        .validation_context(provider_context, signatures),
+    );
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         parsed,
         &schemas,
@@ -1835,16 +1838,15 @@ fn refined_int_module_argument_report(annotation: &str, sink: TypeExpr) -> Bindi
             requires: Vec::new(),
         },
     )]);
-    check_bare_binding_uses(&ValidationTypeContext::new(
-        crate::test_utils::load_canonical_buffer_configuration(
+    check_bare_binding_uses(
+        &crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             provider_context.as_provider_context(),
         )
-        .judged(),
-        &provider_context,
-        &signatures,
-    ))
+        .judged()
+        .validation_context(&provider_context, &signatures),
+    )
 }
 
 #[test]
@@ -2705,11 +2707,9 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
         &schemas,
         &provider_context,
     );
-    let context = ValidationTypeContext::new_providerless(
-        judged_configuration.judged(),
-        &provider_context,
-        &module_signatures,
-    );
+    let context = judged_configuration
+        .judged()
+        .providerless_validation_context(&provider_context, &module_signatures);
     let report = check_bare_binding_uses(&context);
     let finding = report.findings().first().expect("binding-use finding");
     let detail = finding.error.to_string();
@@ -2755,16 +2755,15 @@ fn binding_diagnostics_preserve_symlink_parent_source_spelling() {
             .unwrap();
     let schemas = function_ref_schema();
     let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-    let report = check_bare_binding_uses(&ValidationTypeContext::new(
-        crate::test_utils::load_canonical_buffer_configuration(
+    let report = check_bare_binding_uses(
+        &crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             provider.as_provider_context(),
         )
-        .judged(),
-        &provider,
-        &signatures,
-    ));
+        .judged()
+        .validation_context(&provider, &signatures),
+    );
     assert_eq!(report.findings().len(), 1, "{report:?}");
     let finding = &report.findings()[0];
     assert_eq!(finding.use_site.source_file.path(), path);
@@ -2839,11 +2838,9 @@ let generated = for item in items {
         &schemas,
         provider_context.as_provider_context(),
     );
-    let context = ValidationTypeContext::new(
-        judged_configuration.judged(),
-        &provider_context,
-        &module_signatures,
-    );
+    let context = judged_configuration
+        .judged()
+        .validation_context(&provider_context, &module_signatures);
 
     let report = check_bare_binding_uses(&context);
     assert!(
@@ -5565,11 +5562,11 @@ fn check_module_calls_providerless_defers_unloaded_bare_count_argument() {
         },
     )]);
     let schemas = SchemaRegistry::new();
-    let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
-        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config).judged(),
-        &config,
-        &signatures,
-    ));
+    let report = check_bare_binding_uses(
+        &crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config)
+            .judged()
+            .providerless_validation_context(&config, &signatures),
+    );
     let bindings =
         BindingIndex::from_parsed_with_module_signatures(&parsed, &schemas, &signatures, &config);
     let findings = crate::validation::deferred_types::with_session_for_test(&config, |session| {
@@ -5791,16 +5788,15 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
         &crate::paths::ResolvedPath::new(fixture.path()).unwrap(),
         &provider_context,
     );
-    let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
-        crate::test_utils::load_canonical_buffer_configuration(
+    let binding_use_report = check_bare_binding_uses(
+        &crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             provider_context.as_provider_context(),
         )
-        .judged(),
-        &provider_context,
-        &signatures,
-    ));
+        .judged()
+        .validation_context(&provider_context, &signatures),
+    );
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         &parsed,
         &schemas,
@@ -6077,16 +6073,18 @@ child { values = [vpc] }
         },
     )]);
     let schemas = SchemaRegistry::new();
-    let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
-        crate::test_utils::load_canonical_buffer_configuration(
+    let report = check_bare_binding_uses(
+        &crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
-        .judged(),
-        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        &signatures,
-    ));
+        .judged()
+        .providerless_validation_context(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            &signatures,
+        ),
+    );
     assert!(!report.is_ready(), "fixture must produce a binding finding");
 
     let findings = check_expanded_module_calls::<crate::resource::ParserPlaceholder>(
@@ -6139,16 +6137,18 @@ let child = child_module { value = forwarded }
             requires: Vec::new(),
         },
     )]);
-    let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
-        crate::test_utils::load_canonical_buffer_configuration(
+    let report = check_bare_binding_uses(
+        &crate::test_utils::load_canonical_buffer_configuration(
             &parsed,
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
-        .judged(),
-        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        &signatures,
-    ));
+        .judged()
+        .providerless_validation_context(
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            &signatures,
+        ),
+    );
     assert_eq!(report.findings().len(), 1, "unexpected report: {report:#?}");
     assert!(matches!(
         report.findings()[0].error,
@@ -10782,7 +10782,7 @@ fn bare_typeexpr_sink_requires_authored_evidence() {
         &schemas,
         provider.as_provider_context(),
     );
-    let context = ValidationTypeContext::new(loaded.judged(), &provider, &signatures);
+    let context = loaded.judged().validation_context(&provider, &signatures);
     let report = check_bare_binding_uses(&context);
     assert!(!report.is_ready(), "a TypeExpr sink used pending evidence");
 }
@@ -10799,8 +10799,9 @@ fn bare_binding_precheck_preserves_rejection_after_constant_folding() {
         let loaded =
             crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config);
         let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
-        let context =
-            ValidationTypeContext::new_providerless(loaded.judged(), &config, &signatures);
+        let context = loaded
+            .judged()
+            .providerless_validation_context(&config, &signatures);
         let record = parsed
             .bare_binding_uses()
             .records()
@@ -11228,7 +11229,7 @@ fn deferred_loop_keys_and_indexes_are_not_concrete() {
             "{pattern}: {:?}",
             judged.report().findings()
         );
-        let tree = crate::parser::AnalysisTree::try_from_file(loaded.parsed()).unwrap();
+        let tree = loaded.parsed().analysis_tree().unwrap();
         let resource = tree
             .resources()
             .find(|r| r.id().resource_type == "test.Sink")
@@ -11339,8 +11340,10 @@ fn schema_bundle_replaces_findings_from_a_different_registry() {
         &expression_validation_config(),
     );
     assert_eq!(first.judged().report().findings().len(), 1);
+    // This cache fixture deliberately rejudges a test-only raw snapshot. Normal
+    // callers cannot extract a file from the canonicalization witness.
     let second = crate::test_utils::load_canonical_buffer_configuration(
-        first.parsed(),
+        first.file(),
         &integers,
         &expression_validation_config(),
     );

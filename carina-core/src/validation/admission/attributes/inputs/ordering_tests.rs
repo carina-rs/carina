@@ -110,7 +110,7 @@ fn admission_uses_owning_resource_order_even_for_reversed_classifications() {
             _,
         >(
             resource,
-            judged.file(),
+            crate::identifier::PrefixFileRead::for_test(judged.file(), &schemas),
             resource.schema(&schemas).unwrap(),
             &classified,
             resource.quoted_string_attrs(),

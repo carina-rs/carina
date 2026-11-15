@@ -130,8 +130,8 @@ impl<'s, E> ParserCanonicalResourcePair<'s, E> {
             Err(self.parsed.prefix_errors().to_vec())
         }
     }
-    pub fn parsed(&self) -> &carina_core::parser::ModuleResolvedFile<E> {
-        &self.parsed
+    pub fn parsed(&self) -> carina_core::identifier::ModuleResolvedFileRead<'_, E> {
+        self.parsed.parsed()
     }
     pub fn canonicalized(
         &self,

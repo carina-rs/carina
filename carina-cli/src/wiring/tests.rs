@@ -868,7 +868,7 @@ fn successful_validation_report_returns_the_resolved_file_as_a_result() {
     let resolved = report
         .into_result()
         .unwrap_or_else(|errors| panic!("empty configuration must validate: {errors:?}"));
-    assert!(resolved.resources.is_empty());
+    assert!(resolved.parsed().resources.is_empty());
 }
 
 #[test]

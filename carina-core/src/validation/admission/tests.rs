@@ -565,7 +565,7 @@ fn resource_callers_admit_wider_same_identity_references() {
             .resolve_root_for_test();
             let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
             let configuration =
-                crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+                crate::test_utils::load_canonical_buffer_configuration(&parsed, schemas, catalog);
             crate::test_utils::legacy_validate_resources(
                 &parsed,
                 schemas,
@@ -634,8 +634,9 @@ fn issue_4362_resource_reference_admission_uses_anonymous_overlap() {
                     catalog,
                 );
                 let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
-                let configuration =
-                    crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+                let configuration = crate::test_utils::load_canonical_buffer_configuration(
+                    &parsed, schemas, catalog,
+                );
                 crate::validation::validate_attribute_param_ref_types_with_bindings(
                     &configuration.judged().file().attribute_params,
                     &bindings,
