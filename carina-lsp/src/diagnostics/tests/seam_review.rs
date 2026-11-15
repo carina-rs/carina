@@ -100,7 +100,10 @@ fn review_seam_expanded_admission_retains_instantiated_judgements() {
         };
         assert_eq!(instances.resources.len(), 2);
         for resource in &instances.resources {
-            let findings = inputs.resource_admissions(&resource.id, session).unwrap();
+            let findings = inputs
+                .resource_admissions(&resource.id, session)
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 findings.errors().count(),
                 0,

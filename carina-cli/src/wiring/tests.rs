@@ -15734,6 +15734,7 @@ exports { team_prefix: String = "x" }"#,
 fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
     use carina_core::validation::deferred_types::{ProviderTypeCheckSite, TypeCheckSession};
     let catalog = carina_core::parser::LoadedProviderContext::empty_for_test();
+    let schemas = SchemaRegistry::new();
     let checks = TypeCheckSession::run(&catalog, |checks| {
         let expected = carina_core::parser::parse_type_expr_str(
             "Typo",
@@ -15763,14 +15764,13 @@ fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
         crate::commands::ConfigurationValidation {
             result: Ok(carina_core::identifier::canonicalize_file_prefixes(
                 Default::default(),
-                &SchemaRegistry::new(),
+                &schemas,
                 carina_core::identifier::SuffixSource::Preview,
             )),
             authored_inputs: authored.authored_inputs().unwrap().clone(),
             warnings: Vec::new(),
         }
     });
-    let schemas = SchemaRegistry::new();
     let report: ValidationReport = ValidationReport::settle(checks, &schemas);
     let errors = report.into_errors();
     assert_eq!(errors.len(), 1);

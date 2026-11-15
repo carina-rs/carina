@@ -1658,7 +1658,7 @@ fn seam_generated_prefix_result_has_explicit_projection_authority() {
         &schemas,
         crate::identifier::SuffixSource::Preview,
     );
-    let configuration = parsed.judge(&schemas, &catalog);
+    let configuration = parsed.judge(&catalog);
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.project_resources().next().unwrap();

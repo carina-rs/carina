@@ -3,9 +3,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use carina_core::{EnvironmentSnapshot, UserDirs, parser::ProviderContext};
-use carina_lsp::admission_coverage::{
-    AdmissionCoverage, ExpandedDeclineReason, with_admission_coverage,
-};
+use carina_lsp::admission_coverage::{AdmissionCoverage, with_admission_coverage};
 use carina_lsp::backend::{
     FactoryBuilder, ProviderStates, analyze_document, reload_provider_states,
 };
@@ -111,18 +109,13 @@ async fn production_analysis_exercises_all_three_resource_admission_branches() {
     // buffer. Its module-origin resource contributes one expanded admission
     // in every case; the remaining counters identify this resource's route.
     let setup = format!("{}\n{}", line("let choice ="), line("let child ="));
-    for (case, prefix, relative, expanded, preflight, decline) in [
-        ("relative entry", "let direct =", 1, 1, 0, None),
-        ("composition preflight", "let composed =", 0, 2, 1, None),
-        // carina#4407: pins a known lookup gap, not intended design.
-        (
-            "anonymous resource misses the expanded lookup",
-            "mock.test.resource {",
-            1,
-            1,
-            0,
-            Some(ExpandedDeclineReason::MissingResource),
-        ),
+    for (case, prefix, relative, expanded) in [
+        ("relative entry", "let direct =", 1, 1),
+        ("named composition entry", "let composed =", 0, 2),
+        // carina#4407: provenance matching closes the anonymous ResourceId
+        // lookup gap. Both named and anonymous composition owners reach
+        // expanded admission, with no relative fallback.
+        ("anonymous composition entry", "mock.test.resource {", 0, 2),
     ] {
         let buffer = format!("{setup}\n{}\n", line(prefix));
         let (diagnostics, coverage) = editor.analyze_text(&path, buffer);
@@ -134,16 +127,8 @@ async fn production_analysis_exercises_all_three_resource_admission_branches() {
             coverage.expanded.reached_admission, expanded,
             "{case}: {coverage:?}; {diagnostics:?}"
         );
-        assert_eq!(
-            coverage.classification_preflight_ran, preflight,
-            "{case}: {coverage:?}; {diagnostics:?}"
-        );
-        let expected = decline
-            .into_iter()
-            .map(|reason| (reason, 1))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(
-            coverage.expanded_declined_fell_back, expected,
+        assert!(
+            coverage.expanded_declined_fell_back.is_empty(),
             "{case}: {coverage:?}; {diagnostics:?}"
         );
     }

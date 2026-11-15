@@ -375,7 +375,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
     /// The file produces its own bound resources; no unrelated tree can be paired.
     pub fn admitted_resources<'a, B, D, T>(
         &'a mut self,
-        judged: &'a PrefixCanonicalized<crate::parser::retained::JudgedFile<'_, T, D, B>>,
+        judged: &'a PrefixCanonicalized<'_, crate::parser::retained::JudgedFile<'_, T, D, B>>,
         bindings: &'a crate::binding_index::BindingIndex<'_, B>,
         session: &'a dyn super::deferred_types::ProviderTypeCheckContext,
         subject: FindingSubject,
@@ -398,7 +398,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
 
     pub(super) fn resource_steps<'a, B, D, T>(
         &'a mut self,
-        judged: &'a PrefixCanonicalized<crate::parser::retained::JudgedFile<'_, T, D, B>>,
+        judged: &'a PrefixCanonicalized<'_, crate::parser::retained::JudgedFile<'_, T, D, B>>,
         bindings: &'a crate::binding_index::BindingIndex<'_, B>,
         session: &'a dyn super::deferred_types::ProviderTypeCheckContext,
         subject: FindingSubject,
@@ -458,7 +458,7 @@ impl<E: ValidationClientError> ConversionValidation<E> {
     /// it neither seals a scope nor supplies completion evidence.
     pub fn admit_remaining_resources<B, D, T>(
         &mut self,
-        judged: &PrefixCanonicalized<crate::parser::retained::JudgedFile<'_, T, D, B>>,
+        judged: &PrefixCanonicalized<'_, crate::parser::retained::JudgedFile<'_, T, D, B>>,
         bindings: &crate::binding_index::BindingIndex<'_, B>,
         session: &dyn super::deferred_types::ProviderTypeCheckContext,
         prechecks: super::admission::attributes::SlotPrechecks<'_>,

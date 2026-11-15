@@ -268,7 +268,8 @@ impl carina_core::provider::ProviderFactory for PrefixFactory {
         };
         [
             ResourceSchema::new("PrefixSink")
-                .attribute(AttributeSchema::required("attr", AttributeType::string()).build()),
+                .attribute(AttributeSchema::required("attr", AttributeType::string()).build())
+                .attribute(AttributeSchema::optional("count", AttributeType::int()).build()),
             ResourceSchema::new("IdentityPrefixSink").attribute(
                 AttributeSchema::optional(
                     "attr",
@@ -653,4 +654,48 @@ async fn prefix_companion_optional_named_string_matches_issue_4429() {
     assert_eq!(cli["resource_count"], 1, "{cli:#}");
     let lsp = fixture.lsp(true).await;
     assert!(lsp.is_empty(), "{lsp:#?}");
+}
+
+#[tokio::test]
+async fn prefix_companion_sibling_interpolation_matches_validate() {
+    assert_directory_accepted(&[
+        (
+            "main.crn",
+            "mock.test.resource { name_prefix = \"${p}-x\" }\n",
+        ),
+        ("lets.crn", "let p = 'lit'\n"),
+    ])
+    .await;
+}
+
+#[tokio::test]
+async fn prefix_companion_builtin_string_call_matches_validate() {
+    assert_directory_accepted(&[(
+        "main.crn",
+        "mock.test.resource { name_prefix = lower('AB') }\n",
+    )])
+    .await;
+}
+
+#[tokio::test]
+async fn prefix_companion_with_binding_error_keeps_the_same_owner_finding() {
+    let fixture = PrefixDirectory::new(&[
+        (
+            "main.crn",
+            "mock.PrefixSink { attr_prefix = p count = bad }\n",
+        ),
+        ("lets.crn", "let p = 'lit'\nlet bad = 'wrong'\n"),
+    ]);
+    let cli = fixture.cli(true);
+    let lsp = fixture.lsp(true).await;
+    assert_eq!(cli["status"], "error", "{cli:#}");
+    let expected = cli["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|error| error["message"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(expected.len(), 1, "{cli:#}");
+    assert!(expected[0].contains("expected Int"), "{cli:#}");
+    assert_eq!(error_messages(&lsp), expected, "{lsp:#?}");
 }

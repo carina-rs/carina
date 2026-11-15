@@ -62,30 +62,61 @@ fn check_report_selection(reported: bool) {
         &schemas,
         &config,
     );
-    carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
-        let request = ResourceAdmissionRequest::new(
-            resource,
-            resource.quoted_string_attrs(),
-            inputs,
-            ValidationEvaluation::None,
-            &bindings,
-            session,
-        )
-        .unwrap();
-        let mut validation =
-            carina_core::validation::ConversionValidation::<OrdinaryDiagnostic>::new(
-                configuration.report(),
+    let admit = |inputs| {
+        let mut coverage = carina_core::validation::admission::WalkCoverage::default();
+        let errors =
+            carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+                let request = ResourceAdmissionRequest::new(
+                    resource,
+                    resource.quoted_string_attrs(),
+                    inputs,
+                    ValidationEvaluation::None,
+                    &bindings,
+                    session,
+                )
+                .unwrap();
+                let outcome = carina_core::test_utils::admit_resource_with_coverage_for_test(
+                    request,
+                    &mut coverage,
+                );
+                assert!(outcome.classification_diagnostics.0.is_empty());
+                outcome
+                    .values
+                    .errors()
+                    .chain(outcome.values.symbolic_errors().map(|(_, _, error)| error))
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            });
+        (errors, coverage)
+    };
+    let (errors, coverage) = admit(inputs);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("expected Int, got String"), "{errors:?}");
+    if reported {
+        let (expected, expected_coverage) = admit(ResourceAttributeInputs::from_report(
+            resource, &values, report,
+        ));
+        assert_eq!(
+            errors, expected,
+            "selection fallback must equal direct report admission"
+        );
+        assert!(
+            coverage.is_empty(),
+            "report-only checks confer no authored coverage"
+        );
+        assert!(expected_coverage.is_empty());
+        for report in [report, configuration.report()] {
+            assert!(
+                report
+                    .completeness_report(&coverage)
+                    .unreached_slots()
+                    .any(|slot| {
+                        slot.resource_id() == resource.id() && slot.attribute() == "input"
+                    }),
+                "fallback must leave the input slot explicitly unreached"
             );
-        let outcome = validation.admit_resource(request);
-        let errors = outcome
-            .values
-            .errors()
-            .chain(outcome.values.symbolic_errors().map(|(_, _, error)| error))
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("expected Int, got String"), "{errors:?}");
-    });
+        }
+    }
 }
 
 #[test]
@@ -171,7 +202,7 @@ fn round2_lsp_missing_expanded_report_selects_main_fallback() {
                 ),
             };
             let resource = tree.resources().next().unwrap();
-            let result = inputs.resource_admissions(resource.id(), session);
+            let result = inputs.resource_admissions(resource.id(), session).unwrap();
             actual.push(result.map(|report| {
                 report
                     .errors()
@@ -235,6 +266,63 @@ fn canonical_lsp_caller_values_remain_open_but_keys_are_witnessed() {
                 .values
                 .errors()
                 .any(|error| error.to_string().contains("expected Int, got String"))
+        );
+    });
+}
+
+#[test]
+fn expanded_admission_missing_evidence_is_an_owner_diagnostic() {
+    let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let schemas = seam_schemas();
+    let path = std::path::PathBuf::from("/project/main.crn");
+    let source = "mock.Test { input = 1 }\nmock.Previous { input = 2 }";
+    let parsed = carina_core::parser::parse_file(source, &path, &config).unwrap();
+    let configuration =
+        carina_core::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config);
+    let tree = configuration.analysis_tree().unwrap();
+    let mut resources = tree.resources();
+    let owner = resources.next().unwrap();
+    let other = resources.next().unwrap();
+    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
+        configuration.file(),
+        &schemas,
+        &config,
+    );
+    let doc = create_document_at(source, path);
+    carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+        // Correct owner construction cannot cause this invariant failure. Supply
+        // another declaration's inputs to exercise the real request guard.
+        let request = ResourceAdmissionRequest::new(
+            owner,
+            owner.quoted_string_attrs(),
+            ResourceAttributeInputs::new(other),
+            ValidationEvaluation::None,
+            &bindings,
+            session,
+        );
+        let expected = match &request {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("mismatched declarations must fail"),
+        };
+        assert!(expected.contains("canonical resource schema/value pairing"));
+        let mut diagnostics = Vec::new();
+        let outcome = admission_or_diagnostic(
+            &doc.for_diagnostics().unwrap(),
+            owner.type_location(),
+            request.map(|_| Some(())),
+            &mut diagnostics,
+        );
+        assert!(outcome.is_none());
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "missing evidence must never silently drop admission"
+        );
+        assert_eq!(diagnostics[0].message, expected);
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostics[0].range,
+            Range::new(Position::new(0, 0), Position::new(0, 9))
         );
     });
 }

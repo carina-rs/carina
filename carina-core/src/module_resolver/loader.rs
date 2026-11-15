@@ -29,6 +29,7 @@ pub struct ModuleTemplate {
 /// Root configuration judgements cannot enter this boundary.
 pub struct ModuleTemplatePreflight<'a> {
     configuration: crate::identifier::PrefixCanonicalized<
+        'a,
         crate::parser::retained::JudgedFile<
             'a,
             crate::parser::ParsedExportParam,
@@ -78,7 +79,7 @@ impl ModuleTemplate {
                 schemas,
                 crate::identifier::SuffixSource::Preview,
             )
-            .judge(schemas, context),
+            .judge(context),
         }
     }
 }
@@ -87,6 +88,7 @@ impl<'a> ModuleTemplatePreflight<'a> {
     pub fn judged(
         &self,
     ) -> &crate::identifier::PrefixCanonicalized<
+        'a,
         crate::parser::retained::JudgedFile<
             'a,
             crate::parser::ParsedExportParam,

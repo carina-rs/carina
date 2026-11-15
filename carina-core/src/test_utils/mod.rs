@@ -19,7 +19,7 @@ pub fn load_canonical_buffer_configuration<'a, E, D, B: crate::resource::Binding
     >,
     schemas: &'a crate::schema::SchemaRegistry,
     context: &crate::parser::ProviderContext,
-) -> crate::identifier::PrefixCanonicalized<crate::parser::retained::JudgedFile<'a, E, D, B>>
+) -> crate::identifier::PrefixCanonicalized<'a, crate::parser::retained::JudgedFile<'a, E, D, B>>
 where
     E: Clone + crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
     D: Clone
@@ -34,7 +34,22 @@ where
         schemas,
         crate::identifier::SuffixSource::Preview,
     )
-    .judge(schemas, context)
+    .judge(context)
+}
+
+/// Observe authored coverage using the same witnessed request as production.
+pub fn admit_resource_with_coverage_for_test<E, D, B: crate::resource::BindingAddress>(
+    request: crate::validation::admission::attributes::ResourceAdmissionRequest<'_, '_, E, D, B>,
+    coverage: &mut crate::validation::admission::WalkCoverage,
+) -> crate::validation::admission::attributes::ResourceAdmissionOutcome<B>
+where
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    crate::validation::admission::attributes::resource_attribute_admissions(request, coverage)
 }
 
 /// Run resource value fixtures through production validation admission.
@@ -580,7 +595,7 @@ pub fn legacy_validate_resource_ref_types<
         judged.schemas(),
         crate::identifier::SuffixSource::Preview,
     );
-    let canonical = canonical.judge(judged.schemas(), bindings.provider_context());
+    let canonical = canonical.judge(bindings.provider_context());
     legacy_findings_result(crate::validation::resource_reference_findings(
         &canonical,
         bindings,
@@ -606,7 +621,7 @@ pub fn legacy_validate_resource_admissions<
         judged.schemas(),
         crate::identifier::SuffixSource::Preview,
     );
-    let canonical = canonical.judge(judged.schemas(), bindings.provider_context());
+    let canonical = canonical.judge(bindings.provider_context());
     legacy_findings_result(crate::validation::resource_admission_findings(
         &canonical,
         bindings,

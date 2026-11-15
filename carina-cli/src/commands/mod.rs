@@ -419,22 +419,23 @@ pub(crate) enum ConfigNameResolution {
 /// After that owner is minted, production code can change its resources only
 /// through concrete [`crate::wiring::ValidatedConfig`] methods or consuming
 /// owner transitions.
-pub(crate) enum ResolvedConfig {
+pub(crate) enum ResolvedConfig<'s> {
     Evaluated {
         parsed: Box<
             carina_core::identifier::PrefixCanonicalized<
+                's,
                 carina_core::parser::ModuleResolvedInferredFile,
             >,
         >,
     },
     Paired {
         resources: Box<
-            ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam>,
+            ParserCanonicalResourcePair<'s, carina_core::parser::ModuleResolvedInferredExportParam>,
         >,
     },
 }
 
-impl ResolvedConfig {
+impl<'s> ResolvedConfig<'s> {
     fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
         match self {
             Self::Evaluated { parsed, .. } => parsed,
@@ -445,6 +446,7 @@ impl ResolvedConfig {
     fn canonicalized(
         &self,
     ) -> &carina_core::identifier::PrefixCanonicalized<
+        's,
         carina_core::parser::ModuleResolvedInferredFile,
     > {
         match self {
@@ -601,17 +603,17 @@ pub(crate) struct ConfigurationValidation<T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn validate_and_resolve_errors_inner(
+pub(crate) fn validate_and_resolve_errors_inner<'s>(
     access: &crate::wiring::ValidationPipelineAccess,
     parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
-    ctx: &WiringContext,
+    ctx: &'s WiringContext,
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
-) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
+) -> Result<ResolvedConfig<'s>, NonEmptyValidationErrors> {
     let report = validate_and_resolve_report_inner(
         access,
         parsed,
@@ -636,17 +638,17 @@ pub(crate) fn validate_and_resolve_errors_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn validate_and_resolve_report_inner(
+pub(crate) fn validate_and_resolve_report_inner<'s>(
     access: &crate::wiring::ValidationPipelineAccess,
     parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
-    ctx: &WiringContext,
+    ctx: &'s WiringContext,
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
-) -> ConfigurationValidation<ResolvedConfig> {
+) -> ConfigurationValidation<ResolvedConfig<'s>> {
     let mut warnings = Vec::new();
     let mut directive_errors = Vec::new();
     let mut authored_inputs = carina_core::input_rules::AuthoredInputs::for_directory_in_session(
@@ -709,11 +711,11 @@ impl ValidationStopped {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_and_resolve_configuration(
+fn validate_and_resolve_configuration<'s>(
     access: &crate::wiring::ValidationPipelineAccess,
     mut parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
-    ctx: &WiringContext,
+    ctx: &'s WiringContext,
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
     duplicate_declarations: &[DuplicateDeclaration],
@@ -723,7 +725,7 @@ fn validate_and_resolve_configuration(
     warnings: &mut Vec<ConfigurationWarning>,
     validation: &mut carina_core::validation::ConversionValidation<AppError>,
     directive_errors: &mut Vec<AppError>,
-) -> Result<ResolvedConfig, ValidationStopped> {
+) -> Result<ResolvedConfig<'s>, ValidationStopped> {
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
@@ -1292,7 +1294,7 @@ fn validate_and_resolve_configuration(
         );
         let configuration = resolved_config
             .canonicalized()
-            .judge(ctx.schemas(), enriched_context.catalog());
+            .judge(enriched_context.catalog());
         let admission_warnings = crate::wiring::resource_admission_report_in_run(
             ctx,
             configuration.judged(),
@@ -1483,17 +1485,17 @@ mod tests {
     }
 
     type ValidateAndResolveErrors =
-        fn(
+        for<'s> fn(
             &crate::wiring::ValidationPipelineAccess,
             carina_core::config_loader::InferredRootDirectory,
             &ResolvedPath,
-            &WiringContext,
+            &'s WiringContext,
             &ValidationProviderCatalog,
             &HashMap<String, String>,
             bool,
             &[DuplicateDeclaration],
             ConfigNameResolution,
-        ) -> Result<ResolvedConfig, crate::wiring::NonEmptyValidationErrors>;
+        ) -> Result<ResolvedConfig<'s>, crate::wiring::NonEmptyValidationErrors>;
 
     #[test]
     fn validate_and_resolve_failure_type_is_non_empty() {

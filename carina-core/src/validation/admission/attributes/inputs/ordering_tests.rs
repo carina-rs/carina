@@ -300,7 +300,7 @@ fn projected_attributes_take_resource_order_without_authored_authority() {
         carina_core::identifier::SuffixSource::Preview,
     );
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let loaded = parsed.judge(&schemas, &config);
+    let loaded = parsed.judge(&config);
     let tree = loaded.analysis_tree().unwrap();
     let resource = tree.resources().next().unwrap();
     assert!(resource.authored_slot("name").is_err());

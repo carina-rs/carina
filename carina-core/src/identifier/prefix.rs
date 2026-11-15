@@ -14,7 +14,7 @@ use crate::resource::{
 use crate::schema::{OwnerBoundResourceSchema, SchemaKind, SchemaRegistry};
 use crate::validation::admission::{DeclarationIdentity, attributes::declaration_identity};
 use indexmap::IndexMap;
-use std::{ops::Deref, sync::Arc};
+use std::ops::Deref;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuffixSource {
@@ -41,14 +41,22 @@ impl SuffixSource {
 ///     let _ = ResourceAttributeInputs::new(tree.resources().next().unwrap());
 /// }
 /// ```
+/// The witness cannot outlive the catalog that authorized its keys:
+/// ```compile_fail,E0515
+/// use carina_core::{identifier::{canonicalize_file_prefixes, PrefixCanonicalized, SuffixSource}, parser::ParsedFile, schema::SchemaRegistry};
+/// fn escape(file: ParsedFile) -> PrefixCanonicalized<'static, ParsedFile> {
+///     let schemas = SchemaRegistry::new();
+///     canonicalize_file_prefixes(file, &schemas, SuffixSource::Preview)
+/// }
+/// ```
 #[derive(Clone)]
-pub struct PrefixCanonicalized<F> {
+pub struct PrefixCanonicalized<'s, F> {
     file: F,
-    schemas: Arc<SchemaRegistry>,
+    schemas: &'s SchemaRegistry,
     errors: Vec<AttributePrefixError>,
     rejected: Vec<usize>,
 }
-impl<F: std::fmt::Debug> std::fmt::Debug for PrefixCanonicalized<F> {
+impl<F: std::fmt::Debug> std::fmt::Debug for PrefixCanonicalized<'_, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrefixCanonicalized")
             .field("file", &self.file)
@@ -56,22 +64,23 @@ impl<F: std::fmt::Debug> std::fmt::Debug for PrefixCanonicalized<F> {
             .finish_non_exhaustive()
     }
 }
-impl<F> Deref for PrefixCanonicalized<F> {
+impl<F> Deref for PrefixCanonicalized<'_, F> {
     type Target = F;
     fn deref(&self) -> &F {
         &self.file
     }
 }
-impl<F> PrefixCanonicalized<F> {
+impl<'s, F> PrefixCanonicalized<'s, F> {
     pub fn prefix_errors(&self) -> &[AttributePrefixError] {
         &self.errors
     }
-    pub fn schemas(&self) -> &SchemaRegistry {
-        &self.schemas
+    pub fn schemas(&self) -> &'s SchemaRegistry {
+        self.schemas
     }
 }
 
 pub fn canonicalize_file_prefixes<
+    's,
     X,
     P: PlaceholderKind,
     T: PlaceholderKind,
@@ -79,11 +88,10 @@ pub fn canonicalize_file_prefixes<
     B: BindingAddress,
 >(
     mut file: File<X, P, T, D, B>,
-    schemas: &SchemaRegistry,
+    schemas: &'s SchemaRegistry,
     suffix: SuffixSource,
-) -> PrefixCanonicalized<File<X, P, T, D, B>> {
-    let schemas = Arc::new(schemas.clone());
-    let (errors, rejected) = resolve_resources(&mut file.resources, &schemas, suffix);
+) -> PrefixCanonicalized<'s, File<X, P, T, D, B>> {
+    let (errors, rejected) = resolve_resources(&mut file.resources, schemas, suffix);
     PrefixCanonicalized {
         file,
         schemas,
@@ -93,7 +101,7 @@ pub fn canonicalize_file_prefixes<
 }
 
 impl<X, P: PlaceholderKind, T: PlaceholderKind, D, B: BindingAddress>
-    PrefixCanonicalized<File<X, P, T, D, B>>
+    PrefixCanonicalized<'_, File<X, P, T, D, B>>
 {
     pub fn canonicalize_values(
         &mut self,
@@ -101,23 +109,22 @@ impl<X, P: PlaceholderKind, T: PlaceholderKind, D, B: BindingAddress>
         crate::value::CanonicalizedResources<'_, ModuleSource, P, B>,
         crate::value::EnumCanonicalizationError,
     > {
-        crate::value::canonicalize_resources_with_schemas(&mut self.file.resources, &self.schemas)
+        crate::value::canonicalize_resources_with_schemas(&mut self.file.resources, self.schemas)
     }
 }
-impl<X, D, B: BindingAddress>
-    PrefixCanonicalized<File<X, ParserPlaceholder, ParserPlaceholder, D, B>>
+impl<'s, X, D, B: BindingAddress>
+    PrefixCanonicalized<'s, File<X, ParserPlaceholder, ParserPlaceholder, D, B>>
 where
     X: Clone + ExportParamLike<ParserPlaceholder, B>,
     D: Clone + DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    pub fn judge<'s>(
+    pub fn judge(
         &self,
-        schemas: &'s SchemaRegistry,
         context: &ProviderContext,
-    ) -> PrefixCanonicalized<JudgedFile<'s, X, D, B>> {
+    ) -> PrefixCanonicalized<'s, JudgedFile<'s, X, D, B>> {
         PrefixCanonicalized {
-            file: JudgedFile::new(self.file.clone(), schemas, context),
-            schemas: self.schemas.clone(),
+            file: JudgedFile::new(self.file.clone(), self.schemas, context),
+            schemas: self.schemas,
             errors: self.errors.clone(),
             rejected: self.rejected.clone(),
         }
@@ -288,7 +295,7 @@ where
         })
     }
 }
-impl<'s, X, D, B: BindingAddress> PrefixCanonicalized<JudgedFile<'s, X, D, B>>
+impl<'s, X, D, B: BindingAddress> PrefixCanonicalized<'s, JudgedFile<'s, X, D, B>>
 where
     X: ExportParamLike<ParserPlaceholder, B>,
     D: DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -332,11 +339,11 @@ where
                     .rejected
                     .iter()
                     .any(|index| std::ptr::eq(&file.resources[*index].id, resource.id()));
-                match resource.schema(&self.schemas) {
+                match resource.schema(self.schemas) {
                     Some(schema) if !rejected => CanonicalItem::Bound(CanonicalResource {
                         resource,
                         file,
-                        schemas: &self.schemas,
+                        schemas: self.schemas,
                         schema,
                     }),
                     Some(_schema) => CanonicalItem::Rejected(resource),
@@ -525,7 +532,7 @@ fn concrete_prefix<P: PlaceholderKind, B: BindingAddress>(
 }
 
 impl<E: crate::parser::IntoExpandedExportParam<crate::resource::AbsoluteBindingAddress>>
-    PrefixCanonicalized<crate::parser::ModuleResolvedFile<E>>
+    PrefixCanonicalized<'_, crate::parser::ModuleResolvedFile<E>>
 {
     /// Consume the authored witness at the existing parser-placeholder boundary.
     pub fn resolve_binding_uses(
@@ -571,6 +578,32 @@ mod tests {
     }
 
     #[test]
+    fn prefix_canonicalization_uses_one_borrowed_catalog() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_and_resolve("mock.Sink { name_prefix = 'ok' }").unwrap();
+        let canonical = canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview);
+        assert!(
+            std::ptr::eq(canonical.schemas(), &schemas),
+            "the witness must borrow the caller's catalog"
+        );
+        let judged = canonical.judge(&context);
+        assert!(std::ptr::eq(judged.schemas(), &schemas));
+        assert!(
+            std::ptr::eq(judged.file.schemas(), &schemas),
+            "the inner Judge uses that same catalog"
+        );
+        let tree = judged.analysis_tree().unwrap();
+        let owner = tree.resources().next().unwrap();
+        assert!(std::ptr::eq(owner.schemas(), &schemas));
+        let expected = schemas.get("mock", "Sink", SchemaKind::Resource).unwrap();
+        assert!(std::ptr::eq(
+            owner.resource_schema().schema(),
+            expected.schema()
+        ));
+    }
+
+    #[test]
     fn prefix_canonicalization_preview_retains_authored_reference_slot() {
         let schemas = schemas();
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
@@ -588,7 +621,7 @@ mod tests {
             .unwrap();
         let canonical = canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview);
         assert!(canonical.prefix_errors().is_empty());
-        let judged = canonical.judge(&schemas, &context);
+        let judged = canonical.judge(&context);
         let tree = judged.analysis_tree().unwrap();
         let owner = tree.resources().next().unwrap();
         assert_eq!(
@@ -605,7 +638,7 @@ mod tests {
         );
         assert!(owner.projected_phase("name").is_some());
         assert!(owner.authored_slot("name").is_err());
-        let again = canonical.judge(&schemas, &context);
+        let again = canonical.judge(&context);
         assert_eq!(
             again.file().resources[0].attributes,
             judged.file().resources[0].attributes
@@ -622,8 +655,8 @@ mod tests {
         .unwrap();
         let cli = canonicalize_file_prefixes(parsed.clone(), &schemas, SuffixSource::Random);
         let lsp = canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview);
-        let cli = cli.judge(&schemas, &context);
-        let lsp = lsp.judge(&schemas, &context);
+        let cli = cli.judge(&context);
+        let lsp = lsp.judge(&context);
         let cli_tree = cli.analysis_tree().unwrap();
         let lsp_tree = lsp.analysis_tree().unwrap();
         let cli_owner = cli_tree.resources().next().unwrap();
@@ -721,7 +754,7 @@ mod tests {
         .unwrap();
         let canonical = canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview);
         assert_eq!(canonical.prefix_errors().len(), 1);
-        let judged = canonical.judge(&schemas, &context);
+        let judged = canonical.judge(&context);
         let tree = judged.analysis_tree().unwrap();
         assert_eq!(tree.project_resource_refs().count(), 2);
         let owners = tree.resources().collect::<Vec<_>>();
@@ -786,7 +819,7 @@ mod tests {
                 .unwrap(),
         );
         let canonical = canonicalize_file_prefixes(parsed.clone(), &schemas, SuffixSource::Preview);
-        let judged = canonical.judge(&schemas, &context);
+        let judged = canonical.judge(&context);
         let tree = judged.analysis_tree().unwrap();
         assert_eq!(
             tree.resources().count(),

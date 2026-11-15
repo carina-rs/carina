@@ -193,11 +193,11 @@ fn complete_update(
     }
 }
 
-fn canonical_unresolved_for_test(
-    ctx: &WiringContext,
+fn canonical_unresolved_for_test<'s>(
+    ctx: &'s WiringContext,
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam> {
+) -> ParserCanonicalResourcePair<'s, carina_core::parser::ModuleResolvedInferredExportParam> {
     ParserCanonicalResourcePair::from_block_pair(
         resolve_config_block_names_for_test(
             resolve_module_file_for_test(parsed.clone()),
@@ -218,11 +218,11 @@ fn canonical_unresolved_for_test(
     )
 }
 
-fn canonical_resolved_unresolved_for_test(
-    ctx: &WiringContext,
+fn canonical_resolved_unresolved_for_test<'s>(
+    ctx: &'s WiringContext,
     parsed: &carina_core::parser::ModuleResolvedInferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam> {
+) -> ParserCanonicalResourcePair<'s, carina_core::parser::ModuleResolvedInferredExportParam> {
     ParserCanonicalResourcePair::from_block_pair(
         resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
             .unwrap_or_else(|errors| {

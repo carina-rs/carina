@@ -5893,6 +5893,7 @@ pub fn resource_reference_findings<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     judged: &crate::identifier::PrefixCanonicalized<
+        '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
     bindings: &BindingIndex<'_, B>,
@@ -5918,6 +5919,7 @@ pub fn resource_reference_findings_in<
 >(
     run: &mut ConversionValidation<F>,
     judged: &crate::identifier::PrefixCanonicalized<
+        '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
     bindings: &BindingIndex<'_, B>,
@@ -5975,6 +5977,7 @@ pub fn resource_admission_findings<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     judged: &crate::identifier::PrefixCanonicalized<
+        '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
     bindings: &BindingIndex<'_, B>,
@@ -6002,6 +6005,7 @@ pub fn resource_admission_findings_in<
 >(
     run: &mut ConversionValidation<F>,
     judged: &crate::identifier::PrefixCanonicalized<
+        '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
     bindings: &BindingIndex<'_, B>,
@@ -6028,6 +6032,7 @@ fn complete_resource_admission_report<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     judged: &crate::identifier::PrefixCanonicalized<
+        '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
     bindings: &BindingIndex<'_, B>,
@@ -6155,6 +6160,7 @@ fn resource_admission_report<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     judged: &crate::identifier::PrefixCanonicalized<
+        '_,
         crate::parser::retained::JudgedFile<'_, E, D, B>,
     >,
     bindings: &BindingIndex<'_, B>,

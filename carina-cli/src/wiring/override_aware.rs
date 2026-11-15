@@ -84,18 +84,20 @@ pub struct CanonicalResourcePair<
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ParserCanonicalResourcePair<E> {
-    parsed:
-        carina_core::identifier::PrefixCanonicalized<carina_core::parser::ModuleResolvedFile<E>>,
+pub(crate) struct ParserCanonicalResourcePair<'s, E> {
+    parsed: carina_core::identifier::PrefixCanonicalized<
+        's,
+        carina_core::parser::ModuleResolvedFile<E>,
+    >,
     unresolved: Vec<Resource<ModuleSource, ParserPlaceholder>>,
 }
 
-impl<E> ParserCanonicalResourcePair<E> {
+impl<'s, E> ParserCanonicalResourcePair<'s, E> {
     pub(super) fn resolve_block_names(
         access: &super::ValidationPipelineAccess,
         parsed: carina_core::parser::ModuleResolvedFile<E>,
         unresolved: UnresolvedConfigSnapshot,
-        schemas: &SchemaRegistry,
+        schemas: &'s SchemaRegistry,
     ) -> Result<Self, Vec<BlockNameConflict>> {
         let pair =
             CanonicalResourcePair::<E, ParserPlaceholder, ParserPlaceholder>::resolve_block_names(
@@ -106,7 +108,7 @@ impl<E> ParserCanonicalResourcePair<E> {
 
     pub(crate) fn from_block_pair(
         pair: CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder>,
-        schemas: &SchemaRegistry,
+        schemas: &'s SchemaRegistry,
     ) -> Self {
         let (parsed, unresolved) = pair.into_parts();
         Self {
@@ -133,7 +135,7 @@ impl<E> ParserCanonicalResourcePair<E> {
     }
     pub fn canonicalized(
         &self,
-    ) -> &carina_core::identifier::PrefixCanonicalized<carina_core::parser::ModuleResolvedFile<E>>
+    ) -> &carina_core::identifier::PrefixCanonicalized<'s, carina_core::parser::ModuleResolvedFile<E>>
     {
         &self.parsed
     }
@@ -144,7 +146,10 @@ impl<E> ParserCanonicalResourcePair<E> {
     pub(super) fn into_parts(
         self,
     ) -> (
-        carina_core::identifier::PrefixCanonicalized<carina_core::parser::ModuleResolvedFile<E>>,
+        carina_core::identifier::PrefixCanonicalized<
+            's,
+            carina_core::parser::ModuleResolvedFile<E>,
+        >,
         Vec<Resource<ModuleSource, ParserPlaceholder>>,
     ) {
         (self.parsed, self.unresolved)
@@ -180,7 +185,7 @@ impl<E> ParserCanonicalResourcePair<E> {
     pub(crate) fn for_test(
         parsed: carina_core::parser::ModuleResolvedFile<E>,
         unresolved: Vec<Resource<ModuleSource, ParserPlaceholder>>,
-        schemas: &SchemaRegistry,
+        schemas: &'s SchemaRegistry,
     ) -> Self {
         Self {
             parsed: carina_core::identifier::canonicalize_file_prefixes(
@@ -194,21 +199,21 @@ impl<E> ParserCanonicalResourcePair<E> {
 }
 
 #[cfg(test)]
-impl<E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
-    ParserCanonicalResourcePair<E>
+impl<'s, E: carina_core::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>
+    ParserCanonicalResourcePair<'s, E>
 {
     pub(crate) fn into_expanded_for_test(
         self,
     ) -> Result<CanonicalResourcePair<E::Expanded>, carina_core::resource::ExpansionError> {
-        let schemas = self.parsed.schemas().clone();
+        let schemas = self.parsed.schemas();
         let context =
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let unresolved = self
             .unresolved
             .into_iter()
-            .map(|resource| resource.into_expanded(&schemas))
+            .map(|resource| resource.into_expanded(schemas))
             .collect::<Result<_, _>>()?;
-        let parsed = self.parsed.into_expanded(&schemas, &context)?;
+        let parsed = self.parsed.into_expanded(schemas, &context)?;
         Ok(CanonicalResourcePair::new(parsed, unresolved))
     }
 }

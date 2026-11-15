@@ -441,6 +441,7 @@ where
 /// Expanded values and their binding authority stay in the absolute phase.
 /// Authored values are used separately for source positions and lexical checks.
 type ExpandedConfiguration<'a> = PrefixCanonicalized<
+    'a,
     carina_core::parser::retained::JudgedFile<
         'a,
         carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
@@ -464,7 +465,10 @@ impl<'a> ExpandedDiagnosticValidationInputs<'a> {
         &mut self,
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Option<carina_core::schema::ResourceValueValidation> {
+    ) -> Result<
+        Option<carina_core::schema::ResourceValueValidation>,
+        carina_core::parser::retained::MissingEvidence,
+    > {
         let mut validation =
             carina_core::validation::ConversionValidation::<OrdinaryDiagnostic>::new(
                 self.configuration.report(),
@@ -473,14 +477,17 @@ impl<'a> ExpandedDiagnosticValidationInputs<'a> {
             .resources
             .iter()
             .copied()
-            .find(|resource| resource.id() == resource_id)?;
+            .find(|resource| resource.id() == resource_id);
+        let Some(resource) = resource else {
+            return Ok(None);
+        };
         self.admit_owner(
             &mut validation,
             resource,
             carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
             session,
         )
-        .map(|outcome| outcome.values)
+        .map(|outcome| outcome.map(|outcome| outcome.values))
     }
 
     fn admit_owner<F: carina_core::validation::ValidationClientError>(
@@ -489,17 +496,20 @@ impl<'a> ExpandedDiagnosticValidationInputs<'a> {
         resource: &ExpandedResource<'a>,
         prechecks: carina_core::validation::admission::attributes::SlotPrechecks<'_>,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Option<
-        carina_core::validation::admission::attributes::ResourceAdmissionOutcome<
-            AbsoluteBindingAddress,
+    ) -> Result<
+        Option<
+            carina_core::validation::admission::attributes::ResourceAdmissionOutcome<
+                AbsoluteBindingAddress,
+            >,
         >,
+        carina_core::parser::retained::MissingEvidence,
     > {
         let Ok(inputs) =
             ResourceAttributeInputs::for_resource(resource, self.configuration.report())
         else {
             #[cfg(feature = "test-utils")]
             replay_coverage::declined(ExpandedDeclineReason::MissingReport);
-            return None;
+            return Ok(None);
         };
         let inputs = inputs.with_prechecks(prechecks);
         let request =
@@ -510,11 +520,31 @@ impl<'a> ExpandedDiagnosticValidationInputs<'a> {
                 ValidationEvaluation::expanded(),
                 &self.binding_index,
                 session,
-            )
-            .ok()?;
+            )?;
         #[cfg(feature = "test-utils")]
         replay_coverage::reached(AdmissionPath::Expanded);
-        Some(validation.admit_resource(request))
+        Ok(Some(validation.admit_resource(request)))
+    }
+}
+
+// Admission can decline report selection, but missing evidence must be surfaced.
+fn admission_or_diagnostic<T>(
+    doc: &Document,
+    location: &carina_core::parser::DeclarationLocation,
+    outcome: Result<Option<T>, carina_core::parser::retained::MissingEvidence>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<T> {
+    match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            diagnostics.extend(render_merged(
+                doc,
+                &carina_core::parser::Located::new(location.clone(), ()),
+                DiagnosticSeverity::ERROR,
+                error.to_string(),
+            ));
+            None
+        }
     }
 }
 
@@ -1940,7 +1970,7 @@ impl DiagnosticRun<'_> {
             let canonical_pre_expansion =
                 canonicalize_file_prefixes(admission_file, &self.schemas, SuffixSource::Preview);
             let pre_expansion_configuration =
-                canonical_pre_expansion.judge(&self.schemas, self.provider_context.catalog());
+                canonical_pre_expansion.judge(self.provider_context.catalog());
             let expression_report = pre_expansion_configuration.judged().report();
             for finding in expression_report.findings() {
                 if let Some(diagnostic) = render_merged(
@@ -2032,7 +2062,7 @@ impl DiagnosticRun<'_> {
             });
             let expanded_configuration = expanded_canonical
                 .as_ref()
-                .map(|graph| graph.judge(&self.schemas, self.provider_context.catalog()));
+                .map(|graph| graph.judge(self.provider_context.catalog()));
             let expanded_validation_tree = expanded_configuration
                 .as_ref()
                 .and_then(|configuration| configuration.analysis_tree().ok());
@@ -2078,12 +2108,13 @@ impl DiagnosticRun<'_> {
             // be reinterpreted by the LSP's legacy BindingIndex pass using a
             // differently enriched bootstrap identity. Nested uses keep the
             // surrounding schema walk to validate unrelated sibling leaves.
-            let binding_error_sinks = parsed
+            let binding_error_sinks = pre_expansion_configuration
+                .file()
                 .bare_binding_uses()
                 .uses()
                 .filter(|use_site| {
                     carina_core::validation::binding_use_authority_owns_use(
-                        parsed,
+                        pre_expansion_configuration.file(),
                         &binding_use_context,
                         &binding_use_report,
                         use_site,
@@ -2097,7 +2128,8 @@ impl DiagnosticRun<'_> {
                     carina_core::parser::BindingUseOwner::ModuleArgument { .. } => None,
                 })
                 .collect::<HashSet<_>>();
-            let pending_resource_sinks = parsed
+            let pending_resource_sinks = pre_expansion_configuration
+                .file()
                 .bare_binding_uses()
                 .pending_slots()
                 .filter_map(|slot| match &slot.owner {
@@ -2370,13 +2402,18 @@ impl DiagnosticRun<'_> {
                         continue;
                     };
                     let call = &origin.module_call_path().root().id;
-                    let Some(report) = inputs.admit_owner(
-                        conversion_validation,
-                        resource,
-                        carina_core::validation::admission::attributes::SlotPrechecks::Reported(
-                            &binding_use_report,
+                    let Some(report) = admission_or_diagnostic(
+                        doc,
+                        call.declaration_location(),
+                        inputs.admit_owner(
+                            conversion_validation,
+                            resource,
+                            carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                                &binding_use_report,
+                            ),
+                            self.provider_context,
                         ),
-                        self.provider_context,
+                        &mut diagnostics,
                     ) else {
                         #[cfg(feature = "test-utils")]
                         replay_coverage::declined_outcome(false);
@@ -2454,13 +2491,19 @@ impl DiagnosticRun<'_> {
                     if let (Some(owner), Some(inputs)) =
                         (selected, expanded_validation_inputs.as_ref())
                     {
-                        if let Some(outcome) = inputs.admit_owner(
+                        let admission = inputs.admit_owner(
                             conversion_validation,
                             owner,
                             carina_core::validation::admission::attributes::SlotPrechecks::Reported(
                                 &binding_use_report,
                             ),
                             self.provider_context,
+                        );
+                        if let Some(outcome) = admission_or_diagnostic(
+                            doc,
+                            owner.type_location(),
+                            admission,
+                            &mut diagnostics,
                         ) {
                             self.render_resource_admission(
                                 doc,
@@ -3083,7 +3126,7 @@ fn decorate_schema_diagnostic(diagnostic: &mut Diagnostic, error: &carina_core::
 
 fn publish_prefix_errors<X, D, B: BindingAddress>(
     doc: &Document,
-    configuration: &PrefixCanonicalized<carina_core::parser::retained::JudgedFile<'_, X, D, B>>,
+    configuration: &PrefixCanonicalized<'_, carina_core::parser::retained::JudgedFile<'_, X, D, B>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) where
     X: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
