@@ -454,28 +454,6 @@ pub fn no_conversion_proof() -> crate::parser::retained::NoConversion {
     })
 }
 
-/// Raw classified fixtures have no authored source. Production authored inputs
-/// must use the slot/source-bearing candidate constructors instead.
-pub fn classified_candidate_for_test<
-    'a,
-    P: crate::resource::PlaceholderKind,
-    B: crate::resource::BindingAddress,
->(
-    classification: crate::resource::knowledge::Classification<'a, P, B>,
-    bindings: Option<&'a crate::binding_index::BindingIndex<'a, B>>,
-    provider: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> (
-    crate::validation::admission::Candidate<P, B>,
-    crate::validation::admission::AdmissionContext<'a, P, B>,
-) {
-    crate::validation::admission::Candidate::validation_classified(
-        classification,
-        bindings,
-        provider,
-        no_conversion_proof(),
-    )
-}
-
 /// Final test renderer after the consuming presentation boundary. Production
 /// core APIs cannot stringify the mixed findings aggregate.
 pub fn render_presented_for_test<E: crate::validation::ValidationClientError>(

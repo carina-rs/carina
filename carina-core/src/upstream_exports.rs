@@ -121,7 +121,7 @@ impl UpstreamDiscoveryContext<'_> {
         crate::config_loader::ParsedRootDirectory,
         crate::config_loader::DirectoryParseFailure,
     > {
-        crate::config_loader::parse_directory_for_metadata_with_source_overrides_report(
+        crate::config_loader::parse_directory_for_metadata_report(
             source,
             self.context.catalog(),
             overrides,
@@ -2309,10 +2309,10 @@ mod tests {
         .unwrap();
         let guard = upstream_dir.join(std::ffi::OsString::from_vec(b"\xff.crn".to_vec()));
         let physical = std::fs::write(&guard, "require false, 'upstream guard'\n").is_ok();
-        let overrides = crate::config_loader::SourceOverrides::from([(
-            guard.clone(),
+        let overrides = crate::config_loader::SourceOverrides::single(
+            ResolvedPath::new(&guard).unwrap(),
             "require false, 'upstream guard'\n".to_string(),
-        )]);
+        );
         let project = upstream_project(&[upstream("prior", "./upstream")]);
         let context = ctx();
         crate::validation::deferred_types::with_session_for_test(&context, |session| {

@@ -19,15 +19,20 @@ fn r10_provider_finalization_observes_unsaved_imported_module_values() {
     let (old, actual, notices) = engine.with_run_for_test(|run| {
         let base = ResolvedPath::new(directory.path()).unwrap();
         let doc = document.for_diagnostics().unwrap();
-        let overrides = SourceOverrides::from([(doc.source_file().to_path_buf(), doc.text())]);
-        let parsed =
-            carina_core::config_loader::parse_directory_for_metadata_with_source_overrides_report(
-                &base,
-                run.provider_context.catalog(),
-                &overrides,
-                &run.schemas,
-            )
-            .unwrap();
+        let document_base = base.join("child").unwrap();
+        let overrides = SourceOverrides::single(
+            document_base
+                .join(doc.source_file().file_name().unwrap())
+                .unwrap(),
+            doc.text(),
+        );
+        let parsed = carina_core::config_loader::parse_directory_for_metadata_report(
+            &base,
+            run.provider_context.catalog(),
+            &overrides,
+            &run.schemas,
+        )
+        .unwrap();
         let mut validation =
             carina_core::test_utils::conversion_validation::<std::convert::Infallible>();
         // Main's previous query forwards the same snapshot to the resolver's
@@ -70,7 +75,7 @@ fn r10_provider_finalization_observes_unsaved_imported_module_values() {
         let notices = validation.complete().into_presented();
         assert!(notices.is_empty(), "no-as metadata control: {notices:?}");
         let actual = run
-            .finalize_provider_diagnostic(&doc, Some("child/main.crn"), &base)
+            .finalize_provider_diagnostic(&base, &overrides)
             .map(|error| error.to_string());
         (old, actual, notices.len())
     });
@@ -145,7 +150,7 @@ fn r16_reinstanced_omitted_sources_keep_the_twins_ordinary_gate() {
                 let doc = document.for_diagnostics().unwrap();
                 let base = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
                 let merged = run
-                    .parse_and_resolve_merged_with_buffer(&doc, Some("main.crn"), &base)
+                    .parse_and_resolve_merged_with_buffer(&doc, &base)
                     .unwrap();
                 match &merged.module_resolution {
                     checks::MergedModuleResolution::Unowned { errors } => errors
@@ -221,15 +226,17 @@ fn r18_provider_finalization_preserves_mains_forwarded_template_query() {
     let (old, actual, strict_error) = engine.with_run_for_test(|run| {
         let base = ResolvedPath::new(directory.path()).unwrap();
         let doc = document.for_diagnostics().unwrap();
-        let overrides = SourceOverrides::from([(doc.source_file().to_path_buf(), doc.text())]);
-        let parsed =
-            carina_core::config_loader::parse_directory_for_metadata_with_source_overrides_report(
-                &base,
-                run.provider_context.catalog(),
-                &overrides,
-                &run.schemas,
-            )
-            .unwrap();
+        let overrides = SourceOverrides::single(
+            base.join(doc.source_file().file_name().unwrap()).unwrap(),
+            doc.text(),
+        );
+        let parsed = carina_core::config_loader::parse_directory_for_metadata_report(
+            &base,
+            run.provider_context.catalog(),
+            &overrides,
+            &run.schemas,
+        )
+        .unwrap();
         let strict_error = carina_core::module_resolver::resolve_modules_with_config_and_overrides(
             parsed.clone().admit(&run.schemas, run.provider_context),
             &base,
@@ -273,7 +280,7 @@ fn r18_provider_finalization_preserves_mains_forwarded_template_query() {
         };
         assert!(validation.complete().into_presented().is_empty());
         let actual = run
-            .finalize_provider_diagnostic(&doc, Some("main.crn"), &base)
+            .finalize_provider_diagnostic(&base, &overrides)
             .map(|error| error.to_string());
         (old, actual, strict_error)
     });

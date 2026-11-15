@@ -1,6 +1,114 @@
 use super::*;
 use tower_lsp::lsp_types::{Position, Range};
 
+#[cfg(unix)]
+#[test]
+fn round23_unpinnable_leaf_keeps_root_placement_once_and_unknown_defers() {
+    for (evidence, evidence_end) in [
+        (None, 0),
+        (Some("provider mock {}\n"), 13),
+        (Some("backend local {}\n"), 7),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let evidence_path = directory.path().join("evidence.crn");
+        if let Some(source) = evidence {
+            std::fs::write(&evidence_path, source).unwrap();
+        }
+        let path = directory.path().join("main.crn");
+        std::os::unix::fs::symlink("main.crn", &path).unwrap();
+        let base = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+        assert!(base.join("main.crn").is_err());
+        let source = "arguments {}\nrequire false, 'PRIVATE_GUARD'\nunloaded.test.Thing {}\n";
+        let diagnostics =
+            test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+        assert_eq!(
+            diagnostics.len(),
+            if evidence.is_some() { 3 } else { 1 },
+            "{evidence:?}: {diagnostics:#?}"
+        );
+        for (message, line, end) in [
+            (
+                "arguments blocks are only valid inside module definitions, not in root configurations.",
+                0,
+                9,
+            ),
+            ("`require` is only allowed inside a module", 1, 30),
+        ] {
+            let matching: Vec<_> = diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message == message)
+                .collect();
+            assert_eq!(matching.len(), usize::from(evidence.is_some()));
+            if let Some(diagnostic) = matching.first() {
+                assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+                assert_eq!(
+                    diagnostic.range,
+                    Range::new(Position::new(line, 0), Position::new(line, end))
+                );
+                let related = diagnostic.related_information.as_ref().unwrap();
+                assert_eq!(related.len(), 1);
+                assert_eq!(
+                    related[0].location.uri,
+                    tower_lsp::lsp_types::Url::from_file_path(&evidence_path).unwrap()
+                );
+                assert_eq!(
+                    related[0].location.range,
+                    Range::new(Position::new(0, 0), Position::new(0, evidence_end))
+                );
+            }
+        }
+        let missing_provider: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.message == "Provider 'unloaded' has no loaded schema for this file: no provider block for it was found in this file's configuration."
+            })
+            .collect();
+        assert_eq!(missing_provider.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            missing_provider[0].severity,
+            Some(DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(
+            missing_provider[0].range,
+            Range::new(Position::new(2, 0), Position::new(2, 19))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("PRIVATE_GUARD"))
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn round23_unpinnable_buffer_root_keeps_placement_without_backend_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("main.crn");
+    std::os::unix::fs::symlink("main.crn", &path).unwrap();
+    let source = "backend s3 { typo = true }\narguments {}\n";
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "arguments blocks are only valid inside module definitions, not in root configurations."
+    );
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(1, 0), Position::new(1, 9))
+    );
+    let related = diagnostics[0].related_information.as_ref().unwrap();
+    assert_eq!(related.len(), 1);
+    assert_eq!(
+        related[0].location.uri,
+        tower_lsp::lsp_types::Url::from_file_path(path).unwrap()
+    );
+    assert_eq!(
+        related[0].location.range,
+        Range::new(Position::new(0, 0), Position::new(0, 7))
+    );
+}
+
 #[test]
 fn round18_single_file_module_import_matches_main_diagnostic() {
     let directory = tempfile::tempdir().unwrap();
@@ -376,14 +484,9 @@ fn non_utf8_editor_file_keeps_its_authored_path() {
     }
     let document = create_document_at("arguments { n: Int }\n", path.clone());
     let pinned = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
-    let name = path.file_name().unwrap().to_string_lossy();
     let merged = test_engine()
         .with_run_for_test(|run| {
-            run.parse_and_resolve_merged_with_buffer(
-                &document.for_diagnostics().unwrap(),
-                Some(&name),
-                &pinned,
-            )
+            run.parse_and_resolve_merged_with_buffer(&document.for_diagnostics().unwrap(), &pinned)
         })
         .unwrap();
     let syntax =

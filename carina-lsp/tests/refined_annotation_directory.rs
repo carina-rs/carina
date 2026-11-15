@@ -103,13 +103,8 @@ mod destinations;
 fn boundary_parity(boundary: destinations::Boundary) {
     let snapshot = Arc::new(fixture::snapshot());
     let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["awscc".into()]);
+    // See carina-core's validation::admission::tests::refined_destinations for admission results.
     for length in [None, Some(5), Some(50)] {
-        let applied = destinations::check(boundary, &snapshot, length);
-        assert_eq!(
-            applied.is_ok(),
-            length != Some(50),
-            "{boundary:?}: {applied:?}"
-        );
         // The editor has no apply phase: known literals are its resolved-value oracle.
         let dir = destinations::directory(boundary, length);
         let path = dir.path().join("main.crn");
@@ -155,8 +150,7 @@ boundary_test!(round15_function_return, FunctionReturn);
 fn round15_attributes_block() {
     let snapshot = fixture::snapshot();
     for length in [None, Some(5), Some(50)] {
-        let result = destinations::check(destinations::Boundary::Attributes, &snapshot, length);
-        assert_eq!(result.is_ok(), length != Some(50), "{result:?}");
+        // Core admission/discharge coverage lives in the private relocated tests.
         let dir = destinations::directory(destinations::Boundary::Attributes, length);
         let path = dir.path().join("main.crn");
         let doc = Document::new_with_path(

@@ -438,7 +438,8 @@ mod tests {
             tokio::time::sleep(self.renewal_delay).await;
             let sequence = self.renewals.fetch_add(1, Ordering::SeqCst) + 1;
             let renewed = lock.renewed_at_for_test(renewal_stamp(sequence));
-            *self.latest_renewed_at.lock().expect("latest renewed lock") = Some(renewed.created());
+            *self.latest_renewed_at.lock().expect("latest renewed lock") =
+                Some(renewed.last_updated());
             self.renewal_completed.add_permits(1);
             self.renewing.store(false, Ordering::SeqCst);
             Ok(renewed)
@@ -458,7 +459,7 @@ mod tests {
                 .latest_renewed_at
                 .lock()
                 .expect("latest renewed lock")
-                .is_some_and(|created| created == lock.created());
+                .is_some_and(|last_updated| last_updated == lock.last_updated());
             self.write_used_latest_lock
                 .store(used_latest, Ordering::SeqCst);
             Ok(())
@@ -494,10 +495,10 @@ mod tests {
         assert!(backend.renewals.load(Ordering::SeqCst) >= 2);
         assert_eq!(renewed.id(), original_id);
         let last_sequence = backend.renewals.load(Ordering::SeqCst);
-        assert_eq!(renewed.created(), renewal_stamp(last_sequence));
-        assert_ne!(renewed.created(), renewal_stamp(1));
+        assert_eq!(renewed.last_updated(), renewal_stamp(last_sequence));
+        assert_ne!(renewed.last_updated(), renewal_stamp(1));
         assert_eq!(
-            Some(renewed.created()),
+            Some(renewed.last_updated()),
             *backend.latest_renewed_at.lock().unwrap(),
             "stop must return the last completed renewal's capability"
         );

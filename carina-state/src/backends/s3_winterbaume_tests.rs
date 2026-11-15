@@ -339,7 +339,8 @@ struct TestLockFile {
     id: String,
     operation: String,
     who: &'static str,
-    created: DateTime<Utc>,
+    #[serde(rename = "created")]
+    last_updated: DateTime<Utc>,
     expires: DateTime<Utc>,
 }
 
@@ -359,7 +360,7 @@ fn test_lock(operation: &str, timeout_secs: i64) -> TestLockFile {
         id: uuid::Uuid::new_v4().to_string(),
         operation: operation.to_string(),
         who: "test@localhost",
-        created: now,
+        last_updated: now,
         expires: now + Duration::seconds(timeout_secs),
     }
 }
@@ -1240,7 +1241,11 @@ async fn acquire_lock_conflicts_with_held_lock() {
         .expect_err("a second acquire while a fresh lock is held must conflict");
     match err {
         BackendError::Locked {
-            lock_id, operation, ..
+            lock_id,
+            who,
+            operation,
+            last_updated,
+            expires,
         } => {
             assert_eq!(
                 lock_id,
@@ -1251,6 +1256,9 @@ async fn acquire_lock_conflicts_with_held_lock() {
                 operation, "apply",
                 "Locked error must report the holder's operation",
             );
+            assert_eq!(who, first.who());
+            assert_eq!(last_updated, first.last_updated());
+            assert_eq!(expires, first.expires());
         }
         other => panic!("expected BackendError::Locked, got: {other:?}"),
     }
@@ -1271,7 +1279,7 @@ async fn acquire_lock_takes_over_expired_lock() {
     // Plant an expired lock under the same key the backend uses.
     let expired = test_lock("apply", -60);
     assert!(
-        expired.is_expired_at(expired.created),
+        expired.is_expired_at(expired.last_updated),
         "precondition: planted lock is expired"
     );
     let body = serde_json::to_vec(&expired).unwrap();

@@ -70,7 +70,10 @@ fn assert_buffer_membership(buffer_text: &str, disk_text: &str, expected_templat
     let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
     for overrides in [
         Default::default(),
-        crate::config_loader::SourceOverrides::from([(file.clone(), disk_text.to_string())]),
+        crate::config_loader::SourceOverrides::single(
+            pinned.join("guards.crn").unwrap(),
+            disk_text.to_string(),
+        ),
     ] {
         let snapshot = crate::config_loader::DirectoryBufferSnapshot::capture(
             &pinned,
@@ -158,10 +161,17 @@ fn non_utf8_sibling_is_preserved_in_recovery_discovery() {
     // Unsaved buffers exercise raw Unix paths even on filesystems which
     // cannot create non-UTF-8 names. Use the physical sibling when supported.
     let physical = std::fs::write(&arguments, "arguments { n: Int }\n").is_ok();
-    let overrides = crate::config_loader::SourceOverrides::from([
-        (guard.clone(), source.to_string()),
-        (arguments, "arguments { n: Int }\n".to_string()),
-    ]);
+    let overrides = crate::config_loader::SourceOverrides::try_from_entries([
+        (
+            crate::paths::ResolvedPath::new(&guard).unwrap(),
+            source.to_string(),
+        ),
+        (
+            crate::paths::ResolvedPath::new(arguments).unwrap(),
+            "arguments { n: Int }\n".to_string(),
+        ),
+    ])
+    .unwrap();
     let context = config();
     let parsed = crate::config_loader::ParsedSourceBuffer::parse(source, &guard, &context).unwrap();
     let schemas = SchemaRegistry::new();
@@ -295,7 +305,10 @@ fn recovery_uses_sibling_declaration_evidence() {
     let parsed = crate::config_loader::ParsedSourceBuffer::parse(source, &guard, &context).unwrap();
     let schemas = SchemaRegistry::new();
     let pinned = crate::paths::ResolvedPath::new(directory.path()).unwrap();
-    let overrides = crate::config_loader::SourceOverrides::from([(guard, source.to_string())]);
+    let overrides = crate::config_loader::SourceOverrides::single(
+        pinned.join("guards.crn").unwrap(),
+        source.to_string(),
+    );
     let load = || {
         let snapshot = crate::config_loader::DirectoryBufferSnapshot::capture(
             &pinned,

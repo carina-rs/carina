@@ -1,6 +1,6 @@
 //! Configuration loading and .crn file discovery utilities
 
-use crate::paths::{CanonicalPath, ResolvedPath};
+use crate::paths::{CanonicalPath, DisplayPath, ResolvedPath};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -949,12 +949,7 @@ fn mark_complete_directory_files(
         completeness: CompleteInventory,
         inventories: files
             .iter()
-            .map(|(_, file)| {
-                (
-                    file.parsed.parser_binding_metadata.syntax(),
-                    file.source.persisted_path(),
-                )
-            })
+            .map(|(_, file)| (file.parsed.parser_binding_metadata.syntax(), &file.source))
             .collect(),
     }
     .issue();
@@ -1465,7 +1460,7 @@ impl ParsedSourceBuffer {
 }
 
 struct SnapshotSource {
-    file: ResolvedPath,
+    file: crate::paths::PersistedPath,
     inventory: Option<parser::SyntaxInventory>,
 }
 
@@ -1479,10 +1474,20 @@ struct SnapshotBufferMember {
 pub struct DirectoryBufferSnapshot {
     sources: Vec<SnapshotSource>,
     member: SnapshotBufferMember,
+    discovery_complete: bool,
 }
 
 impl DirectoryBufferSnapshot {
     pub fn capture(
+        directory: &ResolvedPath,
+        buffer: ParsedSourceBuffer,
+        overrides: &SourceOverrides,
+    ) -> Result<Self, DirectoryParseFailure> {
+        Self::capture_complete(directory, buffer.clone(), overrides)
+            .or_else(|_error| Self::capture_incomplete(directory, buffer, overrides))
+    }
+
+    fn capture_complete(
         directory: &ResolvedPath,
         buffer: ParsedSourceBuffer,
         overrides: &SourceOverrides,
@@ -1501,11 +1506,7 @@ impl DirectoryBufferSnapshot {
                 )),
             ));
         }
-        let mut overrides = overrides.clone();
-        overrides.retain(|path, _| {
-            !ResolvedPath::new(path).is_ok_and(|path| path.identity() == pinned.identity())
-        });
-        overrides.insert(buffer.file.path().to_path_buf(), buffer.text.to_string());
+        let overrides = overrides.replacing(pinned.clone(), buffer.text.to_string());
         let files = DirectoryFiles::discover(directory, &overrides).map_err(|error| {
             DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error))
         })?;
@@ -1541,12 +1542,109 @@ impl DirectoryBufferSnapshot {
                             .map(|metadata| metadata.syntax().clone())
                     })
                 };
-                SnapshotSource { file, inventory }
+                SnapshotSource {
+                    file: file.persisted_path().clone(),
+                    inventory,
+                }
             })
             .collect();
         Ok(Self {
             sources,
             member: SnapshotBufferMember { buffer },
+            discovery_complete: true,
+        })
+    }
+
+    // A failed leaf must not erase readable root evidence from the pinned
+    // directory. This syntax-only inventory can never establish completeness.
+    fn capture_incomplete(
+        directory: &ResolvedPath,
+        buffer: ParsedSourceBuffer,
+        overrides: &SourceOverrides,
+    ) -> Result<Self, DirectoryParseFailure> {
+        let discovery_error =
+            |error| DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error));
+        let parent = buffer.file.path().parent().ok_or_else(|| {
+            discovery_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer source has no parent directory",
+            ))
+        })?;
+        if ResolvedPath::new(parent)
+            .map_err(discovery_error)?
+            .identity()
+            != directory.identity()
+            || buffer
+                .file
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "crn")
+        {
+            return Err(discovery_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "buffer source is not a member of this directory",
+            )));
+        }
+        let buffer_file =
+            crate::paths::PersistedPath::new(buffer.file.path()).map_err(discovery_error)?;
+        let mut sources = Vec::new();
+        for entry in directory.entries().map_err(discovery_error)? {
+            if entry.display().extension().is_none_or(|ext| ext != "crn") {
+                continue;
+            }
+            let file = crate::paths::PersistedPath::new(entry.display().clone().into_source_path())
+                .map_err(discovery_error)?;
+            if file == buffer_file {
+                continue;
+            }
+            let inventory = entry.resolve().ok().and_then(|path| {
+                read_source_with_overrides(&path, overrides)
+                    .ok()
+                    .and_then(|text| {
+                        parser::parse_syntax_inventory(&text, &path.source_label())
+                            .ok()
+                            .map(|metadata| metadata.syntax().clone())
+                    })
+            });
+            sources.push(SnapshotSource { file, inventory });
+        }
+        for (path, _text) in overrides.iter() {
+            if path
+                .parent()
+                .is_none_or(|parent| parent.identity() != directory.identity())
+            {
+                continue;
+            }
+            let Some(name) = path.display().file_name() else {
+                continue;
+            };
+            let file = directory
+                .persisted_path()
+                .join(name)
+                .map_err(discovery_error)?;
+            if file == buffer_file || sources.iter().any(|source| source.file == file) {
+                continue;
+            }
+            let inventory = directory.join(name).ok().and_then(|path| {
+                read_source_with_overrides(&path, overrides)
+                    .ok()
+                    .and_then(|text| {
+                        parser::parse_syntax_inventory(&text, &path.source_label())
+                            .ok()
+                            .map(|metadata| metadata.syntax().clone())
+                    })
+            });
+            sources.push(SnapshotSource { file, inventory });
+        }
+        sources.push(SnapshotSource {
+            file: buffer_file,
+            inventory: Some(buffer.parsed().parser_binding_metadata.syntax().clone()),
+        });
+        sources.sort_by(|left, right| left.file.cmp(&right.file));
+        Ok(Self {
+            sources,
+            member: SnapshotBufferMember { buffer },
+            discovery_complete: false,
         })
     }
 
@@ -1558,7 +1656,7 @@ impl DirectoryBufferSnapshot {
                 source
                     .inventory
                     .as_ref()
-                    .map(|inventory| (inventory, source.file.persisted_path()))
+                    .map(|inventory| (inventory, &source.file))
             })
             .collect();
         let readable = inventories
@@ -1566,7 +1664,7 @@ impl DirectoryBufferSnapshot {
             .flatten()
             .map(|(inventory, file)| (*inventory, *file))
             .collect();
-        let verdict = if inventories.iter().all(Option::is_some) {
+        let verdict = if self.discovery_complete && inventories.iter().all(Option::is_some) {
             DirectoryInventories {
                 inventories: readable,
                 completeness: CompleteInventory,
@@ -1647,7 +1745,7 @@ impl LoadedConfig {
 #[derive(Debug, Clone)]
 pub struct DirectoryResolvedFile {
     parsed: ParsedFile,
-    source: ResolvedPath,
+    source: crate::paths::PersistedPath,
     /// Names present in this file before sibling bindings were seeded. The
     /// final parse's `variables` map contains sibling seed echoes, so this set
     /// is required to distinguish local value-let declarations from context.
@@ -1781,8 +1879,76 @@ pub fn find_duplicate_declarations_in_analysis(
     duplicate_groups(occurrences)
 }
 
-/// In-memory source snapshots keyed by the edited file path.
-pub type SourceOverrides = IndexMap<PathBuf, String>;
+/// In-memory source snapshots keyed by pinned filesystem identity.
+///
+/// Identical text under multiple spellings retains the first spelling.
+/// Conflicting text must be rejected before a snapshot can be used for analysis.
+/// Retargeting a leaf symlink after construction can give a later lookup a new
+/// identity, which falls back to disk for that analysis pass.
+#[derive(Clone, Default)]
+pub struct SourceOverrides {
+    entries: IndexMap<CanonicalPath, (ResolvedPath, String)>,
+}
+
+/// Two spellings of one file supplied different source text.
+#[derive(Debug, thiserror::Error)]
+#[error("Conflicting source overrides for {first} and {second}")]
+pub struct SourceOverrideConflict {
+    pub first: DisplayPath,
+    pub second: DisplayPath,
+}
+
+impl SourceOverrides {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn single(path: ResolvedPath, text: String) -> Self {
+        let mut overrides = Self::new();
+        overrides.entries.insert(path.identity(), (path, text));
+        overrides
+    }
+
+    pub fn try_from_entries(
+        entries: impl IntoIterator<Item = (ResolvedPath, String)>,
+    ) -> Result<Self, SourceOverrideConflict> {
+        let mut overrides = Self::new();
+        for (path, text) in entries {
+            match overrides.entries.entry(path.identity()) {
+                indexmap::map::Entry::Vacant(entry) => {
+                    entry.insert((path, text));
+                }
+                indexmap::map::Entry::Occupied(entry) => {
+                    let (first, existing) = entry.get();
+                    if existing != &text {
+                        return Err(SourceOverrideConflict {
+                            first: first.display().clone(),
+                            second: path.display().clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(overrides)
+    }
+
+    // Only the parser-owned buffer may replace text already in a snapshot.
+    pub(crate) fn replacing(&self, path: ResolvedPath, text: String) -> Self {
+        let mut overrides = self.clone();
+        overrides.entries.insert(path.identity(), (path, text));
+        overrides
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&ResolvedPath, &str)> {
+        self.entries
+            .values()
+            .map(|(path, text)| (path, text.as_str()))
+    }
+
+    pub(crate) fn get(&self, identity: &CanonicalPath) -> Option<&str> {
+        self.entries.get(identity).map(|(_, text)| text.as_str())
+    }
+}
 
 /// The complete, sorted listing of one directory, including unsaved buffers.
 /// Paths remain OS paths throughout discovery; filename encoding never decides
@@ -1797,15 +1963,14 @@ impl DirectoryFiles {
         overrides: &SourceOverrides,
     ) -> std::io::Result<Self> {
         let mut paths = directory.crn_files()?;
-        for path in overrides.keys() {
-            let parent = path
+        for (path, _) in overrides.iter() {
+            if path
                 .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            if ResolvedPath::new(parent)?.identity() != directory.identity() {
+                .is_none_or(|parent| parent.identity() != directory.identity())
+            {
                 continue;
             }
-            let name = path.file_name().ok_or_else(|| {
+            let name = path.display().file_name().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "source override must name a file",
@@ -1903,24 +2068,10 @@ pub(crate) fn read_source_with_overrides(
     path: &ResolvedPath,
     overrides: &SourceOverrides,
 ) -> std::io::Result<String> {
-    for (source, text) in overrides {
-        if *source == path.source_label()
-            || ResolvedPath::new(source).is_ok_and(|source| source.identity() == path.identity())
-        {
-            return Ok(text.clone());
-        }
+    if let Some(text) = overrides.get(&path.identity()) {
+        return Ok(text.to_string());
     }
     path.read_to_string()
-}
-
-fn filename_source_overrides(
-    dir: &ResolvedPath,
-    overrides: &IndexMap<String, String>,
-) -> SourceOverrides {
-    overrides
-        .iter()
-        .map(|(name, text)| (dir.source_label().join(name), text.clone()))
-        .collect()
 }
 
 pub fn find_duplicate_declarations_in_source(
@@ -2303,7 +2454,7 @@ pub fn parse_directory(
     dir: &ResolvedPath,
     config: &ProviderContext,
 ) -> Result<ParsedRootDirectory, String> {
-    parse_directory_with_overrides(dir, config, &IndexMap::new())
+    parse_directory_with_overrides(dir, config, &SourceOverrides::new())
 }
 
 /// Inspect declarations for completion/discovery without demanding their values.
@@ -2315,7 +2466,7 @@ pub fn parse_directory_for_bootstrap(
     parse_directory_with_overrides_impl(
         dir,
         config,
-        &IndexMap::new(),
+        &SourceOverrides::new(),
         ResolutionContext::issue(ResolutionPhase::Bootstrap),
         &SchemaRegistry::new(),
     )
@@ -2323,34 +2474,21 @@ pub fn parse_directory_for_bootstrap(
     .map_err(|error| error.to_string())
 }
 
-/// Parse declaration metadata with optional editor overrides, retaining all value roots.
+/// Parse declaration metadata with identity-keyed [`SourceOverrides`], retaining
+/// all value roots.
 pub fn parse_directory_for_metadata(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
+    overrides: &SourceOverrides,
     schemas: &SchemaRegistry,
 ) -> Result<ParsedRootDirectory, String> {
     parse_directory_for_metadata_report(dir, config, overrides, schemas)
         .map_err(|error| error.to_string())
 }
 
-/// Metadata loading with the original parser failure retained for diagnostics.
+/// Load declaration metadata with identity-keyed [`SourceOverrides`], retaining
+/// the original parser failure for diagnostics.
 pub fn parse_directory_for_metadata_report(
-    dir: &ResolvedPath,
-    config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
-    schemas: &SchemaRegistry,
-) -> Result<ParsedRootDirectory, DirectoryParseFailure> {
-    parse_directory_for_metadata_with_source_overrides_report(
-        dir,
-        config,
-        &filename_source_overrides(dir, overrides),
-        schemas,
-    )
-}
-
-/// Metadata discovery with OS-path editor snapshots, including non-UTF-8 names.
-pub fn parse_directory_for_metadata_with_source_overrides_report(
     dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &SourceOverrides,
@@ -2366,21 +2504,19 @@ pub fn parse_directory_for_metadata_with_source_overrides_report(
     .map(|result| result.parsed)
 }
 
-/// Like [`parse_directory`] but takes an `overrides` map from **file name**
-/// (e.g. `"main.crn"`) to source text. Files present in the map are parsed
-/// from the override text; the rest are read from disk.
+/// Parse and merge a directory in strict mode with identity-keyed [`SourceOverrides`].
 ///
-/// LSP uses this to analyze the open document's in-memory buffer alongside
-/// the on-disk siblings, so edits show diagnostics before the user saves.
+/// Files present in `overrides` use their snapshot text; other files are read
+/// from disk. Uses an empty schema registry and returns failures as strings.
 pub fn parse_directory_with_overrides(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
+    overrides: &SourceOverrides,
 ) -> Result<ParsedRootDirectory, String> {
     parse_directory_with_overrides_impl(
         dir,
         config,
-        &filename_source_overrides(dir, overrides),
+        overrides,
         strict_resolution_context(),
         &SchemaRegistry::new(),
     )
@@ -2574,33 +2710,20 @@ impl DirectoryParseResult {
 pub fn parse_directory_with_overrides_and_diagnostics(
     dir: &ResolvedPath,
     config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
+    overrides: &SourceOverrides,
 ) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     parse_directory_with_overrides_impl(
         dir,
         config,
-        &filename_source_overrides(dir, overrides),
+        overrides,
         diagnostics_resolution_context(),
         &SchemaRegistry::new(),
     )
 }
 
+/// Diagnostic-preserving directory parsing with identity-keyed [`SourceOverrides`]
+/// and the supplied schemas.
 pub fn parse_directory_with_overrides_and_diagnostics_with_schemas(
-    dir: &ResolvedPath,
-    config: &ProviderContext,
-    overrides: &IndexMap<String, String>,
-    schemas: &SchemaRegistry,
-) -> Result<DirectoryParseResult, DirectoryParseFailure> {
-    parse_directory_with_source_overrides_and_diagnostics_with_schemas(
-        dir,
-        config,
-        &filename_source_overrides(dir, overrides),
-        schemas,
-    )
-}
-
-/// Directory analysis retaining OS-path override identities without encoding loss.
-pub fn parse_directory_with_source_overrides_and_diagnostics_with_schemas(
     dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &SourceOverrides,
@@ -2953,23 +3076,21 @@ pub(crate) fn parse_directory_files_located(
         .first()
         .and_then(|(path, _)| path.parent())
         .unwrap_or_else(|| Path::new(""));
-    let sources = files
+    let locators = files
         .iter()
-        .map(|(path, source)| {
-            ResolvedPath::new(path)
-                .map(|path| (path, source.clone()))
-                .map_err(|error| {
-                    LocatedParseError::in_file(
-                        path,
-                        parser::ParseError::InternalError {
-                            expected: "source address".into(),
-                            context: error.to_string(),
-                        },
-                    )
-                })
+        .map(|(path, _source)| {
+            crate::paths::PersistedPath::new(path).map_err(|error| {
+                LocatedParseError::in_file(
+                    path,
+                    parser::ParseError::InternalError {
+                        expected: "source address".into(),
+                        context: error.to_string(),
+                    },
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    parse_directory_files_located_from_root(&sources, config, display_root)
+    parse_directory_files_with_locators(files, &locators, config, display_root)
 }
 
 pub(crate) fn parse_directory_files_located_from_root(
@@ -2981,7 +3102,21 @@ pub(crate) fn parse_directory_files_located_from_root(
         .iter()
         .map(|(path, source)| (path.source_label(), source.clone()))
         .collect::<Vec<_>>();
-    let files = labels.as_slice();
+    let locators = sources
+        .iter()
+        .map(|(path, _source)| path.persisted_path().clone())
+        .collect::<Vec<_>>();
+    parse_directory_files_with_locators(&labels, &locators, config, display_root)
+}
+
+// In-memory authored sources need locators, not resolvable disk leaves. The
+// strict directory entry point supplies locators from its already pinned inputs.
+fn parse_directory_files_with_locators(
+    files: &[(PathBuf, String)],
+    locators: &[crate::paths::PersistedPath],
+    config: &ProviderContext,
+    display_root: &Path,
+) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, LocatedParseError> {
     let directory_functions = parser::top_level_user_functions_in_files(files, config)
         .map_err(LocatedParseError::directory_wide)?;
     let mut directory_module_parameters = HashSet::new();
@@ -3115,8 +3250,9 @@ pub(crate) fn parse_directory_files_located_from_root(
 
     // Pass 2: re-parse each file with the sibling-aware union seeded into `ctx`.
     let mut out = Vec::with_capacity(files.len());
-    for ((source, content), local_variable_names) in sources.iter().zip(pass_1a_local_variables) {
-        let path = &source.source_label();
+    for (((path, content), source), local_variable_names) in
+        files.iter().zip(locators).zip(pass_1a_local_variables)
+    {
         let mut parsed = parser::parse_with_directory_context(
             content,
             path,
@@ -3375,6 +3511,60 @@ mod tests {
     use crate::resource::Value;
     use std::fs;
 
+    #[cfg(unix)]
+    #[test]
+    fn round23_authored_buffer_view_does_not_pin_its_leaf() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.crn");
+        std::os::unix::fs::symlink("main.crn", &path).unwrap();
+        assert!(ResolvedPath::new(&path).is_err());
+        let view = AuthoredBindingView::parse_file_source(
+            "let bucket = mock.test.resource { name = 'bucket' }\n",
+            &path,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        assert_eq!(view.parsed().resources.len(), 1);
+        assert_eq!(
+            crate::validation::check_unused_bindings(&view),
+            vec!["bucket".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round23_unpinnable_leaf_keeps_unsaved_sibling_override_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let leaf = directory.path().join("main.crn");
+        std::os::unix::fs::symlink("main.crn", &leaf).unwrap();
+        let root = ResolvedPath::new(directory.path()).unwrap();
+        let provider = root.join("providers.crn").unwrap();
+        let override_provider =
+            SourceOverrides::single(provider.clone(), "provider mock {}\n".into());
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let schemas = SchemaRegistry::new();
+        let buffer = ParsedSourceBuffer::parse("arguments {}\n", &leaf, &context).unwrap();
+        for (overrides, has_root) in [(&override_provider, true), (&SourceOverrides::new(), false)]
+        {
+            let snapshot =
+                DirectoryBufferSnapshot::capture(&root, buffer.clone(), overrides).unwrap();
+            assert!(!snapshot.discovery_complete);
+            let configuration =
+                load_buffer_configuration_in_directory(snapshot, &schemas, &context);
+            match configuration.parsed().directory_verdict() {
+                DirectoryVerdict::Root(root) => {
+                    assert!(has_root);
+                    assert_eq!(root.evidence().file_locator(), provider.persisted_path());
+                }
+                DirectoryVerdict::Unknown(()) => assert!(!has_root),
+                DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::NoEvidence(_) => {
+                    panic!("failed discovery cannot establish completeness")
+                }
+            }
+        }
+        assert!(!directory.path().join("providers.crn").exists());
+    }
+
     #[test]
     fn inferred_root_analysis_preserves_the_issued_directory_verdict() {
         for source in [
@@ -3463,6 +3653,206 @@ mod tests {
     }
 
     #[test]
+    fn source_override_conflicting_aliases() {
+        // A leading `./` survives Path equality, unlike an interior `./`.
+        let temp = tempfile::tempdir_in(".").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let directory = temp.path().strip_prefix(&cwd).unwrap();
+        let root = ResolvedPath::new(directory).unwrap();
+        let file = root.join("f.crn").unwrap();
+        let alias = ResolvedPath::new(Path::new(".").join(file.source_label())).unwrap();
+        assert_eq!(file.identity(), alias.identity());
+        assert_ne!(file.source_label(), alias.source_label());
+        let first_text = "let value = 'A'\n";
+        let second_text = "let value = 'B'\n";
+        for (first, second) in [(&file, &alias), (&alias, &file)] {
+            let conflict = SourceOverrides::try_from_entries([
+                (first.clone(), first_text.to_string()),
+                (second.clone(), second_text.to_string()),
+            ])
+            .err()
+            .expect("conflicting aliases must fail before directory parsing");
+            assert_eq!(&conflict.first, first.display());
+            assert_eq!(&conflict.second, second.display());
+            let display = conflict.to_string();
+            assert!(display.contains(&first.display().to_string()));
+            assert!(display.contains(&second.display().to_string()));
+            for rendered in [display, format!("{conflict:?}")] {
+                assert!(!rendered.contains(first_text.trim_end()));
+                assert!(!rendered.contains(second_text.trim_end()));
+            }
+        }
+    }
+
+    #[test]
+    fn source_override_identical_aliases_keep_first_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = ResolvedPath::new(temp.path()).unwrap();
+        let file = root.join("f.crn").unwrap();
+        let alias = ResolvedPath::new(temp.path().join("./f.crn")).unwrap();
+        let text = "let value = 'buffer'\n";
+        for (first, second) in [(&file, &alias), (&alias, &file)] {
+            let overrides = SourceOverrides::try_from_entries([
+                (first.clone(), text.to_string()),
+                (second.clone(), text.to_string()),
+            ])
+            .unwrap();
+            assert_eq!(overrides.iter().count(), 1);
+            assert_eq!(
+                overrides.iter().next().unwrap().0.display(),
+                first.display()
+            );
+            assert_eq!(read_source_with_overrides(&file, &overrides).unwrap(), text);
+            assert_eq!(
+                read_source_with_overrides(&alias, &overrides).unwrap(),
+                text
+            );
+
+            let result = parse_directory_with_overrides_and_diagnostics_with_schemas(
+                &root,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                &overrides,
+                &SchemaRegistry::new(),
+            )
+            .unwrap();
+            assert_eq!(result.source_files.len(), 1);
+            assert_eq!(
+                result.parsed.parsed().variables.get("value"),
+                Some(&Value::Concrete(crate::resource::ConcreteValue::String(
+                    "buffer".into()
+                )))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_override_symlink_aliases_share_one_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("target.crn"), "on disk").unwrap();
+        std::os::unix::fs::symlink("target.crn", temp.path().join("link.crn")).unwrap();
+        let root = ResolvedPath::new(temp.path()).unwrap();
+        let target = root.join("target.crn").unwrap();
+        let link = root.join("link.crn").unwrap();
+        let text = "in memory";
+        for (first, second) in [(&target, &link), (&link, &target)] {
+            let overrides = SourceOverrides::try_from_entries([
+                (first.clone(), text.to_string()),
+                (second.clone(), text.to_string()),
+            ])
+            .unwrap();
+            assert_eq!(overrides.iter().count(), 1);
+            assert_eq!(
+                overrides.iter().next().unwrap().0.display(),
+                first.display()
+            );
+            assert_eq!(
+                read_source_with_overrides(&target, &overrides).unwrap(),
+                text
+            );
+            assert_eq!(read_source_with_overrides(&link, &overrides).unwrap(), text);
+
+            let conflict = SourceOverrides::try_from_entries([
+                (first.clone(), text.to_string()),
+                (second.clone(), "different text".to_string()),
+            ])
+            .err()
+            .expect("symlink aliases must also reject conflicting text");
+            assert_eq!(&conflict.first, first.display());
+            assert_eq!(&conflict.second, second.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_override_retargeted_leaf_falls_back_to_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("before.crn"), "old disk text").unwrap();
+        fs::write(temp.path().join("after.crn"), "new disk text").unwrap();
+        let alias = temp.path().join("link.crn");
+        std::os::unix::fs::symlink("before.crn", &alias).unwrap();
+        let pinned = ResolvedPath::new(&alias).unwrap();
+        let overrides = SourceOverrides::single(pinned.clone(), "buffer text".to_string());
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("after.crn", &alias).unwrap();
+
+        assert_eq!(
+            read_source_with_overrides(&pinned, &overrides).unwrap(),
+            "buffer text"
+        );
+        assert_eq!(
+            read_source_with_overrides(&ResolvedPath::new(&alias).unwrap(), &overrides).unwrap(),
+            "new disk text"
+        );
+    }
+
+    #[test]
+    fn source_override_snapshot_buffer_replaces_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = ResolvedPath::new(temp.path()).unwrap();
+        let file = root.join("f.crn").unwrap();
+        let alias = ResolvedPath::new(temp.path().join("./f.crn")).unwrap();
+        let overrides = SourceOverrides::single(alias, "let value = 'A'\n".to_string());
+        let text = "let value = 'B'\n";
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let buffer = ParsedSourceBuffer::parse(text, &file.source_label(), &context).unwrap();
+
+        let snapshot = DirectoryBufferSnapshot::capture(&root, buffer, &overrides).unwrap();
+        assert_eq!(snapshot.sources.len(), 1);
+        assert_eq!(Some(snapshot.member.buffer.text.as_ref()), Some(text));
+        let schemas = SchemaRegistry::new();
+        let configuration = load_buffer_configuration_in_directory(snapshot, &schemas, &context);
+        assert_eq!(
+            configuration.parsed().variables.get("value"),
+            Some(&Value::Concrete(crate::resource::ConcreteValue::String(
+                "B".into()
+            )))
+        );
+        assert_eq!(
+            read_source_with_overrides(&file, &overrides).unwrap(),
+            "let value = 'A'\n"
+        );
+    }
+
+    #[test]
+    fn source_override_discovery_keeps_directory_spelling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = ResolvedPath::new(temp.path()).unwrap();
+        let file = root.join("new.crn").unwrap();
+        assert!(!temp.path().join("new.crn").exists());
+        let alias = ResolvedPath::new(temp.path().join("./new.crn")).unwrap();
+        let text = "let fresh = 'unsaved'\n";
+        let overrides = SourceOverrides::single(alias, text.to_string());
+        let files = DirectoryFiles::discover(&root, &overrides)
+            .unwrap()
+            .into_paths();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].display(), file.display());
+
+        let result = parse_directory_with_overrides_and_diagnostics_with_schemas(
+            &root,
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            &overrides,
+            &SchemaRegistry::new(),
+        )
+        .unwrap();
+        assert_eq!(result.source_files.len(), 1);
+        assert_eq!(result.source_files[0].0.display(), file.display());
+        let semantic = result.semantic_file(&file.source_label()).unwrap();
+        let declaration = semantic
+            .parser_binding_metadata
+            .syntax()
+            .declarations()
+            .iter()
+            .find(|declaration| declaration.name() == "fresh")
+            .unwrap();
+        assert_eq!(
+            declaration.location().file().path().as_os_str(),
+            file.source_label().as_os_str()
+        );
+    }
+
+    #[test]
     fn conversion_parse_diagnostic_uses_the_shared_message_shape() {
         let path = Path::new("conversion-shape.crn");
         let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
@@ -3521,9 +3911,12 @@ mod tests {
         let root = ResolvedPath::new(&directory).unwrap();
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
-        let parsed =
-            parse_directory_with_overrides_and_diagnostics(&root, &context, &IndexMap::new())
-                .unwrap();
+        let parsed = parse_directory_with_overrides_and_diagnostics(
+            &root,
+            &context,
+            &SourceOverrides::new(),
+        )
+        .unwrap();
 
         assert!(parsed.semantic_file(&main_path).is_some());
         assert_eq!(
@@ -5090,7 +5483,7 @@ awscc.ec2.SecurityGroup {
         let directory = parse_directory_with_overrides_and_diagnostics(
             &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-            &IndexMap::new(),
+            &SourceOverrides::new(),
         )
         .expect("directory parse");
         let semantic = directory.semantic_file(&main_path).expect("semantic file");
@@ -5198,7 +5591,7 @@ awscc.ec2.SecurityGroup {
                 (
                     temp.path().join(name),
                     DirectoryResolvedFile {
-                        source: ResolvedPath::new(temp.path().join(name)).unwrap(),
+                        source: crate::paths::PersistedPath::new(temp.path().join(name)).unwrap(),
                         parsed,
                         local_variable_names,
                     },
