@@ -50,7 +50,7 @@ use super::{
     verify_for_mutation,
 };
 use crate::commands::plan::{ReadOnlyProviderInputs, load_and_resolve_read_only_provider_configs};
-use crate::commands::shared::finalize::release_lock_after_execute;
+use crate::commands::shared::finalize::{FinalizationContext, release_lock_after_execute};
 use crate::commands::shared::lock_heartbeat::{StateLock, StateLockRef};
 use crate::commands::shared::progress::{
     ProgressBackend, ProgressSink, RefreshPhase, emit_newline_on_interrupt,
@@ -264,7 +264,8 @@ pub enum StateCommands {
         path: Option<PathBuf>,
 
         /// Read state directly from a URL, bypassing .crn / backend
-        /// resolution. Accepts s3://bucket/key, file://path, or a bare
+        /// resolution. Accepts github://owner/repo/path?branch=name,
+        /// s3://bucket/key, file://path, or a bare
         /// local path. Mutually exclusive with [PATH].
         #[arg(long, conflicts_with = "path")]
         state_url: Option<String>,
@@ -280,7 +281,8 @@ pub enum StateCommands {
         path: Option<PathBuf>,
 
         /// Read state directly from a URL, bypassing .crn / backend
-        /// resolution. Accepts s3://bucket/key, file://path, or a bare
+        /// resolution. Accepts github://owner/repo/path?branch=name,
+        /// s3://bucket/key, file://path, or a bare
         /// local path. Mutually exclusive with [PATH].
         #[arg(long, conflicts_with = "path")]
         state_url: Option<String>,
@@ -296,7 +298,8 @@ pub enum StateCommands {
         path: Option<PathBuf>,
 
         /// Read state directly from a URL, bypassing .crn / backend
-        /// resolution. Accepts s3://bucket/key, file://path, or a bare
+        /// resolution. Accepts github://owner/repo/path?branch=name,
+        /// s3://bucket/key, file://path, or a bare
         /// local path. Mutually exclusive with [PATH].
         #[arg(long, conflicts_with = "path")]
         state_url: Option<String>,
@@ -642,7 +645,7 @@ pub async fn run_state_forget(
         DriftCommand::ForgetState,
     )?;
     let backend = verified_backend
-        .resolve()
+        .resolve(&cancel)
         .await
         .map_err(AppError::Backend)?;
 
@@ -665,8 +668,11 @@ pub async fn run_state_forget(
         cancel.clone(),
     )
     .await;
-    let release =
-        release_lock_after_execute(backend.as_ref(), StateLockRef::Held(&lock), &cancel).await;
+    let release = release_lock_after_execute(
+        FinalizationContext::new(&backend, path),
+        StateLockRef::Held(&lock),
+    )
+    .await;
     if release.is_ok() {
         println!("  {} Lock released", "✓".green(color_mode));
     }
@@ -1748,8 +1754,8 @@ pub async fn run_state_refresh(
     )?;
 
     // Create backend
-    let backend: Box<dyn StateBackend> = verified_backend
-        .resolve()
+    let backend = verified_backend
+        .resolve(&cancel)
         .await
         .map_err(AppError::Backend)?;
 
@@ -1782,8 +1788,11 @@ pub async fn run_state_refresh(
     )
     .await;
 
-    let release_result =
-        release_lock_after_execute(backend.as_ref(), state_lock.as_ref(), &cancel).await;
+    let release_result = release_lock_after_execute(
+        FinalizationContext::new(&backend, path),
+        state_lock.as_ref(),
+    )
+    .await;
     if state_lock.is_held()
         && release_result.is_ok()
         && matches!(op_result, Err(AppError::Interrupted))
@@ -3330,6 +3339,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StateBackend for ModuleConstraintRefreshBackend {
+        fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+            carina_core::shutdown::CleanupBudget::TWO_SECOND
+        }
+
         async fn read_state(
             &self,
         ) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {

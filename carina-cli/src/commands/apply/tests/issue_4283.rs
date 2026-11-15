@@ -383,7 +383,8 @@ async fn apply_saved(fixture: &ApplyCancellationFixture, cloud: &Cloud, saved_pl
         &source,
     )
     .unwrap();
-    let backend = fixture.backend_handle();
+    let backend =
+        carina_state::PublishedBackend::for_test(fixture.backend_handle(), &fixture.cancel_token());
     let outcome = run_apply_from_plan_locked_owned(
         fixture.runtime().color_mode(),
         bound,
@@ -404,9 +405,8 @@ async fn apply_saved(fixture: &ApplyCancellationFixture, cloud: &Cloud, saved_pl
     .await;
     finish_lock_command(
         fixture.runtime().color_mode(),
-        backend.as_ref(),
+        FinalizationContext::new(&backend, fixture.config_path()),
         outcome,
-        &fixture.cancel_token(),
     )
     .await
     .unwrap();

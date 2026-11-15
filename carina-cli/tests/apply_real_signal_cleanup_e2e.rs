@@ -115,6 +115,7 @@ fn sigint_then_sigterm_flushes_completed_state_releases_lock_and_exits_130() {
         "the in-flight provider operation abandoned after SIGTERM must not be persisted"
     );
     assert!(stderr.contains("Received shutdown signal: Terminate."));
+    assert!(stderr.contains("Waiting up to 2 seconds for state and lock cleanup."));
     assert!(stderr.contains("Cancellation cleanup: state flushed."));
     assert!(stderr.contains("Cancellation cleanup: state lock released."));
 }

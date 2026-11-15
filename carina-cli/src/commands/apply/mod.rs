@@ -59,7 +59,8 @@ use crate::commands::shared::effect_execution::{
     execute_import_effects, execute_state_only_effects,
 };
 use crate::commands::shared::finalize::{
-    LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
+    FinalizationContext, LockCommandOutcome, StatePersistence, finalize_after_execute,
+    finish_lock_command,
 };
 use crate::commands::shared::incremental_state_saver::{
     FinalStateBase, IncrementalStateSaver, MidRunStateWriter,
@@ -1289,7 +1290,7 @@ pub async fn refresh_pending_states(
 pub(crate) async fn finalize_apply<S: Clone>(
     color_mode: crate::output_style::ColorMode,
     input: FinalizeApplyInput<'_, S>,
-    persistence: StatePersistence,
+    persistence: StatePersistence<'_>,
 ) -> Result<SkippedExports, AppError> {
     println!();
     println!("{}", "Saving state...".cyan(color_mode));
@@ -1368,11 +1369,11 @@ pub(crate) async fn save_state_locked_after_execute(
     backend: &dyn StateBackend,
     lock: &LockInfo,
     state: &mut StateFile,
-    persistence: StatePersistence,
+    persistence: StatePersistence<'_>,
 ) -> Result<(), AppError> {
     match persistence {
         StatePersistence::Normal => save_state_locked(backend, lock, state).await,
-        StatePersistence::CancellationCleanup => {
+        StatePersistence::CancellationCleanup(backend) => {
             state.increment_serial();
             backend
                 .write_state_locked_for_cleanup(state, lock)
@@ -1399,11 +1400,11 @@ pub(crate) async fn save_state_unlocked_after_execute(
     backend: &dyn StateBackend,
     disabled: &LockingDisabled,
     state: &mut StateFile,
-    persistence: StatePersistence,
+    persistence: StatePersistence<'_>,
 ) -> Result<(), AppError> {
     match persistence {
         StatePersistence::Normal => save_state_unlocked(backend, disabled, state).await,
-        StatePersistence::CancellationCleanup => {
+        StatePersistence::CancellationCleanup(backend) => {
             state.increment_serial();
             backend
                 .write_state_for_cleanup(state)
@@ -2083,11 +2084,10 @@ async fn run_apply_using(
     )?;
 
     // Check for backend configuration - use local backend by default
-    let backend: Arc<dyn StateBackend> = verified_backend
-        .resolve()
+    let backend = verified_backend
+        .resolve(&cancel)
         .await
-        .map_err(AppError::Backend)?
-        .into();
+        .map_err(AppError::Backend)?;
 
     // Must stay before acquire_lock and before operation providers are built.
     let validated_config = prepare_apply_storage(
@@ -2129,7 +2129,7 @@ async fn run_apply_using(
     let outcome = run_apply_locked_owned(
         validated_config,
         auto_approve,
-        Arc::clone(&backend),
+        backend.clone(),
         state_lock,
         project,
         provider_context,
@@ -2139,7 +2139,12 @@ async fn run_apply_using(
         accept_legacy_name_overrides,
     )
     .await;
-    let timing = finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await?;
+    let timing = finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, path),
+        outcome,
+    )
+    .await?;
     if let Some(elapsed) = timing {
         println!("{}", format_total_apply_line(elapsed));
     }
@@ -2460,7 +2465,6 @@ struct SourceApplyExecuted {
     wait_aliases: Vec<WaitAliasSpec>,
     pre_resolve_compositions: Vec<carina_core::resource::LiveComposition>,
     provider_context: LoadedProviderContext,
-    cancel: ShutdownToken,
 }
 
 enum SavedPlanApplyAfterHeartbeat {
@@ -2482,14 +2486,13 @@ struct SavedPlanApplyExecuted {
     state_base: FinalStateBase,
     state_save_inputs: Arc<ApplyStateSaveInputs<SavedModuleSource>>,
     wait_aliases: Vec<WaitAliasSpec>,
-    cancel: ShutdownToken,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_apply_locked_owned(
     mut validated_config: ValidatedConfig,
     auto_approve: bool,
-    backend: Arc<dyn StateBackend>,
+    backend: carina_state::PublishedBackend,
     lock: StateLock,
     project_dir: &ResolvedPath,
     provider_context: &ProviderContext,
@@ -2532,7 +2535,7 @@ async fn run_apply_locked_owned(
         };
     }
     let heartbeat_outcome = with_lock_heartbeat(
-        Arc::clone(&backend),
+        backend.shared_backend(),
         lock,
         cancel,
         async |cancel, mid_run_writer| {
@@ -3108,7 +3111,6 @@ async fn run_apply_locked_owned(
                     wait_aliases,
                     pre_resolve_compositions,
                     provider_context: ctx.provider_context().clone(),
-                    cancel,
                 },
             )))
         },
@@ -3190,7 +3192,6 @@ async fn run_apply_locked_owned(
                     wait_aliases,
                     pre_resolve_compositions,
                     provider_context,
-                    cancel,
                 } = *context;
                 let export_resources: Vec<
                     Resource<
@@ -3210,6 +3211,7 @@ async fn run_apply_locked_owned(
                 // tags out of `current` and surfaces a spurious `tags: (none) → ...`
                 // diff (refs awscc#206).
                 let skipped_exports = finalize_after_execute(
+                    FinalizationContext::new(&backend, project_display),
                     |persistence| {
                         finalize_apply(
                             color_mode,
@@ -3232,7 +3234,6 @@ async fn run_apply_locked_owned(
                         )
                     },
                     cancelled,
-                    &cancel,
                 )
                 .await?;
 
@@ -3316,13 +3317,14 @@ async fn run_apply_locked_canonical(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
+    let backend = carina_state::PublishedBackend::for_test(backend, &cancel);
     let project =
         ResolvedPath::new(project_dir).map_err(|error| AppError::Config(error.to_string()))?;
     let color_mode = validated_config.context().runtime().color_mode();
     let outcome = run_apply_locked_owned(
         validated_config,
         auto_approve,
-        Arc::clone(&backend),
+        backend.clone(),
         lock,
         &project,
         provider_context,
@@ -3332,7 +3334,12 @@ async fn run_apply_locked_canonical(
         accept_legacy_name_overrides,
     )
     .await;
-    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, project_dir),
+        outcome,
+    )
+    .await
 }
 
 fn ensure_saved_plan_backend_matches_current<'a>(
@@ -4095,11 +4102,10 @@ async fn run_apply_from_plan_with_observer_factory(
     }
 
     // Set up backend
-    let backend: Arc<dyn StateBackend> = verified_backend
-        .resolve()
+    let backend = verified_backend
+        .resolve(&cancel)
         .await
-        .map_err(AppError::Backend)?
-        .into();
+        .map_err(AppError::Backend)?;
 
     // Acquire lock (unless --lock=false)
     let state_lock = if lock {
@@ -4125,7 +4131,7 @@ async fn run_apply_from_plan_with_observer_factory(
         inspected_plan,
         provider_context,
         auto_approve,
-        Arc::clone(&backend),
+        backend.clone(),
         state_lock,
         apply_target,
         base_dir,
@@ -4135,9 +4141,13 @@ async fn run_apply_from_plan_with_observer_factory(
         accept_legacy_name_overrides,
     )
     .await;
-    let timing = finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel)
-        .await
-        .map_err(|error| error.with_project_dir(&source_path))?;
+    let timing = finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, &source_path),
+        outcome,
+    )
+    .await
+    .map_err(|error| error.with_project_dir(&source_path))?;
     if let Some(elapsed) = timing {
         println!("{}", format_total_apply_line(elapsed));
     }
@@ -4151,7 +4161,7 @@ async fn run_apply_from_plan_locked_owned(
     inspected_plan: ProviderBoundPlanFile,
     provider_context: &ProviderContext,
     auto_approve: bool,
-    backend: Arc<dyn StateBackend>,
+    backend: carina_state::PublishedBackend,
     lock: StateLock,
     apply_target: ApplyTarget<'_>,
     source: &ResolvedPath,
@@ -4259,7 +4269,7 @@ async fn run_apply_from_plan_locked_owned(
         state_file = Some(state);
     }
     let heartbeat_outcome = with_lock_heartbeat(
-        Arc::clone(&backend),
+        backend.shared_backend(),
         lock,
         cancel,
         async |cancel, mid_run_writer| {
@@ -4693,7 +4703,6 @@ async fn run_apply_from_plan_locked_owned(
                     state_base,
                     state_save_inputs,
                     wait_aliases,
-                    cancel,
                 },
             )))
         },
@@ -4738,9 +4747,9 @@ async fn run_apply_from_plan_locked_owned(
                     state_base,
                     state_save_inputs,
                     wait_aliases,
-                    cancel,
                 } = *context;
                 let skipped_exports = finalize_after_execute(
+                    FinalizationContext::new(&backend, project_dir),
                     |persistence| {
                         finalize_apply(
                             color_mode,
@@ -4767,7 +4776,6 @@ async fn run_apply_from_plan_locked_owned(
                         )
                     },
                     cancelled,
-                    &cancel,
                 )
                 .await?;
 
@@ -4803,6 +4811,7 @@ async fn run_apply_from_plan_locked(
     parallelism: NonZeroUsize,
     accept_legacy_name_overrides: bool,
 ) -> Result<Option<Duration>, AppError> {
+    let backend = carina_state::PublishedBackend::for_test(backend, &cancel);
     let source = ResolvedPath::new(apply_target.source_dir())
         .map_err(|error| AppError::Config(error.to_string()))?;
     let color_mode = runtime.color_mode();
@@ -4825,12 +4834,11 @@ async fn run_apply_from_plan_locked(
         Err(error) => {
             return finish_lock_command(
                 color_mode,
-                backend.as_ref(),
+                FinalizationContext::new(&backend, apply_target.source_dir()),
                 LockCommandOutcome::Kept {
                     result: Err(error),
                     lock,
                 },
-                &cancel,
             )
             .await;
         }
@@ -4840,7 +4848,7 @@ async fn run_apply_from_plan_locked(
         inspected_plan,
         provider_context,
         auto_approve,
-        Arc::clone(&backend),
+        backend.clone(),
         lock,
         apply_target,
         &source,
@@ -4850,7 +4858,12 @@ async fn run_apply_from_plan_locked(
         accept_legacy_name_overrides,
     )
     .await;
-    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, apply_target.source_dir()),
+        outcome,
+    )
+    .await
 }
 
 #[derive(Debug, PartialEq, Eq)]
