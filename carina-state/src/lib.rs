@@ -34,7 +34,8 @@
 //!     // Initialize or migrate the backend lock before mutating state.
 //!     return Err("backend is not ready for mutation".into());
 //! };
-//! let backend = selected.resolve().await?;
+//! let shutdown = carina_core::shutdown::ShutdownToken::running();
+//! let backend = selected.resolve(&shutdown).await?;
 //!
 //! // Acquire lock before modifying state
 //! let lock = backend.acquire_lock("apply").await?;
@@ -89,9 +90,10 @@ pub use backend_config::{
 pub use backend_lock::BackendLock;
 pub use backend_selection::{
     BackendConfigurationSource, BackendDrift, BackendDriftStatus, BackendSelection,
-    BucketDeleteBackendSelection, BucketDeleteSelectionError, MigrationBackends,
-    MutationBackendSelection, ProtectedBackendBucket, ReadBackendOrigin, ReadBackendSelection,
-    ResolvedReadBackend, VerifiedMutationBackendSelection, inspect_backend_drift,
+    BucketDeleteBackendSelection, BucketDeleteSelectionError, CleanupPermit, MigrationBackends,
+    MutationBackendSelection, ProtectedBackendBucket, PublishedBackend, ReadBackendOrigin,
+    ReadBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
+    inspect_backend_drift,
 };
 pub use backends::{
     GitHubBackend, GitHubError, LocalBackend, LocalStateFile, S3AutoCreate, S3AutoCreateDisabled,

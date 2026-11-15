@@ -873,6 +873,10 @@ async fn cleanup_locked_write_with_cached_state_etag_uses_three_s3_calls() {
     state.increment_serial();
 
     enabled.store(true, Ordering::SeqCst);
+    let backend = crate::PublishedBackend::for_test(
+        Arc::new(backend),
+        &carina_core::shutdown::ShutdownToken::running(),
+    );
     backend
         .write_state_locked_for_cleanup(&state, &lock)
         .await
@@ -988,6 +992,10 @@ async fn cleanup_locked_write_with_known_absent_state_uses_three_s3_calls() {
     state.increment_serial();
 
     enabled.store(true, Ordering::SeqCst);
+    let backend = crate::PublishedBackend::for_test(
+        Arc::new(backend),
+        &carina_core::shutdown::ShutdownToken::running(),
+    );
     backend
         .write_state_locked_for_cleanup(&state, &lock)
         .await
@@ -1178,6 +1186,10 @@ async fn cancellation_cleanup_write_and_release_preserve_the_lock_protocol() {
     let mut state = StateFile::new();
     state.increment_serial();
 
+    let backend = crate::PublishedBackend::for_test(
+        Arc::new(backend),
+        &carina_core::shutdown::ShutdownToken::running(),
+    );
     backend
         .write_state_locked_for_cleanup(&state, &lock)
         .await

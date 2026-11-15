@@ -644,7 +644,7 @@ pub async fn run_state_forget(
         DriftCommand::ForgetState,
     )?;
     let backend = verified_backend
-        .resolve()
+        .resolve(&cancel)
         .await
         .map_err(AppError::Backend)?;
 
@@ -667,8 +667,7 @@ pub async fn run_state_forget(
         cancel.clone(),
     )
     .await;
-    let release =
-        release_lock_after_execute(backend.as_ref(), StateLockRef::Held(&lock), &cancel).await;
+    let release = release_lock_after_execute(&backend, StateLockRef::Held(&lock)).await;
     if release.is_ok() {
         println!("  {} Lock released", "✓".green(color_mode));
     }
@@ -1750,8 +1749,8 @@ pub async fn run_state_refresh(
     )?;
 
     // Create backend
-    let backend: Box<dyn StateBackend> = verified_backend
-        .resolve()
+    let backend = verified_backend
+        .resolve(&cancel)
         .await
         .map_err(AppError::Backend)?;
 
@@ -1784,8 +1783,7 @@ pub async fn run_state_refresh(
     )
     .await;
 
-    let release_result =
-        release_lock_after_execute(backend.as_ref(), state_lock.as_ref(), &cancel).await;
+    let release_result = release_lock_after_execute(&backend, state_lock.as_ref()).await;
     if state_lock.is_held()
         && release_result.is_ok()
         && matches!(op_result, Err(AppError::Interrupted))
@@ -3327,6 +3325,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StateBackend for ModuleConstraintRefreshBackend {
+        fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+            carina_core::shutdown::CleanupBudget::TWO_SECOND
+        }
+
         async fn read_state(
             &self,
         ) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {

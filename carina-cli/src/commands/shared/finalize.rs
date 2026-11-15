@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::output_style::Colorize;
-use carina_core::shutdown::{ShutdownPhase, ShutdownToken};
-use carina_state::StateBackend;
+use carina_core::shutdown::{CleanupBudget, ShutdownPhase, ShutdownToken, duration_for_log};
+use carina_state::PublishedBackend;
 use std::future::Future;
 
 use super::lock_heartbeat::{StateLock, StateLockRef};
@@ -15,10 +15,10 @@ pub(crate) enum LockCommandOutcome<T> {
     Lost(AppError),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StatePersistence {
+#[derive(Clone, Copy)]
+pub(crate) enum StatePersistence<'a> {
     Normal,
-    CancellationCleanup,
+    CancellationCleanup(&'a PublishedBackend),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,18 +44,20 @@ impl CleanupStageMode {
 }
 
 pub(crate) async fn release_lock_after_execute(
-    backend: &dyn StateBackend,
+    backend: &PublishedBackend,
     lock: StateLockRef<'_>,
-    shutdown: &ShutdownToken,
 ) -> Result<(), AppError> {
+    let shutdown = backend.shutdown();
     let StateLockRef::Held(lock) = lock else {
         return Ok(());
     };
-    let release = match shutdown.phase() {
-        ShutdownPhase::CleanupPriority | ShutdownPhase::Graceful => {
-            backend.release_lock_for_cleanup(lock)
+    let release = async {
+        match shutdown.phase() {
+            ShutdownPhase::CleanupPriority | ShutdownPhase::Graceful => {
+                backend.release_lock_for_cleanup(lock).await
+            }
+            ShutdownPhase::Running => backend.release_lock(lock).await,
         }
-        ShutdownPhase::Running => backend.release_lock(lock),
     };
     await_cleanup_stage(
         release,
@@ -72,16 +74,15 @@ pub(crate) async fn release_lock_after_execute(
 /// Finish a lock-owning command, releasing only when ownership survived.
 pub(crate) async fn finish_lock_command<T>(
     color_mode: crate::output_style::ColorMode,
-    backend: &dyn StateBackend,
+    backend: &PublishedBackend,
     outcome: LockCommandOutcome<Result<T, AppError>>,
-    shutdown: &ShutdownToken,
 ) -> Result<T, AppError> {
     let (result, lock) = match outcome {
         LockCommandOutcome::Kept { result, lock } => (result, lock),
         LockCommandOutcome::Lost(error) => return Err(error),
     };
 
-    let release_result = release_lock_after_execute(backend, lock.as_ref(), shutdown).await;
+    let release_result = release_lock_after_execute(backend, lock.as_ref()).await;
     if lock.is_held()
         && release_result.is_ok()
         && (result.is_ok() || matches!(result, Err(AppError::Interrupted)))
@@ -104,25 +105,27 @@ pub(crate) async fn finish_lock_command<T>(
 ///
 /// On cancellation, `Interrupted` takes precedence so the user sees the
 /// interruption instead of a cleanup error. The finalize error is still logged.
-pub(crate) async fn finalize_after_execute<T, MakeFinalize, F>(
+pub(crate) async fn finalize_after_execute<'a, T, MakeFinalize, F>(
+    backend: &'a PublishedBackend,
     make_finalize: MakeFinalize,
     execution_cancelled: bool,
-    shutdown: &ShutdownToken,
 ) -> Result<T, AppError>
 where
-    MakeFinalize: FnOnce(StatePersistence) -> F,
+    MakeFinalize: FnOnce(StatePersistence<'a>) -> F,
     F: Future<Output = Result<T, AppError>>,
 {
+    let shutdown = backend.shutdown();
     let persistence = match shutdown.phase() {
         ShutdownPhase::Running if !execution_cancelled => StatePersistence::Normal,
         ShutdownPhase::Running | ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
-            StatePersistence::CancellationCleanup
+            StatePersistence::CancellationCleanup(backend)
         }
     };
     let finalize = make_finalize(persistence);
     let Some(finalize_result) = await_state_flush_stage(
         finalize,
         shutdown,
+        backend.cleanup_budget(),
         execution_cancelled,
         "flushing state...",
         "state flushed.",
@@ -131,7 +134,8 @@ where
     .await
     else {
         eprintln!(
-            "Cancellation cleanup: state flush budget expired; continuing to state lock release."
+            "Cancellation cleanup: the state save could not be confirmed within {}; continuing to state lock release. Run `carina state refresh` to reconcile state with the provider.",
+            duration_for_log(backend.cleanup_budget().state_flush())
         );
         return Err(AppError::Interrupted);
     };
@@ -187,6 +191,7 @@ where
 async fn await_state_flush_stage<T, E, F>(
     future: F,
     shutdown: &ShutdownToken,
+    budget: CleanupBudget,
     already_cancelled: bool,
     started: &str,
     completed: &str,
@@ -197,6 +202,8 @@ where
     E: std::fmt::Display,
 {
     tokio::pin!(future);
+    let cutoff = shutdown.state_flush_budget_expired(budget);
+    tokio::pin!(cutoff);
     let mut mode = CleanupStageMode::at_start(already_cancelled, shutdown.phase());
     match mode {
         CleanupStageMode::Normal => {}
@@ -209,7 +216,7 @@ where
         tokio::select! {
             biased;
             result = &mut future => break Some(result),
-            _ = shutdown.state_flush_budget_expired() => break None,
+            _ = &mut cutoff => break None,
             _ = shutdown.cancelled(), if matches!(mode, CleanupStageMode::Normal) => {
                 mode = CleanupStageMode::CancellationCleanup;
                 eprintln!("Cancellation cleanup: {started}");
@@ -247,7 +254,7 @@ mod tests {
     use super::*;
     use carina_core::shutdown::CLEANUP_DEADLINE;
     use carina_core::shutdown::testing::shutdown_channel;
-    use carina_state::{BackendResult, LoadedState, LockInfo, StateFile};
+    use carina_state::{BackendResult, LoadedState, LockInfo, StateBackend, StateFile};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -268,26 +275,29 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn slow_bounded_cleanup_operations_finish_inside_the_hard_deadline() {
-        let backend = LatencyBackend::new(Duration::from_millis(250));
+        let backend = Arc::new(LatencyBackend::new(Duration::from_millis(250)));
         let lock = LockInfo::for_test("apply");
         let mut state = StateFile::new();
         let (trigger, shutdown) = shutdown_channel();
+        let published = PublishedBackend::for_test(backend.clone(), &shutdown);
         trigger.prioritize_cleanup();
-        schedule_state_flush_cutoff(trigger.clone());
 
         tokio::time::timeout(CLEANUP_DEADLINE, async {
             let result = finalize_after_execute(
+                &published,
                 |mode| {
                     crate::commands::apply::save_state_locked_after_execute(
-                        &backend, &lock, &mut state, mode,
+                        backend.as_ref(),
+                        &lock,
+                        &mut state,
+                        mode,
                     )
                 },
                 true,
-                &shutdown,
             )
             .await;
             assert!(matches!(result, Err(AppError::Interrupted)));
-            release_lock_after_execute(&backend, StateLockRef::Held(&lock), &shutdown)
+            release_lock_after_execute(&published, StateLockRef::Held(&lock))
                 .await
                 .unwrap();
         })
@@ -310,27 +320,32 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn slow_state_flush_cannot_starve_cleanup_lock_release() {
-        let backend =
-            LatencyBackend::with_latencies(Duration::from_secs(5), Duration::from_millis(250));
+        let backend = Arc::new(LatencyBackend::with_latencies(
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+        ));
         let lock = LockInfo::for_test("destroy");
         let mut state = StateFile::new();
         let (trigger, shutdown) = shutdown_channel();
+        let published = PublishedBackend::for_test(backend.clone(), &shutdown);
         trigger.prioritize_cleanup();
-        schedule_state_flush_cutoff(trigger.clone());
 
         tokio::time::timeout(CLEANUP_DEADLINE, async {
             let result = finalize_after_execute(
+                &published,
                 |mode| {
                     crate::commands::apply::save_state_locked_after_execute(
-                        &backend, &lock, &mut state, mode,
+                        backend.as_ref(),
+                        &lock,
+                        &mut state,
+                        mode,
                     )
                 },
                 true,
-                &shutdown,
             )
             .await;
             assert!(matches!(result, Err(AppError::Interrupted)));
-            release_lock_after_execute(&backend, StateLockRef::Held(&lock), &shutdown)
+            release_lock_after_execute(&published, StateLockRef::Held(&lock))
                 .await
                 .unwrap();
         })
@@ -349,14 +364,97 @@ mod tests {
         );
     }
 
-    fn schedule_state_flush_cutoff(trigger: carina_core::shutdown::testing::TestShutdownTrigger) {
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            trigger.expire_state_flush_budget();
-        });
+    #[tokio::test(start_paused = true)]
+    async fn finalizer_uses_backend_provided_state_flush_budget() {
+        for before_finalize in [
+            Duration::ZERO,
+            Duration::from_millis(350),
+            Duration::from_millis(600),
+        ] {
+            let mut backend = LatencyBackend::new(Duration::from_secs(5));
+            backend.cleanup_budget =
+                CleanupBudget::new(Duration::from_millis(400), Duration::from_secs(2));
+            let backend = Arc::new(backend);
+            let lock = LockInfo::for_test("apply");
+            let mut state = StateFile::new();
+            let (trigger, shutdown) = shutdown_channel();
+            let published = PublishedBackend::for_test(backend.clone(), &shutdown);
+            trigger.prioritize_cleanup();
+            tokio::time::advance(before_finalize).await;
+
+            let start = tokio::time::Instant::now();
+            let result = finalize_after_execute(
+                &published,
+                |mode| {
+                    crate::commands::apply::save_state_locked_after_execute(
+                        backend.as_ref(),
+                        &lock,
+                        &mut state,
+                        mode,
+                    )
+                },
+                true,
+            )
+            .await;
+
+            assert!(matches!(result, Err(AppError::Interrupted)));
+            assert_eq!(
+                start.elapsed(),
+                backend
+                    .cleanup_budget
+                    .state_flush()
+                    .saturating_sub(before_finalize)
+            );
+            assert!(!backend.state_written.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn github_sized_flush_window_preserves_the_lock_release_slice() {
+        for (state_latency, saved, elapsed) in [
+            (
+                Duration::from_millis(1500),
+                true,
+                Duration::from_millis(6500),
+            ),
+            (Duration::from_secs(10), false, Duration::from_secs(7)),
+        ] {
+            let mut backend = LatencyBackend::with_latencies(state_latency, Duration::from_secs(1));
+            backend.cleanup_budget =
+                CleanupBudget::new(Duration::from_secs(5), Duration::from_secs(8));
+            let backend = Arc::new(backend);
+            let (trigger, shutdown) = shutdown_channel();
+            let published = PublishedBackend::for_test(backend.clone(), &shutdown);
+            let lock = LockInfo::for_test("apply");
+            let mut state = StateFile::new();
+            trigger.prioritize_cleanup();
+            let start = tokio::time::Instant::now();
+            let result = finalize_after_execute(
+                &published,
+                |mode| {
+                    crate::commands::apply::save_state_locked_after_execute(
+                        backend.as_ref(),
+                        &lock,
+                        &mut state,
+                        mode,
+                    )
+                },
+                true,
+            )
+            .await;
+            assert!(matches!(result, Err(AppError::Interrupted)));
+            release_lock_after_execute(&published, StateLockRef::Held(&lock))
+                .await
+                .unwrap();
+            assert_eq!(start.elapsed(), elapsed);
+            assert!(start.elapsed() < published.cleanup_budget().total());
+            assert_eq!(backend.state_written.load(Ordering::SeqCst), saved);
+            assert!(!backend.lock_held.load(Ordering::SeqCst));
+        }
     }
 
     struct LatencyBackend {
+        cleanup_budget: carina_core::shutdown::CleanupBudget,
         state_operation_latency: Duration,
         release_operation_latency: Duration,
         operations: Arc<Mutex<Vec<&'static str>>>,
@@ -374,6 +472,7 @@ mod tests {
             release_operation_latency: Duration,
         ) -> Self {
             Self {
+                cleanup_budget: carina_core::shutdown::CleanupBudget::TWO_SECOND,
                 state_operation_latency,
                 release_operation_latency,
                 operations: Arc::new(Mutex::new(Vec::new())),
@@ -390,6 +489,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StateBackend for LatencyBackend {
+        fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+            self.cleanup_budget
+        }
+
         async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
             Ok(None)
         }
@@ -426,6 +529,7 @@ mod tests {
             &self,
             _state: &StateFile,
             lock: &LockInfo,
+            _permit: &carina_state::CleanupPermit<'_>,
         ) -> BackendResult<()> {
             self.operation("cleanup lock GET", self.state_operation_latency)
                 .await;
@@ -439,7 +543,11 @@ mod tests {
             Ok(())
         }
 
-        async fn release_lock_for_cleanup(&self, _lock: &LockInfo) -> BackendResult<()> {
+        async fn release_lock_for_cleanup(
+            &self,
+            _lock: &LockInfo,
+            _permit: &carina_state::CleanupPermit<'_>,
+        ) -> BackendResult<()> {
             self.operation("cleanup release GET", self.release_operation_latency)
                 .await;
             self.operation("cleanup release DELETE", self.release_operation_latency)

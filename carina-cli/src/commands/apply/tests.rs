@@ -5211,12 +5211,13 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
             .unwrap();
     let observer_factory = fixture.observer_factory();
     let cancel = fixture.cancel_token();
+    let backend = carina_state::PublishedBackend::for_test(fixture.backend_handle(), &cancel);
     let outcome = run_apply_from_plan_locked_owned(
         fixture.runtime().color_mode(),
         bound,
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         true,
-        fixture.backend_handle(),
+        backend.clone(),
         StateLock::disabled_for_test(),
         ApplyTarget::SavedPlan {
             plan_file: &plan_path,
@@ -5229,14 +5230,9 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
         false,
     )
     .await;
-    let error = finish_lock_command(
-        fixture.runtime().color_mode(),
-        fixture.backend_handle().as_ref(),
-        outcome,
-        &cancel,
-    )
-    .await
-    .expect_err("unresolved provider configuration must not reach execution");
+    let error = finish_lock_command(fixture.runtime().color_mode(), &backend, outcome)
+        .await
+        .expect_err("unresolved provider configuration must not reach execution");
 
     assert!(
         matches!(&error, AppError::SavedProviderConfig { .. }),
@@ -7519,6 +7515,10 @@ struct BootstrapWriteFailureBackend;
 
 #[async_trait::async_trait]
 impl StateBackend for BootstrapWriteFailureBackend {
+    fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {
         Ok(None)
     }

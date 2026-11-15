@@ -1,6 +1,7 @@
 //! GitHub.com Contents storage and SHA-conditioned leases.
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
+use carina_core::shutdown::CleanupBudget;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -190,6 +191,13 @@ impl GitHubRequest {
             ..Self::get(path, None, JSON_MEDIA_TYPE)
         }
     }
+    fn lease_at_branch(path: String, branch: &crate::GitBranch) -> Self {
+        Self {
+            // Disambiguate the branch from a same-named tag or object ID.
+            reference: Some(format!("refs/heads/{}", branch.as_str())),
+            ..Self::get(path, None, JSON_MEDIA_TYPE)
+        }
+    }
     fn mutation(method: Method, path: String, body: Value) -> Self {
         Self {
             method,
@@ -256,10 +264,8 @@ pub struct GitHubBackend {
     migration_logged: OnceLock<crate::MigrationInfo>,
 }
 
+const CLEANUP_OPERATION_MARGIN: Duration = Duration::from_millis(500);
 const OPERATION_BUDGET: Duration = Duration::from_secs(30);
-// The existing finalizer allows 1s to flush and 2s overall. Each complete
-// cleanup operation, including its gate, retries and compare, is bounded to 900ms.
-const CLEANUP_BUDGET: Duration = Duration::from_millis(900);
 const MAX_ATTEMPTS: usize = 5;
 // A locked save needs strictly more than 60s remaining, plus 5s for clock
 // skew. This narrows expiry/takeover races without renewing during cleanup.
@@ -273,15 +279,15 @@ struct Operation {
     mutation_dispatched: AtomicBool,
 }
 impl Operation {
-    fn new(cleanup: bool) -> Self {
+    fn new(cleanup: Option<&crate::CleanupPermit<'_>>, budget: Duration) -> Self {
+        let deadline = Instant::now() + budget;
+        let deadline = match cleanup.and_then(crate::CleanupPermit::cleanup_deadline) {
+            Some(cleanup_deadline) => deadline.min(cleanup_deadline - CLEANUP_OPERATION_MARGIN),
+            None => deadline,
+        };
         Self {
-            deadline: Instant::now()
-                + if cleanup {
-                    CLEANUP_BUDGET
-                } else {
-                    OPERATION_BUDGET
-                },
-            cleanup,
+            deadline,
+            cleanup: cleanup.is_some(),
             rate_retries: AtomicUsize::new(0),
             mutation_dispatched: AtomicBool::new(false),
         }
@@ -365,9 +371,9 @@ impl AmbiguousWrite {
     }
 }
 
-/// Decision (b) remains open with the orchestrator. Preserve the current
-/// exact-bytes recovery policy, including possible resurrection, ONLY here.
-/// A Git blob hash is an identity of bytes, not a fencing generation.
+/// Accepted, documented limitation: a lost reply concurrent with deletion or
+/// force-unlock can recover matching bytes even if the PUT recreated the path.
+/// A Git blob hash identifies bytes, not a fencing generation.
 fn matching_write_is_ours(current: Option<&BlobSha>, sent: &BlobSha) -> bool {
     current == Some(sent)
 }
@@ -798,7 +804,10 @@ impl GitHubBackend {
         if response.status != 200 {
             return Err(Self::api_error(&response));
         }
-        let metadata = decode(&response.body)?;
+        Self::decode_metadata(&response.body).map(Some)
+    }
+    fn decode_metadata(body: &[u8]) -> BackendResult<FileMetadata> {
+        let metadata = decode(body)?;
         if metadata.is_array() || json_string(&metadata, "type")? != "file" {
             return Err(GitHubError::NonFile.into());
         }
@@ -814,7 +823,7 @@ impl GitHubBackend {
             "none" => None,
             _ => return Err(GitHubError::MalformedResponse.into()),
         };
-        Ok(Some(FileMetadata { sha, size, inline }))
+        Ok(FileMetadata { sha, size, inline })
     }
     async fn observe_at(
         &self,
@@ -827,13 +836,7 @@ impl GitHubBackend {
         };
         let bytes = if let Some(inline) = metadata.inline {
             // GitHub wraps inline base64 with newlines.
-            let encoded: Vec<_> = inline
-                .bytes()
-                .filter(|byte| !byte.is_ascii_whitespace())
-                .collect();
-            STANDARD
-                .decode(encoded)
-                .map_err(|_| GitHubError::MalformedResponse)?
+            Self::decode_inline(&inline)?
         } else {
             let response = self
                 .get(
@@ -860,10 +863,58 @@ impl GitHubBackend {
         }))
     }
     async fn lease(&self, operation: &Operation) -> BackendResult<Option<(LockInfo, BlobSha)>> {
-        self.observe((&self.settings.path().lock_path()).into(), operation)
-            .await?
+        let path = self.settings.path().lock_path();
+        let observed = if operation.cleanup {
+            // A single inline Contents response couples the lease bytes to its
+            // blob SHA. No preliminary branch GET is needed for that proof.
+            let response = self
+                .request(
+                    GitHubRequest::lease_at_branch(
+                        self.contents_route((&path).into()),
+                        self.settings.branch(),
+                    ),
+                    operation,
+                )
+                .await?;
+            match response.status {
+                200 => {
+                    let metadata = Self::decode_metadata(&response.body)?;
+                    if let Some(inline) = metadata.inline {
+                        let bytes = Self::decode_inline(&inline)?;
+                        if bytes.len() != metadata.size {
+                            return Err(GitHubError::MalformedResponse.into());
+                        }
+                        Some(ObservedFile {
+                            sha: metadata.sha,
+                            bytes,
+                        })
+                    } else {
+                        // Split reads still need one immutable ref for both
+                        // metadata and raw bytes. Re-observe instead of mixing refs.
+                        self.observe((&path).into(), operation).await?
+                    }
+                }
+                // A branch-ref 404 cannot prove readable absence. Re-observe
+                // and prove root access at the same immutable commit as before.
+                404 => self.observe((&path).into(), operation).await?,
+                403 => return Err(self.contents_read_error()),
+                _ => return Err(Self::api_error(&response)),
+            }
+        } else {
+            self.observe((&path).into(), operation).await?
+        };
+        observed
             .map(|file| Ok((decode_lease(&file.bytes)?, file.sha)))
             .transpose()
+    }
+    fn decode_inline(inline: &str) -> BackendResult<Vec<u8>> {
+        let encoded: Vec<_> = inline
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect();
+        STANDARD
+            .decode(encoded)
+            .map_err(|_| GitHubError::MalformedResponse.into())
     }
     async fn confirm_lease_absence(&self, operation: &Operation) -> BackendResult<bool> {
         let commit = self.branch_snapshot(operation).await?;
@@ -1131,17 +1182,7 @@ impl GitHubBackend {
                     return Err(error);
                 }
             };
-            // M6, real GitHub measurement (2026-11-15, #4436): rules requiring
-            // pull requests reject Contents creates and updates with HTTP 409.
-            // This is a definitive rejection; other 409 bodies keep the recorded
-            // re-read / unchanged-SHA retry rule below.
-            if response.status == 409
-                && serde_json::from_slice::<Value>(&response.body).is_ok_and(|value| {
-                    value
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .is_some_and(|message| message.contains("Repository rule violations found"))
-                })
+            if response.status == 409 && classify_conflict(&response) == ConflictBody::RuleViolation
             {
                 self.reject_mutation(&mutation);
                 return Err(GitHubError::RuleViolation {
@@ -1471,9 +1512,15 @@ impl GitHubBackend {
         &self,
         state: &StateFile,
         lock: Option<&LockInfo>,
-        cleanup: bool,
+        cleanup: Option<&crate::CleanupPermit<'_>>,
     ) -> BackendResult<()> {
-        let operation = Operation::new(cleanup);
+        let budget = cleanup.map_or(OPERATION_BUDGET, |permit| {
+            permit
+                .cleanup_budget()
+                .state_flush()
+                .saturating_sub(CLEANUP_OPERATION_MARGIN)
+        });
+        let operation = Operation::new(cleanup, budget);
         bounded(&operation, async {
             let bytes = Self::state_bytes(state)?;
             let _gate = self.mutations.lock().await;
@@ -1489,14 +1536,43 @@ impl GitHubBackend {
         &self,
         id: &str,
         kind: ReleaseKind,
-        cleanup: bool,
+        cleanup: Option<&crate::CleanupPermit<'_>>,
     ) -> BackendResult<()> {
-        let operation = Operation::new(cleanup);
+        // Reserve the total-minus-flush slice and finish before the absolute
+        // supervisor deadline, even when the flush consumed its entire cutoff.
+        let budget = cleanup.map_or(OPERATION_BUDGET, |permit| {
+            let budget = permit.cleanup_budget();
+            budget.total() - budget.state_flush()
+        });
+        let operation = Operation::new(cleanup, budget);
         bounded(&operation, async {
             let _gate = self.mutations.lock().await;
             self.release(id, kind, &operation).await
         })
         .await
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConflictBody {
+    RuleViolation,
+    Other,
+}
+
+fn classify_conflict(response: &GitHubResponse) -> ConflictBody {
+    // M6, real GitHub measurement (2026-11-15, #4436): rules requiring pull
+    // requests reject Contents creates and updates with HTTP 409. Only this
+    // measured message is definitive; other bodies use re-read / unchanged-SHA
+    // bounded retries. Keep all 409 message classification here.
+    if serde_json::from_slice::<Value>(&response.body).is_ok_and(|value| {
+        value
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("Repository rule violations found"))
+    }) {
+        ConflictBody::RuleViolation
+    } else {
+        ConflictBody::Other
     }
 }
 
@@ -1625,8 +1701,12 @@ async fn bounded<T>(
 
 #[async_trait]
 impl StateBackend for GitHubBackend {
+    fn cleanup_budget(&self) -> CleanupBudget {
+        self.settings.cleanup_budget()
+    }
+
     async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
-        let operation = Operation::new(false);
+        let operation = Operation::new(None, OPERATION_BUDGET);
         bounded(&operation, async {
             let _gate = self.mutations.lock().await;
             let Some(file) = self
@@ -1651,7 +1731,7 @@ impl StateBackend for GitHubBackend {
         .await
     }
     async fn read_state_bytes(&self) -> BackendResult<Option<RawState>> {
-        let operation = Operation::new(false);
+        let operation = Operation::new(None, OPERATION_BUDGET);
         bounded(&operation, async {
             Ok(self
                 .observe(self.settings.path().into(), &operation)
@@ -1661,10 +1741,10 @@ impl StateBackend for GitHubBackend {
         .await
     }
     async fn write_state(&self, state: &StateFile) -> BackendResult<()> {
-        self.write_with_budget(state, None, false).await
+        self.write_with_budget(state, None, None).await
     }
     async fn acquire_lock(&self, operation_name: &str) -> BackendResult<LockInfo> {
-        let operation = Operation::new(false);
+        let operation = Operation::new(None, OPERATION_BUDGET);
         bounded(&operation, async {
             let _gate = self.mutations.lock().await;
             let observed = self.lease(&operation).await?;
@@ -1701,11 +1781,11 @@ impl StateBackend for GitHubBackend {
         .await
     }
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
-        self.release_with_budget(lock.id(), ReleaseKind::Release, false)
+        self.release_with_budget(lock.id(), ReleaseKind::Release, None)
             .await
     }
     async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
-        let operation = Operation::new(false);
+        let operation = Operation::new(None, OPERATION_BUDGET);
         bounded(&operation, async {
             let _gate = self.mutations.lock().await;
             self.renew(lock, &operation).await
@@ -1713,28 +1793,38 @@ impl StateBackend for GitHubBackend {
         .await
     }
     async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()> {
-        self.write_with_budget(state, Some(lock), false).await
+        self.write_with_budget(state, Some(lock), None).await
     }
-    async fn write_state_for_cleanup(&self, state: &StateFile) -> BackendResult<()> {
-        self.write_with_budget(state, None, true).await
+    async fn write_state_for_cleanup(
+        &self,
+        state: &StateFile,
+        permit: &crate::CleanupPermit<'_>,
+    ) -> BackendResult<()> {
+        self.write_with_budget(state, None, Some(permit)).await
     }
     async fn write_state_locked_for_cleanup(
         &self,
         state: &StateFile,
         lock: &LockInfo,
+        permit: &crate::CleanupPermit<'_>,
     ) -> BackendResult<()> {
-        self.write_with_budget(state, Some(lock), true).await
+        self.write_with_budget(state, Some(lock), Some(permit))
+            .await
     }
-    async fn release_lock_for_cleanup(&self, lock: &LockInfo) -> BackendResult<()> {
-        self.release_with_budget(lock.id(), ReleaseKind::Release, true)
+    async fn release_lock_for_cleanup(
+        &self,
+        lock: &LockInfo,
+        permit: &crate::CleanupPermit<'_>,
+    ) -> BackendResult<()> {
+        self.release_with_budget(lock.id(), ReleaseKind::Release, Some(permit))
             .await
     }
     async fn force_unlock(&self, id: &str) -> BackendResult<()> {
-        self.release_with_budget(id, ReleaseKind::ForceUnlock, false)
+        self.release_with_budget(id, ReleaseKind::ForceUnlock, None)
             .await
     }
     async fn storage_readiness(&self) -> BackendResult<StorageReadiness> {
-        let operation = Operation::new(false);
+        let operation = Operation::new(None, OPERATION_BUDGET);
         bounded(&operation, async {
             match self.destination(&operation).await {
                 Ok(_) => Ok(StorageReadiness::Ready),

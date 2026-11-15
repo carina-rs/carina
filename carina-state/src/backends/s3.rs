@@ -12,6 +12,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{PublicAccessBlockConfiguration, ServerSideEncryption};
+use carina_core::shutdown::CleanupBudget;
 
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -42,16 +43,18 @@ const REGION_UNRESOLVED_MESSAGE: &str = "S3 backend has no region: set `region` 
 // that retry, but the late checkpoint that caused the conflict is already
 // durable, and every later state PUT remains conditional. Normal operations
 // retain SDK retries.
-const CLEANUP_S3_OPERATION_TIMEOUT: Duration = Duration::from_millis(300);
 const STATE_WRITE_MAX_ATTEMPTS: usize = 5;
 
+const CLEANUP_REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
+
 fn cleanup_operation_config() -> aws_sdk_s3::config::Builder {
+    let timeout = CLEANUP_REQUEST_TIMEOUT;
     aws_sdk_s3::Config::builder()
         .retry_config(RetryConfig::standard().with_max_attempts(1))
         .timeout_config(
             TimeoutConfig::builder()
-                .operation_timeout(CLEANUP_S3_OPERATION_TIMEOUT)
-                .operation_attempt_timeout(CLEANUP_S3_OPERATION_TIMEOUT)
+                .operation_timeout(timeout)
+                .operation_attempt_timeout(timeout)
                 .build(),
         )
 }
@@ -392,14 +395,13 @@ impl S3Backend {
         operation: &'static str,
         future: impl std::future::Future<Output = BackendResult<T>>,
     ) -> BackendResult<T> {
-        tokio::time::timeout(CLEANUP_S3_OPERATION_TIMEOUT, future)
-            .await
-            .map_err(|_| {
-                BackendError::Io(format!(
-                    "Cancellation cleanup {operation} timed out after {}ms",
-                    CLEANUP_S3_OPERATION_TIMEOUT.as_millis()
-                ))
-            })?
+        let timeout = CLEANUP_REQUEST_TIMEOUT;
+        tokio::time::timeout(timeout, future).await.map_err(|_| {
+            BackendError::Io(format!(
+                "Cancellation cleanup {operation} timed out after {}ms",
+                timeout.as_millis()
+            ))
+        })?
     }
 
     fn lock_body(lock: &LockInfo) -> BackendResult<Vec<u8>> {
@@ -825,6 +827,10 @@ impl S3Backend {
 
 #[async_trait]
 impl StateBackend for S3Backend {
+    fn cleanup_budget(&self) -> CleanupBudget {
+        self.settings.cleanup_budget()
+    }
+
     async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
         let state_location = self.state_location();
         match self.get_state_object().await? {
@@ -922,7 +928,11 @@ impl StateBackend for S3Backend {
         .await
     }
 
-    async fn write_state_for_cleanup(&self, state: &StateFile) -> BackendResult<()> {
+    async fn write_state_for_cleanup(
+        &self,
+        state: &StateFile,
+        _permit: &crate::CleanupPermit<'_>,
+    ) -> BackendResult<()> {
         self.write_state_for_cleanup_operation(state, StateWriteLock::Unlocked)
             .await
     }
@@ -931,6 +941,7 @@ impl StateBackend for S3Backend {
         &self,
         state: &StateFile,
         lock: &LockInfo,
+        _permit: &crate::CleanupPermit<'_>,
     ) -> BackendResult<()> {
         // Releasing first, or racing release against this write, is unsafe:
         // another process could acquire the now-free lock after our ownership
@@ -983,7 +994,11 @@ impl StateBackend for S3Backend {
         self.delete_lock().await
     }
 
-    async fn release_lock_for_cleanup(&self, lock: &LockInfo) -> BackendResult<()> {
+    async fn release_lock_for_cleanup(
+        &self,
+        lock: &LockInfo,
+        _permit: &crate::CleanupPermit<'_>,
+    ) -> BackendResult<()> {
         let Some((existing_lock, _etag)) = self.read_lock_with_etag_for_cleanup().await? else {
             return Err(BackendError::LockNotFound(lock.id().to_owned()));
         };
@@ -1140,6 +1155,7 @@ mod tests {
     use super::*;
     use crate::state::ResourceState;
     use aws_sdk_s3::error::{ErrorMetadata, SdkError};
+    use std::time::Duration;
 
     #[test]
     fn test_resolve_region_prefers_explicit_over_sdk_chain() {
@@ -1221,6 +1237,9 @@ mod tests {
 
     #[test]
     fn cancellation_cleanup_s3_operations_have_a_bounded_single_attempt_budget() {
+        let settings =
+            S3BackendSettings::from_url_parts("test-bucket".into(), "state.json".into()).unwrap();
+        let budget = settings.cleanup_budget();
         let config = cleanup_operation_config().build();
         let retry = config
             .retry_config()
@@ -1236,10 +1255,15 @@ mod tests {
         );
         assert_eq!(
             timeout.operation_timeout(),
-            Some(CLEANUP_S3_OPERATION_TIMEOUT)
+            Some(Duration::from_millis(300))
+        );
+        assert_eq!(budget.state_flush(), Duration::from_secs(1));
+        assert_eq!(
+            timeout.operation_attempt_timeout(),
+            Some(CLEANUP_REQUEST_TIMEOUT)
         );
         assert!(
-            CLEANUP_S3_OPERATION_TIMEOUT * 5 < carina_core::shutdown::CLEANUP_DEADLINE,
+            CLEANUP_REQUEST_TIMEOUT * 5 < budget.total(),
             "three state calls plus two lock-release calls must fit inside the 2s cleanup deadline"
         );
     }

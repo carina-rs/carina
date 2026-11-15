@@ -232,9 +232,9 @@ These observations do not establish a guarantee during incidents or future
 GitHub changes. Blob SHAs identify content, not monotonically increasing
 generations, and checking the lease and writing state are separate requests.
 
-Also measured: GitHub ignores the sha precondition when the file was deleted.
-On November 15, 2026, a PUT carrying the deleted file's SHA recreated the path
-with HTTP 201. S3's `If-Match` fails when the object has been deleted.
+M1 (measured November 15, 2026): GitHub ignores the SHA precondition when the
+file is absent. A PUT carrying a deleted file's SHA recreates it with HTTP 201,
+so a SHA precondition cannot detect a deletion.
 
 Carina verifies that an acknowledged mutation's commit remains on the branch
 with one compare request. A later commit on the same history is accepted;
@@ -268,7 +268,7 @@ error and remembers the uncertain write in memory. A mismatched blob
 acknowledgement also retains this uncertainty. The next mutation in the same
 process resolves it with a Contents metadata read (plus the root access check
 if the path is absent): a blob SHA
-matching the exact sent bytes is currently treated as our write, the prior SHA
+matching the exact sent bytes is treated as our write, the prior SHA
 means it did not commit, and a different SHA is a conflict. An acquisition or
 renewal recovered this way recognizes its own lock UUID. Other lost replies
 can also be recovered within the original deadline. For a release or
@@ -282,10 +282,54 @@ Releasing an already absent lease succeeds. A force-unlock that confirms the
 lease is absent returns `LockNotFound`; recovery of an earlier lost DELETE
 reply still follows the release rule above.
 
-A lost mutation response also loses its 201/200 status and commit parent.
-Matching bytes cannot establish whether that PUT recreated a deleted path.
-The matching-bytes recovery policy remains under review; this deletion window
-is not equivalent to S3's `If-Match`.
+Accepted limitation: if a mutation reply is lost while another client
+force-unlocks or deletes in the same window, matching bytes are treated as our
+write even if the PUT recreated a deleted path. Subsequent state writes still
+carry a SHA precondition, so one of the competing writers loses.
+
+### Cancellation cleanup limits
+
+The first shutdown signal stops new provider work and lets in-flight work drain.
+The second signal prioritizes state and lock cleanup and starts these limits:
+
+| Backend | State flush | Total cleanup | Backend I/O limit during cleanup |
+| --- | --- | --- | --- |
+| Local | 1s | 2s | Local file operations |
+| S3 | 1s | 2s | 300ms per request, one attempt |
+| GitHub | 5s | 8s | 4.5s per save; 3s reserved for lock release |
+
+Commands without a published mutation backend keep the 2s total. A late state
+flush receives only the time remaining since the second signal. When its limit
+expires, Carina attempts lock release. GitHub bounds each save and release by
+the time remaining until 500ms before the supervisor deadline. A third signal
+exits immediately.
+
+GitHub writes each state or lock change as a separate commit. Measured GitHub
+latencies were PUT p50 0.93s, p95 1.33s, max 1.88s; DELETE p50
+0.85s; GET p50 0.28s. With an inline lease, a cleanup locked save with a
+cached state SHA takes 3 requests (lease GET, conditional state PUT, compare),
+and release takes 3 (lease GET, conditional DELETE, compare). A cold save
+that discovers absent state takes 6, including a branch snapshot, state
+metadata GET, and a root Contents readability proof. Before the inline-lease
+optimization these paths took 4, 4, and 7, respectively. Split lease reads,
+404 fallback, retries, and uncertain-outcome reconciliation can require more.
+An experiment confirmed that the Contents API accepts the qualified
+`refs/heads/<branch>` ref for both `main` and `exp/slash-branch`, returning
+HTTP 200 and the same blob SHA as the short ref. This lets the inline lease
+read use a qualified branch ref without an extra request. The ownership and
+TTL check, SHA preconditions, and post-write reachability compare remain in place.
+
+GitHub Actions sends SIGINT, then SIGTERM 7.5s later, then SIGKILL 2.5s
+after SIGTERM. Carina's cleanup limit starts at the second signal, so Actions
+can cut off GitHub's 8s cleanup with SIGKILL. The longer GitHub limit is
+intentional given the measured request costs; it cannot extend the runner's
+external deadline.
+
+After a cut-off, run `carina state refresh` to reconcile state with the provider.
+For a leftover lock, use the lock ID shown in the lock diagnostic and either
+wait for its 60-minute lease to expire or run `carina force-unlock <id>`
+once the previous process has stopped. Refresh uses the state lock too, so
+resolve a leftover lock first.
 
 ### State history is kept
 

@@ -335,6 +335,10 @@ impl LocalBackend {
 
 #[async_trait]
 impl StateBackend for LocalBackend {
+    fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
         let Some((bytes, state_location)) = self.read_state_file().await? else {
             return Ok(None);

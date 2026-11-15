@@ -96,6 +96,16 @@ pub struct GitHubBackendSettings {
     path: StatePath,
 }
 impl GitHubBackendSettings {
+    /// Decision B1: allow GitHub's commit-backed writes five seconds to flush,
+    /// with eight seconds total, even beyond GitHub Actions' SIGKILL window.
+    pub fn cleanup_budget(&self) -> crate::shutdown::CleanupBudget {
+        crate::shutdown::CleanupBudget::new(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(8),
+        )
+        .with_reason(crate::shutdown::CleanupWaitReason::GitHubCommits)
+    }
+
     /// Assemble already validated destination components, including URL parts.
     pub fn from_parts(repository: RepositorySlug, branch: GitBranch, path: StatePath) -> Self {
         Self {

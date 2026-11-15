@@ -210,6 +210,11 @@ pub struct S3BackendSettings {
 }
 
 impl S3BackendSettings {
+    /// Cleanup retains a one-second flush cutoff and two seconds total.
+    pub fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     pub(crate) fn from_url_parts(bucket: String, key: String) -> Result<Self, BackendConfigError> {
         let raw = parser::BackendConfig::<NoPlaceholder> {
             backend_type: S3_BACKEND_TYPE.into(),
