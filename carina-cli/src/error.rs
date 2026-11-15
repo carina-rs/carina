@@ -1610,6 +1610,9 @@ pub enum AppError {
     #[error("{} at line {}\n{}", .0.location().file().path().display(), .0.location().span().start_line(), .0.detail())]
     ExpressionType(Box<carina_core::parser::Located<carina_core::static_type::InferenceError>>),
 
+    #[error(transparent)]
+    Secrecy(Box<carina_core::secrecy::Finding>),
+
     #[error("{0}")]
     DependsOn(
         Box<carina_core::parser::Located<carina_core::validation::depends_on::DependsOnDiagnostic>>,
@@ -2923,6 +2926,7 @@ impl PresentedAppError {
             Self::Conversion(error) => error.to_string(),
         }
     }
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_rendered(self) -> AppError {
         match self {
             Self::Ordinary(error) => error,

@@ -1,0 +1,11 @@
+let seed = mock.test.resource { name = "seed" }
+let other = mock.test.resource {
+  name = "other"
+  comment = secret("${seed.identifier}-STRUCTURAL_SECRECY_4470_CANARY")
+  tags = { token = secret("${seed.identifier}-STRUCTURAL_SECRECY_4470_CANARY") }
+}
+let public = mock.test.resource { name = "public" comment = seed.identifier }
+let known = mock.test.resource {
+  name = "known"
+  comment = secret("STRUCTURAL_SECRECY_4470_CANARY")
+}

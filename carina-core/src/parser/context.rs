@@ -109,8 +109,9 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     /// as disjoint variants. Value bindings carry `EvalValue` because partial
     /// applications can live until a later pipe finishes the application.
     pub(super) bindings: IndexMap<String, ParseBinding>,
-    /// Resource bindings (binding_name -> Resource)
-    pub(super) resource_bindings: HashMap<String, Resource>,
+    /// Inherited resources are immutable in a lexical child. Sharing the table
+    /// avoids copying every earlier resource and its judged slots per block.
+    pub(super) resource_bindings: Arc<HashMap<String, Resource>>,
     /// Imported modules (alias -> path)
     pub(super) imported_modules: HashMap<String, String>,
     /// User-defined functions
@@ -505,7 +506,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
     ) -> Self {
         Self {
             bindings: IndexMap::new(),
-            resource_bindings: HashMap::new(),
+            resource_bindings: Arc::default(),
             imported_modules: HashMap::new(),
             user_functions: Arc::new(IndexMap::new()),
             resolved_user_functions: RefCell::new(HashMap::new()),
@@ -796,7 +797,7 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
                 ),
             );
         }
-        self.resource_bindings.insert(name, resource);
+        Arc::make_mut(&mut self.resource_bindings).insert(name, resource);
     }
 }
 
@@ -1178,4 +1179,56 @@ pub(crate) fn first_inner<'a>(
             expected: expected.to_string(),
             context: context.to_string(),
         })
+}
+
+#[cfg(test)]
+mod sharing_tests {
+    use super::*;
+
+    #[test]
+    fn lexical_children_share_inherited_resources_without_cloning_judged_slots() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let source = Arc::new(crate::parser::preprocess_file("").unwrap());
+        let mut context = ParseContext::new(&config, std::path::Path::new("scope.crn"), source);
+        for index in 0..1000 {
+            context.set_resource_binding(
+                format!("r{index}"),
+                Resource::new(
+                    "mock.test.resource",
+                    crate::resource::ResourceIdentity::new(format!("r{index}")),
+                ),
+            );
+        }
+        let table = Arc::as_ptr(&context.resource_bindings);
+        for _ in 0..1000 {
+            let child = context.child_scope();
+            assert!(Arc::ptr_eq(
+                &context.resource_bindings,
+                &child.resource_bindings
+            ));
+            assert_eq!(child.resource_bindings.len(), 1000);
+        }
+        context.set_resource_binding(
+            "next".into(),
+            Resource::new(
+                "mock.test.resource",
+                crate::resource::ResourceIdentity::new("next"),
+            ),
+        );
+        assert_eq!(
+            Arc::as_ptr(&context.resource_bindings),
+            table,
+            "discarded child scopes must not force a copy on the next root insertion"
+        );
+        let mut child = context.child_scope();
+        child.set_resource_binding(
+            "local".into(),
+            Resource::new(
+                "mock.test.resource",
+                crate::resource::ResourceIdentity::new("local"),
+            ),
+        );
+        assert!(child.resource_bindings.contains_key("local"));
+        assert!(!context.resource_bindings.contains_key("local"));
+    }
 }

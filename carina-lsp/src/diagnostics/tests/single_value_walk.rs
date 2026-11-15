@@ -285,7 +285,7 @@ fn issue_4276_coalesce_uses_authored_findings() {
 #[test]
 fn issue_4276_coalesce_provider_failures_render_once() {
     let engine = engine(remote("Remote"));
-    let source = "test.test.Widget {\n  value = secret(\"left\") ?? \"right\"\n}\n";
+    let source = "test.test.Widget {\n  value = secret(\"left\") ?? secret(\"right\")\n}\n";
     let diagnostics = value_diagnostics(&engine, source);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     let messages = diagnostics
@@ -297,7 +297,7 @@ fn issue_4276_coalesce_provider_failures_render_once() {
         assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
         assert_eq!(
             diagnostic.message,
-            "Type mismatch: expected Remote, got String (from (secret) ?? 'right')"
+            "Type mismatch: expected Remote, got String (from (secret) ?? (secret))"
         );
         assert_eq!(
             diagnostic.range,
@@ -312,12 +312,12 @@ fn issue_4276_union_provider_failures_render_once() {
         remote("First"),
         remote("Second"),
     ]));
-    let source = "test.test.Widget {\n  value = secret(\"left\") ?? \"right\"\n}\n";
+    let source = "test.test.Widget {\n  value = secret(\"left\") ?? secret(\"right\")\n}\n";
     let diagnostics = value_diagnostics(&engine, source);
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
     assert_eq!(
         diagnostics[0].message,
-        "Type mismatch: expected First | Second, got String (from (secret) ?? 'right')"
+        "Type mismatch: expected First | Second, got String (from (secret) ?? (secret))"
     );
     assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
     assert_eq!(
@@ -349,7 +349,7 @@ fn coalesce_parent_diagnostic_preserves_provider_branch_callback_counts() {
         );
         let diagnostics = value_diagnostics(
             &engine,
-            "test.test.Widget { value = secret(\"left\") ?? \"right\" }\n",
+            "test.test.Widget { value = secret(\"left\") ?? secret(\"right\") }\n",
         );
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), expected);
@@ -496,7 +496,7 @@ fn secret_predicate_lsp_defers_public_pending_values_in_a_directory() {
     for expression in [
         "upstream.output",
         "\"${secret('a')}-${upstream.output}\"",
-        "upstream.output ?? secret('fallback')",
+        "secret(upstream.output ?? 'fallback')",
     ] {
         let main = format!(
             "let example = test.test.Widget {{ type = 'secure_string' value = {expression} }}\n"

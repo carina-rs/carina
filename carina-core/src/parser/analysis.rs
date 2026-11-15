@@ -97,6 +97,21 @@ impl DeclarationLocation {
         }
     }
 
+    pub(in crate::parser) fn coalesce_operator(
+        left: &pest::iterators::Pair<'_, Rule>,
+        right: &pest::iterators::Pair<'_, Rule>,
+        file: &PreprocessedFile,
+        source_file: &Path,
+    ) -> Self {
+        let start = left.as_span().end();
+        let gap = &left.as_span().get_input()[start..right.as_span().start()];
+        let offset = super::grammar::coalesce_operator_offset(gap);
+        Self {
+            file: SourceFileId::new(source_file.to_path_buf()),
+            span: SourceSpan::from_preprocessed_range(start + offset, start + offset + 2, file),
+        }
+    }
+
     pub(in crate::parser) fn conversion_expression(
         expression: &pest::iterators::Pair<'_, Rule>,
         target: &pest::iterators::Pair<'_, Rule>,

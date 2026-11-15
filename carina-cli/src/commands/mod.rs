@@ -840,6 +840,15 @@ fn validate_and_resolve_configuration(
     );
     let expression_report = configuration.judged().report();
     errors.extend(
+        configuration
+            .judged()
+            .secrecy()
+            .findings()
+            .iter()
+            .cloned()
+            .map(|finding| AppError::Secrecy(Box::new(finding))),
+    );
+    errors.extend(
         expression_report
             .findings()
             .iter()
@@ -1115,6 +1124,15 @@ fn validate_and_resolve_configuration(
         &parsed,
         ctx.schemas(),
         enriched_context.catalog(),
+    );
+    errors.extend(
+        configuration
+            .judged()
+            .secrecy()
+            .findings()
+            .iter()
+            .cloned()
+            .map(|finding| AppError::Secrecy(Box::new(finding))),
     );
     let binding_use_report = carina_core::validation::check_expanded_bare_binding_uses(
         &enriched_context.type_context(configuration.judged(), &imported_module_signatures),

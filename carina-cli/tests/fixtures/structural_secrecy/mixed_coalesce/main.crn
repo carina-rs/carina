@@ -1,0 +1,28 @@
+let secret_left_pending = mock.test.resource {
+  name = "secret-left-pending"
+  comment = other.comment ?? "default"
+}
+let public_left_pending = mock.test.resource {
+  name = "public-left-pending"
+  comment = public.comment ?? other.comment
+}
+let secret_left_selected = mock.test.resource {
+  name = "secret-left-selected"
+  comment = secret("STRUCTURAL_SECRECY_4470_CANARY") ?? "default"
+}
+let public_left_selected = mock.test.resource {
+  name = "public-left-selected"
+  comment = "public" ?? known.comment
+}
+let wrapped = mock.test.resource {
+  name = "wrapped"
+  comment = secret(other.tags.token ?? "default")
+}
+let discarded_nested = mock.test.resource {
+  name = "discarded-nested"
+  comment = known.comment ?? secret(other.comment ?? "default")
+}
+let unicode_prefix = mock.test.resource {
+  name = "unicode-prefix"
+  comment = "🔒" ?? known.comment
+}

@@ -312,6 +312,20 @@ pub(super) fn is_secret_identifier(input: &str) -> bool {
     input == "secret"
 }
 
+// Parse only the trivia between two already parsed coalesce operands, so a
+// comment containing question marks cannot become the diagnostic anchor.
+pub(super) fn coalesce_operator_offset(source: &str) -> usize {
+    CarinaParser::parse(Rule::coalesce_separator, source)
+        .expect("coalesce operand separator")
+        .next()
+        .expect("separator")
+        .into_inner()
+        .find(|part| part.as_rule() == Rule::coalesce_token)
+        .expect("coalesce token")
+        .as_span()
+        .start()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

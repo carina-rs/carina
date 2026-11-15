@@ -11991,3 +11991,142 @@ fn module_if_audit_checks_functions_in_sibling_declaration_order() {
         );
     });
 }
+
+/// Sibling directories keep filesystem path depth independent of module depth.
+/// Exercise diagnostics, loading, expansion, judgement, admission and teardown
+/// on the ordinary test-thread stack, with no stack-size override or limit.
+fn assert_nested_module_chain_validates(depth: usize) {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("modules")).unwrap();
+    fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    fs::write(
+        directory.path().join("main.crn"),
+        "let child = use { source = './modules/m1' }\nlet instance = child {}\n",
+    )
+    .unwrap();
+    for index in 1..=depth {
+        let module = directory.path().join(format!("modules/m{index}"));
+        fs::create_dir(&module).unwrap();
+        let body = if index == depth {
+            "mock.test.resource { name = 'leaf' comment = x }\n".to_string()
+        } else {
+            format!(
+                "let child = use {{ source = '../m{}' }}\nlet instance = child {{}}\n",
+                index + 1
+            )
+        };
+        fs::write(
+            module.join("main.crn"),
+            "arguments { x: String = 'a' }\n".to_string() + &body,
+        )
+        .unwrap();
+    }
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut schemas = crate::schema::SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.resource")
+            .attribute(
+                PatternAttributeSchema::required("name", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("comment", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let parsed = crate::config_loader::parse_directory(&base, &config).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let tree = crate::parser::AnalysisTree::try_from_file(parsed.parsed()).unwrap();
+        let findings = crate::validation::check_module_calls_from_analysis(
+            &tree,
+            &base,
+            session,
+            &schemas,
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(findings.is_empty(), "{depth} nested modules: {findings:?}");
+        let graph =
+            super::resolve_modules_with_providerless_config(parsed, &base, session, &schemas)
+                .unwrap();
+        assert_eq!(graph.resources.len(), 1);
+        assert_eq!(graph.compositions.len(), depth);
+        assert_eq!(
+            graph.resources[0].attributes["comment"],
+            ExpandedValue::Concrete(ExpandedConcreteValue::String("a".into()))
+        );
+        let admitted = crate::validation::resolve_bare_binding_uses_in_session(
+            graph,
+            &schemas,
+            session,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(admitted.resources.len(), 1);
+        assert!(
+            admitted.validated_secrecy().is_ok(),
+            "all module slots must be admitted"
+        );
+        drop(admitted);
+    });
+}
+
+#[test]
+fn nested_module_chain_of_500_validates_without_stack_growth() {
+    assert_nested_module_chain_validates(500);
+}
+
+#[test]
+fn nested_module_chain_of_2000_validates_without_stack_growth() {
+    assert_nested_module_chain_validates(2000);
+}
+
+#[test]
+fn import_worklist_restores_scope_and_cycle_guard_after_nested_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("outer")).unwrap();
+    fs::write(
+        directory.path().join("outer/main.crn"),
+        concat!(
+            "arguments { x: String = 'a' }\n",
+            "let child = use { source = '../missing' }\n",
+            "let instance = child {}\n",
+        ),
+    )
+    .unwrap();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        let mut resolver = ModuleResolver::new(&base, session, resolver_context());
+        resolver
+            .module_paths
+            .insert("root_alias".into(), "./root_module".into());
+        resolver
+            .imported_modules
+            .insert("root_alias".into(), ParsedFile::default());
+        let error = resolver.load_module("./outer").unwrap_err();
+        assert!(matches!(error.root_cause(), ModuleError::Io(_)), "{error}");
+        assert_eq!(resolver.base_dir, base.source_label());
+        assert_eq!(resolver.io_base_dir, base);
+        assert!(resolver.resolving.is_empty());
+        assert_eq!(resolver.imported_modules.len(), 1);
+        assert!(resolver.imported_modules.contains_key("root_alias"));
+        assert_eq!(
+            resolver.module_paths.get("root_alias").unwrap(),
+            "./root_module"
+        );
+        fs::create_dir(directory.path().join("missing")).unwrap();
+        fs::write(
+            directory.path().join("missing/main.crn"),
+            "arguments { x: String = 'a' }\n",
+        )
+        .unwrap();
+        assert!(resolver.load_module("./outer").is_ok());
+        assert!(resolver.resolving.is_empty());
+        assert_eq!(resolver.imported_modules.len(), 1);
+        assert_eq!(resolver.module_paths.len(), 1);
+    });
+}

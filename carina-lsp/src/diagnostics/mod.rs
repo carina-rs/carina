@@ -336,6 +336,52 @@ fn render_merged<F: MergedFinding>(
     })
 }
 
+fn render_secrecy(doc: &Document, finding: &carina_core::secrecy::Finding) -> Option<Diagnostic> {
+    let authored = finding.location();
+    if authored.file().path() == doc.source_file() {
+        return render_merged(
+            doc,
+            &carina_core::parser::Located::new(authored.clone(), ()),
+            DiagnosticSeverity::ERROR,
+            finding.message(),
+        );
+    }
+    let call = finding.call_site()?;
+    if call.location.file().path() != doc.source_file() {
+        return None;
+    }
+    let mut diagnostic = render_merged(
+        doc,
+        &carina_core::parser::Located::new(call.location.clone(), ()),
+        DiagnosticSeverity::ERROR,
+        finding.message(),
+    )?;
+    let source = std::fs::read_to_string(authored.file().path()).ok()?;
+    let position = |line: usize, column: usize| {
+        let text = source.lines().nth(line - 1)?;
+        Some(Position::new(
+            u32::try_from(line - 1).ok()?,
+            text.chars()
+                .take(column - 1)
+                .map(|character| character.len_utf16() as u32)
+                .sum(),
+        ))
+    };
+    let span = authored.span();
+    diagnostic.related_information =
+        Some(vec![tower_lsp::lsp_types::DiagnosticRelatedInformation {
+            location: tower_lsp::lsp_types::Location {
+                uri: tower_lsp::lsp_types::Url::from_file_path(authored.file().path()).ok()?,
+                range: Range::new(
+                    position(span.start_line(), span.start_column())?,
+                    position(span.end_line(), span.end_column())?,
+                ),
+            },
+            message: format!("Authored alternative in module instance '{}'", call.name),
+        }]);
+    Some(diagnostic)
+}
+
 /// Syntax errors can use coordinates only from this buffer's own parser.
 /// A directory parse failure without a local syntax error remains file scoped.
 fn render_parse(
@@ -1507,6 +1553,17 @@ impl DiagnosticRun<'_> {
                     self.provider_context.catalog(),
                 )
             });
+            let secrecy_report = expanded_configuration.as_ref().map_or_else(
+                || pre_expansion_configuration.judged().secrecy(),
+                |configuration| configuration.judged().secrecy(),
+            );
+            for finding in secrecy_report.findings() {
+                if let Some(diagnostic) = render_secrecy(doc, finding)
+                    && !diagnostics.contains(&diagnostic)
+                {
+                    diagnostics.push(diagnostic);
+                }
+            }
             let expanded_validation_tree = match &expanded_configuration {
                 Some(configuration) => {
                     carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file())

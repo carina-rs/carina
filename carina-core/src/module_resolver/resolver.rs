@@ -1035,6 +1035,34 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     type_resolution: PhantomData<P>,
 }
 
+/// State restored when an import frame finishes, including error unwinding.
+struct ImportScope {
+    io_base: ResolvedPath,
+    base: PathBuf,
+    imported: HashMap<String, ParsedFile>,
+    paths: HashMap<String, String>,
+}
+
+struct ImportFrame {
+    parsed: ParsedFile,
+    canonical: crate::paths::CanonicalPath,
+    cached: bool,
+    next_import: usize,
+    owned_calls: Vec<crate::parser::ModuleCall>,
+    scope: ImportScope,
+}
+
+impl ImportFrame {
+    fn owning_calls(&self) -> Vec<crate::parser::ModuleCallId> {
+        let import = &self.parsed.uses[self.next_import - 1];
+        self.owned_calls
+            .iter()
+            .filter(|call| call.module_name == import.alias)
+            .map(|call| call.id().clone())
+            .collect()
+    }
+}
+
 impl<'cfg> ModuleResolver<'cfg, StrictTypeResolution> {
     /// Create a new resolver with the given base directory and default config
     #[cfg(test)]
@@ -1256,98 +1284,145 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     }
 
     pub fn load_module(&mut self, path: &str) -> Result<ParsedFile, ModuleError> {
-        let full_path = self.resolve_path(path)?;
+        let mut frames = Vec::new();
+        let result: Result<ParsedFile, ModuleError> = (|| {
+            frames.push(self.begin_module_load(path)?);
+            loop {
+                let frame = frames.last_mut().expect("active module import");
+                if let Some(import) = frame.parsed.uses.get(frame.next_import) {
+                    let path = import.path.clone();
+                    frame.next_import += 1;
+                    frames.push(self.begin_module_load(&path)?);
+                    continue;
+                }
 
-        // Distinguish "file exists but isn't a directory" from
-        // "path doesn't exist / permission denied": only the former is the
-        // single-file-module contract violation. Otherwise let canonicalize()
-        // surface the underlying IO error (NotFound, PermissionDenied, ...).
+                let mut frame = frames.pop().expect("completed module import");
+                // This runs after all child imports have populated this scope,
+                // exactly as the recursive loader did.
+                let checked = self.validate_reference_types(&mut frame.parsed);
+                self.resolving.remove(&frame.canonical);
+                self.restore_import_scope(frame.scope);
+                checked?;
+                if !frame.cached {
+                    self.module_cache
+                        .insert(frame.canonical, frame.parsed.clone());
+                }
+                if let Some(parent) = frames.last() {
+                    let import = &parent.parsed.uses[parent.next_import - 1];
+                    self.imported_modules
+                        .insert(import.alias.clone(), frame.parsed);
+                    self.module_paths
+                        .insert(import.alias.clone(), import.path.clone());
+                } else {
+                    return Ok(frame.parsed);
+                }
+            }
+        })();
+        result.map_err(|mut error| {
+            // Each suspended process_imports call used to add this owner while
+            // unwinding. Preserve both its order and the original error.
+            while let Some(frame) = frames.pop() {
+                error = error.with_owning_calls(frame.owning_calls());
+                self.resolving.remove(&frame.canonical);
+                self.restore_import_scope(frame.scope);
+            }
+            error
+        })
+    }
+
+    fn restore_import_scope(&mut self, scope: ImportScope) {
+        self.io_base_dir = scope.io_base;
+        self.base_dir = scope.base;
+        self.imported_modules = scope.imported;
+        self.module_paths = scope.paths;
+    }
+
+    fn begin_module_load(&mut self, path: &str) -> Result<ImportFrame, ModuleError> {
+        let full_path = self.resolve_path(path)?;
         let metadata = full_path.metadata()?;
         if !metadata.is_dir() {
             return Err(ModuleError::NotADirectory {
                 path: path.to_string(),
             });
         }
-
         let canonical = full_path.identity();
         self.module_locations.insert(
             ModuleLocationKey::new(&self.io_base_dir, path)?,
             full_path.clone(),
         );
-
-        // Check for circular import
         if self.resolving.contains(&canonical) {
             return Err(ModuleError::CircularImport(path.to_string()));
         }
-
-        // Parsed templates share canonical identities, but nested import
-        // locations belong to each spelling and its pinned directory.
-        if let Some(mut module) = self.module_cache.get(&canonical).cloned() {
-            self.resolving.insert(canonical.clone());
-            let result = self.resolve_nested_modules(&mut module, &full_path);
-            self.resolving.remove(&canonical);
-            return result.map(|()| module);
-        }
-
         self.resolving.insert(canonical.clone());
-        let loaded = self.load_directory_module(&full_path);
-        let mut parsed = match loaded {
+        let cached = self.module_cache.contains_key(&canonical);
+        let loaded = (|| {
+            if let Some(module) = self.module_cache.get(&canonical) {
+                return Ok(module.clone());
+            }
+            let parsed = self.load_directory_module(&full_path)?;
+            // Verify it's a module (has arguments or attributes)
+            if parsed.arguments.is_empty() && parsed.attribute_params.is_empty() {
+                return Err(ModuleError::NotFound(path.to_string()));
+            }
+
+            // Expansion-phase backstops for root-owned blocks inside modules. The
+            // CLI's validation walks are the user-facing gates: they collect
+            // module-path-prefixed diagnostics and stop before expansion, so
+            // validate/plan/apply and lint cannot emit both forms. The production
+            // paths that bypass those walks but still expand are destroy, state
+            // refresh, and apply's backend-bootstrap re-resolve
+            // (`skip_resource_validation = true`). `fixture_plan` also depends on
+            // these backstops as test support.
+            if !parsed.providers.is_empty() {
+                return Err(ModuleError::ProviderInModule);
+            }
+            if !parsed.state_blocks.is_empty() {
+                return Err(ModuleError::StateBlockInModule);
+            }
+            if parsed.backend.is_some() {
+                return Err(ModuleError::BackendInModule);
+            }
+            if !parsed.upstream_states.is_empty() {
+                return Err(ModuleError::UpstreamStateInModule);
+            }
+            if !parsed.export_params.is_empty() {
+                return Err(ModuleError::ExportsInModule);
+            }
+
+            Ok(parsed)
+        })();
+        let parsed = match loaded {
             Ok(parsed) => parsed,
             Err(error) => {
                 self.resolving.remove(&canonical);
                 return Err(error);
             }
         };
-
-        // Verify it's a module (has arguments or attributes)
-        if parsed.arguments.is_empty() && parsed.attribute_params.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::NotFound(path.to_string()));
-        }
-
-        // Expansion-phase backstops for root-owned blocks inside modules. The
-        // CLI's validation walks are the user-facing gates: they collect
-        // module-path-prefixed diagnostics and stop before expansion, so
-        // validate/plan/apply and lint cannot emit both forms. The production
-        // paths that bypass those walks but still expand are destroy, state
-        // refresh, and apply's backend-bootstrap re-resolve
-        // (`skip_resource_validation = true`). `fixture_plan` also depends on
-        // these backstops as test support.
-        if !parsed.providers.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::ProviderInModule);
-        }
-        if !parsed.state_blocks.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::StateBlockInModule);
-        }
-        if parsed.backend.is_some() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::BackendInModule);
-        }
-        if !parsed.upstream_states.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::UpstreamStateInModule);
-        }
-        if !parsed.export_params.is_empty() {
-            self.resolving.remove(&canonical);
-            return Err(ModuleError::ExportsInModule);
-        }
-
-        // Recursively resolve nested module imports within this module.
-        // The module's directory is used for resolving its relative imports.
-        if let Err(e) = self.resolve_nested_modules(&mut parsed, &full_path) {
-            self.resolving.remove(&canonical);
-            return Err(e);
-        }
-
-        // Remove from resolving set
-        self.resolving.remove(&canonical);
-
-        // Cache the module
-        self.module_cache.insert(canonical, parsed.clone());
-
-        Ok(parsed)
+        let mut owned_calls = parsed.module_calls.clone();
+        owned_calls.extend(
+            parsed
+                .deferred_module_ifs
+                .iter()
+                .flat_map(|deferred| deferred.branches())
+                .filter_map(|branch| match branch {
+                    DeferredIfBody::ModuleCall(call) => Some(call.clone()),
+                    DeferredIfBody::Resource(_) | DeferredIfBody::DataSource(_) => None,
+                }),
+        );
+        let scope = ImportScope {
+            io_base: std::mem::replace(&mut self.io_base_dir, full_path.clone()),
+            base: std::mem::replace(&mut self.base_dir, full_path.source_label()),
+            imported: std::mem::take(&mut self.imported_modules),
+            paths: std::mem::take(&mut self.module_paths),
+        };
+        Ok(ImportFrame {
+            parsed,
+            canonical,
+            cached,
+            next_import: 0,
+            owned_calls,
+            scope,
+        })
     }
 
     /// Load all .crn files from a directory and merge them into a single ParsedFile.
@@ -1464,69 +1539,6 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             }
         }
         errors
-    }
-
-    /// Resolve nested module imports within a parsed module.
-    ///
-    /// This loads and validates the module's own imports without expanding
-    /// them. Expansion happens later with the caller's concrete composed scope.
-    fn resolve_nested_modules(
-        &mut self,
-        parsed: &mut ParsedFile,
-        base_dir: &ResolvedPath,
-    ) -> Result<(), ModuleError> {
-        let base_dir = base_dir.clone();
-        // Save both the diagnostic spelling and pinned IO address.
-        let original_io_base = std::mem::replace(&mut self.io_base_dir, base_dir.clone());
-        let original_base_dir = std::mem::replace(&mut self.base_dir, base_dir.source_label());
-        let original_imported = std::mem::take(&mut self.imported_modules);
-        let original_paths = std::mem::take(&mut self.module_paths);
-
-        let conditional_calls = parsed
-            .deferred_module_ifs
-            .iter()
-            .flat_map(|deferred| deferred.branches())
-            .filter_map(|branch| match branch {
-                DeferredIfBody::ModuleCall(call) => Some(call.clone()),
-                DeferredIfBody::Resource(_) | DeferredIfBody::DataSource(_) => None,
-            })
-            .collect::<Vec<_>>();
-
-        // Process the module's own imports. Conditional calls participate in
-        // ownership and loading, but stay relative until their branch is
-        // selected under a concrete module-instance scope.
-        let imports = parsed.uses.clone();
-        let mut owned_calls = parsed.module_calls.clone();
-        owned_calls.extend(conditional_calls);
-        let result = self.process_imports(&imports, &owned_calls);
-
-        if let Err(e) = result {
-            // Restore state on error
-            self.io_base_dir = original_io_base;
-            self.base_dir = original_base_dir;
-            self.imported_modules = original_imported;
-            self.module_paths = original_paths;
-            return Err(e);
-        }
-
-        match self.validate_reference_types(parsed) {
-            Ok(_) => {}
-            Err(error) => {
-                self.io_base_dir = original_io_base;
-                self.base_dir = original_base_dir;
-                self.imported_modules = original_imported;
-                self.module_paths = original_paths;
-                return Err(error);
-            }
-        }
-
-        // Restore original state
-        self.io_base_dir = original_io_base;
-        self.base_dir = original_base_dir;
-        self.imported_modules = original_imported;
-        self.module_paths = original_paths;
-
-        Ok(())
     }
 }
 

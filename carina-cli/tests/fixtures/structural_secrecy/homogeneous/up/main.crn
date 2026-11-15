@@ -1,0 +1,1 @@
+let seed = mock.test.resource { name = "upstream-seed" }

@@ -1165,7 +1165,7 @@ pub struct JudgedSlot<B: BindingAddress = RelativeBindingName> {
     occurrence: UseId,
     instance: ExpansionInstanceId,
     generation: ProjectionGeneration,
-    snapshot: Arc<ExpressionReport<B>>,
+    snapshot: Option<Arc<ExpressionReport<B>>>,
     snapshot_error: Option<MissingEvidence>,
     schema_kind: crate::schema::SchemaKind,
     conditions: ConditionSnapshot,
@@ -1193,7 +1193,7 @@ impl JudgedSlot {
             occurrence: UseId::fresh(),
             instance,
             generation: ProjectionGeneration::fresh(),
-            snapshot: Arc::new(ExpressionReport::empty()),
+            snapshot: None,
             snapshot_error: None,
             schema_kind,
             conditions: ConditionSnapshot::default(),
@@ -1202,6 +1202,14 @@ impl JudgedSlot {
 }
 
 impl<B: BindingAddress> JudgedSlot<B> {
+    pub(crate) fn secrecy_conditions(&self) -> ConditionSnapshot {
+        self.conditions.clone()
+    }
+
+    pub(crate) fn secrecy_node(&self) -> NodeId {
+        self.root.id
+    }
+
     pub fn schema_kind(&self) -> crate::schema::SchemaKind {
         self.schema_kind
     }
@@ -1210,7 +1218,7 @@ impl<B: BindingAddress> JudgedSlot<B> {
         &mut self,
         snapshot: Arc<ExpressionReport<B>>,
     ) -> Result<(), MissingEvidence> {
-        self.snapshot = Arc::new(ExpressionReport::empty());
+        self.snapshot = None;
         let _ = snapshot
             .node(&snapshot.instance, self.root.id)
             .ok_or_else(|| MissingEvidence::new(format!("slot node {:?}", self.root.id)))?;
@@ -1218,7 +1226,7 @@ impl<B: BindingAddress> JudgedSlot<B> {
             .syntax_node(&snapshot.instance, self.root.id)
             .ok_or_else(|| MissingEvidence::new(format!("slot syntax {:?}", self.root.id)))?
             .clone();
-        self.snapshot = snapshot;
+        self.snapshot = Some(snapshot);
         self.snapshot_error = None;
         Ok(())
     }
@@ -1231,7 +1239,11 @@ impl<B: BindingAddress> JudgedSlot<B> {
     }
 
     pub(crate) fn source_judgement(&self) -> Result<&JudgedExpr, MissingEvidence> {
-        self.source_judgement_in(&self.snapshot)
+        self.source_judgement_in(
+            self.snapshot
+                .as_deref()
+                .ok_or_else(|| MissingEvidence::new("attribute source judgement"))?,
+        )
     }
     pub(crate) fn source_judgement_in<'a>(
         &self,
@@ -1245,23 +1257,24 @@ impl<B: BindingAddress> JudgedSlot<B> {
         if let Some(error) = &self.snapshot_error {
             return Err(error.clone());
         }
-        let judgement = self
-            .snapshot
-            .node(&self.snapshot.instance, self.root.id)
-            .ok_or_else(|| {
-                MissingEvidence::new(format!(
-                    "slot {:?} requires a current judgement",
-                    self.root.id
-                ))
-            })?;
+        let missing = || {
+            MissingEvidence::new(format!(
+                "slot {:?} requires a current judgement",
+                self.root.id
+            ))
+        };
+        let snapshot = self.snapshot.as_deref().ok_or_else(missing)?;
+        let judgement = snapshot
+            .node(&snapshot.instance, self.root.id)
+            .ok_or_else(missing)?;
         AuthoredUse {
             node: JudgedNodeRef {
                 node: &self.root,
                 judgement,
-                snapshot: &self.snapshot,
+                snapshot,
                 generation: self.generation,
                 conditions: &self.conditions,
-                environment: self.snapshot.instance.clone(),
+                environment: snapshot.instance.clone(),
             },
             occurrence: self.occurrence,
 
@@ -1290,13 +1303,13 @@ impl<B: BindingAddress> JudgedSlot<B> {
     /// taken by lowering remain immutable; expansion adds its own decisions.
     pub(crate) fn invalidate_judgement(&mut self) {
         self.generation = ProjectionGeneration::fresh();
-        self.snapshot = Arc::new(ExpressionReport::empty());
+        self.snapshot = None;
     }
 
     pub(crate) fn replace_projection(&mut self, value: Value<ParserPlaceholder, B>) {
         self.projection = Projection::Value(value);
         self.generation = ProjectionGeneration::fresh();
-        self.snapshot = Arc::new(ExpressionReport::empty());
+        self.snapshot = None;
     }
 
     pub fn occurrence(&self) -> UseId {
@@ -1667,7 +1680,11 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             instance: slot.instance,
             generation: slot.generation,
             definition: false,
-            environment: slot.snapshot.instance.clone(),
+            environment: slot
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.instance.clone())
+                .unwrap_or_default(),
             conditions: slot.conditions.clone(),
         })
     }
@@ -1730,7 +1747,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             slot.snapshot_error = match &snapshot {
                 Ok(snapshot) => slot.attach_snapshot(snapshot.clone()).err(),
                 Err(error) => {
-                    slot.snapshot = Arc::new(ExpressionReport::empty());
+                    slot.snapshot = None;
                     Some(error.clone())
                 }
             };
@@ -1747,7 +1764,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             // later substitution/remapping still invalidates it explicitly.
             // Pending slots must first acquire their instance projection.
             if slot.projection().is_none() {
-                slot.snapshot = Arc::new(ExpressionReport::empty());
+                slot.snapshot = None;
             }
         }
     }
@@ -1779,7 +1796,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
                             occurrence: slot.occurrence,
                             instance: slot.instance,
                             generation: ProjectionGeneration::fresh(),
-                            snapshot: Arc::new(ExpressionReport::empty()),
+                            snapshot: None,
                             snapshot_error: None,
                             schema_kind: slot.schema_kind,
                             conditions: slot.conditions,
@@ -1821,7 +1838,7 @@ impl<B: BindingAddress> AuthoredSlots<B> {
             if !updated.contains(&slot.occurrence) {
                 slot.projection = Projection::Pending;
                 slot.generation = ProjectionGeneration::fresh();
-                slot.snapshot = Arc::new(ExpressionReport::empty());
+                slot.snapshot = None;
             }
         }
     }

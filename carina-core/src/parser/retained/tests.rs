@@ -1230,3 +1230,70 @@ fn issue_4282_round2_collection_members_never_become_a_single_construction() {
         }
     }
 }
+
+#[test]
+fn last_owned_deep_retained_syntax_drops_iteratively() {
+    let parsed = crate::parser::parse("let leaf = 'value'", &config()).unwrap();
+    let mut root = parsed
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .roots()[0]
+        .clone();
+    let location = root.location().clone();
+    for _ in 0..20_000 {
+        root = node_at(location.clone(), ExprKind::Alias, vec![root]);
+    }
+    let shared = root.clone();
+    drop(root);
+    drop(shared);
+}
+
+#[test]
+fn condition_history_lookup_and_drop_use_heap_storage() {
+    let first = ConditionRecorder::default();
+    let known = NodeId::fresh();
+    first.extend([(known, true)]);
+    let mut snapshot = first.snapshot();
+    let missing = NodeId::fresh();
+    for _ in 0..20_000 {
+        let next = ConditionRecorder::default();
+        next.extend([(NodeId::fresh(), false)]);
+        snapshot = next.snapshot().over(&snapshot);
+    }
+    assert_eq!(snapshot.get(known), Some(true));
+    assert_eq!(snapshot.get(missing), None);
+    drop(snapshot);
+}
+
+#[test]
+fn structural_secrecy_is_lazy_and_owned_by_the_immutable_judged_graph() {
+    let config = config();
+    let schemas = SchemaRegistry::new();
+    let parsed = crate::parser::parse("let input = secret('value') ?? 'public'", &config).unwrap();
+    let judged = JudgedFile::new(parsed, &schemas, &config);
+    assert!(judged.secrecy.get().is_none());
+    assert!(judged.report().findings().is_empty());
+    assert!(
+        judged.secrecy.get().is_none(),
+        "type queries must not derive secrecy"
+    );
+
+    let secrecy = judged.secrecy();
+    assert_eq!(secrecy.findings().len(), 1);
+    assert_eq!(
+        secrecy.findings()[0].cause(),
+        &crate::secrecy::DerivationError::MixedAlternatives(crate::secrecy::MixedAlternatives {
+            operator: crate::secrecy::Alternatives::Coalesce,
+        })
+    );
+    assert!(std::ptr::eq(secrecy, judged.secrecy()));
+    let findings = secrecy.findings().to_vec();
+
+    let rejudged = JudgedFile::new(judged.into_file(), &schemas, &config);
+    assert!(
+        rejudged.secrecy.get().is_none(),
+        "a new graph must derive its own evidence"
+    );
+    assert_eq!(rejudged.secrecy().findings(), findings.as_slice());
+}
