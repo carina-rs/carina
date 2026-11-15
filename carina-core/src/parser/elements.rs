@@ -428,7 +428,11 @@ fn collect_keys(
                 let syntax = pair.clone();
                 let mut inner = pair.into_inner();
                 let key_pair = inner.next().expect("attribute grammar has a key");
-                let key = super::extract_key_string(key_pair.clone()).expect("grammar key");
+                // Rejected authored keys remain in the syntax inventory but
+                // have no evaluated map entry or element path to locate.
+                let Ok(key) = super::extract_key_string(key_pair.clone()) else {
+                    continue;
+                };
                 let mut path = parent.to_vec();
                 let kind = if parent.is_empty() {
                     super::ProtectedPathKind::Attribute

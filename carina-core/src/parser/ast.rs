@@ -3978,15 +3978,37 @@ impl BindingScopeId {
 
 /// Stable parser address of a resource that owns an authored value sink.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ResourceAddress(ResourceId);
+pub struct ResourceAddress {
+    resource: ResourceId,
+    origin: Option<super::retained::SlotDeclarationId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ResourcePrecheckIdentity {
+    pub(crate) origin: super::retained::SlotDeclarationId,
+    pub(crate) instance: super::retained::ExpressionInstance,
+}
 
 impl ResourceAddress {
-    pub(in crate::parser) fn new(id: ResourceId) -> Self {
-        Self(id)
+    pub(in crate::parser) fn new(
+        id: ResourceId,
+        origin: Option<super::retained::SlotDeclarationId>,
+    ) -> Self {
+        Self {
+            resource: id,
+            origin,
+        }
     }
-
+    fn remapped(&self, resource: ResourceId) -> Self {
+        Self {
+            resource,
+            origin: self.origin.clone(),
+        }
+    }
+    pub(crate) fn input_origin(&self) -> Option<super::retained::SlotDeclarationId> {
+        self.origin.clone()
+    }
     pub fn resource_id(&self) -> &ResourceId {
-        &self.0
+        &self.resource
     }
 }
 
@@ -4085,6 +4107,7 @@ pub enum BareBindingKind {
 /// lookup. This data is parser-only and never enters [`Value`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BareBindingUse {
+    pub(crate) type_source: BindingTypeSource,
     pub(crate) expression_instance: super::retained::ExpressionInstance,
     pub(in crate::parser) location: super::DeclarationLocation,
     pub source_file: SourceFileId,
@@ -4096,6 +4119,12 @@ pub struct BareBindingUse {
     pub binding: BareBindingKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindingTypeSource {
+    Binding,
+    Conversion(super::retained::NodeId),
+    MissingConversion,
+}
 impl BareBindingUse {
     pub fn location(&self) -> &super::DeclarationLocation {
         &self.location
@@ -4246,12 +4275,12 @@ impl<B: BindingAddress> ParsedBindingUses<B> {
                 else {
                     unreachable!("resource owner index points to a module argument")
                 };
-                *address = ResourceAddress::new(to.clone());
+                *address = address.remapped(to.clone());
                 if let Some(slot) = &mut self.records[*index].pending_slot {
                     let BindingUseOwner::Resource(address) = &mut slot.owner else {
                         unreachable!("resource record has a module-argument pending slot")
                     };
-                    *address = ResourceAddress::new(to.clone());
+                    *address = address.remapped(to.clone());
                 }
             }
             self.record_indices_by_owner

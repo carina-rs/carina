@@ -6,9 +6,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use crate::eval_value::{EvalValue, ParsedSinkValue, UnexpandedStructuralHandleKind};
-use crate::parser::context::{
-    ExpressionMode, ParseContext, extract_key_string, first_inner, next_pair,
-};
+use crate::parser::context::{ExpressionMode, ParseContext, first_inner, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::resource_body::{
     BlockContent, BlockContents, DirectiveBlock, DirectiveEntry, ResourceBody, ResourceDirectives,
@@ -93,7 +91,12 @@ pub(crate) fn parse_resource_for_target(
             target.template_resource_id(provider, &resource_type, None)
         }
     };
-    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
+    let mode = ExpressionMode::resource(
+        provisional_id.clone(),
+        source_file,
+        preprocessed_file,
+        ctx.authored_resource_declaration(&syntax),
+    );
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
     let parsed_contents = parse_block_contents_with_quoted(
         contents,
@@ -103,12 +106,13 @@ pub(crate) fn parse_resource_for_target(
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
-    let authored_slots = ctx.authored_resource_slots(
+    let mut authored_slots = ctx.authored_resource_slots(
         &syntax,
         &parsed_contents.sinks,
         &parsed_contents.attributes,
         crate::schema::SchemaKind::Resource,
     )?;
+    authored_slots.set_input_origin(mode.resource_input_origin());
     let attributes = parsed_contents.attributes;
     let ParsedDirectives {
         directives,
@@ -279,7 +283,10 @@ fn parse_block_contents_with_quoted(
                         let key_pair =
                             next_pair(&mut attr_inner, "attribute name", "block content")?;
                         let key_span = key_pair.as_span();
-                        let key = extract_key_string(key_pair.clone())?;
+                        let key = match ctx.key_string(key_pair.clone())? {
+                            crate::parser::context::ParsedKey::Literal(key) => key,
+                            crate::parser::context::ParsedKey::Rejected => continue,
+                        };
                         reject_reserved_resource_attribute(
                             &key,
                             key_span,
@@ -344,7 +351,10 @@ fn parse_block_contents_with_quoted(
                 let mut attr_inner = content_pair.into_inner();
                 let key_pair = next_pair(&mut attr_inner, "attribute name", "block content")?;
                 let key_span = key_pair.as_span();
-                let key = extract_key_string(key_pair.clone())?;
+                let key = match ctx.key_string(key_pair.clone())? {
+                    crate::parser::context::ParsedKey::Literal(key) => key,
+                    crate::parser::context::ParsedKey::Rejected => continue,
+                };
                 reject_reserved_resource_attribute(&key, key_span, reserved_attribute_names)?;
                 let value_pair = next_pair(&mut attr_inner, "attribute value", "block content")?;
                 record_quoted_if_literal(quoted_out, &key, &value_pair);
@@ -466,7 +476,12 @@ pub(crate) fn parse_read_resource_expr(
         ResourceIdentity::new(binding_name.to_string()),
         None,
     );
-    let mode = ExpressionMode::resource(provisional_id.clone(), source_file, preprocessed_file);
+    let mode = ExpressionMode::resource(
+        provisional_id.clone(),
+        source_file,
+        preprocessed_file,
+        ctx.authored_resource_declaration(&syntax),
+    );
     let mut quoted_out: Option<HashSet<String>> = Some(HashSet::new());
     let parsed_contents = parse_block_contents_with_quoted(
         contents,
@@ -476,12 +491,13 @@ pub(crate) fn parse_read_resource_expr(
         ReservedAttributeNamePolicy::Reject,
     )?;
     let quoted_string_attrs = quoted_out.unwrap_or_default();
-    let authored_slots = ctx.authored_resource_slots(
+    let mut authored_slots = ctx.authored_resource_slots(
         &syntax,
         &parsed_contents.sinks,
         &parsed_contents.attributes,
         crate::schema::SchemaKind::DataSource,
     )?;
+    authored_slots.set_input_origin(mode.resource_input_origin());
     let attributes = parsed_contents.attributes;
     let ParsedDirectives {
         directives,

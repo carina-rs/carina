@@ -145,6 +145,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                     .into_classification(),
                 Some(&bindings),
                 session,
+                crate::test_utils::no_conversion_proof(),
             );
             let pending = admit(&destination, candidate, &boundary)
                 .unwrap()
@@ -158,6 +159,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                     .into_classification(),
                 Some(&bindings),
                 session,
+                crate::test_utils::no_conversion_proof(),
             );
             let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
             let mut resolved = ResolvedBindings::default();
@@ -306,6 +308,7 @@ fn widening_member_obligation_discharge_parity(decoded: bool) {
                         .into_classification(),
                     Some(&bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 admit(&destination, candidate, &boundary)
             };

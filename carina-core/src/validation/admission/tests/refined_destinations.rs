@@ -99,7 +99,7 @@ pub fn check(
         crate::module_resolver::resolve_modules_with_config(loaded.parsed, &root, session, schemas)
     })
     .map_err(|e| e.to_string())?;
-    crate::validation::validate_resources(
+    crate::test_utils::legacy_validate_resources(
         &parsed,
         schemas,
         &HashSet::from(["awscc".into()]),
@@ -152,6 +152,7 @@ pub fn check(
                 .into_classification(),
             Some(&bindings),
             session,
+            crate::test_utils::no_conversion_proof(),
         );
         let pending = admit(&destination, candidate, &context)
             .map_err(|e| e.resolution_error().to_string())?

@@ -335,13 +335,23 @@ fn snapshot_state_typecheck_uses_checked_conversion() {
         .report()
         .binding(&carina_core::resource::RelativeBindingName::new("ordinary"))
         .unwrap();
-    check_type_expr_value_providerless(&TypeExpr::String, &ordinary, &context, expression)
-        .require_provider_schemas()
-        .unwrap();
+    check_type_expr_value_providerless(
+        &TypeExpr::String,
+        &ordinary,
+        &context,
+        (expression).ordinary().unwrap(),
+    )
+    .require_provider_schemas()
+    .unwrap();
     assert!(
-        check_type_expr_value_providerless(&TypeExpr::Int, &ordinary, &context, expression)
-            .require_provider_schemas()
-            .is_err()
+        check_type_expr_value_providerless(
+            &TypeExpr::Int,
+            &ordinary,
+            &context,
+            (expression).ordinary().unwrap()
+        )
+        .require_provider_schemas()
+        .is_err()
     );
     assert_eq!(
         state

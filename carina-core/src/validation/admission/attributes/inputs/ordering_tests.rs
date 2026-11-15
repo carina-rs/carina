@@ -102,6 +102,7 @@ fn admission_uses_owning_resource_order_even_for_reversed_classifications() {
     let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &config);
     with_session_for_test(&config, |session| {
         let report = super::super::typed_resource_attribute_admissions::<
+            super::super::LiveResource,
             crate::validation::admission::kind::ResourceAttribute,
             _,
             _,

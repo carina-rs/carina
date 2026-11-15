@@ -19,7 +19,6 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::DiagnosticDocument as Document;
 use crate::position;
-use carina_core::parser::retained::JudgedExpr;
 use carina_core::parser::{
     ParseError, ProviderConfig, SourceSpan, WarningKind, contains_function_call,
 };
@@ -35,11 +34,47 @@ use carina_core::schema::{SchemaRegistry, TypeError};
 use carina_core::validation::DeferredAccessTypeError;
 #[cfg(not(feature = "test-utils"))]
 use carina_core::validation::admission::attributes::classification_preflight;
-#[cfg(test)]
-use carina_core::validation::admission::attributes::uses_resource_attribute_admission;
 use carina_core::validation::admission::attributes::{
-    ClassificationDiagnostics, ValidationEvaluation, resource_attribute_admissions,
+    ClassificationDiagnostics, ResourceAttributeInputs, ValidationEvaluation,
 };
+#[cfg(test)]
+use carina_core::validation::admission::attributes::{
+    resource_attribute_admissions, uses_resource_attribute_admission,
+};
+
+#[derive(Debug)]
+enum OrdinaryDiagnostic {
+    Visible(Box<Diagnostic>),
+}
+impl OrdinaryDiagnostic {
+    fn visible(diagnostic: Diagnostic) -> Self {
+        Self::Visible(Box::new(diagnostic))
+    }
+}
+impl std::fmt::Display for OrdinaryDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Visible(diagnostic) => f.write_str(&diagnostic.message),
+        }
+    }
+}
+impl carina_core::validation::ValidationClientError for OrdinaryDiagnostic {
+    fn kind(&self) -> carina_core::validation::ClientFindingKind {
+        use carina_core::validation::ClientFindingKind;
+        match self {
+            Self::Visible(diagnostic) => match diagnostic.severity {
+                None => ClientFindingKind::Error,
+                Some(severity) => {
+                    if severity == DiagnosticSeverity::ERROR {
+                        ClientFindingKind::Error
+                    } else {
+                        ClientFindingKind::Notice
+                    }
+                }
+            },
+        }
+    }
+}
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -64,6 +99,7 @@ fn select_admission_inputs<'r, 'a>(
     >,
     values: &IndexMap<String, Value>,
     report: &carina_core::parser::retained::ExpressionReport,
+    prechecks: carina_core::validation::admission::attributes::SlotPrechecks<'_>,
 ) -> (
     &'r carina_core::parser::AnalysisResourceRef<'a>,
     carina_core::validation::admission::attributes::ResourceAttributeInputs<RelativeBindingName>,
@@ -76,7 +112,9 @@ fn select_admission_inputs<'r, 'a>(
         let resolved = ResourceAttributeInputs::from_resolved(source, values, report);
         #[cfg(feature = "test-utils")]
         let resolved = resolved.inspect_err(|_| replay_coverage::resolved_inputs_fell_back());
-        resolved.ok().map(|inputs| (source, inputs))
+        resolved
+            .ok()
+            .map(|inputs| (source, inputs.with_prechecks(prechecks)))
     }) {
         Some(authored) => authored,
         // Main checks the expanded owner against its resolved values. Only
@@ -90,7 +128,8 @@ fn select_admission_inputs<'r, 'a>(
                 carina_core::parser::retained::NoAuthoredEvidence::for_resource(
                     authored.unwrap_or(resource),
                 ),
-            ),
+            )
+            .with_prechecks(prechecks),
         ),
     }
 }
@@ -391,11 +430,8 @@ enum DiagnosticProviderContext {
 }
 
 struct DiagnosticValidationInputs<'a> {
+    binding_use_context: carina_core::validation::ValidationTypeContext<'a>,
     binding_index: carina_core::binding_index::BindingIndex<'a, RelativeBindingName>,
-    inference_bindings: carina_core::validation::inference::InferenceBindings<
-        ParserPlaceholder,
-        RelativeBindingName,
-    >,
     binding_use_report: carina_core::validation::BindingUseReport,
     export_value_bindings:
         carina_core::binding_index::ResolvedBindings<ParserPlaceholder, RelativeBindingName>,
@@ -441,14 +477,61 @@ type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
 struct ExpandedDiagnosticValidationInputs<'a> {
     configuration: &'a ExpandedConfiguration<'a>,
     resources: HashMap<&'a carina_core::resource::ResourceId, &'a ExpandedResource<'a>>,
+    // Compatibility observer for main's seam tests. Production coverage is
+    // owned only by ConversionValidation and borrowed for every walk.
+    #[cfg(test)]
     coverage: carina_core::validation::admission::WalkCoverage,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
 
 impl ExpandedDiagnosticValidationInputs<'_> {
+    #[cfg(test)]
     fn resource_admissions(
         &mut self,
         resource_id: &carina_core::resource::ResourceId,
+        session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Option<carina_core::schema::ResourceValueValidation> {
+        let resource = *self.resources.get(resource_id)?;
+        let schemas = self.configuration.schemas();
+        let Some(schema) = resource.schema(schemas) else {
+            #[cfg(feature = "test-utils")]
+            {
+                replay_coverage::missing_schema(AdmissionPath::Expanded, &resource_id.provider);
+                replay_coverage::declined(ExpandedDeclineReason::MissingSchema);
+            }
+            return None;
+        };
+        let Ok(inputs) =
+            ResourceAttributeInputs::for_resource(resource, self.configuration.report())
+        else {
+            #[cfg(feature = "test-utils")]
+            replay_coverage::declined(ExpandedDeclineReason::MissingReport);
+            return None;
+        };
+        #[cfg(feature = "test-utils")]
+        replay_coverage::reached(AdmissionPath::Expanded);
+        Some(
+            resource_attribute_admissions(
+                resource,
+                self.configuration.file(),
+                schema,
+                resource.quoted_string_attrs(),
+                inputs,
+                ValidationEvaluation::expanded(),
+                &self.binding_index,
+                session,
+                schemas,
+                &mut self.coverage,
+            )
+            .values,
+        )
+    }
+
+    fn resource_admissions_in<F: carina_core::validation::ValidationClientError>(
+        &mut self,
+        validation: &mut carina_core::validation::ConversionValidation<F>,
+        resource_id: &carina_core::resource::ResourceId,
+        prechecks: &carina_core::validation::BindingUseReport,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
         let Some(&resource) = self.resources.get(resource_id) else {
@@ -466,31 +549,33 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             return None;
         };
         let Ok(inputs) =
-            carina_core::validation::admission::attributes::ResourceAttributeInputs::for_resource(
-                resource,
-                self.configuration.report(),
-            )
+            ResourceAttributeInputs::for_resource(resource, self.configuration.report())
         else {
             #[cfg(feature = "test-utils")]
             replay_coverage::declined(ExpandedDeclineReason::MissingReport);
             return None;
         };
+        let inputs = inputs.with_prechecks(
+            carina_core::validation::admission::attributes::SlotPrechecks::Reported(prechecks),
+        );
         #[cfg(feature = "test-utils")]
         replay_coverage::reached(AdmissionPath::Expanded);
         Some(
-            carina_core::validation::admission::attributes::resource_attribute_admissions(
-                resource,
-                self.configuration.file(),
-                schema,
-                resource.quoted_string_attrs(),
-                inputs,
-                ValidationEvaluation::expanded(),
-                &self.binding_index,
-                session,
-                schemas,
-                &mut self.coverage,
-            )
-            .values,
+            validation
+                .admit_resource(
+                    carina_core::validation::admission::attributes::ResourceAdmissionRequest {
+                        resource,
+                        parsed: self.configuration.file(),
+                        schema,
+                        quoted: resource.quoted_string_attrs(),
+                        inputs,
+                        evaluation: ValidationEvaluation::expanded(),
+                        bindings: &self.binding_index,
+                        session,
+                        schemas,
+                    },
+                )
+                .values,
         )
     }
 }
@@ -662,8 +747,7 @@ impl DiagnosticRun<'_> {
             module_signatures,
             self.provider_context,
         );
-        let inference_bindings =
-            carina_core::validation::inference::bindings_from_parsed(binding_input);
+
         let context = carina_core::validation::ValidationTypeContext::in_session(
             configuration,
             self.provider_context,
@@ -673,8 +757,8 @@ impl DiagnosticRun<'_> {
         let export_value_bindings =
             carina_core::binding_index::ResolvedBindings::for_authored_validation(binding_input);
         DiagnosticValidationInputs {
+            binding_use_context: context,
             binding_index,
-            inference_bindings,
             binding_use_report,
             export_value_bindings,
         }
@@ -684,6 +768,72 @@ impl DiagnosticRun<'_> {
         &self,
         doc: &Document,
         current_file_path: Option<&Path>,
+    ) -> Vec<Diagnostic> {
+        let mut conversion_validation: carina_core::validation::ConversionValidation<
+            OrdinaryDiagnostic,
+        > = match doc.parsed_buffer() {
+            Some(source) => {
+                carina_core::validation::ConversionValidation::for_editor_source(source)
+            }
+            None => carina_core::validation::ConversionValidation::for_parse_failure(
+                doc.parse_error()
+                    .expect("a document without a parse carries its parse failure"),
+            ),
+        };
+        let ordinary =
+            self.collect_diagnostics_in(doc, current_file_path, &mut conversion_validation);
+        conversion_validation.extend(ordinary.into_iter().map(OrdinaryDiagnostic::visible));
+        let mut diagnostics = Vec::new();
+        for finding in conversion_validation.complete().into_presented() {
+            use carina_core::validation::{OrdinaryFinding, PresentedFinding};
+            match finding {
+                PresentedFinding::Ordinary(OrdinaryFinding::Resource(error)) => {
+                    if let Some(location) = error.location() {
+                        let finding =
+                            carina_core::parser::Located::new(location.clone(), error.message());
+                        diagnostics.extend(render_merged(
+                            doc,
+                            &finding,
+                            DiagnosticSeverity::ERROR,
+                            finding.detail().clone(),
+                        ));
+                    }
+                }
+                PresentedFinding::Ordinary(OrdinaryFinding::Client(diagnostic)) => {
+                    match *diagnostic {
+                        OrdinaryDiagnostic::Visible(diagnostic) => diagnostics.push(*diagnostic),
+                    }
+                }
+                PresentedFinding::Conversion(error) => {
+                    let finding = carina_core::parser::Located::new(
+                        error.location().clone(),
+                        error.message().to_owned(),
+                    );
+                    if let Some(mut diagnostic) = render_merged(
+                        doc,
+                        &finding,
+                        DiagnosticSeverity::ERROR,
+                        finding.detail().clone(),
+                    ) {
+                        diagnostic.code = Some(tower_lsp::lsp_types::NumberOrString::String(
+                            error.code().to_owned(),
+                        ));
+                        diagnostics.push(diagnostic);
+                    }
+                }
+            }
+        }
+
+        diagnostics
+    }
+
+    fn collect_diagnostics_in(
+        &self,
+        doc: &Document,
+        current_file_path: Option<&Path>,
+        conversion_validation: &mut carina_core::validation::ConversionValidation<
+            OrdinaryDiagnostic,
+        >,
     ) -> Vec<Diagnostic> {
         #[cfg(test)]
         if let Some(current_file_path) = current_file_path {
@@ -812,6 +962,7 @@ impl DiagnosticRun<'_> {
             false
         };
         let mut merged_result = merged_attempt.and_then(Result::ok);
+
         // Keep the parsed input stable while module-analysis results are filled
         // in. Cloning this Arc preserves the exact sealed directory without
         // cloning or revalidating the AST.
@@ -892,7 +1043,14 @@ impl DiagnosticRun<'_> {
                 .as_ref()
                 .map(|(exports, _)| exports)
                 .unwrap_or(&empty_exports);
-            self.resolve_merged_modules(result, tree, base, exports, &overrides);
+            self.resolve_merged_modules(
+                result,
+                tree,
+                base,
+                exports,
+                &overrides,
+                conversion_validation,
+            );
         }
         let expanded_graph =
             merged_result
@@ -1110,12 +1268,17 @@ impl DiagnosticRun<'_> {
                 },
             ),
         };
-        if let Some(tree) = preferred_analysis {
-            diagnostics.extend(self.check_undefined_references(
+        let undefined_references = preferred_analysis
+            .map(|tree| {
+                self.undefined_reference_findings(tree, &known_bindings, &declared_providers)
+            })
+            .unwrap_or_default();
+        for finding in &undefined_references {
+            diagnostics.extend(render_merged(
                 doc,
-                tree,
-                &known_bindings,
-                &declared_providers,
+                finding,
+                DiagnosticSeverity::ERROR,
+                finding.detail().to_string(),
             ));
         }
 
@@ -1257,7 +1420,7 @@ impl DiagnosticRun<'_> {
                     let owner = expression_report
                         .expression(finding.location())
                         .ok()
-                        .and_then(JudgedExpr::boundary_owner);
+                        .and_then(|expression| expression.boundary_owner());
                     let owned_range = owner.and_then(|owner| {
                         render_merged(
                             doc,
@@ -1338,11 +1501,13 @@ impl DiagnosticRun<'_> {
                     self.provider_context.catalog(),
                 )
             });
-            let expanded_validation_tree =
-                expanded_configuration.as_ref().and_then(|configuration| {
+            let expanded_validation_tree = match &expanded_configuration {
+                Some(configuration) => {
                     carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file())
                         .ok()
-                });
+                }
+                None => None,
+            };
             let mut expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
                 let configuration = configuration.judged();
                 let graph = configuration.file();
@@ -1354,6 +1519,7 @@ impl DiagnosticRun<'_> {
                 Some(ExpandedDiagnosticValidationInputs {
                     configuration,
                     resources,
+                    #[cfg(test)]
                     coverage: Default::default(),
                     binding_index:
                         carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
@@ -1362,8 +1528,8 @@ impl DiagnosticRun<'_> {
                 })
             });
             let DiagnosticValidationInputs {
+                binding_use_context,
                 binding_index,
-                inference_bindings,
                 binding_use_report,
                 export_value_bindings,
             } = validation_inputs;
@@ -1398,6 +1564,8 @@ impl DiagnosticRun<'_> {
                 .uses()
                 .filter(|use_site| {
                     carina_core::validation::binding_use_authority_owns_use(
+                        parsed,
+                        &binding_use_context,
                         &binding_use_report,
                         use_site,
                     )
@@ -1633,11 +1801,27 @@ impl DiagnosticRun<'_> {
                     );
                 }
             }
+            conversion_validation.include(expression_report);
+            let prior_diagnostics = std::mem::take(&mut diagnostics);
+            conversion_validation.extend(
+                prior_diagnostics
+                    .iter()
+                    .cloned()
+                    .map(OrdinaryDiagnostic::visible),
+            );
+            if let Some(configuration) = &expanded_configuration {
+                conversion_validation.include(configuration.judged().report());
+            }
+            let authored_tree = carina_core::parser::AnalysisTree::try_from_file(
+                pre_expansion_configuration.judged().file(),
+            )
+            .ok();
             if let Some(inputs) = expanded_validation_inputs.as_mut() {
                 // A rejected call already owns the diagnostic. Do not add a
                 // downstream resource consequence of that same rejection.
-                let rejected_calls: Vec<_> = diagnostics
+                let rejected_calls: Vec<_> = prior_diagnostics
                     .iter()
+                    .chain(diagnostics.iter())
                     .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
                     .map(|diagnostic| diagnostic.range)
                     .collect();
@@ -1656,9 +1840,12 @@ impl DiagnosticRun<'_> {
                         continue;
                     };
                     let call = &origin.module_call_path().root().id;
-                    let Some(report) =
-                        inputs.resource_admissions(&resource.id, self.provider_context)
-                    else {
+                    let Some(report) = inputs.resource_admissions_in(
+                        conversion_validation,
+                        &resource.id,
+                        &binding_use_report,
+                        self.provider_context,
+                    ) else {
                         #[cfg(feature = "test-utils")]
                         replay_coverage::declined_outcome(false);
                         continue;
@@ -1674,6 +1861,7 @@ impl DiagnosticRun<'_> {
                             DiagnosticSeverity::ERROR,
                             format!("{}: {}", resource.id, finding.detail()),
                         ) && !rejected_calls.contains(&diagnostic.range)
+                            && !prior_diagnostics.contains(&diagnostic)
                             && !diagnostics.contains(&diagnostic)
                         {
                             diagnostics.push(diagnostic);
@@ -1683,12 +1871,6 @@ impl DiagnosticRun<'_> {
             }
             // Admission reads the sealed slots and projections owned by the
             // judged directory. Source locations still anchor each diagnostic.
-            // Authored inventory is optional on main's buffer path. Its
-            // absence selects report-based admission, not a new diagnostic.
-            let authored_tree = carina_core::parser::AnalysisTree::try_from_file(
-                pre_expansion_configuration.judged().file(),
-            )
-            .ok();
             let authored_resources = authored_tree.as_ref().map(authored_validation_resources);
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
@@ -1716,7 +1898,6 @@ impl DiagnosticRun<'_> {
                 .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
             // Every schema finding is anchored by the sealed parser view,
             // including the semantic per-file fallback after a buffer parse fails.
-            let mut authored_coverage = carina_core::validation::admission::WalkCoverage::default();
             for (resource_index, rref) in tree.project_resources().enumerate() {
                 let resource_id = rref.id();
                 let resource_attributes = rref.attributes();
@@ -1826,6 +2007,9 @@ impl DiagnosticRun<'_> {
                         authored_resources.as_ref(),
                         &resolved_attrs,
                         expression_report,
+                        carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                            &binding_use_report,
+                        ),
                     );
                     // Expansion supplies the binding authority for composition
                     // exports. Select that input before admitting attributes;
@@ -1841,8 +2025,12 @@ impl DiagnosticRun<'_> {
                         .as_mut()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| {
-                            let result =
-                                inputs.resource_admissions(resource_id, self.provider_context);
+                            let result = inputs.resource_admissions_in(
+                                conversion_validation,
+                                resource_id,
+                                &binding_use_report,
+                                self.provider_context,
+                            );
                             #[cfg(feature = "test-utils")]
                             if result.is_none() {
                                 replay_coverage::declined_outcome(true);
@@ -1861,17 +2049,12 @@ impl DiagnosticRun<'_> {
                         None => {
                             #[cfg(feature = "test-utils")]
                             replay_coverage::reached(AdmissionPath::Relative);
-                            let outcome = resource_attribute_admissions(
-                                admission_resource,
-                                parsed,
-                                validated_schema,
-                                resource_quoted_string_attrs,
-                                inputs,
-                                ValidationEvaluation::relative_static(),
-                                &binding_index,
-                                self.provider_context,
-                                &self.schemas,
-                                &mut authored_coverage,
+                            let outcome = conversion_validation.admit_resource(
+                                carina_core::validation::admission::attributes::ResourceAdmissionRequest {
+                                    resource: admission_resource, parsed, schema: validated_schema,
+                                    quoted: resource_quoted_string_attrs, inputs, evaluation: ValidationEvaluation::relative_static(),
+                                    bindings: &binding_index, session: self.provider_context, schemas: &self.schemas,
+                                },
                             );
                             (outcome.values, outcome.classification_diagnostics)
                         }
@@ -2173,10 +2356,12 @@ impl DiagnosticRun<'_> {
                                 if let Some(diagnostic) =
                                     render_merged(doc, &finding, severity, finding.detail().clone())
                                 {
-                                    if !diagnostics.iter().any(|existing| {
-                                        existing.range == diagnostic.range
-                                            && existing.message == diagnostic.message
-                                    }) {
+                                    if !prior_diagnostics.iter().chain(diagnostics.iter()).any(
+                                        |existing| {
+                                            existing.range == diagnostic.range
+                                                && existing.message == diagnostic.message
+                                        },
+                                    ) {
                                         diagnostics.push(diagnostic);
                                     }
                                     if covers_path {
@@ -2426,6 +2611,30 @@ impl DiagnosticRun<'_> {
                 }
             }
 
+            if let (Some(tree), Some(inputs)) =
+                (&expanded_validation_tree, &expanded_validation_inputs)
+            {
+                conversion_validation.admit_remaining_resources(
+                    tree,
+                    inputs.configuration,
+                    &inputs.binding_index,
+                    self.provider_context,
+                    carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                        &binding_use_report,
+                    ),
+                );
+            }
+            if let Some(authored_tree) = &authored_tree {
+                conversion_validation.admit_remaining_resources(
+                    authored_tree,
+                    pre_expansion_configuration.judged(),
+                    &binding_index,
+                    self.provider_context,
+                    carina_core::validation::admission::attributes::SlotPrechecks::Reported(
+                        &binding_use_report,
+                    ),
+                );
+            }
             // Check the current buffer's attributes against directory-wide
             // binding authority while keeping diagnostics owned by this file.
             diagnostics.extend(self.check_attributes_blocks(
@@ -2434,7 +2643,7 @@ impl DiagnosticRun<'_> {
                 &semantic_view,
                 &binding_index,
                 &known_bindings,
-                &inference_bindings,
+                conversion_validation,
             ));
 
             diagnostics.extend(self.check_exports_blocks(
@@ -2443,7 +2652,7 @@ impl DiagnosticRun<'_> {
                 tree,
                 &semantic_view,
                 &export_value_bindings,
-                expanded_graph,
+                (expanded_graph, conversion_validation),
             ));
 
             if let (Some(configuration), Some(tree)) =

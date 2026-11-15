@@ -35,6 +35,7 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
                 .into_classification(),
             Some(&bindings),
             session,
+            crate::test_utils::no_conversion_proof(),
         );
         let pending = admit(&destination, candidate, &boundary)
             .unwrap()
@@ -50,6 +51,7 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
                 .into_classification(),
             Some(&bindings),
             session,
+            crate::test_utils::no_conversion_proof(),
         );
         let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
         let mut resolved = ResolvedBindings::default();
@@ -122,6 +124,7 @@ fn round12_unknown_function_return_rechecks_destination_member_at_resolution() {
                     .into_classification(),
                 Some(&bindings),
                 session,
+                crate::test_utils::no_conversion_proof(),
             );
             let pending = admit(&destination, candidate, &boundary)
                 .unwrap()

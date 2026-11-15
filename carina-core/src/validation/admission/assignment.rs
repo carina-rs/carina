@@ -32,6 +32,7 @@ fn reference_judgement_uses_the_contract_already_found() {
                         .into_classification(),
                     Some(bindings),
                     session,
+                    crate::test_utils::no_conversion_proof(),
                 );
                 let CandidateOrigin::Reference(reference) = CandidateOrigin::of(&value) else {
                     panic!("reference origin")
@@ -222,6 +223,50 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> From<&AdmissionContext<'a, P, B>
 }
 
 impl<B: BindingAddress> ReferenceCandidate<B> {
+    /// The same resolved source feeds ordinary reference assignment and a
+    /// conversion's static source check. Existence errors keep their ordinary
+    /// path/error shape; no assignment relation has been applied here.
+    pub(crate) fn source(
+        &self,
+        context: &ReferenceContext<'_, B>,
+    ) -> Result<ReferenceSource, TypeError> {
+        let Some(bindings) = context.bindings else {
+            return Ok(ReferenceSource::Unchecked);
+        };
+        let source = match self.reference.as_ref() {
+            crate::resource::ReferencePathRef::Access(path) => bindings.postfix_ref_type(path),
+            crate::resource::ReferencePathRef::Binding(binding) => bindings.ref_type(binding),
+            reference @ crate::resource::ReferencePathRef::BindingAccess { .. } => {
+                bindings.ref_type(reference)
+            }
+        };
+        match source {
+            RefType::Typed(source) => Ok(ReferenceSource::Typed(source)),
+            RefType::Unchecked => Ok(ReferenceSource::Unchecked),
+            RefType::UnknownBinding { binding, attribute } => {
+                Err(reference_error(AdmissionReferenceError::UnknownBinding {
+                    binding,
+                    attribute,
+                }))
+            }
+            RefType::UnknownAttribute(crate::binding_index::RefTypeError::InvalidAccess {
+                step,
+                actual,
+                ..
+            }) => Err(reference_error(AdmissionReferenceError::Computed(
+                crate::validation::DeferredAccessTypeError::InvalidAccess {
+                    error: crate::validation::inference::InferenceError::InvalidAccess {
+                        base_type: actual,
+                        step,
+                    },
+                },
+            ))),
+            RefType::UnknownAttribute(error) => {
+                Err(reference_error(AdmissionReferenceError::Path(error)))
+            }
+        }
+    }
+
     pub(super) fn error_with_origin(&self, error: TypeError) -> TypeError {
         match error {
             TypeError::TypeMismatch { types } => {
@@ -334,15 +379,8 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
             }
             return Ok(());
         }
-        let source = match self.reference.as_ref() {
-            crate::resource::ReferencePathRef::Access(path) => bindings.postfix_ref_type(path),
-            crate::resource::ReferencePathRef::Binding(binding) => bindings.ref_type(binding),
-            reference @ crate::resource::ReferencePathRef::BindingAccess { .. } => {
-                bindings.ref_type(reference)
-            }
-        };
-        match source {
-            RefType::Typed(source) => {
+        match self.source(context)? {
+            ReferenceSource::Typed(source) => {
                 // The value walk supplies each Union member's own sink. Every
                 // kind judges that sink even when several members share a shape:
                 // reject if none fit, admit if all fit, without guessing a sink.
@@ -378,7 +416,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                     }
                 }
             }
-            RefType::Unchecked => {
+            ReferenceSource::Unchecked => {
                 // A known binding without representable type authority cannot
                 // confer placement. The owned obligation is retried on discharge.
                 findings
@@ -386,32 +424,14 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                     .requirements
                     .push(SchemaRequirement::Reference);
             }
-            RefType::UnknownBinding { binding, attribute } => {
-                return Err(reference_error(AdmissionReferenceError::UnknownBinding {
-                    binding,
-                    attribute,
-                }));
-            }
-            RefType::UnknownAttribute(crate::binding_index::RefTypeError::InvalidAccess {
-                step,
-                actual,
-                ..
-            }) => {
-                return Err(reference_error(AdmissionReferenceError::Computed(
-                    crate::validation::DeferredAccessTypeError::InvalidAccess {
-                        error: crate::validation::inference::InferenceError::InvalidAccess {
-                            base_type: actual,
-                            step,
-                        },
-                    },
-                )));
-            }
-            RefType::UnknownAttribute(error) => {
-                return Err(reference_error(AdmissionReferenceError::Path(error)));
-            }
         }
         Ok(())
     }
+}
+
+pub(crate) enum ReferenceSource {
+    Typed(crate::binding_index::ResolvedRefType),
+    Unchecked,
 }
 
 pub(super) fn reference_error(error: AdmissionReferenceError) -> TypeError {
@@ -439,7 +459,11 @@ fn verdict<K: AssignmentKind>(
         local: paths,
         schema,
         errors: _,
-        deferred: _,
+        #[cfg(test)]
+            deferred: _,
+        matched_destination: _,
+        claim_effect: _,
+        conversions: _,
     } = findings;
     match K::local(destination, paths, schema) {
         Ok(obligation) => AssignmentVerdict::NeedsLocal(obligation),
@@ -460,6 +484,7 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
     candidate: &Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<AssignmentJudgement<K>, AdmissionErrors> {
+    let cursor = &context.cursor;
     if candidate.obligations.identity != context.identity {
         return Err(KnowledgeError::<B>::InvalidStage {
             operation: "candidate/proof pairing",
@@ -477,7 +502,8 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
         }
         .into());
     }
-    if let AdmissionProof::Validation(proof) = &context.proof
+    if let AdmissionProof::Validation(proof) | AdmissionProof::Template { proof, .. } =
+        &context.proof
         && let Some(error) = proof.failure()
     {
         return Err(error.into());
@@ -506,9 +532,60 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
     };
     let lookup = contract.lookup(context.provider.catalog());
     let mut checked = match &context.proof {
-        AdmissionProof::Validation(proof) => {
+        AdmissionProof::Validation(proof) | AdmissionProof::Template { proof, .. } => {
             let reference_context = ReferenceContext::from(context);
             let authored =
+                |attr: &CompiledAttributeType,
+                 checked: crate::schema::value_validation::CheckValue<'_, P, B>,
+                 path: &LeafPath,
+                 cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
+                    let source = match &cursor.kind {
+                        crate::parser::retained::CursorKind::Authored(usage)
+                        | crate::parser::retained::CursorKind::CoveredBy(usage)
+                            if matches!(
+                                usage.node().kind(),
+                                crate::parser::retained::ExprKind::Convert { .. }
+                            ) =>
+                        {
+                            let operand = usage
+                                .child(0, crate::parser::retained::EdgeRole::ConvertOperand)
+                                .map_err(assignment_seam_error)?;
+                            let operand =
+                                crate::parser::retained::AuthoredCursor::authored(operand);
+                            match operand.source_reference().filter(|_| match &operand.kind {
+                                crate::parser::retained::CursorKind::Authored(usage)
+                                | crate::parser::retained::CursorKind::CoveredBy(usage) => {
+                                    usage.node().judgement().assignment_source_type().is_none()
+                                }
+                                crate::parser::retained::CursorKind::Projected(_) => false,
+                            }) {
+                                Some(source) => ReferenceCandidate {
+                                    reference: source.into_path(),
+                                }
+                                .source(&reference_context)?,
+                                None => ReferenceSource::Unchecked,
+                            }
+                        }
+                        crate::parser::retained::CursorKind::Authored(_)
+                        | crate::parser::retained::CursorKind::CoveredBy(_)
+                        | crate::parser::retained::CursorKind::Projected(_) => {
+                            ReferenceSource::Unchecked
+                        }
+                    };
+                    crate::parser::retained::check_conversion::<K, P, B>(
+                        attr,
+                        checked,
+                        &join(&contract.path, path),
+                        cursor,
+                        contract.defs(),
+                        crate::parser::retained::ConversionContext {
+                            catalog: context.provider.catalog(),
+                            reference: source,
+                        },
+                    )
+                };
+            #[cfg(test)]
+            let observer =
                 |attr: &CompiledAttributeType,
                  checked: crate::schema::value_validation::CheckValue<'_, P, B>,
                  path: &LeafPath,
@@ -518,38 +595,41 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
                         None => Ok(Default::default()),
                     }
                 };
-            let check =
-                |attr: &CompiledAttributeType,
-                 checked: crate::schema::value_validation::CheckValue<'_, P, B>,
-                 path: &LeafPath,
-                 cursor: crate::parser::retained::AuthoredCursor<'_, B>| {
-                    let path = join(&contract.path, path);
-                    let mut findings = Default::default();
-                    // Selection parents are policy-only: main's ordinary local
-                    // and reference obligations belong to the selected child.
-                    if cursor.is_selection() {
-                        return Ok(findings);
-                    }
-                    let crate::schema::value_validation::CheckValue::Current(value) = checked
-                    else {
-                        return Ok(findings);
-                    };
-                    match CandidateOrigin::of(value) {
-                        CandidateOrigin::Reference(reference) => reference.judge_at::<K>(
-                            contract,
-                            attr,
-                            &path,
-                            &reference_context,
-                            &mut findings,
-                        )?,
-                        CandidateOrigin::Expression => {
-                            if let Some(check) = context.assignment.ordinary {
-                                findings.extend(check(attr, value, &path, cursor)?);
-                            }
+            let check = |attr: &CompiledAttributeType,
+                         checked: crate::schema::value_validation::CheckValue<'_, P, B>,
+                         path: &LeafPath,
+                         cursor: crate::parser::retained::AuthoredCursor<'_, B>,
+                         _proof: crate::parser::retained::NoConversion| {
+                let path = join(&contract.path, path);
+                let mut findings = Default::default();
+                if context.scope == crate::schema::value_validation::AssignmentScope::ClaimedValues
+                {
+                    return Ok(findings);
+                }
+                // Selection parents are policy-only: main's ordinary local
+                // and reference obligations belong to the selected child.
+                if cursor.is_selection() {
+                    return Ok(findings);
+                }
+                let crate::schema::value_validation::CheckValue::Current(value) = checked else {
+                    return Ok(findings);
+                };
+                match CandidateOrigin::of(value) {
+                    CandidateOrigin::Reference(reference) => reference.judge_at::<K>(
+                        contract,
+                        attr,
+                        &path,
+                        &reference_context,
+                        &mut findings,
+                    )?,
+                    CandidateOrigin::Expression => {
+                        if let Some(check) = context.assignment.ordinary {
+                            findings.extend(check(attr, value, &path, cursor)?);
                         }
                     }
-                    Ok(findings)
-                };
+                }
+                Ok(findings)
+            };
             let reference_check =
                 |attr: &CompiledAttributeType,
                  relative_path: &LeafPath,
@@ -578,10 +658,19 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
                 contract.defs(),
                 contract.ancestry,
                 &lookup,
-                context.cursor.clone(),
-                crate::schema::value_validation::AssignmentCallbacks {
-                    ordinary: &check,
-                    authored: context.assignment.authored.map(|_| &authored as _),
+                cursor.clone(),
+                {
+                    let callbacks = crate::schema::value_validation::WalkCallbacks::from(
+                        crate::schema::value_validation::RequiredAssignmentCallbacks {
+                            ordinary: &check,
+                            scope: context.scope,
+                            authored: context.authored_policy(&authored),
+                        },
+                    );
+                    #[cfg(test)]
+                    let callbacks =
+                        callbacks.observe(context.assignment.authored.map(|_| &observer as _));
+                    callbacks
                 },
                 crate::schema::value_validation::ReferenceCheck {
                     schema_source: &|binding: &B| {
@@ -601,26 +690,36 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
                 contract.defs(),
                 contract.ancestry,
                 &lookup,
-                context.cursor.clone(),
-                crate::schema::value_validation::AssignmentCallbacks {
-                    ordinary: &|_, _, _, _| Ok(Default::default()),
-                    authored: None,
-                },
+                cursor.clone(),
+                crate::schema::value_validation::WalkCallbacks::from(
+                    crate::schema::value_validation::RequiredAssignmentCallbacks {
+                        ordinary: &|_, _, _, _, _| Ok(Default::default()),
+                        scope: crate::schema::value_validation::AssignmentScope::Full,
+                        authored: crate::schema::value_validation::AuthoredChecks::Projected(
+                            crate::parser::retained::ProjectedPhase::plan(proof),
+                        ),
+                    },
+                ),
                 &mut context.coverage.borrow_mut(),
             )
         }
-        AdmissionProof::Apply(proof) => {
+        AdmissionProof::Apply { known, phase } => {
             crate::schema::value_validation::validate_authored_value_for_admission(
                 contract.attr(),
-                &crate::resource::knowledge::Classification::<P, B>::Known(proof.clone()),
+                &crate::resource::knowledge::Classification::<P, B>::Known(known.clone()),
                 contract.defs(),
                 contract.ancestry,
                 &lookup,
-                context.cursor.clone(),
-                crate::schema::value_validation::AssignmentCallbacks {
-                    ordinary: &|_, _, _, _| Ok(Default::default()),
-                    authored: None,
-                },
+                cursor.clone(),
+                crate::schema::value_validation::WalkCallbacks::from(
+                    crate::schema::value_validation::RequiredAssignmentCallbacks {
+                        ordinary: &|_, _, _, _, _| Ok(Default::default()),
+                        scope: crate::schema::value_validation::AssignmentScope::Full,
+                        authored: crate::schema::value_validation::AuthoredChecks::Projected(
+                            *phase,
+                        ),
+                    },
+                ),
                 &mut context.coverage.borrow_mut(),
             )
         }
@@ -642,6 +741,7 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
         });
     }
     if errors.is_empty()
+        && !checked.rejected_by_claim()
         && context.is_apply()
         && candidate
             .obligations
@@ -654,10 +754,8 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
                 .with_attribute(&destination.label),
         }]));
     }
-    if !errors.is_empty() {
-        let mut error = constraints(errors);
-        error.findings = Some(Box::new(checked));
-        return Err(error);
+    if !errors.is_empty() || checked.rejected_by_claim() {
+        return Err(checked_constraints(errors, checked));
     }
     Ok(AssignmentJudgement {
         verdict: verdict(destination, assignment),
@@ -734,6 +832,7 @@ mod discharge_tests {
                             .into_classification(),
                         None,
                         session,
+                        crate::test_utils::no_conversion_proof(),
                     );
                     let pending = admit(destination, candidate, &context)
                         .unwrap()
@@ -776,6 +875,7 @@ mod discharge_tests {
                             .into_classification(),
                         Some(&bindings),
                         session,
+                        crate::test_utils::no_conversion_proof(),
                     );
                     let pending = admit(destination, candidate, &context)
                         .unwrap()
