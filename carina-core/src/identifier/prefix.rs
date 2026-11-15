@@ -1012,7 +1012,7 @@ mod tests {
             "mock.Sink { name_prefix = 'ok' }\nmock.Sink { name_prefix = 'raw' }",
         )
         .unwrap();
-        let unvisited = parsed.resources.pop().unwrap();
+        let unvisited = parsed.resources.pop().unwrap(); // allow: direct — fixture test inspection
         let location = unvisited.declaration.location().unwrap().clone();
         assert_eq!(location.span().start_line(), 2);
         let mut canonical = canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview);
