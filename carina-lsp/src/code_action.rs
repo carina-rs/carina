@@ -91,6 +91,7 @@ impl EnumDiagnosticData {
 /// would replace the entire collection with one identifier.
 pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDiagnosticData> {
     match error {
+        TypeError::AttributePrefix(_error) => None,
         TypeError::BindingShadowsEnumMember(error) => Some(EnumDiagnosticData::new(
             EnumDiagnosticKind::BareInvalid,
             vec![error.qualified.clone()],
@@ -576,17 +577,7 @@ mod tests {
                 .expect("quick-fix schema must be owner-bound"),
             &attrs
                 .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap(),
-                    )
-                })
+                .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
             &|_| false,
             &resolver,

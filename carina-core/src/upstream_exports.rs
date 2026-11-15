@@ -3394,7 +3394,7 @@ mod tests {
             |session| {
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(parsed, schemas, Some(exports), &signatures, session);
-                let configuration = crate::config_loader::load_buffer_configuration(
+                let configuration = crate::test_utils::load_canonical_buffer_configuration(
                     parsed,
                     schemas,
                     session.as_provider_context(),
@@ -3840,7 +3840,7 @@ mod tests {
         let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(&parsed, &schemas, &exports, &signatures, &catalog);
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let errs = crate::validation::validate_resource_ref_types(
             configuration.judged(),
             &std::collections::HashSet::new(),

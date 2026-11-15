@@ -193,34 +193,17 @@ fn complete_update(
     }
 }
 
-fn canonical_unresolved_for_test(
-    ctx: &WiringContext,
+fn canonical_unresolved_for_test<'s>(
+    ctx: &'s WiringContext,
     parsed: &carina_core::parser::InferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam> {
-    resolve_config_block_names_for_test(
-        resolve_module_file_for_test(parsed.clone()),
-        unresolved.clone(),
-        ctx.schemas(),
-    )
-    .unwrap_or_else(|errors| {
-        panic!(
-            "test block-name resolution failed: {}",
-            errors
-                .into_iter()
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
+) -> ParserCanonicalResourcePair<'s, carina_core::parser::ModuleResolvedInferredExportParam> {
+    ParserCanonicalResourcePair::from_block_pair(
+        resolve_config_block_names_for_test(
+            resolve_module_file_for_test(parsed.clone()),
+            unresolved.clone(),
+            ctx.schemas(),
         )
-    })
-}
-
-fn canonical_resolved_unresolved_for_test(
-    ctx: &WiringContext,
-    parsed: &carina_core::parser::ModuleResolvedInferredFile,
-    unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam> {
-    resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
         .unwrap_or_else(|errors| {
             panic!(
                 "test block-name resolution failed: {}",
@@ -230,7 +213,30 @@ fn canonical_resolved_unresolved_for_test(
                     .collect::<Vec<_>>()
                     .join("\n")
             )
-        })
+        }),
+        ctx.schemas(),
+    )
+}
+
+fn canonical_resolved_unresolved_for_test<'s>(
+    ctx: &'s WiringContext,
+    parsed: &carina_core::parser::ModuleResolvedInferredFile,
+    unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
+) -> ParserCanonicalResourcePair<'s, carina_core::parser::ModuleResolvedInferredExportParam> {
+    ParserCanonicalResourcePair::from_block_pair(
+        resolve_config_block_names_for_test(parsed.clone(), unresolved.clone(), ctx.schemas())
+            .unwrap_or_else(|errors| {
+                panic!(
+                    "test block-name resolution failed: {}",
+                    errors
+                        .into_iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            }),
+        ctx.schemas(),
+    )
 }
 
 fn canonical_resources_for_test(
@@ -251,14 +257,27 @@ fn validated_apply_config_for_test(
     wiring.validated_parser_pair_for_test(resources)
 }
 
-fn validated_resolved_apply_config_for_test(
+fn validated_expanded_apply_config_for_test(
     wiring: &ValidatedWiring,
-    parsed: &carina_core::parser::ModuleResolvedInferredFile,
+    parsed: &carina_core::parser::ExpandedInferredFile,
     unresolved: &carina_core::config_loader::UnresolvedConfigSnapshot,
 ) -> ValidatedConfig {
-    let resources = canonical_resolved_unresolved_for_test(wiring.context(), parsed, unresolved)
-        .into_expanded_for_test()
-        .expect("resolved test pair must contain no parser placeholders");
+    // The live file already crossed admission and expansion. Resolve only the
+    // separate authored snapshot needed by the fixture's override pairing.
+    let snapshot = resolve_config_block_names_for_test(
+        carina_core::parser::ModuleResolvedInferredFile::default(),
+        unresolved.clone(),
+        wiring.context().schemas(),
+    )
+    .expect("the fixture's authored snapshot must resolve block aliases");
+    let unresolved = snapshot
+        .unresolved()
+        .iter()
+        .cloned()
+        .map(|resource| resource.into_expanded(wiring.context().schemas()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("unresolved fixture resources have no parser placeholders");
+    let resources = crate::wiring::CanonicalResourcePair::for_test(parsed.clone(), unresolved);
     ValidatedConfig::from_wiring_ref_for_test(wiring, resources)
 }
 
@@ -4305,7 +4324,7 @@ fn load_and_resolve_module_data_source_fixture(
     fixture: &ApplyCancellationFixture,
     shared: &ApplyTimeReadShared,
 ) -> (
-    carina_core::parser::ModuleResolvedInferredFile,
+    carina_core::parser::ExpandedInferredFile,
     carina_core::config_loader::UnresolvedConfigSnapshot,
 ) {
     let loaded = load_configuration_with_config(
@@ -4338,7 +4357,11 @@ fn load_and_resolve_module_data_source_fixture(
             )
         });
 
-    (parsed, unresolved_parsed)
+    let schemas = parsed.schemas();
+    let expanded = parsed
+        .into_expanded(schemas, fixture.provider_context())
+        .expect("module data-source fixture has no parser placeholders");
+    (expanded, unresolved_parsed)
 }
 
 #[tokio::test]
@@ -4365,13 +4388,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         })],
         &[],
     );
-    let expanded = parsed
-        .clone()
-        .into_expanded(
-            &carina_core::schema::SchemaRegistry::new(),
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        )
-        .expect("module data-source fixture has no parser placeholders");
+    let expanded = parsed.clone();
     let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
@@ -4383,7 +4400,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         },
     )
     .expect("module data-source provider configs must resolve");
-    let validated = validated_resolved_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
+    let validated = validated_expanded_apply_config_for_test(&wiring, &parsed, &unresolved_parsed);
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
@@ -4450,7 +4467,7 @@ async fn apply_reads_module_data_source_and_resolves_consumer_interpolation() {
     let observer_factory = fixture.observer_factory();
 
     run_apply_locked(
-        validated_resolved_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
+        validated_expanded_apply_config_for_test(&wiring, &parsed, &unresolved_parsed),
         true,
         fixture.backend_handle(),
         StateLock::disabled_for_test(),

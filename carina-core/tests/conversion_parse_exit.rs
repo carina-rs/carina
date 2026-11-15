@@ -20,14 +20,11 @@ fn parser_conversion_rejections_wait_for_the_presented_exit() {
                 panic!("parsing must retain the rejected Convert: {source}: {error}")
             });
         let schemas = SchemaRegistry::new();
-        let configuration =
-            carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
-        let judged = configuration.judged();
-        let bindings = carina_core::binding_index::BindingIndex::from_parsed(
-            judged.file(),
-            &schemas,
-            &catalog,
+        let configuration = carina_core::test_utils::load_canonical_buffer_configuration(
+            &parsed, &schemas, &catalog,
         );
+        let judged = configuration.judged();
+        let bindings = judged.parsed().binding_index(&catalog);
         let findings = validation::resource_admission_findings(
             judged,
             &bindings,

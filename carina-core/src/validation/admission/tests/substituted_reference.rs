@@ -78,7 +78,7 @@ fn check_with_schemas(source: &str, consumer: &str, schemas: &SchemaRegistry) ->
     let parsed = crate::config_loader::parse_directory(&path, catalog)
         .unwrap()
         .into_parsed();
-    let loaded = crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+    let loaded = crate::test_utils::load_canonical_buffer_configuration(&parsed, schemas, catalog);
     let bindings = BindingIndex::from_parsed(loaded.judged().file(), schemas, catalog);
     crate::validation::validate_resource_admissions(
         loaded.judged(),

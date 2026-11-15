@@ -1917,17 +1917,7 @@ async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_overri
         schema,
         &attributes
             .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    value
-                        .knowledge(
-                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                        )
-                        .map(|proof| proof.into_classification())
-                        .unwrap(),
-                )
-            })
+            .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         &|_| false,
         &custom_types,
@@ -4946,15 +4936,7 @@ async fn test_wasm_validate_custom_type_rebuilds_after_validate_config_timeout()
             Value::Concrete(ConcreteValue::String("clean".into())),
         )])
         .iter()
-        .map(|(name, value)| {
-            (
-                name.clone(),
-                value
-                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .unwrap(),
-            )
-        })
+        .map(|(name, value)| (name.clone(), value.clone()))
         .collect(),
         &|_| false,
         &custom_types,
@@ -4990,17 +4972,7 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
                 Value::Concrete(ConcreteValue::String(value.to_string().into())),
             )])
             .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    value
-                        .knowledge(
-                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                        )
-                        .map(|proof| proof.into_classification())
-                        .unwrap(),
-                )
-            })
+            .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
             &|_| false,
             &custom_types,

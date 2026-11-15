@@ -1,4 +1,5 @@
 use super::*;
+use crate::identifier::{CanonicalAttributeValues, CanonicalResource};
 use crate::parser::retained::{
     JudgedExpr, JudgedSlot, MissingEvidence, ProjectionGeneration, ValidationProjection,
 };
@@ -74,6 +75,7 @@ where
 /// Admission consumes this product and classifies its stored projections.
 pub struct ResourceAttributeInputs<B: BindingAddress> {
     owner: ResourceId,
+    pub(super) declaration: Option<DeclarationIdentity>,
     precheck: Option<crate::parser::ResourcePrecheckIdentity>,
     pub(super) scope: crate::schema::value_validation::AssignmentScope,
     report: Option<Arc<crate::parser::retained::ExpressionReport<B>>>,
@@ -152,7 +154,133 @@ impl<B: BindingAddress> StoredInput<B> {
 }
 
 impl<B: BindingAddress> ResourceAttributeInputs<B> {
-    pub fn new<D>(
+    pub fn new<X, D>(owner: &CanonicalResource<'_, X, D, B>) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let mut result = Self::new_raw(owner);
+        result.declaration = Some(super::declaration_identity(owner.resource_schema()));
+        result
+    }
+    pub fn for_resource<X, D>(
+        owner: &CanonicalResource<'_, X, D, B>,
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> Result<Self, MissingEvidence>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let mut result = Self::for_resource_raw(owner, report)?;
+        result.declaration = Some(super::declaration_identity(owner.resource_schema()));
+        Ok(result)
+    }
+    pub fn from_resolved<X, D>(
+        owner: &CanonicalResource<'_, X, D, B>,
+        values: &CanonicalAttributeValues<ParserPlaceholder, B>,
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> Result<Self, MissingEvidence>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let mut result = Self::from_resolved_raw(owner, values, report)?;
+        result.declaration = Some(values.declaration.clone());
+        Ok(result)
+    }
+    pub fn from_report<X, D>(
+        owner: &CanonicalResource<'_, X, D, B>,
+        values: &CanonicalAttributeValues<ParserPlaceholder, B>,
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let mut result = Self::from_report_raw(owner, values, report);
+        result.declaration = Some(values.declaration.clone());
+        result
+    }
+    pub fn from_report_with_evidence<X, D>(
+        owner: &CanonicalResource<'_, X, D, B>,
+        values: &CanonicalAttributeValues<ParserPlaceholder, B>,
+        report: &crate::parser::retained::ExpressionReport<B>,
+        unchecked: crate::parser::retained::NoAuthoredEvidence,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        let mut result = Self::from_report_with_evidence_raw(owner, values, report, unchecked);
+        result.declaration = Some(values.declaration.clone());
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test<D>(
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        Self::new_raw(resource)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_resource_for_test<D>(
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> Result<Self, MissingEvidence>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        Self::for_resource_raw(resource, report)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_report_for_test<D>(
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> Self
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        Self::from_report_raw(resource, values, report)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_resolved_for_test<D>(
+        resource: &crate::parser::AnalysisResourceRef<
+            '_,
+            ParserPlaceholder,
+            ParserPlaceholder,
+            D,
+            B,
+        >,
+        values: &IndexMap<String, Value<ParserPlaceholder, B>>,
+        report: &crate::parser::retained::ExpressionReport<B>,
+    ) -> Result<Self, MissingEvidence>
+    where
+        D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    {
+        Self::from_resolved_raw(resource, values, report)
+    }
+
+    fn new_raw<D>(
         resource: &crate::parser::AnalysisResourceRef<
             '_,
             ParserPlaceholder,
@@ -169,7 +297,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 
     /// Require the resource report used by main's CLI/expanded admission path.
     /// Callers retain main's distinct missing-report outcome (error or fallback).
-    pub fn for_resource<D>(
+    fn for_resource_raw<D>(
         resource: &crate::parser::AnalysisResourceRef<
             '_,
             ParserPlaceholder,
@@ -183,14 +311,14 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let report = report.for_resource(resource.id())?;
-        let mut inputs = Self::new(resource);
+        let mut inputs = Self::new_raw(resource);
         inputs.report = Some(Arc::new(report.clone()));
         Ok(inputs)
     }
 
     /// Main's buffer path when an authored owner/tree is not available.
     /// Values keep their classifications, and computed checks use this report.
-    pub fn from_report<D>(
+    fn from_report_raw<D>(
         resource: &crate::parser::AnalysisResourceRef<
             '_,
             ParserPlaceholder,
@@ -204,7 +332,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        Self::from_report_with_evidence(
+        Self::from_report_with_evidence_raw(
             resource,
             values,
             report,
@@ -214,7 +342,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 
     /// Report-based checks keep their checked owner and resolved values.
     /// Unreached source identities are metadata, never a replacement owner.
-    pub fn from_report_with_evidence<D>(
+    fn from_report_with_evidence_raw<D>(
         resource: &crate::parser::AnalysisResourceRef<
             '_,
             ParserPlaceholder,
@@ -231,6 +359,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     {
         let mut prepared = Self {
             owner: resource.id().clone(),
+            declaration: None,
             precheck: unchecked.precheck_identity(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(unchecked)),
@@ -269,7 +398,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
 
     /// Resolved values are joined with every authored attribute slot. Evaluation
     /// owns materialization; a slot without a value remains an admission input.
-    pub fn from_resolved<D>(
+    fn from_resolved_raw<D>(
         resource: &crate::parser::AnalysisResourceRef<
             '_,
             ParserPlaceholder,
@@ -373,6 +502,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
             .collect();
         let mut prepared = Self {
             owner: resource.id().clone(),
+            declaration: None,
             precheck: resource.precheck_identity(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             report: None,
@@ -523,6 +653,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     fn fork(&self) -> Self {
         Self {
             owner: self.owner.clone(),
+            declaration: self.declaration.clone(),
             precheck: self.precheck.clone(),
             scope: self.scope,
             report: self.report.clone(),
@@ -852,8 +983,11 @@ mod tests {
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
-        let mut inputs =
-            ResourceAttributeInputs::from_report(resource, &IndexMap::new(), judged.report());
+        let mut inputs = ResourceAttributeInputs::from_report_for_test(
+            resource,
+            &IndexMap::new(),
+            judged.report(),
+        );
         inputs
             .materialize(&IndexMap::from([(
                 "attr".into(),

@@ -1,5 +1,4 @@
-use carina_core::binding_index::BindingIndex;
-use carina_core::config_loader::{load_buffer_configuration, parse_directory};
+use carina_core::config_loader::parse_directory;
 use carina_core::parser::{AnalysisTree, ParsedFile, ProviderContext};
 use carina_core::paths::ResolvedPath;
 use carina_core::resource::knowledge::KnowledgeContext;
@@ -7,8 +6,9 @@ use carina_core::resource::{ConcreteValue, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeError, suggest_similar_name,
 };
+use carina_core::test_utils::load_canonical_buffer_configuration as load_buffer_configuration;
 use carina_core::validation::admission::attributes::{
-    ResourceAttributeInputs, resource_attribute_admissions,
+    ResourceAdmissionRequest, ResourceAttributeInputs,
 };
 use carina_core::validation::deferred_types::with_session_for_test;
 
@@ -147,9 +147,8 @@ fn function_arithmetic_findings_keep_sibling_declaration_order() {
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let schemas = schemas();
     let loaded = load_buffer_configuration(&parsed, &schemas, &config);
-    let bindings = BindingIndex::from_parsed(loaded.judged().file(), &schemas, &config);
-    let findings =
-        carina_core::validation::check_file_integer_arithmetic_values(loaded.judged(), &bindings);
+    let bindings = loaded.parsed().binding_index(&config);
+    let findings = loaded.integer_arithmetic_findings(&bindings);
     assert_eq!(findings.len(), 4, "{findings:?}");
     assert_eq!(
         findings
@@ -175,7 +174,7 @@ fn function_reference_and_call_findings_keep_sibling_declaration_order() {
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let schemas = schemas();
     let loaded = load_buffer_configuration(&parsed, &schemas, &config);
-    let bindings = BindingIndex::from_parsed(loaded.judged().file(), &schemas, &config);
+    let bindings = loaded.parsed().binding_index(&config);
     let errors =
         carina_core::validation::validate_user_function_ref_types_with_bindings(&parsed, &bindings)
             .unwrap_err();
@@ -188,7 +187,7 @@ fn function_reference_and_call_findings_keep_sibling_declaration_order() {
             "{error}"
         );
     }
-    let tree = AnalysisTree::try_from_file(loaded.judged().file()).unwrap();
+    let tree = loaded.parsed().analysis_tree().unwrap();
     let findings = carina_core::validation::user_function_reference_diagnostics(&tree, &bindings);
     assert_eq!(
         findings
@@ -354,24 +353,25 @@ fn canonical_attribute_wins_an_equal_distance_block_alias() {
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let loaded = load_buffer_configuration(&parsed, &schemas, &config);
     let judged = loaded.judged();
-    let tree = AnalysisTree::try_from_file(judged.file()).unwrap();
+    let tree = judged.analysis_tree().unwrap();
     let resource = tree.resources().next().unwrap();
     let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
-    let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &config);
+    let bindings = judged.parsed().binding_index(&config);
     with_session_for_test(&config, |session| {
         let report = {
-            let outcome = resource_attribute_admissions(
+            let request = ResourceAdmissionRequest::new(
                 resource,
-                judged.file(),
-                resource.schema(&schemas).unwrap(),
                 resource.quoted_string_attrs(),
                 inputs,
                 carina_core::validation::admission::attributes::ValidationEvaluation::None,
                 &bindings,
                 session,
-                &schemas,
-                &mut Default::default(),
-            );
+            )
+            .unwrap();
+            let mut validation = carina_core::validation::ConversionValidation::<
+                std::convert::Infallible,
+            >::new(judged.report());
+            let outcome = validation.admit_resource(request);
             assert!(outcome.classification_diagnostics.0.is_empty());
             outcome.values
         };
