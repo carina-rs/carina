@@ -180,9 +180,9 @@ them or chooses a default branch. The path must be relative, with no empty or
 Branch names are passed to GitHub as-is. GitHub rejects invalid ref names.
 
 Authentication uses a non-empty `GITHUB_TOKEN`, otherwise
-`gh auth token --hostname github.com`. Grant **Contents read/write** on the
+`gh auth token --hostname github.com`. Grant Contents read/write on the
 state repository. Read-only consumers of `upstream_state`, exports, or state
-commands need only **Contents read**. The token is kept outside backend
+commands need only Contents read. The token is kept outside backend
 configuration, backend locks, and saved plans.
 
 Carina trims surrounding ASCII whitespace from either credential source.
@@ -213,21 +213,21 @@ The `branch` query parameter is required. Percent-encode `/` in branch names
 as `%2F`. These URLs never acquire a lock or modify state. Offline
 `state migrate --check` accepts only a local copy, not a GitHub URL.
 
-Use **one branch per independently applied state**. State and lease writes
+Use one branch per independently applied state. State and lease writes
 use the Contents API with the observed blob SHA; mutations of different paths
 on one branch can also conflict. Carina retries branch contention a bounded
 number of times, and stops on a changed target or an unexpected response.
-The maximum state size is **10,000,000 decoded bytes (10 MB)**, checked on reads
+The maximum state size is 10,000,000 decoded bytes (10 MB), checked on reads
 and before writes. Larger states fail with a size error; they are not split.
 
 ### Measured concurrency, not a GitHub guarantee
 
-The concurrency behavior is measured, **not guaranteed by GitHub's
-documentation**. In experiments on November 14, 2026, simultaneous creates
-of the same lock file had exactly one winner in **50 of 50 trials**, and
+The concurrency behavior is measured, not guaranteed by GitHub's
+documentation. In experiments on November 14, 2026, simultaneous creates
+of the same lock file had exactly one winner in 50 of 50 trials, and
 simultaneous updates using the same blob SHA had exactly one winner in
-**50 of 50 trials**. Every loser returned HTTP 409. Simultaneous creates of
-different paths on the same branch also conflicted in **50 of 50 trials**.
+50 of 50 trials. Every loser returned HTTP 409. Simultaneous creates of
+different paths on the same branch also conflicted in 50 of 50 trials.
 These observations do not establish a guarantee during incidents or future
 GitHub changes. Blob SHAs identify content, not monotonically increasing
 generations, and checking the lease and writing state are separate requests.
@@ -240,7 +240,7 @@ Carina verifies that an acknowledged mutation's commit remains on the branch
 with one compare request. A later commit on the same history is accepted;
 a competing history is an unexpected outcome. This check does not prevent
 later changes to the branch or file. Only the comparison's status and ahead/
-behind counts are parsed. Compare responses have their own **1 MiB** body
+behind counts are parsed. Compare responses have their own 1 MiB body
 limit, separate from the state size limit. If that limit is exceeded, Carina
 reports that the write was committed but could not be verified; it retains
 the acknowledged state SHA for the next save. A November 15, 2026 measurement
@@ -253,7 +253,7 @@ SHA. An expired lease that disappears during acquisition may still be created.
 When a state write expected an existing file but returns 201, Carina reports
 a concurrent-deletion conflict and keeps the created state file.
 
-Locked state saves, including cleanup saves, require **more than 65 seconds**
+Locked state saves, including cleanup saves, require more than 65 seconds
 remaining on the observed lease: 60 seconds plus a fixed 5-second clock-skew
 allowance. This adds no request and does not change the cleanup time budget.
 It narrows the expiry window; a force-unlock or takeover can still happen
@@ -326,10 +326,17 @@ intentional given the measured request costs; it cannot extend the runner's
 external deadline.
 
 After a cut-off, run `carina state refresh` to reconcile state with the provider.
-For a leftover lock, use the lock ID shown in the lock diagnostic and either
-wait for its 60-minute lease to expire or run `carina force-unlock <id>`
-once the previous process has stopped. Refresh uses the state lock too, so
-resolve a leftover lock first.
+A cancelled run can leave its lock behind. The next run then reports:
+
+```text
+State is locked by <who> (lock ID: <id>, operation: apply, last updated <time>, expires <time>).
+A previous run may have been stopped before it released the lock (for example, a CI job cancelled during cleanup); if so, the lock expires on its own at <time>.
+If no other run is using this state, run: `carina force-unlock <id>`
+```
+
+Either wait for the 60-minute lease to expire or, once the previous process
+has stopped, run the `carina force-unlock <id>` command it shows. Refresh
+uses the state lock too, so resolve a leftover lock first.
 
 ### State history is kept
 
