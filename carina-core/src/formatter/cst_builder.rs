@@ -244,7 +244,7 @@ impl<'a> CstBuilder<'a> {
             Rule::compose_expr => {
                 Some(CstChild::Node(self.build_node(NodeKind::ComposeExpr, pair)))
             }
-            Rule::additive_expr | Rule::multiplicative_expr => {
+            Rule::additive_expr | Rule::multiplicative_expr | Rule::conversion_expr => {
                 Some(CstChild::Node(self.build_node(NodeKind::ComposeExpr, pair)))
             }
             Rule::postfix_expr => {
@@ -309,8 +309,11 @@ impl<'a> CstBuilder<'a> {
             Rule::pipe_op => Some(CstChild::Token(Token::new("|>".to_string(), span))),
             Rule::compose_op => Some(CstChild::Token(Token::new(">>".to_string(), span))),
             Rule::coalesce_op => Some(CstChild::Token(Token::new("??".to_string(), span))),
-            Rule::add_op | Rule::multiplicative_op => {
-                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            Rule::add_op
+            | Rule::multiplicative_op
+            | Rule::as_keyword
+            | Rule::conversion_type_path => {
+                Some(CstChild::Token(Token::from_rule(pair.as_str().to_string(), span, pair.as_rule())))
             }
             Rule::dot => Some(CstChild::Token(Token::new(".".to_string(), span))),
 

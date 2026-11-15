@@ -369,7 +369,7 @@ fn heterogeneous_record_keeps_its_field_constraint_checks() {
         &expected,
         &parsed.variables["value"],
         &config,
-        expression,
+        (expression).ordinary().unwrap(),
     )
     .require_provider_schemas()
     .unwrap_err()
@@ -630,7 +630,7 @@ fn literal_access_preserves_interpolation_judgement() {
                 &sink,
                 &parsed.variables["result"],
                 &config(),
-                result
+                (result).ordinary().unwrap()
             )
             .require_provider_schemas()
             .is_ok(),
@@ -688,7 +688,7 @@ fn missing_child_evidence_is_a_hard_error() {
         &TypeExpr::List(Box::new(TypeExpr::String)),
         &projection,
         &config(),
-        result,
+        (result).ordinary().unwrap(),
     )
     .require_provider_schemas();
     assert!(check.is_err(), "missing evidence was admitted: {check:?}");
@@ -758,7 +758,7 @@ fn composite_collections_preserve_child_interpolation_judgements() {
                 &sink,
                 &parsed.variables["result"],
                 &config(),
-                expression,
+                (expression).ordinary().unwrap(),
             )
             .require_provider_schemas();
             assert_eq!(result.is_ok(), accepted, "{source}: {result:?}");
@@ -1097,7 +1097,7 @@ fn boundary_value_check_enforces_binding_owned_admission() {
         .check_boundary_values_at(
             &TypeExpr::String,
             &parsed.variables["result"],
-            result,
+            result.ordinary().unwrap(),
             crate::validation::deferred_types::ProviderTypeCheckSite::new(
                 location,
                 "attribute 'output'",

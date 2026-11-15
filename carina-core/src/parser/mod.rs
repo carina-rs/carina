@@ -16,7 +16,7 @@ pub use failed_file::{
     FailedFileText, ParseFailureKind, ProtectedParseFailure, PublicFailedFileText, failed_file_text,
 };
 mod protected_regions;
-pub(crate) use ast::ParserSeedMetadata;
+pub(crate) use ast::{BindingTypeSource, ParserSeedMetadata, ResourcePrecheckIdentity};
 pub use authored_text::{AuthoredExpressionDiagnostic, AuthoredExpressionText};
 pub use grammar::{SyntaxDiagnostic, decode_attribute_key};
 mod attribute_key;

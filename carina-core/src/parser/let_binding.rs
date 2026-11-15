@@ -173,6 +173,7 @@ pub(super) fn parse_let_binding_extended(
     let is_structurally_required = detect_structural_rhs(&rhs_pair);
 
     // Check if it's a module call, resource expression, or for expression
+    let rhs_syntax = rhs_pair.clone();
     let (value, expanded_resources, data_sources, module_calls, maybe_import, binding_kind) =
         parse_expression_with_resource_or_module(
             rhs_pair,
@@ -180,7 +181,20 @@ pub(super) fn parse_let_binding_extended(
             &name,
             preprocessed_file,
             source_file,
-        )?;
+        )
+        .or_else(|error| {
+            ctx.recover_converted_evaluation(&rhs_syntax, Err(error))
+                .map(|value| {
+                    (
+                        value,
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        LetBindingKind::Value,
+                    )
+                })
+        })?;
 
     Ok((
         name.into_string(),
@@ -288,7 +302,9 @@ fn parse_expression_with_resource_or_module(
                 "primary expression",
                 "postfix expression",
             )?;
-            let postfix_steps = postfix_inner.collect::<Vec<_>>();
+            let postfix_steps = postfix_inner
+                .filter(|part| matches!(part.as_rule(), Rule::index_access | Rule::field_access))
+                .collect::<Vec<_>>();
             if !postfix_steps.is_empty() {
                 if is_declaration || matches!(binding_kind, LetBindingKind::StructuralAlias) {
                     return Err(ParseError::InvalidExpression {

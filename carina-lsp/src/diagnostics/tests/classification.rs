@@ -26,11 +26,23 @@ fn resolved_input_fallback_counter_only_records_swallowed_errors() {
     let map = authored_validation_resources(&tree);
     let values = resource.attributes().into_owned();
     let (_, coverage) = crate::admission_coverage::with_admission_coverage(|| {
-        select_admission_inputs(resource, Some(&map), &values, sealed.judged().report())
+        select_admission_inputs(
+            resource,
+            Some(&map),
+            &values,
+            sealed.judged().report(),
+            carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
+        )
     });
     assert_eq!(coverage.resolved_inputs_fell_back, 1);
     let (_, coverage) = crate::admission_coverage::with_admission_coverage(|| {
-        select_admission_inputs(resource, None, &values, sealed.judged().report())
+        select_admission_inputs(
+            resource,
+            None,
+            &values,
+            sealed.judged().report(),
+            carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
+        )
     });
     assert_eq!(coverage.resolved_inputs_fell_back, 0);
 }

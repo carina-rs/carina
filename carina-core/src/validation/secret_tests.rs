@@ -339,7 +339,7 @@ fn secret_origin_4275_providerless_deferral_has_no_plaintext() {
         &expected,
         &parsed.variables["value"],
         &config,
-        expression,
+        (expression).ordinary().unwrap(),
     );
     assert!(!format!("{check:?}").contains("private-"));
     let error = check.require_provider_schemas().unwrap_err();

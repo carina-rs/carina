@@ -2,6 +2,7 @@
 //! and the top-level `resolve_modules*` entry points.
 
 use crate::paths::{PersistedPath, ResolvedPath};
+use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
@@ -133,6 +134,27 @@ pub enum ModuleResolutionDiagnosticResult<E> {
     Unowned {
         errors: Vec<ResidualModuleResolutionError>,
     },
+}
+
+/// Produced resolver findings cannot be separated from its ordinary outcome.
+/// The document-set owner receives them before any outcome can be consumed.
+///
+/// ```compile_fail,E0599
+/// use carina_core::module_resolver::ModuleResolutionReport;
+/// fn bypass<E>(report: ModuleResolutionReport<E>) { report.into_outcome(); }
+/// ```
+pub struct ModuleResolutionReport<E> {
+    outcome: ModuleResolutionDiagnosticResult<E>,
+    placements: std::sync::Arc<crate::ConversionChannel>,
+}
+impl<E> ModuleResolutionReport<E> {
+    pub fn into_validation<F: crate::validation::ValidationClientError>(
+        self,
+        run: &mut crate::validation::ConversionValidation<F>,
+    ) -> ModuleResolutionDiagnosticResult<E> {
+        run.produced_placements(self.placements);
+        self.outcome
+    }
 }
 
 /// Resolver failure left after typed source diagnostics have claimed every
@@ -712,6 +734,9 @@ mod diagnostic_status_tests {
                 &schemas,
                 &[],
             )
+            .into_validation(&mut crate::test_utils::conversion_validation::<
+                std::convert::Infallible,
+            >())
         });
 
         match result {
@@ -980,7 +1005,7 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// Base directory for resolving relative imports
     pub(super) base_dir: PathBuf,
     pub(super) io_base_dir: ResolvedPath,
-    pub(super) module_locations: HashMap<ModuleLocationKey, ResolvedPath>,
+    pub(super) module_locations: IndexMap<ModuleLocationKey, ResolvedPath>,
     /// Root of the configuration being expanded. Unlike `base_dir`, this does
     /// not change while recursively resolving nested module imports and is
     /// therefore the stable base for user-facing source labels.
@@ -1108,7 +1133,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let base_dir = base_dir.source_label();
         Self {
             io_base_dir,
-            module_locations: HashMap::new(),
+            module_locations: IndexMap::new(),
             configuration_root: base_dir.clone(),
             source_overrides: Default::default(),
             resolution,
@@ -1264,14 +1289,13 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             return result.map(|()| module);
         }
 
-        // Mark as resolving
         self.resolving.insert(canonical.clone());
-
-        let mut parsed = match self.load_directory_module(&full_path) {
+        let loaded = self.load_directory_module(&full_path);
+        let mut parsed = match loaded {
             Ok(parsed) => parsed,
-            Err(e) => {
+            Err(error) => {
                 self.resolving.remove(&canonical);
-                return Err(e);
+                return Err(error);
             }
         };
 
@@ -1939,11 +1963,33 @@ pub fn resolve_modules_with_config<E: ResolveExportBindingPhase<ParserPlaceholde
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
+    resolve_modules_with_config_and_overrides(
+        parsed,
+        base_dir,
+        config,
+        schemas,
+        &Default::default(),
+    )
+}
+
+/// Resolve projected metadata against the same unsaved source snapshot as the
+/// directory parse. This returns values and ordinary resolver errors; callers
+/// do not publish authored findings from a separate metadata-only parse.
+pub fn resolve_modules_with_config_and_overrides<
+    E: ResolveExportBindingPhase<ParserPlaceholder>,
+>(
+    parsed: RootDirectoryParse<E>,
+    base_dir: &ResolvedPath,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: &SchemaRegistry,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let resolution = parsed.module_resolution_context();
     let mut parsed = parsed.into_parsed();
-    let expanded =
-        RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas, resolution)?
-            .expand()?;
+    let mut resolver =
+        ModuleResolver::with_config_and_schemas(base_dir, config, schemas, resolution);
+    resolver.source_overrides = overrides.clone();
+    let expanded = RefCheckedModuleGraph::check_with_resolver(&mut parsed, resolver)?.expand()?;
     ensure_expanded_root_graph(&expanded)?;
     finalize_deferred_for_bodies(expanded)
         .map(|graph| publish_authored_module_graph(graph, config.catalog()))
@@ -2114,7 +2160,7 @@ pub fn resolve_modules_with_diagnostics<E: ResolveExportBindingPhase<ParserPlace
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionReport<E::Absolute> {
     resolve_modules_with_diagnostics_and_overrides(
         parsed,
         base_dir,
@@ -2134,7 +2180,7 @@ pub fn resolve_modules_with_diagnostics_and_overrides<
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
     overrides: &crate::config_loader::SourceOverrides,
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionReport<E::Absolute> {
     let mut resolver = ModuleResolver::with_constraint_reports(
         base_dir,
         config,
@@ -2143,6 +2189,49 @@ pub fn resolve_modules_with_diagnostics_and_overrides<
     );
     resolver.source_overrides = overrides.clone();
     resolve_modules_with_diagnostics_and_resolver(parsed.parsed(), resolver, covered_findings)
+}
+
+/// Provider-value query result; this deliberately exposes no authored graph or
+/// conversion findings from the metadata parse's foreign NodeIds.
+pub enum ProviderMetadataResolution {
+    Expanded(Result<(), crate::parser::AnalysisResolutionError>),
+    Unavailable,
+}
+
+/// Finalize projected provider values using the editor's diagnostic expansion.
+/// Unlike operational expansion, this retains argument-dependent templates.
+/// The owning document run reports authored findings; this separate metadata
+/// query returns only its provider-finalization result.
+pub fn finalize_provider_metadata_with_module_overrides(
+    parsed: &ParsedRootDirectory,
+    base_dir: &ResolvedPath,
+    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: &SchemaRegistry,
+    overrides: &crate::config_loader::SourceOverrides,
+) -> ProviderMetadataResolution {
+    let report = resolve_modules_with_diagnostics_and_overrides(
+        parsed,
+        base_dir,
+        config,
+        schemas,
+        &[],
+        overrides,
+    );
+    match report.outcome {
+        ModuleResolutionDiagnosticResult::Expanded { mut graph } => {
+            ProviderMetadataResolution::Expanded(
+                crate::parser::resolve_expanded_provider_unresolved_attributes_for_analysis(
+                    &mut graph,
+                    config.catalog(),
+                )
+                .and_then(|()| crate::parser::finalize_provider_configs_for_analysis(&mut graph)),
+            )
+        }
+        ModuleResolutionDiagnosticResult::ConstraintFailed { .. }
+        | ModuleResolutionDiagnosticResult::Unowned { .. } => {
+            ProviderMetadataResolution::Unavailable
+        }
+    }
 }
 
 /// Editor/bootstrap diagnostic expansion with provider-owned value checks
@@ -2155,7 +2244,7 @@ pub fn resolve_modules_with_providerless_diagnostics<
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionReport<E::Absolute> {
     let resolver = ModuleResolver::with_providerless_constraint_reports(
         base_dir,
         config,
@@ -2171,7 +2260,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
     parsed: &crate::parser::File<E>,
     mut resolver: ModuleResolver<'_, StrictTypeResolution>,
     covered_findings: &[crate::validation::ModuleCallFinding],
-) -> ModuleResolutionDiagnosticResult<E::Absolute> {
+) -> ModuleResolutionReport<E::Absolute> {
     let mut graph = parsed.clone();
     crate::parser::retained::admit_require_scope(&mut graph);
     crate::parser::retained::judge_configuration(&mut graph, resolver.schemas, resolver.config());
@@ -2193,6 +2282,25 @@ fn resolve_modules_with_diagnostics_and_resolver<
     }
     graph.warnings.extend(resolver.provider_type_warnings());
     let mut graph = finish_root_expansion(graph, contributions, &root);
+    let mut retained_templates = HashSet::new();
+    for directory in resolver.module_locations.values() {
+        let identity = directory.identity();
+        if retained_templates.insert(identity.clone())
+            && let Some(template) = resolver.module_cache.get(&identity)
+        {
+            crate::parser::retained::retain_module_placement_findings(
+                &mut graph,
+                template.expression_report(),
+                crate::validation::FindingSubject::Module(
+                    crate::paths::DisplayPath::for_diagnostics_from(
+                        directory.source_label(),
+                        &resolver.io_base_dir,
+                    )
+                    .to_string(),
+                ),
+            );
+        }
+    }
     crate::parser::retained::judge_configuration(&mut graph, resolver.schemas, resolver.config());
     let (graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
     errors.extend(deferred_for_errors);
@@ -2212,7 +2320,8 @@ fn resolve_modules_with_diagnostics_and_resolver<
         .into_iter()
         .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings))
         .collect::<Vec<_>>();
-    if !findings.is_empty() {
+    let placements = graph.expression_report().placements.clone();
+    let outcome = if !findings.is_empty() {
         ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
     } else if !resolution_failed {
         let graph = publish_authored_module_graph(graph, resolver.session.catalog());
@@ -2221,6 +2330,10 @@ fn resolve_modules_with_diagnostics_and_resolver<
         }
     } else {
         ModuleResolutionDiagnosticResult::Unowned { errors }
+    };
+    ModuleResolutionReport {
+        outcome,
+        placements,
     }
 }
 
