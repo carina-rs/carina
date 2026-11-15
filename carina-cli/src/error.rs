@@ -2598,11 +2598,8 @@ mod tests {
 
     #[test]
     fn from_backend_locked_error() {
-        let locked = BackendError::Locked {
-            lock_id: "abc".to_string(),
-            who: "user@host".to_string(),
-            operation: "apply".to_string(),
-        };
+        let lock = carina_state::LockInfo::for_test("apply");
+        let locked = BackendError::locked(&lock);
         let app_err: AppError = locked.into();
         assert!(matches!(
             app_err,
