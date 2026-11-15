@@ -5706,37 +5706,34 @@ pub fn validate_resources<
     );
     let report = canonical.validation_report(provider_context);
     let mut run: ConversionValidation = ConversionValidation::new(&report);
-    let findings = if canonical.prefix_errors().is_empty() {
-        run.walk_in(FindingSubject::Root, |coverage| {
-            resource_values_report(
-                canonical.schema_validation_resources(),
-                canonical.schemas(),
-                known_providers,
-                provider_context,
+    let mut findings = canonical
+        .prefix_errors()
+        .iter()
+        .map(|error| {
+            let mut finding = ResourceAdmissionFinding::schema(
+                error.resource_id(),
                 None,
-                diagnostics,
-                ValueAdmission {
-                    report: &report,
-                    coverage,
-                },
-            )
+                &TypeError::AttributePrefix(Box::new(error.clone())),
+            );
+            finding.human = error.to_string();
+            finding.location = error.location().cloned();
+            finding
         })
-    } else {
-        canonical
-            .prefix_errors()
-            .iter()
-            .map(|error| {
-                let mut finding = ResourceAdmissionFinding::schema(
-                    error.resource_id(),
-                    None,
-                    &TypeError::AttributePrefix(Box::new(error.clone())),
-                );
-                finding.human = error.to_string();
-                finding.location = error.location().cloned();
-                finding
-            })
-            .collect()
-    };
+        .collect::<Vec<_>>();
+    findings.extend(run.walk_in(FindingSubject::Root, |coverage| {
+        resource_values_report(
+            canonical.schema_validation_resources(),
+            canonical.schemas(),
+            known_providers,
+            provider_context,
+            None,
+            diagnostics,
+            ValueAdmission {
+                report: &report,
+                coverage,
+            },
+        )
+    }));
     run.ordinary(findings, FindingSubject::Root);
     let findings = run.complete().into_presented();
     if findings.is_empty() {

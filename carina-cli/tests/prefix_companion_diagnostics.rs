@@ -214,6 +214,10 @@ impl PrefixDirectory {
         if !native {
             return editor_diagnostics(self.0.path()).await;
         }
+        self.native_lsp_at("main.crn")
+    }
+
+    fn native_lsp_at(&self, relative: &str) -> Vec<Diagnostic> {
         let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(vec![
                 Box::new(PrefixFactory) as Box<dyn carina_core::provider::ProviderFactory>
@@ -226,7 +230,7 @@ impl PrefixDirectory {
             Arc::new(loaded),
             vec!["mock".into()],
         );
-        let path = self.0.path().join("main.crn");
+        let path = self.0.path().join(relative);
         let document = Document::new_with_path(
             std::fs::read_to_string(&path).unwrap(),
             path.clone(),
@@ -698,4 +702,43 @@ async fn prefix_companion_with_binding_error_keeps_the_same_owner_finding() {
     assert_eq!(expected.len(), 1, "{cli:#}");
     assert!(expected[0].contains("expected Int"), "{cli:#}");
     assert_eq!(error_messages(&lsp), expected, "{lsp:#?}");
+}
+
+#[tokio::test]
+async fn prefix_companion_module_deferred_if_matches_validate() {
+    let fixture = PrefixDirectory::new(&[
+        (
+            "main.crn",
+            "let child = use { source = './child' }\nlet instance = child { enabled = true }\n",
+        ),
+        ("child/arguments.crn", "arguments { enabled: Bool }\n"),
+        (
+            "child/main.crn",
+            "let r = if enabled { mock.PrefixSink { attr_prefix = 'ok' } } else { mock.PrefixSink { attr_prefix = 'other' } }\n",
+        ),
+    ]);
+    let cli = fixture.cli(true);
+    assert_eq!(cli["status"], "ok", "{cli:#}");
+    let root = fixture.lsp(true).await;
+    assert!(error_messages(&root).is_empty(), "root: {root:#?}");
+    let module = fixture.native_lsp_at("child/main.crn");
+    assert!(
+        error_messages(&module).is_empty(),
+        "module-own diagnostics must agree with validate: {module:#?}"
+    );
+}
+
+#[tokio::test]
+async fn prefix_companion_root_static_if_matches_validate() {
+    let fixture = PrefixDirectory::new(&[
+        ("lets.crn", "let enabled = true\n"),
+        (
+            "main.crn",
+            "let r = if enabled { mock.PrefixSink { attr_prefix = 'ok' } }\n",
+        ),
+    ]);
+    let cli = fixture.cli(true);
+    let lsp = fixture.lsp(true).await;
+    assert_eq!(cli["status"], "ok", "{cli:#}");
+    assert!(error_messages(&lsp).is_empty(), "{lsp:#?}");
 }

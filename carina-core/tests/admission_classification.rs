@@ -172,3 +172,47 @@ fn raw_file_validation_retains_typed_prefix_failures() {
         assert!(errors[0].to_string().contains(message), "{errors:?}");
     }
 }
+
+#[test]
+fn raw_file_validation_reports_prefix_and_other_owner_errors() {
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Test")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = parse_file_and_resolve(
+        "let bad_prefix = mock.Test { name_prefix = '' }\nlet other = mock.Test { name = 7 }",
+        std::path::Path::new("main.crn"),
+        &context,
+    )
+    .unwrap();
+    let findings = carina_core::validation::validate_resources(
+        &parsed,
+        &schemas,
+        &std::collections::HashSet::from(["mock".into()]),
+        &context,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    let messages = findings
+        .iter()
+        .map(|finding| finding.message())
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 2, "{findings:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("'name_prefix' cannot be empty")),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("expected String, got Int")),
+        "{messages:?}"
+    );
+}

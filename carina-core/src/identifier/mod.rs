@@ -1556,7 +1556,7 @@ pub fn resolve_attr_prefix_findings<P: PlaceholderKind, B: BindingAddress>(
     resources: &mut [Resource<crate::resource::ModuleSource, P, B>],
     registry: &SchemaRegistry,
 ) -> Vec<AttributePrefixError> {
-    prefix::resolve_resources(resources, registry, SuffixSource::Random).0
+    prefix::resolve_resources(resources, registry, SuffixSource::Random)
 }
 
 /// State information needed for prefix reconciliation.

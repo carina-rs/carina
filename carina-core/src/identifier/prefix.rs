@@ -81,8 +81,99 @@ pub struct PrefixCanonicalized<'s, F> {
     file: F,
     schemas: &'s SchemaRegistry,
     errors: Vec<AttributePrefixError>,
-    rejected: Vec<usize>,
+    visits: Vec<OwnerVisit>,
 }
+// These addresses are minted only while visiting the owning file. Judging
+// clones that file without adding/reordering owners, so addresses survive the
+// phase transition without treating a projected ResourceId as membership.
+#[derive(Clone, Copy)]
+enum OwnerAddress {
+    Resource(usize),
+    DataSource(usize),
+    DeferredFor(usize),
+    Conditional { conditional: usize, branch: usize },
+}
+#[derive(Clone)]
+struct OwnerVisit {
+    owner: OwnerAddress,
+    errors: std::ops::Range<usize>,
+}
+impl OwnerAddress {
+    fn managed_resource<X, P: PlaceholderKind, T: PlaceholderKind, D, B: BindingAddress>(
+        self,
+        file: &File<X, P, T, D, B>,
+    ) -> Option<&Resource<ModuleSource, P, B>> {
+        match self {
+            Self::Resource(index) => file.resources.get(index),
+            Self::Conditional {
+                conditional,
+                branch,
+            } => {
+                match file
+                    .deferred_module_ifs
+                    .get(conditional)?
+                    .branches()
+                    .nth(branch)?
+                {
+                    crate::parser::DeferredIfBody::Resource(resource) => Some(resource),
+                    crate::parser::DeferredIfBody::DataSource(_)
+                    | crate::parser::DeferredIfBody::ModuleCall(_) => None,
+                }
+            }
+            Self::DataSource(_) | Self::DeferredFor(_) => None,
+        }
+    }
+}
+
+// Pointer keys are local to this borrow, rebuilt from recorded addresses after
+// cloning/judging. Pending/anonymous IDs may be equal for different owners.
+fn visited_members<X, P: PlaceholderKind, T: PlaceholderKind, D, B: BindingAddress>(
+    file: &File<X, P, T, D, B>,
+    visits: &[OwnerVisit],
+) -> std::collections::HashMap<*const ResourceId, bool>
+where
+    D: DeferredForPhaseTraversal<P, T, B>,
+{
+    let templates: Vec<_> = file
+        .deferred_for_phase
+        .analysis_resource_refs()
+        .map(|resource| std::ptr::from_ref(resource.id()))
+        .collect();
+    visits
+        .iter()
+        .filter_map(|visit| {
+            let owner = match visit.owner {
+                OwnerAddress::Resource(_) => visit
+                    .owner
+                    .managed_resource(file)
+                    .map(|resource| std::ptr::from_ref(&resource.id)),
+                OwnerAddress::Conditional {
+                    conditional,
+                    branch,
+                } => file
+                    .deferred_module_ifs
+                    .get(conditional)
+                    .and_then(|deferred| deferred.branches().nth(branch))
+                    .and_then(|body| match body {
+                        crate::parser::DeferredIfBody::Resource(resource) => {
+                            Some(std::ptr::from_ref(&resource.id))
+                        }
+                        crate::parser::DeferredIfBody::DataSource(resource) => {
+                            Some(std::ptr::from_ref(&resource.id))
+                        }
+                        crate::parser::DeferredIfBody::ModuleCall(_) => None,
+                    }),
+                OwnerAddress::DataSource(index) => file
+                    .data_sources
+                    .get(index)
+                    .map(|resource| std::ptr::from_ref(&resource.id)),
+                OwnerAddress::DeferredFor(index) => templates.get(index).copied(),
+            }?;
+            Some((owner, !visit.errors.is_empty()))
+        })
+        .collect()
+}
+
 impl<F: std::fmt::Debug> std::fmt::Debug for PrefixCanonicalized<'_, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrefixCanonicalized")
@@ -105,19 +196,60 @@ pub fn canonicalize_file_prefixes<
     X,
     P: PlaceholderKind,
     T: PlaceholderKind,
-    D,
+    D: DeferredForPhaseTraversal<P, T, B>,
     B: BindingAddress,
 >(
     mut file: File<X, P, T, D, B>,
     schemas: &'s SchemaRegistry,
     suffix: SuffixSource,
 ) -> PrefixCanonicalized<'s, File<X, P, T, D, B>> {
-    let (errors, rejected) = resolve_resources(&mut file.resources, schemas, suffix);
+    let mut errors = Vec::new();
+    let mut visits = Vec::new();
+    let mut record = |owner, findings: Vec<AttributePrefixError>| {
+        let start = errors.len();
+        errors.extend(findings);
+        visits.push(OwnerVisit {
+            owner,
+            errors: start..errors.len(),
+        });
+    };
+    for (index, resource) in file.resources.iter_mut().enumerate() {
+        record(
+            OwnerAddress::Resource(index),
+            resolve_resource(resource, schemas, suffix),
+        );
+    }
+    // Exclusions are visited explicitly: reads never generate names and
+    // deferred-for bodies retain the CLI's raw-key language behavior.
+    for index in 0..file.data_sources.len() {
+        record(OwnerAddress::DataSource(index), Vec::new());
+    }
+    for (index, _) in file.deferred_for_phase.analysis_resource_refs().enumerate() {
+        record(OwnerAddress::DeferredFor(index), Vec::new());
+    }
+    for (conditional, deferred) in file.deferred_module_ifs.iter_mut().enumerate() {
+        for (branch, body) in deferred.branches_mut().enumerate() {
+            let findings = match body {
+                crate::parser::DeferredIfBody::Resource(resource) => {
+                    resolve_resource(resource, schemas, suffix)
+                }
+                crate::parser::DeferredIfBody::DataSource(_) => Vec::new(),
+                crate::parser::DeferredIfBody::ModuleCall(_) => continue,
+            };
+            record(
+                OwnerAddress::Conditional {
+                    conditional,
+                    branch,
+                },
+                findings,
+            );
+        }
+    }
     PrefixCanonicalized {
         file,
         schemas,
         errors,
-        rejected,
+        visits,
     }
 }
 
@@ -150,7 +282,7 @@ where
             file: JudgedFile::new(self.file.clone(), self.schemas, context),
             schemas: self.schemas,
             errors: self.errors.clone(),
-            rejected: self.rejected.clone(),
+            visits: self.visits.clone(),
         }
     }
 }
@@ -200,7 +332,7 @@ fn schema_validation_resources<
 >(
     file: &'f File<X, P, T, D, B>,
     schemas: &'f SchemaRegistry,
-    rejected: &[usize],
+    visits: &[OwnerVisit],
 ) -> CanonicalSchemaInputs<'f, P, T, B>
 where
     D: DeferredForPhaseTraversal<P, T, B>,
@@ -214,24 +346,18 @@ where
             declaration: declaration_identity(schema),
         }
     }
+    let members = visited_members(file, visits);
     let resources = file
         .iter_all_resources()
+        .filter(|resource| members.get(&std::ptr::from_ref(resource.id())) == Some(&false))
         .filter_map(|resource| match resource {
             ResourceRef::LiveComposition(_) => None,
-            ResourceRef::Resource(resource) => {
-                if rejected
-                    .iter()
-                    .any(|index| std::ptr::eq(&file.resources[*index], resource))
-                {
-                    return None;
-                }
-                Some(CanonicalSchemaResource::Resource(
-                    resource,
-                    schemas
-                        .get_for(resource)
-                        .map(|schema| (schema, values(schema, &resource.attributes))),
-                ))
-            }
+            ResourceRef::Resource(resource) => Some(CanonicalSchemaResource::Resource(
+                resource,
+                schemas
+                    .get_for(resource)
+                    .map(|schema| (schema, values(schema, &resource.attributes))),
+            )),
             ResourceRef::DataSource(resource) => Some(CanonicalSchemaResource::DataSource(
                 resource,
                 schemas
@@ -258,7 +384,7 @@ where
     D: DeferredForPhaseTraversal<P, T, B>,
 {
     pub(crate) fn schema_validation_resources(&self) -> CanonicalSchemaInputs<'_, P, T, B> {
-        schema_validation_resources(&self.file, self.schemas, &self.rejected)
+        schema_validation_resources(&self.file, self.schemas, &self.visits)
     }
     pub(crate) fn validation_report(
         &self,
@@ -448,7 +574,7 @@ where
     pub(crate) fn schema_validation_resources(
         &self,
     ) -> CanonicalSchemaInputs<'_, ParserPlaceholder, ParserPlaceholder, B> {
-        schema_validation_resources(self.file.file(), self.schemas, &self.rejected)
+        schema_validation_resources(self.file.file(), self.schemas, &self.visits)
     }
     pub(crate) fn admission_report(&self) -> &crate::parser::retained::ExpressionReport<B> {
         self.file
@@ -513,32 +639,41 @@ where
             &AttributePrefixError,
         ),
     > {
-        self.rejected
-            .iter()
-            .zip(&self.errors)
-            .map(|(index, error)| (&self.file.file().resources[*index], error))
+        let file = self.file.file();
+        self.visits.iter().flat_map(move |visit| {
+            visit
+                .owner
+                .managed_resource(file)
+                .into_iter()
+                .flat_map(move |owner| {
+                    self.errors[visit.errors.clone()]
+                        .iter()
+                        .map(move |error| (owner, error))
+                })
+        })
     }
+
     pub fn analysis_tree(&self) -> Result<CanonicalAnalysisTree<'_, X, D, B>, AnalysisTreeError> {
         let file = self.file.file();
         let tree = AnalysisTree::try_from_file(file)?;
+        let members = visited_members(file, &self.visits);
         let top_level_resource_count = tree.top_level_resources().count();
         let resources = tree
             .into_resources()
             .into_iter()
             .map(|resource| {
-                let rejected = self
-                    .rejected
-                    .iter()
-                    .any(|index| std::ptr::eq(&file.resources[*index].id, resource.id()));
-                match resource.schema(self.schemas) {
-                    Some(schema) if !rejected => CanonicalItem::Bound(CanonicalResource {
+                match (
+                    members.get(&std::ptr::from_ref(resource.id())),
+                    resource.schema(self.schemas),
+                ) {
+                    (Some(false), Some(schema)) => CanonicalItem::Bound(CanonicalResource {
                         resource,
                         file,
                         schemas: self.schemas,
                         schema,
                     }),
-                    Some(_schema) => CanonicalItem::Rejected(resource),
-                    None => CanonicalItem::Unavailable(resource),
+                    (Some(true), Some(_schema)) => CanonicalItem::Rejected(resource),
+                    (None, _) | (_, None) => CanonicalItem::Unavailable(resource),
                 }
             })
             .collect();
@@ -574,42 +709,45 @@ pub(super) fn resolve_resources<P: PlaceholderKind, B: BindingAddress>(
     resources: &mut [Resource<ModuleSource, P, B>],
     schemas: &SchemaRegistry,
     suffix: SuffixSource,
-) -> (Vec<AttributePrefixError>, Vec<usize>) {
-    let mut errors = Vec::new();
-    let mut rejected = Vec::new();
-    for (index, resource) in resources.iter_mut().enumerate() {
-        let Some(schema) = schemas.get_for(resource) else {
-            continue;
-        };
-        let (rewrites, mut findings) = rewrite_prefix_values(
-            &mut resource.attributes,
-            schema,
-            &resource.id,
-            resource.declaration.location().cloned(),
-            suffix,
+) -> Vec<AttributePrefixError> {
+    resources
+        .iter_mut()
+        .flat_map(|resource| resolve_resource(resource, schemas, suffix))
+        .collect()
+}
+
+fn resolve_resource<P: PlaceholderKind, B: BindingAddress>(
+    resource: &mut Resource<ModuleSource, P, B>,
+    schemas: &SchemaRegistry,
+    suffix: SuffixSource,
+) -> Vec<AttributePrefixError> {
+    let Some(schema) = schemas.get_for(resource) else {
+        return Vec::new();
+    };
+    let (rewrites, findings) = rewrite_prefix_values(
+        &mut resource.attributes,
+        schema,
+        &resource.id,
+        resource.declaration.location().cloned(),
+        suffix,
+    );
+    for rewrite in rewrites {
+        resource.declaration.rename_attribute_path(
+            &[crate::parser::AttributePathSegment::Attribute(
+                rewrite.authored,
+            )],
+            &rewrite.base,
         );
-        if !findings.is_empty() {
-            rejected.extend(std::iter::repeat_n(index, findings.len()));
-        }
-        errors.append(&mut findings);
-        for rewrite in rewrites {
-            resource.declaration.rename_attribute_path(
-                &[crate::parser::AttributePathSegment::Attribute(
-                    rewrite.authored,
-                )],
-                &rewrite.base,
-            );
-            resource.prefixes.insert(
-                rewrite.base.clone(),
-                rewrite.prefix.expose_plaintext().to_owned(),
-            );
-            resource.authored_slots.record_synthetic(
-                rewrite.base,
-                crate::parser::retained::SyntheticSource::ResourcePrefix(ResourcePrefixSource(())),
-            );
-        }
+        resource.prefixes.insert(
+            rewrite.base.clone(),
+            rewrite.prefix.expose_plaintext().to_owned(),
+        );
+        resource.authored_slots.record_synthetic(
+            rewrite.base,
+            crate::parser::retained::SyntheticSource::ResourcePrefix(ResourcePrefixSource(())),
+        );
     }
-    (errors, rejected)
+    findings
 }
 
 pub(crate) fn canonicalize_prefix_values<P: PlaceholderKind, B: BindingAddress>(
@@ -815,6 +953,32 @@ mod tests {
             }
             assert_eq!(count, 1);
         });
+    }
+
+    #[test]
+    fn prefix_canonicalization_does_not_authorize_unvisited_owners() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        // Keep both declarations in the syntax inventory, but hide one from
+        // the canonicalizer to simulate a future, unvisited tree source.
+        let mut parsed = crate::parser::parse_and_resolve(
+            "mock.Sink { name_prefix = 'ok' }\nmock.Sink { name_prefix = 'raw' }",
+        )
+        .unwrap();
+        let unvisited = parsed.resources.pop().unwrap();
+        let mut canonical = canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview);
+        canonical.file.resources.push(unvisited);
+        let judged = canonical.judge(&context);
+        let tree = judged.analysis_tree().unwrap();
+        assert_eq!(tree.project_resource_refs().count(), 2);
+        assert_eq!(
+            (
+                tree.resources().count(),
+                judged.schema_validation_resources().resources.len()
+            ),
+            (1, 1),
+            "neither the tree nor schema validation can authorize an unvisited owner (even with the same pending ResourceId)",
+        );
     }
 
     #[test]
