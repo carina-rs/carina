@@ -148,6 +148,7 @@ fn unsubstituted_reference_keeps_ordinary_memo_allocations_and_skips_reference_c
                     authored: None,
                 }),
                 coverage: &coverage,
+                claim: Default::default(),
             };
             let mut recovered = direct.clone();
             recovered.callbacks.ordinary = OrdinaryCheck::References(&policy);
@@ -230,6 +231,7 @@ fn substituted_module_output_keeps_ordinary_memo_and_skips_reference_callback() 
                 cursor,
                 callbacks,
                 coverage: &coverage,
+                claim: Default::default(),
             };
             let validator = ValueValidator::new(empty_defs_for_schema_walks(), None);
             for _ in 0..2 {
@@ -293,6 +295,7 @@ fn reference_scope_does_not_reuse_member_trial_cache() {
             cursor,
             callbacks,
             coverage: &coverage,
+            claim: Default::default(),
         };
         for member_first in [false, true] {
             let validator = ValueValidator::new(empty_defs_for_schema_walks(), None);
@@ -408,6 +411,7 @@ fn with_rejected_reference(test: impl FnOnce(CheckedValue<'_>, TypeError)) {
                 cursor,
                 callbacks,
                 coverage: &coverage,
+                claim: Default::default(),
             }),
         );
         test(checked, error);
@@ -466,6 +470,7 @@ fn recovered_reference_memo_hits_allocate_only_what_the_ordinary_walk_does() {
             cursor,
             callbacks: callbacks.clone(),
             coverage: &coverage,
+            claim: Default::default(),
         };
         let mut recovered = direct.clone();
         recovered.callbacks.ordinary = OrdinaryCheck::References(&policy);

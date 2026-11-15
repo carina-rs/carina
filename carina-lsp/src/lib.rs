@@ -14,6 +14,8 @@ pub(crate) mod let_parse;
 pub(crate) mod lex;
 pub mod position;
 pub mod semantic_tokens;
+#[cfg(feature = "test-utils")]
+pub mod test_support;
 pub mod workspace;
 
 pub use backend::Backend;

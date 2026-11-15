@@ -136,7 +136,9 @@ fn read_value_evidence_cannot_retain_string_or_int_member_constraints() {
             &restored,
             &value,
             loaded.provider_context(),
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         )
         .require_provider_schemas()
         .expect("reads retain identity constraints and semantic checks only");
@@ -603,7 +605,9 @@ fn read_projections_keep_identity_constraints_without_slot_members() {
         &exact,
         &text("A".repeat(80)),
         snapshot.provider_context(),
-        &crate::parser::retained::value_dependent_judgement_for_test(),
+        crate::parser::retained::value_dependent_judgement_for_test()
+            .ordinary()
+            .unwrap(),
     )
     .require_provider_schemas()
     .expect("an exact source value must not inherit its narrower sibling's bound");
@@ -622,7 +626,9 @@ fn read_projections_keep_identity_constraints_without_slot_members() {
         &restored,
         &text("A".repeat(80)),
         snapshot.provider_context(),
-        &crate::parser::retained::value_dependent_judgement_for_test(),
+        crate::parser::retained::value_dependent_judgement_for_test()
+            .ordinary()
+            .unwrap(),
     )
     .require_provider_schemas()
     .expect("serde must retain the exact projection's validation scope");
@@ -660,7 +666,9 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
         &exact,
         &value,
         snapshot.provider_context(),
-        &crate::parser::retained::value_dependent_judgement_for_test(),
+        crate::parser::retained::value_dependent_judgement_for_test()
+            .ordinary()
+            .unwrap(),
     )
     .require_provider_schemas()
     .expect("only the exact declaration's callback may validate this source");
@@ -669,7 +677,9 @@ fn exact_projection_value_validation_keeps_its_callback_without_sibling_callback
         &annotation(&snapshot),
         &value,
         snapshot.provider_context(),
-        &crate::parser::retained::value_dependent_judgement_for_test(),
+        crate::parser::retained::value_dependent_judgement_for_test()
+            .ordinary()
+            .unwrap(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -775,7 +785,9 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
                     ty,
                     &text("INVALID"),
                     snapshot.provider_context(),
-                    &crate::parser::retained::value_dependent_judgement_for_test(),
+                    crate::parser::retained::value_dependent_judgement_for_test()
+                        .ordinary()
+                        .unwrap(),
                 )
                 .require_provider_schemas()
                 .is_err(),
@@ -788,7 +800,9 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
                 &restored,
                 &text("VALID"),
                 missing.provider_context(),
-                &crate::parser::retained::value_dependent_judgement_for_test(),
+                crate::parser::retained::value_dependent_judgement_for_test()
+                    .ordinary()
+                    .unwrap(),
             )
             .require_provider_schemas()
             .is_err(),
@@ -856,7 +870,9 @@ fn review_projection_serde_keeps_reference_semantics_and_rejects_ambiguous_callb
         &restored,
         &text("VALID"),
         ambiguous.provider_context(),
-        &crate::parser::retained::value_dependent_judgement_for_test(),
+        crate::parser::retained::value_dependent_judgement_for_test()
+            .ordinary()
+            .unwrap(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -901,7 +917,9 @@ fn review_enum_witness_constraints_apply_to_canonical_api_spelling() {
             &ty,
             &value,
             snapshot.provider_context(),
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         )
         .require_provider_schemas()
         .unwrap();
@@ -940,7 +958,9 @@ fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
                     &ty,
                     &value,
                     lax.provider_context(),
-                    &crate::parser::retained::value_dependent_judgement_for_test(),
+                    crate::parser::retained::value_dependent_judgement_for_test()
+                        .ordinary()
+                        .unwrap(),
                 )
                 .require_provider_schemas();
                 assert_eq!(result.is_ok(), accepted, "{value:?}: {result:?}");
@@ -975,7 +995,9 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
             &ty,
             value,
             &context,
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         )
         .require_provider_schemas()
         .expect_err("the retained witness must reject the value");
@@ -1345,9 +1367,11 @@ fn computed_access_keeps_only_identity_constraints() {
         &TypeExpr::List(Box::new(expected)),
         &list(vec![access]),
         snapshot.provider_context(),
-        report
+        (report
             .binding(&crate::resource::RelativeBindingName::new("result"))
-            .unwrap(),
+            .unwrap())
+        .ordinary()
+        .unwrap(),
     )
     .require_provider_schemas()
     .expect("a read's former member bounds are not value constraints");
@@ -1457,7 +1481,7 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
                 &expected,
                 &access,
                 snapshot.provider_context(),
-                inference,
+                (inference).ordinary().unwrap(),
             )
             .require_provider_schemas();
             match expected_error {
@@ -1745,6 +1769,7 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
                 .into_classification(),
             Some(&bindings),
             session,
+            crate::test_utils::no_conversion_proof(),
         );
         let pending = admit(&destination, candidate, &boundary)
             .unwrap()
@@ -1760,6 +1785,7 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
                 .into_classification(),
             Some(&bindings),
             session,
+            crate::test_utils::no_conversion_proof(),
         );
         let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
         let mut resolved = ResolvedBindings::default();
@@ -1910,9 +1936,11 @@ fn integer_result_mismatches_share_names_in_value_and_resource_checkers() {
         &inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p"),
         &parsed.resources[0].attributes["value0"],
         snapshot.provider_context(),
-        report
+        (report
             .binding(&crate::resource::RelativeBindingName::new("result"))
-            .unwrap(),
+            .unwrap())
+        .ordinary()
+        .unwrap(),
     )
     .require_provider_schemas()
     .unwrap_err();
@@ -2067,11 +2095,13 @@ fn constructed_builtin_at_named_field(expression: &str, sink: DraftType) -> Resu
         &expected,
         &parsed.variables["result"],
         &context,
-        configuration
+        (configuration
             .judged()
             .report()
             .binding(&crate::resource::RelativeBindingName::new("result"))
-            .unwrap(),
+            .unwrap())
+        .ordinary()
+        .unwrap(),
     )
     .require_provider_schemas()
     .map_err(|error| error.to_string())?;
@@ -2172,11 +2202,13 @@ fn issue_4282_external_strings_and_keys_keep_named_sink_rejection() {
             loaded.schema_registry(),
             loaded.provider_context().as_provider_context(),
         );
-        let error = crate::parser::retained::admit_expression(
-            report
-                .binding(&crate::resource::RelativeBindingName::new("result"))
-                .unwrap(),
-            &annotation(&loaded),
+        let error = crate::test_utils::ordinary_sink_result_for_test(
+            crate::parser::retained::admit_expression(
+                report
+                    .binding(&crate::resource::RelativeBindingName::new("result"))
+                    .unwrap(),
+                &annotation(&loaded),
+            ),
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "expected aws.iam.Role.Name, got String");
@@ -2249,11 +2281,13 @@ fn issue_4282_review_split_coalesce_checks_literal_alternative() {
         &expected,
         &parsed.variables["r"],
         context,
-        configuration
+        (configuration
             .judged()
             .report()
             .binding(&crate::resource::RelativeBindingName::new("r"))
-            .unwrap(),
+            .unwrap())
+        .ordinary()
+        .unwrap(),
     )
     .require_provider_schemas();
     let error = checked.expect_err("the literal alternative must retain its value check");
@@ -2632,7 +2666,9 @@ fn layered_scalar_evidence_fixture_round_trips_and_rebinds() {
                 &restored[key],
                 &value,
                 snapshot.provider_context(),
-                &crate::parser::retained::value_dependent_judgement_for_test(),
+                crate::parser::retained::value_dependent_judgement_for_test()
+                    .ordinary()
+                    .unwrap(),
             )
             .require_provider_schemas();
             assert_eq!(result.is_ok(), valid, "{key}: {result:?}");
@@ -2809,7 +2845,9 @@ fn enum_identity_annotations_reject_nonmembers_matching_the_base() {
                 ty,
                 &value,
                 loaded.provider_context(),
-                &crate::parser::retained::value_dependent_judgement_for_test(),
+                crate::parser::retained::value_dependent_judgement_for_test()
+                    .ordinary()
+                    .unwrap(),
             )
             .require_provider_schemas();
             assert_eq!(result.is_ok(), valid, "{value:?}: {result:?}");
@@ -2931,7 +2969,9 @@ fn decoded_annotation_checks_current_owner_declarations() {
             &decoded,
             &text(value),
             current.provider_context(),
-            &crate::parser::retained::value_dependent_judgement_for_test(),
+            crate::parser::retained::value_dependent_judgement_for_test()
+                .ordinary()
+                .unwrap(),
         )
         .require_provider_schemas();
         assert_eq!(checked.is_ok(), valid, "{value}: {checked:?}");
@@ -3058,6 +3098,7 @@ fn round12_unknown_function_return_rechecks_destination_member_at_resolution() {
                     .into_classification(),
                 Some(&bindings),
                 session,
+                crate::test_utils::no_conversion_proof(),
             );
             let pending = admit(&destination, candidate, &boundary)
                 .unwrap()

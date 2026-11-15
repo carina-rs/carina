@@ -139,6 +139,12 @@ pub(crate) fn parse_coalesce_expr_with_mode(
     let evaluation = ctx.evaluation_site(&pair);
     evaluation
         .evaluate(|| {
+            if let Some(postfix) = forwarded_postfix(&pair) {
+                let value = super::primary::parse_postfix_eval_with_mode(postfix, ctx, mode)?;
+                ctx.record_retained_eval(&pair, &value);
+                return Ok(value);
+            }
+
             let line = pair.line_col().0;
             let mut values = pair
                 .into_inner()
@@ -162,6 +168,33 @@ pub(crate) fn parse_coalesce_expr_with_mode(
             Ok(result)
         })
         .map_err(Into::into)
+}
+
+// Precedence layers with one operand have no evaluation policy. Peel them
+// without keeping a recursive frame per layer for nested branch expressions.
+fn forwarded_postfix<'i>(
+    pair: &pest::iterators::Pair<'i, Rule>,
+) -> Option<pest::iterators::Pair<'i, Rule>> {
+    let mut pair = pair.clone();
+    loop {
+        use super::EvaluationForm;
+        match super::evaluation_form(pair.as_rule()) {
+            EvaluationForm::Forwarding => {
+                let mut children = pair.into_inner();
+                let child = children.next()?;
+                if children.next().is_some() {
+                    return None;
+                }
+                pair = child;
+            }
+            EvaluationForm::Postfix => return Some(pair),
+            EvaluationForm::List
+            | EvaluationForm::Map
+            | EvaluationForm::If
+            | EvaluationForm::Expression
+            | EvaluationForm::Other => return None,
+        }
+    }
 }
 
 pub(crate) fn combine_coalesce_operands(
