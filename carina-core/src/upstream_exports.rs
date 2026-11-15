@@ -310,12 +310,8 @@ impl ResolvedUpstreamSource {
     pub fn upstream_states(&self) -> &[UpstreamState<RelativeBindingName>] {
         &self.upstream_states
     }
-    pub fn unavailable_reason(&self) -> Option<&UpstreamSourceUnavailable> {
-        self.surface
-            .entries
-            .as_ref()
-            .err()
-            .map(std::sync::Arc::as_ref)
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        self.surface.entries.as_ref().err().map(String::as_str)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -332,11 +328,9 @@ impl ResolvedUpstreamSource {
             backend: None,
             upstream_states: vec![],
             surface: SourceSurface {
-                entries: entries.cloned().ok_or_else(|| {
-                    std::sync::Arc::new(UpstreamSourceUnavailable::Configuration(
-                        "test fixture has no source surface".into(),
-                    ))
-                }),
+                entries: entries
+                    .cloned()
+                    .ok_or_else(|| "test fixture has no source surface".into()),
             },
         }
     }
@@ -344,54 +338,54 @@ impl ResolvedUpstreamSource {
 
 #[derive(Debug, Clone)]
 struct SourceSurface {
-    entries: Result<UpstreamExportEntries, std::sync::Arc<UpstreamSourceUnavailable>>,
-}
-
-/// Non-rejecting source failures preserve unchecked admission and their typed
-/// causes. A module-template rejection cannot inhabit this unavailable surface.
-#[derive(Debug, thiserror::Error)]
-pub enum UpstreamSourceUnavailable {
-    #[error("{0}")]
-    Configuration(String),
-    #[error("{error}")]
-    Module {
-        base: std::path::PathBuf,
-        error: Box<crate::module_resolver::ModuleError>,
-    },
-    #[error("{}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))]
-    Boundaries(Vec<crate::validation::ExportBoundaryError>),
+    entries: Result<UpstreamExportEntries, String>,
 }
 
 // These witnesses have private fields in a child module. Their only
 // constructors issue a witness inside an exhaustive verdict match.
 mod root_witness {
     use super::*;
+    #[derive(Clone, Copy)]
+    struct RootAdmission;
+    impl RootAdmission {
+        fn issue(
+            verdict: crate::config_loader::CompleteDirectoryVerdict,
+        ) -> Result<Self, crate::config_loader::ModuleTemplateDeclarations> {
+            match verdict {
+                crate::config_loader::DirectoryVerdict::Root(_)
+                | crate::config_loader::DirectoryVerdict::NoEvidence(_) => Ok(Self),
+                crate::config_loader::DirectoryVerdict::ModuleTemplate(template) => Err(template),
+            }
+        }
+    }
     pub(super) struct RootUpstreamSource<'a> {
         loaded: &'a crate::config_loader::LoadedConfig,
         identity: &'a UpstreamSourceIdentity,
+        admission: RootAdmission,
     }
     pub(super) struct RootUpstreamParse {
         parsed: crate::config_loader::ParsedRootDirectory,
+        _admission: RootAdmission,
     }
     impl<'a> RootUpstreamSource<'a> {
         pub(super) fn from_verdict(
             loaded: &'a crate::config_loader::LoadedConfig,
             identity: &'a UpstreamSourceIdentity,
         ) -> Result<Self, Box<UpstreamModuleTemplateRejection>> {
-            match loaded.parsed.complete_directory_verdict() {
-                crate::config_loader::DirectoryVerdict::Root(_)
-                | crate::config_loader::DirectoryVerdict::NoEvidence(_) => {
-                    Ok(Self { loaded, identity })
-                }
-                crate::config_loader::DirectoryVerdict::ModuleTemplate(template) => {
-                    Err(Box::new(UpstreamModuleTemplateRejection::new(
+            let admission = RootAdmission::issue(loaded.parsed.complete_directory_verdict())
+                .map_err(|template| {
+                    Box::new(UpstreamModuleTemplateRejection::new(
                         identity.binding.clone(),
                         identity.declared_source.clone(),
                         template,
                         identity.caller.clone(),
-                    )))
-                }
-            }
+                    ))
+                })?;
+            Ok(Self {
+                loaded,
+                identity,
+                admission,
+            })
         }
         pub(super) fn source(&self) -> &ResolvedPath {
             &self.identity.source
@@ -405,6 +399,7 @@ mod root_witness {
             // projecting its export parse. Carry the witness across that projection.
             Ok(RootUpstreamParse {
                 parsed: self.loaded.upstream_export_source(catalog, schemas)?,
+                _admission: self.admission,
             })
         }
     }
@@ -413,11 +408,11 @@ mod root_witness {
         pub(super) fn from_verdict(
             parsed: crate::config_loader::ParsedRootDirectory,
         ) -> Result<Self, crate::config_loader::ModuleTemplateDeclarations> {
-            match parsed.complete_directory_verdict() {
-                crate::config_loader::DirectoryVerdict::Root(_)
-                | crate::config_loader::DirectoryVerdict::NoEvidence(_) => Ok(Self { parsed }),
-                crate::config_loader::DirectoryVerdict::ModuleTemplate(template) => Err(template),
-            }
+            let admission = RootAdmission::issue(parsed.complete_directory_verdict())?;
+            Ok(Self {
+                parsed,
+                _admission: admission,
+            })
         }
         pub(super) fn into_parsed(self) -> crate::config_loader::ParsedRootDirectory {
             self.parsed
@@ -432,7 +427,7 @@ fn resolve_upstream_source_surface(
     source: RootUpstreamSource<'_>,
     context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &crate::schema::SchemaRegistry,
-) -> Result<SourceSurface, UpstreamSourceLoadError> {
+) -> Result<SourceSurface, crate::parser::AnalysisTreeError> {
     let entries = match source.export_source(context.catalog(), schemas) {
         Ok(parsed) => match resolve_upstream_root_exports(
             parsed,
@@ -442,19 +437,15 @@ fn resolve_upstream_source_surface(
             &Default::default(),
         ) {
             Ok(entries) => Ok(entries),
-            Err(RootUpstreamExportError::Invariant(error)) => return Err(error.into()),
-            Err(RootUpstreamExportError::Module { base, error }) => {
-                Err(UpstreamSourceUnavailable::Module { base, error })
-            }
-            Err(RootUpstreamExportError::Boundaries(errors)) => {
-                Err(UpstreamSourceUnavailable::Boundaries(errors))
-            }
+            Err(RootUpstreamExportError::Invariant(error)) => return Err(error),
+            Err(
+                reason @ (RootUpstreamExportError::Module { base: _, error: _ }
+                | RootUpstreamExportError::Boundaries(_)),
+            ) => Err(UpstreamExportSourceError::from(reason).to_string()),
         },
-        Err(reason) => Err(UpstreamSourceUnavailable::Configuration(reason)),
+        Err(reason) => Err(reason),
     };
-    Ok(SourceSurface {
-        entries: entries.map_err(std::sync::Arc::new),
-    })
+    Ok(SourceSurface { entries })
 }
 
 /// Identity of the immutable type evidence used to discover a source surface.
@@ -676,6 +667,15 @@ pub struct UpstreamResolveError {
     pub reason: String,
     failure: Box<UpstreamResolveFailure>,
 }
+// Preserve main's compatibility equality over its three public fields.
+// Caller provenance remains diagnostic-only.
+impl PartialEq for UpstreamResolveError {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding == other.binding && self.source == other.source && self.reason == other.reason
+    }
+}
+impl Eq for UpstreamResolveError {}
+
 impl std::fmt::Display for UpstreamResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.failure.fmt(f)
@@ -704,7 +704,11 @@ impl UpstreamTemplateDiagnostic {
         format!("{}{}", self.prefix, self.message)
     }
     fn message_with_note(&self) -> String {
-        format!("{}\nNote: {}", self.message, self.note)
+        format!(
+            "{}\n{}",
+            self.message,
+            crate::config_loader::evidence_note(&self.note, "")
+        )
     }
 }
 impl UpstreamModuleTemplateRejection {
@@ -766,7 +770,11 @@ impl UpstreamModuleTemplateRejection {
         self.diagnostic().message_with_note()
     }
     fn legacy_reason(&self) -> String {
-        format!("{}\nNote: {}", Self::REASON, self.diagnostic().note)
+        format!(
+            "{}\n{}",
+            Self::REASON,
+            crate::config_loader::evidence_note(&self.diagnostic().note, "")
+        )
     }
     pub fn diagnostic_lines(&self) -> Vec<crate::module_resolver::DiagnosticLine> {
         use crate::module_resolver::DiagnosticLine;
@@ -781,7 +789,12 @@ impl UpstreamModuleTemplateRejection {
 }
 impl std::fmt::Display for UpstreamTemplateDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}\nNote: {}", self.located_message(), self.note)
+        write!(
+            f,
+            "{}\n{}",
+            self.located_message(),
+            crate::config_loader::evidence_note(&self.note, "")
+        )
     }
 }
 impl std::fmt::Display for UpstreamModuleTemplateRejection {
@@ -1566,7 +1579,7 @@ fn resolve_upstream_root_exports(
         // as value-shaped upstream exports.
         let inferred = crate::validation::inference::infer_export_params(
             crate::config_loader::load_buffer_configuration(
-                &parsed,
+                crate::config_loader::issue_buffer_configuration(&parsed),
                 &empty_schemas,
                 config.catalog(),
             )
@@ -2423,7 +2436,7 @@ fn visit_subscript_access<B: BindingAddress>(
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn non_utf8_upstream_require_rejection_is_not_omitted() {
+    fn round3_non_utf8_upstream_guard_is_not_omitted() {
         use std::os::unix::ffi::OsStringExt;
         let directory = tempfile::tempdir().unwrap();
         let upstream_dir = directory.path().join("upstream");
@@ -2669,6 +2682,9 @@ mod tests {
 
     #[test]
     fn legacy_template_failure_matches_display() {
+        fn require_eq<T: Eq>(value: T) -> T {
+            value
+        }
         let directory = tempfile::tempdir().unwrap();
         write_crn(directory.path(), "arguments.crn", "arguments {}\n");
         write_crn(directory.path(), "locals.crn", "// sibling\n");
@@ -2691,7 +2707,7 @@ mod tests {
             },
         );
         assert_eq!(
-            failure.clone().into_legacy().to_string(),
+            require_eq(failure.clone().into_legacy()).to_string(),
             failure.to_string()
         );
     }
@@ -2880,7 +2896,7 @@ mod tests {
     }
 
     #[test]
-    fn round4_discovery_registers_resource_type_argument_but_rejects_template_source() {
+    fn round4_discovery_registers_resource_type_argument_in_upstream_root() {
         let (context, schemas) = round4_discovery_authority();
         let source = "arguments { item: test.Item }\nexports { identifier = item.identifier }\n";
         let (_directory, base) = round4_directory(source);
@@ -4205,7 +4221,7 @@ mod tests {
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(parsed, schemas, Some(exports), &signatures, session);
                 let configuration = crate::config_loader::load_buffer_configuration(
-                    parsed,
+                    crate::config_loader::issue_buffer_configuration(parsed),
                     schemas,
                     session.as_provider_context(),
                 );
@@ -4649,8 +4665,11 @@ mod tests {
         };
         let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(&parsed, &schemas, &exports, &signatures, &catalog);
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let errs = crate::validation::validate_resource_ref_types(
             configuration.judged(),
             &std::collections::HashSet::new(),

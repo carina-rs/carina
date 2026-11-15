@@ -5,8 +5,11 @@ fn function_validation(source: &str) -> Vec<String> {
     let parsed =
         super::super::parse_file(source, Path::new("function-default.crn"), &catalog).unwrap();
     let schemas = crate::schema::SchemaRegistry::new();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     configuration
         .judged()
         .report()

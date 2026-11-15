@@ -122,7 +122,7 @@ use carina_core::hint::ProjectCommand;
 use carina_core::identifier::{
     self, AnonymousIdBindingStateInfo, AnonymousIdStateInfo, PrefixStateInfo, StateBlockClaims,
 };
-use carina_core::module_resolver;
+use carina_core::module_resolver::{self, ModuleError};
 use carina_core::name_override::{NameOverride, NameOverrideSource};
 use carina_core::parser::{
     ExpandedFile, ExpandedInferredExportParam, ExpandedInferredFile, ExpandedProviderConfig,
@@ -5215,7 +5215,7 @@ pub(crate) fn validate_module_internal_ref_types(
         let parsed = template.parsed();
         let prefix = module.diagnostic_label().to_string();
         let configuration = carina_core::config_loader::load_buffer_configuration(
-            parsed,
+            carina_core::config_loader::issue_buffer_configuration(parsed),
             ctx.schemas(),
             config.catalog(),
         );
@@ -5319,11 +5319,8 @@ fn rejected_module_errors(module_walk: &ModuleWalk) -> Vec<AppError> {
 pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_state_blocks_in_module(module.loaded()) {
-            errors.push(AppError::Validation(format!(
-                "{}: {message}",
-                module.diagnostic_label()
-            )));
+        if validation::validate_no_state_blocks_in_module(module.loaded()).is_err() {
+            errors.push(module.import_diagnostic(ModuleError::StateBlockInModule));
         }
     }
     errors
@@ -5336,11 +5333,8 @@ pub(crate) fn validate_no_state_blocks_in_modules(module_walk: &ModuleWalk) -> V
 pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_upstream_states_in_module(module.loaded()) {
-            errors.push(AppError::Validation(format!(
-                "{}: {message}",
-                module.diagnostic_label()
-            )));
+        if validation::validate_no_upstream_states_in_module(module.loaded()).is_err() {
+            errors.push(module.import_diagnostic(ModuleError::UpstreamStateInModule));
         }
     }
     errors
@@ -5353,11 +5347,8 @@ pub(crate) fn validate_no_upstream_states_in_modules(module_walk: &ModuleWalk) -
 pub(crate) fn validate_no_exports_in_modules(module_walk: &ModuleWalk) -> Vec<AppError> {
     let mut errors = Vec::new();
     for module in module_walk.iter() {
-        if let Err(message) = validation::validate_no_exports_in_module(module.loaded()) {
-            errors.push(AppError::Validation(format!(
-                "{}: {message}",
-                module.diagnostic_label()
-            )));
+        if validation::validate_no_exports_in_module(module.loaded()).is_err() {
+            errors.push(module.import_diagnostic(ModuleError::ExportsInModule));
         }
     }
     errors

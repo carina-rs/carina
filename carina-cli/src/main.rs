@@ -995,7 +995,7 @@ mod error_format_tests {
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let module_signatures = carina_core::module_resolver::ResolvedModuleSignatures::new();
         let configuration = carina_core::config_loader::load_buffer_configuration(
-            &parsed,
+            carina_core::config_loader::issue_buffer_configuration(&parsed),
             &schemas,
             &provider_context,
         );

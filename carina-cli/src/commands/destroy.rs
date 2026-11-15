@@ -2983,7 +2983,7 @@ mod tests {
                 )
                 .unwrap();
                 let project = carina_core::paths::ResolvedPath::new(config_path).unwrap();
-                let backend_config = crate::test_support::inferred_fixture(
+                let backend_config = crate::test_support::parsed_fixture(
                     "backend s3 { bucket = 'backend-state-bucket' key = 'state.json' auto_create = false }",
                 ).backend.unwrap();
                 carina_state::BackendLock::for_config(Some(&backend_config))

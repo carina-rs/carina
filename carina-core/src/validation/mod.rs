@@ -5780,7 +5780,7 @@ fn resource_values_report<
     // availability cannot be decided until its resources are expanded into a
     // root configuration. Keep every other schema/type check below active for
     // modules; only defer this provider-availability diagnostic.
-    if !parsed.declares_module_placeholders() {
+    if !is_module_definition(parsed) {
         all_errors.extend(group_anonymous_resource_schema_errors(
             parsed
                 .iter_all_resources()
@@ -7356,35 +7356,6 @@ fn is_string_compatible_type_on_path<'a>(
     }
 }
 
-/// Check that a root configuration does not contain module interface blocks.
-///
-/// `arguments` is a module-input declaration: it belongs on the module side
-/// of a module boundary and is paired with `use` on the caller side. In a
-/// root configuration there is no caller to pass values, so the block has
-/// no meaning — its `default` would silently become a de-facto root
-/// variable, which is not a documented feature (issue #2198).
-///
-/// A directory loaded via the CLI may be either a root config or a module
-/// the user is validating in isolation. We only flag the misplaced block
-/// when a `backend` or `provider` block is also present, since both are
-/// root-only constructs and unambiguously identify a root configuration.
-/// Block presence, including empty arguments/attributes, uses the same
-/// declaration classification as require admission.
-pub fn validate_no_module_declarations_in_root<E>(
-    parsed: &crate::parser::File<E>,
-) -> Result<(), crate::parser::Located<ConfigurationPlacementDiagnostic>> {
-    match placement_diagnostics_for_inventory(
-        parsed.parser_binding_metadata.syntax(),
-        parsed.declares_module_placeholders(),
-    )
-    .into_iter()
-    .find(|finding| finding.detail().root_evidence().is_some())
-    {
-        Some(finding) => Err(finding),
-        None => Ok(()),
-    }
-}
-
 fn unknown_type_resolution_error(
     authored_name: &str,
     config: &ProviderContext,
@@ -8324,10 +8295,7 @@ impl ConfigurationPlacementDiagnostic {
         self.root.as_ref().map(|root| root.evidence())
     }
     pub fn lsp_message(&self) -> String {
-        self.root.as_ref().map_or_else(
-            || self.message.to_string(),
-            |root| root.lsp_message(self.message),
-        )
+        self.message.to_string()
     }
 }
 impl std::error::Error for ConfigurationPlacementDiagnostic {}
@@ -8357,32 +8325,41 @@ fn root_declaration_message(block: crate::parser::ConfigurationBlock) -> Option<
     }
 }
 
-pub fn configuration_placement_diagnostics<
+#[must_use]
+pub fn is_module_definition<
+    E,
     P: crate::resource::PlaceholderKind,
     T: crate::resource::PlaceholderKind,
+    D,
     B: BindingAddress,
-    E: crate::parser::ExportParamLike<P, B>,
-    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
 >(
-    tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
+    parsed: &crate::parser::File<E, P, T, D, B>,
+) -> bool {
+    !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty()
+}
+
+pub fn configuration_placement_diagnostics<B: BindingAddress>(
+    directory: crate::config_loader::IssuedDirectory<'_, B>,
+    declares_module_placeholders: bool,
 ) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
-    placement_diagnostics_for_inventory(tree.syntax(), tree.file().declares_module_placeholders())
+    placement_diagnostics_for_inventory(directory, declares_module_placeholders)
 }
 
 pub(crate) fn placement_diagnostics_for_inventory<B: BindingAddress>(
-    syntax: &crate::parser::SyntaxInventory<B>,
+    directory: crate::config_loader::IssuedDirectory<'_, B>,
     declares_module_placeholders: bool,
 ) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
     use crate::config_loader::DirectoryVerdict;
     use crate::parser::ConfigurationBlock;
-    syntax.configuration_blocks().iter().filter_map(|block| {
+    directory.syntax().configuration_blocks().iter().filter_map(|block| {
         let (message, root) = match block.detail().kind() {
             ConfigurationBlock::State if declares_module_placeholders => ("state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.", None),
             ConfigurationBlock::UpstreamState if declares_module_placeholders => ("upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.", None),
             ConfigurationBlock::Exports if declares_module_placeholders => ("exports blocks are not allowed inside modules. Define exports at the root configuration level.", None),
             ConfigurationBlock::Arguments | ConfigurationBlock::Attributes => match block.detail().directory_verdict() {
-                DirectoryVerdict::Root(root) => (root_declaration_message(block.detail().kind())?, Some(root.clone())),
-                DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::Unknown(_) | DirectoryVerdict::NoEvidence(_) => return None,
+                Some(DirectoryVerdict::Root(root)) => (root_declaration_message(block.detail().kind())?, Some(root.clone())),
+                Some(DirectoryVerdict::ModuleTemplate(_) | DirectoryVerdict::Unknown(()) | DirectoryVerdict::NoEvidence(_)) => return None,
+                None => return None,
             },
             ConfigurationBlock::State | ConfigurationBlock::UpstreamState | ConfigurationBlock::Exports | ConfigurationBlock::Provider | ConfigurationBlock::Backend | ConfigurationBlock::Require => return None,
         };
@@ -9925,7 +9902,7 @@ impl ModuleCallChecker<'_> {
                 self.provider_context.as_provider_context(),
             );
             let judged = crate::config_loader::load_buffer_configuration(
-                &module,
+                crate::config_loader::issue_buffer_configuration(&module),
                 self.schemas,
                 self.provider_context.as_provider_context(),
             );
@@ -10335,7 +10312,7 @@ pub fn check_module_calls_from_analysis(
         overrides,
     );
     let judged = crate::config_loader::load_buffer_configuration(
-        parsed,
+        crate::config_loader::issue_buffer_configuration(parsed),
         schemas,
         provider_context.catalog(),
     );

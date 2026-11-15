@@ -10,8 +10,11 @@ fn mismatched_slot_and_proof_panics_at_admission_boundary() {
         "let first = mock.Test { input = 'same' }\nlet second = mock.Test { input = 'same' }",
     )
     .unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let resources = &configuration.judged().file().resources;
     let first = resources[0].authored_slots.get("input").unwrap();
     let second = resources[1].authored_slots.get("input").unwrap();
@@ -31,8 +34,11 @@ fn round1_seam_materialization_reports_unmatched_attribute_names() {
     let parsed = crate::parser::parse_and_resolve("mock.Test { input = 'value' }").unwrap();
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let schemas = SchemaRegistry::new();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let tree = crate::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
     let mut inputs = crate::validation::admission::attributes::ResourceAttributeInputs::new(
         tree.resources().next().unwrap(),
@@ -81,8 +87,11 @@ fn seam_known_if_preserves_the_single_main_local_obligation() {
             .unwrap(),
     );
     let parsed = crate::parser::parse_and_resolve("let source = mock.Source {}\nmock.Test { input = if true { source.output } else { source.output } }").unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let resource = &judged.file().resources[1];
     let slot = resource.authored_slots.get("input").unwrap();
@@ -130,8 +139,11 @@ fn review_seam_producer_materialization_keeps_a_real_projection_pairing() {
     );
     let parsed =
         crate::parser::parse_and_resolve("let one = mock.Test { input = 'before' }").unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();

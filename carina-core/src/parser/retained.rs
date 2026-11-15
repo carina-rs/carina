@@ -492,6 +492,8 @@ impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
 /// retained with every require node, and reused by all resolver entry points.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RequireScope {
+    /// Parsing has not issued a directory judgement.
+    Unissued,
     /// No complete directory verdict is available for this require node.
     Unknown,
     /// A complete inventory proved that this directory has no require nodes.
@@ -923,7 +925,7 @@ impl<B: BindingAddress> Default for Expressions<B> {
             report: Arc::new(ExpressionReport::empty()),
             arguments: IndexMap::new(),
             instance: ExpressionInstance::Root,
-            require_scope: RequireScope::Unknown,
+            require_scope: RequireScope::Unissued,
             captures: Arc::default(),
             projections: Arc::default(),
             template_placements: Default::default(),
@@ -1208,7 +1210,8 @@ fn admit_require_scope<E, D, B: BindingAddress>(
     let expressions = file.parser_binding_metadata.syntax.expressions_mut();
     let evidence = match &expressions.require_scope {
         RequireScope::UnvalidatedDirectory(evidence) => evidence.clone(),
-        RequireScope::Unknown
+        RequireScope::Unissued
+        | RequireScope::Unknown
         | RequireScope::Absent(_)
         | RequireScope::Directory(_)
         | RequireScope::ModuleTemplate(_)
@@ -5239,7 +5242,8 @@ mod judgement {
                     | RequireScope::UnvalidatedDirectory(verdict) => {
                         Some((require.statement.clone(), verdict.clone()))
                     }
-                    RequireScope::Unknown
+                    RequireScope::Unissued
+                    | RequireScope::Unknown
                     | RequireScope::Absent(_)
                     | RequireScope::ModuleTemplate(_)
                     | RequireScope::ModuleCall => None,

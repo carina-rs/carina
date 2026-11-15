@@ -541,7 +541,7 @@ pub(crate) fn validate_root_backend<E: carina_core::parser::ExportParamLike>(
 
 /// Recovery still checks each backend setting when the authored tree cannot seal.
 fn validate_unlocated_root_backend<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError> {
-    if !parsed.declares_module_placeholders()
+    if !carina_core::validation::is_module_definition(parsed)
         && let Some(backend) = &parsed.backend
         && let Err(error) = StateBackendConfig::try_from(backend)
     {
@@ -835,7 +835,7 @@ fn validate_and_resolve_configuration(
     }
     extend_module_call_errors(errors, root_type_resolution_findings);
     let configuration = carina_core::config_loader::load_buffer_configuration(
-        parsed.parsed(),
+        carina_core::config_loader::issue_buffer_configuration(parsed.parsed()),
         ctx.schemas(),
         enriched_context.catalog(),
     );
@@ -881,7 +881,7 @@ fn validate_and_resolve_configuration(
     // recovery paths (`skip_resource_validation`): the flag may skip provider
     // resource checks, but it cannot mint validation readiness.
     let binding_configuration = carina_core::config_loader::load_buffer_configuration(
-        parsed.parsed(),
+        carina_core::config_loader::issue_buffer_configuration(parsed.parsed()),
         ctx.schemas(),
         enriched_context.catalog(),
     );
@@ -897,7 +897,7 @@ fn validate_and_resolve_configuration(
             enriched_context.catalog(),
         );
         let configuration = carina_core::config_loader::load_buffer_configuration(
-            module_parsed,
+            carina_core::config_loader::issue_buffer_configuration(module_parsed),
             ctx.schemas(),
             enriched_context.catalog(),
         );
@@ -1107,7 +1107,7 @@ fn validate_and_resolve_configuration(
     // consumes this exact file through `resolve_bare_binding_uses`; both calls
     // use the same mandatory provider context.
     let configuration = carina_core::config_loader::load_buffer_configuration(
-        &parsed,
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
         ctx.schemas(),
         enriched_context.catalog(),
     );
@@ -1156,7 +1156,7 @@ fn validate_and_resolve_configuration(
     // This is the sole parser-placeholder boundary. Standalone module
     // definitions intentionally retain typed module-argument slots until a
     // caller expands them; root configurations must be fully expanded.
-    let placeholder_boundary = if parsed.declares_module_placeholders() {
+    let placeholder_boundary = if carina_core::validation::is_module_definition(parsed) {
         carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
     } else {
         carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
@@ -1271,7 +1271,7 @@ fn validate_and_resolve_configuration(
             ),
         );
         let configuration = carina_core::config_loader::load_buffer_configuration(
-            parsed,
+            carina_core::config_loader::issue_buffer_configuration(parsed),
             ctx.schemas(),
             enriched_context.catalog(),
         );
@@ -1789,23 +1789,22 @@ mod tests {
     #[test]
     fn backend_validation_keeps_the_typed_error() {
         let runtime = crate::test_support::TestCommandRuntime::new();
-        let base = tempfile::tempdir().unwrap();
-        std::fs::write(
-            base.path().join("backend.crn"),
+        let raw = carina_core::parser::parse_file(
             r#"backend s3 {
                 bucket = "state"
                 key = "state.json"
                 region = true
             }"#,
+            std::path::Path::new("backend.crn"),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let parsed = carina_core::config_loader::load_configuration_with_config(
-            &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
-            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        let parsed = carina_core::validation::inference::apply_inference(
+            raw,
             &carina_core::schema::SchemaRegistry::new(),
-        )
-        .unwrap()
-        .parsed;
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        );
+        let base = tempfile::tempdir().unwrap();
         let providers = ProviderLoad::load(
             &runtime,
             &parsed.providers,
@@ -1814,6 +1813,8 @@ mod tests {
         )
         .unwrap();
 
+        let parsed =
+            carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
         let errors = validate_and_resolve_errors(
             &parsed,
             &carina_core::paths::ResolvedPath::new(base.path()).unwrap(),
@@ -2166,8 +2167,11 @@ child { values = [source] }
         )]);
         let schemas = carina_core::schema::SchemaRegistry::new();
         let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-        let configuration =
-            carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = carina_core::config_loader::load_buffer_configuration(
+            carina_core::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let report = carina_core::validation::check_bare_binding_uses(
             &carina_core::validation::ValidationTypeContext::new_providerless(
                 configuration.judged(),

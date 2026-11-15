@@ -194,8 +194,7 @@ pub(crate) fn parsed_fixture(source: &str) -> carina_core::parser::ParsedFile {
         &carina_core::parser::ProviderContext::new(EnvironmentSnapshot::empty()),
     )
     .expect("parse authored fixture");
-    carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(parsed, source)
-        .into_parsed()
+    carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed).into_parsed()
 }
 
 #[cfg(test)]

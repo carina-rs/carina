@@ -238,8 +238,11 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                 std::path::Path::new("admission-work.crn"),
                 &catalog,
             ).unwrap();
-            let configuration =
-                crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            let configuration = crate::config_loader::load_buffer_configuration(
+                crate::config_loader::issue_buffer_configuration(&parsed),
+                &schemas,
+                &catalog,
+            );
             let judged = configuration.judged();
             let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
             let resource = tree
@@ -564,8 +567,11 @@ fn resource_callers_admit_wider_same_identity_references() {
             .unwrap()
             .resolve_root_for_test();
             let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
-            let configuration =
-                crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+            let configuration = crate::config_loader::load_buffer_configuration(
+                crate::config_loader::issue_buffer_configuration(&parsed),
+                schemas,
+                catalog,
+            );
             crate::test_utils::legacy_validate_resources(
                 &parsed,
                 schemas,
@@ -634,8 +640,11 @@ fn issue_4362_resource_reference_admission_uses_anonymous_overlap() {
                     catalog,
                 );
                 let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
-                let configuration =
-                    crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+                let configuration = crate::config_loader::load_buffer_configuration(
+                    crate::config_loader::issue_buffer_configuration(&parsed),
+                    schemas,
+                    catalog,
+                );
                 crate::validation::validate_attribute_param_ref_types_with_bindings(
                     &configuration.judged().file().attribute_params,
                     &bindings,
@@ -2996,8 +3005,11 @@ fn round3_admission_hook(source: &str, declaration: AttributeType) -> Vec<Round3
     let parsed =
         crate::parser::parse_file(source, std::path::Path::new("round3-hook.crn"), &catalog)
             .unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree
@@ -3179,8 +3191,11 @@ fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
             .unwrap(),
     );
     let parsed = crate::parser::parse_and_resolve("mock.Sink { input = 'value' }").unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -3257,7 +3272,11 @@ pub(crate) fn check_conversion_pending_discharge(
     let parsed = crate::parser::parse_file(source, std::path::Path::new("conversion.crn"), catalog)
         .map_err(|error| format!("normal parse rejected authored source: {error}"))?
         .resolve_root_for_test();
-    let configuration = crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        schemas,
+        catalog,
+    );
     let judged = configuration.judged();
     let tree =
         crate::parser::AnalysisTree::try_from_file(judged.file()).map_err(|e| e.to_string())?;

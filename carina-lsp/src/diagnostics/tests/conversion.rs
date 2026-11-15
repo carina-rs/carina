@@ -143,8 +143,11 @@ fn conversion_lsp_parse_rejection_keeps_the_convert_range_and_cause() {
     .unwrap();
     let catalog =
         carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let configuration =
-        carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let presented = carina_core::validation::ConversionValidation::<std::convert::Infallible>::new(
         configuration.judged().report(),
     )
@@ -272,8 +275,11 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                 std::fs::write(directory.path().join("main.crn"), "let main = 'ok'").unwrap();
             }
             let parsed = carina_core::parser::parse_file(&source, &path, &catalog).unwrap();
-            let configuration =
-                carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            let configuration = carina_core::config_loader::load_buffer_configuration(
+                carina_core::config_loader::issue_buffer_configuration(&parsed),
+                &schemas,
+                &catalog,
+            );
             let judged = configuration.judged();
             let tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
             let resource = tree.resources().next().unwrap();
@@ -309,7 +315,9 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                         carina_core::parser::parse_file("let other = 'ok'", &path, &catalog)
                             .unwrap();
                     let empty_configuration = carina_core::config_loader::load_buffer_configuration(
-                        &empty, &schemas, &catalog,
+                        carina_core::config_loader::issue_buffer_configuration(&empty),
+                        &schemas,
+                        &catalog,
                     );
                     validation.admit_remaining_resources(
                         &tree,

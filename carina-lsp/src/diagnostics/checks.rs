@@ -641,21 +641,27 @@ impl DiagnosticRun<'_> {
         doc: &Document,
         tree: &carina_core::parser::AnalysisTree<'_>,
     ) -> Vec<Diagnostic> {
-        carina_core::validation::configuration_placement_diagnostics(tree)
-            .iter()
-            .filter_map(|finding| {
-                let mut diagnostic = render_merged(
-                    doc,
-                    finding,
-                    DiagnosticSeverity::ERROR,
-                    finding.detail().lsp_message(),
-                )?;
-                if let Some(evidence) = finding.detail().root_evidence() {
-                    super::attach_directory_evidence(&mut diagnostic, &evidence);
-                }
-                Some(diagnostic)
-            })
-            .collect()
+        let Some(directory) = tree.syntax().issued_directory() else {
+            return Vec::new();
+        };
+        carina_core::validation::configuration_placement_diagnostics(
+            directory,
+            tree.is_module_definition(),
+        )
+        .iter()
+        .filter_map(|finding| {
+            let mut diagnostic = render_merged(
+                doc,
+                finding,
+                DiagnosticSeverity::ERROR,
+                finding.detail().lsp_message(),
+            )?;
+            if let Some(evidence) = finding.detail().root_evidence() {
+                super::attach_directory_evidence(&mut diagnostic, &evidence);
+            }
+            Some(diagnostic)
+        })
+        .collect()
     }
 
     /// Validate the current file's backend block through the same built-in

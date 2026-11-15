@@ -31,7 +31,11 @@ fn rejects_invalid_product_value(projected: bool) {
     if projected {
         carina_core::identifier::resolve_attr_prefixes(&mut parsed.resources, &schemas).unwrap();
     }
-    let configuration = load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();

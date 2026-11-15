@@ -92,8 +92,11 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
     let parsed = crate::parser::parse_file(source, Path::new("channels.crn"), &catalog)
         .unwrap()
         .resolve_root_for_test();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let bindings =
@@ -249,8 +252,11 @@ fn conversion_unrendered_coverage_does_not_repeat_native_map_key_or_value_checks
     )
     .unwrap()
     .resolve_root_for_test();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -306,7 +312,11 @@ fn check(
     let parsed = crate::parser::parse_file(source, Path::new("b1.crn"), &catalog)
         .unwrap()
         .resolve_root_for_test();
-    let configuration = crate::config_loader::load_buffer_configuration(&parsed, schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), schemas, &catalog);
@@ -446,8 +456,11 @@ fn r16_report_only_slot_reads_recorded_destination_then_checks_the_source() {
     )
     .unwrap()
     .resolve_root_for_test();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree
@@ -527,8 +540,11 @@ fn r11_stale_projection_can_only_reuse_an_already_recorded_static_verdict() {
         )
         .unwrap()
         .resolve_root_for_test();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
@@ -622,8 +638,11 @@ fn round5_unresolved_or_reshaped_containers_require_conversion_descent() {
                 )
                 .unwrap()
                 .resolve_root_for_test();
-                let configuration =
-                    crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+                let configuration = crate::config_loader::load_buffer_configuration(
+                    crate::config_loader::issue_buffer_configuration(&parsed),
+                    &schemas,
+                    &catalog,
+                );
                 let judged = configuration.judged();
                 let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
                 let resource = tree.resources().next().unwrap();
@@ -781,8 +800,11 @@ fn r9_syntax_with_values(
     )
     .unwrap()
     .resolve_root_for_test();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -1005,8 +1027,11 @@ fn r5b_pending_transport_requires_a_shape_compatible_destination() {
         )
         .unwrap()
         .resolve_root_for_test();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
@@ -1314,7 +1339,7 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
         let parsed = crate::config_loader::parse_directory(&path, &catalog).unwrap();
         {
             let configuration = crate::config_loader::load_buffer_configuration(
-                parsed.parsed(),
+                crate::config_loader::issue_buffer_configuration(parsed.parsed()),
                 &schemas,
                 &catalog,
             );
@@ -1337,8 +1362,11 @@ fn conversion_no_as_directory_inventory_is_vacuous_without_any_walk_evidence() {
             ) {
                 Ok(graph) => {
                     assert_eq!(case["expected"]["status"], "ok", "{}", case["name"]);
-                    let configuration =
-                        crate::config_loader::load_buffer_configuration(&graph, &schemas, &catalog);
+                    let configuration = crate::config_loader::load_buffer_configuration(
+                        crate::config_loader::issue_buffer_configuration(&graph),
+                        &schemas,
+                        &catalog,
+                    );
                     let conversions = crate::validation::ConversionValidation::<
                         std::convert::Infallible,
                     >::new(configuration.judged().report())
@@ -1380,8 +1408,11 @@ fn r11_alias_uses_each_read_their_recorded_static_verdict() {
         let parsed = crate::parser::parse_file(&source, Path::new("alias-evidence.crn"), &catalog)
             .unwrap()
             .resolve_root_for_test();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings =
@@ -1474,8 +1505,11 @@ fn round5_partial_driver_retains_only_the_judged_slot_verdict() {
             &catalog,
         )
         .unwrap();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings =
@@ -1522,7 +1556,11 @@ fn round5_an_unentered_document_has_no_sink_findings() {
         &catalog,
     )
     .unwrap();
-    let configuration = crate::config_loader::load_buffer_configuration(&other, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&other),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let bindings =
@@ -1707,8 +1745,11 @@ fn r10_pending_nested_shape_validation_matches_the_no_as_control() {
         )
         .unwrap()
         .resolve_root_for_test();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
@@ -1856,8 +1897,11 @@ fn r11_judge_owned_static_conversion_failures_do_not_require_admission() {
         let parsed = crate::parser::parse_file(&source, Path::new("judge-owned.crn"), &catalog)
             .unwrap()
             .resolve_root_for_test();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         // No resource admission walk: read-only and stopped runs still own
         // exactly main's Judge findings before a provider may be dispatched.
         let presented = crate::validation::ConversionValidation::<std::convert::Infallible>::new(
@@ -1890,8 +1934,11 @@ fn r11_walk_consumes_a_judge_verdict_without_resolving_the_target_again() {
         )
         .unwrap()
         .resolve_root_for_test();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();

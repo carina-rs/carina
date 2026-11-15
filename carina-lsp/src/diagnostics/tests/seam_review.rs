@@ -10,8 +10,11 @@ fn review_seam_loop_lookup_preserves_every_instance() {
     )
     .unwrap();
     let schemas = SchemaRegistry::new();
-    let configuration =
-        carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let tree =
         carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
     let resources = authored_validation_resources(&tree);
@@ -81,8 +84,11 @@ fn review_seam_expanded_admission_retains_instantiated_judgements() {
             &path,
         )
         .unwrap();
-        let configuration =
-            carina_core::config_loader::load_buffer_configuration(&graph, &schemas, &catalog);
+        let configuration = carina_core::config_loader::load_buffer_configuration(
+            carina_core::config_loader::issue_buffer_configuration(&graph),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let instances = judged.file().clone();
         let tree = carina_core::parser::AnalysisTree::try_from_file(&instances).unwrap();

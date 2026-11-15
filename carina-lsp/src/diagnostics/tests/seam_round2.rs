@@ -21,8 +21,11 @@ fn check_report_selection(with_empty_map: bool) {
         &config,
     )
     .unwrap();
-    let configuration =
-        carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+    let configuration = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let judged = configuration.judged();
     let tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -119,8 +122,11 @@ fn round5_source_resource_missing_from_report_is_explicitly_unreached() {
         &config,
     )
     .unwrap();
-    let sealed =
-        carina_core::config_loader::load_buffer_configuration(&previous, &schemas, &config);
+    let sealed = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&previous),
+        &schemas,
+        &config,
+    );
     // A newer source resource is being checked against a different sealed
     // analysis. Its syntax exists, but that report cannot authorize its slots.
     let current = carina_core::parser::parse_file(
@@ -234,8 +240,11 @@ fn round2_lsp_missing_expanded_report_selects_main_fallback() {
                 &path,
             )
             .unwrap();
-            let configuration =
-                carina_core::config_loader::load_buffer_configuration(&graph, &schemas, &config);
+            let configuration = carina_core::config_loader::load_buffer_configuration(
+                carina_core::config_loader::issue_buffer_configuration(&graph),
+                &schemas,
+                &config,
+            );
             let mut instances = configuration.judged().file().clone();
             for resource in &mut instances.resources {
                 // allow: direct - emulate an expanded instance absent from the original report
@@ -290,8 +299,11 @@ fn round6_report_fallback_records_the_matched_authored_slots() {
     let expanded = parse("mock.Test { input = ('bad') }");
     let previous = parse("mock.Previous { input = 1 }");
     let schemas = SchemaRegistry::new();
-    let sealed =
-        carina_core::config_loader::load_buffer_configuration(&previous, &schemas, &config);
+    let sealed = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&previous),
+        &schemas,
+        &config,
+    );
     let buffer_tree = carina_core::parser::AnalysisTree::try_from_file(&buffer).unwrap();
     let expanded_tree = carina_core::parser::AnalysisTree::try_from_file(&expanded).unwrap();
     let authored = buffer_tree.resources().next().unwrap();
@@ -352,8 +364,11 @@ fn round7_report_fallback_checks_expanded_resource_with_authored_unreached_slots
         &config,
     )
     .unwrap();
-    let configuration =
-        carina_core::config_loader::load_buffer_configuration(&expanded, &schemas, &config);
+    let configuration = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&expanded),
+        &schemas,
+        &config,
+    );
     let judged = configuration.judged();
     let authored_tree = carina_core::parser::AnalysisTree::try_from_file(&authored).unwrap();
     let expanded_tree = carina_core::parser::AnalysisTree::try_from_file(judged.file()).unwrap();

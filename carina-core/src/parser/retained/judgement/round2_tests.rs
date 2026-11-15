@@ -25,7 +25,6 @@ fn output(
         '_,
         crate::parser::ParsedExportParam,
         crate::parser::ParsedDeferredForPhase,
-        crate::resource::RelativeBindingName,
     >,
 ) -> Vec<String> {
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());

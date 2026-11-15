@@ -353,7 +353,11 @@ where
     if let Some(report) = supplied {
         crate::parser::retained::attach_report(&mut parsed, report.clone());
     }
-    let configuration = crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        schemas,
+        catalog,
+    );
     let judged = configuration.judged();
     let tree =
         crate::parser::AnalysisTree::try_from_file(judged.file()).map_err(|e| e.to_string())?;
@@ -1171,7 +1175,7 @@ fn conversion_review_cached_placement_does_not_replace_original_source_checks() 
         .map_err(|e| format!("normal parse rejected authored source: {e}"))?
         .resolve_root_for_test();
     let configuration = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         &initial.schemas,
         &initial.catalog,
     );
@@ -1202,7 +1206,7 @@ fn conversion_changed_bindings_are_rejudged_before_admission() -> TestResult {
     .map_err(|e| format!("normal parse rejected authored source: {e}"))?
     .resolve_root_for_test();
     let old = crate::config_loader::load_buffer_configuration(
-        &initial,
+        crate::config_loader::issue_buffer_configuration(&initial),
         &fixture.schemas,
         &fixture.catalog,
     );
@@ -1255,7 +1259,7 @@ fn conversion_source_snapshot_rejects_a_detached_report() -> TestResult {
         .resolve_root_for_test();
     let detached_fixture = Fixture::string();
     let detached = crate::config_loader::load_buffer_configuration(
-        &other,
+        crate::config_loader::issue_buffer_configuration(&other),
         &detached_fixture.schemas,
         &fixture.catalog,
     );
@@ -1408,7 +1412,7 @@ fn r11_reported_schema_validation_requires_a_recorded_static_source_verdict() {
     )
     .unwrap();
     let configuration = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         &fixture.schemas,
         &fixture.catalog,
     );

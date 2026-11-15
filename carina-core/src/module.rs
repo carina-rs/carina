@@ -941,7 +941,7 @@ impl FileSignature {
         config: &crate::parser::ProviderContext,
     ) -> Self {
         // Check for directory-based module (has top-level arguments or attribute_params)
-        if parsed.declares_module_placeholders() {
+        if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
             return FileSignature::Module(ModuleSignature::from_directory_module(
                 parsed, file_name, config,
             ));
@@ -959,7 +959,7 @@ impl FileSignature {
         config: &crate::parser::ProviderContext,
     ) -> Self {
         // Check for directory-based module (has top-level arguments or attribute_params)
-        if parsed.declares_module_placeholders() {
+        if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
             return FileSignature::Module(ModuleSignature::from_directory_module(
                 parsed,
                 module_name,

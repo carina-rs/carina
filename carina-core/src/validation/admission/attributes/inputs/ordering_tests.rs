@@ -70,7 +70,11 @@ fn classifications_keep_authored_attribute_order() {
     let parsed = directory("unknown_attributes");
     let schemas = schemas();
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let loaded = load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let tree = AnalysisTree::try_from_file(loaded.judged().file()).unwrap();
     let resource = tree.resources().next().unwrap();
     let inputs = ResourceAttributeInputs::for_resource(resource, loaded.judged().report()).unwrap();
@@ -88,7 +92,11 @@ fn admission_uses_owning_resource_order_even_for_reversed_classifications() {
     let parsed = directory("unknown_attributes");
     let schemas = schemas();
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let loaded = load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let judged = loaded.judged();
     let tree = AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -162,7 +170,11 @@ fn resolved_and_reported_inputs_order_aliases_and_replacements_by_the_owner() {
             .unwrap(),
     );
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let loaded = load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let judged = loaded.judged();
     let tree = AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -224,7 +236,11 @@ fn materialized_subsets_keep_owner_order_and_unchanged_projections() {
     let parsed = directory("unknown_attributes");
     let schemas = schemas();
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let loaded = load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let tree = AnalysisTree::try_from_file(loaded.judged().file()).unwrap();
     let resource = tree.resources().next().unwrap();
     let mut inputs =
@@ -293,7 +309,11 @@ fn projected_attributes_take_resource_order_without_authored_authority() {
     let schemas = schemas();
     carina_core::identifier::resolve_attr_prefixes(&mut parsed.resources, &schemas).unwrap();
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let loaded = load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let tree = AnalysisTree::try_from_file(loaded.judged().file()).unwrap();
     let resource = tree.resources().next().unwrap();
     assert!(resource.authored_slot("name").is_err());

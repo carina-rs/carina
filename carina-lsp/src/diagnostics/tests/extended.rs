@@ -1767,8 +1767,11 @@ fn render_value_type_error(
 ) -> Option<String> {
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let parsed = carina_core::parser::parse_file(source, Path::new("test.crn"), &config).unwrap();
-    let loaded =
-        carina_core::config_loader::load_buffer_configuration(&parsed, &engine.schemas, &config);
+    let loaded = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
+        &engine.schemas,
+        &config,
+    );
     let expression = loaded
         .judged()
         .report()
@@ -18044,7 +18047,7 @@ fn widening_member_obligation_lsp_validate_parity(decoded: bool) {
     .expect("validate must admit the widening and defer its destination member");
     let authored = parse(source);
     let configuration = carina_core::config_loader::load_buffer_configuration(
-        &authored,
+        carina_core::config_loader::issue_buffer_configuration(&authored),
         &engine.schemas,
         &engine.provider_context,
     );

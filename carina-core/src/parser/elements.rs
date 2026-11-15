@@ -1005,7 +1005,7 @@ pub enum ConfigurationBlock {
 pub struct ConfigurationBlockDeclaration {
     kind: ConfigurationBlock,
     utf16_columns: (u32, u32),
-    verdict: crate::config_loader::DirectoryVerdict,
+    verdict: Option<crate::config_loader::DirectoryVerdict>,
 }
 impl ConfigurationBlockDeclaration {
     fn new(
@@ -1031,7 +1031,7 @@ impl ConfigurationBlockDeclaration {
                 column(span.start_line(), span.start_column()),
                 column(span.end_line(), span.end_column()),
             ),
-            verdict: Default::default(),
+            verdict: None,
         }
     }
     pub fn utf16_columns(&self) -> (u32, u32) {
@@ -1040,8 +1040,8 @@ impl ConfigurationBlockDeclaration {
     pub fn kind(&self) -> ConfigurationBlock {
         self.kind
     }
-    pub fn directory_verdict(&self) -> &crate::config_loader::DirectoryVerdict {
-        &self.verdict
+    pub fn directory_verdict(&self) -> Option<&crate::config_loader::DirectoryVerdict> {
+        self.verdict.as_ref()
     }
 }
 
@@ -1058,7 +1058,7 @@ pub struct SyntaxInventory<
     attribute_keys: Vec<AttributeKeyLocation>,
     providers: Vec<Located<ProviderDeclaration>>,
     configuration_blocks: Vec<Located<ConfigurationBlockDeclaration>>,
-    directory_verdict: crate::config_loader::DirectoryVerdict,
+    directory_verdict: Option<crate::config_loader::DirectoryVerdict>,
     backend_keys: Vec<Located<super::AttributeKey>>,
     anonymous_headers: Vec<DeclarationLocation>,
     loops: Vec<DeclarationLocation>,
@@ -1074,7 +1074,7 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
             attribute_keys: Vec::new(),
             providers: Vec::new(),
             configuration_blocks: Vec::new(),
-            directory_verdict: crate::config_loader::DirectoryVerdict::default(),
+            directory_verdict: None,
             backend_keys: Vec::new(),
             anonymous_headers: Vec::new(),
             loops: Vec::new(),
@@ -1102,8 +1102,11 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     pub fn configuration_blocks(&self) -> &[Located<ConfigurationBlockDeclaration>] {
         &self.configuration_blocks
     }
-    pub fn directory_verdict(&self) -> &crate::config_loader::DirectoryVerdict {
-        &self.directory_verdict
+    pub fn directory_verdict(&self) -> Option<&crate::config_loader::DirectoryVerdict> {
+        self.directory_verdict.as_ref()
+    }
+    pub fn issued_directory(&self) -> Option<crate::config_loader::IssuedDirectory<'_, B>> {
+        crate::config_loader::IssuedDirectory::from_inventory(self)
     }
     pub(in crate::parser) fn install_directory_verdict(
         &mut self,
@@ -1111,9 +1114,9 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     ) {
         let (verdict, _) = admission.into_parts();
         for block in &mut self.configuration_blocks {
-            block.detail_mut().verdict = verdict.clone();
+            block.detail_mut().verdict = Some(verdict.clone());
         }
-        self.directory_verdict = verdict;
+        self.directory_verdict = Some(verdict);
     }
     pub(crate) fn backend_keys(&self) -> &[Located<super::AttributeKey>] {
         &self.backend_keys

@@ -57,7 +57,11 @@ fn round9_admission_locations_use_linear_resource_work() {
         );
         let parsed = crate::parser::parse(&source, config).unwrap();
         let bindings = BindingIndex::from_parsed(&parsed, &schemas, config);
-        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, config);
+        let loaded = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            config,
+        );
         let (findings, work) = crate::test_work::measure(|| {
             resource_admission_findings(
                 loaded.judged(),
@@ -270,7 +274,11 @@ fn validation_views_borrow_the_produced_report() {
     let schemas = SchemaRegistry::new();
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
-    let judged = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+    let judged = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let first = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
     let second = ValidationTypeContext::new_providerless(judged.judged(), &config, &signatures);
     assert!(std::ptr::eq(
@@ -712,7 +720,7 @@ fn ref_validation_rejects_missing_provenance_without_panicking() {
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(&parsed, &schemas, None, &signatures, session);
                 let configuration = crate::config_loader::load_buffer_configuration(
-                    &parsed,
+                    crate::config_loader::issue_buffer_configuration(&parsed),
                     &schemas,
                     session.as_provider_context(),
                 );
@@ -925,9 +933,7 @@ fn empty_parsed() -> ParsedFile {
 
 #[test]
 fn anonymous_schema_error_groups_plain_and_deferred_template_resources() {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(
-        directory.path().join("main.crn"),
+    let parsed = crate::parser::parse(
         r#"
 mock.test.Thing { name = "one" }
 mock.test.Thing { name = "two" }
@@ -937,14 +943,9 @@ for item in upstream.items {
     mock.test.Thing { name = item.name }
 }
 "#,
-    )
-    .unwrap();
-    let parsed = crate::config_loader::parse_directory(
-        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
-    .expect("fixture parses")
-    .into_parsed();
+    .expect("fixture parses");
     assert_eq!(parsed.iter_top_level_resources().count(), 2);
     assert_eq!(parsed.parsed_deferred_for_expressions().len(), 1);
 
@@ -983,7 +984,7 @@ fn module_call_findings_for_test(
     let parsed = &fixture;
     let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
         crate::config_loader::load_buffer_configuration(
-            parsed,
+            crate::config_loader::issue_buffer_configuration(parsed),
             &schemas,
             provider_context.as_provider_context(),
         )
@@ -1072,7 +1073,7 @@ fn validate_resource_ref_types_for_test<
                 .map(|argument| argument.name.clone())
                 .collect();
             let configuration = crate::config_loader::load_buffer_configuration(
-                parsed,
+                crate::config_loader::issue_buffer_configuration(parsed),
                 schemas,
                 session.as_provider_context(),
             );
@@ -1835,7 +1836,7 @@ fn refined_int_module_argument_report(annotation: &str, sink: TypeExpr) -> Bindi
     )]);
     check_bare_binding_uses(&ValidationTypeContext::new(
         crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             &schemas,
             provider_context.as_provider_context(),
         )
@@ -2698,8 +2699,11 @@ fn binding_use_finding_display_is_context_only_and_error_is_its_source() {
     let schemas = SchemaRegistry::new();
     let provider_context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
-    let judged_configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &provider_context);
+    let judged_configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &provider_context,
+    );
     let context = ValidationTypeContext::new_providerless(
         judged_configuration.judged(),
         &provider_context,
@@ -2752,7 +2756,7 @@ fn binding_diagnostics_preserve_symlink_parent_source_spelling() {
     let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
     let report = check_bare_binding_uses(&ValidationTypeContext::new(
         crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             &schemas,
             provider.as_provider_context(),
         )
@@ -2830,7 +2834,7 @@ let generated = for item in items {
     let module_signatures = crate::module_resolver::ResolvedModuleSignatures::new();
     let provider_context = LoadedProviderContext::empty_for_test();
     let judged_configuration = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         &schemas,
         provider_context.as_provider_context(),
     );
@@ -4427,14 +4431,18 @@ fn admitted_placement_directory(source: &str) -> crate::config_loader::ParsedRoo
     .unwrap()
 }
 
-// --- validate_no_module_declarations_in_root tests ---
+// --- RootDirectoryParse::root_placement_diagnostics tests ---
 
 #[test]
 fn arguments_with_backend_errors() {
     let parsed = admitted_placement_directory(
         "arguments { state_path: String }\nbackend local { path = 'state.json' }\n",
     );
-    let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
+    let error = parsed
+        .root_placement_diagnostics()
+        .into_iter()
+        .next()
+        .unwrap();
     assert_eq!(
         error.detail().to_string(),
         format!(
@@ -4455,7 +4463,11 @@ fn arguments_with_backend_errors() {
 #[test]
 fn arguments_with_provider_errors() {
     let parsed = admitted_placement_directory("arguments { vpc_cidr: String }\nprovider aws {}\n");
-    let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
+    let error = parsed
+        .root_placement_diagnostics()
+        .into_iter()
+        .next()
+        .unwrap();
     assert_eq!(
         error.detail().to_string(),
         format!(
@@ -4478,7 +4490,11 @@ fn authored_arguments_in_root_are_rejected_regardless_of_entries() {
     for root in ["provider mock {}", "backend local { path = 'state.json' }"] {
         for block in ["arguments {}", "arguments { n: Int = 1 }"] {
             let parsed = admitted_placement_directory(&format!("{root}\n{block}\n"));
-            let error = validate_no_module_declarations_in_root(parsed.parsed()).unwrap_err();
+            let error = parsed
+                .root_placement_diagnostics()
+                .into_iter()
+                .next()
+                .unwrap();
             assert_eq!(
                 error.detail().to_string(),
                 format!(
@@ -4504,6 +4520,7 @@ fn authored_arguments_in_root_are_rejected_regardless_of_entries() {
                 parsed
                     .parsed()
                     .directory_verdict()
+                    .expect("issued directory verdict")
                     .root()
                     .unwrap()
                     .evidence()
@@ -4520,20 +4537,19 @@ fn authored_arguments_in_root_are_rejected_regardless_of_entries() {
 fn arguments_alone_is_ok() {
     let parsed = admitted_placement_directory("arguments { vpc_cidr: String }\n");
     assert!(matches!(
-        parsed.parsed().directory_verdict(),
+        parsed
+            .parsed()
+            .directory_verdict()
+            .expect("issued directory verdict"),
         crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
     ));
-    assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_ok());
+    assert!(parsed.root_placement_diagnostics().is_empty());
 }
 
 #[test]
-fn direct_directory_without_module_evidence_is_ok() {
-    let parsed = admitted_placement_directory("// No arguments block.\n");
-    assert!(matches!(
-        parsed.parsed().directory_verdict(),
-        crate::config_loader::DirectoryVerdict::NoEvidence(_)
-    ));
-    assert!(validate_no_module_declarations_in_root(parsed.parsed()).is_ok());
+fn empty_arguments_in_root_ok() {
+    let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(empty_parsed());
+    assert!(parsed.root_placement_diagnostics().is_empty());
 }
 
 #[test]
@@ -5456,7 +5472,12 @@ fn check_module_calls_providerless_defers_unloaded_bare_count_argument() {
     )]);
     let schemas = SchemaRegistry::new();
     let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config).judged(),
+        crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &config,
+        )
+        .judged(),
         &config,
         &signatures,
     ));
@@ -5683,7 +5704,7 @@ fn check_module_calls_reports_nested_file_type_resolution_errors() {
     );
     let binding_use_report = check_bare_binding_uses(&ValidationTypeContext::new(
         crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             &schemas,
             provider_context.as_provider_context(),
         )
@@ -5969,7 +5990,7 @@ child { values = [vpc] }
     let schemas = SchemaRegistry::new();
     let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
         crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
@@ -6031,7 +6052,7 @@ let child = child_module { value = forwarded }
     )]);
     let report = check_bare_binding_uses(&ValidationTypeContext::new_providerless(
         crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             &schemas,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
@@ -10668,7 +10689,7 @@ fn bare_typeexpr_sink_requires_authored_evidence() {
     let provider = LoadedProviderContext::empty_for_test();
     let schemas = SchemaRegistry::new();
     let loaded = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         &schemas,
         provider.as_provider_context(),
     );
@@ -10686,7 +10707,11 @@ fn bare_binding_precheck_preserves_rejection_after_constant_folding() {
             "let bad = {rhs}\nlet template = use {{ source = './child' }}\nlet child = template {{ x = bad }}"
         ))
         .unwrap();
-        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+        let loaded = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &config,
+        );
         let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
         let context =
             ValidationTypeContext::new_providerless(loaded.judged(), &config, &signatures);
@@ -10841,7 +10866,7 @@ fn review_r9_nested_symbolic_findings_are_rendered_once_per_path() {
     let parsed = crate::parser::parse("let src = mock.test.Source {}\nlet sink = mock.test.Sink { values = [src.bad, src.bad] }\n", catalog.as_provider_context()).unwrap();
     let bindings = BindingIndex::from_parsed(&parsed, &schemas, catalog.as_provider_context());
     let loaded = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         &schemas,
         catalog.as_provider_context(),
     );
@@ -10894,8 +10919,11 @@ fn admission_deferred_read_keeps_main_verdict_across_files() {
         assert_eq!(tree.resources().count(), 1);
         assert_eq!(tree.project_resources().count(), 0);
         let bindings = BindingIndex::from_parsed(&parsed, &schemas, catalog);
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            catalog,
+        );
         validate_resource_admissions(
             configuration.judged(),
             &bindings,
@@ -10993,7 +11021,7 @@ fn folded_children_keep_every_failure() {
     ] {
         let parsed = crate::parser::parse_and_resolve(source).unwrap();
         let loaded = crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             &schemas,
             &expression_validation_config(),
         );
@@ -11035,7 +11063,7 @@ fn resource_sink_does_not_repeat_child_findings() {
             .unwrap(),
     );
     let loaded = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         &schemas,
         &expression_validation_config(),
     );
@@ -11107,7 +11135,7 @@ fn deferred_loop_keys_and_indexes_are_not_concrete() {
         let name = if pattern.contains("k,") { "k" } else { "i" };
         let parsed = crate::parser::parse_and_resolve(&format!("let src = mock.test.Source {{}}\n{pattern} {{ mock.test.Sink {{ name = \"${{{name}}}-inline\" }} }}")).unwrap();
         let loaded = crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             &schemas,
             &expression_validation_config(),
         );
@@ -11219,13 +11247,13 @@ fn schema_bundle_replaces_findings_from_a_different_registry() {
     let strings = schemas(crate::schema::PatternAttributeType::string());
     let integers = schemas(crate::schema::PatternAttributeType::int());
     let first = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         &strings,
         &expression_validation_config(),
     );
     assert_eq!(first.judged().report().findings().len(), 1);
     let second = crate::config_loader::load_buffer_configuration(
-        first.parsed(),
+        crate::config_loader::issue_buffer_configuration(first.parsed()),
         &integers,
         &expression_validation_config(),
     );

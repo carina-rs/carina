@@ -44,7 +44,7 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
         .module_resolution_context()
 }
 
-fn assert_empty_template(blocks: &str) {
+fn assert_round4_empty_template(blocks: &str) {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("arguments.crn"), blocks).unwrap();
     fs::write(
@@ -126,14 +126,20 @@ fn assert_empty_template(blocks: &str) {
         );
         assert_eq!(
             matches!(
-                configuration.parsed().directory_verdict(),
+                configuration
+                    .parsed()
+                    .directory_verdict()
+                    .expect("issued directory verdict"),
                 crate::config_loader::DirectoryVerdict::Unknown(())
             ),
             broken
         );
         assert_eq!(
             matches!(
-                configuration.parsed().directory_verdict(),
+                configuration
+                    .parsed()
+                    .directory_verdict()
+                    .expect("issued directory verdict"),
                 crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
             ),
             !broken
@@ -143,20 +149,20 @@ fn assert_empty_template(blocks: &str) {
 }
 
 #[test]
-fn empty_arguments_are_template_scope() {
-    assert_empty_template("arguments {}\n");
+fn round4_empty_arguments_are_template_scope() {
+    assert_round4_empty_template("arguments {}\n");
 }
 #[test]
-fn empty_attributes_are_template_scope() {
-    assert_empty_template("attributes {}\n");
+fn round4_empty_attributes_are_template_scope() {
+    assert_round4_empty_template("attributes {}\n");
 }
 #[test]
-fn both_empty_blocks_are_template_scope() {
-    assert_empty_template("arguments {}\nattributes {}\n");
+fn round4_both_empty_blocks_are_template_scope() {
+    assert_round4_empty_template("arguments {}\nattributes {}\n");
 }
 
 #[test]
-fn direct_template_scope_in_all_resolver_entry_points() {
+fn round1_direct_template_scope_in_all_resolver_entry_points() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(
         directory.path().join("arguments.crn"),
@@ -247,11 +253,8 @@ fn resolve_modules(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_in_directory_for_test(
-                    parsed,
-                    &crate::paths::ResolvedPath::new(base_dir).unwrap(),
-                )
-                .admit(&crate::schema::SchemaRegistry::new(), session),
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(base_dir).unwrap(),
             )
             .map_err(Box::new)
@@ -261,7 +264,7 @@ fn resolve_modules(
 }
 
 #[test]
-fn root_require_directory_rejected_and_module_evaluated() {
+fn root_require_directory_and_module_share_scope_evaluation() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("checked")).unwrap();
     fs::write(
@@ -358,11 +361,8 @@ fn resolve_modules_with_config(
 ) -> Result<ModuleResolvedParsedFile, ModuleError> {
     crate::validation::deferred_types::with_session_for_test(config, |session| {
         super::resolve_modules_with_providerless_config(
-            crate::config_loader::ParsedRootDirectory::from_parsed_in_directory_for_test(
-                parsed,
-                &crate::paths::ResolvedPath::new(base_dir).unwrap(),
-            )
-            .admit(schemas, session),
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                .admit(schemas, session),
             &crate::paths::ResolvedPath::new(base_dir).unwrap(),
         )
         .map_err(Box::new)
@@ -466,10 +466,8 @@ impl ModuleResolutionFixture {
             .expect("fixture caller parses");
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
             resolve_upstream_modules_with_providerless_config(
-                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                    parsed, &caller,
-                )
-                .admit(&crate::schema::SchemaRegistry::new(), session),
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(
                     caller_file.parent().expect("caller file has a directory"),
                 )
@@ -1442,10 +1440,7 @@ let forwarded = inner { flag = flag }
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("standalone outer module parses");
-    let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-        parsed,
-        outer_source,
-    );
+    let parsed = crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed);
     let result = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
@@ -1722,7 +1717,7 @@ fn module_parse_error_preserves_symlink_followed_by_parent_components() {
     .unwrap();
     let error =
         resolve_modules(parsed, &project).expect_err("the symlink target contains invalid DSL");
-    let ModuleError::ParseInFile { path, .. } = error.root_cause() else {
+    let ModuleError::ParseInFile { path, error: _ } = error.root_cause() else {
         panic!("expected a located module parse error: {error:?}");
     };
     assert_eq!(path, &project.join("jump/../bad/main.crn"));
@@ -4885,7 +4880,10 @@ fn test_missing_required_argument() {
             let result = resolver.expand_module_call(&call, "my_instance");
             assert!(matches!(
                 result.as_ref().map_err(|error| error.root_cause()),
-                Err(ModuleError::MissingArgument { .. })
+                Err(ModuleError::MissingArgument {
+                    module: _,
+                    argument: _
+                })
             ));
         },
     )
@@ -5243,7 +5241,10 @@ fn test_unknown_argument_rejected() {
             assert!(
                 matches!(
                     result.as_ref().map_err(|error| error.root_cause()),
-                    Err(ModuleError::UnknownArgument { .. })
+                    Err(ModuleError::UnknownArgument {
+                        module: _,
+                        argument: _
+                    })
                 ),
                 "Expected UnknownArgument error, got {:?}",
                 result
@@ -5880,7 +5881,7 @@ fn test_load_module_parse_error_cleans_resolving_set() {
             );
             let err = result.unwrap_err();
             assert!(
-                matches!(&err, ModuleError::ParseInFile { .. }),
+                matches!(&err, ModuleError::ParseInFile { path: _, error: _ }),
                 "expected located Parse error on first attempt, got: {err:?}"
             );
 
@@ -5890,7 +5891,7 @@ fn test_load_module_parse_error_cleans_resolving_set() {
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(
-                matches!(&err, ModuleError::ParseInFile { .. }),
+                matches!(&err, ModuleError::ParseInFile { path: _, error: _ }),
                 "expected located Parse error on second attempt, not CircularImport, got: {err:?}"
             );
 
@@ -5993,7 +5994,10 @@ fn test_load_module_rejects_backend_and_cleans_resolving_set() {
                     .load_module("module")
                     .expect_err("backend inside a module must be rejected");
                 assert!(
-                    matches!(err.root_cause(), ModuleError::BackendInModule),
+                    matches!(
+                        err.root_cause(),
+                        ModuleError::BackendInModule { evidence: _ }
+                    ),
                     "expected BackendInModule on attempt {attempt}, got {err:?}",
                 );
                 assert_eq!(
@@ -6115,7 +6119,7 @@ fn test_load_module_rejects_file_path() {
                 .load_module("single.crn")
                 .expect_err("a single .crn file must not be loadable as a module");
             assert!(
-                matches!(&err, ModuleError::NotADirectory { .. }),
+                matches!(&err, ModuleError::NotADirectory { path: _ }),
                 "expected NotADirectory, got {err:?}"
             );
 
@@ -7175,7 +7179,11 @@ fn test_argument_type_mismatch_int_for_string() {
             assert!(
                 matches!(
                     result.as_ref().map_err(|error| error.root_cause()),
-                    Err(ModuleError::InvalidArgumentType { .. })
+                    Err(ModuleError::InvalidArgumentType {
+                        module: _,
+                        argument: _,
+                        mismatch: _
+                    })
                 ),
                 "Expected InvalidArgumentType error, got {:?}",
                 result
@@ -7221,7 +7229,11 @@ fn test_argument_type_mismatch_string_for_bool() {
             assert!(
                 matches!(
                     result.as_ref().map_err(|error| error.root_cause()),
-                    Err(ModuleError::InvalidArgumentType { .. })
+                    Err(ModuleError::InvalidArgumentType {
+                        module: _,
+                        argument: _,
+                        mismatch: _
+                    })
                 ),
                 "Expected InvalidArgumentType error, got {:?}",
                 result
@@ -7323,7 +7335,11 @@ fn test_argument_type_custom_validator() {
         assert!(
             matches!(
                 result.as_ref().map_err(|error| error.root_cause()),
-                Err(ModuleError::InvalidArgumentType { .. })
+                Err(ModuleError::InvalidArgumentType {
+                    module: _,
+                    argument: _,
+                    mismatch: _
+                })
             ),
             "Expected InvalidArgumentType error for invalid ARN, got {:?}",
             result
@@ -7425,7 +7441,11 @@ fn test_argument_type_list_of_custom_type() {
         assert!(
             matches!(
                 result.as_ref().map_err(|error| error.root_cause()),
-                Err(ModuleError::InvalidArgumentType { .. })
+                Err(ModuleError::InvalidArgumentType {
+                    module: _,
+                    argument: _,
+                    mismatch: _
+                })
             ),
             "Expected InvalidArgumentType for list with invalid ARN, got {:?}",
             result
@@ -9003,7 +9023,7 @@ fn ref_typed_module_argument_used_bare_is_rejected_in_module_context() {
             let schemas = crate::schema::SchemaRegistry::new();
             let signatures = crate::module_resolver::ResolvedModuleSignatures::new();
             let judged_configuration = crate::config_loader::load_buffer_configuration(
-                &parsed,
+                crate::config_loader::issue_buffer_configuration(&parsed),
                 &schemas,
                 session.catalog(),
             );
@@ -9196,7 +9216,11 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
             assert!(
                 matches!(
                     result.as_ref().map_err(|error| error.root_cause()),
-                    Err(ModuleError::InvalidArgumentType { .. })
+                    Err(ModuleError::InvalidArgumentType {
+                        module: _,
+                        argument: _,
+                        mismatch: _
+                    })
                 ),
                 "Caller passing 'dpv' to `'dev' | 'prod'` must be rejected — \
          carina-rs/carina#2611. Got: {:?}",
@@ -9995,15 +10019,14 @@ let resources = for item in itmes {
 
 #[test]
 fn finalize_reports_every_undefined_iterable_for_managed_resource_bodies() {
-    let fixture_source = r#"let first = for item in frist_items {
+    let parsed = crate::parser::parse(
+        r#"let first = for item in frist_items {
   mock.test.resource { name = item }
 }
 let second = for item in secnd_items {
   mock.test.resource { name = item }
 }
-"#;
-    let parsed = crate::parser::parse(
-        fixture_source,
+"#,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("both undefined iterables remain deferred until finalization");
@@ -10012,11 +10035,8 @@ let second = for item in secnd_items {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             super::resolve_modules_providerless(
-                crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                    parsed,
-                    fixture_source,
-                )
-                .admit(&crate::schema::SchemaRegistry::new(), session),
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                    .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )
             .expect_err("finalization must reject both undefined iterables")
@@ -12177,10 +12197,7 @@ fn expanded_complete_directory_keeps_its_own_verdict() {
         context.as_provider_context(),
     )
     .unwrap();
-    let root = crate::config_loader::RootDirectoryParse::from_parsed_source_for_test(
-        parsed,
-        fixture_source,
-    );
+    let root = crate::config_loader::RootDirectoryParse::from_parsed_for_test(parsed);
     let schemas = crate::schema::SchemaRegistry::new();
     crate::validation::deferred_types::with_session_for_test(&context, |session| {
         let expanded = super::resolve_modules_with_providerless_config(
@@ -12189,7 +12206,9 @@ fn expanded_complete_directory_keeps_its_own_verdict() {
         )
         .unwrap();
         assert!(matches!(
-            expanded.directory_verdict(),
+            expanded
+                .directory_verdict()
+                .expect("issued directory verdict"),
             crate::config_loader::DirectoryVerdict::NoEvidence(_)
         ));
     });
@@ -12205,7 +12224,9 @@ fn empty_directory_metadata_keeps_the_no_evidence_verdict() {
     )
     .unwrap();
     assert!(matches!(
-        parsed.directory_verdict(),
+        parsed
+            .directory_verdict()
+            .expect("issued directory verdict"),
         crate::config_loader::DirectoryVerdict::NoEvidence(_)
     ));
 }

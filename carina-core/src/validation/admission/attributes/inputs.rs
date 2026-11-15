@@ -810,8 +810,11 @@ mod tests {
         .unwrap()
         .resolve_root_for_test();
         let schemas = SchemaRegistry::new();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();
@@ -847,8 +850,11 @@ mod tests {
         .unwrap()
         .resolve_root_for_test();
         let schemas = SchemaRegistry::new();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree.resources().next().unwrap();

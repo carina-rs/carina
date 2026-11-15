@@ -146,7 +146,11 @@ fn function_arithmetic_findings_keep_sibling_declaration_order() {
     let parsed = directory("functions/arithmetic");
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let schemas = schemas();
-    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let loaded = load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let bindings = BindingIndex::from_parsed(loaded.judged().file(), &schemas, &config);
     let findings =
         carina_core::validation::check_file_integer_arithmetic_values(loaded.judged(), &bindings);
@@ -174,7 +178,11 @@ fn function_reference_and_call_findings_keep_sibling_declaration_order() {
     let parsed = directory("functions/references");
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let schemas = schemas();
-    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let loaded = load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let bindings = BindingIndex::from_parsed(loaded.judged().file(), &schemas, &config);
     let errors =
         carina_core::validation::validate_user_function_ref_types_with_bindings(&parsed, &bindings)
@@ -352,7 +360,11 @@ fn canonical_attribute_wins_an_equal_distance_block_alias() {
             .unwrap(),
     );
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
+    let loaded = load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &config,
+    );
     let judged = loaded.judged();
     let tree = AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();

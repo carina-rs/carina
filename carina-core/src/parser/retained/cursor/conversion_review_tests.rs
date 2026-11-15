@@ -29,8 +29,11 @@ fn conversion_missing_operand_judgement_uses_only_the_conversion_channel() {
         &catalog,
     )
     .unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -106,8 +109,11 @@ fn ordinary_if_and_coalesce_missing_children_do_not_claim_a_conversion() {
             &catalog,
         )
         .unwrap();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let tree =
             crate::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
         let resource = tree.resources().next().unwrap();

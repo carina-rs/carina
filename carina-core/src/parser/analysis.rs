@@ -1813,6 +1813,8 @@ pub struct AnalysisTree<
     functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
+    module_definition: bool,
+    root_configuration: bool,
     backend_location: Option<&'a DeclarationLocation>,
 }
 
@@ -2642,6 +2644,8 @@ where
             arguments: &file.arguments,
             functions: &file.user_functions,
             module_calls: &file.module_calls,
+            module_definition: !file.arguments.is_empty() || !file.attribute_params.is_empty(),
+            root_configuration: file.backend.is_some() || !file.providers.is_empty(),
             backend_location,
             binding_names: syntax
                 .binding_names()
@@ -2712,7 +2716,13 @@ where
             .expect("provider inventory validated at the analysis boundary")
     }
 
-    pub fn directory_verdict(&self) -> &crate::config_loader::DirectoryVerdict {
+    pub fn is_module_definition(&self) -> bool {
+        self.module_definition
+    }
+    pub fn is_root_configuration(&self) -> bool {
+        self.root_configuration
+    }
+    pub fn directory_verdict(&self) -> Option<&crate::config_loader::DirectoryVerdict> {
         self.syntax.directory_verdict()
     }
     pub fn backend_location(&self) -> Option<&'a DeclarationLocation> {

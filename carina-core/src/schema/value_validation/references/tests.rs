@@ -49,7 +49,11 @@ fn with_files(
     let parsed = crate::config_loader::parse_directory(&path, &catalog)
         .unwrap()
         .into_parsed();
-    let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let loaded = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let tree = crate::parser::AnalysisTree::try_from_file(loaded.judged().file()).unwrap();
     let resource = tree
         .project_resources()

@@ -280,7 +280,10 @@ fn duplicate_directives_in_a_sibling_keep_the_require_scope_complete() {
         snapshot, &schemas, &context,
     );
     assert!(matches!(
-        configuration.parsed().directory_verdict(),
+        configuration
+            .parsed()
+            .directory_verdict()
+            .expect("issued directory verdict"),
         carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
     ));
 }

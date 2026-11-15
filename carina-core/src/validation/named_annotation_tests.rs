@@ -1125,7 +1125,7 @@ fn call_findings(
     )]);
     let schemas = caller.schema_registry();
     let configuration = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         schemas,
         context.as_provider_context(),
     );
@@ -1412,7 +1412,7 @@ fn computed_access_rejects_heterogeneous_collection_in_validation() {
         let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
         let result = validate_resource_ref_types(
             crate::config_loader::load_buffer_configuration(
-                &parsed,
+                crate::config_loader::issue_buffer_configuration(&parsed),
                 snapshot.schema_registry(),
                 context,
             )
@@ -1610,7 +1610,7 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
     .unwrap();
     let signatures = HashMap::new();
     let configuration = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         snapshot.schema_registry(),
         snapshot.provider_context().as_provider_context(),
     );
@@ -1729,7 +1729,7 @@ fn every_boundary_admits_same_identity_member_restrictions() {
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     validate_resource_ref_types(
         crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             snapshot.schema_registry(),
             context,
         )
@@ -1853,7 +1853,7 @@ fn integer_result_mismatches_share_names_in_value_and_resource_checkers() {
     let expected = "expected Int (range 1..=64), got Int (range unbounded)";
     let error = validate_resource_ref_types(
         crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             snapshot.schema_registry(),
             context,
         )
@@ -1932,7 +1932,7 @@ fn integer_operand_mismatches_do_not_hide_a_named_strings_constraints() {
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
     let error = validate_resource_ref_types(
         crate::config_loader::load_buffer_configuration(
-            &parsed,
+            crate::config_loader::issue_buffer_configuration(&parsed),
             snapshot.schema_registry(),
             context,
         )
@@ -2017,7 +2017,7 @@ fn constructed_builtin_at_named_field(expression: &str, sink: DraftType) -> Resu
     crate::parser::resolve_resource_refs_with_config(&mut parsed, context.as_provider_context())
         .unwrap();
     let configuration = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         loaded.schema_registry(),
         context.as_provider_context(),
     );
@@ -2209,7 +2209,7 @@ fn issue_4282_review_split_coalesce_checks_literal_alternative() {
     )
     .unwrap();
     let configuration = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         loaded.schema_registry(),
         context.as_provider_context(),
     );
@@ -2467,7 +2467,7 @@ fn retained_read_types_do_not_claim_slot_member_bounds() {
     )
     .unwrap();
     let configuration = crate::config_loader::load_buffer_configuration(
-        &parsed,
+        crate::config_loader::issue_buffer_configuration(&parsed),
         snapshot.schema_registry(),
         context,
     );

@@ -119,8 +119,11 @@ fn conversion_unrendered_no_as_walk_cannot_emit_or_add_shared_sink_findings() {
     let parsed = crate::parser::parse_file(source, Path::new("sibling.crn"), &catalog)
         .unwrap()
         .resolve_root_for_test();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let bindings =
@@ -175,8 +178,11 @@ fn r5b_no_as_sibling_driver_does_no_extra_walks() {
     .unwrap()
     .into_parsed()
     .resolve_root_for_test();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let bindings =
@@ -249,8 +255,11 @@ fn r5b_sibling_driver_does_not_repeat_a_completed_conversion_validator() {
     )
     .unwrap()
     .resolve_root_for_test();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();

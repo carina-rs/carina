@@ -47,8 +47,11 @@ fn trace_materialized(
     );
     let parsed =
         crate::parser::parse_file(source, std::path::Path::new("round4.crn"), &catalog).unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -338,7 +341,7 @@ fn round5_live_computed_parts_reach_authored_hook() {
 }
 
 #[test]
-fn module_body_slots_keep_per_instance_authored_roots() {
+fn round5_module_body_slots_keep_per_instance_authored_roots() {
     use crate::resource::AbsoluteBindingAddress;
     use crate::validation::admission::attributes::ResourceAttributeInputs;
     let directory = tempfile::tempdir().unwrap();
@@ -374,8 +377,11 @@ fn module_body_slots_keep_per_instance_authored_roots() {
             &path,
         )
         .unwrap();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&expanded, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&expanded),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);

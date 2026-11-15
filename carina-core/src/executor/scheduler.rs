@@ -983,12 +983,11 @@ mod tests {
 
     #[test]
     fn unbound_loop_key_is_distinct_from_binding_and_graph_edge_uses_source_location() {
-        let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
+        let parsed = crate::parser::parse_file(
+            "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
-             }\n";
-        let parsed = crate::parser::parse_file(
-            fixture_source,
+             }\n",
             std::path::Path::new("main.crn"),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
@@ -997,11 +996,8 @@ mod tests {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
-                    crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                        parsed,
-                        fixture_source,
-                    )
-                    .admit(&crate::schema::SchemaRegistry::new(), session),
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                        .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                 )
                 .expect("deferred fixture crosses the module-resolution seam")
@@ -1066,12 +1062,11 @@ mod tests {
     }
     #[test]
     fn cross_phase_unbound_failure_uses_source_location_not_scheduler_key() {
-        let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
+        let parsed = crate::parser::parse_file(
+            "let upstream = upstream_state { source = '../upstream' }\n\
              for value in upstream.values {\n\
                mock.test.Child { identity_input = value }\n\
-             }\n";
-        let parsed = crate::parser::parse_file(
-            fixture_source,
+             }\n",
             std::path::Path::new("main.crn"),
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
@@ -1080,11 +1075,8 @@ mod tests {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
-                    crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                        parsed,
-                        fixture_source,
-                    )
-                    .admit(&crate::schema::SchemaRegistry::new(), session),
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                        .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(".").unwrap(),
                 )
                 .map_err(Box::new)

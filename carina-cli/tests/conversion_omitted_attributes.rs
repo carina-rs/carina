@@ -833,8 +833,11 @@ fn r9_audit_directive_storage_and_unsupported_keys() {
         }
         let parsed = parsed.resolve_root_for_test();
         let schemas = SchemaRegistry::new();
-        let configuration =
-            carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = carina_core::config_loader::load_buffer_configuration(
+            carina_core::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let tree = carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file())
             .unwrap();
         for resource in tree.resources() {

@@ -45,8 +45,11 @@ fn round5_resource_and_data_source_references_do_not_enter_definition_blocks() {
         let parsed =
             crate::parser::parse_file(&source, std::path::Path::new("boundary.crn"), &catalog)
                 .unwrap();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         let judged = configuration.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree
@@ -122,8 +125,11 @@ fn round5_reference_slot_syntax_inventory() {
     }
     let parsed =
         crate::parser::parse_file(source, std::path::Path::new("reference.crn"), &catalog).unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree
@@ -757,8 +763,11 @@ fn walk(source: &str, declaration: crate::schema::AttributeType) -> Vec<Visit> {
             .validate()
             .unwrap(),
     );
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree
@@ -1045,7 +1054,11 @@ fn slot_coverage(
     run: impl FnOnce(&ExpressionReport, &crate::schema::value_validation::WalkCoverage),
 ) {
     use crate::schema::value_validation::{WalkCoverage, validate_authored_value_for_admission};
-    let configuration = crate::config_loader::load_buffer_configuration(parsed, schemas, catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(parsed),
+        schemas,
+        catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let mut coverage = WalkCoverage::default();
@@ -1401,8 +1414,11 @@ fn seam_directory_replacement_keeps_reference_root_and_covers_descendants() {
                 .unwrap(),
         );
     }
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree
@@ -1464,8 +1480,11 @@ fn seam_admission_coverage_accumulates_across_resource_slots() {
             ),
         ],
         |parsed, schemas, catalog| {
-            let configuration =
-                crate::config_loader::load_buffer_configuration(parsed, schemas, catalog);
+            let configuration = crate::config_loader::load_buffer_configuration(
+                crate::config_loader::issue_buffer_configuration(parsed),
+                schemas,
+                catalog,
+            );
             let judged = configuration.judged();
             let (rows, coverage) = admit_all(
                 judged,
@@ -1526,8 +1545,11 @@ fn seam_schema_block_aliases_keep_the_synthetic_authored_containers() {
             .unwrap(),
     );
     crate::schema::resolve_file_block_names_with_schemas(&mut parsed, &schemas).unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -1557,15 +1579,11 @@ fn seam_schema_block_aliases_keep_the_synthetic_authored_containers() {
 #[test]
 fn seam_deferred_loop_substitution_rebuilds_the_whole_slot() {
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let fixture_source = "let upstream = upstream_state { source = '../upstream' }\nfor value in upstream.values { mock.Test { input = [value] } }";
-    let parsed = crate::parser::parse(fixture_source, &catalog).unwrap();
+    let parsed = crate::parser::parse("let upstream = upstream_state { source = '../upstream' }\nfor value in upstream.values { mock.Test { input = [value] } }", &catalog).unwrap();
     let parsed = crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         crate::module_resolver::resolve_modules_providerless(
-            crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                parsed,
-                fixture_source,
-            )
-            .admit(&crate::schema::SchemaRegistry::new(), session),
+            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                .admit(&crate::schema::SchemaRegistry::new(), session),
             &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
         )
         .unwrap()
@@ -1659,8 +1677,11 @@ fn seam_generated_prefix_result_has_explicit_projection_authority() {
         crate::parser::parse_and_resolve("let target = mock.Test { name_prefix = 'test-' }")
             .unwrap();
     crate::identifier::resolve_attr_prefixes(&mut parsed.resources, &schemas).unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.project_resources().next().unwrap();
@@ -1730,8 +1751,11 @@ fn seam_completeness_tracks_the_materialized_slot_generation() {
         &catalog,
     )
     .unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let resource = &judged.file().resources[0];
     let original = resource.authored_slots.get("input").unwrap();
@@ -1826,8 +1850,11 @@ fn seam_missing_resource_snapshot_invalidates_a_previous_cursor() {
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let schemas = SchemaRegistry::new();
     let parsed = crate::parser::parse_and_resolve("mock.Test { input = 'value' }").unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let mut file = judged.file().clone();
     assert!(
@@ -1883,8 +1910,11 @@ fn seam_deferred_read_aliases_use_the_selected_data_source_schema() {
             .validate()
             .unwrap(),
     );
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let tree = crate::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
     let read = tree
         .resources()
@@ -1911,8 +1941,11 @@ fn seam_pending_sink_retains_authored_storage_and_unreached_use() {
     )
     .unwrap();
     assert_eq!(parsed.bare_binding_uses().pending_slots().count(), 2);
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     for name in ["input", "block"] {
         let slot = judged.file().resources[1].authored_slots.get(name).unwrap();
@@ -2043,8 +2076,11 @@ fn review_seam_instantiated_materialized_slot_has_a_current_judgement() {
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse_and_resolve("mock.Test { input = 'same' }").unwrap();
     let schemas = SchemaRegistry::new();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let resource = &configuration.judged().file().resources[0];
     let instance = resource.instantiate();
     let original = resource.authored_slots.get("input").unwrap();
@@ -2148,8 +2184,11 @@ fn review_seam_composition_computed_values_keep_main_checks() {
                 &path,
             )
             .unwrap();
-            let configuration =
-                crate::config_loader::load_buffer_configuration(&graph, &schemas, &catalog);
+            let configuration = crate::config_loader::load_buffer_configuration(
+                crate::config_loader::issue_buffer_configuration(&graph),
+                &schemas,
+                &catalog,
+            );
             let judged = configuration.judged();
             let (mut rows, _) = admit_all(
                 judged,
@@ -2192,8 +2231,11 @@ fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
     );
     let parsed =
         crate::parser::parse_and_resolve("let one = mock.Test { input = 'same' }").unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();

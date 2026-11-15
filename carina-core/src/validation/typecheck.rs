@@ -1437,7 +1437,11 @@ mod tests {
         let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::parse_and_resolve(source).unwrap();
         let schemas = crate::schema::SchemaRegistry::new();
-        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config);
+        let loaded = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &config,
+        );
         let expression = loaded
             .judged()
             .report()

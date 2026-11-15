@@ -284,8 +284,10 @@ fn attach_directory_evidence(
             diagnostic.related_information = Some(vec![related]);
         }
         DirectoryEvidencePresentation::Note(note) => {
-            diagnostic.message.push_str("\nNote: ");
-            diagnostic.message.push_str(&note);
+            diagnostic.message.push('\n');
+            diagnostic
+                .message
+                .push_str(&carina_core::config_loader::evidence_note(&note, ""));
         }
     }
 }
@@ -1171,14 +1173,12 @@ impl DiagnosticRun<'_> {
             diagnostics.extend(self.check_mixed_tag_key_styles(doc, base, &result.directory, tree));
         }
         if let Some(boundary_file) = current_parsed {
-            let boundary = if merged
-                .unwrap_or(boundary_file)
-                .declares_module_placeholders()
-            {
-                carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
-            } else {
-                carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
-            };
+            let boundary =
+                if carina_core::validation::is_module_definition(merged.unwrap_or(boundary_file)) {
+                    carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+                } else {
+                    carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+                };
             if let Some(merged) = merged {
                 diagnostics.extend(self.check_expansion_boundary(
                     doc,
@@ -1438,11 +1438,12 @@ impl DiagnosticRun<'_> {
             // back to the buffer parse only when directory merging failed. This
             // deliberately gives both composition-attribute existence checks
             // and `check_resource_ref_type_mismatch` directory-wide targets.
-            let directive_boundary = if merged.unwrap_or(parsed).declares_module_placeholders() {
-                carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
-            } else {
-                carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
-            };
+            let directive_boundary =
+                if carina_core::validation::is_module_definition(merged.unwrap_or(parsed)) {
+                    carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
+                } else {
+                    carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
+                };
             let directive_errors = if let Some(graph) = expanded_graph {
                 graph.directive_resolution_errors(
                     directive_boundary,
@@ -1493,7 +1494,7 @@ impl DiagnosticRun<'_> {
                     configuration
                 } else {
                     fallback_configuration = carina_core::config_loader::load_buffer_configuration(
-                        pre_expansion_input,
+                        carina_core::config_loader::issue_buffer_configuration(pre_expansion_input),
                         &self.schemas,
                         self.provider_context.catalog(),
                     );
@@ -1592,7 +1593,7 @@ impl DiagnosticRun<'_> {
             };
             let expanded_configuration = expanded_graph.map(|graph| {
                 carina_core::config_loader::load_buffer_configuration(
-                    graph,
+                    carina_core::config_loader::issue_buffer_configuration(graph),
                     &self.schemas,
                     self.provider_context.catalog(),
                 )
@@ -2796,19 +2797,18 @@ impl DiagnosticRun<'_> {
                     .filter(|b| current_file_bindings.contains(b))
                     .collect()
                 }
-                (None, None) => match carina_core::config_loader::AuthoredBindingView::parse_file_source(
+                (None, None) => carina_core::config_loader::AuthoredBindingView::parse_file_source(
                     &text,
                     current_file_path.unwrap_or_else(|| doc.source_file()),
                     self.provider_context.catalog(),
-                ) {
-                    Ok(view) => carina_core::validation::check_unused_bindings_with_identity_requirements(
-                        &view, &self.schemas,
-                    ),
-                    Err(error) => {
-                        log::debug!("unused-binding analysis unavailable for buffer: {error}");
-                        Vec::new()
-                    }
-                },
+                )
+                .map(|view| {
+                    carina_core::validation::check_unused_bindings_with_identity_requirements(
+                        &view,
+                        &self.schemas,
+                    )
+                })
+                .unwrap_or_default(),
                 (None, Some(_)) => Vec::new(),
             };
             diagnostics.extend(self.unused_binding_diagnostics(

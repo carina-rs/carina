@@ -2031,7 +2031,7 @@ pub fn present_human_error_line(line: HumanErrorLine) -> HumanErrorPresentation 
             evidence.note_relative_to(&root)
         }
     };
-    HumanErrorPresentation::Note(format!("  Note: {note}"))
+    HumanErrorPresentation::Note(carina_core::config_loader::evidence_note(&note, "  "))
 }
 
 pub(crate) fn upstream_source_config_error<B: carina_core::resource::BindingAddress>(
@@ -2960,7 +2960,7 @@ mod tests {
         let provider_context =
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let configuration = carina_core::config_loader::load_buffer_configuration(
-            &parsed,
+            carina_core::config_loader::issue_buffer_configuration(&parsed),
             &schemas,
             &provider_context,
         );

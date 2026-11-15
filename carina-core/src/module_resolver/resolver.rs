@@ -225,7 +225,7 @@ impl ResidualModuleResolutionError {
     pub fn element_diagnostic(&self) -> Option<&crate::parser::Located<ParseError>> {
         match self.0.root_cause() {
             ModuleError::Parse(error) => error.element_diagnostic(),
-            ModuleError::ParseInFile { error, .. } => error.element_diagnostic(),
+            ModuleError::ParseInFile { error, path: _ } => error.element_diagnostic(),
             _ => None,
         }
     }
@@ -263,7 +263,13 @@ impl ResidualModuleResolutionError {
                 }
             }
         }
-        if let ModuleError::ArgumentValueAccess { diagnostic, .. } = self.0.root_cause() {
+        if let ModuleError::ArgumentValueAccess {
+            diagnostic,
+            module: _,
+            source_path: _,
+            line: _,
+        } = self.0.root_cause()
+        {
             // Keep the authored module operand as well as its caller anchors.
             // In the operand's own file it replaces any broader call anchor.
             findings.retain(|finding| finding.location().file() != diagnostic.location().file());
@@ -278,7 +284,63 @@ impl ResidualModuleResolutionError {
     pub fn analysis_invariant(&self) -> Option<&crate::parser::AnalysisTreeError> {
         match self.0.root_cause() {
             ModuleError::AnalysisInvariant(error) => Some(error),
-            _ => None,
+            ModuleError::WithProviderTypeWarnings {
+                error: _,
+                warnings: _,
+            }
+            | ModuleError::OwnedByCalls { calls: _, error: _ }
+            | ModuleError::AtCall { call: _, error: _ }
+            | ModuleError::NoConfigurationFiles { path: _ }
+            | ModuleError::MissingArgument {
+                module: _,
+                argument: _,
+            }
+            | ModuleError::InvalidArgumentType {
+                module: _,
+                argument: _,
+                mismatch: _,
+            }
+            | ModuleError::BareStructuralHandleArgument {
+                module: _,
+                argument: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | ModuleError::ArgumentValueAccess {
+                module: _,
+                source_path: _,
+                line: _,
+                diagnostic: _,
+            }
+            | ModuleError::DroppedConditionalBinding {
+                binding: _,
+                condition: _,
+                source_path: _,
+                line: _,
+            }
+            | ModuleError::UnexpandedModuleTemplate { context: _ }
+            | ModuleError::ParseInFile { path: _, error: _ }
+            | ModuleError::UnknownArgument {
+                module: _,
+                argument: _,
+            }
+            | ModuleError::ProviderInModule { evidence: _ }
+            | ModuleError::BackendInModule { evidence: _ }
+            | ModuleError::NotADirectory { path: _ }
+            | ModuleError::Multiple(_)
+            | ModuleError::NotFound(_)
+            | ModuleError::CircularImport(_)
+            | ModuleError::ReferenceType(_)
+            | ModuleError::Io(_)
+            | ModuleError::Parse(_)
+            | ModuleError::TypeResolution(_)
+            | ModuleError::UnknownModule(_)
+            | ModuleError::Constraint(_)
+            | ModuleError::RequireOutsideModule(_)
+            | ModuleError::StateBlockInModule
+            | ModuleError::UpstreamStateInModule
+            | ModuleError::ExportsInModule => None,
         }
     }
 
@@ -293,7 +355,10 @@ impl ResidualModuleResolutionError {
         match self.0.root_cause() {
             ModuleError::RequireOutsideModule(_) => None,
             ModuleError::AnalysisInvariant(_) => None,
-            ModuleError::WithProviderTypeWarnings { .. } | ModuleError::WithRootEvidence { .. } => {
+            ModuleError::WithProviderTypeWarnings {
+                error: _,
+                warnings: _,
+            } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
             ModuleError::Multiple(_errors) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
@@ -343,7 +408,7 @@ impl ResidualModuleResolutionError {
                 Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
             ModuleError::NotFound(_module) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
-            ModuleError::NoConfigurationFiles { .. } => {
+            ModuleError::NoConfigurationFiles { path: _ } => {
                 Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
             ModuleError::CircularImport(_module) => None,
@@ -351,9 +416,9 @@ impl ResidualModuleResolutionError {
             ModuleError::UnknownModule(_module) => {
                 Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
-            ModuleError::ProviderInModule
+            ModuleError::ProviderInModule { evidence: _ }
             | ModuleError::StateBlockInModule
-            | ModuleError::BackendInModule
+            | ModuleError::BackendInModule { evidence: _ }
             | ModuleError::UpstreamStateInModule
             | ModuleError::ExportsInModule => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::NotADirectory { path: _path } => {
@@ -405,7 +470,10 @@ impl ResidualModuleResolutionError {
         let root_cause = self.0.root_cause();
         match root_cause {
             ModuleError::AnalysisInvariant(_) => false,
-            ModuleError::WithProviderTypeWarnings { .. } | ModuleError::WithRootEvidence { .. } => {
+            ModuleError::WithProviderTypeWarnings {
+                error: _,
+                warnings: _,
+            } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
             ModuleError::Multiple(_errors) => false,
@@ -440,7 +508,7 @@ impl ResidualModuleResolutionError {
             }),
             ModuleError::OwnedByCalls { calls: _, error: _ } => false,
             ModuleError::AtCall { call: _, error: _ } => false,
-            ModuleError::NotFound(_) | ModuleError::NoConfigurationFiles { .. } => false,
+            ModuleError::NotFound(_) | ModuleError::NoConfigurationFiles { path: _ } => false,
             ModuleError::CircularImport(_) => false,
             ModuleError::ArgumentValueAccess {
                 module: _,
@@ -574,9 +642,9 @@ impl ResidualModuleResolutionError {
                 finding.message().type_resolution_diagnostic() == Some(diagnostic.as_ref())
             }),
             ModuleError::UnknownModule(_) => false,
-            ModuleError::ProviderInModule => false,
+            ModuleError::ProviderInModule { evidence: _ } => false,
             ModuleError::StateBlockInModule => false,
-            ModuleError::BackendInModule => false,
+            ModuleError::BackendInModule { evidence: _ } => false,
             ModuleError::UpstreamStateInModule => false,
             ModuleError::ExportsInModule => false,
             ModuleError::Constraint(_) | ModuleError::RequireOutsideModule(_) => false,
@@ -638,8 +706,7 @@ fn without_covered_reference_type_members(
         ModuleError::ReferenceType(errors) => errors
             .without_covered_module_calls(findings)
             .map(ModuleError::ReferenceType),
-        error @ (ModuleError::WithRootEvidence { .. }
-        | ModuleError::NoConfigurationFiles { .. }
+        error @ (ModuleError::NoConfigurationFiles { path: _ }
         | ModuleError::NotFound(_)
         | ModuleError::CircularImport(_)
         | ModuleError::MissingArgument {
@@ -681,9 +748,9 @@ fn without_covered_reference_type_members(
             argument: _,
         }
         | ModuleError::UnknownModule(_)
-        | ModuleError::ProviderInModule
+        | ModuleError::ProviderInModule { evidence: _ }
         | ModuleError::StateBlockInModule
-        | ModuleError::BackendInModule
+        | ModuleError::BackendInModule { evidence: _ }
         | ModuleError::UpstreamStateInModule
         | ModuleError::ExportsInModule
         | ModuleError::Constraint(_)
@@ -803,7 +870,7 @@ mod diagnostic_status_tests {
                 let binding_use_report = crate::validation::check_bare_binding_uses(
                     &crate::validation::ValidationTypeContext::new_providerless(
                         crate::config_loader::load_buffer_configuration(
-                            &parsed,
+                            crate::config_loader::issue_buffer_configuration(&parsed),
                             &schemas,
                             provider_context.catalog(),
                         )

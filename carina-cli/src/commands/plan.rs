@@ -7496,8 +7496,13 @@ async fn walk_upstream_cycles_only<B: carina_core::resource::BindingAddress>(
                 source.metadata()?;
                 Ok(source)
             })
-            .map_err(|error| {
-                crate::error::upstream_source_config_error(&us.binding, &us.source, error)
+            .map_err(|e| {
+                AppError::Config(format!(
+                    "upstream_state '{}': cannot resolve source '{}': {}",
+                    us.binding,
+                    us.source.display(),
+                    e
+                ))
             })?;
 
         let source_identity = source_abs.identity();

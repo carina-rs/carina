@@ -3975,16 +3975,15 @@ mod tests {
             "#,
         )
         .unwrap();
-        let source = r#"
+        let parsed = parse_file(
+            r#"
                 let tags_mod = use { source = "./modules/standard-tags" }
                 let tags = tags_mod { environment = "dev" }
 
                 provider test {
                     default_tags = tags.tags
                 }
-            "#;
-        let parsed = parse_file(
-            source,
+            "#,
             std::path::Path::new("state_bucket_delete.crn"),
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
@@ -3996,10 +3995,7 @@ mod tests {
             "the fixture must exercise the parser shape used by bucket delete"
         );
         let parsed = resolve_authored_file_for_test(
-            carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                parsed, source,
-            )
-            .into_parsed(),
+            parsed,
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
         );
 

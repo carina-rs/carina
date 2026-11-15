@@ -31,8 +31,7 @@ impl RequireOutsideModuleDiagnostic {
         self.root.evidence()
     }
     pub fn lsp_message(&self) -> String {
-        self.root
-            .lsp_message("`require` is only allowed inside a module")
+        "`require` is only allowed inside a module".to_string()
     }
 }
 impl fmt::Display for RequireOutsideModuleDiagnostic {

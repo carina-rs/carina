@@ -142,7 +142,7 @@ where
         &self,
     ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<LocatedBackendError>>>
     {
-        if self.file().declares_module_placeholders() {
+        if self.is_module_definition() {
             return None;
         }
         let backend = self.file().backend.as_ref()?;

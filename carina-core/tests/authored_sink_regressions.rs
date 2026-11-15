@@ -68,7 +68,11 @@ fn source_schemas() -> SchemaRegistry {
 
 fn findings(parsed: &ParsedFile, schemas: &SchemaRegistry) -> Vec<String> {
     let context = ProviderContext::new(EnvironmentSnapshot::empty());
-    let loaded = carina_core::config_loader::load_buffer_configuration(parsed, schemas, &context);
+    let loaded = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(parsed),
+        schemas,
+        &context,
+    );
     loaded
         .judged()
         .report()
@@ -80,7 +84,11 @@ fn findings(parsed: &ParsedFile, schemas: &SchemaRegistry) -> Vec<String> {
 
 fn validation_findings(parsed: &ParsedFile, schemas: &SchemaRegistry) -> Vec<String> {
     let context = ProviderContext::new(EnvironmentSnapshot::empty());
-    let loaded = carina_core::config_loader::load_buffer_configuration(parsed, schemas, &context);
+    let loaded = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(parsed),
+        schemas,
+        &context,
+    );
     let messages = loaded
         .judged()
         .report()

@@ -1,0 +1,7 @@
+Error: ../rooted: provider blocks are not allowed inside modules. Define providers at the root configuration level.
+  Note: directory is a root configuration because of the provider block at ../rooted/providers.crn:1.
+Error: ../rooted: backend blocks are not allowed inside modules. Define the backend at the root configuration level.
+  Note: directory is a root configuration because of the backend block at ../rooted/backend.crn:1.
+Error: ../rooted: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.
+Error: ../rooted: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.
+Error: ../rooted: exports blocks are not allowed inside modules. Define exports at the root configuration level.

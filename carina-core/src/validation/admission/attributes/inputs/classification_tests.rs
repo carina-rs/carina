@@ -77,7 +77,11 @@ fn assert_both_passes<E, D, B>(
     E: Clone + crate::parser::ExportParamLike<ParserPlaceholder, B>,
     D: Clone + crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    let configuration = crate::config_loader::load_buffer_configuration(parsed, schemas, catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(parsed),
+        schemas,
+        catalog,
+    );
     let judged = configuration.judged();
     let tree = AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
@@ -148,8 +152,11 @@ fn evaluation_modes_are_copy_without_copy_bindings_and_use_the_supplied_session(
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let parsed = crate::parser::parse_and_resolve("mock.Test { name = 'before' }").unwrap();
     let schemas = SchemaRegistry::new();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let configuration = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &catalog,
+    );
     let tree = AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
     let resource = tree.resources().next().unwrap();
     let mut values = resource.attributes().into_owned();

@@ -304,10 +304,8 @@ fn lint_result(
         base_dir,
         &provider_context.environment,
         &carina_core::schema::SchemaRegistry::new(),
-    );
-    if let Some(error) = module_walk.fatal_import() {
-        return Err(error);
-    }
+    )
+    .for_lint();
     let module_boundary_findings = validate_module_boundaries(&module_walk);
 
     let (providers, provider_factory_error) = ProviderLoad::load_reporting(
@@ -329,13 +327,6 @@ fn lint_result(
                 .into_iter()
                 .map(|error| error.to_string())
                 .collect::<Vec<_>>();
-            if let Err(error) =
-                carina_core::validation::validate_no_module_declarations_in_root(parsed.parsed())
-            {
-                type_findings.push(crate::error::lint_error_message(
-                    &AppError::RootDeclaration(Box::new(error)),
-                ));
-            }
             let mut conversion_validation = carina_core::validation::ConversionValidation::<
                 std::convert::Infallible,
             >::for_file(&parsed);

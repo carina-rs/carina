@@ -1,0 +1,113 @@
+[
+  {
+    "message": "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
+    "range": {
+      "end": {
+        "character": 1,
+        "line": 1
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    },
+    "relatedInformation": [
+      {
+        "location": {
+          "range": {
+            "end": {
+              "character": 13,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "uri": "$ROOT/rooted/providers.crn"
+        },
+        "message": "This provider block makes the directory a root configuration."
+      }
+    ],
+    "severity": 1,
+    "source": "carina"
+  },
+  {
+    "message": "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",
+    "range": {
+      "end": {
+        "character": 1,
+        "line": 1
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    },
+    "relatedInformation": [
+      {
+        "location": {
+          "range": {
+            "end": {
+              "character": 7,
+              "line": 0
+            },
+            "start": {
+              "character": 0,
+              "line": 0
+            }
+          },
+          "uri": "$ROOT/rooted/backend.crn"
+        },
+        "message": "This backend block makes the directory a root configuration."
+      }
+    ],
+    "severity": 1,
+    "source": "carina"
+  },
+  {
+    "message": "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+    "range": {
+      "end": {
+        "character": 1,
+        "line": 1
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    },
+    "severity": 1,
+    "source": "carina"
+  },
+  {
+    "message": "upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+    "range": {
+      "end": {
+        "character": 1,
+        "line": 1
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    },
+    "severity": 1,
+    "source": "carina"
+  },
+  {
+    "message": "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+    "range": {
+      "end": {
+        "character": 1,
+        "line": 1
+      },
+      "start": {
+        "character": 0,
+        "line": 1
+      }
+    },
+    "severity": 1,
+    "source": "carina"
+  }
+]

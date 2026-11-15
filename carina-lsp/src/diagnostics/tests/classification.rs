@@ -13,8 +13,11 @@ fn resolved_input_fallback_counter_only_records_swallowed_errors() {
         &catalog,
     )
     .unwrap();
-    let sealed =
-        carina_core::config_loader::load_buffer_configuration(&previous, &schemas, &catalog);
+    let sealed = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&previous),
+        &schemas,
+        &catalog,
+    );
     let current = carina_core::parser::parse_file(
         "mock.Test { input = 'bad' }",
         Path::new("buffer.crn"),

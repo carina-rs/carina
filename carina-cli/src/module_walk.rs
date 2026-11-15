@@ -13,6 +13,7 @@ pub(crate) struct LoadedModuleAtPath {
     diagnostic_base: ResolvedPath,
     module_path: ResolvedPath,
     loaded: LoadedModule,
+    owners: Vec<carina_core::parser::ModuleCallId>,
 }
 
 impl LoadedModuleAtPath {
@@ -30,6 +31,16 @@ impl LoadedModuleAtPath {
 
     pub(crate) fn loaded(&self) -> &LoadedModule {
         &self.loaded
+    }
+
+    pub(crate) fn import_diagnostic(&self, error: ModuleError) -> crate::error::AppError {
+        crate::error::AppError::ModuleImport {
+            path: self.diagnostic_label(),
+            error: std::sync::Arc::new(ModuleError::OwnedByCalls {
+                calls: self.owners.clone(),
+                error: Box::new(error),
+            }),
+        }
     }
 }
 
@@ -111,11 +122,15 @@ impl ModuleWalk {
         walk
     }
 
-    pub(crate) fn fatal_import(&self) -> Option<crate::error::AppError> {
+    /// Main's lint walk skips single-file imports. The resolver remains the
+    /// fallback when no independently collected finding blocks expansion.
+    pub(crate) fn for_lint(mut self) -> Self {
         self.rejections
-            .iter()
-            .find(|rejection| matches!(rejection.presentation, ImportPresentation::Resolution(_)))
-            .map(RejectedModuleAtPath::diagnostic)
+            .retain(|rejection| match &rejection.presentation {
+                ImportPresentation::Boundary => true,
+                ImportPresentation::Resolution(_) => false,
+            });
+        self
     }
 
     pub(crate) fn rejections(&self) -> &[RejectedModuleAtPath] {
@@ -165,6 +180,7 @@ fn visit_module(
                 diagnostic_base: diagnostic_base.clone(),
                 module_path: module_path.clone(),
                 loaded,
+                owners: owners.to_vec(),
             });
             imports
         }
@@ -194,7 +210,10 @@ fn visit_module(
                                     diagnostic_path,
                                     diagnostic_base,
                                 ),
-                                error: std::sync::Arc::new(error),
+                                error: std::sync::Arc::new(ModuleError::OwnedByCalls {
+                                    calls: owners.to_vec(),
+                                    error: Box::new(error),
+                                }),
                                 presentation: ImportPresentation::Boundary,
                             }
                         }));
@@ -398,11 +417,11 @@ mod rejected_import_tests {
         assert_eq!(walk.rejections().len(), 2);
         assert!(matches!(
             walk.rejections()[0].error.root_cause(),
-            ModuleError::ProviderInModule
+            ModuleError::ProviderInModule { evidence: _ }
         ));
         assert!(matches!(
             walk.rejections()[1].error.root_cause(),
-            ModuleError::BackendInModule
+            ModuleError::BackendInModule { evidence: _ }
         ));
     }
 }

@@ -442,8 +442,11 @@ pub fn no_conversion_proof() -> crate::parser::retained::NoConversion {
             crate::parser::parse_file("let proof = 0", std::path::Path::new("proof.crn"), &catalog)
                 .expect("plain proof fixture");
         let schemas = crate::schema::SchemaRegistry::new();
-        let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            &catalog,
+        );
         configuration
             .judged()
             .report()

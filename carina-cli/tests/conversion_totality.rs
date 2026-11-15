@@ -123,8 +123,11 @@ fn round5_generated_p1_covers_every_grammar_context() {
                     continue;
                 }
             };
-            let configuration =
-                carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            let configuration = carina_core::config_loader::load_buffer_configuration(
+                carina_core::config_loader::issue_buffer_configuration(&parsed),
+                &schemas,
+                &catalog,
+            );
             let report =
                 carina_core::validation::ConversionValidation::<std::convert::Infallible>::new(
                     configuration.judged().report(),

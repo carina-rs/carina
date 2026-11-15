@@ -1,0 +1,4 @@
+moved { from = mock.test.resource 'old' to = mock.test.resource 'new' }
+removed { from = mock.test.resource 'gone' }
+import { to = mock.test.resource 'existing' id = 'existing-id' }
+let prior = upstream_state { source = '../prior' }

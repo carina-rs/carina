@@ -755,21 +755,16 @@ mod tests {
 
     #[test]
     fn deferred_directive_failures_keep_their_label_and_typed_source() {
-        let fixture_source = "let up = upstream_state { source = '../upstream' }\nlet children = for flag in up.flags { mock.test.Child { name = 'child' directives { force_delete = flag } } }\n";
         let parsed = crate::parser::parse(
-            fixture_source,
+            "let up = upstream_state { source = '../upstream' }\nlet children = for flag in up.flags { mock.test.Child { name = 'child' directives { force_delete = flag } } }\n",
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        )
-        .unwrap();
+        ).unwrap();
         let expanded = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
                 crate::module_resolver::resolve_modules_providerless(
-                    crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                        parsed,
-                        fixture_source,
-                    )
-                    .admit(&crate::schema::SchemaRegistry::new(), session),
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                        .admit(&crate::schema::SchemaRegistry::new(), session),
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                 )
                 .map_err(Box::new)
@@ -899,12 +894,11 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |session| {
-                let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
+                let parsed = crate::parser::parse(
+                    "let upstream = upstream_state { source = '../upstream' }\n\
                      for value in upstream.values {\n\
                        mock.test.Child { identity_input = value }\n\
-                     }\n";
-                let parsed = crate::parser::parse(
-                    fixture_source,
+                     }\n",
                     &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .expect("deferred unbound loop parses");
@@ -912,11 +906,8 @@ mod tests {
                     &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                     |session| {
                         crate::module_resolver::resolve_modules_providerless(
-                            crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                                parsed,
-                                fixture_source,
-                            )
-                            .admit(&crate::schema::SchemaRegistry::new(), session),
+                            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                                .admit(&crate::schema::SchemaRegistry::new(), session),
                             &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                         )
                         .map_err(Box::new)
@@ -985,12 +976,11 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |session| {
-                let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
+                let parsed = crate::parser::parse_file(
+                    "let upstream = upstream_state { source = '../upstream' }\n\
                      for value in upstream.values {\n\
                        mock.test.Child { mode = value }\n\
-                     }\n";
-                let parsed = crate::parser::parse_file(
-                    fixture_source,
+                     }\n",
                     std::path::Path::new("main.crn"),
                     &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
@@ -999,11 +989,8 @@ mod tests {
                     &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                     |session| {
                         crate::module_resolver::resolve_modules_providerless(
-                            crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                                parsed,
-                                fixture_source,
-                            )
-                            .admit(&crate::schema::SchemaRegistry::new(), session),
+                            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                                .admit(&crate::schema::SchemaRegistry::new(), session),
                             &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                         )
                         .map_err(Box::new)
@@ -1124,12 +1111,11 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |session| {
-                let fixture_source = "let upstream = upstream_state { source = '../upstream' }\n\
+                let parsed = crate::parser::parse(
+                    "let upstream = upstream_state { source = '../upstream' }\n\
                      for value in upstream.values {\n\
                        mock.test.Child { identity_input = value }\n\
-                     }\n";
-                let parsed = crate::parser::parse(
-                    fixture_source,
+                     }\n",
                     &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .expect("deferred unbound loop parses");
@@ -1137,11 +1123,8 @@ mod tests {
                     &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                     |session| {
                         crate::module_resolver::resolve_modules_providerless(
-                            crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
-                                parsed,
-                                fixture_source,
-                            )
-                            .admit(&crate::schema::SchemaRegistry::new(), session),
+                            crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
+                                .admit(&crate::schema::SchemaRegistry::new(), session),
                             &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                         )
                         .map_err(Box::new)

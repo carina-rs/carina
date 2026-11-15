@@ -75,7 +75,7 @@ impl ModuleTemplate {
     ) -> ModuleTemplatePreflight<'a> {
         ModuleTemplatePreflight {
             configuration: crate::config_loader::load_buffer_configuration(
-                &self.parsed,
+                crate::config_loader::issue_buffer_configuration(&self.parsed),
                 schemas,
                 context,
             ),
@@ -470,11 +470,17 @@ mod tests {
         let loaded =
             load_module_from_directory(&ResolvedPath::new(dir.path()).unwrap(), &config).unwrap();
         assert!(matches!(
-            loaded.directory_verdict(),
+            loaded
+                .directory_verdict()
+                .expect("issued directory verdict"),
             crate::config_loader::DirectoryVerdict::Root(_)
         ));
         let schemas = crate::schema::SchemaRegistry::new();
-        let judged = crate::config_loader::load_buffer_configuration(&loaded, &schemas, &config);
+        let judged = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&loaded),
+            &schemas,
+            &config,
+        );
         assert_eq!(judged.judged().report().findings().len(), 1);
         assert!(
             judged.judged().report().findings()[0]
@@ -558,11 +564,11 @@ mod tests {
         let errors = error.into_errors();
         assert!(matches!(
             errors[0].root_cause(),
-            ModuleError::ProviderInModule
+            ModuleError::ProviderInModule { evidence: _ }
         ));
         assert!(matches!(
             errors[1].root_cause(),
-            ModuleError::BackendInModule
+            ModuleError::BackendInModule { evidence: _ }
         ));
         assert!(matches!(
             errors[2].root_cause(),
@@ -719,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn load_module_distinguishes_a_file_path_from_unavailable_source() {
+    fn load_module_returns_none_for_file_path() {
         let tmp = tempdir().unwrap();
         let single = tmp.path().join("solo.crn");
         fs::write(&single, "arguments {\n  x: String\n}\n").unwrap();
@@ -797,15 +803,16 @@ mod importability_tests {
         };
         assert!(matches!(
             error.into_error().root_cause(),
-            ModuleError::NoConfigurationFiles { .. }
+            ModuleError::NoConfigurationFiles { path: _ }
         ));
         fs::write(directory.path().join("arguments.crn"), "arguments {}\n").unwrap();
         fs::write(directory.path().join("broken.crn"), "let broken =\n").unwrap();
         assert!(matches!(
             load_module(&path, &context),
-            Err(ModuleLoadError::Unavailable(
-                ModuleError::ParseInFile { .. }
-            ))
+            Err(ModuleLoadError::Unavailable(ModuleError::ParseInFile {
+                path: _,
+                error: _
+            }))
         ));
         fs::write(directory.path().join("broken.crn"), [0xff]).unwrap();
         assert!(matches!(
@@ -818,7 +825,10 @@ mod importability_tests {
             panic!("root evidence must prohibit import");
         };
         let error = error.into_error();
-        assert!(matches!(error.root_cause(), ModuleError::ProviderInModule));
+        assert!(matches!(
+            error.root_cause(),
+            ModuleError::ProviderInModule { evidence: _ }
+        ));
         assert!(error.root_evidence().is_some());
     }
 
@@ -842,7 +852,10 @@ mod importability_tests {
             fs::write(directory.path().join("evidence.crn"), evidence).unwrap();
             let loaded = load_module_from_directory(&path, &context).unwrap();
             use crate::config_loader::DirectoryVerdict;
-            let actual = match loaded.directory_verdict() {
+            let actual = match loaded
+                .directory_verdict()
+                .expect("issued directory verdict")
+            {
                 DirectoryVerdict::Root(_) => "root",
                 DirectoryVerdict::ModuleTemplate(_) => "module",
                 DirectoryVerdict::NoEvidence(_) => "neutral",

@@ -78,7 +78,11 @@ fn check_with_schemas(source: &str, consumer: &str, schemas: &SchemaRegistry) ->
     let parsed = crate::config_loader::parse_directory(&path, catalog)
         .unwrap()
         .into_parsed();
-    let loaded = crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+    let loaded = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        schemas,
+        catalog,
+    );
     let bindings = BindingIndex::from_parsed(loaded.judged().file(), schemas, catalog);
     crate::validation::validate_resource_admissions(
         loaded.judged(),
@@ -177,7 +181,11 @@ fn substituted_concrete_references_do_not_add_local_or_schema_deferrals() {
         let parsed = crate::config_loader::parse_directory(&path, catalog)
             .unwrap()
             .into_parsed();
-        let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, catalog);
+        let loaded = crate::config_loader::load_buffer_configuration(
+            crate::config_loader::issue_buffer_configuration(&parsed),
+            &schemas,
+            catalog,
+        );
         let judged = loaded.judged();
         let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let resource = tree
@@ -274,7 +282,11 @@ fn with_ordinary_check(
     let parsed = crate::config_loader::parse_directory(&path, catalog)
         .unwrap()
         .into_parsed();
-    let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, catalog);
+    let loaded = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        catalog,
+    );
     let judged = loaded.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree
@@ -594,7 +606,11 @@ fn substituted_reference_retains_the_ordinary_assignment_callback() {
         "let a = mock.Identity { name = 'abc' }\nlet sink = mock.Sink { value = a.name }\n",
     )
     .unwrap();
-    let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, catalog);
+    let loaded = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        catalog,
+    );
     let judged = loaded.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree
@@ -667,7 +683,11 @@ fn substituted_reference_source_always_carries_its_authored_use_identity() {
     let parsed = crate::config_loader::parse_directory(&path, catalog)
         .unwrap()
         .into_parsed();
-    let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, catalog);
+    let loaded = crate::config_loader::load_buffer_configuration(
+        crate::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        catalog,
+    );
     let judged = loaded.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let mut identities = std::collections::HashSet::new();

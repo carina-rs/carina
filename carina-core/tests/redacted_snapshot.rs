@@ -329,7 +329,11 @@ fn snapshot_state_typecheck_uses_checked_conversion() {
     )
     .unwrap();
     let schemas = carina_core::schema::SchemaRegistry::new();
-    let loaded = carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &context);
+    let loaded = carina_core::config_loader::load_buffer_configuration(
+        carina_core::config_loader::issue_buffer_configuration(&parsed),
+        &schemas,
+        &context,
+    );
     let report = loaded.judged();
     let expression = report
         .report()

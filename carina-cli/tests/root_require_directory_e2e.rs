@@ -13,6 +13,9 @@ use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
 use serde_json::{Value, json};
 use tower_lsp::lsp_types::{Position, Range};
 
+#[path = "root_require_directory_e2e/import_rejections.rs"]
+mod import_rejections;
+
 struct Directory {
     _temp: tempfile::TempDir,
     project: PathBuf,
@@ -108,11 +111,11 @@ impl Directory {
             home,
         };
         success(&directory.run(&["init", "."]));
-        directory.write_root_require(condition);
+        directory.guard(condition);
         directory
     }
 
-    fn write_root_require(&self, condition: &str) {
+    fn guard(&self, condition: &str) {
         fs::write(
             self.project.join("guards.crn"),
             format!("// sibling guard\nrequire {condition}, 'root guard'\n"),
@@ -225,7 +228,7 @@ fn success(output: &Output) {
 }
 
 #[test]
-fn directory_read_error_chain_renders_once() {
+fn round5_directory_read_error_chain_renders_once() {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("blocked.crn");
     fs::write(&file, [0xff]).unwrap();
@@ -258,7 +261,7 @@ fn directory_read_error_chain_renders_once() {
 }
 
 #[test]
-fn directory_discovery_error_chain_renders_once() {
+fn round5_directory_discovery_error_chain_renders_once() {
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("missing");
     let context =
@@ -280,7 +283,7 @@ fn directory_discovery_error_chain_renders_once() {
     );
 }
 
-fn upstream_failures() -> (
+fn round5_upstream_failures() -> (
     carina_core::upstream_exports::UpstreamExportSourceError,
     carina_core::upstream_exports::UpstreamResolveFailure,
 ) {
@@ -338,8 +341,8 @@ fn upstream_failures() -> (
 }
 
 #[test]
-fn module_require_error_chain_renders_once() {
-    let (source_error, _) = upstream_failures();
+fn round5_module_guard_error_chain_renders_once() {
+    let (source_error, _) = round5_upstream_failures();
     let carina_core::upstream_exports::UpstreamExportSourceError::Module { error, .. } =
         source_error
     else {
@@ -371,8 +374,8 @@ fn module_require_error_chain_renders_once() {
 }
 
 #[test]
-fn upstream_source_error_chain_renders_once() {
-    let (error, _) = upstream_failures();
+fn round5_upstream_source_error_chain_renders_once() {
+    let (error, _) = round5_upstream_failures();
     let (base, module) = error.module_failure().unwrap();
     assert!(base.ends_with("upstream"));
     assert!(module.require_outside_module().is_some());
@@ -383,8 +386,8 @@ fn upstream_source_error_chain_renders_once() {
 }
 
 #[test]
-fn upstream_report_error_chain_renders_once() {
-    let (_, error) = upstream_failures();
+fn round5_upstream_report_error_chain_renders_once() {
+    let (_, error) = round5_upstream_failures();
     assert!(error.module_failure().is_some());
     assert_eq!(
         carina_cli::error::format_error_with_source_chain(&error),
@@ -392,7 +395,7 @@ fn upstream_report_error_chain_renders_once() {
     );
 }
 
-fn assert_empty_template(blocks: &str) {
+fn assert_round4_empty_template(blocks: &str) {
     let directory = Directory::new("true");
     directory.clear_root_require();
     fs::create_dir(directory.project.join("empty")).unwrap();
@@ -419,20 +422,20 @@ fn assert_empty_template(blocks: &str) {
 }
 
 #[test]
-fn empty_arguments_validate_as_template() {
-    assert_empty_template("arguments {}\n");
+fn round4_empty_arguments_validate_as_template() {
+    assert_round4_empty_template("arguments {}\n");
 }
 #[test]
-fn empty_attributes_validate_as_template() {
-    assert_empty_template("attributes {}\n");
+fn round4_empty_attributes_validate_as_template() {
+    assert_round4_empty_template("attributes {}\n");
 }
 #[test]
-fn both_empty_blocks_validate_as_template() {
-    assert_empty_template("arguments {}\nattributes {}\n");
+fn round4_both_empty_blocks_validate_as_template() {
+    assert_round4_empty_template("arguments {}\nattributes {}\n");
 }
 
 #[test]
-fn validate_standalone_module_directory_keeps_template_scope() {
+fn round1_validate_standalone_module_directory_keeps_template_scope() {
     let directory = Directory::new("true");
     fs::write(
         directory.project.join("checked/guards.crn"),
@@ -447,7 +450,7 @@ fn validate_standalone_module_directory_keeps_template_scope() {
     }
 }
 
-fn assert_upstream_require(condition: &str) {
+fn assert_round1_upstream_guard(condition: &str) {
     let directory = Directory::new("true");
     directory.clear_root_require();
     let upstream = directory.project.join("upstream");
@@ -499,27 +502,27 @@ fn assert_upstream_require(condition: &str) {
 }
 
 #[test]
-fn root_require_upstream_false_keeps_location() {
-    assert_upstream_require("false");
+fn round1_upstream_false_require_keeps_location() {
+    assert_round1_upstream_guard("false");
 }
 
 #[test]
-fn root_require_upstream_unknown_keeps_location() {
-    assert_upstream_require("missing == 1");
+fn round1_upstream_unknown_require_keeps_location() {
+    assert_round1_upstream_guard("missing == 1");
 }
 
 #[test]
 fn root_require_upstream_true_keeps_location() {
-    assert_upstream_require("true");
+    assert_round1_upstream_guard("true");
 }
 
 #[test]
 fn root_require_upstream_function_call_reports_placement_first() {
-    assert_upstream_require("custom('x') == 1");
+    assert_round1_upstream_guard("custom('x') == 1");
 }
 
 #[test]
-fn root_require_rejected_without_module_calls_and_with_data_sources() {
+fn round1_zero_module_calls_and_data_source_only_guards() {
     for main in [
         "let r = mock.test.resource { name = 'root' }\n",
         "let r = read mock.test.resource { name = 'root' }\n",
@@ -532,13 +535,13 @@ fn root_require_rejected_without_module_calls_and_with_data_sources() {
 }
 
 #[test]
-fn saved_plan_secret_verification_matches_module_policy() {
+fn round1_saved_plan_secret_verification_matches_module_policy() {
     for has_secret in [false, true] {
-        for root_require in [false, true] {
+        for root_guard in [false, true] {
             let directory = Directory::new("true");
             directory.clear_root_require();
             let comment = if has_secret {
-                "comment = secret('SAVED_PLAN_SECRET_VALUE')"
+                "comment = secret('ROUND1_SECRET_VALUE')"
             } else {
                 ""
             };
@@ -546,8 +549,8 @@ fn saved_plan_secret_verification_matches_module_policy() {
                 "let r = mock.test.resource {{ name = 'root' {comment} }}\nlet checked = use {{ source = './checked' }}\nlet control = checked {{ n = 2 }}\n"
             )).unwrap();
             success(&directory.run(&["plan", "--out", "saved.plan", "."]));
-            let message = if root_require {
-                directory.write_root_require("false");
+            let message = if root_guard {
+                directory.guard("false");
                 ROOT_REQUIRE_ERROR
             } else {
                 fs::write(
@@ -569,7 +572,7 @@ fn saved_plan_secret_verification_matches_module_policy() {
             } else {
                 success(&output);
             }
-            assert!(!output_text(&output).contains("SAVED_PLAN_SECRET_VALUE"));
+            assert!(!output_text(&output).contains("ROUND1_SECRET_VALUE"));
         }
     }
 }
@@ -591,7 +594,7 @@ fn root_require_saved_plan_secret_failure_exposes_the_cause() {
         directory.home.join("mock-state.json"),
     ];
     let before = state_paths.each_ref().map(|path| fs::read(path).ok());
-    directory.write_root_require("true");
+    directory.guard("true");
     let output = directory.run(&["apply", "--auto-approve", "saved.plan"]);
     rejected(&output, ROOT_REQUIRE_ERROR);
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();
@@ -735,7 +738,7 @@ fn assert_root_declaration_rejected(block: &str, declaration: &str, same_file: b
     assert_eq!(
         String::from_utf8(lint.stderr).unwrap(),
         format!(
-            "warning: .:1  {declaration_file}:1:1: {block_error}\n  {evidence_note}\nError: Found 1 lint warning(s).\n"
+            "Error: Module resolution error: guards.crn:{require_line}:1: {ROOT_REQUIRE_ERROR}\n  {evidence_note}\n"
         )
     );
 
@@ -879,7 +882,7 @@ fn assert_root_rejected_on_every_path(condition: &str) {
     directory.clear_root_require();
     success(&directory.run(&["apply", "--auto-approve", "."]));
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
-    directory.write_root_require(condition);
+    directory.guard(condition);
     rejected(
         &directory.run(&["apply", "--auto-approve", "."]),
         ROOT_REQUIRE_ERROR,
@@ -911,7 +914,7 @@ fn assert_state_command_rejects_root_require(args: &[&str]) {
         directory.home.join("mock-state.json"),
     ];
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
-    directory.write_root_require("true");
+    directory.guard("true");
     let output = directory.run(args);
     assert_eq!(output.status.code(), Some(1), "{}", output_text(&output));
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "");
@@ -951,7 +954,7 @@ fn root_require_saved_plan_contract() {
     assert_eq!(plan["version"], current_version);
     assert!(!plan.to_string().contains("root guard"));
     // A secret-free saved plan reloads backend syntax without full validation.
-    directory.write_root_require("true");
+    directory.guard("true");
     let mut old = plan.clone();
     old["version"] = json!(previous_version);
     fs::write(
@@ -1025,7 +1028,7 @@ fn root_require_one_error_per_statement() {
 fn root_require_index_builtin_does_not_expose_map_key() {
     let directory = Directory::new("false");
     rejected(&directory.run(&["validate", "."]), ROOT_REQUIRE_ERROR);
-    directory.write_root_require("r[env('CARINA_ROOT_REQUIRE_KEY')] != null");
+    directory.guard("r[env('CARINA_ROOT_REQUIRE_KEY')] != null");
     for args in [
         &["validate", "."][..],
         &["validate", "--json", "."],
@@ -1837,7 +1840,7 @@ fn imported_backend_precedes_state_prohibition_on_validating_paths() {
     success(&directory.run(&["apply", "--auto-approve", "."]));
     let state = fs::read(directory.project.join("carina.state.json")).unwrap();
     let provider_state = fs::read(directory.home.join("mock-state.json")).unwrap();
-    directory.write_root_require("true");
+    directory.guard("true");
     configure_importability_target(
         &directory,
         &[
@@ -1915,11 +1918,15 @@ fn imported_provider_and_backend_notes_name_their_own_files() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.is_empty());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let location = json!({"file": "main.crn", "range": {
+        "start": {"line": 2, "column": 12},
+        "end": {"line": 2, "column": 19}
+    }});
     assert_eq!(
         report["errors"],
         json!([
-            { "message": format!("checked: {provider}\n{provider_note}"), "severity": "error", "code": null, "location": null },
-            { "message": format!("checked: {backend}\n{backend_note}"), "severity": "error", "code": null, "location": null },
+            { "message": format!("checked: {provider}\n{provider_note}"), "severity": "error", "code": null, "location": location },
+            { "message": format!("checked: {backend}\n{backend_note}"), "severity": "error", "code": null, "location": location },
         ])
     );
 }
@@ -2655,4 +2662,47 @@ fn direct_module_only_checks_keep_main_command_behavior() {
             success(&directory.run(&["validate", "."]));
         }
     }
+}
+
+fn lint_scope_fixture(source: &str) -> Directory {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let home = temp.path().join("home");
+    fs::create_dir(&project).unwrap();
+    fs::create_dir(&home).unwrap();
+    fs::write(project.join("main.crn"), source).unwrap();
+    Directory {
+        _temp: temp,
+        project,
+        home,
+    }
+}
+
+#[test]
+fn lint_collects_type_findings_before_single_file_import_failure() {
+    let directory = lint_scope_fixture(
+        "provider mock {}\nlet m = use { source = './single.crn' }\nm {}\nexports { value: UnknownType = 1 }\n",
+    );
+    fs::write(directory.project.join("single.crn"), "arguments {}\n").unwrap();
+    let output = directory.run(&["lint", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "warning: .:1  ./main.crn:4:18: export 'value': unknown custom type 'UnknownType'\nError: Found 1 lint warning(s).\n"
+    );
+}
+
+#[test]
+fn lint_root_interface_blocks_keep_main_success() {
+    let directory = lint_scope_fixture(
+        "provider mock {}\narguments { name: String = 'x' }\nattributes { value: String = 'y' }\n",
+    );
+    let output = directory.run(&["lint", "."]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "No lint warnings found.\n"
+    );
+    assert!(output.stderr.is_empty());
 }

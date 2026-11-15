@@ -2095,7 +2095,7 @@ fn assert_module_resolution_expands(base_dir: &std::path::Path, schemas: &Schema
             context,
         );
         let configuration = carina_core::config_loader::load_buffer_configuration(
-            &directory.parsed,
+            carina_core::config_loader::issue_buffer_configuration(&directory.parsed),
             schemas,
             context.as_provider_context(),
         );
