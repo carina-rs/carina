@@ -1013,6 +1013,8 @@ mod tests {
         )
         .unwrap();
         let unvisited = parsed.resources.pop().unwrap();
+        let location = unvisited.declaration.location().unwrap().clone();
+        assert_eq!(location.span().start_line(), 2);
         let mut canonical = canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview);
         canonical.file.resources.push(unvisited);
         let judged = canonical.judge(&context);
@@ -1027,6 +1029,20 @@ mod tests {
                 ..
             }
         ));
+        match error.diagnostic() {
+            crate::parser::AnalysisTreeDiagnostic::Located(finding) => {
+                assert_eq!(finding.location(), &location);
+                assert_eq!(
+                    finding.to_string(),
+                    format!("{}:2:1: {error}", location.file().path().display())
+                );
+                assert_eq!(error.diagnostic().to_string(), finding.to_string());
+            }
+            crate::parser::AnalysisTreeDiagnostic::File(_)
+            | crate::parser::AnalysisTreeDiagnostic::Directory(_) => {
+                panic!("the unvisited owner's declaration must anchor its diagnostic")
+            }
+        }
         let error = match judged.schema_validation_resources() {
             Err(error) => error,
             Ok(_) => panic!("unvisited owner received canonical values"),
@@ -1038,6 +1054,15 @@ mod tests {
                 ..
             }
         ));
+        match error.diagnostic() {
+            crate::parser::AnalysisTreeDiagnostic::Located(finding) => {
+                assert_eq!(finding.location(), &location);
+            }
+            crate::parser::AnalysisTreeDiagnostic::File(_)
+            | crate::parser::AnalysisTreeDiagnostic::Directory(_) => {
+                panic!("schema input projection must retain the owner's diagnostic location")
+            }
+        }
     }
 
     #[test]

@@ -736,8 +736,19 @@ impl crate::resource::InsideSecret for AnalysisTreeError {
 }
 
 pub enum AnalysisTreeDiagnostic<'a> {
+    Located(Located<&'a AnalysisTreeError>),
     File(FileScoped<&'a AnalysisTreeError>),
     Directory(DirectoryScoped<&'a AnalysisTreeError>),
+}
+
+impl std::fmt::Display for AnalysisTreeDiagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Located(finding) => std::fmt::Display::fmt(finding, f),
+            Self::File(finding) => std::fmt::Display::fmt(finding.detail(), f),
+            Self::Directory(finding) => std::fmt::Display::fmt(finding.detail(), f),
+        }
+    }
 }
 
 impl AnalysisTreeError {
@@ -751,10 +762,22 @@ impl AnalysisTreeError {
 
     pub fn diagnostic(&self) -> AnalysisTreeDiagnostic<'_> {
         match &self.kind {
+            AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: Some(declaration),
+                ..
+            } => AnalysisTreeDiagnostic::Located(Located::new(declaration.clone(), self)),
             AnalysisTreeErrorKind::MissingElementProvenance { declaration, .. } => {
                 AnalysisTreeDiagnostic::File(FileScoped::new(declaration.file().path(), self))
             }
-            _ => AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self }),
+            AnalysisTreeErrorKind::InsideSecret
+            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }
+            | AnalysisTreeErrorKind::MissingResourceProvenance { .. }
+            | AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: None, ..
+            }
+            | AnalysisTreeErrorKind::MissingWaitProvenance { .. } => {
+                AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self })
+            }
         }
     }
 }

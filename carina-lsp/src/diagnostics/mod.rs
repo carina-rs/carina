@@ -179,6 +179,9 @@ fn render_analysis_invariant(
 ) -> Option<Diagnostic> {
     let message = error.to_string();
     match error.diagnostic() {
+        carina_core::parser::AnalysisTreeDiagnostic::Located(finding) => {
+            render_merged(doc, &finding, DiagnosticSeverity::ERROR, message)
+        }
         carina_core::parser::AnalysisTreeDiagnostic::File(finding) => {
             render_merged(doc, &finding, DiagnosticSeverity::ERROR, message)
         }

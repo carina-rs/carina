@@ -809,6 +809,55 @@ async fn prefix_companion_unselected_module_if_conflict_is_reported() {
     .await;
 }
 
+async fn assert_selected_prefix_rejection(attributes: &str, expected: &str) {
+    let source = format!("let r = if enabled {{ mock.test.resource {{ {attributes} }} }}\n");
+    let fixture = PrefixDirectory::new(&[
+        (
+            "main.crn",
+            "let child = use { source = './child' }\nlet instance = child { enabled = true }\n",
+        ),
+        ("child/arguments.crn", "arguments { enabled: Bool }\n"),
+        ("child/main.crn", &source),
+    ]);
+    let cli = fixture.cli(false);
+    assert_eq!(cli["status"], "error", "{cli:#}");
+    let errors = cli["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{cli:#}");
+    let message = format!("mock.test.resource.r: {expected}");
+    assert_eq!(errors[0]["message"], message, "{cli:#}");
+    let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+        .arg("validate")
+        .arg(fixture.0.path())
+        .current_dir(fixture.0.path())
+        .env("NO_COLOR", "1")
+        .env_remove("CLICOLOR_FORCE")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap().trim(),
+        format!("Error: child: {message}")
+    );
+    let lsp = fixture.lsp(false).await;
+    let errors = error_messages(&lsp);
+    assert_eq!(errors.len(), 1, "{lsp:#?}");
+    assert!(errors[0].ends_with(expected), "{lsp:#?}");
+}
+
+#[tokio::test]
+async fn prefix_companion_selected_module_if_empty_reports_once() {
+    assert_selected_prefix_rejection("name_prefix = ''", "'name_prefix' cannot be empty").await;
+}
+
+#[tokio::test]
+async fn prefix_companion_selected_module_if_conflict_reports_once() {
+    assert_selected_prefix_rejection(
+        "name_prefix = 'bad'\nname = 'fixed'",
+        "cannot specify both 'name_prefix' and 'name'",
+    )
+    .await;
+}
+
 async fn assert_standalone_module_prefix(attributes: &str, expected: Option<&str>) {
     let source =
         format!("let r = if enabled {{\n  mock.test.resource {{\n    {attributes}\n  }}\n}}\n");

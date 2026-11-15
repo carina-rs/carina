@@ -5409,11 +5409,12 @@ impl ResourceAdmissionFinding {
         finding
     }
     fn analysis(error: crate::parser::AnalysisTreeError) -> Self {
-        let location = match error.kind() {
-            crate::parser::AnalysisTreeErrorKind::UncanonicalizedResource {
-                declaration, ..
-            } => declaration.clone(),
-            _ => None,
+        let location = match error.diagnostic() {
+            crate::parser::AnalysisTreeDiagnostic::Located(finding) => {
+                Some(finding.location().clone())
+            }
+            crate::parser::AnalysisTreeDiagnostic::File(_)
+            | crate::parser::AnalysisTreeDiagnostic::Directory(_) => None,
         };
         Self {
             human: error.to_string(),
