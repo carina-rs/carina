@@ -1,5 +1,6 @@
 use crate::provider::{LoadedProviderSnapshot, ProviderFactory};
 use crate::schema::SchemaRegistry;
+use crate::validation::admission::{kind, tests::selected_destination};
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 // Schema-only factories copied from the LSP fixtures. The snapshot owns both
@@ -121,14 +122,19 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
         snapshot.schema_registry(),
         snapshot.provider_context().as_provider_context(),
     );
-    let destination = snapshot
-        .schema_registry()
-        .resource_attribute_destination(
-            &parsed.resources[1].id,
-            "role_name",
-            snapshot.provider_context().as_provider_context(),
-        )
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        snapshot
+            .schema_registry()
+            .get(
+                &parsed.resources[1].id.provider,
+                &parsed.resources[1].id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &parsed.resources[1].id,
+        "role_name",
+        snapshot.provider_context().as_provider_context(),
+    );
     crate::validation::deferred_types::with_session_for_test(
         snapshot.provider_context().as_provider_context(),
         |session| {
@@ -279,14 +285,19 @@ fn widening_member_obligation_discharge_parity(decoded: bool) {
         snapshot.schema_registry(),
         snapshot.provider_context().as_provider_context(),
     );
-    let destination = snapshot
-        .schema_registry()
-        .resource_attribute_destination(
-            &parsed.resources[1].id,
-            "target",
-            snapshot.provider_context().as_provider_context(),
-        )
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        snapshot
+            .schema_registry()
+            .get(
+                &parsed.resources[1].id.provider,
+                &parsed.resources[1].id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &parsed.resources[1].id,
+        "target",
+        snapshot.provider_context().as_provider_context(),
+    );
     let target = |value| {
         Value::Concrete(ConcreteValue::Map(
             [("role_arn".into(), value)].into_iter().collect(),

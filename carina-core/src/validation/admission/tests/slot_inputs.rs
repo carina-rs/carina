@@ -1,4 +1,5 @@
 use super::*;
+use crate::validation::admission::{kind, tests::selected_destination};
 
 #[cfg(debug_assertions)]
 #[test]
@@ -89,9 +90,18 @@ fn seam_known_if_preserves_the_single_main_local_obligation() {
     let slot = resource.authored_slots.get("input").unwrap();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-    let destination = schemas
-        .resource_attribute_destination(&resource.id, "input", &catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &resource.id,
+        "input",
+        &catalog,
+    );
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         let proof = slot
             .projection()

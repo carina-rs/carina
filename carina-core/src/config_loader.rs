@@ -1267,13 +1267,12 @@ impl LoadedConfig {
         &self,
         catalog: &ProviderContext,
         schemas: &SchemaRegistry,
-    ) -> Result<ParsedRootDirectory, String> {
+    ) -> Option<ParsedRootDirectory> {
         let resolution = ResolutionContext::issue(ResolutionPhase::Bootstrap).metadata_only();
         let mut parsed = self.unresolved_parsed.parsed.clone();
-        parser::resolve_resource_refs_in_context(&mut parsed, catalog, None, resolution)
-            .map_err(|error| error.to_string())?;
+        parser::resolve_resource_refs_in_context(&mut parsed, catalog, None, resolution).ok()?;
         crate::parser::retained::judge_configuration(&mut parsed, schemas, catalog);
-        Ok(RootDirectoryParse::with_resolution(parsed, resolution))
+        Some(RootDirectoryParse::with_resolution(parsed, resolution))
     }
 }
 

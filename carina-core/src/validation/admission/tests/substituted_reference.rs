@@ -1,4 +1,5 @@
 use super::*;
+use crate::validation::admission::{kind, tests::selected_destination};
 
 fn identity(name: &str) -> AttributeType {
     AttributeType::refined_string(Some(TypeIdentity::from_dotted(name)), None, None, None)
@@ -211,9 +212,18 @@ fn substituted_concrete_references_do_not_add_local_or_schema_deferrals() {
             crate::resource::knowledge::Classification::Known(_)
         ));
         let proof = projected;
-        let destination = schemas
-            .resource_attribute_destination(resource.id(), "value", catalog)
-            .unwrap();
+        let destination = selected_destination::<kind::ResourceAttribute>(
+            schemas
+                .get(
+                    &resource.id().provider,
+                    &resource.id().resource_type,
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap(),
+            resource.id(),
+            "value",
+            catalog,
+        );
         with_session_for_test(catalog, |session| {
             let (baseline, baseline_context) = Candidate::validation_classified(
                 proof.clone(),
@@ -289,9 +299,18 @@ fn with_ordinary_check(
         .unwrap()
         .into_classification();
     let bindings = BindingIndex::from_parsed(judged.file(), &schemas, catalog);
-    let destination = schemas
-        .resource_attribute_destination(resource.id(), "value", catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &resource.id().provider,
+                &resource.id().resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        resource.id(),
+        "value",
+        catalog,
+    );
     with_session_for_test(catalog, |session| {
         let (candidate, context) =
             Candidate::validation_slot(slot, proof, Some(&bindings), session).unwrap();
@@ -609,9 +628,18 @@ fn substituted_reference_retains_the_ordinary_assignment_callback() {
         .unwrap()
         .into_classification();
     let bindings = BindingIndex::from_parsed(judged.file(), &schemas, catalog);
-    let destination = schemas
-        .resource_attribute_destination(resource.id(), "value", catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &resource.id().provider,
+                &resource.id().resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        resource.id(),
+        "value",
+        catalog,
+    );
     let ordinary = |_: &CompiledAttributeType,
                     _: &crate::resource::Value<
         crate::resource::ParserPlaceholder,

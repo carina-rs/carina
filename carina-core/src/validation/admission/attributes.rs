@@ -3,7 +3,7 @@
 use super::*;
 use crate::resource::ParserPlaceholder;
 use crate::resource::ResourceId;
-use crate::schema::{LeafPathSegment, SchemaKind, SchemaRegistry};
+use crate::schema::{LeafPathSegment, SchemaRegistry};
 
 mod inputs;
 use inputs::{AttributeInput, with_classified_inputs};
@@ -11,20 +11,6 @@ pub use inputs::{
     ClassificationDiagnostics, ResourceAdmissionOutcome, ResourceAttributeInputs, SlotPrechecks,
     ValidationEvaluation, classification_preflight,
 };
-
-/// A catalog descriptor requires a registered schema owner.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum DestinationError {
-    #[error("unknown schema owner '{provider}'")]
-    UnknownOwner { provider: String },
-    #[error("schema unavailable for {resource}")]
-    SchemaUnavailable { resource: Box<ResourceId> },
-    #[error("unknown attribute '{attribute}' on {resource}")]
-    UnknownAttribute {
-        resource: Box<ResourceId>,
-        attribute: String,
-    },
-}
 
 pub(crate) fn declaration_identity(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
@@ -51,56 +37,6 @@ fn identity(
     }
 }
 
-impl SchemaRegistry {
-    fn admission_attribute<K: AssignmentKind>(
-        &self,
-        id: &ResourceId,
-        attribute: &str,
-        kind: SchemaKind,
-        catalog: &ProviderContext,
-    ) -> Result<Destination<K>, DestinationError> {
-        let schema = self
-            .get(&id.provider, &id.resource_type, kind)
-            .ok_or_else(|| {
-                if self.assignability_closures().contains_key(
-                    &crate::parser::SchemaTypeOwner::Provider(id.provider.clone()),
-                ) {
-                    DestinationError::SchemaUnavailable {
-                        resource: Box::new(id.clone()),
-                    }
-                } else {
-                    DestinationError::UnknownOwner {
-                        provider: id.provider.clone(),
-                    }
-                }
-            })?;
-        schema
-            .admission_attribute(id, attribute, catalog)
-            .ok_or_else(|| DestinationError::UnknownAttribute {
-                resource: Box::new(id.clone()),
-                attribute: attribute.into(),
-            })
-    }
-
-    pub fn resource_attribute_destination(
-        &self,
-        id: &ResourceId,
-        attribute: &str,
-        catalog: &ProviderContext,
-    ) -> Result<Destination<kind::ResourceAttribute>, DestinationError> {
-        self.admission_attribute(id, attribute, SchemaKind::Resource, catalog)
-    }
-
-    pub fn data_source_attribute_destination(
-        &self,
-        id: &ResourceId,
-        attribute: &str,
-        catalog: &ProviderContext,
-    ) -> Result<Destination<kind::DataSourceAttribute>, DestinationError> {
-        self.admission_attribute(id, attribute, SchemaKind::DataSource, catalog)
-    }
-}
-
 impl crate::schema::OwnerBoundResourceSchema<'_> {
     fn untyped_attribute<K: AssignmentKind>(
         self,
@@ -111,25 +47,15 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
         Destination::catalogued(identity(self, id, catalog), name.into())
     }
 
-    pub(crate) fn admission_attribute<K: AssignmentKind>(
+    #[cfg(test)]
+    pub(super) fn admission_selected_attribute_for_test<K: AssignmentKind>(
         self,
         id: &ResourceId,
         attribute: &str,
+        selected: crate::schema::value_validation::SchemaAttribute<'_>,
         catalog: &ProviderContext,
-    ) -> Option<Destination<K>> {
-        let effective = self.effective_attribute_by_authored_name(attribute)?;
-        let ordinal = self
-            .schema()
-            .as_schema()
-            .attributes()
-            .keys()
-            .position(|name| name == effective.name())?;
-        Some(self.admission_selected_attribute(
-            id,
-            attribute,
-            crate::schema::value_validation::SchemaAttribute { ordinal, effective },
-            catalog,
-        ))
+    ) -> Destination<K> {
+        self.admission_selected_attribute(id, attribute, selected, catalog)
     }
 
     fn admission_selected_attribute<K: AssignmentKind>(
@@ -1556,6 +1482,7 @@ fn resource_attribute_admission_api_pins() {}
 #[cfg(test)]
 mod review_tests {
     use super::*;
+    use crate::schema::SchemaKind;
 
     #[test]
     fn apply_admission_validates_every_supplied_attribute() {
@@ -1711,10 +1638,5 @@ mod review_tests {
         .declaration
         .owner;
         assert_eq!(before, after);
-        let unknown = ResourceId::with_provider_identity("unknown", "Sink", "sink", None);
-        assert!(matches!(
-            schemas.resource_attribute_destination(&unknown, "value", &catalog),
-            Err(DestinationError::UnknownOwner { .. })
-        ));
     }
 }

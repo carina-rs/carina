@@ -3041,9 +3041,7 @@ where
         }
     }
 
-    pub fn inference_bindings(
-        &self,
-    ) -> crate::validation::inference::InferenceBindings<ParserPlaceholder, B> {
+    pub fn inference_bindings(&self) -> crate::validation::inference::InferenceBindings {
         use crate::validation::inference::InferenceBinding;
         let mut bindings = std::collections::HashMap::new();
         for upstream in self.upstream_states() {
@@ -3054,9 +3052,15 @@ where
         }
         for resource in self.resources() {
             if let Some(binding) = resource.binding_address() {
-                let kind = if resource.kind() == AnalysisItemKind::Composition {
+                let kind = if let ResourceRef::LiveComposition(composition) = resource.resource {
                     InferenceBinding::Virtual {
-                        attributes: resource.attributes().into_owned(),
+                        attributes: composition
+                            .signature
+                            .attributes
+                            .iter()
+                            .filter(|(_, attribute)| attribute.handle().is_none())
+                            .map(|(name, _)| name.clone())
+                            .collect(),
                     }
                 } else {
                     InferenceBinding::Resource {
@@ -3082,11 +3086,9 @@ where
                 });
         }
         for function in self.functions.values() {
-            bindings.entry(function.name.clone()).or_insert_with(|| {
-                InferenceBinding::UserFunction {
-                    return_type: function.return_type.clone(),
-                }
-            });
+            bindings
+                .entry(function.name.clone())
+                .or_insert(InferenceBinding::UserFunction);
         }
         bindings
     }
