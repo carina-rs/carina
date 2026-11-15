@@ -1992,6 +1992,9 @@ impl AppError {
 /// boundary. Keeping traversal here also lets collected validation errors
 /// retain the same source detail as directly returned command errors.
 pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(AppError::AnalysisInvariant(error)) = error.downcast_ref::<AppError>() {
+        return error.diagnostic().to_string();
+    }
     let mut messages = Vec::new();
     let mut source = Some(error);
     let mut replan_command = None;

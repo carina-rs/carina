@@ -393,10 +393,11 @@ fn round5_module_body_slots_keep_per_instance_authored_roots() {
         {
             let slot = resource.authored_slot("input").unwrap();
             let root = slot.cursor().unwrap().canonical().unwrap();
-            let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+            let inputs =
+                ResourceAttributeInputs::for_resource_for_test(resource, judged.report()).unwrap();
             let mut coverage = Default::default();
             let report = {
-                let outcome = attributes::resource_attribute_admissions(
+                let outcome = attributes::resource_attribute_admissions_for_test(
                     resource,
                     judged.file(),
                     resource.schema(&schemas).unwrap(),

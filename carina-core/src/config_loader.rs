@@ -1385,6 +1385,20 @@ pub struct IssuedBufferSource<E, D, B: BindingAddress = crate::resource::Relativ
     >,
 }
 
+impl<E, D, B: BindingAddress> IssuedBufferSource<E, D, B> {
+    pub(crate) fn into_scoped_file(
+        self,
+    ) -> crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    > {
+        self.parsed
+    }
+}
+
 /// Preserve an existing judgement, or judge an isolated source as incomplete.
 /// Readable root evidence is decisive; otherwise this explicitly issues Unknown.
 /// No filesystem access or current-directory lookup participates in this operation.
@@ -1680,6 +1694,14 @@ impl DirectoryBufferSnapshot {
         })
     }
 
+    /// Retain this snapshot's issued scope without judging raw attribute keys.
+    pub fn into_scoped_file(self) -> parser::ParsedFile {
+        let scope = self.require_scope();
+        let mut parsed = self.member.buffer.parsed().clone();
+        crate::parser::retained::set_directory_require_scope(&mut parsed, scope);
+        parsed
+    }
+
     fn require_scope(&self) -> DirectoryRequireScope {
         let inventories: Vec<_> = self
             .sources
@@ -1724,9 +1746,7 @@ pub fn load_buffer_configuration_in_directory<'a>(
     schemas: &'a SchemaRegistry,
     config: &ProviderContext,
 ) -> BufferConfiguration<'a> {
-    let require_scope = snapshot.require_scope();
-    let mut parsed = snapshot.member.buffer.parsed().clone();
-    crate::parser::retained::set_directory_require_scope(&mut parsed, require_scope);
+    let parsed = snapshot.into_scoped_file();
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
     }
@@ -4124,13 +4144,10 @@ mod tests {
         )
         .unwrap();
         let schemas = SchemaRegistry::new();
-        let configuration = load_buffer_configuration(
-            crate::config_loader::issue_buffer_configuration(&parsed),
-            &schemas,
-            &catalog,
-        );
+        let configuration =
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
-        let tree = parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let _tree = parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         let mut validation =
@@ -4140,12 +4157,12 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             validation
                 .admitted_resources(
-                    &tree,
                     judged,
                     &bindings,
                     session,
                     crate::validation::FindingSubject::Root,
                 )
+                .unwrap()
                 .for_each(drop);
         });
         let presented = validation.complete().into_presented();

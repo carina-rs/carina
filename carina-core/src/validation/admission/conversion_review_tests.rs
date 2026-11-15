@@ -31,11 +31,8 @@ fn conversion_admission_error_renders_its_typed_channel_once() {
             )
             .unwrap()
             .resolve_root_for_test();
-            let configuration = crate::config_loader::load_buffer_configuration(
-                crate::config_loader::issue_buffer_configuration(&parsed),
-                schemas,
-                catalog,
-            );
+            let configuration =
+                crate::test_utils::load_canonical_buffer_configuration(&parsed, schemas, catalog);
             let bindings =
                 BindingIndex::from_parsed(configuration.judged().file(), schemas, catalog);
             let presented = crate::validation::resource_admission_findings(
@@ -77,11 +74,8 @@ fn mismatched_cursor_is_rejected(apply: bool) {
             )
             .unwrap()
             .resolve_root_for_test();
-            let configuration = crate::config_loader::load_buffer_configuration(
-                crate::config_loader::issue_buffer_configuration(&parsed),
-                schemas,
-                catalog,
-            );
+            let configuration =
+                crate::test_utils::load_canonical_buffer_configuration(&parsed, schemas, catalog);
             let tree =
                 crate::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
             let resource = tree.resources().next().unwrap();

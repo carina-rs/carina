@@ -57,17 +57,7 @@ fn render_first_error(
             .expect("snapshot schema must be owner-bound"),
         &attrs
             .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    value
-                        .knowledge(
-                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                        )
-                        .map(|proof| proof.into_classification())
-                        .unwrap(),
-                )
-            })
+            .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         &|_| string_literal,
         &resolver,

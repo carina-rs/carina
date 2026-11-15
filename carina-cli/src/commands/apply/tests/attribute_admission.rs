@@ -148,7 +148,10 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
             &source,
         )
         .unwrap();
-        let backend = fixture.backend_handle();
+        let backend = carina_state::PublishedBackend::for_test(
+            fixture.backend_handle(),
+            &fixture.cancel_token(),
+        );
         let outcome = run_apply_from_plan_locked_owned(
             fixture.runtime().color_mode(),
             bound,
@@ -169,9 +172,8 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
         .await;
         let result = finish_lock_command(
             fixture.runtime().color_mode(),
-            backend.as_ref(),
+            FinalizationContext::new(&backend, fixture.config_path()),
             outcome,
-            &fixture.cancel_token(),
         )
         .await;
         {

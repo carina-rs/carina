@@ -94,8 +94,9 @@ fn assert_both_passes<E, D, B>(
             source_line: 0.into(),
         }),
     );
-    let make_inputs =
-        || ResourceAttributeInputs::from_resolved(resource, &values, judged.report()).unwrap();
+    let make_inputs = || {
+        ResourceAttributeInputs::from_resolved_for_test(resource, &values, judged.report()).unwrap()
+    };
     let bindings = crate::binding_index::BindingIndex::from_parsed(judged.file(), schemas, catalog);
     with_session_for_test(catalog, |session| {
         let inputs = make_inputs();
@@ -106,7 +107,7 @@ fn assert_both_passes<E, D, B>(
         assert!(coverage.is_empty());
         assert_eq!(coverage.work(), 0);
         let outcome = with_injected_errors(|| {
-            resource_attribute_admissions(
+            resource_attribute_admissions_for_test(
                 resource,
                 judged.file(),
                 resource.schema(schemas).unwrap(),
@@ -168,8 +169,11 @@ fn evaluation_modes_are_copy_without_copy_bindings_and_use_the_supplied_session(
             source_line: 0.into(),
         }),
     );
-    let inputs =
-        ResourceAttributeInputs::from_report(resource, &values, configuration.judged().report());
+    let inputs = ResourceAttributeInputs::from_report_for_test(
+        resource,
+        &values,
+        configuration.judged().report(),
+    );
     let other = ProviderContext::new(crate::EnvironmentSnapshot::new([(
         "ADMISSION_VALUE".into(),
         "from-session".into(),

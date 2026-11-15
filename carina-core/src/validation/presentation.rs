@@ -1,6 +1,7 @@
 //! The consuming presentation boundary for authored validation findings.
 
 use super::ResourceAdmissionFinding;
+use crate::identifier::{CanonicalResource, PrefixCanonicalized};
 use crate::parser::retained::ExpressionReport;
 use crate::resource::BindingAddress;
 
@@ -237,53 +238,36 @@ pub(super) enum AdmissionBoundary {
     Preflight,
 }
 
-type ResourceAdmissionParts<'a, 'file, D, B> = (
-    &'a crate::parser::AnalysisResourceRef<
-        'file,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
+type ResourceAdmissionParts<'file, E, D, B> = (
+    CanonicalResource<'file, E, D, B>,
     Result<
         Option<crate::schema::ResourceValueValidation>,
         crate::parser::retained::MissingEvidence,
     >,
 );
-pub struct ResourceAdmissionStep<
-    'a,
-    'file: 'a,
+pub struct ResourceAdmissionStep<'file, E, D, B: BindingAddress>
+where
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             B,
-        > + 'file,
-    B: BindingAddress + 'file,
-> {
-    resource: &'a crate::parser::AnalysisResourceRef<
-        'file,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        D,
-        B,
-    >,
+        >,
+{
+    resource: CanonicalResource<'file, E, D, B>,
     values: Result<
         Option<crate::schema::ResourceValueValidation>,
         crate::parser::retained::MissingEvidence,
     >,
 }
-impl<
-    'a,
-    'file: 'a,
+impl<'file, E, D, B: BindingAddress> ResourceAdmissionStep<'file, E, D, B>
+where
     D: crate::parser::DeferredForPhaseTraversal<
             crate::resource::ParserPlaceholder,
             crate::resource::ParserPlaceholder,
             B,
-        > + 'file,
-    B: BindingAddress + 'file,
-> ResourceAdmissionStep<'a, 'file, D, B>
+        >,
 {
-    pub fn into_parts(self) -> ResourceAdmissionParts<'a, 'file, D, B> {
+    pub fn into_parts(self) -> ResourceAdmissionParts<'file, E, D, B> {
         (self.resource, self.values)
     }
 }
@@ -388,129 +372,76 @@ impl<E: ValidationClientError> ConversionValidation<E> {
         self.fail(error)
     }
 
-    /// Each step performs admission before yielding and records its use in
-    /// this driver. Dropping the iterator produces no judgement for later slots.
-    pub fn admitted_resources<'a, 'file: 'a, B, D, T>(
+    /// The file produces its own bound resources; no unrelated tree can be paired.
+    pub fn admitted_resources<'a, B, D, T>(
         &'a mut self,
-        tree: &'a crate::parser::AnalysisTree<
-            'file,
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            D,
-            B,
-            T,
-        >,
-        judged: &'a crate::parser::retained::JudgedFile<'_, T, D, B>,
+        judged: &'a PrefixCanonicalized<'_, crate::parser::retained::JudgedFile<'_, T, D, B>>,
         bindings: &'a crate::binding_index::BindingIndex<'_, B>,
         session: &'a dyn super::deferred_types::ProviderTypeCheckContext,
         subject: FindingSubject,
-    ) -> impl Iterator<Item = ResourceAdmissionStep<'a, 'file, D, B>> + 'a
+    ) -> Result<
+        impl Iterator<Item = ResourceAdmissionStep<'a, T, D, B>> + 'a,
+        crate::parser::AnalysisTreeError,
+    >
     where
-        B: BindingAddress + 'file,
-        T: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B> + 'file,
+        B: BindingAddress + 'a,
+        T: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B> + 'a,
         D: crate::parser::DeferredForPhaseTraversal<
                 crate::resource::ParserPlaceholder,
                 crate::resource::ParserPlaceholder,
                 B,
-            > + 'file,
+            > + 'a,
     {
-        self.include_in(tree.admission_report(), subject.clone());
-        self.resource_steps(
-            tree.project_resources(),
-            judged,
-            bindings,
-            session,
-            subject,
-            AdmissionBoundary::Live,
-        )
+        self.include_in(judged.admission_report(), subject.clone());
+        self.resource_steps(judged, bindings, session, subject, AdmissionBoundary::Live)
     }
 
-    pub(super) fn resource_steps<'a, 'file: 'a, B, D, T>(
+    pub(super) fn resource_steps<'a, B, D, T>(
         &'a mut self,
-        resources: impl Iterator<
-            Item = &'a crate::parser::AnalysisResourceRef<
-                'file,
-                crate::resource::ParserPlaceholder,
-                crate::resource::ParserPlaceholder,
-                D,
-                B,
-            >,
-        > + 'a,
-        judged: &'a crate::parser::retained::JudgedFile<'_, T, D, B>,
+        judged: &'a PrefixCanonicalized<'_, crate::parser::retained::JudgedFile<'_, T, D, B>>,
         bindings: &'a crate::binding_index::BindingIndex<'_, B>,
         session: &'a dyn super::deferred_types::ProviderTypeCheckContext,
         subject: FindingSubject,
         boundary: AdmissionBoundary,
-    ) -> impl Iterator<Item = ResourceAdmissionStep<'a, 'file, D, B>> + 'a
+    ) -> Result<
+        impl Iterator<Item = ResourceAdmissionStep<'a, T, D, B>> + 'a,
+        crate::parser::AnalysisTreeError,
+    >
     where
-        B: BindingAddress + 'file,
-        T: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B> + 'file,
+        B: BindingAddress + 'a,
+        T: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B> + 'a,
         D: crate::parser::DeferredForPhaseTraversal<
                 crate::resource::ParserPlaceholder,
                 crate::resource::ParserPlaceholder,
                 B,
-            > + 'file,
+            > + 'a,
     {
-        let mut resources = resources.filter(|resource| match resource.kind() {
-            crate::parser::AnalysisItemKind::Composition => false,
-            crate::parser::AnalysisItemKind::Resource
-            | crate::parser::AnalysisItemKind::DataSource
-            | crate::parser::AnalysisItemKind::DeferredResource
-            | crate::parser::AnalysisItemKind::Wait => true,
-        });
-        match &boundary {
+        let resources = judged.analysis_tree()?.into_project_resources();
+        match boundary {
             AdmissionBoundary::Live => self.include_in(judged.report(), subject.clone()),
             AdmissionBoundary::Preflight => {}
         }
-        std::iter::from_fn(move || {
-            let resource = resources.next()?;
-            let values = match resource.schema(judged.schemas()) {
-                None => Ok(None),
-                Some(schema) => {
-                    super::admission::attributes::ResourceAttributeInputs::for_resource(
-                        resource,
-                        judged.report(),
-                    )
-                    .map(|inputs| {
-                        let resource_subject = match &subject {
-                            FindingSubject::Module(_) => subject.clone(),
-                            FindingSubject::Root => resource
-                                .module_source()
-                                .and_then(crate::resource::ModuleSource::module_call)
-                                .map_or(FindingSubject::Root, |module| {
-                                    FindingSubject::Module(
-                                        module
-                                            .module_call_path()
-                                            .calls()
-                                            .map(|call| format!("{} ({})", call.module_name, call.display_label()))
-                                            .collect::<Vec<_>>()
-                                            .join(" -> "),
-                                    )
-                                }),
-                        };
-                        Some(self.coverage.in_subject(resource_subject, |coverage| {
-                            let request = super::admission::attributes::ResourceAdmissionRequest {
-                                resource, parsed: judged.file(), schema,
-                                quoted: resource.quoted_string_attrs(), inputs,
-                                evaluation: super::admission::attributes::ValidationEvaluation::None,
-                                bindings, session, schemas: judged.schemas(),
-                            };
-                            match &boundary {
-                                AdmissionBoundary::Live => super::admission::attributes::resource_attribute_admissions(
-                                    request.resource, request.parsed, request.schema,
-                                    request.quoted, request.inputs, request.evaluation, request.bindings, request.session, request.schemas, coverage,
-                                ),
-                                AdmissionBoundary::Preflight => super::admission::attributes::resource_template_preflight_admissions(request, coverage),
-                            }.values
-                        }))
-                    })
-                }
-            };
-            if let AdmissionBoundary::Live = &boundary {
-                self.record_admitted_resource(resource);
-            }
-            Some(ResourceAdmissionStep { resource, values })
-        })
+        Ok(resources.map(move |resource| {
+            let values = super::admission::attributes::ResourceAttributeInputs::for_resource(&resource,judged.report())
+                .and_then(|inputs| {
+                    let request = super::admission::attributes::ResourceAdmissionRequest::new(
+                        &resource,resource.quoted_string_attrs(),inputs,
+                        super::admission::attributes::ValidationEvaluation::None,bindings,session,
+                    )?;
+                    let resource_subject = match &subject {
+                        FindingSubject::Module(_module) => subject.clone(),
+                        FindingSubject::Root => resource.module_source()
+                            .and_then(crate::resource::ModuleSource::module_call)
+                            .map_or(FindingSubject::Root, |module| FindingSubject::Module(module.module_call_path().calls().map(|call| format!("{} ({})",call.module_name,call.display_label())).collect::<Vec<_>>().join(" -> "))),
+                    };
+                    Ok(Some(self.coverage.in_subject(resource_subject, |coverage| match boundary {
+                        AdmissionBoundary::Live => super::admission::attributes::resource_attribute_admissions(request,coverage),
+                        AdmissionBoundary::Preflight => super::admission::attributes::resource_template_preflight_admissions(request,coverage),
+                    }).values))
+                });
+            if let AdmissionBoundary::Live = boundary { self.record_admitted_resource(&resource); }
+            ResourceAdmissionStep { resource, values }
+        }))
     }
 
     pub fn ordinary_failure(&self) -> Option<OrdinaryFailure> {
@@ -525,21 +456,14 @@ impl<E: ValidationClientError> ConversionValidation<E> {
     /// Check sibling uses whose ordinary findings are outside this document.
     /// This is needed to report an alias rejection at its defining document;
     /// it neither seals a scope nor supplies completion evidence.
-    pub fn admit_remaining_resources<'a, B, D, T>(
+    pub fn admit_remaining_resources<B, D, T>(
         &mut self,
-        tree: &crate::parser::AnalysisTree<
-            'a,
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            D,
-            B,
-            T,
-        >,
-        judged: &crate::parser::retained::JudgedFile<'_, T, D, B>,
+        judged: &PrefixCanonicalized<'_, crate::parser::retained::JudgedFile<'_, T, D, B>>,
         bindings: &crate::binding_index::BindingIndex<'_, B>,
         session: &dyn super::deferred_types::ProviderTypeCheckContext,
         prechecks: super::admission::attributes::SlotPrechecks<'_>,
-    ) where
+    ) -> Result<(), crate::parser::retained::MissingEvidence>
+    where
         B: BindingAddress,
         T: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
         D: crate::parser::DeferredForPhaseTraversal<
@@ -548,25 +472,16 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                 B,
             >,
     {
+        let tree = judged
+            .analysis_tree()
+            .map_err(|error| crate::parser::retained::MissingEvidence::new(error.to_string()))?;
         for resource in tree.project_resources() {
             let carrying = match resource.authored_slots() {
-                Some(slots) => slots.carries_conversion(judged.report()),
-                None => Ok(false),
+                Some(slots) => slots.carries_conversion(judged.report())?,
+                None => false,
             };
-            match carrying {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(missing) => {
-                    self.ordinary.push((
-                        FindingSubject::Root,
-                        OrdinaryFinding::Resource(Box::new(ResourceAdmissionFinding::schema(
-                            resource.id(),
-                            None,
-                            &super::admission::assignment_seam_error(missing),
-                        ))),
-                    ));
-                    continue;
-                }
+            if !carrying {
+                continue;
             }
             let (identity, revision) = admission_use(resource);
             if self.admitted_uses.get(&identity).is_some_and(|admitted| {
@@ -580,11 +495,12 @@ impl<E: ValidationClientError> ConversionValidation<E> {
             }
             self.walk_resource(resource, |coverage| {
                 super::admission::attributes::unrendered_resource_conversion_admissions(
-                    resource, judged, bindings, session, prechecks, coverage,
+                    resource, bindings, session, prechecks, coverage,
                 )
-            });
+            })?;
             self.record_admitted_resource(resource);
         }
+        Ok(())
     }
 
     /// Start a document run from parser-owned file evidence.
@@ -666,20 +582,9 @@ impl<E: ValidationClientError> ConversionValidation<E> {
                 B,
             >,
     {
-        let resource = request.resource;
+        let resource = request.resource();
         let findings = self.walk_resource(resource, |coverage| {
-            super::admission::attributes::resource_attribute_admissions(
-                request.resource,
-                request.parsed,
-                request.schema,
-                request.quoted,
-                request.inputs,
-                request.evaluation,
-                request.bindings,
-                request.session,
-                request.schemas,
-                coverage,
-            )
+            super::admission::attributes::resource_attribute_admissions(request, coverage)
         });
         self.record_admitted_resource(resource);
         findings

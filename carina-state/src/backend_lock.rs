@@ -52,6 +52,23 @@ impl BackendLock {
     /// included only when explicitly configured.
     pub fn from_config(config: &BackendConfig) -> Self {
         let (backend_type, attributes) = match config {
+            BackendConfig::GitHub(settings) => (
+                "github",
+                BTreeMap::from([
+                    (
+                        "repository".into(),
+                        serde_json::Value::String(settings.repository().as_str().into()),
+                    ),
+                    (
+                        "branch".into(),
+                        serde_json::Value::String(settings.branch().as_str().into()),
+                    ),
+                    (
+                        "path".into(),
+                        serde_json::Value::String(settings.path().as_str().into()),
+                    ),
+                ]),
+            ),
             BackendConfig::S3(settings) => {
                 let mut attributes = BTreeMap::from([
                     (

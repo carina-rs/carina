@@ -378,11 +378,8 @@ fn secret_origin_4275_reference_validation_drops_inner_paths() {
             .unwrap(),
     );
     crate::parser::retained::judge_configuration(&mut parsed, &schemas, &config());
-    let loaded = crate::config_loader::load_buffer_configuration(
-        crate::config_loader::issue_buffer_configuration(&parsed),
-        &schemas,
-        &config(),
-    );
+    let loaded =
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config());
     let provider = LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
     let error =
@@ -510,11 +507,8 @@ fn assert_secret_reference_context(reference: &str, expected: &str) {
             .unwrap(),
     );
     crate::parser::retained::judge_configuration(&mut parsed, &schemas, &config());
-    let loaded = crate::config_loader::load_buffer_configuration(
-        crate::config_loader::issue_buffer_configuration(&parsed),
-        &schemas,
-        &config(),
-    );
+    let loaded =
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config());
     let provider = LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
     let error =

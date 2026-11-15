@@ -1099,7 +1099,7 @@ fn providerless_loop_directives_keep_legacy_placeholder_boundary() {
         ("missing", vec![provider.to_string()]),
         ("prior.flags", vec![provider.to_string()]),
         ("[true]", vec![provider.to_string()]),
-        ("[true, false]", vec![provider.to_string(), provider.to_string()]),
+        ("[true, false]", vec![provider.to_string()]),
         ("[missing]", vec!["directives.prevent_destroy must resolve to a Bool for resource `mock.test.resource.<pending>`; got Enum".to_string(), provider.to_string()]),
         ("['one']", vec!["directives.prevent_destroy must resolve to a Bool for resource `mock.test.resource.<pending>`; got String".to_string(), provider.to_string()]),
     ] {

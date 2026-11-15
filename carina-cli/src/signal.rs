@@ -313,13 +313,18 @@ mod tests {
         let supervisor = tokio::spawn(supervise_shutdown_events(
             move |shutdown| async move {
                 cleanup_priority_requested(&shutdown).await;
+                let backend = carina_state::local_backend_for_test("unused.state.json");
+                let backend = carina_state::PublishedBackend::for_test(backend.into(), &shutdown);
                 let result = crate::commands::shared::finalize::finalize_after_execute(
+                    crate::commands::shared::finalize::FinalizationContext::new(
+                        &backend,
+                        std::path::Path::new("."),
+                    ),
                     |_| async move {
                         command_cleanup_started.notify_one();
                         std::future::pending::<Result<(), AppError>>().await
                     },
                     true,
-                    &shutdown,
                 )
                 .await;
                 assert!(matches!(result, Err(AppError::Interrupted)));

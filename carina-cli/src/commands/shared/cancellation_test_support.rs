@@ -58,6 +58,10 @@ impl LockLossBackend {
 
 #[async_trait]
 impl StateBackend for LockLossBackend {
+    fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
         self.inner.read_state().await
     }
@@ -96,9 +100,12 @@ impl StateBackend for LockLossBackend {
         &self,
         state: &StateFile,
         lock: &LockInfo,
+        permit: &carina_state::CleanupPermit<'_>,
     ) -> BackendResult<()> {
         self.locked_writes.fetch_add(1, Ordering::SeqCst);
-        self.inner.write_state_locked_for_cleanup(state, lock).await
+        self.inner
+            .write_state_locked_for_cleanup(state, lock, permit)
+            .await
     }
 
     async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {

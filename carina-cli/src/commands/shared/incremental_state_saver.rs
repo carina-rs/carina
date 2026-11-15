@@ -294,6 +294,10 @@ mod tests {
 
     #[async_trait]
     impl StateBackend for RecordingBackend {
+        fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+            carina_core::shutdown::CleanupBudget::TWO_SECOND
+        }
+
         async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
             Ok(None)
         }

@@ -311,6 +311,43 @@ backend s3 {
 
 When no backend is configured, state is stored locally in `carina.state.json`.
 
+The GitHub.com backend requires all three fields:
+
+```crn
+backend github {
+  repository = 'owner/infra-state'
+  branch = 'carina-state'
+  path = 'states/prod/carina.state.json'
+}
+```
+
+The repository and explicit branch must already exist. Concrete expressions
+such as `env()` are accepted; unresolved and secret values are rejected.
+`repository` is an `owner/repo` slug. `branch` must be non-empty and may contain
+`/`. `path` is a non-empty relative repository path with no empty or `..`
+segments, and cannot end in `.lock`; `<path>.lock` holds the lease.
+
+Read-only state and export commands also accept
+`github://owner/repo/path/to/state.json?branch=states%2Fprod`. The `branch`
+parameter is required and percent-decoded. Unknown query keys and duplicate
+`branch` parameters are errors. Credentials use non-empty `GITHUB_TOKEN`,
+then `gh auth token --hostname github.com`. Require Contents read/write on the
+state repository, or Contents read for upstream and exports consumers.
+
+Recommend one branch per independently applied state. The hard limit is
+10,000,000 decoded bytes (10 MB), with no splitting. GitHub keeps every version
+in history: use a private repository with narrow access. Plaintext values,
+provider-populated outputs, and resume tokens of unfinished creates remain in
+history; values written as secrets are hashed. Once committed, values cannot
+be removed from every copy, including other people's clones. S3 by default
+keeps only the latest state.
+
+Concurrency is measured, not guaranteed by GitHub documentation: over 50 trials
+of simultaneous creates of the same lock file and 50 trials of simultaneous
+updates with the same SHA, each trial had exactly one winner and a 409 loser.
+See [GitHub backend and history](/guides/state-management/#configuring-the-github-backend)
+for the protocol's limits and retention policy.
+
 ## State Manipulation
 
 ### Import

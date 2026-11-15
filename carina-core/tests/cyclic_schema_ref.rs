@@ -364,17 +364,7 @@ fn resource_schema_validate_routes_ref_through_defs() {
             .expect("cyclic schema fixture must be owner-bound"),
         &attrs
             .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    value
-                        .knowledge(
-                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                        )
-                        .map(|proof| proof.into_classification())
-                        .unwrap(),
-                )
-            })
+            .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
         &|_| false,
         &resolver,

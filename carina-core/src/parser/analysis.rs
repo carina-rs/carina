@@ -716,6 +716,11 @@ pub enum AnalysisTreeErrorKind {
         kind: AnalysisItemKind,
         id: ResourceId,
     },
+    #[error("resource {id} has a schema but was not visited by prefix canonicalization")]
+    UncanonicalizedResource {
+        id: Box<ResourceId>,
+        declaration: Option<DeclarationLocation>,
+    },
     #[error("missing declaration provenance for wait {binding}")]
     MissingWaitProvenance { binding: String },
     #[error("missing {element} provenance in {}", declaration.file().path().display())]
@@ -732,8 +737,19 @@ impl crate::resource::InsideSecret for AnalysisTreeError {
 }
 
 pub enum AnalysisTreeDiagnostic<'a> {
+    Located(Located<&'a AnalysisTreeError>),
     File(FileScoped<&'a AnalysisTreeError>),
     Directory(DirectoryScoped<&'a AnalysisTreeError>),
+}
+
+impl std::fmt::Display for AnalysisTreeDiagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Located(finding) => std::fmt::Display::fmt(finding, f),
+            Self::File(finding) => std::fmt::Display::fmt(finding.detail(), f),
+            Self::Directory(finding) => std::fmt::Display::fmt(finding.detail(), f),
+        }
+    }
 }
 
 impl AnalysisTreeError {
@@ -747,10 +763,22 @@ impl AnalysisTreeError {
 
     pub fn diagnostic(&self) -> AnalysisTreeDiagnostic<'_> {
         match &self.kind {
+            AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: Some(declaration),
+                ..
+            } => AnalysisTreeDiagnostic::Located(Located::new(declaration.clone(), self)),
             AnalysisTreeErrorKind::MissingElementProvenance { declaration, .. } => {
                 AnalysisTreeDiagnostic::File(FileScoped::new(declaration.file().path(), self))
             }
-            _ => AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self }),
+            AnalysisTreeErrorKind::InsideSecret
+            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }
+            | AnalysisTreeErrorKind::MissingResourceProvenance { .. }
+            | AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: None, ..
+            }
+            | AnalysisTreeErrorKind::MissingWaitProvenance { .. } => {
+                AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self })
+            }
         }
     }
 }
@@ -1390,6 +1418,24 @@ pub struct AuthoredResourceInstanceKey<'a, B: BindingAddress = RelativeBindingNa
     module_scope: Option<&'a str>,
 }
 
+impl<B: BindingAddress> AuthoredResourceInstanceKey<'_, B> {
+    /// Match the same source instance across relative/absolute binding phases.
+    /// This is an address comparison, not admission authority.
+    pub fn same_source_instance<C: BindingAddress>(
+        &self,
+        other: &AuthoredResourceInstanceKey<'_, C>,
+    ) -> bool {
+        self.same_source_declaration(other) && self.element == other.element
+    }
+
+    pub(crate) fn same_source_declaration<C: BindingAddress>(
+        &self,
+        other: &AuthoredResourceInstanceKey<'_, C>,
+    ) -> bool {
+        self.declaration == other.declaration && self.module_scope == other.module_scope
+    }
+}
+
 impl<'a, P, T, D, B> AnalysisResourceRef<'a, P, T, D, B>
 where
     P: ValueKind,
@@ -1672,6 +1718,10 @@ where
     B: BindingAddress,
     D: DeferredForPhaseTraversal<P, P, B>,
 {
+    pub(crate) fn is_project_resource(&self) -> bool {
+        self.in_project_walk
+    }
+
     pub fn attributes(&self) -> std::borrow::Cow<'a, indexmap::IndexMap<String, Value<P, B>>> {
         self.resource.attributes()
     }
@@ -2863,12 +2913,8 @@ where
         &self.iterables
     }
 
-    pub(crate) fn admission_report(&self) -> &super::retained::ExpressionReport<B> {
-        self.file
-            .parser_binding_metadata
-            .syntax()
-            .expressions()
-            .admission_report()
+    pub(crate) fn into_resources(self) -> Vec<AnalysisResourceRef<'a, P, T, D, B>> {
+        self.resources
     }
 
     pub fn resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {

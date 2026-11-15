@@ -425,7 +425,7 @@ enum DeclarationOwner {
     Backend(configuration::backend::BackendKind),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DeclarationIdentity {
+pub(crate) struct DeclarationIdentity {
     owner: DeclarationOwner,
     schema: DeclarationId,
 }

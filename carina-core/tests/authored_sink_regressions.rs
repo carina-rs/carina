@@ -3,7 +3,6 @@
 
 use carina_core::{
     EnvironmentSnapshot,
-    binding_index::BindingIndex,
     config_loader::parse_directory,
     parser::{ParsedFile, ProviderContext},
     paths::ResolvedPath,
@@ -12,8 +11,7 @@ use carina_core::{
     },
     static_type::{ExportStaticType, InferenceError, InferredUncheckedReason, StaticType},
     validation::{
-        ResourceRefTypeValidationError, ValidationTypeContext, check_bare_binding_uses,
-        validate_resource_admissions,
+        ResourceRefTypeValidationError, check_bare_binding_uses, validate_resource_admissions,
     },
 };
 use std::collections::HashSet;
@@ -84,11 +82,8 @@ fn findings(parsed: &ParsedFile, schemas: &SchemaRegistry) -> Vec<String> {
 
 fn validation_findings(parsed: &ParsedFile, schemas: &SchemaRegistry) -> Vec<String> {
     let context = ProviderContext::new(EnvironmentSnapshot::empty());
-    let loaded = carina_core::config_loader::load_buffer_configuration(
-        carina_core::config_loader::issue_buffer_configuration(parsed),
-        schemas,
-        &context,
-    );
+    let loaded =
+        carina_core::test_utils::load_canonical_buffer_configuration(parsed, schemas, &context);
     let messages = loaded
         .judged()
         .report()
@@ -100,8 +95,7 @@ fn validation_findings(parsed: &ParsedFile, schemas: &SchemaRegistry) -> Vec<Str
         return messages;
     }
     let signatures = Default::default();
-    let validation =
-        ValidationTypeContext::new_providerless(loaded.judged(), &context, &signatures);
+    let validation = loaded.providerless_validation_context(&context, &signatures);
     let uses = check_bare_binding_uses(&validation);
     let messages = uses
         .findings()
@@ -111,7 +105,7 @@ fn validation_findings(parsed: &ParsedFile, schemas: &SchemaRegistry) -> Vec<Str
     if !messages.is_empty() {
         return messages;
     }
-    let bindings = BindingIndex::from_parsed(loaded.parsed(), schemas, &context);
+    let bindings = loaded.parsed().binding_index(&context);
     // Follow the validation stages in order. Concrete values and binding-owned
     // loop slots need their owning checks beyond the expression-only report.
     match validate_resource_admissions(

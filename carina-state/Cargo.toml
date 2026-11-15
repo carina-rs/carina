@@ -31,11 +31,15 @@ async-trait = "0.1"
 thiserror = "2"
 hostname = "0.4"
 log = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+base64 = "0.22"
+percent-encoding = "2"
+sha1 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 argon2 = "0.5"
-carina-core = { path = "../carina-core", features = ["test-utils"] }
+carina-core = { path = "../carina-core", features = ["test-utils", "test-shutdown"] }
 hex = "0.4"
 indexmap = "2"
 tempfile = "3"

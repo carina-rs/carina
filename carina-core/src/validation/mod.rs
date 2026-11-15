@@ -1952,7 +1952,9 @@ fn same_authored_finding(left: &BindingUseFinding, right: &BindingUseFinding) ->
     same_authored_use(&left.use_site, &right.use_site) && left.error == right.error
 }
 
-fn same_authored_use(
+/// Compare diagnostic source occurrences across parser views. This does not
+/// grant the node/use/instance authority required for authored admission.
+pub fn same_authored_use(
     left: &crate::parser::BareBindingUse,
     right: &crate::parser::BareBindingUse,
 ) -> bool {
@@ -5382,6 +5384,7 @@ enum ResourceAdmissionDetail {
     Arithmetic(Box<crate::parser::Located<IntegerArithmeticTypeFinding>>),
     Iterable(Box<crate::parser::Located<DeferredForIterableTypeDiagnostic>>),
     UnavailableSchema(AnonymousResourceSchemaError),
+    AnalysisInvariant(Box<crate::parser::AnalysisTreeError>),
     Message,
 }
 
@@ -5396,6 +5399,30 @@ impl ResourceAdmissionFinding {
             .collect::<Vec<_>>()
             .join("\n");
         self
+    }
+    fn prefix(error: &crate::identifier::AttributePrefixError) -> Self {
+        let mut finding = Self::schema(
+            error.resource_id(),
+            None,
+            &TypeError::AttributePrefix(Box::new(error.clone())),
+        );
+        finding.human = error.to_string();
+        finding.location = error.location().cloned();
+        finding
+    }
+    fn analysis(error: crate::parser::AnalysisTreeError) -> Self {
+        let location = match error.diagnostic() {
+            crate::parser::AnalysisTreeDiagnostic::Located(finding) => {
+                Some(finding.location().clone())
+            }
+            crate::parser::AnalysisTreeDiagnostic::File(_)
+            | crate::parser::AnalysisTreeDiagnostic::Directory(_) => None,
+        };
+        Self {
+            human: error.to_string(),
+            detail: ResourceAdmissionDetail::AnalysisInvariant(Box::new(error)),
+            location,
+        }
     }
     fn schema(
         resource: &crate::resource::ResourceId,
@@ -5419,6 +5446,7 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::AnalysisInvariant(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5428,6 +5456,7 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::AnalysisInvariant(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5437,6 +5466,7 @@ impl ResourceAdmissionFinding {
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::AnalysisInvariant(_)
             | ResourceAdmissionDetail::Message => None,
         }
     }
@@ -5462,6 +5492,7 @@ impl ResourceAdmissionFinding {
             ResourceAdmissionDetail::Arithmetic(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::Iterable(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::UnavailableSchema(error) => error.to_string(),
+            ResourceAdmissionDetail::AnalysisInvariant(error) => error.to_string(),
             ResourceAdmissionDetail::Message => self.human.clone(),
         }
     }
@@ -5510,6 +5541,7 @@ impl std::fmt::Display for ResourceAdmissionFinding {
             | ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
+            | ResourceAdmissionDetail::AnalysisInvariant(_)
             | ResourceAdmissionDetail::Message => formatter.write_str(&self.human),
         }
     }
@@ -5548,27 +5580,35 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
     id: &crate::resource::ResourceId,
     slots: &crate::parser::retained::AuthoredSlots<B>,
     quoted_string_attrs: &HashSet<String>,
-    attributes: &IndexMap<String, GenericValue<P, B>>,
-    schema: Option<crate::schema::OwnerBoundResourceSchema<'_>>,
+    input: Option<(
+        crate::schema::OwnerBoundResourceSchema<'_>,
+        &crate::identifier::CanonicalAttributeValues<P, B>,
+    )>,
     kind: ValidatableKind,
     context: &mut ResourceValidationContext<'_, B>,
 ) {
-    match schema {
-        Some(schema) => {
+    match input {
+        Some((schema, attributes)) => {
             let mut classification_errors = Vec::new();
-            let classified = crate::resource::knowledge::collect_classified_attributes(
-                attributes.iter().map(|(name, value)| (name.clone(), value)),
-                &crate::resource::knowledge::KnowledgeContext::validation(),
-                |name, error| classification_errors.push((name.to_owned(), error)),
-            );
             let checked;
             let values = if let Some(values) =
                 context.admissions.and_then(|reports| reports.get(id))
             {
+                let _ = crate::resource::knowledge::collect_classified_attributes(
+                    attributes.iter().map(|(name, value)| (name.clone(), value)),
+                    &crate::resource::knowledge::KnowledgeContext::validation(),
+                    |name, error| classification_errors.push((name.to_owned(), error)),
+                );
                 values
             } else {
-                checked = publish_admission_diagnostics(
+                let outcome = publish_admission_diagnostics(
                     deferred_types::TypeCheckSession::run(context.provider_context, |session| {
+                        let authority = admission::attributes::SchemaInputAuthority::new(
+                            slots,
+                            attributes,
+                            context.report.for_resource(id).unwrap_or(context.report),
+                            context.coverage,
+                        );
                         match kind {
                             ValidatableKind::Resource => {
                                 admission::attributes::admit_validation_attributes::<
@@ -5578,17 +5618,12 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                                 >(
                                     schema,
                                     id,
-                                    &classified,
                                     quoted_string_attrs,
                                     None,
                                     session,
                                     None,
                                     None,
-                                    admission::attributes::SchemaInputAuthority::new(
-                                        slots,
-                                        context.report.for_resource(id).unwrap_or(context.report),
-                                        context.coverage,
-                                    ),
+                                    authority,
                                 )
                             }
                             ValidatableKind::DataSource => {
@@ -5599,23 +5634,20 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                                 >(
                                     schema,
                                     id,
-                                    &classified,
                                     quoted_string_attrs,
                                     None,
                                     session,
                                     None,
                                     None,
-                                    admission::attributes::SchemaInputAuthority::new(
-                                        slots,
-                                        context.report.for_resource(id).unwrap_or(context.report),
-                                        context.coverage,
-                                    ),
+                                    authority,
                                 )
                             }
                         }
                     }),
                     context.diagnostics,
                 );
+                classification_errors = outcome.classification_diagnostics.0;
+                checked = outcome.values;
                 &checked
             };
             for (error, path, symbolic) in values.diagnostic_errors() {
@@ -5684,12 +5716,13 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
 /// Two-sided check: a `read` resource requires a `DataSource` registry entry,
 /// and a non-`read` resource requires a `Managed` registry entry. If the
 /// wrong-kind entry is present (e.g. `read` against a managed-only type),
-/// emit a kind-specific error explaining the mismatch.
+/// emit a kind-specific error explaining the mismatch. Prefix companions are
+/// canonicalized on a preview copy; the caller's file remains unchanged.
 pub fn validate_resources<
-    E,
+    E: Clone,
     P: crate::resource::PlaceholderKind,
     T: crate::resource::PlaceholderKind,
-    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B> + Clone,
     B: BindingAddress,
 >(
     parsed: &crate::parser::File<E, P, T, D, B>,
@@ -5698,56 +5731,36 @@ pub fn validate_resources<
     provider_context: &ProviderContext,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), PresentedFindings> {
-    validate_resources_from_report(
-        parsed,
+    let canonical = crate::identifier::canonicalize_file_prefixes(
+        parsed.clone(),
         registry,
-        known_providers,
-        provider_context,
-        None,
-        diagnostics,
-    )
-}
+        crate::identifier::SuffixSource::Preview,
+    );
+    let report = canonical.validation_report(provider_context);
+    let mut run: ConversionValidation = ConversionValidation::new(&report);
+    let mut findings = canonical
+        .prefix_errors()
+        .iter()
+        .map(ResourceAdmissionFinding::prefix)
+        .collect::<Vec<_>>();
+    match canonical.schema_validation_resources() {
+        Ok(inputs) => findings.extend(run.walk_in(FindingSubject::Root, |coverage| {
+            resource_values_report(
+                inputs,
+                canonical.schemas(),
+                known_providers,
+                provider_context,
+                None,
+                diagnostics,
+                ValueAdmission {
+                    report: &report,
+                    coverage,
+                },
+            )
+        })),
+        Err(error) => findings.push(ResourceAdmissionFinding::analysis(error)),
+    }
 
-fn validate_resources_from_report<
-    E,
-    P: PlaceholderKind,
-    T: PlaceholderKind,
-    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
-    B: BindingAddress,
->(
-    parsed: &crate::parser::File<E, P, T, D, B>,
-    registry: &SchemaRegistry,
-    known_providers: &HashSet<String>,
-    provider_context: &ProviderContext,
-    admissions: Option<
-        &HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
-    >,
-    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
-) -> Result<(), PresentedFindings> {
-    let existing = parsed
-        .parser_binding_metadata
-        .syntax()
-        .expressions()
-        .admission_report();
-    let fresh;
-    let report = if existing.has_authored_judgement() {
-        existing
-    } else {
-        fresh = crate::parser::retained::judge_expressions(parsed, registry, provider_context);
-        &fresh
-    };
-    let mut run: ConversionValidation = ConversionValidation::new(report);
-    let findings = run.walk_in(FindingSubject::Root, |coverage| {
-        resource_values_report(
-            parsed,
-            registry,
-            known_providers,
-            provider_context,
-            admissions,
-            diagnostics,
-            ValueAdmission { report, coverage },
-        )
-    });
     run.ordinary(findings, FindingSubject::Root);
     let findings = run.complete().into_presented();
     if findings.is_empty() {
@@ -5757,14 +5770,8 @@ fn validate_resources_from_report<
     }
 }
 
-fn resource_values_report<
-    E,
-    P: PlaceholderKind,
-    T: PlaceholderKind,
-    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
-    B: BindingAddress,
->(
-    parsed: &crate::parser::File<E, P, T, D, B>,
+fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>(
+    inputs: crate::identifier::CanonicalSchemaInputs<'_, P, T, B>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
@@ -5774,31 +5781,31 @@ fn resource_values_report<
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     admission: ValueAdmission<'_, B>,
 ) -> Vec<ResourceAdmissionFinding> {
+    use crate::identifier::CanonicalSchemaResource;
     let ValueAdmission { report, coverage } = admission;
     let mut all_errors = ResourceAdmissionFindings::default();
     // A standalone module receives its providers from the caller, so schema
     // availability cannot be decided until its resources are expanded into a
     // root configuration. Keep every other schema/type check below active for
     // modules; only defer this provider-availability diagnostic.
-    if !is_module_definition(parsed) {
+    if !inputs.is_module_definition {
         all_errors.extend(group_anonymous_resource_schema_errors(
-            parsed
-                .iter_all_resources()
+            inputs
+                .resources
+                .iter()
                 .filter_map(|resource| match resource {
-                    ResourceRef::Resource(resource) => {
+                    CanonicalSchemaResource::Resource(resource, _) => {
                         anonymous_resource_schema_key(resource, registry, known_providers)
                     }
-                    ResourceRef::Deferred { resource, .. } => anonymous_resource_schema_key(
-                        resource.as_resource(),
-                        registry,
-                        known_providers,
-                    ),
-                    ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
+                    CanonicalSchemaResource::Deferred(resource, _) => {
+                        anonymous_resource_schema_key(resource, registry, known_providers)
+                    }
+                    CanonicalSchemaResource::DataSource(_, _) => None,
                 }),
         ));
     }
 
-    // Classify per kind via the typed `ResourceRef` arms instead of
+    // Classify per kind via the canonical file's typed members instead of
     // runtime `is_virtual()` / `is_data_source()` calls (carina#3180 /
     // #3181). compositions are post-apply attribute containers and have no
     // schema to validate against, so they are silently filtered. Managed
@@ -5816,32 +5823,26 @@ fn resource_values_report<
             admissions,
             coverage,
         };
-        for rref in parsed.iter_all_resources() {
-            // A deferred for-expression template body is always managed —
-            // `for` bodies never carry `read` / composition.
-            match rref {
-                ResourceRef::LiveComposition(_) => {}
-                ResourceRef::DataSource(resource) => validate_resource_values(
+        for resource in inputs.resources {
+            match resource {
+                CanonicalSchemaResource::DataSource(resource, input) => validate_resource_values(
                     &resource.id,
                     &resource.authored_slots,
                     &resource.quoted_string_attrs,
-                    &resource.attributes,
-                    registry.get_for_data_source(resource),
+                    input.as_ref().map(|(schema, values)| (*schema, values)),
                     ValidatableKind::DataSource,
                     &mut context,
                 ),
-                ResourceRef::Resource(resource) => {
-                    let schema = registry.get_for(resource);
+                CanonicalSchemaResource::Resource(resource, input) => {
                     validate_resource_values(
                         &resource.id,
                         &resource.authored_slots,
                         &resource.quoted_string_attrs,
-                        &resource.attributes,
-                        schema,
+                        input.as_ref().map(|(schema, values)| (*schema, values)),
                         ValidatableKind::Resource,
                         &mut context,
                     );
-                    if let Some(schema) = schema
+                    if let Some((schema, _)) = input
                         && let Err(errors) =
                             crate::resource::resolve_ignore_changes(resource, &schema)
                     {
@@ -5852,25 +5853,23 @@ fn resource_values_report<
                         );
                     }
                 }
-                ResourceRef::Deferred { resource, .. } => {
-                    let schema = registry.get_for(resource.as_resource());
+                CanonicalSchemaResource::Deferred(resource, input) => {
                     validate_resource_values(
-                        resource.id(),
-                        &resource.as_resource().authored_slots,
-                        resource.quoted_string_attrs(),
-                        resource.attributes(),
-                        schema,
+                        &resource.id,
+                        &resource.authored_slots,
+                        &resource.quoted_string_attrs,
+                        input.as_ref().map(|(schema, values)| (*schema, values)),
                         ValidatableKind::Resource,
                         &mut context,
                     );
-                    if let Some(schema) = schema
+                    if let Some((schema, _)) = input
                         && let Err(errors) =
-                            crate::resource::resolve_ignore_changes(resource.as_resource(), &schema)
+                            crate::resource::resolve_ignore_changes(resource, &schema)
                     {
                         context.all_errors.extend(
                             errors
                                 .into_iter()
-                                .map(|error| format!("{}: {}", resource.id(), error)),
+                                .map(|error| format!("{}: {}", resource.id, error)),
                         );
                     }
                 }
@@ -5892,7 +5891,10 @@ pub fn resource_reference_findings<
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        '_,
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<PresentedFindings, crate::parser::AnalysisTreeError> {
@@ -5915,7 +5917,10 @@ pub fn resource_reference_findings_in<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     run: &mut ConversionValidation<F>,
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        '_,
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     subject: FindingSubject,
@@ -5928,7 +5933,7 @@ pub fn resource_reference_findings_in<
         &subject,
         presentation::AdmissionBoundary::Live,
     )?;
-    run.ordinary(report.references.0, subject);
+    run.ordinary(report.findings.0, subject);
     Ok(())
 }
 
@@ -5961,7 +5966,7 @@ pub fn resource_reference_preflight_findings_in<F: ValidationClientError>(
         &subject,
         presentation::AdmissionBoundary::Preflight,
     )?;
-    run.ordinary(report.references.0, subject);
+    run.ordinary(report.findings.0, subject);
     Ok(())
 }
 
@@ -5970,7 +5975,10 @@ pub fn resource_admission_findings<
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        '_,
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
@@ -5995,7 +6003,10 @@ pub fn resource_admission_findings_in<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     run: &mut ConversionValidation<F>,
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        '_,
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
@@ -6009,7 +6020,7 @@ pub fn resource_admission_findings_in<
         run,
         &subject,
     )?;
-    run.ordinary(report.references.0, subject);
+    run.ordinary(report.findings.0, subject);
     Ok(())
 }
 
@@ -6019,7 +6030,10 @@ fn complete_resource_admission_report<
     F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        '_,
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
@@ -6034,9 +6048,10 @@ fn complete_resource_admission_report<
         subject,
         presentation::AdmissionBoundary::Live,
     )?;
+    let inputs = judged.schema_validation_resources()?;
     let mut findings = run.walk_in(subject.clone(), |coverage| {
         resource_values_report(
-            judged.file(),
+            inputs,
             judged.schemas(),
             known_providers,
             bindings.provider_context(),
@@ -6048,7 +6063,7 @@ fn complete_resource_admission_report<
             },
         )
     });
-    let tree = crate::parser::AnalysisTree::try_from_file(judged.file())?;
+    let tree = judged.parsed().analysis_tree()?;
     let mut resources = HashMap::new();
     for resource in tree.project_resources() {
         // Preserve the former find() policy if an earlier validation phase
@@ -6072,8 +6087,8 @@ fn complete_resource_admission_report<
             );
         }
     }
-    findings.extend(report.references.0);
-    report.references = ResourceAdmissionFindings(findings);
+    findings.extend(report.findings.0);
+    report.findings = ResourceAdmissionFindings(findings);
     Ok(report)
 }
 
@@ -6086,18 +6101,40 @@ fn publish_admission_diagnostics<T>(
 
 struct ResourceAdmissionReport {
     attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
-    references: ResourceAdmissionFindings,
+    // Required prefix rejections and reference findings have one consuming exit.
+    findings: ResourceAdmissionFindings,
+}
+impl ResourceAdmissionReport {
+    fn new<F>(
+        file: &crate::identifier::PrefixCanonicalized<'_, F>,
+        attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
+        mut references: ResourceAdmissionFindings,
+    ) -> Self {
+        let mut findings = file
+            .prefix_errors()
+            .iter()
+            .map(ResourceAdmissionFinding::prefix)
+            .collect::<Vec<_>>();
+        findings.append(&mut references.0);
+        Self {
+            attributes,
+            findings: ResourceAdmissionFindings(findings),
+        }
+    }
 }
 /// Recover the lexical type of a bare value that became an entire reference
 /// attribute during expansion. The runtime reference stays absolute; only its
 /// module-body type retains the declaration and the original source together.
-fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
-    parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+pub(crate) fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
+    parsed: crate::identifier::PrefixFileRead<'a, E, ParserPlaceholder, ParserPlaceholder, D, B>,
     resource_id: &crate::resource::ResourceId,
     attribute: &str,
     value: &GenericValue<ParserPlaceholder, B>,
     bindings: &BindingIndex<'_, B>,
-) -> Option<(&'a str, crate::binding_index::DeclaredValueSource)> {
+) -> Option<(&'a str, crate::binding_index::DeclaredValueSource)>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
     let GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path: source_path }) =
         value
     else {
@@ -6144,26 +6181,28 @@ fn resource_admission_report<
     F: ValidationClientError,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &crate::identifier::PrefixCanonicalized<
+        '_,
+        crate::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     conversion_validation: &mut ConversionValidation<F>,
     subject: &FindingSubject,
     boundary: presentation::AdmissionBoundary,
 ) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
-    let parsed = judged.file();
+    let parsed = judged.parsed();
     let registry = judged.schemas();
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
-    let inference_bindings = inference::bindings_from_parsed(parsed);
-    let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
+    let inference_bindings = parsed.inference_bindings();
 
     // Validate declarations directly instead of relying on a later resource
     // attribute to happen to expose an expression. Keep the authored
     // operator keys so a let substituted into an attribute is not reported a
     // second time by the schema-sink pass below.
     let mut declaration_arithmetic_findings = HashSet::new();
-    for finding in check_file_integer_arithmetic_values(judged, bindings) {
+    for finding in judged.integer_arithmetic_findings(bindings) {
         let message = finding.to_string();
         declaration_arithmetic_findings.insert((finding.location().clone(), message.clone()));
         all_errors.push(finding);
@@ -6172,17 +6211,16 @@ fn resource_admission_report<
     publish_admission_diagnostics(
         crate::validation::deferred_types::TypeCheckSession::run(
             bindings.provider_context(),
-            |session| {
+            |session| -> Result<(), crate::parser::AnalysisTreeError> {
                 // Match the main-branch project walk. Parser-side deferred read
                 // templates are checked at expansion, not admitted here.
                 for step in conversion_validation.resource_steps(
-                    tree.project_resources(),
                     judged,
                     bindings,
                     session,
                     subject.clone(),
                     boundary.clone(),
-                ) {
+                )? {
                     let (resource, result) = step.into_parts();
                     let values = match result {
                         Ok(Some(values)) => values,
@@ -6271,24 +6309,22 @@ fn resource_admission_report<
                     }
                     attributes.insert(resource.id().clone(), values);
                 }
+                Ok(())
             },
         ),
         diagnostics,
-    );
+    )?;
 
     if parsed.deferred_for_sites().next().is_some() {
         all_errors.extend(validate_deferred_for_iterable_types_with_bindings(
-            &crate::parser::AnalysisTree::try_from_file(parsed)?,
+            &parsed.analysis_tree()?,
             registry,
             &inference_bindings,
             bindings.provider_context(),
         ));
     }
 
-    Ok(ResourceAdmissionReport {
-        attributes,
-        references: all_errors,
-    })
+    Ok(ResourceAdmissionReport::new(judged, attributes, all_errors))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -871,7 +871,7 @@ fn successful_validation_report_returns_the_resolved_file_as_a_result() {
     let resolved = report
         .into_result()
         .unwrap_or_else(|errors| panic!("empty configuration must validate: {errors:?}"));
-    assert!(resolved.resources.is_empty());
+    assert!(resolved.parsed().resources.is_empty());
 }
 
 #[test]
@@ -2769,14 +2769,15 @@ where
 {
     let mut unresolved = carina_core::parser::ParsedFile::default();
     unresolved.resources = unresolved_resources;
-    resolve_config_block_names_for_test(
+    let pair = resolve_config_block_names_for_test(
         resolve_file_for_test(evaluated.clone()),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         schemas,
     )
-    .expect("test block-name resolution must succeed")
-    .into_expanded_for_test()
-    .expect("test values must contain no leftover parser placeholders")
+    .expect("test block-name resolution must succeed");
+    ParserCanonicalResourcePair::from_block_pair(pair, schemas)
+        .into_expanded_for_test()
+        .expect("test values must contain no leftover parser placeholders")
 }
 
 fn canonical_pair_from_resolved<
@@ -2796,7 +2797,7 @@ fn canonical_pair_from_resolved<
     unresolved.resources = unresolved_resources;
     carina_core::schema::resolve_file_block_names_with_schemas(&mut unresolved, schemas)
         .expect("test unresolved block-name resolution must succeed");
-    ParserCanonicalResourcePair::for_test(evaluated, unresolved.resources)
+    ParserCanonicalResourcePair::for_test(evaluated, unresolved.resources, schemas)
         .into_expanded_for_test()
         .expect("test values must contain no leftover parser placeholders")
 }
@@ -3501,7 +3502,9 @@ where
         ctx.schemas(),
     )
     .expect("test block-name resolution must succeed");
-    let validated = wiring.validated_parser_pair_for_test(canonical_resources);
+    let validated = wiring.validated_parser_pair_for_test(
+        ParserCanonicalResourcePair::from_block_pair(canonical_resources, ctx.schemas()),
+    );
     create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         provider_configs,
@@ -15731,6 +15734,7 @@ exports { team_prefix: String = "x" }"#,
 fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
     use carina_core::validation::deferred_types::{ProviderTypeCheckSite, TypeCheckSession};
     let catalog = carina_core::parser::LoadedProviderContext::empty_for_test();
+    let schemas = SchemaRegistry::new();
     let checks = TypeCheckSession::run(&catalog, |checks| {
         let expected = carina_core::parser::parse_type_expr_str(
             "Typo",
@@ -15758,12 +15762,15 @@ fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
             carina_core::parser::parse_file("", Path::new("/project/main.crn"), checks.catalog())
                 .unwrap();
         crate::commands::ConfigurationValidation {
-            result: Ok(Default::default()),
+            result: Ok(carina_core::identifier::canonicalize_file_prefixes(
+                Default::default(),
+                &schemas,
+                carina_core::identifier::SuffixSource::Preview,
+            )),
             authored_inputs: authored.authored_inputs().unwrap().clone(),
             warnings: Vec::new(),
         }
     });
-    let schemas = SchemaRegistry::new();
     let report: ValidationReport = ValidationReport::settle(checks, &schemas);
     let errors = report.into_errors();
     assert_eq!(errors.len(), 1);

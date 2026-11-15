@@ -55,7 +55,8 @@ use crate::DetailLevel;
 use crate::commands::plan::collect_historical_display_attributes;
 use crate::commands::plan::load_and_resolve_read_only_provider_configs;
 use crate::commands::shared::finalize::{
-    LockCommandOutcome, StatePersistence, finalize_after_execute, finish_lock_command,
+    FinalizationContext, LockCommandOutcome, StatePersistence, finalize_after_execute,
+    finish_lock_command,
 };
 use crate::commands::shared::incremental_state_saver::{FinalStateBase, IncrementalStateSaver};
 use crate::commands::shared::lock_heartbeat::{
@@ -167,11 +168,10 @@ pub async fn run_destroy(
     // state file may still need to be destroyed.
 
     // Check for backend configuration - use local backend by default
-    let backend: Arc<dyn StateBackend> = verified_backend
-        .resolve()
+    let backend = verified_backend
+        .resolve(&cancel)
         .await
-        .map_err(AppError::Backend)?
-        .into();
+        .map_err(AppError::Backend)?;
 
     let protected_bucket = verified_backend.protected_bucket();
 
@@ -197,7 +197,7 @@ pub async fn run_destroy(
     let outcome = run_destroy_locked_owned(
         validated_config,
         auto_approve,
-        Arc::clone(&backend),
+        backend.clone(),
         protected_bucket,
         state_lock,
         refresh,
@@ -208,7 +208,12 @@ pub async fn run_destroy(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await?;
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, path),
+        outcome,
+    )
+    .await?;
 
     Ok(())
 }
@@ -233,10 +238,11 @@ pub async fn run_destroy_with_factories_for_test(
     let backend: Arc<dyn StateBackend> =
         crate::commands::local_backend_for_test(path.join("carina.state.json")).into();
     let cancel = ShutdownToken::running();
+    let backend = carina_state::PublishedBackend::for_test(backend, &cancel);
     let outcome = run_destroy_locked_owned(
         validated,
         true,
-        Arc::clone(&backend),
+        backend.clone(),
         None,
         StateLock::disabled_by_cli_flag(),
         true,
@@ -247,7 +253,12 @@ pub async fn run_destroy_with_factories_for_test(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(runtime.color_mode(), backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(
+        runtime.color_mode(),
+        FinalizationContext::new(&backend, path),
+        outcome,
+    )
+    .await
 }
 
 enum DestroyAfterHeartbeat {
@@ -263,7 +274,6 @@ struct DestroyExecuted {
     skip_count: usize,
     unknown_count: usize,
     cancelled: bool,
-    cancel: ShutdownToken,
 }
 
 /// Every deferred retry owns the provider failure that made it necessary.
@@ -386,7 +396,7 @@ impl DestroyedInstances {
 async fn run_destroy_locked_owned(
     mut validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     auto_approve: bool,
-    backend: Arc<dyn StateBackend>,
+    backend: carina_state::PublishedBackend,
     protected_bucket: Option<ProtectedBackendBucket>,
     lock: StateLock,
     refresh: bool,
@@ -430,7 +440,7 @@ async fn run_destroy_locked_owned(
         };
     }
     let heartbeat = with_lock_heartbeat(
-        Arc::clone(&backend),
+        backend.shared_backend(),
         lock,
         cancel,
         async |cancel, mid_run_writer| {
@@ -1549,7 +1559,6 @@ validated_config.provider_plan())
         skip_count,
         unknown_count,
         cancelled,
-        cancel,
     })))
         },
     )
@@ -1578,7 +1587,6 @@ validated_config.provider_plan())
                     skip_count,
                     unknown_count,
                     cancelled,
-                    cancel,
                 } = *context;
                 let failure_count = failures.failures().len();
                 if cancelled && destroyed_instances.is_empty() {
@@ -1601,6 +1609,7 @@ validated_config.provider_plan())
                 println!("{}", "Saving state...".cyan(color_mode));
 
                 let finalize_result = finalize_after_execute(
+                    FinalizationContext::new(&backend, &base_dir.source_label()),
                     |persistence| {
                         finalize_destroy(
                             color_mode,
@@ -1614,7 +1623,6 @@ validated_config.provider_plan())
                         )
                     },
                     cancelled,
-                    &cancel,
                 )
                 .await;
 
@@ -1681,6 +1689,7 @@ async fn run_destroy_locked(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let backend = carina_state::PublishedBackend::for_test(backend, &cancel);
     let providers = match ProviderLoad::load(
         runtime,
         &parsed.providers,
@@ -1691,12 +1700,11 @@ async fn run_destroy_locked(
         Err(error) => {
             return finish_lock_command(
                 color_mode,
-                backend.as_ref(),
+                FinalizationContext::new(&backend, &base_dir.source_label()),
                 LockCommandOutcome::Kept {
                     result: Err(error),
                     lock,
                 },
-                &cancel,
             )
             .await;
         }
@@ -1707,12 +1715,11 @@ async fn run_destroy_locked(
         Err(error) => {
             return finish_lock_command(
                 color_mode,
-                backend.as_ref(),
+                FinalizationContext::new(&backend, &base_dir.source_label()),
                 LockCommandOutcome::Kept {
                     result: Err(error),
                     lock,
                 },
-                &cancel,
             )
             .await;
         }
@@ -1720,7 +1727,7 @@ async fn run_destroy_locked(
     let outcome = run_destroy_locked_owned(
         validated_config,
         auto_approve,
-        Arc::clone(&backend),
+        backend.clone(),
         protected_bucket,
         lock,
         refresh,
@@ -1731,7 +1738,12 @@ async fn run_destroy_locked(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, &base_dir.source_label()),
+        outcome,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1749,11 +1761,12 @@ pub(crate) async fn run_destroy_locked_with_ctx(
     parallelism: NonZeroUsize,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    let backend = carina_state::PublishedBackend::for_test(backend, &cancel);
     let color_mode = validated_config.context().runtime().color_mode();
     let outcome = run_destroy_locked_owned(
         validated_config,
         auto_approve,
-        Arc::clone(&backend),
+        backend.clone(),
         protected_bucket,
         lock,
         refresh,
@@ -1764,7 +1777,12 @@ pub(crate) async fn run_destroy_locked_with_ctx(
         cancel.clone(),
     )
     .await;
-    finish_lock_command(color_mode, backend.as_ref(), outcome, &cancel).await
+    finish_lock_command(
+        color_mode,
+        FinalizationContext::new(&backend, &base_dir.source_label()),
+        outcome,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2193,7 +2211,7 @@ pub(crate) struct FinalizeDestroyInput<'a> {
 pub(crate) async fn finalize_destroy(
     color_mode: crate::output_style::ColorMode,
     input: FinalizeDestroyInput<'_>,
-    persistence: StatePersistence,
+    persistence: StatePersistence<'_>,
 ) -> Result<(), AppError> {
     let mut state = input.state_base.into_state();
 

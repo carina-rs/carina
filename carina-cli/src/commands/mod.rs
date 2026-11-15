@@ -43,7 +43,7 @@ use crate::wiring::{
     NonEmptyValidationErrors, ParserCanonicalResourcePair, ValidationProviderCatalog,
     ValidationProviderCatalogExt, WiringContext,
     compute_anonymous_identifiers_with_policy_with_ctx,
-    compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
+    compute_parser_pair_anonymous_identifiers_with_policy_with_ctx, resolve_file_names_with_ctx,
     validate_deferred_populate_refs_with_ctx,
     validate_module_attribute_refs_after_expansion_failure, validate_module_boundaries,
     validate_module_internal_ref_types, validate_wait_bindings_with_ctx,
@@ -314,6 +314,49 @@ pub(crate) fn duplicate_declaration_errors(
     errors
 }
 
+/// Read-only validation results used by integration fixtures. This inventory
+/// carries no file, judgement or admission authority.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug)]
+pub struct ValidationInventory {
+    pub resources: Vec<
+        carina_core::resource::Resource<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+    >,
+    pub compositions: Vec<
+        carina_core::resource::LiveComposition<
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+    >,
+    pub providers: Vec<
+        carina_core::parser::ProviderConfig<
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+    >,
+    pub wait_bindings:
+        Vec<carina_core::parser::WaitBinding<carina_core::resource::AbsoluteBindingAddress>>,
+}
+#[cfg(any(test, feature = "test-utils"))]
+fn validation_inventory(
+    canonical: carina_core::identifier::PrefixCanonicalized<
+        '_,
+        carina_core::parser::ModuleResolvedInferredFile,
+    >,
+) -> ValidationInventory {
+    let read = canonical.parsed();
+    ValidationInventory {
+        resources: read.resources.to_vec(),
+        compositions: read.compositions.to_vec(),
+        providers: read.providers.to_vec(),
+        wait_bindings: read.wait_bindings.to_vec(),
+    }
+}
+
 /// Test-support wrapper around the non-minting validation report.
 ///
 /// Fixtures supply directory-level uniqueness diagnostics as well as the
@@ -325,7 +368,7 @@ pub fn validate_and_resolve_with_config(
     providers: &ProviderLoad,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
+) -> Result<ValidationInventory, AppError> {
     providers
         .validation_report(
             parsed,
@@ -334,6 +377,7 @@ pub fn validate_and_resolve_with_config(
             duplicate_declarations,
         )
         .into_result()
+        .map(validation_inventory)
         .map_err(|errors| collapse_presented_errors(errors.into_vec()))
 }
 
@@ -363,7 +407,7 @@ pub fn validate_and_resolve_with_provider_load_for_test(
     base_dir: &ResolvedPath,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
-) -> Result<carina_core::parser::ModuleResolvedInferredFile, AppError> {
+) -> Result<ValidationInventory, AppError> {
     let (providers, load_error) = ProviderLoad::load_reporting(
         runtime,
         &parsed.providers,
@@ -381,6 +425,7 @@ pub fn validate_and_resolve_with_provider_load_for_test(
             duplicate_declarations,
         )
         .into_result()
+        .map(validation_inventory)
         .map_err(|errors| collapse_presented_errors(errors.into_vec()))
 }
 
@@ -423,22 +468,44 @@ pub(crate) enum ConfigNameResolution {
 /// After that owner is minted, production code can change its resources only
 /// through concrete [`crate::wiring::ValidatedConfig`] methods or consuming
 /// owner transitions.
-pub(crate) enum ResolvedConfig {
+pub(crate) enum ResolvedConfig<'s> {
     Evaluated {
-        parsed: Box<carina_core::parser::ModuleResolvedInferredFile>,
+        parsed: Box<
+            carina_core::identifier::PrefixCanonicalized<
+                's,
+                carina_core::parser::ModuleResolvedInferredFile,
+            >,
+        >,
     },
     Paired {
         resources: Box<
-            ParserCanonicalResourcePair<carina_core::parser::ModuleResolvedInferredExportParam>,
+            ParserCanonicalResourcePair<'s, carina_core::parser::ModuleResolvedInferredExportParam>,
         >,
     },
 }
 
-impl ResolvedConfig {
-    fn parsed(&self) -> &carina_core::parser::ModuleResolvedInferredFile {
+impl<'s> ResolvedConfig<'s> {
+    fn parsed(
+        &self,
+    ) -> carina_core::identifier::ModuleResolvedFileRead<
+        '_,
+        carina_core::parser::ModuleResolvedInferredExportParam,
+    > {
         match self {
-            Self::Evaluated { parsed, .. } => parsed,
+            Self::Evaluated { parsed, .. } => parsed.parsed(),
             Self::Paired { resources, .. } => resources.parsed(),
+        }
+    }
+
+    fn canonicalized(
+        &self,
+    ) -> &carina_core::identifier::PrefixCanonicalized<
+        's,
+        carina_core::parser::ModuleResolvedInferredFile,
+    > {
+        match self {
+            Self::Evaluated { parsed } => parsed,
+            Self::Paired { resources } => resources.canonicalized(),
         }
     }
 
@@ -447,13 +514,10 @@ impl ResolvedConfig {
         ctx: &WiringContext,
         conflict_policy: carina_core::identifier::AnonymousIdentityConflictPolicy,
     ) -> Result<Vec<AppError>, AppError> {
-        let providers = self.parsed().providers.clone();
+        let providers = self.parsed().providers.to_vec();
         match self {
             Self::Evaluated { parsed, .. } => {
-                let canonical_resources = carina_core::value::canonicalize_resources_with_schemas(
-                    &mut parsed.resources,
-                    ctx.schemas(),
-                )?;
+                let canonical_resources = parsed.canonicalize_values()?;
                 Ok(compute_anonymous_identifiers_with_policy_with_ctx(
                     ctx,
                     canonical_resources,
@@ -462,7 +526,7 @@ impl ResolvedConfig {
                 ))
             }
             Self::Paired { resources, .. } => {
-                compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx(
+                compute_parser_pair_anonymous_identifiers_with_policy_with_ctx(
                     ctx,
                     resources,
                     &providers,
@@ -593,17 +657,17 @@ pub(crate) struct ConfigurationValidation<T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn validate_and_resolve_errors_inner(
+pub(crate) fn validate_and_resolve_errors_inner<'s>(
     access: &crate::wiring::ValidationPipelineAccess,
     parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
-    ctx: &WiringContext,
+    ctx: &'s WiringContext,
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
-) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
+) -> Result<ResolvedConfig<'s>, NonEmptyValidationErrors> {
     let report = validate_and_resolve_report_inner(
         access,
         parsed,
@@ -628,17 +692,17 @@ pub(crate) fn validate_and_resolve_errors_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn validate_and_resolve_report_inner(
+pub(crate) fn validate_and_resolve_report_inner<'s>(
     access: &crate::wiring::ValidationPipelineAccess,
     parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
-    ctx: &WiringContext,
+    ctx: &'s WiringContext,
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
-) -> ConfigurationValidation<ResolvedConfig> {
+) -> ConfigurationValidation<ResolvedConfig<'s>> {
     let mut warnings = Vec::new();
     let mut directive_errors = Vec::new();
     let mut authored_inputs = carina_core::input_rules::AuthoredInputs::for_directory_in_session(
@@ -701,11 +765,11 @@ impl ValidationStopped {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_and_resolve_configuration(
+fn validate_and_resolve_configuration<'s>(
     access: &crate::wiring::ValidationPipelineAccess,
     mut parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
-    ctx: &WiringContext,
+    ctx: &'s WiringContext,
     enriched_context: &ValidationProviderCatalog,
     _load_errors: &HashMap<String, String>,
     duplicate_declarations: &[DuplicateDeclaration],
@@ -715,7 +779,7 @@ fn validate_and_resolve_configuration(
     warnings: &mut Vec<ConfigurationWarning>,
     validation: &mut carina_core::validation::ConversionValidation<AppError>,
     directive_errors: &mut Vec<AppError>,
-) -> Result<ResolvedConfig, ValidationStopped> {
+) -> Result<ResolvedConfig<'s>, ValidationStopped> {
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
@@ -1130,13 +1194,14 @@ fn validate_and_resolve_configuration(
     // attributes, so its failures gate the remaining pipeline.
     let mut resolved_config = match name_resolution {
         ConfigNameResolution::EvaluatedOnly | ConfigNameResolution::ReadOnly => {
-            let name_errors = resolve_file_names_with_ctx(ctx, &mut parsed);
-            if !name_errors.is_empty() {
-                errors.extend(name_errors);
-                return Err(ValidationStopped::existing(errors));
-            }
-            ResolvedConfig::Evaluated {
-                parsed: Box::new(parsed),
+            match resolve_file_names_with_ctx(ctx, parsed) {
+                Ok(parsed) => ResolvedConfig::Evaluated {
+                    parsed: Box::new(parsed),
+                },
+                Err(name_errors) => {
+                    errors.extend(name_errors);
+                    return Err(ValidationStopped::existing(errors));
+                }
             }
         }
         ConfigNameResolution::Paired(unresolved) => {
@@ -1156,16 +1221,13 @@ fn validate_and_resolve_configuration(
     // This is the sole parser-placeholder boundary. Standalone module
     // definitions intentionally retain typed module-argument slots until a
     // caller expands them; root configurations must be fully expanded.
-    let placeholder_boundary = if carina_core::validation::is_module_definition(parsed) {
+    let placeholder_boundary = if parsed.is_module_definition() {
         carina_core::parser::ParserPlaceholderBoundary::ModuleDefinition
     } else {
         carina_core::parser::ParserPlaceholderBoundary::ExpandedFile
     };
-    let directive_errors = parsed.directive_resolution_errors(
-        placeholder_boundary,
-        ctx.schemas(),
-        enriched_context.catalog(),
-    );
+    let directive_errors =
+        parsed.directive_resolution_errors(placeholder_boundary, enriched_context.catalog());
     match directive_errors {
         Ok(directive_errors) => {
             for error in directive_errors {
@@ -1184,7 +1246,7 @@ fn validate_and_resolve_configuration(
     }
 
     let expanded_analysis = if !skip_resource_validation {
-        let analysis = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+        let analysis = match parsed.analysis_tree() {
             Ok(tree) => tree,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
@@ -1213,15 +1275,13 @@ fn validate_and_resolve_configuration(
         (Default::default(), Vec::new())
     };
 
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-        parsed,
-        ctx.schemas(),
+    let bindings = parsed.binding_index_in_session(
         Some(&upstream_exports),
         &imported_module_signatures,
         enriched_context,
     );
     if let Err(ref_errors) = carina_core::validation::validate_export_param_ref_types_with_bindings(
-        &parsed.export_params,
+        parsed.export_params,
         &bindings,
     ) {
         errors.extend(ref_errors.into_iter().map(AppError::from));
@@ -1250,10 +1310,9 @@ fn validate_and_resolve_configuration(
             }
         }));
 
-        let export_value_bindings =
-            carina_core::binding_index::ResolvedBindings::for_expanded_validation(parsed);
+        let export_value_bindings = parsed.resolved_bindings();
         let checked_export_values = carina_core::validation::check_export_values_for_validation(
-            &parsed.export_params,
+            parsed.export_params,
             &export_value_bindings,
             enriched_context,
         )
@@ -1264,17 +1323,15 @@ fn validate_and_resolve_configuration(
             errors,
             carina_core::validation::check_expanded_module_calls(
                 carina_core::validation::ExpandedModuleCallCheckInput::References {
-                    compositions: &parsed.compositions,
+                    compositions: parsed.compositions,
                     bindings: &bindings,
                 },
                 enriched_context.catalog(),
             ),
         );
-        let configuration = carina_core::config_loader::load_buffer_configuration(
-            carina_core::config_loader::issue_buffer_configuration(parsed),
-            ctx.schemas(),
-            enriched_context.catalog(),
-        );
+        let configuration = resolved_config
+            .canonicalized()
+            .judge(enriched_context.catalog());
         let admission_warnings = crate::wiring::resource_admission_report_in_run(
             ctx,
             configuration.judged(),
@@ -1288,7 +1345,7 @@ fn validate_and_resolve_configuration(
         );
         errors.extend(
             carina_core::validation::attribute_param_ref_findings(
-                &parsed.attribute_params,
+                parsed.attribute_params,
                 &bindings,
             )
             .into_iter()
@@ -1298,7 +1355,7 @@ fn validate_and_resolve_configuration(
             }),
         );
         let attribute_findings = carina_core::validation::attribute_value_findings(
-            &parsed.attribute_params,
+            parsed.attribute_params,
             enriched_context,
         )
         .into_validation(errors, carina_core::validation::FindingSubject::Root);
@@ -1341,8 +1398,8 @@ fn validate_and_resolve_configuration(
     // every repair the operator must make.
     errors.extend(
         carina_core::identifier::check_legacy_loop_move_targets(
-            &parsed.state_blocks,
-            &parsed.resources,
+            parsed.state_blocks,
+            parsed.resources,
         )
         .into_iter()
         .map(|error| AppError::AnonymousIdentity(error.into())),
@@ -1363,7 +1420,7 @@ fn validate_and_resolve_configuration(
     if !skip_resource_validation {
         // Identity assignment mutates the parsed resources. Seal their final
         // view only after the identity and move-target gate has succeeded.
-        let analysis = match carina_core::parser::AnalysisTree::try_from_file(parsed) {
+        let analysis = match parsed.analysis_tree() {
             Ok(tree) => tree,
             Err(error) => {
                 errors.push(AppError::AnalysisInvariant(error));
@@ -1465,17 +1522,17 @@ mod tests {
     }
 
     type ValidateAndResolveErrors =
-        fn(
+        for<'s> fn(
             &crate::wiring::ValidationPipelineAccess,
             carina_core::config_loader::InferredRootDirectory,
             &ResolvedPath,
-            &WiringContext,
+            &'s WiringContext,
             &ValidationProviderCatalog,
             &HashMap<String, String>,
             bool,
             &[DuplicateDeclaration],
             ConfigNameResolution,
-        ) -> Result<ResolvedConfig, crate::wiring::NonEmptyValidationErrors>;
+        ) -> Result<ResolvedConfig<'s>, crate::wiring::NonEmptyValidationErrors>;
 
     #[test]
     fn validate_and_resolve_failure_type_is_non_empty() {
