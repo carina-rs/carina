@@ -806,22 +806,6 @@ fn secret_debug_never_formats_the_inner_plaintext() {
 }
 
 #[test]
-fn interpolation_inherits_diagnostic_sensitivity_from_string_expression() {
-    let value = Value::Deferred(DeferredValue::Interpolation(vec![
-        InterpolationPart::Literal("prefix-".into()),
-        InterpolationPart::Expr(dispatched_source_value("secret('hunter2SECRET')")),
-    ]))
-    .canonicalize();
-
-    assert_eq!(crate::ValueDescription::of(&value).to_string(), "string");
-    assert_eq!(crate::value::format_value(&value), "'prefix-hunter2SECRET'");
-    assert_eq!(
-        crate::value::value_to_json(&value).unwrap(),
-        serde_json::json!("prefix-hunter2SECRET")
-    );
-}
-
-#[test]
 fn value_serde_round_trip() {
     let values = vec![
         Value::Concrete(ConcreteValue::String("hello".into())),

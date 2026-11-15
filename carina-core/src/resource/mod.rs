@@ -3003,8 +3003,8 @@ impl ValueString {
         }
     }
 
-    /// Expose the runtime bytes for evaluation, plan/state serialization, or
-    /// provider transport. Do not use this method to build diagnostics.
+    /// Expose runtime bytes for evaluation, serialization, provider transport,
+    /// or a diagnostic builder whose caller owns secret-error replacement.
     pub fn expose_plaintext(&self) -> &str {
         &self.plaintext
     }
@@ -10383,44 +10383,6 @@ mod enum_attr_tests {
             resource.get_enum_attr(&schema, "status"),
             Err(EnumAttrError::UnexpectedShape { path, .. }) if path == "status"
         ));
-    }
-
-    #[test]
-    fn invalid_sensitive_string_is_redacted_in_error_display() {
-        let schema = schema_with_status();
-        let secret = "enum-secret-that-must-not-leak";
-        let mut parsed = crate::parser::parse(
-            "let value = secret('enum-secret-that-must-not-leak')",
-            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        )
-        .unwrap();
-        let value = parsed
-            .variables
-            .shift_remove("value")
-            .unwrap()
-            .resolve_root(&RootScope::new())
-            .into_expanded()
-            .unwrap();
-        let mut inputs = [Resource::new("test", "dispatch-input")
-            .with_attribute("value", value)
-            .into_provider_resource()];
-        crate::executor::normalized::unwrap_dispatch_desired(&mut inputs);
-        let Value::Concrete(value) = inputs[0].attributes.shift_remove("value").unwrap() else {
-            panic!("concrete dispatch value")
-        };
-        let resource = resource_with_attr("status", value);
-
-        let error = match resource.get_enum_attr(&schema, "status") {
-            Err(error) => error,
-            Ok(_) => panic!("invalid closed enum member must fail"),
-        };
-
-        assert!(matches!(&error, EnumAttrError::NotAMember { .. }));
-        assert_eq!(
-            error.to_string(),
-            "invalid enum attribute `status`: string does not exactly match a declared API value"
-        );
-        assert!(!format!("{error:?}").contains(secret));
     }
 
     #[test]

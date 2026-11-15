@@ -1069,14 +1069,17 @@ async fn provider_ready_inputs_preserve_dispatched_secret_strings() {
         resource.attributes = ready_source.attributes.clone();
         let owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
         for inputs in [ready, owner.inputs()] {
+            assert_eq!(format!("{:?}", inputs.attribute("token")), "Some(Known(String(<sensitive string>)))");
             let Some(DesiredValue::Known(DesiredScalar::String(text))) = inputs.attribute("token") else { panic!("known dispatch string") };
             assert!(text.diagnostic_literal().is_none());
             let Some(DesiredValue::Map(nested)) = inputs.attribute("nested") else { panic!("map") };
             let Some(DesiredValue::Known(DesiredScalar::String(text))) = nested.get("token") else { panic!("nested dispatch string") };
+            assert_eq!(format!("{text:?}"), "<sensitive string>");
             assert!(text.diagnostic_literal().is_none());
             for name in ["list", "string_list"] {
                 let Some(DesiredValue::List(values)) = inputs.attribute(name) else { panic!("list") };
                 let Some(DesiredValue::Known(DesiredScalar::String(text))) = values.iter().next() else { panic!("dispatch list string") };
+                assert_eq!(format!("{text:?}"), "<sensitive string>", "{name}");
                 assert!(text.diagnostic_literal().is_none(), "{name}");
             }
         }

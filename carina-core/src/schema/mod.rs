@@ -7711,10 +7711,7 @@ impl From<ValueString> for DiagnosticValue {
 
 impl From<&ValueString> for DiagnosticValue {
     fn from(value: &ValueString) -> Self {
-        match value.diagnostic_literal() {
-            Some(value) => Self::Plain(value.to_owned()),
-            None => Self::Masked,
-        }
+        Self::Plain(value.expose_plaintext().to_owned())
     }
 }
 

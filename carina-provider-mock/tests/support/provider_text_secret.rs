@@ -32,11 +32,13 @@ pub const PUBLIC: &str = "public-value-4305";
 pub enum Failure {
     CreateMessage,
     CreateCause,
+    DebugCreate,
     Update,
     Delete,
     Refresh,
     RecoveryRefresh,
     DataSource,
+    DataSourceEvents,
     ConfigCause,
     JsonEscaped,
     Repeated,
@@ -77,6 +79,7 @@ pub struct EchoMock {
     // credential received during initialization or a prior successful create.
     password: Mutex<Option<String>>,
     deletes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    diagnostics: Option<carina_core::provider_text::ProviderDiagnosticChannel>,
 }
 
 impl EchoMock {
@@ -87,6 +90,7 @@ impl EchoMock {
             failure,
             password: Mutex::new(None),
             deletes: Default::default(),
+            diagnostics: None,
         }
     }
 
@@ -95,6 +99,14 @@ impl EchoMock {
         deletes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         self.deletes = deletes;
+        self
+    }
+
+    pub fn with_diagnostics(
+        mut self,
+        diagnostics: carina_core::provider_text::ProviderDiagnosticChannel,
+    ) -> Self {
+        self.diagnostics = Some(diagnostics);
         self
     }
     fn remembered_password(&self) -> String {
@@ -168,8 +180,35 @@ impl Provider for EchoMock {
         &self,
         resource: &ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        assert_eq!(self.failure, Failure::DataSource);
+        assert!(matches!(
+            self.failure,
+            Failure::DataSource | Failure::DataSourceEvents
+        ));
         let plaintext = password(resource.wire_attributes());
+        if self.failure == Failure::DataSourceEvents {
+            use carina_core::provider_text::{
+                EventLevel, ProviderEvent, ProviderValueDiagnostic, ValueOrigin,
+            };
+            let id = carina_core::protocol_convert::resource_id_to_protocol(&resource.id);
+            let changed: String = plaintext.chars().rev().collect();
+            for (name, value) in [
+                ("password", serde_json::json!(changed)),
+                ("strings", serde_json::json!([changed])),
+            ] {
+                self.diagnostics
+                    .as_ref()
+                    .expect("factory-installed channel")
+                    .emit(ProviderEvent::value(
+                        EventLevel::Warn,
+                        ProviderValueDiagnostic::json(
+                            Some(&id),
+                            &[name.into()],
+                            ValueOrigin::Observed,
+                            &value,
+                        ),
+                    ));
+            }
+        }
         let error = self.error("data source read", &plaintext);
         Box::pin(async { Err(error) })
     }
@@ -233,6 +272,10 @@ impl Provider for EchoMock {
                 ProviderError::api_error("mock create rejected password 3 true").with_status(403)
             }
             Failure::CreateMessage => self.error("create", &plaintext),
+            Failure::DebugCreate => ProviderError::api_error(format!(
+                "mock create debug password {:?}",
+                request.resource().as_resource().attributes["password"]
+            )),
             Failure::CreateCause => round_trip(ProviderError::api_error_caused_by(
                 "mock create rejected password",
                 std::io::Error::other(format!("invalid password {plaintext}; public={PUBLIC}")),
@@ -340,7 +383,7 @@ impl ProviderFactory for EchoFactory {
         config: &carina_core::provider::ProviderSession,
         _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        let provider = EchoMock::new(self.0);
+        let provider = EchoMock::new(self.0).with_diagnostics(config.diagnostics());
         let config = config.configuration();
         if config.wire_attributes().get("password").is_some() {
             *provider.password.lock().unwrap() = Some(password(config.wire_attributes()));
@@ -363,6 +406,16 @@ impl ProviderFactory for EchoFactory {
             ResourceSchema::new("test.lookup")
                 .as_data_source()
                 .attribute(AttributeSchema::required("password", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional(
+                        "strings",
+                        AttributeType::union(vec![
+                            AttributeType::string(),
+                            AttributeType::list(AttributeType::string()),
+                        ]),
+                    )
+                    .build(),
+                )
                 .validate()
                 .unwrap(),
         ]

@@ -794,12 +794,14 @@ fn prepared_secret_data_source_events_protect_scalar_and_list_paths() {
             &ready.attributes["strings"],
             Value::Concrete(ConcreteValue::StringList(_))
         ));
-        let inventory = RedactionSet::collect(ready.attributes.values());
         assert_eq!(
-            ProviderDiagnostic::message("provider saw private-event-token".into())
-                .with_secrets(&inventory)
-                .to_string(),
-            "provider saw (secret)"
+            ["scalar", "strings"].map(|name| {
+                let inventory = RedactionSet::collect([&ready.attributes[name]]);
+                ProviderDiagnostic::message("provider saw private-event-token".into())
+                    .with_secrets(&inventory)
+                    .to_string()
+            }),
+            ["provider saw (secret)", "provider saw (secret)"]
         );
         session.diagnostics().include_ready_data_source(&ready);
         let id = carina_provider_protocol::types::ResourceId {
@@ -807,13 +809,25 @@ fn prepared_secret_data_source_events_protect_scalar_and_list_paths() {
             resource_type: "test.lookup".into(),
             identity: "event-input".into(),
         };
+        // These observations have different bytes from the input. They need
+        // path protection even when a byte redactor knows the original token.
         for (name, candidate) in [
-            ("scalar", serde_json::json!("private-event-token")),
-            ("strings", serde_json::json!(["private-event-token"])),
+            (
+                "scalar",
+                carina_provider_protocol::types::Value::String(
+                    "changed-private-event-token".into(),
+                ),
+            ),
+            (
+                "strings",
+                carina_provider_protocol::types::Value::StringList(vec![
+                    "changed-private-event-token".into(),
+                ]),
+            ),
         ] {
             session.diagnostics().emit(ProviderEvent::value(
                 EventLevel::Warn,
-                ProviderValueDiagnostic::json(
+                ProviderValueDiagnostic::typed(
                     Some(&id),
                     &[name.into()],
                     ValueOrigin::Observed,
