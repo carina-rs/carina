@@ -577,21 +577,18 @@ mod tests {
 
     fn local_config(path: &str) -> ParserBackendConfig {
         ParserBackendConfig {
-            source: (),
             backend_type: "local".to_string(),
             attributes: (HashMap::<String, _>::from([(
                 "path".to_string(),
                 Value::Concrete(ConcreteValue::String(path.to_string().into())),
             )]))
-            .into_iter()
-            .collect(),
+            .into(),
             attribute_spans: Default::default(),
         }
     }
 
     fn s3_config(bucket: &str) -> ParserBackendConfig {
         ParserBackendConfig {
-            source: (),
             backend_type: "s3".to_string(),
             attributes: (HashMap::<String, _>::from([
                 (
@@ -607,8 +604,7 @@ mod tests {
                     Value::Concrete(ConcreteValue::String("us-east-1".into())),
                 ),
             ]))
-            .into_iter()
-            .collect(),
+            .into(),
             attribute_spans: Default::default(),
         }
     }
@@ -836,7 +832,6 @@ mod configured_backend_selection_tests {
     use super::*;
     fn raw(path: &str) -> ParserBackendConfig {
         ParserBackendConfig {
-            source: (),
             backend_type: "local".into(),
             attributes: [(
                 "path".to_owned(),

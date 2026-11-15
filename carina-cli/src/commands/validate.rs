@@ -426,8 +426,6 @@ mod tests {
             |session| {
                 carina_core::module_resolver::resolve_modules_providerless(
                     carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                        .evaluate_backend_in_session(session)
-                        .unwrap()
                         .admit(&carina_core::schema::SchemaRegistry::new(), session),
                     &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                 )
@@ -872,20 +870,19 @@ let observed_names = roles.names
             &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("fixture parses");
-        let parsed =
-            carina_core::validation::deferred_types::with_session_for_test(
-                &carina_core::parser::LoadedProviderContext::empty_for_test(),
-                |session| {
-                    carina_core::module_resolver::resolve_modules_providerless(
+        let parsed = carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                carina_core::module_resolver::resolve_modules_providerless(
                     carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
                         parsed, src,
-                    ).evaluate_backend_in_session(session).unwrap()
+                    )
                     .admit(&carina_core::schema::SchemaRegistry::new(), session),
                     &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                 )
                 .expect("cross the deferred-body resolution seam")
-                },
-            );
+            },
+        );
         // After the resolution seam the same-config provider-read loop is not
         // in `parsed.resources`; its resource-only template is ready for the
         // validate display path in `deferred_for_expressions`.
@@ -975,7 +972,7 @@ let observed_names = roles.names
                     declaration: crate::test_support::composition_declaration_fixture(),
                 }
             };
-        let mut parsed: ParsedFile = Default::default();
+        let mut parsed = ParsedFile::default();
         parsed
             .compositions
             .push(composition("bound", Some("bound")));

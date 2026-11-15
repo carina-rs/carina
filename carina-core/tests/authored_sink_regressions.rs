@@ -18,7 +18,7 @@ use carina_core::{
 };
 use std::collections::HashSet;
 
-fn directory(files: &[(&str, &str)]) -> ParsedFile<carina_core::parser::StrictBackend> {
+fn directory(files: &[(&str, &str)]) -> ParsedFile {
     let root = tempfile::tempdir().unwrap();
     for (name, source) in files {
         std::fs::write(root.path().join(name), source).unwrap();
@@ -66,10 +66,7 @@ fn source_schemas() -> SchemaRegistry {
     schemas
 }
 
-fn findings<K: carina_core::parser::BackendPhase>(
-    parsed: &ParsedFile<K>,
-    schemas: &SchemaRegistry,
-) -> Vec<String> {
+fn findings(parsed: &ParsedFile, schemas: &SchemaRegistry) -> Vec<String> {
     let context = ProviderContext::new(EnvironmentSnapshot::empty());
     let loaded = carina_core::config_loader::load_buffer_configuration(parsed, schemas, &context);
     loaded
@@ -81,10 +78,7 @@ fn findings<K: carina_core::parser::BackendPhase>(
         .collect()
 }
 
-fn validation_findings<K: carina_core::parser::BackendPhase>(
-    parsed: &ParsedFile<K>,
-    schemas: &SchemaRegistry,
-) -> Vec<String> {
+fn validation_findings(parsed: &ParsedFile, schemas: &SchemaRegistry) -> Vec<String> {
     let context = ProviderContext::new(EnvironmentSnapshot::empty());
     let loaded = carina_core::config_loader::load_buffer_configuration(parsed, schemas, &context);
     let messages = loaded

@@ -958,8 +958,8 @@ fn seam_computed_operand_evidence_is_paired_by_parser_identity() {
     assert_ne!(node.node_id(), usage.node().node_id());
 }
 
-fn admit_all<E, D, B, K: crate::parser::BackendPhase>(
-    source: &crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+fn admit_all<E, D, B>(
+    source: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     catalog: &ProviderContext,
 ) -> (
@@ -1008,11 +1008,7 @@ where
 
 fn with_directory(
     source: &[(&str, &str)],
-    run: impl FnOnce(
-        &crate::parser::ParsedFile<crate::parser::StrictBackend>,
-        &SchemaRegistry,
-        &ProviderContext,
-    ),
+    run: impl FnOnce(&crate::parser::ParsedFile, &SchemaRegistry, &ProviderContext),
 ) {
     let directory = tempfile::tempdir().unwrap();
     for (file, contents) in source {
@@ -1042,8 +1038,8 @@ fn with_directory(
     run(&parsed, &schemas, &catalog);
 }
 
-fn slot_coverage<K: crate::parser::BackendPhase>(
-    parsed: &crate::parser::ParsedFile<K>,
+fn slot_coverage(
+    parsed: &crate::parser::ParsedFile,
     schemas: &SchemaRegistry,
     catalog: &ProviderContext,
     run: impl FnOnce(&ExpressionReport, &crate::schema::value_validation::WalkCoverage),
@@ -1801,7 +1797,7 @@ fn seam_storage_owner_address_survives_independent_source_views() {
     let source = "mock.Test { input = 'one' }\nmock.Test { input = 'two' }";
     let one = crate::parser::parse_and_resolve(source).unwrap();
     let two = crate::parser::parse_and_resolve(source).unwrap();
-    let addresses = |file: &crate::parser::ParsedFile<crate::parser::StrictBackend>| {
+    let addresses = |file: &crate::parser::ParsedFile| {
         file.resources
             .iter()
             .map(|resource| resource.authored_slots.declaration_id().unwrap().clone())

@@ -95,7 +95,7 @@ impl UpstreamBootstrapContext {
     pub fn load_metadata(
         &self,
         source: &ResolvedPath,
-    ) -> Result<crate::config_loader::LoadedConfig<crate::parser::RetainedBackend>, String> {
+    ) -> Result<crate::config_loader::LoadedConfig, String> {
         crate::config_loader::load_configuration_for_metadata(
             source,
             &self.0,
@@ -118,7 +118,7 @@ impl UpstreamDiscoveryContext<'_> {
         source: &ResolvedPath,
         overrides: &crate::config_loader::SourceOverrides,
     ) -> Result<
-        crate::config_loader::ParsedRootDirectory<crate::parser::RetainedBackend>,
+        crate::config_loader::ParsedRootDirectory,
         crate::config_loader::DirectoryParseFailure,
     > {
         crate::config_loader::parse_directory_for_metadata_with_source_overrides_report(
@@ -159,18 +159,17 @@ impl UpstreamSourceIdentity {
         })
     }
 
-    /// Saved provenance is a presentation record, never parser provenance.
+    /// Resolve a saved binding/source pair without parser provenance.
     pub fn resolve_saved<B: BindingAddress>(
         binding: &B,
         source: &std::path::Path,
-        caller: &crate::parser::UpstreamCallSite,
         base: &ResolvedPath,
     ) -> std::io::Result<Self> {
         Ok(Self {
             binding: binding.to_string(),
             source: base.join_display(&base.persisted_path().display().join(source))?,
             declared_source: source.to_path_buf(),
-            caller: Some(caller.clone()),
+            caller: None,
             display_root: base.clone(),
         })
     }
@@ -308,10 +307,8 @@ mod root_witness {
         loaded: &'a crate::config_loader::LoadedConfig,
         identity: &'a UpstreamSourceIdentity,
     }
-    pub(super) struct RootUpstreamParse<
-        K: crate::parser::BackendPhase = crate::parser::RetainedBackend,
-    > {
-        parsed: crate::config_loader::ParsedRootDirectory<K>,
+    pub(super) struct RootUpstreamParse {
+        parsed: crate::config_loader::ParsedRootDirectory,
     }
     pub(super) enum SourceParseFailure {
         Unavailable(String),
@@ -351,9 +348,9 @@ mod root_witness {
             })
         }
     }
-    impl<K: crate::parser::BackendPhase> RootUpstreamParse<K> {
+    impl RootUpstreamParse {
         pub(super) fn from_verdict(
-            parsed: crate::config_loader::ParsedRootDirectory<K>,
+            parsed: crate::config_loader::ParsedRootDirectory,
         ) -> Result<Self, crate::config_loader::ModuleTemplateDeclarations> {
             match parsed.complete_directory_verdict() {
                 crate::config_loader::DirectoryVerdict::Root(_)
@@ -361,7 +358,7 @@ mod root_witness {
                 crate::config_loader::DirectoryVerdict::ModuleTemplate(template) => Err(template),
             }
         }
-        pub(super) fn into_parsed(self) -> crate::config_loader::ParsedRootDirectory<K> {
+        pub(super) fn into_parsed(self) -> crate::config_loader::ParsedRootDirectory {
             self.parsed
         }
     }
@@ -475,8 +472,8 @@ impl Eq for UpstreamTypeAuthority {}
 /// completion, future doc tools) read the body without re-parsing
 /// the upstream directory.
 pub type UpstreamExports<B = RelativeBindingName> = HashMap<B, UpstreamExportEntries>;
-type UpstreamAnalysis<'a, D, B, E, K> =
-    AnalysisTree<'a, ParserPlaceholder, ParserPlaceholder, D, B, E, K>;
+type UpstreamAnalysis<'a, D, B, E> =
+    AnalysisTree<'a, ParserPlaceholder, ParserPlaceholder, D, B, E>;
 
 /// A diagnostic about a `binding.field` reference whose downstream usage
 /// doesn't fit the upstream's exports.
@@ -993,9 +990,9 @@ impl UpstreamRefDiagnostic for UpstreamFieldError {
 ///
 /// An empty directory (no `.crn` files) is treated as "exports nothing"
 /// rather than a parse failure; the user may be mid-setup.
-pub fn resolve_upstream_exports<D, B: BindingAddress, E, K: crate::parser::BackendPhase>(
+pub fn resolve_upstream_exports<D, B: BindingAddress, E>(
     base_dir: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B, E, K>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<
     (UpstreamExports<B>, Vec<Located<UpstreamResolveError>>),
@@ -1007,14 +1004,9 @@ where
     resolve_upstream_exports_with_schemas(base_dir, tree, config, None)
 }
 
-pub fn resolve_upstream_exports_with_schemas<
-    D,
-    B: BindingAddress,
-    E,
-    K: crate::parser::BackendPhase,
->(
+pub fn resolve_upstream_exports_with_schemas<D, B: BindingAddress, E>(
     base_dir: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B, E, K>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> Result<
@@ -1033,14 +1025,9 @@ where
     )
 }
 
-pub fn resolve_upstream_exports_with_schemas_and_overrides<
-    D,
-    B: BindingAddress,
-    E,
-    K: crate::parser::BackendPhase,
->(
+pub fn resolve_upstream_exports_with_schemas_and_overrides<D, B: BindingAddress, E>(
     base_dir: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B, E, K>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
     overrides: &crate::config_loader::SourceOverrides,
@@ -1065,9 +1052,9 @@ where
     ))
 }
 
-pub fn resolve_upstream_exports_report<D, B: BindingAddress, E, K: crate::parser::BackendPhase>(
+pub fn resolve_upstream_exports_report<D, B: BindingAddress, E>(
     base_dir: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B, E, K>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
 ) -> Result<
@@ -1086,14 +1073,9 @@ where
     )
 }
 
-pub fn resolve_upstream_exports_report_with_overrides<
-    D,
-    B: BindingAddress,
-    E,
-    K: crate::parser::BackendPhase,
->(
+pub fn resolve_upstream_exports_report_with_overrides<D, B: BindingAddress, E>(
     base_dir: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B, E, K>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
     overrides: &crate::config_loader::SourceOverrides,
@@ -1140,9 +1122,9 @@ impl MissingUpstreamDirectory {
     }
 }
 
-pub fn check_upstream_state_sources<D, B: BindingAddress, E, K: crate::parser::BackendPhase>(
+pub fn check_upstream_state_sources<D, B: BindingAddress, E>(
     base: &ResolvedPath,
-    tree: &UpstreamAnalysis<'_, D, B, E, K>,
+    tree: &UpstreamAnalysis<'_, D, B, E>,
 ) -> Vec<Located<MissingUpstreamDirectory>>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -1370,8 +1352,8 @@ impl UpstreamExportSourceError {
 
 /// Reuse a loader-owned source parse for export discovery. This performs the
 /// same normalization, module expansion and inference as directory discovery.
-pub fn resolve_upstream_exports_from_parsed<K: crate::parser::BackendPhase>(
-    parsed: crate::config_loader::ParsedRootDirectory<K>,
+pub fn resolve_upstream_exports_from_parsed(
+    parsed: crate::config_loader::ParsedRootDirectory,
     source_abs: &ResolvedPath,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
@@ -1383,8 +1365,8 @@ pub fn resolve_upstream_exports_from_parsed<K: crate::parser::BackendPhase>(
         .map_err(Into::into)
 }
 
-fn resolve_upstream_root_exports<K: crate::parser::BackendPhase>(
-    parsed: RootUpstreamParse<K>,
+fn resolve_upstream_root_exports(
+    parsed: RootUpstreamParse,
     source_abs: &ResolvedPath,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: Option<&crate::schema::SchemaRegistry>,
@@ -1546,9 +1528,8 @@ pub fn check_upstream_state_field_references<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
     E,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B, E, K>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamDiagnostic<UpstreamFieldError>>> {
     check_upstream_state_field_references_inner(parsed, exports, true)
@@ -1563,9 +1544,8 @@ pub fn check_upstream_state_untyped_field_references<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
     E,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B, E, K>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamDiagnostic<UpstreamFieldError>>> {
     check_upstream_state_field_references_inner(parsed, exports, false)
@@ -1575,9 +1555,8 @@ fn check_upstream_state_field_references_inner<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
     E,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B, E, K>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
     include_typed_consumers: bool,
 ) -> Vec<Located<UpstreamDiagnostic<UpstreamFieldError>>> {
@@ -1777,8 +1756,8 @@ impl UpstreamRefDiagnostic for UpstreamForIterableShapeError {
 /// Both flag `(ForBinding × shape)` mismatches; this one fires at
 /// validate time off the upstream's *declared* type, the parser-side
 /// one fires at expansion time off the *resolved* `Value`.
-pub fn check_upstream_state_for_iterable_shapes<D, B, E, K: crate::parser::BackendPhase>(
-    parsed: &UpstreamAnalysis<'_, D, B, E, K>,
+pub fn check_upstream_state_for_iterable_shapes<D, B, E>(
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamDiagnostic<UpstreamForIterableShapeError>>>
 where
@@ -1970,9 +1949,8 @@ pub fn check_upstream_state_attribute_access_shapes<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
     E,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B, E, K>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamDiagnostic<UpstreamAttributeAccessShapeError>>> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, true)
@@ -1989,9 +1967,8 @@ pub fn check_upstream_state_attribute_access_shape_fallbacks<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
     E,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B, E, K>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamDiagnostic<UpstreamAttributeAccessShapeError>>> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, false)
@@ -2001,9 +1978,8 @@ fn check_upstream_state_attribute_access_shapes_inner<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
     E,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B, E, K>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
     include_resolver_struct_errors: bool,
 ) -> Vec<Located<UpstreamDiagnostic<UpstreamAttributeAccessShapeError>>> {
@@ -2193,9 +2169,8 @@ pub fn check_upstream_state_subscript_shapes<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     B: BindingAddress,
     E,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &UpstreamAnalysis<'_, D, B, E, K>,
+    parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
 ) -> Vec<Located<UpstreamDiagnostic<UpstreamSubscriptShapeError>>> {
     let mut errors: Vec<Located<UpstreamDiagnostic<UpstreamSubscriptShapeError>>> = Vec::new();
@@ -2420,33 +2395,54 @@ mod tests {
                 &context,
             )
             .unwrap();
-            let identity =
-                UpstreamSourceIdentity::resolve(&caller.upstream_states[0], &base).unwrap();
-            crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                let error = identity
-                    .load(
-                        &UpstreamBootstrapContext::from_runtime(&context),
-                        session,
-                        &SchemaRegistry::new(),
+            let declaration = &caller.upstream_states[0];
+            for (identity, has_caller) in [
+                (
+                    UpstreamSourceIdentity::resolve(declaration, &base).unwrap(),
+                    true,
+                ),
+                (
+                    UpstreamSourceIdentity::resolve_saved(
+                        &declaration.binding,
+                        &declaration.source,
+                        &base,
                     )
-                    .unwrap_err();
-                let UpstreamSourceLoadError::Rejected(rejection) = &error else {
-                    panic!("template must have a dedicated rejection: {error:?}");
-                };
-                assert_eq!(rejection.binding(), "prior");
-                assert_eq!(
-                    rejection.module_evidence().location().span().start_line(),
-                    2
-                );
-                let message = error.to_string();
-                assert!(
-                    message
-                        .contains("source `./mod` is a module definition and has no state to read"),
-                    "{message}"
-                );
-                assert!(message.contains("mod/declarations.crn:2"), "{message}");
-                assert!(!message.contains("PRIVATE_GUARD"), "{message}");
-            });
+                    .unwrap(),
+                    false,
+                ),
+            ] {
+                crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                    let error = identity
+                        .load(
+                            &UpstreamBootstrapContext::from_runtime(&context),
+                            session,
+                            &SchemaRegistry::new(),
+                        )
+                        .unwrap_err();
+                    let UpstreamSourceLoadError::Rejected(rejection) = &error else {
+                        panic!("template must have a dedicated rejection: {error:?}");
+                    };
+                    assert_eq!(rejection.binding(), "prior");
+                    assert_eq!(
+                        rejection.module_evidence().location().span().start_line(),
+                        2
+                    );
+                    let message = error.to_string();
+                    assert_eq!(
+                        message.starts_with("./caller.crn:1:39: "),
+                        has_caller,
+                        "{message}"
+                    );
+                    assert!(
+                        message.contains(
+                            "source `./mod` is a module definition and has no state to read"
+                        ),
+                        "{message}"
+                    );
+                    assert!(message.contains("mod/declarations.crn:2"), "{message}");
+                    assert!(!message.contains("PRIVATE_GUARD"), "{message}");
+                });
+            }
         }
     }
 
@@ -2822,7 +2818,7 @@ mod tests {
         }
     }
 
-    fn parse_project(source: &str) -> ParsedFile<crate::parser::StrictBackend> {
+    fn parse_project(source: &str) -> ParsedFile {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("main.crn"), source).unwrap();
         parse_directory(
@@ -3959,10 +3955,7 @@ mod tests {
         registry
     }
 
-    fn parse_project_with_provider(
-        source: &str,
-        provider_name: &str,
-    ) -> ParsedFile<crate::parser::StrictBackend> {
+    fn parse_project_with_provider(source: &str, provider_name: &str) -> ParsedFile {
         let tmp = tempfile::tempdir().unwrap();
         let full = format!(
             "provider {} {{\n  source = 'x/y'\n  version = '0.1'\n  region = 'ap-northeast-1'\n}}\n{}",
@@ -3979,8 +3972,8 @@ mod tests {
 
     /// Preserve the historical positional-walker coverage while exercising
     /// the unified binding resolver used by production validation.
-    fn check_upstream_ref_types_via_binding_index<K: crate::parser::BackendPhase>(
-        parsed: &ParsedFile<K>,
+    fn check_upstream_ref_types_via_binding_index(
+        parsed: &ParsedFile,
         exports: &UpstreamExports,
         schemas: &SchemaRegistry,
     ) -> Vec<String> {

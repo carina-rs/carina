@@ -1591,7 +1591,7 @@ fn backend_schema_is_not_reported_for_a_module_definition() {
         .collect();
     assert_eq!(
         module_messages,
-        vec!["Unknown attribute 'typo' for backend type 's3'"],
+        Vec::<&str>::new(),
         "module diagnostics: {module_diagnostics:#?}"
     );
 
@@ -1647,60 +1647,6 @@ fn backend_schema_uses_resolved_sibling_let_and_function_values() {
 }
 
 #[test]
-fn backend_schema_uses_resolved_sibling_let_and_function_values_with_broken_sibling() {
-    for (sibling, failed) in [
-        ("let b = 'state'\n", false),
-        ("let b = cidr_subnet('bad', 8, 1)\n", true),
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let source = "backend s3 {\n  bucket = b\n  key = 'state.json'\n  typo = true\n}\n";
-        std::fs::write(directory.path().join("backend.crn"), source).unwrap();
-        std::fs::write(directory.path().join("values.crn"), sibling).unwrap();
-        std::fs::write(directory.path().join("broken.crn"), "let broken =\n").unwrap();
-        let path = directory.path().join("backend.crn");
-        let context =
-            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-        let root = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
-        let buffer =
-            carina_core::config_loader::ParsedSourceBuffer::parse(source, &path, &context).unwrap();
-        let snapshot = carina_core::config_loader::DirectoryBufferSnapshot::capture(
-            &root,
-            buffer,
-            &Default::default(),
-        )
-        .unwrap();
-        let schemas = SchemaRegistry::new();
-        let configuration = carina_core::config_loader::load_buffer_configuration_in_directory(
-            snapshot, &schemas, &context,
-        );
-        let tree =
-            carina_core::parser::AnalysisTree::try_from_file(configuration.parsed()).unwrap();
-        let value = tree.backend_attribute_value(&"bucket".into()).unwrap();
-        assert_eq!(
-            matches!(value, carina_core::parser::BackendAttributeValue::Failed(_)),
-            failed
-        );
-        if !failed {
-            assert!(
-                matches!(value, carina_core::parser::BackendAttributeValue::Evaluated(Value::Concrete(ConcreteValue::String(value))) if value.expose_plaintext() == "state")
-            );
-        }
-        let diagnostics =
-            test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
-        let schema_errors: Vec<_> = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.message.contains("backend type 's3'"))
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect();
-        assert_eq!(
-            schema_errors,
-            vec!["Unknown attribute 'typo' for backend type 's3'"],
-            "{sibling}: {diagnostics:#?}"
-        );
-    }
-}
-
-#[test]
 fn failed_backend_user_function_does_not_emit_a_schema_type_mismatch() {
     let sibling_source = "fn backend_bucket(): String { true }\n";
     let backend_source = "backend s3 {\n  bucket = backend_bucket()\n  key = \"state.json\"\n}\n";
@@ -1715,103 +1661,6 @@ fn failed_backend_user_function_does_not_emit_a_schema_type_mismatch() {
         "diagnostics: {diagnostics:#?}"
     );
     assert_backend_typo_is_diagnosed(sibling_source, backend_source);
-}
-
-#[test]
-fn round17_each_failed_backend_builtin_reports_its_own_evaluation_error() {
-    let source = "backend s3 {\n  bucket = cidr_subnet('bad', 8, 1)\n  key = cidr_subnet('bad', 8, 1)\n  encrypt = 'yes'\n}\n";
-    let diagnostics =
-        backend_directory_diagnostics_with_sibling("let ordinary = 'value'\n", source);
-    let failures: Vec<_> = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            diagnostic.message.starts_with("Invalid expression")
-                && diagnostic.message.contains("invalid CIDR")
-        })
-        .collect();
-    eprintln!(
-        "Round 17 backend diagnostics: {}",
-        serde_json::to_string_pretty(&diagnostics).unwrap()
-    );
-    assert_eq!(failures.len(), 2, "{diagnostics:#?}");
-    assert_eq!(
-        failures
-            .iter()
-            .map(|diagnostic| diagnostic.range.start.line)
-            .collect::<Vec<_>>(),
-        vec![1, 2]
-    );
-    assert!(diagnostics.iter().all(|diagnostic| {
-        !diagnostic.message.contains("Invalid attribute 'bucket'")
-            && !diagnostic.message.contains("Invalid attribute 'key'")
-    }));
-}
-
-#[test]
-fn failed_backend_builtins_are_not_admitted_from_recovery() {
-    let source = "backend s3 {\n  bucket = cidr_subnet('bad', 8, 1)\n  key = cidr_subnet('bad', 8, 1)\n  encrypt = 'yes'\n}\n";
-    let diagnostics =
-        backend_directory_diagnostics_with_sibling("let ordinary = 'value'\n", source);
-    let messages: Vec<_> = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.message.contains("backend type 's3'"))
-        .map(|diagnostic| diagnostic.message.as_str())
-        .collect();
-    assert_eq!(
-        messages,
-        vec![
-            "Invalid attribute 'encrypt' for backend type 's3': Type mismatch: expected Bool, got String"
-        ],
-        "{diagnostics:#?}"
-    );
-}
-
-#[test]
-fn failed_backend_interpolation_is_not_admitted_from_recovery() {
-    let source =
-        "backend s3 {\n  bucket = \"${cidr_subnet('bad', 8, 1)}\"\n  key = 'state.json'\n}\n";
-    let diagnostics =
-        backend_directory_diagnostics_with_sibling("let ordinary = 'value'\n", source);
-    assert!(
-        diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.message.contains("Invalid attribute 'bucket'")),
-        "{diagnostics:#?}"
-    );
-    assert_backend_typo_is_diagnosed("let ordinary = 'value'\n", source);
-}
-
-#[test]
-fn failed_backend_sibling_let_is_not_admitted_from_recovery() {
-    let sibling = "let b = cidr_subnet('bad', 8, 1)\n";
-    let source = "backend s3 {\n  bucket = b\n  key = 'state.json'\n}\n";
-    let diagnostics = backend_directory_diagnostics_with_sibling(sibling, source);
-    assert!(
-        diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.message.contains("Invalid attribute 'bucket'")),
-        "{diagnostics:#?}"
-    );
-    assert_backend_typo_is_diagnosed(sibling, source);
-}
-
-#[test]
-fn failed_backend_builtin_keeps_independent_schema_errors() {
-    let source = "backend s3 {\n  bucket = cidr_subnet('bad', 8, 1)\n  key = 'state.json'\n  encrypt = 'yes'\n  typo = true\n}\n";
-    let diagnostics = backend_directory_diagnostics(source);
-    let messages: Vec<_> = diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.message.contains("backend type 's3'"))
-        .map(|diagnostic| diagnostic.message.as_str())
-        .collect();
-    assert_eq!(
-        messages,
-        vec![
-            "Invalid attribute 'encrypt' for backend type 's3': Type mismatch: expected Bool, got String",
-            "Unknown attribute 'typo' for backend type 's3'",
-        ],
-        "diagnostics: {diagnostics:#?}"
-    );
 }
 
 #[test]
@@ -3102,8 +2951,8 @@ awscc.iam.role {
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| !diagnostic.message.contains("has no loaded schema")),
-        "provider availability stays provisional without a directory: {diagnostics:#?}"
+            .any(|diagnostic| diagnostic.message.contains("has no loaded schema")),
+        "the existing missing-schema diagnostic must still fire: {diagnostics:#?}"
     );
     assert!(
         diagnostics.iter().all(|diagnostic| !diagnostic
@@ -6239,8 +6088,17 @@ fn error_when_provider_has_no_loaded_schema_for_file_configuration() {
         .iter()
         .find(|diagnostic| diagnostic.message == expected);
     assert!(
-        unavailable.is_none(),
-        "the buffer has no complete directory provider inventory: {diagnostics:#?}"
+        unavailable.is_some(),
+        "a provider absent from this file's loaded configuration should be distinguished from an unknown resource type. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        unavailable.unwrap().severity,
+        Some(DiagnosticSeverity::ERROR)
+    );
+    assert!(
+        !unavailable.unwrap().message.contains("carina init"),
+        "a missing-schema diagnostic must not suggest initialization"
     );
 
     // And the old generic message should no longer fire for this case.
@@ -18694,205 +18552,4 @@ backend local {
     );
     let diag = arguments_diag.unwrap();
     assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-}
-
-#[test]
-fn error_when_provider_has_no_loaded_schema_for_file_configuration_in_directory() {
-    let engine = test_engine();
-    let doc = create_document(
-        r#"awscc.iam.role {
-  role_name = 'test'
-}
-"#,
-    );
-
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("main.crn");
-    let source = doc.text();
-    std::fs::write(&path, &source).unwrap();
-    let diagnostics = engine.analyze(&create_document_at(&source, path.clone()), Some(&path));
-
-    let expected = "Provider 'awscc' has no loaded schema for this file: no provider block for it was found in this file's configuration.";
-    let unavailable = diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.message == expected);
-    assert!(
-        unavailable.is_some(),
-        "a provider absent from this file's loaded configuration should be distinguished from an unknown resource type. Got: {:?}",
-        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        unavailable.unwrap().severity,
-        Some(DiagnosticSeverity::ERROR)
-    );
-    assert!(
-        !unavailable.unwrap().message.contains("carina init"),
-        "a missing-schema diagnostic must not suggest initialization"
-    );
-
-    // And the old generic message should no longer fire for this case.
-    let generic_unknown = diagnostics
-        .iter()
-        .find(|d| d.message == "Unknown resource type: awscc.iam.role");
-    assert!(
-        generic_unknown.is_none(),
-        "Should not emit generic 'Unknown resource type' when the provider is absent from the file's loaded configuration. Got: {:?}",
-        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn missing_provider_schema_suppresses_attribute_derived_identity_conflict_in_directory() {
-    let engine = test_engine();
-    let source = r#"awscc.iam.role {
-  role_name = "one"
-}
-
-awscc.iam.role {
-  role_name = "two"
-}
-"#;
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("main.crn");
-    std::fs::write(&path, source).unwrap();
-    let diagnostics = engine.analyze(&create_document_at(source, path.clone()), Some(&path));
-
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("has no loaded schema")),
-        "the existing missing-schema diagnostic must still fire: {diagnostics:#?}"
-    );
-    assert!(
-        diagnostics.iter().all(|diagnostic| !diagnostic
-            .message
-            .contains("identity is derived from mutable attributes")),
-        "a missing schema must not also produce the identity-basis diagnostic: {diagnostics:#?}"
-    );
-}
-
-#[test]
-fn round19_backend_failure_has_one_owner_beside_unrelated_resolution_error() {
-    let root = tempfile::tempdir().unwrap();
-    let backend = "backend s3 { bucket = cidr_subnet('bad', 8, 1) key = 'k' }\n";
-    let main = "let r = mock.test.resource { name = missing_function() }\n";
-    std::fs::write(root.path().join("backend.crn"), backend).unwrap();
-    std::fs::write(root.path().join("main.crn"), main).unwrap();
-    let engine = test_engine();
-    let backend_diagnostics = analyze_with_buffer(&engine, root.path(), "backend.crn", backend);
-    let failures: Vec<_> = backend_diagnostics
-        .iter()
-        .filter(|d| d.message.contains("invalid CIDR"))
-        .collect();
-    assert_eq!(failures.len(), 1, "{backend_diagnostics:#?}");
-    assert_eq!(
-        failures[0].message,
-        "Invalid expression at line 1: cidr_subnet(): cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')"
-    );
-    let diagnostics = analyze_with_buffer(&engine, root.path(), "main.crn", main);
-    assert_eq!(
-        diagnostics
-            .iter()
-            .filter(|d| d.message == "Unknown function 'missing_function'")
-            .count(),
-        1,
-        "{diagnostics:#?}"
-    );
-}
-
-#[test]
-fn round19_backend_defers_when_inventory_passes_but_sibling_parse_fails() {
-    let root = tempfile::tempdir().unwrap();
-    let backend = "backend s3 { bucket = b key = 'k' typo = true }\n";
-    for (file, text) in [
-        ("backend.crn", backend),
-        ("a.crn", "let b = 'state'\n"),
-        ("broken.crn", "let duplicate = 1\nlet duplicate = 2\n"),
-    ] {
-        std::fs::write(root.path().join(file), text).unwrap();
-    }
-    let diagnostics = analyze_with_buffer(&test_engine(), root.path(), "backend.crn", backend);
-    assert!(
-        diagnostics
-            .iter()
-            .all(|d| !d.message.contains("Invalid attribute 'bucket'")),
-        "{diagnostics:#?}"
-    );
-    assert_eq!(
-        diagnostics
-            .iter()
-            .filter(|d| d.message == "Unknown attribute 'typo' for backend type 's3'")
-            .count(),
-        1,
-        "{diagnostics:#?}"
-    );
-}
-
-#[test]
-fn round19_backend_provider_parameter_uses_the_callers_session() {
-    let root = tempfile::tempdir().unwrap();
-    let backend = "backend s3 { bucket = bucket_for('state') key = 'k' }\n";
-    for (file, text) in [
-        ("backend.crn", backend),
-        ("main.crn", "provider mock {}\n"),
-        (
-            "functions.crn",
-            "fn bucket_for(value: mock.test.resource): String { 'state' }\n",
-        ),
-    ] {
-        std::fs::write(root.path().join(file), text).unwrap();
-    }
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "mock",
-        carina_core::schema::PatternResourceSchema::new("test.resource")
-            .validate()
-            .unwrap(),
-    );
-    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
-    let diagnostics = analyze_with_buffer(&engine, root.path(), "backend.crn", backend);
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(
-        diagnostics[0].message,
-        "Invalid expression at line 1: function 'bucket_for': parameter 'value': expected mock.test.resource, got string 'state'"
-    );
-    assert_eq!(
-        diagnostics[0].range,
-        Range::new(Position::new(0, 22), Position::new(0, 41))
-    );
-}
-
-#[test]
-fn round19_backend_failure_keeps_independent_late_resolution_diagnostics() {
-    let root = tempfile::tempdir().unwrap();
-    let main = "let r = mock.test.resource { name = keys('bad') }\n";
-    std::fs::write(root.path().join("main.crn"), main).unwrap();
-    std::fs::write(
-        root.path().join("backend.crn"),
-        "backend s3 { bucket = cidr_subnet('bad', 8, 1) key = 'k' }\n",
-    )
-    .unwrap();
-    std::fs::write(root.path().join("providers.crn"), "provider mock {}\n").unwrap();
-    let engine = DiagnosticEngine::new(
-        loaded_providers_from_factories(vec![Box::new(
-            carina_provider_mock::ConfiguredBuiltinMock::new(
-                Default::default(),
-                carina_provider_mock::MockScope::memory(),
-            ),
-        )]),
-        vec!["mock".into()],
-    );
-    let diagnostics = analyze_with_buffer(&engine, root.path(), "main.crn", main);
-    let errors: Vec<_> = diagnostics
-        .iter()
-        .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
-        .map(|finding| finding.message.as_str())
-        .collect();
-    assert_eq!(
-        errors,
-        [
-            "keys(): keys() argument must be a Map, got String",
-            "Invalid expression at line 1: keys(): keys() argument must be a Map, got String"
-        ]
-    );
 }

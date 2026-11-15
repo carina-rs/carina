@@ -86,7 +86,6 @@ mod read_origin_serialization_tests {
     use carina_core::paths::ResolvedPath;
     fn raw(path: &str) -> ExpandedBackendConfig {
         ExpandedBackendConfig {
-            source: (),
             backend_type: "local".into(),
             attributes: [(
                 "path".to_owned(),
@@ -152,41 +151,8 @@ mod implicit_backend_serialization_tests {
 mod saved_backend_serde_tests {
     use super::*;
     #[test]
-    fn round19_saved_upstream_requires_relative_caller() {
-        let source = super::super::UpstreamSource {
-            binding: carina_core::resource::absolute_binding_address_for_test("prior"),
-            source: "../source".into(),
-            caller: carina_core::parser::UpstreamCallSite::for_test(),
-        };
-        let valid = serde_json::to_value(source).unwrap();
-        serde_json::from_value::<super::super::UpstreamSource>(valid.clone()).unwrap();
-        let mut missing = valid.clone();
-        missing.as_object_mut().unwrap().remove("caller");
-        assert!(serde_json::from_value::<super::super::UpstreamSource>(missing).is_err());
-        let mut absolute = valid;
-        absolute["caller"]["file"] = serde_json::json!("/local/private/project/main.crn");
-        assert!(serde_json::from_value::<super::super::UpstreamSource>(absolute).is_err());
-    }
-
-    #[test]
-    fn round19_saved_backend_deserialization_uses_plain_value_errors() {
-        let expected = serde_json::from_value::<
-            carina_core::resource::Value<
-                carina_core::resource::NoPlaceholder,
-                carina_core::resource::AbsoluteBindingAddress,
-            >,
-        >(serde_json::Value::Null)
-        .unwrap_err();
-        let error = serde_json::from_value::<SavedBackendConfig>(
-            serde_json::json!({"backend_type":"s3", "attributes":{"bucket":null, "key":"k"}}),
-        )
-        .unwrap_err();
-        assert_eq!(error.to_string(), expected.to_string());
-    }
-    #[test]
     fn saved_backend_serde_preserves_private_origin_payload() {
         let recorded = ExpandedBackendConfig {
-            source: (),
             backend_type: "local".into(),
             attributes: [(
                 "path".to_owned(),

@@ -702,7 +702,7 @@ A struct type represents a nested object with typed fields.
   identity/member labels; identified leaves show every identity-conjunction
   pattern. Shared provider docgen
   must render both layers too. This change needs no WIT change.
-  Schema fingerprints use v13 and saved plans use format 47; format 46 plans
+  Schema fingerprints use v13 and saved plans use format 46; format 45 plans
   must fail the version gate before decoding the payload. Saved module
   `pending_constraints` contain `ValidateExpr` values, not retained types.
   Condition strings, `require` messages, and wait RHS strings retain checked
@@ -1110,7 +1110,8 @@ arguments, attributes, and require (empty blocks count). The distinct no-evidenc
 verdict is a module when imported and a root on direct/LSP/upstream/metadata entry.
 Readable provider/backend evidence establishes Root even with unavailable siblings
 or without a directory snapshot. Otherwise incomplete snapshots remain Unknown
-and defer placement and provider/backend schema checks. ModuleTemplate retains
+and defer only the root-only/module-only placement checks added by #4398.
+Provider/backend schema checking retains its existing loading behavior. ModuleTemplate retains
 its first module evidence location: upstream_state sources with this verdict
 are typed errors with that evidence, since module definitions have no state to read.
 Importability never depends on entry

@@ -74,18 +74,8 @@ pub(crate) struct ModuleWalk {
 }
 
 impl ModuleWalk {
-    pub(crate) fn load<E, K: carina_core::parser::BackendPhase>(
-        parsed: &carina_core::parser::File<
-            E,
-            carina_core::resource::ParserPlaceholder,
-            carina_core::resource::ParserPlaceholder,
-            carina_core::parser::ParsedDeferredForPhase<
-                carina_core::resource::ParserPlaceholder,
-                carina_core::resource::RelativeBindingName,
-            >,
-            carina_core::resource::RelativeBindingName,
-            K,
-        >,
+    pub(crate) fn load<E>(
+        parsed: &carina_core::parser::File<E>,
         base_dir: &ResolvedPath,
         environment: &carina_core::EnvironmentSnapshot,
         schemas: &carina_core::schema::SchemaRegistry,

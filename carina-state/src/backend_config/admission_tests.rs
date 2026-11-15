@@ -127,7 +127,6 @@ fn locate_error_retains_terminal_io_cause() {
 fn configured_locate_error_includes_file_context() {
     let root = tempfile::tempdir().unwrap();
     let raw = parser::BackendConfig::<NoPlaceholder> {
-        source: (),
         backend_type: "local".into(),
         attributes: [(
             "path".to_owned(),

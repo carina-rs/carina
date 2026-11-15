@@ -1297,20 +1297,10 @@ fn loop_directive_projection_evaluates_env_from_the_caller_snapshot() {
     });
 }
 
-fn cross_deferred_for_resolution_seam<E, K: crate::parser::BackendPhase>(
-    parsed: File<
-        E,
-        crate::resource::ParserPlaceholder,
-        crate::resource::ParserPlaceholder,
-        crate::parser::ParsedDeferredForPhase<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
-        crate::resource::RelativeBindingName,
-        K,
-    >,
+fn cross_deferred_for_resolution_seam<E>(
+    parsed: File<E>,
     source: &str,
-) -> ModuleResolvedFile<E::Absolute, crate::resource::AbsoluteBindingAddress, K>
+) -> ModuleResolvedFile<E::Absolute>
 where
     E: ResolveExportBindingPhase<ParserPlaceholder>,
 {
@@ -1404,7 +1394,7 @@ fn file_into_expanded_collects_every_leftover_with_locations() {
 #[test]
 fn file_into_expanded_collects_multiple_leftovers_inside_one_value() {
     let empty = empty_interpolation_placeholder;
-    let mut file: ParsedFile = Default::default();
+    let mut file = ParsedFile::default();
     file.variables.insert(
         "greeting".to_string(),
         Value::Concrete(ConcreteValue::List(vec![empty(), empty()])),
@@ -1430,7 +1420,7 @@ fn file_into_expanded_collects_multiple_leftovers_inside_one_value() {
 #[test]
 fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
     let empty = empty_interpolation_placeholder;
-    let mut file: ParsedFile<StrictBackend> = Default::default();
+    let mut file = ParsedFile::default();
 
     file.providers.push(ProviderConfig {
         name: "mock".to_string(),
@@ -1443,7 +1433,6 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
         binding: None,
     });
     file.backend = Some(BackendConfig {
-        source: (),
         backend_type: "local".to_string(),
         attributes: HashMap::<String, _>::from([("path".to_string(), empty())])
             .into_iter()
@@ -1578,7 +1567,7 @@ fn file_into_expanded_locates_leftovers_in_every_value_bearing_field() {
 
 #[test]
 fn module_argument_in_variable_is_allowed_only_at_module_definition_boundary() {
-    let mut file: ParsedFile = Default::default();
+    let mut file = ParsedFile::default();
     file.variables.insert(
         "derived".to_string(),
         Value::Deferred(DeferredValue::Placeholder(
@@ -1610,7 +1599,7 @@ fn expansion_boundary_checks_canonical_deferred_template_resource_attributes() {
     template_resource
         .attributes
         .insert("name".to_string(), empty_interpolation_placeholder());
-    let mut file: ParsedFile = Default::default();
+    let mut file = ParsedFile::default();
     let target = DeferredForTarget::bound(crate::resource::RelativeBindingName::new("items"))
         .expect("fixture binding is valid");
     let body = DeferredForBody::resource(template_resource);
@@ -3619,9 +3608,8 @@ fn parse_backend_block() {
         }
     "#;
 
-    let result = parse_file_and_resolve(
+    let result = parse(
         input,
-        std::path::Path::new("test.crn"),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
@@ -3665,17 +3653,15 @@ fn parse_backend_block() {
 #[test]
 fn secret_derived_backend_attribute_error_carries_the_attribute_span() {
     let input = "backend local {\n    path = secret(\"carina.state.json\")\n}";
-    let parsed = parse(
+    let mut parsed = parse(
         input,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
 
-    let error = evaluate_file_backend::<StrictBackend, _>(
-        parsed,
+    let error = resolve_resource_refs_with_config(
+        &mut parsed,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        None,
-        crate::config_loader::strict_resolution_context(),
     )
     .expect_err("secret-derived backend attributes must be rejected");
 
@@ -3729,9 +3715,8 @@ fn parse_backend_block_with_resources() {
         }
     "#;
 
-    let result = parse_file_and_resolve(
+    let result = parse(
         input,
-        std::path::Path::new("test.crn"),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
@@ -16746,28 +16731,10 @@ fn parsed_export_param_keeps_optional_type_expr() {
 
 #[test]
 fn parsed_file_is_file_of_parsed_export_param() {
-    fn _coerce(
-        p: ParsedFile,
-    ) -> File<
-        ParsedExportParam,
-        ParserPlaceholder,
-        ParserPlaceholder,
-        ParsedDeferredForPhase,
-        RelativeBindingName,
-        AuthoredBackend,
-    > {
+    fn _coerce(p: ParsedFile) -> File<ParsedExportParam> {
         p
     }
-    fn _back(
-        f: File<
-            ParsedExportParam,
-            ParserPlaceholder,
-            ParserPlaceholder,
-            ParsedDeferredForPhase,
-            RelativeBindingName,
-            AuthoredBackend,
-        >,
-    ) -> ParsedFile {
+    fn _back(f: File<ParsedExportParam>) -> ParsedFile {
         f
     }
 }
@@ -19975,11 +19942,7 @@ fn assert_resource_reference_shape<P: crate::resource::PlaceholderKind>(
     );
 }
 
-fn resource_attribute<K: crate::parser::BackendPhase>(
-    parsed: &ParsedFile<K>,
-    resource_type: &str,
-    name: &str,
-) -> Value {
+fn resource_attribute(parsed: &ParsedFile, resource_type: &str, name: &str) -> Value {
     parsed
         .iter_all_resources()
         .find(|resource| resource.id().resource_type == resource_type)

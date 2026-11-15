@@ -46,8 +46,9 @@ Root evidence is decisive even when a sibling cannot be read or parsed: any
 readable authored provider/backend block, including one in an unsaved buffer,
 establishes a root. Without root evidence, an incomplete directory or an editor
 buffer without a directory snapshot remains unknown. Module evidence alone
-cannot settle an incomplete inventory. Under unknown, Carina defers placement
-and provider/backend schema checks; ordinary expression checks still run.
+cannot settle an incomplete inventory. Under unknown, Carina defers only
+root-only and module-only placement errors. Provider/backend schema and
+expression checks follow their usual rules.
 This partial recovery is specific to the language server; CLI directory loads
 still report the sibling read or parse failure.
 `module info` displays neutral file metadata for an unknown snapshot.

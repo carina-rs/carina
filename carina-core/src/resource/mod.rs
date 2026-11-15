@@ -5974,9 +5974,6 @@ pub enum ApplyTimeUnknown<B: BindingAddress = AbsoluteBindingAddress> {
     UpstreamAllExports { binding: B },
     /// An apply completed, but its follow-up read did not resolve the value.
     PendingReRead(PendingReRead),
-    /// Editor-only deferral: directory binding scope could not be constructed.
-    #[serde(skip)]
-    IncompleteBackendScope,
 }
 
 /// A parser slot survived the only fallible parser-to-expanded value
@@ -7322,7 +7319,6 @@ impl<B: BindingAddress> ApplyTimeUnknown<B> {
                 }
             }
             ApplyTimeUnknown::PendingReRead(value) => ApplyTimeUnknown::PendingReRead(value),
-            ApplyTimeUnknown::IncompleteBackendScope => ApplyTimeUnknown::IncompleteBackendScope,
         }
     }
 }
@@ -8163,7 +8159,6 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     ApplyTimeUnknown::UpstreamExport { path } => path.hash(hasher),
                     ApplyTimeUnknown::UpstreamAllExports { binding } => binding.hash(hasher),
                     ApplyTimeUnknown::PendingReRead(pending) => pending.hash(hasher),
-                    ApplyTimeUnknown::IncompleteBackendScope => {}
                 }
             }
             Value::Deferred(DeferredValue::Placeholder(leaf)) => {

@@ -554,7 +554,7 @@ fn provider_finalization_returns_missing_provenance() {
     ));
 }
 
-fn provider_directory() -> ParsedFile<crate::parser::StrictBackend> {
+fn provider_directory() -> ParsedFile {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("main.crn"), "let unrelated = 'main'\n").unwrap();
     std::fs::write(

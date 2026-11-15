@@ -896,7 +896,7 @@ mod tests {
         let remote_bindings: HashMap<String, HashMap<String, Value>> = HashMap::new();
         let wait_aliases: Vec<WaitAliasSpec> = Vec::new();
 
-        let mut parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedParsedFile::default();
         parsed.resources = resources.clone();
         let canonical = CanonicalResourcePair::new(parsed, resources);
         let state = ProjectedStateRead::for_test_name_overrides(overrides);

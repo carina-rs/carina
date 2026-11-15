@@ -573,7 +573,7 @@ fn root_require_unreadable_sibling_keeps_unknown_scope() {
 }
 
 #[test]
-fn broken_sibling_with_backend_runs_root_provider_and_backend_checks() {
+fn broken_sibling_with_backend_keeps_root_placement_and_main_provider_checks() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("main.crn");
     let source = "arguments { x: String }\nunknown.test.resource { name = x }\nbackend s3 { bucket = 'x' key = 'state' region = 'invalid' }\n";
@@ -902,28 +902,6 @@ fn upstream_module_templates_keep_module_evidence_as_related_information() {
 }
 
 #[test]
-fn unsaved_buffer_root_evidence_controls_schema_checks() {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
-    let path = directory.path().join("unsaved.crn");
-    for directory_context in [None, Some(path.as_path())] {
-        let source = "provider x {}\nx.test.resource { name = 'root' }\n";
-        let diagnostics =
-            test_engine().analyze(&create_document_at(source, path.clone()), directory_context);
-        assert_eq!(diagnostics.iter().filter(|d| d.message == "Provider 'x' has no loaded schema for this file: no provider block for it was found in this file's configuration.").count(), 1, "{diagnostics:#?}");
-        let source = "x.test.resource { name = 'root' }\n";
-        let diagnostics =
-            test_engine().analyze(&create_document_at(source, path.clone()), directory_context);
-        assert!(
-            diagnostics
-                .iter()
-                .all(|d| !d.message.contains("no loaded schema")),
-            "{diagnostics:#?}"
-        );
-    }
-}
-
-#[test]
 fn readable_provider_decides_root_despite_a_broken_sibling() {
     let directory = tempfile::tempdir().unwrap();
     let providers = directory.path().join("providers.crn");
@@ -977,14 +955,13 @@ fn readable_arguments_do_not_decide_a_template_with_a_broken_sibling() {
     assert!(
         diagnostics
             .iter()
-            .all(|d| !d.message.contains("no loaded schema")
-                && !d.message.contains("only allowed inside")),
+            .all(|d| !d.message.contains("only allowed inside")),
         "{diagnostics:#?}"
     );
 }
 
 #[test]
-fn unsaved_backend_decides_root_and_runs_schema_checks() {
+fn unsaved_backend_decides_root_without_recovering_schema_checks() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
     let path = directory.path().join("unsaved.crn");
@@ -998,31 +975,39 @@ fn unsaved_backend_decides_root_and_runs_schema_checks() {
                 .iter()
                 .filter(|d| d.message.contains("Unknown attribute 'typo'"))
                 .count(),
-            1,
+            0,
             "{diagnostics:#?}"
         );
     }
 }
 
 #[test]
-fn round12_partial_directory_retains_duplicate_backend_ownership() {
+fn round21_partial_root_does_not_recover_backend_schema_checks() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("main.crn");
+    std::fs::write(directory.path().join("broken.crn"), "let broken =\n").unwrap();
+    let path = directory.path().join("backend.crn");
     let source = "backend s3 { typo = 1 }\n";
     std::fs::write(&path, source).unwrap();
-    std::fs::write(directory.path().join("other.crn"), "backend local {}\n").unwrap();
-    for broken in [false, true] {
-        if broken {
-            std::fs::write(directory.path().join("broken.crn"), "let broken = [\n").unwrap();
-        }
-        let diagnostics =
-            test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
-        assert!(
-            diagnostics.iter().all(
-                |finding| !finding.message.contains("Unknown attribute 'typo'")
-                    && !finding.message.contains("Missing required attribute")
-            ),
-            "{diagnostics:#?}"
-        );
-    }
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+}
+
+#[test]
+fn round21_unknown_keeps_mains_missing_provider_schema_diagnostic() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("broken.crn"), "let broken =\n").unwrap();
+    let path = directory.path().join("main.crn");
+    let source = "unloaded.test.Thing {}\n";
+    // Leave this buffer unsaved, so its syntax must join the snapshot inventory.
+    let diagnostics = test_engine().analyze(&create_document_at(source, path.clone()), Some(&path));
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "Provider 'unloaded' has no loaded schema for this file: no provider block for it was found in this file's configuration."
+    );
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 0), Position::new(0, 19))
+    );
 }

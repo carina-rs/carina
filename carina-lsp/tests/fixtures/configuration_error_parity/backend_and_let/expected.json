@@ -1,30 +1,17 @@
 {
   "case": "backend_and_let",
-  "count": 3,
+  "count": 2,
   "errors": [
     {
-      "message": "cidr_subnet(): cidr_subnet() invalid CIDR format: 'other-bad' (expected 'address/prefix')",
+      "message": "cidr_subnet(): cidr_subnet() invalid CIDR format: 'bad' (expected 'address/prefix')",
       "range": {
         "end": {
-          "character": 5,
-          "line": 4
+          "character": 8,
+          "line": 1
         },
         "start": {
-          "character": 4,
-          "line": 4
-        }
-      }
-    },
-    {
-      "message": "Invalid expression at line 5: cidr_subnet(): cidr_subnet() invalid CIDR format: 'other-bad' (expected 'address/prefix')",
-      "range": {
-        "end": {
-          "character": 5,
-          "line": 4
-        },
-        "start": {
-          "character": 4,
-          "line": 4
+          "character": 2,
+          "line": 1
         }
       }
     },

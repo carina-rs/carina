@@ -8,16 +8,8 @@ pub use analysis::{
     AnalysisResourceRef, AnalysisTree, AnalysisTreeDiagnostic, AnalysisTreeError,
     AnalysisTreeErrorKind, AnalysisValueReference, AnalysisWaitRef, AuthoredResourceInstanceKey,
     DeclarationLocation, DeclarationProvenance, DirectoryScoped, FileScoped, Located,
-    UnexpandedAnalysis,
 };
 mod ast;
-mod backend_value;
-pub use backend_value::{
-    AuthoredBackend, BackendAdmissionInput, BackendAdmissionPhase, BackendAttributeValue,
-    BackendExpression, BackendPhase, BackendSource, RetainedBackend, StrictBackend,
-};
-#[cfg(any(test, feature = "test-utils"))]
-pub use backend_value::{BackendFixturePhase, evaluate_backend_for_test};
 mod authored_text;
 mod failed_file;
 pub use failed_file::{
@@ -59,17 +51,13 @@ mod resolve;
 pub mod retained;
 mod scalar_constraints;
 mod value_type;
+pub(crate) use resolve::resolve_resource_refs_in_session_unsealed;
 pub use resolve::{
     AnalysisResolutionError, DEFAULT_TAGS_ATTRIBUTE, PlanPreviewProviderConfigs,
     PlanProviderConfigurations, ProviderConfiguration, ProviderConfigurations,
     ReadOnlyProviderConfig, ReadOnlyProviderConfigs, finalize_provider_configs_for_analysis,
     resolve_expanded_provider_unresolved_attributes_for_analysis,
     resolve_provider_unresolved_attributes_for_analysis, resolve_resource_refs_from_analysis,
-};
-pub(crate) use resolve::{
-    BackendEvaluationPhase, BackendScope, assemble_evaluated_backend, evaluate_backend_in_scope,
-    evaluate_backend_with_scope, evaluate_file_backend, evaluate_file_backend_in_scope,
-    resolve_resource_refs_in_session_unsealed,
 };
 
 mod static_eval;
@@ -96,11 +84,8 @@ pub(crate) type ParsedFunctionArgument = crate::resource::FunctionArgument<
 >;
 pub(crate) type ParserProviderConfig =
     ast::ProviderConfig<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
-pub(crate) type ParserBackendConfig = ast::BackendConfig<
-    crate::resource::ParserPlaceholder,
-    crate::resource::RelativeBindingName,
-    AuthoredBackend,
->;
+pub(crate) type ParserBackendConfig =
+    ast::BackendConfig<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
 pub(crate) type ParserStateBlock =
     ast::StateBlock<crate::resource::ParserPlaceholder, crate::resource::RelativeBindingName>;
 pub(crate) type ParserWaitBinding = ast::WaitBinding<crate::resource::RelativeBindingName>;
@@ -135,9 +120,8 @@ pub use ast::{
     ResourceMut, ResourceRef, ResourceTypePath, RootBindingResolvedFile,
     RootBindingResolvedInferredFile, RootBindingResolvedParsedFile, SavedDeferredForExpression,
     ShapeMismatch, SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TopLevelResourceRef,
-    TypeExpr, UnexpandedFile, UntilPredicateAst, UpstreamCallSite, UpstreamState, UseStatement,
-    UserFunction, UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding,
-    expand_deferred_children,
+    TypeExpr, UntilPredicateAst, UpstreamCallSite, UpstreamState, UseStatement, UserFunction,
+    UserFunctionBody, ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
 };
 pub(crate) use ast::{
     BareBindingSource, DeclarationSource, DeferredForResourceExpressionError, ParsedBareBindingUse,
@@ -203,8 +187,8 @@ pub use resolve::{
 pub(crate) use resolve::{
     ProviderInputPreview, ProviderInputStatus, RootInputFailure, collect_seed_bindings_from_parts,
     preview_expanded_provider_inputs, reject_cyclic_let_bindings_in_variables,
-    resolve_resource_refs_in_context, resolve_resource_refs_with_backend_failure,
-    resolve_snapshot_function_calls_in_context,
+    resolve_resource_refs_for_diagnostics, resolve_resource_refs_in_context,
+    resolve_resource_refs_with_backend_failure, resolve_snapshot_function_calls_in_context,
 };
 pub use static_eval::{
     evaluate_expanded_value_for_validation, evaluate_static_value_for_validation,

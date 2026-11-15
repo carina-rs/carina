@@ -669,8 +669,8 @@ fn project_expression_sink_type<'a>(
 }
 
 impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
-    pub fn in_session<E, D, K: crate::parser::BackendPhase>(
-        file: &'a crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    pub fn in_session<E, D>(
+        file: &'a crate::parser::retained::JudgedFile<'_, E, D, B>,
         session: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self
@@ -684,8 +684,8 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
         )
     }
 
-    pub fn new<E, D, K: crate::parser::BackendPhase>(
-        file: &'a crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    pub fn new<E, D>(
+        file: &'a crate::parser::retained::JudgedFile<'_, E, D, B>,
         provider_context: &'a LoadedProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self
@@ -702,8 +702,8 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
     /// Build the validation view used by bootstrap/editor callers that have
     /// an incomplete provider custom-type catalog. Structural checks and
     /// successfully loaded owners remain strict; unavailable owners defer.
-    pub fn new_providerless<E, D, K: crate::parser::BackendPhase>(
-        file: &'a crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    pub fn new_providerless<E, D>(
+        file: &'a crate::parser::retained::JudgedFile<'_, E, D, B>,
         provider_context: &'a ProviderContext,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self
@@ -717,8 +717,8 @@ impl<'a, B: BindingAddress> ValidationTypeContext<'a, B> {
         )
     }
 
-    fn with_provider_context<E, D, K: crate::parser::BackendPhase>(
-        judged: &'a crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    fn with_provider_context<E, D>(
+        judged: &'a crate::parser::retained::JudgedFile<'_, E, D, B>,
         provider_context: typecheck::TypecheckProviderContext<'a>,
         module_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     ) -> Self
@@ -1600,9 +1600,8 @@ fn resource_sink<
     E,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    file: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     address: &crate::parser::ResourceAddress,
     path: &crate::parser::AttributePath,
     schemas: &'a SchemaRegistry,
@@ -1648,8 +1647,8 @@ fn resource_sink<
     Some(sink)
 }
 
-fn module_argument_type<E, D, B: BindingAddress, K: crate::parser::BackendPhase>(
-    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+fn module_argument_type<E, D, B: BindingAddress>(
+    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     call_id: &crate::parser::ModuleCallId,
     argument: &str,
     signatures: &crate::module_resolver::ResolvedModuleSignatures,
@@ -1858,13 +1857,8 @@ fn same_authored_use(
 /// module argument. A direct bare binding is the complete argument. For a
 /// nested use, ordinary container validation remains active unless the typed
 /// authority produced the diagnostic for that leaf.
-pub fn binding_use_authority_owns_module_argument<
-    E,
-    D,
-    B: BindingAddress,
-    K: crate::parser::BackendPhase,
->(
-    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+pub fn binding_use_authority_owns_module_argument<E, D, B: BindingAddress>(
+    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     report: &BindingUseReport,
     call: &crate::parser::ModuleCallId,
     argument: &str,
@@ -1901,13 +1895,8 @@ pub fn binding_use_authority_owns_use(
 
 /// Whether parsing reserved this entire module argument because a structural
 /// leaf could not be represented in the runtime `Value` tree.
-pub fn module_argument_has_pending_binding_use<
-    E,
-    D,
-    B: BindingAddress,
-    K: crate::parser::BackendPhase,
->(
-    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+pub fn module_argument_has_pending_binding_use<E, D, B: BindingAddress>(
+    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     call: &crate::parser::ModuleCallId,
     argument: &str,
 ) -> bool {
@@ -1939,8 +1928,7 @@ impl<
     E,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
-> BindingUseInput<B> for crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>
+> BindingUseInput<B> for crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>
 {
     fn value_at_use(
         &self,
@@ -1994,8 +1982,8 @@ impl<
 /// Report-only schema-aware authority for every parser-recorded bare binding
 /// use. Editor and collect-all validation paths borrow the file through this
 /// function; they do not mint production readiness.
-fn check_bare_binding_uses_for_phase<E, B, D, F, K: crate::parser::BackendPhase>(
-    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+fn check_bare_binding_uses_for_phase<E, B, D, F>(
+    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: F,
 ) -> BindingUseReport
@@ -3371,8 +3359,8 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     unique
 }
 
-impl<D, B: BindingAddress, E, K: crate::parser::BackendPhase>
-    crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E, K>
+impl<D, B: BindingAddress, E>
+    crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
@@ -3472,9 +3460,8 @@ pub fn check_file_integer_arithmetic_values<
     B: BindingAddress,
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let parsed = judged.file();
@@ -3532,13 +3519,9 @@ pub fn check_file_integer_arithmetic_values<
         }
     }
     if let Some(backend) = &parsed.backend {
-        backend
-            .try_visit_values(&mut |value| {
-                check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)));
-
-                Ok::<(), std::convert::Infallible>(())
-            })
-            .unwrap_or_else(|never| match never {});
+        for value in backend.attributes.values() {
+            check(value, Some(RefSink::TypeExpr(&INT_REF_SINK)));
+        }
     }
     for state_block in &parsed.state_blocks {
         if let crate::parser::StateBlock::Import { id, .. } = state_block {
@@ -4315,16 +4298,8 @@ pub(crate) fn module_argument_reference_error(
 pub fn validate_user_function_ref_types_with_bindings<
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &crate::parser::File<
-        E,
-        ParserPlaceholder,
-        ParserPlaceholder,
-        D,
-        crate::resource::RelativeBindingName,
-        K,
-    >,
+    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
     bindings: &BindingIndex<'_>,
 ) -> Result<(), String> {
     validate_user_function_ref_types_inner(parsed, bindings, UnknownReferencePolicy::Report)
@@ -4722,15 +4697,8 @@ mod user_function_refs {
 ///     user_function_reference_diagnostics(file, bindings);
 /// }
 /// ```
-pub fn user_function_reference_diagnostics<K: crate::parser::BackendPhase>(
-    tree: &crate::parser::UnexpandedAnalysis<
-        '_,
-        crate::parser::ParsedExportParam<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
-        K,
-    >,
+pub fn user_function_reference_diagnostics(
+    tree: &crate::parser::AnalysisTree<'_>,
     bindings: &BindingIndex<'_>,
 ) -> Vec<crate::parser::Located<String>> {
     use user_function_refs::{FunctionRefFinding, check_function_calls, check_refs};
@@ -4778,16 +4746,8 @@ pub fn user_function_reference_diagnostics<K: crate::parser::BackendPhase>(
 fn validate_user_function_ref_types_inner<
     E: crate::parser::ExportParamLike,
     D: crate::parser::DeferredForPhaseTraversal,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &crate::parser::File<
-        E,
-        ParserPlaceholder,
-        ParserPlaceholder,
-        D,
-        crate::resource::RelativeBindingName,
-        K,
-    >,
+    parsed: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D>,
     bindings: &BindingIndex<'_>,
     unknown_policy: UnknownReferencePolicy,
 ) -> Result<(), String> {
@@ -4867,13 +4827,9 @@ fn validate_user_function_ref_types_inner<
         }
     }
     if let Some(backend) = &parsed.backend {
-        backend
-            .try_visit_values(&mut |value| {
-                check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
-
-                Ok::<(), std::convert::Infallible>(())
-            })
-            .unwrap_or_else(|never| match never {});
+        for value in backend.attributes.values() {
+            check_function_calls(value, None, None, bindings, unknown_policy, &mut errors);
+        }
     }
     for state_block in &parsed.state_blocks {
         if let crate::parser::StateBlock::Import { id, .. } = state_block {
@@ -5493,9 +5449,8 @@ pub fn validate_resources<
     T: crate::resource::PlaceholderKind,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
     B: BindingAddress,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &crate::parser::File<E, P, T, D, B, K>,
+    parsed: &crate::parser::File<E, P, T, D, B>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
@@ -5517,9 +5472,8 @@ fn validate_resources_from_report<
     T: PlaceholderKind,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
     B: BindingAddress,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &crate::parser::File<E, P, T, D, B, K>,
+    parsed: &crate::parser::File<E, P, T, D, B>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
@@ -5553,9 +5507,8 @@ fn resource_values_report<
     T: PlaceholderKind,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
     B: BindingAddress,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &crate::parser::File<E, P, T, D, B, K>,
+    parsed: &crate::parser::File<E, P, T, D, B>,
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
@@ -5569,11 +5522,11 @@ fn resource_values_report<
     // availability cannot be decided until its resources are expanded into a
     // root configuration. Keep every other schema/type check below active for
     // modules; only defer this provider-availability diagnostic.
-    match parsed.directory_verdict() {
-        crate::config_loader::DirectoryVerdict::Root(_)
-        | crate::config_loader::DirectoryVerdict::NoEvidence(_) => all_errors.extend(
-            group_anonymous_resource_schema_errors(parsed.iter_all_resources().filter_map(
-                |resource| match resource {
+    if parsed.arguments.is_empty() && parsed.attribute_params.is_empty() {
+        all_errors.extend(group_anonymous_resource_schema_errors(
+            parsed
+                .iter_all_resources()
+                .filter_map(|resource| match resource {
                     ResourceRef::Resource(resource) => {
                         anonymous_resource_schema_key(resource, registry, known_providers)
                     }
@@ -5583,11 +5536,8 @@ fn resource_values_report<
                         known_providers,
                     ),
                     ResourceRef::LiveComposition(_) | ResourceRef::DataSource(_) => None,
-                },
-            )),
-        ),
-        crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
-        | crate::config_loader::DirectoryVerdict::Unknown(_) => {}
+                }),
+        ));
     }
 
     // Classify per kind via the typed `ResourceRef` arms instead of
@@ -5684,9 +5634,8 @@ pub fn validate_resource_ref_types<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
@@ -5706,9 +5655,8 @@ pub fn resource_reference_findings<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<Vec<ResourceAdmissionFinding>, crate::parser::AnalysisTreeError> {
@@ -5733,9 +5681,8 @@ pub fn validate_resource_admissions<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
@@ -5754,9 +5701,8 @@ pub fn resource_admission_findings<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     known_providers: &HashSet<String>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
@@ -5813,8 +5759,8 @@ struct ResourceAdmissionReport {
 /// Recover the lexical type of a bare value that became an entire reference
 /// attribute during expansion. The runtime reference stays absolute; only its
 /// module-body type retains the declaration and the original source together.
-fn module_resource_ref_declaration<'a, E, D, B: BindingAddress, K: crate::parser::BackendPhase>(
-    parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
+    parsed: &'a crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     resource_id: &crate::resource::ResourceId,
     attribute: &str,
     value: &GenericValue<ParserPlaceholder, B>,
@@ -5864,9 +5810,8 @@ fn resource_admission_report<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    judged: &crate::parser::retained::JudgedFile<'_, E, D, B, K>,
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
@@ -6127,7 +6072,7 @@ pub fn validate_module_iteration_shape<P: PlaceholderKind, B: BindingAddress>(
 ///     validate_deferred_for_iterable_types(file, &SchemaRegistry::new(), context);
 /// }
 /// ```
-pub fn validate_deferred_for_iterable_types<D, B: BindingAddress, K: crate::parser::BackendPhase>(
+pub fn validate_deferred_for_iterable_types<D, B: BindingAddress>(
     tree: &crate::parser::AnalysisTree<
         '_,
         ParserPlaceholder,
@@ -6135,7 +6080,6 @@ pub fn validate_deferred_for_iterable_types<D, B: BindingAddress, K: crate::pars
         D,
         B,
         crate::parser::ParsedExportParam<ParserPlaceholder, B>,
-        K,
     >,
     schemas: &SchemaRegistry,
     provider_context: &ProviderContext,
@@ -6155,9 +6099,8 @@ fn validate_deferred_for_iterable_types_with_bindings<
     E,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E, K>,
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     _schemas: &SchemaRegistry,
     _bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
     provider_context: &ProviderContext,
@@ -6202,7 +6145,7 @@ fn validate_deferred_for_iterable_types_with_bindings<
 }
 
 /// Unknown roots in deferred iterables are owned by their authored occurrence.
-pub fn validate_for_iterable_bindings<D, B: BindingAddress, K: crate::parser::BackendPhase>(
+pub fn validate_for_iterable_bindings<D, B: BindingAddress>(
     tree: &crate::parser::AnalysisTree<
         '_,
         ParserPlaceholder,
@@ -6210,7 +6153,6 @@ pub fn validate_for_iterable_bindings<D, B: BindingAddress, K: crate::parser::Ba
         D,
         B,
         crate::parser::ParsedExportParam<ParserPlaceholder, B>,
-        K,
     >,
 ) -> Vec<crate::parser::Located<crate::parser::ParseError>>
 where
@@ -6661,7 +6603,7 @@ impl ExportBoundaryError {
         }
     }
 
-    pub fn diagnostic<'a, D, B: BindingAddress, K: crate::parser::BackendPhase>(
+    pub fn diagnostic<'a, D, B: BindingAddress>(
         &'a self,
         tree: &crate::parser::AnalysisTree<
             '_,
@@ -6670,7 +6612,6 @@ impl ExportBoundaryError {
             D,
             B,
             crate::parser::ParsedExportParam<ParserPlaceholder, B>,
-            K,
         >,
     ) -> crate::parser::Located<&'a Self>
     where
@@ -6987,9 +6928,8 @@ impl std::error::Error for ExpansionBoundaryReferenceErrors {}
 
 pub(crate) fn validate_expansion_boundary_ref_types_with_bindings<
     E: crate::parser::ExportParamLike,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &crate::parser::UnexpandedFile<E, K>,
+    parsed: &crate::parser::File<E>,
     imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
     bindings: &BindingIndex<'_>,
 ) -> Result<(), ExpansionBoundaryReferenceErrors> {
@@ -7124,8 +7064,8 @@ fn is_string_compatible_type_on_path<'a>(
 /// root-only constructs and unambiguously identify a root configuration.
 /// Block presence, including empty arguments/attributes, uses the same
 /// declaration classification as require admission.
-pub fn validate_no_module_declarations_in_root<E, K: crate::parser::BackendPhase>(
-    parsed: &crate::parser::UnexpandedFile<E, K>,
+pub fn validate_no_module_declarations_in_root<E>(
+    parsed: &crate::parser::File<E>,
 ) -> Result<(), crate::parser::Located<ConfigurationPlacementDiagnostic>> {
     match placement_diagnostics_for_inventory(parsed.parser_binding_metadata.syntax())
         .into_iter()
@@ -7703,9 +7643,8 @@ fn resolve_file_type_exprs_impl<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<
     (
@@ -7728,9 +7667,8 @@ fn resolve_file_type_exprs_with_annotations<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     annotations: &[crate::parser::Located<TypeResolutionContext>],
 ) -> (
@@ -7892,9 +7830,8 @@ pub fn resolve_file_type_exprs<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Vec<crate::parser::Located<TypeResolutionDiagnostic>>, crate::parser::AnalysisTreeError>
 {
@@ -7916,9 +7853,8 @@ pub fn resolve_file_type_exprs_report<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     parser_error: Option<TypeResolutionParserError<'_>>,
 ) -> Result<FileTypeResolutionReport, crate::parser::AnalysisTreeError> {
@@ -7945,13 +7881,12 @@ pub fn resolve_file_type_exprs_from_analysis<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B> + Clone,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B> + Clone,
-    K: crate::parser::BackendPhase,
 >(
-    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E, K>,
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     parser_error: Option<TypeResolutionParserError<'_>>,
 ) -> (
-    crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     FileTypeResolutionReport,
 ) {
     let mut parsed = tree.file().clone();
@@ -8037,9 +7972,8 @@ pub fn resolve_file_type_exprs_best_effort<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    parsed: &mut crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), crate::parser::AnalysisTreeError> {
     resolve_file_type_exprs_impl(parsed, config)?;
@@ -8120,9 +8054,8 @@ pub fn configuration_placement_diagnostics<
     B: BindingAddress,
     E: crate::parser::ExportParamLike<P, B>,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
-    K: crate::parser::BackendPhase,
 >(
-    tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E, K>,
+    tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
 ) -> Vec<crate::parser::Located<ConfigurationPlacementDiagnostic>> {
     placement_diagnostics_for_inventory(tree.syntax())
 }
@@ -9063,10 +8996,9 @@ pub struct ModuleCallCheckInput<
     'bindings,
     E,
     C: ?Sized = dyn deferred_types::ProviderTypeCheckContext + 'a,
-    K: crate::parser::BackendPhase = crate::parser::StrictBackend,
 > {
-    pub authored: &'a crate::parser::UnexpandedFile<E, K>,
-    pub semantic: Option<&'a crate::parser::UnexpandedFile<E, K>>,
+    pub authored: &'a crate::parser::File<E>,
+    pub semantic: Option<&'a crate::parser::File<E>>,
     pub base_dir: Option<&'a crate::paths::ResolvedPath>,
     pub imported_signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     pub provider_context: &'a C,
@@ -9101,13 +9033,8 @@ struct ModuleCallChecker<'a> {
     module_cache: std::collections::HashMap<crate::paths::CanonicalPath, crate::parser::ParsedFile>,
 }
 
-struct ModuleFileCheckContext<
-    'a,
-    'bindings,
-    E,
-    K: crate::parser::BackendPhase = crate::parser::StrictBackend,
-> {
-    semantic: Option<&'a crate::parser::UnexpandedFile<E, K>>,
+struct ModuleFileCheckContext<'a, 'bindings, E> {
+    semantic: Option<&'a crate::parser::File<E>>,
     base_dir: Option<&'a crate::paths::ResolvedPath>,
     signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     binding_use_report: &'a BindingUseReport,
@@ -9116,28 +9043,18 @@ struct ModuleFileCheckContext<
     reference_checks: ModuleCallReferenceChecks,
 }
 
-struct ModuleBoundaryCheckContext<
-    'a,
-    'bindings,
-    E,
-    K: crate::parser::BackendPhase = crate::parser::StrictBackend,
-> {
+struct ModuleBoundaryCheckContext<'a, 'bindings, E> {
     semantic_call: Option<&'a ModuleCall>,
-    authority_file: &'a crate::parser::UnexpandedFile<E, K>,
+    authority_file: &'a crate::parser::File<E>,
     signature: &'a crate::module_resolver::ResolvedModuleSignature,
     binding_use_report: &'a BindingUseReport,
     bindings: &'a BindingIndex<'bindings>,
     owner: ModuleCallFindingOwner,
 }
 
-struct ModuleReferenceCheckContext<
-    'a,
-    'bindings,
-    E,
-    K: crate::parser::BackendPhase = crate::parser::StrictBackend,
-> {
+struct ModuleReferenceCheckContext<'a, 'bindings, E> {
     semantic_call: Option<&'a ModuleCall>,
-    authority_file: &'a crate::parser::UnexpandedFile<E, K>,
+    authority_file: &'a crate::parser::File<E>,
     signatures: &'a crate::module_resolver::ResolvedModuleSignatures,
     binding_use_report: &'a BindingUseReport,
     bindings: &'a BindingIndex<'bindings>,
@@ -9177,10 +9094,10 @@ impl ModuleCallChecker<'_> {
         });
     }
 
-    fn check_file<E, K: crate::parser::BackendPhase>(
+    fn check_file<E>(
         &mut self,
-        authored: &crate::parser::UnexpandedFile<E, K>,
-        context: ModuleFileCheckContext<'_, '_, E, K>,
+        authored: &crate::parser::File<E>,
+        context: ModuleFileCheckContext<'_, '_, E>,
     ) -> Result<(), crate::parser::AnalysisTreeError> {
         let ModuleFileCheckContext {
             semantic,
@@ -9313,10 +9230,10 @@ impl ModuleCallChecker<'_> {
         ));
     }
 
-    fn check_call<E, K: crate::parser::BackendPhase>(
+    fn check_call<E>(
         &mut self,
         authored_call: &ModuleCall,
-        context: ModuleBoundaryCheckContext<'_, '_, E, K>,
+        context: ModuleBoundaryCheckContext<'_, '_, E>,
     ) {
         let ModuleBoundaryCheckContext {
             semantic_call,
@@ -9574,10 +9491,10 @@ impl ModuleCallChecker<'_> {
         }
     }
 
-    fn check_reference_types<E, K: crate::parser::BackendPhase>(
+    fn check_reference_types<E>(
         &mut self,
         authored_call: &ModuleCall,
-        context: ModuleReferenceCheckContext<'_, '_, E, K>,
+        context: ModuleReferenceCheckContext<'_, '_, E>,
     ) {
         let ModuleReferenceCheckContext {
             semantic_call,
@@ -9641,9 +9558,9 @@ impl ModuleCallChecker<'_> {
         }
     }
 
-    fn check_nested_module<E, K: crate::parser::BackendPhase>(
+    fn check_nested_module<E>(
         &mut self,
-        file: &crate::parser::UnexpandedFile<E, K>,
+        file: &crate::parser::File<E>,
         call: &ModuleCall,
         base_dir: Option<&crate::paths::ResolvedPath>,
         root_owner: &ModuleCallFindingOwnerSource,
@@ -10113,8 +10030,8 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
 }
 
 /// Collect module-call findings from authored source and its imported graph.
-pub fn check_module_calls<E, K: crate::parser::BackendPhase>(
-    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_, K>,
+pub fn check_module_calls<E>(
+    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
 ) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     check_module_calls_with_overrides(input, &Default::default())
 }
@@ -10128,15 +10045,8 @@ pub fn check_module_calls<E, K: crate::parser::BackendPhase>(
 ///     check_module_calls_from_analysis(file, base, context, schemas, exports, overrides);
 /// }
 /// ```
-pub fn check_module_calls_from_analysis<K: crate::parser::BackendPhase>(
-    tree: &crate::parser::UnexpandedAnalysis<
-        '_,
-        crate::parser::ParsedExportParam<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
-        K,
-    >,
+pub fn check_module_calls_from_analysis(
+    tree: &crate::parser::AnalysisTree<'_>,
     base: &crate::paths::ResolvedPath,
     provider_context: &dyn deferred_types::ProviderTypeCheckContext,
     schemas: &SchemaRegistry,
@@ -10180,8 +10090,8 @@ pub fn check_module_calls_from_analysis<K: crate::parser::BackendPhase>(
     )
 }
 
-pub fn check_module_calls_with_overrides<E, K: crate::parser::BackendPhase>(
-    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_, K>,
+pub fn check_module_calls_with_overrides<E>(
+    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
@@ -10191,21 +10101,15 @@ pub fn check_module_calls_with_overrides<E, K: crate::parser::BackendPhase>(
 /// Providerless module-call diagnostics for bootstrap and orphan-editor
 /// contexts. Structural checks still run, while provider-owned leaves are not
 /// sent to an unloaded resolver.
-pub fn check_module_calls_providerless<E, K: crate::parser::BackendPhase>(
-    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_, K>,
+pub fn check_module_calls_providerless<E>(
+    input: ModuleCallCheckInput<'_, '_, E, dyn deferred_types::ProviderTypeCheckContext + '_>,
 ) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
     let provider_context = typecheck::TypecheckProviderContext::for_session(input.provider_context);
     check_module_calls_with_provider_context(input, provider_context, &Default::default())
 }
 
-fn check_module_calls_with_provider_context<
-    'a,
-    'bindings,
-    E,
-    C: ?Sized,
-    K: crate::parser::BackendPhase,
->(
-    input: ModuleCallCheckInput<'a, 'bindings, E, C, K>,
+fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
+    input: ModuleCallCheckInput<'a, 'bindings, E, C>,
     provider_context: typecheck::TypecheckProviderContext<'a>,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Result<Vec<ModuleCallFinding>, crate::parser::AnalysisTreeError> {
@@ -10725,14 +10629,13 @@ fn check_unused_bindings_in_resolved_file(
     check_unused_bindings_in_file_parts(parsed, resources, deferred_sites)
 }
 
-fn check_unused_bindings_in_file_parts<'a, B, D, K: crate::parser::BackendPhase>(
+fn check_unused_bindings_in_file_parts<'a, B, D>(
     parsed: &'a crate::parser::File<
         crate::parser::ParsedExportParam<ParserPlaceholder, B>,
         ParserPlaceholder,
         ParserPlaceholder,
         D,
         B,
-        K,
     >,
     resources: Vec<
         ResourceRef<'a, crate::resource::ModuleSource, ParserPlaceholder, ParserPlaceholder, D, B>,
@@ -10909,8 +10812,8 @@ pub fn unused_binding_findings(
 
 /// Attach unused authored names to the declaration inventory. Generated loop
 /// members have no separate name declaration and receive no independent warning.
-pub fn locate_unused_bindings<D, B: BindingAddress, E, K: crate::parser::BackendPhase>(
-    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E, K>,
+pub fn locate_unused_bindings<D, B: BindingAddress, E>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     names: impl IntoIterator<Item = String>,
 ) -> Vec<crate::parser::Located<String>>
 where

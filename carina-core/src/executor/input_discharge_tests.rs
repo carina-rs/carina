@@ -304,7 +304,7 @@ async fn round2_initial_create_after_normalization(
 ) -> Result<Option<crate::replacement::CreatePermit>, ProviderPreparationError> {
     let admission_schemas = schemas(InputRuleScope::CreateOnly);
     let resource = Resource::new("test", "consumer").with_attribute("name", string("valid-name"));
-    let mut parsed: crate::parser::ExpandedInferredFile = Default::default();
+    let mut parsed = crate::parser::ExpandedInferredFile::default();
     parsed.resources.push(resource.clone()); // allow: direct — fixture test inspection
     let graph = crate::resolved_graph::resolve_expanded_graph(parsed.into()).unwrap();
     let checked = graph

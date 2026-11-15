@@ -132,8 +132,8 @@ impl BackendConfigError {
     }
 }
 
-impl<P: PlaceholderKind, T: ValueKind, D, B: BindingAddress, E, K: parser::BackendAdmissionPhase>
-    parser::AnalysisTree<'_, P, T, D, B, E, K>
+impl<P: PlaceholderKind, T: ValueKind, D, B: BindingAddress, E>
+    parser::AnalysisTree<'_, P, T, D, B, E>
 where
     D: parser::DeferredForPhaseTraversal<P, T, B>,
 {
@@ -142,28 +142,18 @@ where
         &self,
     ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<LocatedBackendError>>>
     {
-        let admitted =
-            admit_directory_backend(self.directory_verdict(), self.file().backend.as_ref())?;
-        Some(admitted.map_err(|error| {
+        if !self.file().arguments.is_empty() || !self.file().attribute_params.is_empty() {
+            return None;
+        }
+        let backend = self.file().backend.as_ref()?;
+        Some(admit(backend).map_err(|error| {
             error
                 .into_unlocated()
                 .into_iter()
                 .map(|error| match error {
                     UnlocatedBackendError::Attribute(error) => {
                         LocatedBackendError::Attribute(parser::Located::new(
-                            match &error {
-                                BackendAttributeError::EvaluationFailed {
-                                    error: cause, ..
-                                } => cause.element_diagnostic().map_or_else(
-                                    || self.backend_attribute_location(error.attribute()).clone(),
-                                    |finding| finding.location().clone(),
-                                ),
-                                BackendAttributeError::UnknownAttribute { .. }
-                                | BackendAttributeError::MissingRequiredAttribute { .. }
-                                | BackendAttributeError::InvalidAttribute { .. } => {
-                                    self.backend_attribute_location(error.attribute()).clone()
-                                }
-                            },
+                            self.backend_attribute_location(error.attribute()).clone(),
                             error,
                         ))
                     }
@@ -178,44 +168,6 @@ where
                 })
                 .collect()
         }))
-    }
-}
-
-/// Ownership and failed-value admission are shared by both source projections.
-fn admit_directory_backend<
-    U,
-    T,
-    N,
-    P: PlaceholderKind,
-    B: BindingAddress,
-    K: parser::BackendAdmissionPhase,
->(
-    verdict: &crate::config_loader::DirectoryVerdict<U, T, N>,
-    backend: Option<&parser::BackendConfig<P, B, K>>,
-) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError>> {
-    match verdict {
-        crate::config_loader::DirectoryVerdict::Root(root) if root.has_sole_backend() => {}
-        crate::config_loader::DirectoryVerdict::Root(_)
-        | crate::config_loader::DirectoryVerdict::ModuleTemplate(_)
-        | crate::config_loader::DirectoryVerdict::NoEvidence(_)
-        | crate::config_loader::DirectoryVerdict::Unknown(_) => return None,
-    }
-    let backend = backend?;
-    match check(backend) {
-        Ok(CheckedBackend::Ready(builder)) => Some(Ok(builder.admit_payload())),
-        Ok(CheckedBackend::Deferred(_)) => None,
-        Err(error) => Some(Err(error)),
-    }
-}
-
-impl<E, K: parser::BackendAdmissionPhase> crate::config_loader::RootDirectoryParse<E, K> {
-    /// Preserve backend admission when an authored tree cannot seal.
-    pub fn admit_backend_unlocated(
-        &self,
-    ) -> Option<Result<AdmittedConfiguration<kind::BackendAttribute>, Vec<UnlocatedBackendError>>>
-    {
-        admit_directory_backend(&self.complete_directory_verdict(), self.backend.as_ref())
-            .map(|result| result.map_err(BackendConfigError::into_unlocated))
     }
 }
 
@@ -258,24 +210,9 @@ impl fmt::Display for BackendConfigErrors {
 
 impl std::error::Error for BackendConfigErrors {}
 
-fn evaluation_failure_detail(error: &parser::ParseError) -> &parser::ParseError {
-    match error {
-        parser::ParseError::AtElement(finding) => evaluation_failure_detail(finding.detail()),
-        parser::ParseError::Located { error, .. } => evaluation_failure_detail(error),
-        error => error,
-    }
-}
-
 /// One schema failure associated with a backend attribute.
 #[derive(Debug, Error)]
 pub enum BackendAttributeError {
-    #[error("{}", evaluation_failure_detail(error))]
-    EvaluationFailed {
-        backend_type: String,
-        attribute: crate::parser::AttributeKey,
-        #[source]
-        error: Arc<crate::parser::ParseError>,
-    },
     #[error("Unknown attribute '{attribute}' for backend type '{backend_type}'")]
     UnknownAttribute {
         backend_type: String,
@@ -297,8 +234,7 @@ pub enum BackendAttributeError {
 impl BackendAttributeError {
     pub fn attribute(&self) -> &crate::parser::AttributeKey {
         match self {
-            Self::EvaluationFailed { attribute, .. }
-            | Self::UnknownAttribute { attribute, .. }
+            Self::UnknownAttribute { attribute, .. }
             | Self::MissingRequiredAttribute { attribute, .. }
             | Self::InvalidAttribute { attribute, .. } => attribute,
         }
@@ -306,7 +242,6 @@ impl BackendAttributeError {
 
     fn sort_rank(&self) -> u8 {
         match self {
-            Self::EvaluationFailed { .. } => 3,
             Self::UnknownAttribute { .. } => 0,
             Self::MissingRequiredAttribute { .. } => 1,
             Self::InvalidAttribute { .. } => 2,
@@ -400,7 +335,7 @@ impl AdmittedConfiguration<kind::BackendAttribute> {
 ///
 /// ```
 /// use carina_core::{parser::BackendConfig, validation::admission::configuration::backend};
-/// let raw = BackendConfig::<carina_core::resource::NoPlaceholder> { backend_type: "local".into(), attributes: Default::default(), attribute_spans: Default::default(), source: () };
+/// let raw = BackendConfig::<carina_core::resource::NoPlaceholder> { backend_type: "local".into(), attributes: Default::default(), attribute_spans: Default::default() };
 /// let admitted = backend::admit(&raw).unwrap();
 /// assert!(admitted.attributes().is_empty());
 /// ```
@@ -415,23 +350,9 @@ impl AdmittedConfiguration<kind::BackendAttribute> {
 /// # fn replace(config: &mut AdmittedConfiguration<BackendAttribute>) {
 /// # }
 /// ```
-pub fn admit<P: PlaceholderKind, B: BindingAddress, K: parser::BackendAdmissionPhase>(
-    config: &parser::BackendConfig<P, B, K>,
+pub fn admit<P: PlaceholderKind, B: BindingAddress>(
+    config: &parser::BackendConfig<P, B>,
 ) -> Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError> {
-    match check(config)? {
-        CheckedBackend::Ready(builder) => Ok(builder.admit_payload()),
-        CheckedBackend::Deferred(errors) => Err(BackendConfigErrors::new(errors).into()),
-    }
-}
-
-enum CheckedBackend {
-    Ready(ConfigurationBuilder<kind::BackendAttribute>),
-    Deferred(Vec<BackendAttributeError>),
-}
-
-fn check<P: PlaceholderKind, B: BindingAddress, K: parser::BackendAdmissionPhase>(
-    config: &parser::BackendConfig<P, B, K>,
-) -> Result<CheckedBackend, BackendConfigError> {
     let kind = match config.backend_type.as_str() {
         "s3" => BackendKind::S3,
         "local" => BackendKind::Local,
@@ -445,7 +366,6 @@ fn check<P: PlaceholderKind, B: BindingAddress, K: parser::BackendAdmissionPhase
     let backend = kind.declaration();
     let declaration = &backend.configuration;
     let mut errors = Vec::new();
-    let mut pending = Vec::new();
     for attribute in &backend.required {
         if !config.attributes.contains_key(*attribute) {
             errors.push(BackendAttributeError::MissingRequiredAttribute {
@@ -459,40 +379,17 @@ fn check<P: PlaceholderKind, B: BindingAddress, K: parser::BackendAdmissionPhase
     let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |_| {
         let mut aggregate = ConfigurationBuilder::new(Arc::clone(declaration), kind);
         for (key, value) in &config.attributes {
-            let destination = declaration.destination::<kind::BackendAttribute>(
+            let Some(destination) = declaration.destination::<kind::BackendAttribute>(
                 key,
                 InstanceIdentity::Backend(kind),
                 CatalogRevision(CatalogSnapshot::Backend(declaration.identity)),
-            );
-            if destination.is_none() {
+            ) else {
                 errors.push(BackendAttributeError::UnknownAttribute {
                     backend_type: kind.name().into(),
                     attribute: key.clone(),
                 });
-            }
-            let value = match K::admission_input(value) {
-                parser::BackendAdmissionInput::Evaluated(value) => value,
-                parser::BackendAdmissionInput::Failed(error) => {
-                    errors.push(BackendAttributeError::EvaluationFailed {
-                        backend_type: kind.name().into(),
-                        attribute: key.clone(),
-                        error: Arc::clone(error),
-                    });
-                    continue;
-                }
-            };
-            let Some(destination) = destination else {
                 continue;
             };
-            if matches!(
-                value,
-                Value::Deferred(crate::resource::DeferredValue::Unknown(
-                    crate::resource::ApplyTimeUnknown::IncompleteBackendScope
-                ))
-            ) {
-                pending.push(invalid_shape(kind, key, destination.contract.attr(), value));
-                continue;
-            }
             let ty = destination.contract.attr();
             // The enum's actual namespace is intentional: backend regions do
             // not use provider-block aliases or depend on provider loading.
@@ -554,11 +451,7 @@ fn check<P: PlaceholderKind, B: BindingAddress, K: parser::BackendAdmissionPhase
     if !errors.is_empty() {
         return Err(BackendConfigErrors::new(errors).into());
     }
-    if pending.is_empty() {
-        Ok(CheckedBackend::Ready(aggregate))
-    } else {
-        Ok(CheckedBackend::Deferred(pending))
-    }
+    Ok(aggregate.admit_payload())
 }
 
 #[cfg(test)]

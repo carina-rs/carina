@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_47_for_backend_phases_and_upstream_callers() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 47);
+fn saved_plan_version_is_46_for_ordered_dependents() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 46);
 }
 
 #[test]
@@ -316,7 +316,7 @@ fn fixture_unchecked_export_static_type() -> carina_core::static_type::ExportSta
 fn saved_provider_configs(
     configs: Vec<ExpandedProviderConfig>,
 ) -> carina_core::parser::SavedProviderConfigs {
-    let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
     let resolved = carina_core::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
@@ -965,7 +965,6 @@ fn plan_file_serde_round_trip() {
                 binding: None,
             }]),
             backend_config: Some(BackendConfig {
-                source: (),
                 backend_type: "s3".to_string(),
                 attributes: (HashMap::<String, _>::from([
                     (
@@ -977,8 +976,7 @@ fn plan_file_serde_round_trip() {
                         Value::Concrete(ConcreteValue::String("prod/carina.state".into())),
                     ),
                 ]))
-                .into_iter()
-                .collect(),
+                .into(),
                 attribute_spans: Default::default(),
             })
             .into(),
@@ -1594,7 +1592,7 @@ fn test_anonymous_id_named_resources_are_skipped() {
 
 #[test]
 fn test_find_state_bucket_resource_matching_type() {
-    let mut parsed: ParsedFile = Default::default();
+    let mut parsed = ParsedFile::default();
     parsed.resources = vec![
         Resource::with_provider("aws", "s3.Bucket", "my-bucket", None).with_attribute(
             "bucket",
@@ -2883,7 +2881,7 @@ async fn state_refresh_locked_reconciles_deposed_generation_deleted_externally()
         .expect("test state setup must be valid");
 
     let backend = RefreshTestBackend::new(state);
-    let parsed: carina_core::parser::InferredFile = Default::default();
+    let parsed = carina_core::parser::InferredFile::default();
     let lock = LockInfo::for_test("state-refresh");
     let providers = ProviderLoad::load(
         &user_dirs,
@@ -2960,7 +2958,7 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
         .expect("test state setup must be valid");
 
     let backend = RefreshTestBackend::new(state);
-    let parsed: carina_core::parser::InferredFile = Default::default();
+    let parsed = carina_core::parser::InferredFile::default();
     let lock = LockInfo::for_test("state-refresh");
     let providers = ProviderLoad::load(
         &runtime,

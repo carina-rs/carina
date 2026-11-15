@@ -1118,11 +1118,10 @@ pub(crate) fn construct_builtin_call(
         .map_err(|error| builtin.protect_parse_error(error, line))?;
     builtin
         .call(args, line.into(), |value| {
-            if !ctx.backend_operands_are_retained()
-                && value
-                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
+            if value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
             {
                 // Normalize successful authored inputs here. A failed static
                 // evaluation stays deferred so the normal strict/permissive
@@ -1526,7 +1525,7 @@ pub(crate) fn apply_parser_closure(
     let mut all_args = captured_args.to_vec();
     all_args.extend(new_args.iter().cloned());
     reject_builtin_handle_arguments(&all_args, line)?;
-    if !ctx.backend_operands_are_retained() && all_args.iter().all(is_static_eval) {
+    if all_args.iter().all(is_static_eval) {
         return crate::builtins::apply_closure_with_config(
             name,
             captured_args,

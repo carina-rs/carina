@@ -1000,11 +1000,6 @@ mod tests {
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let raw = carina_core::validation::deferred_types::with_session_for_test(
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            |session| carina_core::parser::evaluate_backend_for_test(raw, session),
-        )
-        .unwrap();
         let config_error = BackendConfig::try_from(raw.backend.as_ref().unwrap()).unwrap_err();
         let expected = config_error.to_string();
 
@@ -1043,7 +1038,6 @@ mod tests {
 
         let provider_context: carina_core::parser::BackendConfig =
             carina_core::parser::BackendConfig {
-                source: (),
                 backend_type: "s3".to_string(),
                 attributes: [
                     (

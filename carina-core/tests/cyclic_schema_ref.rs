@@ -37,7 +37,7 @@ use carina_core::schema::{
 use carina_core::value::CanonicalState;
 
 fn resolve_resource(resource: Resource, registry: &SchemaRegistry) -> ResolvedResource {
-    let parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+    let parsed = carina_core::parser::ExpandedParsedFile::default();
     let graph = carina_core::resolved_graph::resolve_expanded_graph({
         let mut configuration = parsed;
         configuration.resources = (std::slice::from_ref(&resource)).to_vec();

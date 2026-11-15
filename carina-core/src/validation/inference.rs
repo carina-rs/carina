@@ -87,8 +87,8 @@ pub type InferenceBindings<P = NoPlaceholder, B = RelativeBindingName> =
 /// Build an [`InferenceBindings`] map from a `ParsedFile`. Convenience
 /// over [`bindings_from_parts`] for the common case of having a parsed
 /// file in hand.
-pub fn bindings_from_parsed<E, P, T, D, B, K: crate::parser::BackendPhase>(
-    parsed: &crate::parser::File<E, P, T, D, B, K>,
+pub fn bindings_from_parsed<E, P, T, D, B>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
 ) -> InferenceBindings<P, B>
 where
     P: PlaceholderKind + PartialEq,
@@ -1123,14 +1123,13 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
 
 /// Phase transition (#2360 stage 2): attach declared/inferred origin and any
 /// typed unchecked reason to every export.
-pub fn apply_inference<D, B: BindingAddress, K: crate::parser::BackendPhase>(
+pub fn apply_inference<D, B: BindingAddress>(
     parsed: crate::parser::File<
         crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
         D,
         B,
-        K,
     >,
     schemas: &SchemaRegistry,
     provider_context: &crate::parser::ProviderContext,
@@ -1140,7 +1139,6 @@ pub fn apply_inference<D, B: BindingAddress, K: crate::parser::BackendPhase>(
     crate::resource::ParserPlaceholder,
     D,
     B,
-    K,
 >
 where
     D: crate::parser::DeferredForPhaseTraversal<
@@ -1179,13 +1177,12 @@ impl<B: BindingAddress> SchemaCheckedExportParams<B> {
 }
 
 /// Infer export types from a schema-judged configuration without cloning its file.
-pub fn infer_export_params<D, B: BindingAddress, K: crate::parser::BackendPhase>(
+pub fn infer_export_params<D, B: BindingAddress>(
     judged: &crate::parser::retained::JudgedFile<
         '_,
         crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
         D,
         B,
-        K,
     >,
 ) -> SchemaCheckedExportParams<B>
 where
@@ -1296,11 +1293,7 @@ impl<B: BindingAddress> ExportParamsInferredWithLoadedProviderSchemas<B> {
 ///     infer_export_params_with_loaded_provider_schemas(file, schemas, context);
 /// }
 /// ```
-pub fn infer_export_params_with_loaded_provider_schemas<
-    D,
-    B: BindingAddress,
-    K: crate::parser::BackendPhase,
->(
+pub fn infer_export_params_with_loaded_provider_schemas<D, B: BindingAddress>(
     tree: &crate::parser::AnalysisTree<
         '_,
         crate::resource::ParserPlaceholder,
@@ -1308,7 +1301,6 @@ pub fn infer_export_params_with_loaded_provider_schemas<
         D,
         B,
         crate::parser::ParsedExportParam<crate::resource::ParserPlaceholder, B>,
-        K,
     >,
     schemas: &ProviderLoadedSchemaRegistry,
     provider_context: &crate::parser::ProviderContext,
@@ -1375,14 +1367,13 @@ pub fn attached_inference_failures<'a, B: BindingAddress>(
 /// Retry inferred exports whose original reason was not having enough schema
 /// authority. A newly reportable failure replaces that reason; successful or
 /// still-deferred probes retain the original provenance.
-pub fn retry_unchecked_export_inference<'a, D, B: BindingAddress, K: crate::parser::BackendPhase>(
+pub fn retry_unchecked_export_inference<'a, D, B: BindingAddress>(
     parsed: &'a mut crate::parser::File<
         crate::parser::InferredExportParam<crate::resource::ParserPlaceholder, B>,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
         D,
         B,
-        K,
     >,
     schemas: &ProviderLoadedSchemaRegistry,
     provider_context: &crate::parser::ProviderContext,

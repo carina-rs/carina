@@ -167,7 +167,6 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     pub(super) binding_scope: BindingScopeId,
     binding_scope_source_file: std::path::PathBuf,
     diagnostic_source: Source,
-    retain_backend_operands: bool,
     authored_nodes: Arc<super::retained::CapturedNodes>,
     next_binding_scope: Rc<Cell<u64>>,
     /// The exact preprocessing map for the file whose pest pairs are being
@@ -476,19 +475,11 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
             binding_scope: BindingScopeId::root(&source_file),
             binding_scope_source_file: source_file,
             diagnostic_source,
-            retain_backend_operands: false,
             authored_nodes: Arc::default(),
             next_binding_scope: Rc::new(Cell::new(1)),
             source_position_map: None,
             evaluation_scopes: Default::default(),
         }
-    }
-
-    pub(super) fn retain_backend_operands(&mut self) {
-        self.retain_backend_operands = true;
-    }
-    pub(super) fn backend_operands_are_retained(&self) -> bool {
-        self.retain_backend_operands
     }
 
     pub(super) fn child_scope(&self) -> Self {
@@ -1100,20 +1091,4 @@ pub(crate) fn first_inner<'a>(
             expected: expected.to_string(),
             context: context.to_string(),
         })
-}
-
-impl ParseContext<'_, AuthoredDiagnosticSource> {
-    pub(super) fn backend_expression(
-        &self,
-        pair: &pest::iterators::Pair<'_, Rule>,
-        location: super::DeclarationLocation,
-    ) -> super::BackendExpression {
-        super::BackendExpression {
-            file: Arc::clone(&self.diagnostic_source.file),
-            location,
-            nodes: Arc::clone(&self.authored_nodes),
-            start: pair.as_span().start(),
-            end: pair.as_span().end(),
-        }
-    }
 }

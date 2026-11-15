@@ -40,7 +40,7 @@ type ExpandedConcreteValue = ConcreteValue<ParserPlaceholder, AbsoluteBindingAdd
 type ExpandedDeferredValue = DeferredValue<ParserPlaceholder, AbsoluteBindingAddress>;
 
 fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
-    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(<ParsedFile>::default())
+    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(ParsedFile::default())
         .module_resolution_context()
 }
 
@@ -236,8 +236,6 @@ fn resolve_modules(
         |session| {
             super::resolve_modules_providerless(
                 crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                    .evaluate_backend_in_session(session)
-                    .unwrap()
                     .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(base_dir).unwrap(),
             )
@@ -346,8 +344,6 @@ fn resolve_modules_with_config(
     crate::validation::deferred_types::with_session_for_test(config, |session| {
         super::resolve_modules_with_providerless_config(
             crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed)
-                .evaluate_backend_in_session(session)
-                .unwrap()
                 .admit(schemas, session),
             &crate::paths::ResolvedPath::new(base_dir).unwrap(),
         )
@@ -456,8 +452,6 @@ impl ModuleResolutionFixture {
                 crate::config_loader::ParsedRootDirectory::from_parsed_source_for_test(
                     parsed, &caller,
                 )
-                .evaluate_backend_in_session(session)
-                .unwrap()
                 .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(
                     caller_file.parent().expect("caller file has a directory"),
@@ -4055,9 +4049,8 @@ fn role_names<
     T: crate::resource::PlaceholderKind,
     D,
     B: crate::resource::BindingAddress,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &crate::parser::File<E, P, T, D, B, K>,
+    parsed: &crate::parser::File<E, P, T, D, B>,
 ) -> HashSet<String> {
     parsed
         .resources
@@ -4210,7 +4203,7 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
             );
             let mut module: ParsedFile = ParsedFile {
                 resources: vec![origin, dependent],
-                ..<ParsedFile>::default()
+                ..ParsedFile::default()
             };
             crate::parser::resolve_resource_refs_defer_unknown_functions(
                 &mut module,
@@ -10003,8 +9996,6 @@ let second = for item in secnd_items {
                     parsed,
                     fixture_source,
                 )
-                .evaluate_backend_in_session(session)
-                .unwrap()
                 .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )

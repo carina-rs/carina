@@ -28,7 +28,7 @@ use crate::backend::{LOCAL_BACKEND_TYPE, S3_BACKEND_TYPE};
 /// use carina_core::{parser::BackendConfig as Raw, resource::NoPlaceholder,
 ///     validation::admission::configuration::backend};
 /// use carina_state::BackendConfig;
-/// let raw = Raw::<NoPlaceholder> { backend_type: "local".into(), attributes: Default::default(), attribute_spans: Default::default(), source: () };
+/// let raw = Raw::<NoPlaceholder> { backend_type: "local".into(), attributes: Default::default(), attribute_spans: Default::default() };
 /// let checked = BackendConfig::from(backend::admit(&raw).unwrap());
 /// assert!(matches!(checked, BackendConfig::Local(_)));
 /// ```
@@ -84,7 +84,6 @@ pub enum BackendConfig {
 impl BackendConfig {
     pub(crate) fn implicit_local() -> LocalBackendSettings {
         let raw = parser::BackendConfig::<NoPlaceholder> {
-            source: (),
             backend_type: LOCAL_BACKEND_TYPE.into(),
             attributes: Default::default(),
             attribute_spans: Default::default(),
@@ -138,9 +137,8 @@ impl BackendConfig {
                     );
                 }
                 parser::BackendConfig {
-                    source: (),
                     backend_type: S3_BACKEND_TYPE.to_string(),
-                    attributes: attributes.into_iter().collect(),
+                    attributes: attributes.into(),
                     attribute_spans: Default::default(),
                 }
             }
@@ -152,7 +150,6 @@ impl BackendConfig {
                     )
                 });
                 parser::BackendConfig {
-                    source: (),
                     backend_type: LOCAL_BACKEND_TYPE.to_string(),
                     attributes: attributes.collect(),
                     attribute_spans: Default::default(),
@@ -191,7 +188,6 @@ pub struct S3BackendSettings {
 impl S3BackendSettings {
     pub(crate) fn from_url_parts(bucket: String, key: String) -> Result<Self, BackendConfigError> {
         let raw = parser::BackendConfig::<NoPlaceholder> {
-            source: (),
             backend_type: S3_BACKEND_TYPE.into(),
             attributes: [
                 (
@@ -431,11 +427,6 @@ mod tests {
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .expect("backend fixture must parse");
-        let parsed = carina_core::validation::deferred_types::with_session_for_test(
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            |session| carina_core::parser::evaluate_backend_for_test(parsed, session),
-        )
-        .unwrap();
         BackendConfig::try_from(parsed.backend.as_ref().expect("backend fixture"))
     }
 
@@ -685,11 +676,6 @@ mod tests {
             carina_core::parser::parse_file(&source, std::path::Path::new("backend.crn"), &context)
                 .unwrap();
         carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
-        let parsed =
-            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-                carina_core::parser::evaluate_backend_for_test(parsed, session)
-            })
-            .unwrap();
         let resolved = BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
         let settings = resolved.as_s3().unwrap();
         assert_eq!(settings.bucket(), plaintext);

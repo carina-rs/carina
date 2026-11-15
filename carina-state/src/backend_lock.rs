@@ -224,7 +224,6 @@ impl BackendLock {
             .collect::<BackendResult<_>>()?;
         let raw: carina_core::parser::BackendConfig<NoPlaceholder, AbsoluteBindingAddress> =
             carina_core::parser::BackendConfig {
-                source: (),
                 backend_type: self.backend_type.clone(),
                 attributes,
                 attribute_spans: Default::default(),
@@ -289,9 +288,8 @@ mod tests {
 
     fn resolve(backend_type: &str, attributes: HashMap<String, Value>) -> BackendConfig {
         let raw = carina_core::parser::BackendConfig {
-            source: (),
             backend_type: backend_type.to_string(),
-            attributes: (attributes).into_iter().collect(),
+            attributes: (attributes).into(),
             attribute_spans: Default::default(),
         };
         BackendConfig::try_from(&raw).unwrap()

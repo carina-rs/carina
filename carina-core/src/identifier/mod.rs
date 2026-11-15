@@ -1820,9 +1820,6 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
             use crate::resource::ApplyTimeUnknown;
             // Variant labels feed identity hashes; keep them stable across Rust renames.
             match reason {
-                ApplyTimeUnknown::IncompleteBackendScope => {
-                    "Unknown(IncompleteBackendScope)".to_owned()
-                }
                 ApplyTimeUnknown::UpstreamExport { path } => {
                     format!("Unknown(UpstreamRef({}))", path.to_plaintext_dot_string())
                 }

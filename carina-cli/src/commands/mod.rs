@@ -29,8 +29,8 @@ use carina_core::parser::ProviderContext;
 use carina_core::resource::{BindingAddress, PlaceholderKind};
 use carina_core::validation::admission::configuration::backend::LocatedBackendError;
 use carina_state::{
-    BackendDrift, BackendLock, BackendSelection, MutationBackendSelection, ResolvedReadBackend,
-    VerifiedMutationBackendSelection,
+    BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendSelection,
+    MutationBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
 };
 
 pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
@@ -526,16 +526,20 @@ pub(crate) fn validate_root_backend<E: carina_core::parser::ExportParamLike>(
 }
 
 /// Recovery still checks each backend setting when the authored tree cannot seal.
-fn validate_unlocated_root_backend<E>(
-    parsed: &carina_core::config_loader::RootDirectoryParse<E>,
-) -> Vec<AppError> {
-    parsed
-        .admit_backend_unlocated()
-        .and_then(Result::err)
-        .into_iter()
-        .flatten()
-        .map(|error| AppError::UnlocatedBackend(Box::new(error)))
-        .collect()
+fn validate_unlocated_root_backend<E>(parsed: &carina_core::parser::File<E>) -> Vec<AppError> {
+    if parsed.arguments.is_empty()
+        && parsed.attribute_params.is_empty()
+        && let Some(backend) = &parsed.backend
+        && let Err(error) = StateBackendConfig::try_from(backend)
+    {
+        error
+            .into_unlocated()
+            .into_iter()
+            .map(|error| AppError::UnlocatedBackend(Box::new(error)))
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>(
@@ -740,7 +744,7 @@ fn validate_and_resolve_configuration(
     let analysis = match analysis {
         Ok(analysis) => analysis,
         Err(error) => {
-            errors.extend(validate_unlocated_root_backend(&parsed));
+            errors.extend(validate_unlocated_root_backend(parsed.parsed()));
             errors.push(AppError::AnalysisInvariant(error));
             return Err(non_empty_validation_failure(errors));
         }
@@ -1420,9 +1424,8 @@ mod tests {
             Value::Concrete(ConcreteValue::String(region.to_string().into())),
         );
         BackendConfig {
-            source: (),
             backend_type: "s3".to_string(),
-            attributes: (attributes).into_iter().collect(),
+            attributes: (attributes).into(),
             attribute_spans: Default::default(),
         }
     }
@@ -1434,9 +1437,8 @@ mod tests {
             Value::Concrete(ConcreteValue::String(path.to_string().into())),
         );
         BackendConfig {
-            source: (),
             backend_type: "local".to_string(),
-            attributes: (attributes).into_iter().collect(),
+            attributes: (attributes).into(),
             attribute_spans: Default::default(),
         }
     }
@@ -1611,7 +1613,7 @@ mod tests {
     }
 
     fn empty_parsed_file() -> carina_core::parser::InferredFile {
-        <carina_core::parser::InferredFile>::default()
+        carina_core::parser::InferredFile::default()
     }
 
     fn validation_with_missing_resource_provenance(

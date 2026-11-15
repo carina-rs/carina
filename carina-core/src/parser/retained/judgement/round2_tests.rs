@@ -20,13 +20,12 @@ fn schemas() -> crate::schema::SchemaRegistry {
     schemas
 }
 
-fn output<K: crate::parser::BackendPhase>(
+fn output(
     judged: &super::super::JudgedFile<
         '_,
         crate::parser::ParsedExportParam,
         crate::parser::ParsedDeferredForPhase,
         crate::resource::RelativeBindingName,
-        K,
     >,
 ) -> Vec<String> {
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());

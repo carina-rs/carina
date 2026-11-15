@@ -958,7 +958,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            <carina_core::parser::ExpandedInferredFile>::default().deferred_for_expressions(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
         )
         .expect("ordinary desired values cross the snapshot boundary");
 

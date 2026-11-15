@@ -43,12 +43,8 @@ use carina_core::validation::admission::attributes::{
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
-fn authored_validation_resources<'t, 'a, K: carina_core::parser::BackendPhase>(
-    tree: &'t carina_core::parser::UnexpandedAnalysis<
-        'a,
-        carina_core::parser::ParsedExportParam,
-        K,
-    >,
+fn authored_validation_resources<'t, 'a>(
+    tree: &'t carina_core::parser::AnalysisTree<'a>,
 ) -> HashMap<
     carina_core::parser::AuthoredResourceInstanceKey<'a>,
     &'t carina_core::parser::AnalysisResourceRef<'a>,
@@ -110,7 +106,6 @@ type ExpandedAnalysis<'a> = carina_core::parser::AnalysisTree<
     >,
     AbsoluteBindingAddress,
     carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
-    carina_core::parser::RetainedBackend,
 >;
 type ExpandedResource<'a> = carina_core::parser::AnalysisResourceRef<
     'a,
@@ -130,15 +125,14 @@ type RootAnalysis<'a> = carina_core::parser::AnalysisTree<
     carina_core::parser::ParsedDeferredForPhase<ParserPlaceholder, AbsoluteBindingAddress>,
     AbsoluteBindingAddress,
     carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
-    carina_core::parser::RetainedBackend,
 >;
 
 /// Seal each input at the parse/expansion boundary before dependent checks run.
-fn analysis_tree<'a, E, D, B: BindingAddress, K: carina_core::parser::BackendPhase>(
+fn analysis_tree<'a, E, D, B: BindingAddress>(
     doc: &Document,
-    parsed: &'a carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    parsed: &'a carina_core::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Option<carina_core::parser::AnalysisTree<'a, ParserPlaceholder, ParserPlaceholder, D, B, E, K>>
+) -> Option<carina_core::parser::AnalysisTree<'a, ParserPlaceholder, ParserPlaceholder, D, B, E>>
 where
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -473,29 +467,24 @@ fn render_classification_diagnostics(
 
 /// Expanded values and their binding authority stay in the absolute phase.
 /// Authored values are used separately for source positions and lexical checks.
-type ExpandedConfiguration<'a, K = carina_core::parser::RetainedBackend> =
-    carina_core::parser::retained::JudgedFile<
-        'a,
-        carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
-        carina_core::parser::ResolvedDeferredForPhase<
-            ParserPlaceholder,
-            ParserPlaceholder,
-            AbsoluteBindingAddress,
-        >,
-        AbsoluteBindingAddress,
-        K,
-    >;
-struct ExpandedDiagnosticValidationInputs<
+type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
     'a,
-    K: carina_core::parser::BackendPhase = carina_core::parser::RetainedBackend,
-> {
-    configuration: &'a ExpandedConfiguration<'a, K>,
+    carina_core::parser::ParsedExportParam<ParserPlaceholder, AbsoluteBindingAddress>,
+    carina_core::parser::ResolvedDeferredForPhase<
+        ParserPlaceholder,
+        ParserPlaceholder,
+        AbsoluteBindingAddress,
+    >,
+    AbsoluteBindingAddress,
+>;
+struct ExpandedDiagnosticValidationInputs<'a> {
+    configuration: &'a ExpandedConfiguration<'a>,
     resources: HashMap<&'a carina_core::resource::ResourceId, &'a ExpandedResource<'a>>,
     coverage: carina_core::validation::admission::WalkCoverage,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
 
-impl<K: carina_core::parser::BackendPhase> ExpandedDiagnosticValidationInputs<'_, K> {
+impl ExpandedDiagnosticValidationInputs<'_> {
     fn resource_admissions(
         &mut self,
         resource_id: &carina_core::resource::ResourceId,
@@ -672,7 +661,6 @@ impl DiagnosticRun<'_> {
             D,
             B,
             carina_core::parser::ParsedExportParam<ParserPlaceholder, B>,
-            carina_core::parser::RetainedBackend,
         >,
         overrides: &carina_core::config_loader::SourceOverrides,
     ) -> Result<
@@ -703,7 +691,6 @@ impl DiagnosticRun<'_> {
             carina_core::parser::ParsedExportParam,
             D,
             RelativeBindingName,
-            carina_core::parser::RetainedBackend,
         >,
         upstream_exports: &'a carina_core::upstream_exports::UpstreamExports,
         module_signatures: &'a carina_core::module_resolver::ResolvedModuleSignatures,
@@ -805,10 +792,10 @@ impl DiagnosticRun<'_> {
                     .ok()
                 })
                 .map(|snapshot| {
-                    carina_core::config_loader::load_buffer_configuration_in_directory_in_session(
+                    carina_core::config_loader::load_buffer_configuration_in_directory(
                         snapshot,
                         &self.schemas,
-                        self.provider_context,
+                        self.provider_context.catalog(),
                     )
                 })
                 .or_else(|| {
@@ -1201,7 +1188,11 @@ impl DiagnosticRun<'_> {
             preferred_analysis,
         ) {
             diagnostics.extend(self.check_configuration_placement(doc, preferred_tree));
-            diagnostics.extend(self.check_backend_config(doc, preferred_analysis));
+            diagnostics.extend(self.check_backend_config(
+                doc,
+                merged_result.as_ref(),
+                merged_analysis.as_ref(),
+            ));
 
             // Check provider region
             diagnostics.extend(self.check_provider_region(
@@ -1759,11 +1750,22 @@ impl DiagnosticRun<'_> {
             // locally resolvable calls evaluated so schema diagnostics see
             // the actual value type (not a deferred FunctionCall). The value
             // itself carries any diagnostic-sensitivity provenance.
-            let resolved_buffer = carina_core::parser::resolve_resource_refs_from_analysis(
-                tree,
-                self.provider_context,
-            )
-            .ok();
+            let resolved_buffer = {
+                match carina_core::parser::resolve_resource_refs_from_analysis(
+                    tree,
+                    self.provider_context,
+                ) {
+                    Ok(resolved) => Some(resolved),
+                    Err(error) => {
+                        if matches!(&error, carina_core::parser::AnalysisResolutionError::Diagnostic(finding)
+                            if matches!(finding.detail(), ParseError::SecretDerivedBackendAttribute { .. }))
+                        {
+                            diagnostics.extend(render_analysis_resolution_error(doc, &error));
+                        }
+                        None
+                    }
+                }
+            };
             let resolved_buffer_resources = resolved_buffer
                 .as_ref()
                 .map(|resolved| resolved.iter_all_resources().collect::<Vec<_>>());
@@ -1810,12 +1812,6 @@ impl DiagnosticRun<'_> {
                             format!("Unknown resource type: {full_resource_type}"),
                         )
                     } else if !provider_loaded {
-                        match preferred_tree.directory_verdict() {
-                            carina_core::config_loader::DirectoryVerdict::Root(_)
-                            | carina_core::config_loader::DirectoryVerdict::NoEvidence(_) => {}
-                            carina_core::config_loader::DirectoryVerdict::ModuleTemplate(_)
-                            | carina_core::config_loader::DirectoryVerdict::Unknown(_) => continue,
-                        }
                         (
                             DiagnosticSeverity::ERROR,
                             format!(

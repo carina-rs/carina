@@ -3658,7 +3658,7 @@ fn round2_saved_plan_matches_existing_nested_and_tags_snapshots() {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            <carina_core::parser::ExpandedInferredFile>::default().deferred_for_expressions(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
         )
         .expect("ordinary desired values cross the saved-plan snapshot boundary");
         let provider =

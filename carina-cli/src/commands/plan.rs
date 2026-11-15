@@ -1209,8 +1209,7 @@ impl PlanFile {
 /// Format 43 requires explicit schema-pattern modes. Format 44 records v13
 /// schema fingerprints and separate identity/member constraint layers. Format 45
 /// retains quoted condition literals, require messages, and wait RHS strings
-/// so decoding can reject interpolation. Format 47 requires relative upstream
-/// caller provenance and plain strict backend values. Format 46 stores non-empty dependent
+/// so decoding can reject interpolation. Format 46 stores non-empty dependent
 /// sets ordered by system-assigned resource/deferred effect identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
@@ -2162,7 +2161,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 47;
+    pub const CURRENT_VERSION: u32 = 46;
 
     #[cfg(test)]
     pub(crate) fn decode_for_test(self) -> DecodedPlanFile {
@@ -3872,12 +3871,11 @@ pub struct PlanWaitBinding {
     pub target: carina_core::resource::AbsoluteBindingAddress,
 }
 
-/// Upstream source and project-relative diagnostic call site saved at plan time.
+/// Upstream source saved at plan time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamSource {
     pub binding: carina_core::resource::AbsoluteBindingAddress,
     pub source: std::path::PathBuf,
-    pub caller: carina_core::parser::UpstreamCallSite,
 }
 
 /// Typed saved-plan snapshot with an explicit ownership tag.
@@ -5108,7 +5106,6 @@ pub(crate) enum PlanSaveError {
     Serialization(carina_core::value::SerializationError),
     CompositionSourceIdentity(carina_core::resource::CompositionSourceIdentityError),
     ProviderEvidence(ProviderEvidenceError),
-    UpstreamCaller(std::io::Error),
 }
 
 impl From<carina_core::value::SerializationError> for PlanSaveError {
@@ -5135,7 +5132,6 @@ impl std::fmt::Display for PlanSaveError {
             Self::Serialization(error) => error.fmt(formatter),
             Self::CompositionSourceIdentity(error) => error.fmt(formatter),
             Self::ProviderEvidence(error) => error.fmt(formatter),
-            Self::UpstreamCaller(error) => error.fmt(formatter),
         }
     }
 }
@@ -5146,7 +5142,6 @@ impl std::error::Error for PlanSaveError {
             Self::Serialization(error) => error,
             Self::CompositionSourceIdentity(error) => error,
             Self::ProviderEvidence(error) => error,
-            Self::UpstreamCaller(error) => error,
         })
     }
 }
@@ -5387,9 +5382,6 @@ fn build_plan_file_contents<E>(
     let wire_plan = recorded.into_wire();
 
     let contents = PlanFileContents::<ModuleSource, UnresolvedSavedPlan> {
-        // carina#4398: bumped 46→47 — strict backend values use their plain
-        // Value representation; upstream callers are required project-relative
-        // provenance. Older artifacts must be replanned, never adapted.
         // carina#4348: bumped 43→44 — v13 fingerprints and retained scalar
         // identity/member layers change saved schema and pending-constraint evidence.
         // carina#4292: bumped 42→43 — pattern modes change schema semantics;
@@ -5618,17 +5610,11 @@ fn build_plan_file_contents<E>(
         upstream_sources: parsed
             .upstream_states
             .iter()
-            .map(|us| {
-                Ok(UpstreamSource {
-                    caller: carina_core::parser::UpstreamCallSite::from_location(
-                        &us.caller, &source,
-                    )
-                    .map_err(PlanSaveError::UpstreamCaller)?,
-                    binding: us.binding.clone(),
-                    source: us.source.clone(),
-                })
+            .map(|us| UpstreamSource {
+                binding: us.binding.clone(),
+                source: us.source.clone(),
             })
-            .collect::<Result<Vec<_>, PlanSaveError>>()?,
+            .collect(),
         wait_bindings: parsed
             .wait_bindings
             .iter()
@@ -5656,7 +5642,6 @@ fn map_plan_save_error(error: PlanSaveError, flag: &str) -> AppError {
         )),
         PlanSaveError::Serialization(error) => AppError::from(error),
         PlanSaveError::CompositionSourceIdentity(error) => AppError::from(error),
-        PlanSaveError::UpstreamCaller(error) => AppError::SavedUpstreamCaller { error },
         PlanSaveError::ProviderEvidence(error) => {
             AppError::Config(format!("Cannot save plan: {error}"))
         }
@@ -5900,11 +5885,6 @@ mod storage_readiness_tests {
         )
         .unwrap();
         carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
-        let parsed =
-            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
-                carina_core::parser::evaluate_backend_for_test(parsed, session)
-            })
-            .unwrap();
         let config =
             carina_state::BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
         let (backend, requests) =
@@ -7391,7 +7371,6 @@ pub(crate) fn admit_saved_upstream_snapshot(
         let identity = carina_core::upstream_exports::UpstreamSourceIdentity::resolve_saved(
             &source.binding,
             &source.source,
-            &source.caller,
             base_dir,
         )
         .map_err(|error| AppError::UpstreamSourceResolution {
@@ -7642,7 +7621,6 @@ mod load_upstream_states_tests {
             let saved = admit_saved_upstream_snapshot(
                 &runtime,
                 &[UpstreamSource {
-                    caller: carina_core::parser::UpstreamCallSite::for_test(),
                     binding: absolute_binding("orgs"),
                     source: "../upstream".into(),
                 }],
@@ -8105,7 +8083,6 @@ mod load_upstream_states_tests {
         let error = admit_saved_upstream_snapshot(
             &runtime,
             &[UpstreamSource {
-                caller: carina_core::parser::UpstreamCallSite::for_test(),
                 binding: absolute_binding("orgs"),
                 source: "bad\0source".into(),
             }],
@@ -10795,9 +10772,6 @@ mod plan_serialization_error_tests {
                 }
                 ApplyTimeUnknown::PendingReRead(pending) => {
                     panic!("expected an upstream export path, got pending reread: {pending}")
-                }
-                ApplyTimeUnknown::IncompleteBackendScope => {
-                    panic!("unexpected editor backend scope")
                 }
             },
             other => panic!("expected UnknownNotAllowed/UpstreamExport, got: {other:?}"),

@@ -10,6 +10,7 @@ use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::ParseError;
 use crate::parser::expressions::string_literal::parse_string_literal;
 use crate::parser::grammar::PreprocessedFile;
+use crate::parser::parse_expression;
 use crate::parser::util::unwrap_to_primary;
 
 pub(in crate::parser) fn parse_backend_block(
@@ -29,10 +30,14 @@ pub(in crate::parser) fn parse_backend_block(
             let mut attr_inner = attr_pair.into_inner();
             let key_pair = next_pair(&mut attr_inner, "attribute name", "backend block")?;
             let key_span = SourceSpan::from_pest(&key_pair, preprocessed_file);
-            let key_location = ctx.declaration_location(&key_pair);
             let key = ctx.authored_key(key_pair);
-            let value_pair = next_pair(&mut attr_inner, "attribute value", "backend block")?;
-            let value = ctx.backend_expression(&value_pair, key_location);
+            let value = parse_expression(
+                next_pair(&mut attr_inner, "attribute value", "backend block")?,
+                ctx,
+            )?
+            .projection()
+            .expect("materialized parser expression")
+            .clone();
             attribute_spans.insert(key.clone(), key_span);
             attributes.insert(key, value);
         }
@@ -42,7 +47,6 @@ pub(in crate::parser) fn parse_backend_block(
         backend_type,
         attributes,
         attribute_spans,
-        source: (),
     })
 }
 

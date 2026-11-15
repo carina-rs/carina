@@ -386,7 +386,6 @@ enum ExprKind<B: BindingAddress> {
     Boolean,
     Declaration,
     ProviderDeclaration,
-    BackendDeclaration,
     Unsupported(String),
 }
 
@@ -479,7 +478,6 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             ExprKind::Boolean => ExprKind::Boolean,
             ExprKind::Declaration => ExprKind::Declaration,
             ExprKind::ProviderDeclaration => ExprKind::ProviderDeclaration,
-            ExprKind::BackendDeclaration => ExprKind::BackendDeclaration,
             ExprKind::Unsupported(rule) => ExprKind::Unsupported(rule),
         };
         let authored = Arc::new(AuthoredExpr {
@@ -743,24 +741,6 @@ impl<B: BindingAddress> Expressions<B> {
         self.captures.clone()
     }
 
-    pub(crate) fn backend_value_location(
-        &self,
-        key: &super::AttributeKey,
-        file: &std::path::Path,
-    ) -> Option<&DeclarationLocation> {
-        self.roots
-            .iter()
-            .rev()
-            .filter(|root| {
-                matches!(root.authored.kind, ExprKind::BackendDeclaration)
-                    && root.location().file().path() == file
-            })
-            .flat_map(|root| &root.authored.children)
-            .find(|sink| matches!(&sink.authored.kind, ExprKind::Sink(name) if name == key))
-            .and_then(|sink| sink.authored.children.first())
-            .map(ExprValue::location)
-    }
-
     pub fn roots(&self) -> &[ExprValue<ParserPlaceholder, B>] {
         &self.roots
     }
@@ -893,19 +873,13 @@ impl<B: BindingAddress> Expressions<B> {
 /// Directory require has a placement verdict. Reference normalization consumes
 /// this snapshot and re-judges the result before checking require placement.
 #[derive(Debug, Clone)]
-pub struct JudgedFile<
-    'a,
-    E,
-    D,
-    B: BindingAddress = RelativeBindingName,
-    K: super::BackendPhase = super::RetainedBackend,
-> {
-    file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+pub struct JudgedFile<'a, E, D, B: BindingAddress = RelativeBindingName> {
+    file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &'a crate::schema::SchemaRegistry,
 }
 
-impl<'a, E, D, B: BindingAddress, K: super::BackendPhase> JudgedFile<'a, E, D, B, K> {
-    pub fn file(&self) -> &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K> {
+impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
+    pub fn file(&self) -> &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         &self.file
     }
     pub fn report(&self) -> &ExpressionReport<B> {
@@ -914,23 +888,18 @@ impl<'a, E, D, B: BindingAddress, K: super::BackendPhase> JudgedFile<'a, E, D, B
     pub fn schemas(&self) -> &'a crate::schema::SchemaRegistry {
         self.schemas
     }
-    pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K> {
+    pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         self.file
     }
 }
 
-impl<
-    'a,
-    E: super::ExportParamLike<ParserPlaceholder, B>,
-    D,
-    B: BindingAddress,
-    K: super::BackendPhase,
-> JudgedFile<'a, E, D, B, K>
+impl<'a, E: super::ExportParamLike<ParserPlaceholder, B>, D, B: BindingAddress>
+    JudgedFile<'a, E, D, B>
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
     pub(crate) fn new(
-        mut file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+        mut file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &super::ProviderContext,
     ) -> Self {
@@ -944,21 +913,14 @@ where
 #[error("configuration has not crossed the expression judgement boundary")]
 pub struct UnjudgedConfiguration;
 
-impl<E, D, B: BindingAddress, K: crate::parser::BackendPhase>
-    super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>
-{
+impl<E, D, B: BindingAddress> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
     pub(crate) fn expression_report(&self) -> &ExpressionReport<B> {
         &self.parser_binding_metadata.syntax().expressions().report
     }
 }
 
-pub(crate) fn set_directory_require_scope<
-    E,
-    D,
-    B: BindingAddress,
-    K: crate::parser::BackendPhase,
->(
-    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+pub(crate) fn set_directory_require_scope<E, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     scope: crate::config_loader::DirectoryRequireScope,
 ) {
     file.parser_binding_metadata
@@ -972,8 +934,8 @@ pub(crate) fn set_directory_require_scope<
 }
 
 #[cfg(test)]
-pub(crate) fn require_scope<E, D, B: BindingAddress, K: crate::parser::BackendPhase>(
-    file: &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+pub(crate) fn require_scope<E, D, B: BindingAddress>(
+    file: &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> RequireScope {
     file.parser_binding_metadata
         .syntax()
@@ -986,8 +948,8 @@ pub(crate) fn require_scope<E, D, B: BindingAddress, K: crate::parser::BackendPh
 /// Full analysis acquires the root require rejection together with its
 /// inference exemption only when the loader proved declaration completeness.
 /// An isolated buffer stays unknown and retains ordinary expression checks.
-fn admit_require_scope<E, D, B: BindingAddress, K: crate::parser::BackendPhase>(
-    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+fn admit_require_scope<E, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) {
     let expressions = file.parser_binding_metadata.syntax.expressions_mut();
     let Some(RequireScope::UnvalidatedDirectory(evidence)) = expressions.require_scope.as_ref()
@@ -1001,9 +963,8 @@ pub(crate) fn judge_configuration<
     E: super::ExportParamLike<ParserPlaceholder, B>,
     D,
     B: BindingAddress,
-    K: crate::parser::BackendPhase,
 >(
-    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &crate::schema::SchemaRegistry,
     config: &super::ProviderContext,
 ) where
@@ -1034,8 +995,8 @@ pub(crate) fn judge_configuration<
     file.parser_binding_metadata.syntax.expressions_mut().report = report;
 }
 
-pub(crate) fn attach_report<E, D, B: BindingAddress, K: crate::parser::BackendPhase>(
-    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+pub(crate) fn attach_report<E, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     report: ExpressionReport<B>,
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -1045,8 +1006,8 @@ pub(crate) fn attach_report<E, D, B: BindingAddress, K: crate::parser::BackendPh
     file.parser_binding_metadata.syntax.expressions_mut().report = report;
 }
 
-fn prepare_slots<E, D, B: BindingAddress, K: crate::parser::BackendPhase>(
-    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+fn prepare_slots<E, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &crate::schema::SchemaRegistry,
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -1081,8 +1042,8 @@ fn prepare_slots<E, D, B: BindingAddress, K: crate::parser::BackendPhase>(
     }
 }
 
-fn attach_slot_reports<E, D, B: BindingAddress, K: crate::parser::BackendPhase>(
-    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+fn attach_slot_reports<E, D, B: BindingAddress>(
+    file: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     report: &Arc<ExpressionReport<B>>,
 ) where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -2150,13 +2111,6 @@ fn compile_form(
             file,
             source,
         ),
-        Rule::backend_block => node(
-            &pair,
-            ExprKind::BackendDeclaration,
-            children(),
-            file,
-            source,
-        ),
         Rule::arguments_block
         | Rule::arguments_param
         | Rule::arguments_param_block
@@ -2168,6 +2122,7 @@ fn compile_form(
         | Rule::validation_error_message_attr
         | Rule::attributes_block
         | Rule::exports_block
+        | Rule::backend_block
         | Rule::require_statement
         | Rule::wait_attr
         | Rule::wait_until_attr
@@ -3693,9 +3648,9 @@ mod judgement {
                 .get(name)
                 .ok_or_else(|| MissingEvidence::new(format!("parameter {name}")))
         }
-        pub(crate) fn record_instance<E, D, K: crate::parser::BackendPhase>(
+        pub(crate) fn record_instance<E, D>(
             &mut self,
-            file: &super::super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+            file: &super::super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
             binding: Option<&B>,
         ) where
             D: super::super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -3749,9 +3704,9 @@ mod judgement {
             }
             self.record_resources(file);
         }
-        pub(super) fn record_resources<E, D, K: crate::parser::BackendPhase>(
+        pub(super) fn record_resources<E, D>(
             &mut self,
-            file: &super::super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+            file: &super::super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         ) where
             D: super::super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
         {
@@ -3839,8 +3794,8 @@ mod judgement {
             })
     }
 
-    pub fn judge_expressions<E, D, B: BindingAddress, K: crate::parser::BackendPhase>(
-        file: &super::super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    pub fn judge_expressions<E, D, B: BindingAddress>(
+        file: &super::super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
         schemas: &crate::schema::SchemaRegistry,
         config: &super::super::ProviderContext,
     ) -> ExpressionReport<B>
@@ -4086,9 +4041,7 @@ mod judgement {
                 },
                 _ => None,
             };
-            let mut children = if rejected_require.is_some()
-                || matches!(root.kind, ExprKind::BackendDeclaration)
-            {
+            let mut children = if rejected_require.is_some() {
                 Vec::new()
             } else {
                 root.children
@@ -4998,10 +4951,9 @@ mod judgement {
                     result.report_at(FailureOwner::Boundary);
                     result
                 }
-                ExprKind::Declaration
-                | ExprKind::ProviderDeclaration
-                | ExprKind::BackendDeclaration
-                | ExprKind::Compose => declaration(),
+                ExprKind::Declaration | ExprKind::ProviderDeclaration | ExprKind::Compose => {
+                    declaration()
+                }
                 ExprKind::Unsupported(rule) => {
                     incomplete(&format!("unsupported authored rule {rule}"))
                 }

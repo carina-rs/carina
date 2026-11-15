@@ -859,7 +859,7 @@ fn successful_validation_report_returns_the_resolved_file_as_a_result() {
         Vec::new(),
         &[],
     );
-    let parsed: carina_core::parser::InferredFile = Default::default();
+    let parsed = carina_core::parser::InferredFile::default();
     let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
     let report = providers.validation_report(
         &parsed,
@@ -1991,7 +1991,7 @@ fn execution_minting_checks_load_completeness_after_skipped_validation_in_provid
         Ok(_) => panic!("incomplete provider loads must not mint execution wiring"),
         Err(error) => error,
     };
-    let unresolved: carina_core::parser::ParsedFile = Default::default();
+    let unresolved = carina_core::parser::ParsedFile::default();
     let pair_error = match incomplete_load().validate_config_pair(
         invalid_config(),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
@@ -2064,7 +2064,7 @@ fn settlement_includes_checks_from_binding_readiness() {
         &[],
     );
     let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(
-        <carina_core::parser::InferredFile>::default(),
+        carina_core::parser::InferredFile::default(),
     );
     let expected = carina_core::parser::parse_type_expr_str(
         "Missing",
@@ -2189,7 +2189,7 @@ fn plan_style_config_pair_minting_collects_load_and_unrelated_validation_errors(
     .parsed;
 
     let unresolved = carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(
-        <carina_core::parser::ParsedFile>::default(),
+        carina_core::parser::ParsedFile::default(),
     );
     let error = match providers.validate_config_pair(
         parsed,
@@ -2405,7 +2405,7 @@ fn hard_reporting_load_returns_schema_only_diagnostics() {
         "fixture must exercise the hard loader failure"
     );
 
-    let parsed: carina_core::parser::InferredFile = Default::default();
+    let parsed = carina_core::parser::InferredFile::default();
     let parsed = carina_core::config_loader::InferredRootDirectory::from_parsed_for_test(parsed);
     let report = providers.validation_report(
         &parsed,
@@ -2683,18 +2683,8 @@ fn first_provider_load_surfaces_invalid_trusted_local_inputs() {
 fn parse(
     input: &str,
     config: &carina_core::parser::ProviderContext,
-) -> Result<
-    carina_core::parser::ParsedFile<carina_core::parser::StrictBackend>,
-    carina_core::parser::ParseError,
-> {
-    let parsed =
-        carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)?;
-    let parsed =
-        carina_core::config_loader::ParsedRootDirectory::from_parsed_source_for_test(parsed, input)
-            .into_parsed();
-    carina_core::validation::deferred_types::with_session_for_test(config, |session| {
-        carina_core::parser::evaluate_backend_for_test(parsed, session)
-    })
+) -> Result<carina_core::parser::ParsedFile, carina_core::parser::ParseError> {
+    carina_core::parser::parse_file(input, std::path::Path::new("wiring_test.crn"), config)
 }
 
 fn pathless_test_type(
@@ -2748,22 +2738,9 @@ fn test_data_source_values(
     })
 }
 
-fn resolve_file_for_test<E, K: carina_core::parser::BackendFixturePhase>(
-    parsed: carina_core::parser::File<
-        E,
-        carina_core::resource::ParserPlaceholder,
-        carina_core::resource::ParserPlaceholder,
-        carina_core::parser::ParsedDeferredForPhase<
-            carina_core::resource::ParserPlaceholder,
-            carina_core::resource::RelativeBindingName,
-        >,
-        carina_core::resource::RelativeBindingName,
-        K,
-    >,
-) -> carina_core::parser::ModuleResolvedFile<
-    E::Absolute,
-    carina_core::resource::AbsoluteBindingAddress,
->
+fn resolve_file_for_test<E>(
+    parsed: carina_core::parser::File<E>,
+) -> carina_core::parser::ModuleResolvedFile<E::Absolute>
 where
     E: carina_core::parser::ResolveExportBindingPhase<carina_core::resource::ParserPlaceholder>,
 {
@@ -2771,10 +2748,8 @@ where
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::module_resolver::resolve_modules_with_providerless_config(
-                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(
-                    carina_core::parser::evaluate_backend_for_test(parsed, session).unwrap(),
-                )
-                .admit(&carina_core::schema::SchemaRegistry::new(), session),
+                carina_core::config_loader::RootDirectoryParse::from_parsed_for_test(parsed)
+                    .admit(&carina_core::schema::SchemaRegistry::new(), session),
                 &carina_core::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )
             .expect("test fixture crosses module resolution")
@@ -2786,7 +2761,7 @@ fn canonical_unresolved(
     resources: Vec<Resource>,
     schemas: &SchemaRegistry,
 ) -> CanonicalResourcePair<carina_core::parser::ExpandedParsedExportParam> {
-    let mut parsed: carina_core::parser::ExpandedParsedFile = Default::default();
+    let mut parsed = carina_core::parser::ExpandedParsedFile::default();
     parsed.resources = resources;
     carina_core::schema::resolve_file_block_names_with_schemas(&mut parsed, schemas)
         .expect("test block-name resolution must succeed");
@@ -2822,7 +2797,7 @@ where
     E::Absolute:
         carina_core::parser::IntoExpandedExportParam<carina_core::resource::AbsoluteBindingAddress>,
 {
-    let mut unresolved: carina_core::parser::ParsedFile = Default::default();
+    let mut unresolved = carina_core::parser::ParsedFile::default();
     unresolved.resources = unresolved_resources;
     resolve_config_block_names_for_test(
         resolve_file_for_test(evaluated.clone()),
@@ -2864,7 +2839,7 @@ fn canonical_expanded_pair<E: Clone>(
     let mut evaluated = evaluated.clone();
     carina_core::schema::resolve_file_block_names_with_schemas(&mut evaluated, schemas)
         .expect("test evaluated block-name resolution must succeed");
-    let mut unresolved: carina_core::parser::ExpandedParsedFile = Default::default();
+    let mut unresolved = carina_core::parser::ExpandedParsedFile::default();
     unresolved.resources = unresolved_resources;
     carina_core::schema::resolve_file_block_names_with_schemas(&mut unresolved, schemas)
         .expect("test unresolved block-name resolution must succeed");
@@ -3493,7 +3468,7 @@ where
 fn validated_provider_configs(
     configs: Vec<carina_core::parser::ExpandedProviderConfig>,
 ) -> carina_core::parser::ResolvedProviderConfigs {
-    let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.providers = configs;
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
@@ -3548,7 +3523,7 @@ where
         provider_configs.as_provider_configs(),
     );
     let ctx = wiring.context();
-    let mut unresolved: carina_core::parser::ParsedFile = Default::default();
+    let mut unresolved = carina_core::parser::ParsedFile::default();
     unresolved.resources = unresolved_resources.to_vec();
     let canonical_resources = resolve_config_block_names_for_test(
         resolve_file_for_test(parsed.clone()),
@@ -3587,7 +3562,7 @@ fn create_plan(
         carina_core::resource::AbsoluteBindingAddress,
     >],
 ) -> Plan {
-    let mut configuration: carina_core::parser::ExpandedParsedFile = Default::default();
+    let mut configuration = carina_core::parser::ExpandedParsedFile::default();
     configuration.resources = managed.to_vec();
     configuration.data_sources = data_sources.to_vec();
     configuration.wait_bindings = wait_bindings.to_vec();
@@ -9187,7 +9162,7 @@ fn resource_move_invariants_projected_state_read_preserves_dependency_bindings()
     let desired = desired_association(new_name, "private_rtb", "subnet-a");
     let resources = vec![desired];
     let state = Some(state_file);
-    let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
     parsed.resources = resources;
     let comparison_provider = comparison_provider_for_resources(ctx.schemas(), &parsed.resources);
     let detected = DeferredForExpansionPrelude::new_for_test(&parsed, &state, ctx.schemas())
@@ -9381,7 +9356,7 @@ fn destroy_and_state_refresh_identity_preparation_preserve_anonymous_addresses()
         Some(state)
     };
     let config = || {
-        let mut parsed: ExpandedInferredFile = Default::default();
+        let mut parsed = ExpandedInferredFile::default();
         parsed.resources = vec![desired()];
         ValidatedConfig::from_factories_with_additional_schemas_for_test::<
             carina_core::resource::NoPlaceholder,
@@ -11509,9 +11484,8 @@ fn anonymous_route_resource() -> Resource {
     resource
 }
 
-fn two_anonymous_loop_collision_file()
--> carina_core::parser::ParsedFile<carina_core::parser::StrictBackend> {
-    carina_core::parser::parse_file_and_resolve(
+fn two_anonymous_loop_collision_file() -> carina_core::parser::ParsedFile {
+    carina_core::parser::parse_file(
         "for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-a' subnet_id = subnet }\n}\n\
          for subnet in ['same', 'same'] {\n  awscc.ec2.SubnetRouteTableAssociation { route_table_id = 'rtb-b' subnet_id = subnet }\n}\n",
         std::path::Path::new("aggregate.crn"),
@@ -13995,7 +13969,7 @@ mod kind_default_source_tests {
     }
 
     fn resolved(configs: Vec<ExpandedProviderConfig>) -> ResolvedProviderConfigs {
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers = configs;
         carina_core::validation::deferred_types::with_session_for_test(
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
@@ -15504,7 +15478,7 @@ exports { team_prefix: String = "x" }"#,
             .with_absolute_binding(absolute_binding("sink"))
             .with_attribute("target", target);
         let unresolved_resources = vec![consumer.clone()];
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(provider_config);
         parsed.resources.push(consumer); // allow: direct — fixture test inspection
         parsed
@@ -15607,7 +15581,7 @@ exports { team_prefix: String = "x" }"#,
             unresolved_attributes: Default::default(),
             binding: None,
         };
-        let mut parsed: carina_core::parser::ExpandedInferredFile = Default::default();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
         parsed.providers.push(provider_config);
         parsed.compositions.push(composition);
         parsed.data_sources.push(data_source);

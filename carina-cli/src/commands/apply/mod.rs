@@ -972,7 +972,6 @@ async fn verify_upstream_snapshot(
         let identity = carina_core::upstream_exports::UpstreamSourceIdentity::resolve_saved(
             &source.binding,
             &source.source,
-            &source.caller,
             project_dir,
         )
         .and_then(|identity| {
@@ -1141,7 +1140,6 @@ mod upstream_snapshot_tests {
         let runtime = crate::test_support::TestCommandRuntime::new();
         let wiring = crate::wiring::WiringContext::new_for_test(&runtime, vec![], &[]);
         let sources = [crate::commands::plan::UpstreamSource {
-            caller: carina_core::parser::UpstreamCallSite::for_test(),
             binding: carina_core::resource::absolute_binding_address_for_test("orgs"),
             source: "upstream".into(),
         }];

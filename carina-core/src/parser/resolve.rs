@@ -7,9 +7,11 @@ use super::ast::{ExportParamLike, File, ParsedFile, ProviderConfig};
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::{ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value};
-use crate::config_loader::{ResolutionContext, strict_resolution_context};
 #[cfg(test)]
-use crate::config_loader::{analysis_resolution_context, diagnostics_resolution_context};
+use crate::config_loader::analysis_resolution_context;
+use crate::config_loader::{
+    ResolutionContext, diagnostics_resolution_context, strict_resolution_context,
+};
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue,
     ConcreteValue as GenericConcreteValue, DeferredValue, DiagnosticSourceLine, InterpolationPart,
@@ -730,7 +732,7 @@ mod saved_provider_config_secret_tests {
             DEFAULT_TAGS_ATTRIBUTE,
             RuntimeValue::Concrete(GenericConcreteValue::String("private-invalid-map".into())),
         );
-        let file: crate::parser::ExpandedInferredFile = crate::parser::ExpandedInferredFile {
+        let file = crate::parser::ExpandedInferredFile {
             providers: vec![config],
             ..Default::default()
         };
@@ -794,7 +796,7 @@ mod saved_provider_config_secret_tests {
             serde_json::to_value(snapshot_configs(&SavedProviderConfigs(configs.clone()))).unwrap(),
         )
         .unwrap();
-        let file: crate::parser::ExpandedInferredFile = crate::parser::ExpandedInferredFile {
+        let file = crate::parser::ExpandedInferredFile {
             providers: configs.clone(),
             ..Default::default()
         };
@@ -1263,8 +1265,8 @@ impl PreApplyResourceMut for DataSource {
 /// Mutable iterator over the pre-apply resolvable resources — managed
 /// resources then data sources (carina#3181). Used by the resolver to
 /// rewrite refs in place across both typed slices in one walk.
-fn iter_pre_apply_resources_mut<E, K: crate::parser::BackendPhase>(
-    parsed: &mut crate::parser::UnexpandedFile<E, K>,
+fn iter_pre_apply_resources_mut<E>(
+    parsed: &mut File<E>,
 ) -> impl Iterator<Item = &mut dyn PreApplyResourceMut> + '_ {
     parsed
         .resources
@@ -1294,16 +1296,16 @@ pub fn resolve_resource_refs(
 /// the merged directory parse triggers user-fn evaluation here, even when
 /// the per-file parse couldn't evaluate it because the `fn` declaration
 /// lived in a sibling `.crn` (#2444).
-pub fn resolve_resource_refs_with_config<E: ExportParamLike, K: crate::parser::BackendPhase>(
-    parsed: &mut crate::parser::UnexpandedFile<E, K>,
+pub fn resolve_resource_refs_with_config<E: ExportParamLike>(
+    parsed: &mut File<E>,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
     resolve_resource_refs_in_context(parsed, config, None, strict_resolution_context())
 }
 
 /// Resolve pending checks with the same session used for declaration checks.
-pub fn resolve_resource_refs_in_session<E: ExportParamLike, K: crate::parser::BackendPhase>(
-    parsed: &mut crate::parser::UnexpandedFile<E, K>,
+pub fn resolve_resource_refs_in_session<E: ExportParamLike>(
+    parsed: &mut File<E>,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), AnalysisResolutionError> {
     super::AnalysisTree::try_from_file(parsed)?;
@@ -1326,13 +1328,17 @@ pub fn resolve_resource_refs_in_session<E: ExportParamLike, K: crate::parser::Ba
 ///     resolve_resource_refs_from_analysis(file, session);
 /// }
 /// ```
-pub fn resolve_resource_refs_from_analysis<
-    E: ExportParamLike + Clone,
-    K: crate::parser::BackendPhase,
->(
-    tree: &crate::parser::UnexpandedAnalysis<'_, E, K>,
+pub fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
+    tree: &super::AnalysisTree<
+        '_,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        super::ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
+        RelativeBindingName,
+        E,
+    >,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<crate::parser::UnexpandedFile<E, K>, AnalysisResolutionError> {
+) -> Result<File<E>, AnalysisResolutionError> {
     let mut parsed = tree.file().clone();
     resolve_resource_refs_in_context(
         &mut parsed,
@@ -1345,11 +1351,8 @@ pub fn resolve_resource_refs_from_analysis<
 }
 
 /// Parser/module-loader evaluation before the analysis boundary is sealed.
-pub(crate) fn resolve_resource_refs_in_session_unsealed<
-    E: ExportParamLike,
-    K: crate::parser::BackendPhase,
->(
-    parsed: &mut crate::parser::UnexpandedFile<E, K>,
+pub(crate) fn resolve_resource_refs_in_session_unsealed<E: ExportParamLike>(
+    parsed: &mut File<E>,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
@@ -1421,296 +1424,15 @@ pub(crate) fn resolve_resource_refs_defer_unknown_functions(
 /// declarations instead of losing the call behind the evaluation error.
 /// Truly unknown function names remain errors once this directory-wide pass
 /// has the complete function table.
-#[cfg(test)]
 pub(crate) fn resolve_resource_refs_for_diagnostics(
     parsed: &mut ParsedFile,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    resolve_resource_refs_in_context(
-        parsed,
-        config,
-        None,
-        crate::config_loader::diagnostics_resolution_context(),
-    )
+    resolve_resource_refs_in_context(parsed, config, None, diagnostics_resolution_context())
 }
 
-/// The output phase decides whether evaluation failure is retained or returned.
-/// Neither phase accepts a Failed value as an evaluation operand.
-pub(crate) trait BackendEvaluationPhase: super::BackendPhase {
-    type Failure;
-    fn failure(error: Self::Failure) -> RootInputFailure;
-    fn result(
-        value: Result<Value, ParseError>,
-    ) -> Result<Self::Attribute<ParserPlaceholder, RelativeBindingName>, Self::Failure>;
-    fn source(
-        attributes: super::ConfigurationAttributes<super::BackendExpression>,
-    ) -> Self::Source<ParserPlaceholder, RelativeBindingName>;
-}
-impl BackendEvaluationPhase for super::StrictBackend {
-    type Failure = ParseError;
-    fn failure(error: ParseError) -> RootInputFailure {
-        RootInputFailure::Backend(error)
-    }
-    fn result(value: Result<Value, ParseError>) -> Result<Value, ParseError> {
-        value
-    }
-    fn source(_attributes: super::ConfigurationAttributes<super::BackendExpression>) {}
-}
-impl BackendEvaluationPhase for super::RetainedBackend {
-    type Failure = std::convert::Infallible;
-    fn failure(error: std::convert::Infallible) -> RootInputFailure {
-        match error {}
-    }
-    fn result(
-        value: Result<Value, ParseError>,
-    ) -> Result<super::BackendAttributeValue<ParserPlaceholder>, std::convert::Infallible> {
-        Ok(match value {
-            Ok(value) => super::BackendAttributeValue::Evaluated(value),
-            Err(cause) => super::BackendAttributeValue::Failed(std::sync::Arc::new(cause)),
-        })
-    }
-    fn source(
-        attributes: super::ConfigurationAttributes<super::BackendExpression>,
-    ) -> super::BackendSource {
-        super::BackendSource(attributes)
-    }
-}
-
-pub(crate) struct BackendScope<'a> {
-    functions: &'a IndexMap<String, super::UserFunction>,
-    bindings: BackendBindings<'a>,
-}
-enum BackendBindings<'a> {
-    Complete {
-        seeds: Vec<BindingSeed<'a>>,
-        resources: HashMap<String, HashMap<String, Value>>,
-    },
-    Deferred,
-    Unavailable,
-}
-impl<'a> BackendScope<'a> {
-    pub(crate) fn complete<E, S: super::BackendPhase>(
-        scope: &'a crate::parser::UnexpandedFile<E, S>,
-    ) -> Self {
-        let structural = scope.structural_binding_names();
-        let parameters = scope
-            .arguments
-            .iter()
-            .map(|argument| (argument.name.as_str(), &argument.static_type))
-            .collect();
-        let seeds = collect_seed_bindings_from_parts(
-            &structural,
-            &parameters,
-            &scope.variables,
-            &scope.parser_binding_metadata,
-        );
-        let resources = scope
-            .iter_top_level_resources()
-            .filter_map(|resource| {
-                Some((
-                    resource.binding()?.to_string(),
-                    resource.resolved_attributes(),
-                ))
-            })
-            .collect();
-        Self {
-            functions: &scope.user_functions,
-            bindings: BackendBindings::Complete { seeds, resources },
-        }
-    }
-    pub(crate) fn deferred(functions: &'a IndexMap<String, super::UserFunction>) -> Self {
-        Self {
-            functions,
-            bindings: BackendBindings::Deferred,
-        }
-    }
-    pub(crate) fn unavailable(functions: &'a IndexMap<String, super::UserFunction>) -> Self {
-        Self {
-            functions,
-            bindings: BackendBindings::Unavailable,
-        }
-    }
-}
-
-fn evaluate_backend_expression(
-    backend_type: &str,
-    key: &super::AttributeKey,
-    expression: &super::BackendExpression,
-    scope: &BackendScope<'_>,
-    config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    resolution: ResolutionContext,
-) -> Result<Value, ParseError> {
-    if !matches!(scope.bindings, BackendBindings::Complete { .. })
-        && expression.needs_bindings(
-            scope.functions,
-            !matches!(scope.bindings, BackendBindings::Unavailable),
-        )?
-    {
-        return Ok(Value::Deferred(DeferredValue::Unknown(
-            crate::resource::ApplyTimeUnknown::IncompleteBackendScope,
-        )));
-    }
-    let result = expression.with_expression(|pair| {
-        let mut context = super::ParseContext::new(
-            config,
-            expression.location.file().path(),
-            std::sync::Arc::clone(&expression.file),
-        );
-        context.retain_backend_operands();
-        context.session = session;
-        context.replace_user_functions(scope.functions.clone());
-        context
-            .seeded_user_functions
-            .extend(scope.functions.keys().cloned());
-        context.set_authored_nodes(std::sync::Arc::clone(&expression.nodes));
-        let empty_resources = HashMap::new();
-        let resources = match &scope.bindings {
-            BackendBindings::Complete { seeds, resources } => {
-                super::entry::seed_bindings(&mut context, seeds);
-                resources
-            }
-            BackendBindings::Deferred | BackendBindings::Unavailable => &empty_resources,
-        };
-        let expression_location = context.declaration_location(&pair);
-        let value = super::parse_expression(pair, &context)?
-            .projection()
-            .cloned()
-            .ok_or_else(|| ParseError::InternalError {
-                expected: "backend expression value".into(),
-                context: "backend evaluation".into(),
-            })?;
-        let reject_secret = |value: &Value| {
-            if resolution.backend_is_demanded() && crate::value::contains_secret(value) {
-                Err(ParseError::SecretDerivedBackendAttribute {
-                    backend_type: backend_type.to_owned(),
-                    attribute: key.clone(),
-                    line: expression.location.span().start_line(),
-                    start_column: expression.location.span().start_column(),
-                    end_column: expression.location.span().end_column(),
-                })
-            } else {
-                Ok(())
-            }
-        };
-        // A backend cannot consume a protected operand. Reject an authored
-        // Secret before demanding its payload, just as for a secret binding.
-        reject_secret(&value)?;
-        let value = resolve_function_calls_only_with::<RelativeBindingName, BackendCall>(
-            &value, resources, config, session, resolution,
-        )
-        .map_err(|error| {
-            if matches!(
-                &value,
-                Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
-            ) {
-                error.at(&expression_location)
-            } else {
-                error
-            }
-        })?;
-        reject_secret(&value)?;
-        Ok(value)
-    });
-    result.map_err(|error| error.at(&expression.location))
-}
-
-pub(crate) fn evaluate_backend_with_scope<K: BackendEvaluationPhase>(
-    backend: super::ParserBackendConfig,
-    scope: &BackendScope<'_>,
-    config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    resolution: ResolutionContext,
-) -> Result<super::BackendConfig<ParserPlaceholder, RelativeBindingName, K>, K::Failure> {
-    let source = K::source(backend.attributes.clone());
-    let mut attributes = super::ConfigurationAttributes::new();
-    for (key, expression) in backend.attributes {
-        let evaluated = evaluate_backend_expression(
-            &backend.backend_type,
-            &key,
-            &expression,
-            scope,
-            config,
-            session,
-            crate::config_loader::backend_resolution_context(resolution),
-        );
-        attributes.insert(key, K::result(evaluated)?);
-    }
-    Ok(super::BackendConfig {
-        backend_type: backend.backend_type,
-        attributes,
-        attribute_spans: backend.attribute_spans,
-        source,
-    })
-}
-
-pub(crate) fn evaluate_backend_in_scope<K: BackendEvaluationPhase, E, S: super::BackendPhase>(
-    backend: super::ParserBackendConfig,
-    scope: &crate::parser::UnexpandedFile<E, S>,
-    config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    resolution: ResolutionContext,
-) -> Result<super::BackendConfig<ParserPlaceholder, RelativeBindingName, K>, K::Failure> {
-    evaluate_backend_with_scope::<K>(
-        backend,
-        &BackendScope::complete(scope),
-        config,
-        session,
-        resolution,
-    )
-}
-
-pub(crate) fn evaluate_file_backend<K: BackendEvaluationPhase, E>(
-    mut parsed: crate::parser::UnexpandedFile<E, super::AuthoredBackend>,
-    config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    resolution: ResolutionContext,
-) -> Result<crate::parser::UnexpandedFile<E, K>, K::Failure> {
-    let backend = parsed
-        .backend
-        .take()
-        .map(|backend| {
-            evaluate_backend_in_scope::<K, E, super::AuthoredBackend>(
-                backend, &parsed, config, session, resolution,
-            )
-        })
-        .transpose()?;
-    Ok(parsed.map_backend_phase(|_| backend))
-}
-
-pub(crate) fn evaluate_file_backend_in_scope<
-    K: BackendEvaluationPhase,
-    E,
-    F,
-    S: super::BackendPhase,
->(
-    mut parsed: crate::parser::UnexpandedFile<E, super::AuthoredBackend>,
-    scope: &crate::parser::UnexpandedFile<F, S>,
-    config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    resolution: ResolutionContext,
-) -> Result<crate::parser::UnexpandedFile<E, K>, K::Failure> {
-    let backend = parsed
-        .backend
-        .take()
-        .map(|backend| {
-            evaluate_backend_in_scope::<K, F, S>(backend, scope, config, session, resolution)
-        })
-        .transpose()?;
-    Ok(parsed.map_backend_phase(|_| backend))
-}
-pub(crate) fn assemble_evaluated_backend<E, K: super::BackendPhase>(
-    parsed: crate::parser::UnexpandedFile<E, super::AuthoredBackend>,
-    backend: Option<super::BackendConfig<ParserPlaceholder, RelativeBindingName, K>>,
-) -> crate::parser::UnexpandedFile<E, K> {
-    parsed.map_backend_phase(|_| backend)
-}
-
-pub(crate) fn resolve_resource_refs_in_context<
-    E: ExportParamLike,
-    K: crate::parser::BackendPhase,
->(
-    parsed: &mut crate::parser::UnexpandedFile<E, K>,
+pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
+    parsed: &mut File<E>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
@@ -1725,16 +1447,8 @@ pub(crate) enum RootInputFailure {
     Value(ParseError),
 }
 impl RootInputFailure {
-    pub(crate) fn error(&self) -> &ParseError {
-        match self {
-            Self::Backend(error) | Self::Value(error) => error,
-        }
-    }
-    pub(crate) fn map_error(self, map: impl FnOnce(ParseError) -> ParseError) -> Self {
-        match self {
-            Self::Backend(error) => Self::Backend(map(error)),
-            Self::Value(error) => Self::Value(map(error)),
-        }
+    pub(crate) fn is_backend(&self) -> bool {
+        matches!(self, Self::Backend(_))
     }
     pub(crate) fn into_parse_error(self) -> ParseError {
         match self {
@@ -1748,11 +1462,8 @@ impl From<ParseError> for RootInputFailure {
     }
 }
 
-pub(crate) fn resolve_resource_refs_with_backend_failure<
-    E: ExportParamLike,
-    K: crate::parser::BackendPhase,
->(
-    parsed: &mut crate::parser::UnexpandedFile<E, K>,
+pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
+    parsed: &mut File<E>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
@@ -1870,6 +1581,61 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<
         })
         .collect();
 
+    // The typed backend resolver consumes ordinary values directly and has no
+    // secret transport/writeback seam. Evaluate backend function calls with
+    // the same semantics as resource attributes, then reject any
+    // secret-derived result before validate/plan/apply can resolve a backend.
+    if let Some(backend) = &mut parsed.backend {
+        for (key, value) in &mut backend.attributes {
+            let evaluated = resolve_function_calls_only(
+                value,
+                &binding_map,
+                fn_ctx.config,
+                session,
+                crate::config_loader::backend_resolution_context(resolution),
+            )
+            .map_err(|error| {
+                match syntax
+                    .backend_keys()
+                    .iter()
+                    .rev()
+                    .find(|record| record.detail() == key)
+                {
+                    Some(record) => error.at(record.location()),
+                    None => error,
+                }
+            })
+            .map_err(RootInputFailure::Backend)?;
+            if resolution.backend_is_demanded() && crate::value::contains_secret(&evaluated) {
+                let span = backend.attribute_spans.get(key).copied().ok_or_else(|| {
+                    ParseError::InternalError {
+                        expected: format!("source span for backend attribute '{key}'"),
+                        context: "secret-derived backend attribute validation".to_string(),
+                    }
+                })?;
+                let error = ParseError::SecretDerivedBackendAttribute {
+                    backend_type: backend.backend_type.clone(),
+                    attribute: key.clone(),
+                    line: span.start_line(),
+                    start_column: span.start_column(),
+                    end_column: span.end_column(),
+                };
+                return Err(RootInputFailure::Backend(
+                    match syntax
+                        .backend_keys()
+                        .iter()
+                        .rev()
+                        .find(|record| record.detail() == key)
+                    {
+                        Some(record) => error.at(record.location()),
+                        None => error,
+                    },
+                ));
+            }
+            *value = evaluated;
+        }
+    }
+
     // Resolve references in each resource. Keep `IndexMap` to preserve
     // the user's source order through resolution (#2222).
     //
@@ -1904,72 +1670,6 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<
             session,
             resolution,
         )?;
-    }
-
-    // A strict loader may have postponed a provider-typed call until the
-    // caller supplies its session. Continue only those plain values; retained
-    // outcomes are final results of their own evaluator and never inputs here.
-    if let Some(backend) = &mut parsed.backend {
-        for (key, attribute) in &mut backend.attributes {
-            K::try_continue_attribute(attribute, &mut |value| {
-                let call_location = if matches!(
-                    value,
-                    Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
-                ) {
-                    syntax
-                        .backend_keys()
-                        .iter()
-                        .rev()
-                        .find(|record| record.detail() == key)
-                        .and_then(|record| {
-                            syntax
-                                .expressions()
-                                .backend_value_location(key, record.location().file().path())
-                        })
-                } else {
-                    None
-                };
-                let value = resolve_function_calls_only_with::<RelativeBindingName, BackendCall>(
-                    value,
-                    &binding_map,
-                    config,
-                    session,
-                    crate::config_loader::backend_resolution_context(resolution),
-                )
-                .map_err(|error| match call_location {
-                    Some(location) => error.at(location),
-                    None => error,
-                })?;
-                if resolution.backend_is_demanded() && crate::value::contains_secret(&value) {
-                    let (line, start_column, end_column) = backend
-                        .attribute_spans
-                        .get(key)
-                        .map(|span| (span.start_line(), span.start_column(), span.end_column()))
-                        .unwrap_or((0, 0, 0));
-                    return Err(ParseError::SecretDerivedBackendAttribute {
-                        backend_type: backend.backend_type.clone(),
-                        attribute: key.clone(),
-                        line,
-                        start_column,
-                        end_column,
-                    });
-                }
-                Ok(value)
-            })
-            .map_err(|error| {
-                RootInputFailure::Backend(
-                    match syntax
-                        .backend_keys()
-                        .iter()
-                        .rev()
-                        .find(|record| record.detail() == key)
-                    {
-                        Some(record) => error.at(record.location()),
-                        None => error,
-                    },
-                )
-            })?;
-        }
     }
 
     // Residual `for` bodies are not part of `iter_pre_apply_resources_mut`:
@@ -2174,9 +1874,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<
 /// because `accumulate_*` helpers below still take `&HashSet<&str>` as a
 /// borrowed view (changing that signature would force `undefined_identifier_error`
 /// to rebuild a borrowed view per call).
-pub fn collect_known_bindings_merged<E, K: crate::parser::BackendPhase>(
-    parsed: &crate::parser::UnexpandedFile<E, K>,
-) -> std::collections::HashSet<&str> {
+pub fn collect_known_bindings_merged<E>(parsed: &File<E>) -> std::collections::HashSet<&str> {
     let mut known = parsed.structural_binding_names();
     known.extend(parsed.variables.keys().map(String::as_str));
     known
@@ -2476,9 +2174,7 @@ fn push_root(
 /// **This is the canonical entry point for "is this identifier in
 /// scope?" checks.** Follow the #2104 rule: any new semantic check in
 /// that family gets added *here*, not as a new sibling function.
-pub fn check_identifier_scope<E: ExportParamLike, K: crate::parser::BackendPhase>(
-    parsed: &crate::parser::UnexpandedFile<E, K>,
-) -> Vec<ParseError> {
+pub fn check_identifier_scope<E: ExportParamLike>(parsed: &File<E>) -> Vec<ParseError> {
     let known = collect_known_bindings_merged(parsed);
     let mut errors = Vec::new();
     accumulate_undefined_reference_errors(parsed, &known, &mut errors);
@@ -2510,8 +2206,8 @@ pub fn check_identifier_scope<E: ExportParamLike, K: crate::parser::BackendPhase
 /// validation to pay for both.
 pub use crate::validation::routing::check_provider_instance_routing;
 
-fn accumulate_undefined_reference_errors<K: crate::parser::BackendPhase>(
-    parsed: &crate::parser::UnexpandedFile<impl ExportParamLike, K>,
+fn accumulate_undefined_reference_errors(
+    parsed: &File<impl ExportParamLike>,
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
@@ -2564,8 +2260,8 @@ fn accumulate_undefined_reference_errors<K: crate::parser::BackendPhase>(
     }
 }
 
-fn accumulate_deferred_iterable_errors<K: crate::parser::BackendPhase>(
-    parsed: &crate::parser::UnexpandedFile<impl ExportParamLike, K>,
+fn accumulate_deferred_iterable_errors(
+    parsed: &File<impl ExportParamLike>,
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
@@ -2614,78 +2310,7 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
     )
 }
 
-trait CallFailure {
-    fn user_call<B: BindingAddress>(
-        authored: &GenericValue<ParserPlaceholder, B>,
-        result: Result<GenericValue<ParserPlaceholder, B>, ParseError>,
-        resolution: ResolutionContext,
-    ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError>;
-    fn unavailable<B: BindingAddress>(
-        retained: GenericValue<ParserPlaceholder, B>,
-        error: ParseError,
-        resolution: ResolutionContext,
-    ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError>;
-}
-struct OrdinaryCall;
-struct BackendCall;
-impl CallFailure for OrdinaryCall {
-    fn user_call<B: BindingAddress>(
-        authored: &GenericValue<ParserPlaceholder, B>,
-        result: Result<GenericValue<ParserPlaceholder, B>, ParseError>,
-        resolution: ResolutionContext,
-    ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
-        if resolution.retains_failed_calls() && result.is_err() {
-            Ok(authored.clone())
-        } else {
-            result
-        }
-    }
-    fn unavailable<B: BindingAddress>(
-        retained: GenericValue<ParserPlaceholder, B>,
-        error: ParseError,
-        resolution: ResolutionContext,
-    ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
-        if resolution.requires_available() {
-            Err(error)
-        } else {
-            Ok(retained)
-        }
-    }
-}
-impl CallFailure for BackendCall {
-    fn user_call<B: BindingAddress>(
-        _authored: &GenericValue<ParserPlaceholder, B>,
-        result: Result<GenericValue<ParserPlaceholder, B>, ParseError>,
-        _resolution: ResolutionContext,
-    ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
-        result
-    }
-    fn unavailable<B: BindingAddress>(
-        _retained: GenericValue<ParserPlaceholder, B>,
-        error: ParseError,
-        _resolution: ResolutionContext,
-    ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
-        Err(error)
-    }
-}
 fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
-    value: &GenericValue<ParserPlaceholder, B>,
-    binding_lookup: &impl Fn(&B, &str) -> Option<GenericValue<ParserPlaceholder, B>>,
-    config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    resolution: ResolutionContext,
-    scope: DiagnosticScope,
-) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
-    evaluate_value_with_binding_lookup::<B, OrdinaryCall>(
-        value,
-        binding_lookup,
-        config,
-        session,
-        resolution,
-        scope,
-    )
-}
-fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallFailure>(
     value: &GenericValue<ParserPlaceholder, B>,
     binding_lookup: &impl Fn(&B, &str) -> Option<GenericValue<ParserPlaceholder, B>>,
     config: &ProviderContext,
@@ -2698,7 +2323,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
             // HEAD validates known failures in both retained module-if branches.
             // Argument substitution still owns branch selection at runtime.
             let deferred = deferred.try_map(|value| {
-                evaluate_value_with_binding_lookup::<B, M>(
+                resolve_value_with_binding_lookup(
                     value,
                     binding_lookup,
                     config,
@@ -2715,7 +2340,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
             value: left,
             default,
         }) => {
-            let left = evaluate_value_with_binding_lookup::<B, M>(
+            let left = resolve_value_with_binding_lookup(
                 left,
                 binding_lookup,
                 config,
@@ -2734,7 +2359,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
                 // Carry the fallback through the same directory fixed point as
                 // the left operand, while preserving failures as deferred calls
                 // until absence actually selects it.
-                let default = evaluate_value_with_binding_lookup::<B, M>(
+                let default = resolve_value_with_binding_lookup(
                     default,
                     binding_lookup,
                     config,
@@ -2749,7 +2374,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
             }
         }
         GenericValue::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = evaluate_value_with_binding_lookup::<B, M>(
+            let lhs = resolve_value_with_binding_lookup(
                 expression.lhs(),
                 binding_lookup,
                 config,
@@ -2757,7 +2382,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
                 resolution,
                 scope,
             )?;
-            let rhs = evaluate_value_with_binding_lookup::<B, M>(
+            let rhs = resolve_value_with_binding_lookup(
                 expression.rhs(),
                 binding_lookup,
                 config,
@@ -2782,7 +2407,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
                 return Ok(value.clone());
             }
             match binding_lookup(path.binding_address(), path.attribute()) {
-                Some(attribute_value) => evaluate_value_with_binding_lookup::<B, M>(
+                Some(attribute_value) => resolve_value_with_binding_lookup(
                     &attribute_value,
                     binding_lookup,
                     config,
@@ -2799,7 +2424,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
             let resolved: Result<Vec<_>, ParseError> = items
                 .iter()
                 .map(|item| {
-                    evaluate_value_with_binding_lookup::<B, M>(
+                    resolve_value_with_binding_lookup(
                         item,
                         binding_lookup,
                         config,
@@ -2816,7 +2441,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
             for (k, v) in map {
                 resolved.insert(
                     k.clone(),
-                    evaluate_value_with_binding_lookup::<B, M>(
+                    resolve_value_with_binding_lookup(
                         v,
                         binding_lookup,
                         config,
@@ -2832,16 +2457,16 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
             let resolved: Result<Vec<_>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
-                        evaluate_value_with_binding_lookup::<B, M>(
+                    InterpolationPart::Expr(v) => {
+                        Ok(InterpolationPart::Expr(resolve_value_with_binding_lookup(
                             v,
                             binding_lookup,
                             config,
                             session,
                             resolution,
                             scope,
-                        )?,
-                    )),
+                        )?))
+                    }
                     other => Ok(other.clone()),
                 })
                 .collect();
@@ -2854,11 +2479,13 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
             reason,
             source_line,
             ..
-        }) => M::unavailable(
-            value.clone(),
-            unavailable_builtin_error(*name, reason, *source_line),
-            resolution,
-        ),
+        }) => {
+            if !resolution.requires_available() {
+                Ok(value.clone())
+            } else {
+                Err(unavailable_builtin_error(*name, reason, *source_line))
+            }
+        }
         GenericValue::Deferred(DeferredValue::ResolvedFunctionCall {
             function,
             functions,
@@ -2870,7 +2497,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
-                        evaluate_value_with_binding_lookup::<B, M>(
+                        resolve_value_with_binding_lookup(
                             value,
                             binding_lookup,
                             config,
@@ -2889,7 +2516,10 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
                 session,
                 evaluation_line,
             );
-            M::user_call(value, evaluated, resolution)
+            if resolution.retains_failed_calls() && evaluated.is_err() {
+                return Ok(value.clone());
+            }
+            evaluated
         }
         GenericValue::Deferred(DeferredValue::FunctionCall {
             name,
@@ -2901,7 +2531,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
-                        evaluate_value_with_binding_lookup::<B, M>(
+                        resolve_value_with_binding_lookup(
                             value,
                             binding_lookup,
                             config,
@@ -2945,17 +2575,16 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
                         } else {
                             UnavailableReason::from_builtin_error(e.to_string())
                         };
-                        let error = unavailable_builtin_error(*name, &reason, *source_line);
-                        M::unavailable(
-                            GenericValue::Deferred(DeferredValue::Unavailable {
+                        if !resolution.requires_available() {
+                            Ok(GenericValue::Deferred(DeferredValue::Unavailable {
                                 name: *name,
                                 args: resolved_args,
                                 reason,
                                 source_line: *source_line,
-                            }),
-                            error,
-                            resolution,
-                        )
+                            }))
+                        } else {
+                            Err(unavailable_builtin_error(*name, &reason, *source_line))
+                        }
                     } else {
                         // Args contain unresolved refs — keep as FunctionCall for later resolution
                         Ok(GenericValue::Deferred(DeferredValue::FunctionCall {
@@ -2968,7 +2597,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
             }
         }
         GenericValue::Deferred(DeferredValue::Access(access)) => {
-            let resolved_base = evaluate_value_with_binding_lookup::<B, M>(
+            let resolved_base = resolve_value_with_binding_lookup(
                 access.base(),
                 binding_lookup,
                 config,
@@ -2985,7 +2614,7 @@ fn evaluate_value_with_binding_lookup<B: ProviderAttributeBindingPhase, M: CallF
         }
         GenericValue::Deferred(DeferredValue::Secret(inner)) => inner
             .try_map(|value| {
-                evaluate_value_with_binding_lookup::<B, M>(
+                resolve_value_with_binding_lookup(
                     value,
                     binding_lookup,
                     config,
@@ -3081,21 +2710,6 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
-    resolve_function_calls_only_with::<B, OrdinaryCall>(
-        value,
-        binding_map,
-        config,
-        session,
-        resolution,
-    )
-}
-fn resolve_function_calls_only_with<B: ProviderAttributeBindingPhase, M: CallFailure>(
-    value: &GenericValue<ParserPlaceholder, B>,
-    binding_map: &HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>>,
-    config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    resolution: ResolutionContext,
-) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
     match value {
         GenericValue::Deferred(
             DeferredValue::ModuleIf(_)
@@ -3106,31 +2720,11 @@ fn resolve_function_calls_only_with<B: ProviderAttributeBindingPhase, M: CallFai
             | DeferredValue::Coalesce { .. }
             | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Secret(_),
-        ) => evaluate_value_with_binding_lookup::<B, M>(
-            value,
-            &|binding: &B, attribute: &str| {
-                binding_map
-                    .get(binding.as_str())
-                    .and_then(|attributes| attributes.get(attribute))
-                    .cloned()
-            },
-            config,
-            session,
-            resolution,
-            DiagnosticScope::Public,
-        ),
+        ) => resolve_value_with_config(value, binding_map, config, session, resolution),
         GenericValue::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<_>, ParseError> = items
                 .iter()
-                .map(|v| {
-                    resolve_function_calls_only_with::<B, M>(
-                        v,
-                        binding_map,
-                        config,
-                        session,
-                        resolution,
-                    )
-                })
+                .map(|v| resolve_function_calls_only(v, binding_map, config, session, resolution))
                 .collect();
             Ok(GenericValue::Concrete(ConcreteValue::List(resolved?)))
         }
@@ -3139,13 +2733,7 @@ fn resolve_function_calls_only_with<B: ProviderAttributeBindingPhase, M: CallFai
             for (k, v) in map {
                 resolved.insert(
                     k.clone(),
-                    resolve_function_calls_only_with::<B, M>(
-                        v,
-                        binding_map,
-                        config,
-                        session,
-                        resolution,
-                    )?,
+                    resolve_function_calls_only(v, binding_map, config, session, resolution)?,
                 );
             }
             Ok(GenericValue::Concrete(ConcreteValue::Map(resolved)))
@@ -3154,18 +2742,9 @@ fn resolve_function_calls_only_with<B: ProviderAttributeBindingPhase, M: CallFai
             let resolved: Result<Vec<_>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Expr(v) => {
-                        Ok(InterpolationPart::Expr(resolve_function_calls_only_with::<
-                            B,
-                            M,
-                        >(
-                            v,
-                            binding_map,
-                            config,
-                            session,
-                            resolution,
-                        )?))
-                    }
+                    InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
+                        resolve_function_calls_only(v, binding_map, config, session, resolution)?,
+                    )),
                     other => Ok(other.clone()),
                 })
                 .collect();
@@ -3195,9 +2774,8 @@ fn resolve_function_calls_only_with<B: ProviderAttributeBindingPhase, M: CallFai
 pub fn resolve_provider_unresolved_attributes_for_analysis<
     E: ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     D,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, RelativeBindingName, K>,
+    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, RelativeBindingName>,
     config: &ProviderContext,
 ) -> Result<(), AnalysisResolutionError>
 where
@@ -3214,9 +2792,8 @@ where
 pub fn resolve_expanded_provider_unresolved_attributes_for_analysis<
     E: ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress>,
     D,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress, K>,
+    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress>,
     config: &ProviderContext,
 ) -> Result<(), AnalysisResolutionError>
 where
@@ -3238,9 +2815,8 @@ pub fn finalize_provider_configs_for_analysis<
     E: ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    parsed: &mut File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
 ) -> Result<(), AnalysisResolutionError>
 where
     D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
@@ -3267,8 +2843,8 @@ where
 /// Generic over the export-parameter shape so callers can pass either
 /// `ParsedFile` or `InferredFile` — we only touch
 /// `provider.unresolved_attributes`, never `export_params`.
-pub fn resolve_provider_unresolved_attributes<E, D, K: crate::parser::BackendPhase>(
-    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, RelativeBindingName, K>,
+pub fn resolve_provider_unresolved_attributes<E, D>(
+    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, RelativeBindingName>,
     config: &ProviderContext,
 ) -> Result<(), ParseError>
 where
@@ -3278,8 +2854,8 @@ where
 }
 
 /// Resolve deferred provider attributes after root/module binding expansion.
-pub fn resolve_expanded_provider_unresolved_attributes<E, D, K: crate::parser::BackendPhase>(
-    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress, K>,
+pub fn resolve_expanded_provider_unresolved_attributes<E, D>(
+    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress>,
     config: &ProviderContext,
 ) -> Result<(), ParseError>
 where
@@ -3292,13 +2868,8 @@ where
     resolve_provider_unresolved_attributes_for_phase(parsed, config)
 }
 
-fn resolve_provider_unresolved_attributes_for_phase<
-    E,
-    B: ProviderAttributeBindingPhase,
-    D,
-    K: crate::parser::BackendPhase,
->(
-    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+fn resolve_provider_unresolved_attributes_for_phase<E, B: ProviderAttributeBindingPhase, D>(
+    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &ProviderContext,
 ) -> Result<(), ParseError>
 where
@@ -3307,14 +2878,8 @@ where
     resolve_provider_unresolved_attributes_mapped(parsed, config, |_, _, error| error)
 }
 
-fn resolve_provider_unresolved_attributes_mapped<
-    E,
-    B: ProviderAttributeBindingPhase,
-    D,
-    Failure,
-    K: crate::parser::BackendPhase,
->(
-    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+fn resolve_provider_unresolved_attributes_mapped<E, B: ProviderAttributeBindingPhase, D, Failure>(
+    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &ProviderContext,
     mut map_error: impl FnMut(usize, &super::AttributeKey, ParseError) -> Failure,
 ) -> Result<(), Failure>
@@ -3331,9 +2896,8 @@ fn resolve_provider_unresolved_attributes_reporting<
     B: ProviderAttributeBindingPhase,
     D,
     Failure,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B, K>,
+    parsed: &mut super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     config: &ProviderContext,
     mut report_error: impl FnMut(
         usize,
@@ -3413,8 +2977,8 @@ where
 /// validation/LSP paths that intentionally tolerate incomplete edits use the
 /// lower-level parser resolution passes and never receive
 /// [`ResolvedProviderConfigs`].
-pub fn resolve_provider_attributes_with_remote<E, D, K: crate::parser::BackendPhase>(
-    parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress, K>,
+pub fn resolve_provider_attributes_with_remote<E, D>(
+    parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
     remote_bindings: &crate::upstream_exports::AdmittedRemoteBindings,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ResolvedProviderConfigs, ProviderConfigResolutionError> {
@@ -3428,8 +2992,8 @@ struct ProviderAttributeBindings {
 }
 
 impl ProviderAttributeBindings {
-    fn new<E, D, K: crate::parser::BackendPhase>(
-        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress, K>,
+    fn new<E, D>(
+        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
         remote: &crate::upstream_exports::AdmittedRemoteBindings,
     ) -> Self {
         let mut resolved = crate::binding_index::ResolvedBindings::default();
@@ -3509,8 +3073,8 @@ impl ProviderAttributeBindings {
 
 impl ResolvedProviderConfigs {
     /// Strict desired-input resolution retains and resolves every default.
-    pub fn resolve_with_remote<E, D, K: crate::parser::BackendPhase>(
-        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress, K>,
+    pub fn resolve_with_remote<E, D>(
+        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
         remote: &crate::upstream_exports::AdmittedRemoteBindings,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<Self, ProviderConfigResolutionError> {
@@ -3527,8 +3091,8 @@ impl ResolvedProviderConfigs {
 impl PlanPreviewProviderConfigs {
     /// Preview may omit map entries whose only dependencies are absent upstreams.
     /// The result carries no authority to save or execute a desired input.
-    pub fn resolve_with_remote<E, D, K: crate::parser::BackendPhase>(
-        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress, K>,
+    pub fn resolve_with_remote<E, D>(
+        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
         remote: &crate::upstream_exports::AdmittedRemoteBindings,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<Self, ProviderConfigResolutionError> {
@@ -3542,8 +3106,8 @@ impl PlanPreviewProviderConfigs {
     }
 }
 
-fn resolve_desired_provider_configs<E, D, K: crate::parser::BackendPhase>(
-    parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress, K>,
+fn resolve_desired_provider_configs<E, D>(
+    parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
     remote: &crate::upstream_exports::AdmittedRemoteBindings,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     policy: DefaultTagResolutionPolicy,
@@ -3621,8 +3185,8 @@ fn resolve_desired_provider_configs<E, D, K: crate::parser::BackendPhase>(
 impl ReadOnlyProviderConfigs {
     /// Resolve only construction attributes. Default tags and their deferred
     /// whole-map expression are never read, evaluated, or copied into this type.
-    pub fn resolve_with_remote<E, D, K: crate::parser::BackendPhase>(
-        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress, K>,
+    pub fn resolve_with_remote<E, D>(
+        parsed: &super::File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
         remote: &crate::upstream_exports::AdmittedRemoteBindings,
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<Self, ProviderConfigResolutionError> {
@@ -3660,33 +3224,25 @@ impl ReadOnlyProviderConfigs {
 ///
 /// Errors when a resolved value has the wrong shape (e.g.
 /// `default_tags = "string"`).
-pub fn finalize_provider_configs<E, B: BindingAddress, D, K: crate::parser::BackendPhase>(
+pub fn finalize_provider_configs<E, B: BindingAddress, D>(
     parsed: &mut super::File<
         E,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
         D,
         B,
-        K,
     >,
 ) -> Result<(), ParseError> {
     finalize_provider_configs_mapped(parsed, |_, _, error| error)
 }
 
-fn finalize_provider_configs_mapped<
-    E,
-    B: BindingAddress,
-    D,
-    Failure,
-    K: crate::parser::BackendPhase,
->(
+fn finalize_provider_configs_mapped<E, B: BindingAddress, D, Failure>(
     parsed: &mut super::File<
         E,
         crate::resource::ParserPlaceholder,
         crate::resource::ParserPlaceholder,
         D,
         B,
-        K,
     >,
     mut map_error: impl FnMut(usize, &super::AttributeKey, ParseError) -> Failure,
 ) -> Result<(), Failure> {
@@ -3749,8 +3305,8 @@ impl ProviderInputPreview {
 
 /// Diagnostic preview shares the ordinary resolver and default-map gate, but
 /// retains each failed expression and continues with independent providers.
-pub(crate) fn preview_expanded_provider_inputs<E, K: super::BackendPhase>(
-    source: &super::ModuleResolvedFile<E, AbsoluteBindingAddress, K>,
+pub(crate) fn preview_expanded_provider_inputs<E>(
+    source: &super::ModuleResolvedFile<E>,
     config: &ProviderContext,
 ) -> Vec<ProviderInputPreview>
 where
@@ -4067,7 +3623,7 @@ mod seed_precedence_tests {
     fn plain_let_literal_seeds_as_value() {
         // A `let bad_name = 'literal'` shape: `bad_name` appears in
         // `parsed.variables` only, not in any structural source.
-        let mut parsed: ParsedFile = Default::default();
+        let mut parsed = ParsedFile::default();
         parsed.variables.insert(
             "bad_name".to_string(),
             Value::Concrete(ConcreteValue::String("literal".into())),

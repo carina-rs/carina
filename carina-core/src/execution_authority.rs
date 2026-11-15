@@ -37,7 +37,7 @@
 //! async fn forged_create(context: &ProviderPreparationContext<'_>, schemas: &SchemaRegistry) {
 //!     let resource = Resource::with_provider("p", "Bucket", "chosen", None);
 //!     let mut plan = Plan::new();
-//!     let graph = resolve_expanded_graph(<ExpandedInferredFile>::default().into()).unwrap();
+//!     let graph = resolve_expanded_graph(ExpandedInferredFile::default().into()).unwrap();
 //!     plan.add(Effect::Create(graph.resolve_resource(resource, schemas).unwrap()));
 //!     let Effect::Create(target) = &plan.effects()[0] else { unreachable!() };
 //!     let checked = graph.initial_create_plan(Resource::from_id(target.id.clone()), schemas)
@@ -55,7 +55,7 @@
 //!     resolved_graph::resolve_expanded_graph, schema::SchemaRegistry};
 //! async fn forged_bucket(provider: &dyn HostProvider, schemas: &SchemaRegistry) {
 //!     let resource = Resource::with_provider("p", "Bucket", "chosen", None);
-//!     let graph = resolve_expanded_graph(<ExpandedInferredFile>::default().into()).unwrap();
+//!     let graph = resolve_expanded_graph(ExpandedInferredFile::default().into()).unwrap();
 //!     let plan = graph.initial_delete_plan(resource, AppliedIdentifier::new("chosen-id").unwrap(), schemas)
 //!         .unwrap().admit(schemas).unwrap();
 //!     let permit = prepare_initial_delete(&plan).unwrap();

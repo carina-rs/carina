@@ -700,9 +700,8 @@ mod tests {
             })
             .unwrap_or_default();
         let raw = carina_core::parser::BackendConfig {
-            source: (),
             backend_type: "local".to_string(),
-            attributes: (attributes).into_iter().collect(),
+            attributes: (attributes).into(),
             attribute_spans: Default::default(),
         };
         match crate::BackendConfig::try_from(&raw).unwrap() {

@@ -2761,7 +2761,7 @@ mod tests {
             unresolved_attributes: Default::default(),
             binding: None,
         };
-        let mut parsed: carina_core::parser::InferredFile = Default::default();
+        let mut parsed = carina_core::parser::InferredFile::default();
         parsed.providers = vec![provider_config.clone(), provider_config];
         let state_path = project.path().join("state.json");
         let lock_path = state_path.with_extension("lock");

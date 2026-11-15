@@ -696,7 +696,7 @@ mod tests {
             ),
             Err(StaticTypeResolutionError::UnknownCustomType { .. })
         ));
-        let file: crate::parser::ParsedFile = Default::default();
+        let file = crate::parser::ParsedFile::default();
         let schemas = crate::schema::SchemaRegistry::new();
         let bindings = crate::binding_index::BindingIndex::from_parsed(&file, &schemas, &context);
         assert!(matches!(

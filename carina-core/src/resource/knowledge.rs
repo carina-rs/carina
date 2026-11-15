@@ -3038,7 +3038,6 @@ fn classify_value<
         )),
         Value::Deferred(DeferredValue::Unknown(unknown)) => {
             let reason = match unknown {
-                ApplyTimeUnknown::IncompleteBackendScope => PendingReason::IncompleteExpression,
                 ApplyTimeUnknown::UpstreamExport { .. } => PendingReason::UpstreamExport,
                 ApplyTimeUnknown::UpstreamAllExports { .. } => PendingReason::UpstreamAllExports,
                 ApplyTimeUnknown::PendingReRead(_) => PendingReason::ReadBack,
@@ -3046,11 +3045,7 @@ fn classify_value<
             Ok(pending(
                 value,
                 WaitOn::Unknown(unknown.clone()),
-                if matches!(unknown, ApplyTimeUnknown::IncompleteBackendScope) {
-                    Phase::Plan
-                } else {
-                    Phase::Apply
-                },
+                Phase::Apply,
                 reason,
             ))
         }

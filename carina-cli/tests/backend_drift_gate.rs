@@ -32,7 +32,6 @@ fn local_backend_lock(path: &str) -> BackendLock {
         Value::Concrete(ConcreteValue::String(path.to_string().into())),
     );
     let config: carina_core::parser::ExpandedBackendConfig = carina_core::parser::BackendConfig {
-        source: (),
         backend_type: "local".to_string(),
         attributes: attributes.into_iter().collect(),
         attribute_spans: Default::default(),
@@ -55,7 +54,6 @@ fn s3_backend_lock(bucket: &str, key: &str) -> BackendLock {
         Value::Concrete(ConcreteValue::String("us-east-1".into())),
     );
     let config: carina_core::parser::ExpandedBackendConfig = carina_core::parser::BackendConfig {
-        source: (),
         backend_type: "s3".to_string(),
         attributes: attributes.into_iter().collect(),
         attribute_spans: Default::default(),

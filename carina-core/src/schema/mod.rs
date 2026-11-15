@@ -14061,9 +14061,8 @@ fn resolve_file_block_names<
     T: crate::resource::PlaceholderKind,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
     B: BindingAddress,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut crate::parser::File<E, P, T, D, B, K>,
+    parsed: &mut crate::parser::File<E, P, T, D, B>,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
     let mut conflicts = Vec::new();
@@ -14105,14 +14104,13 @@ fn resolve_file_block_names<
     conflicts
 }
 
-fn managed_resource_by_id<'a, E, D, K: crate::parser::BackendPhase>(
+fn managed_resource_by_id<'a, E, D>(
     parsed: &'a crate::parser::File<
         E,
         ParserPlaceholder,
         ParserPlaceholder,
         D,
         RelativeBindingName,
-        K,
     >,
     id: &ResourceId,
 ) -> Option<&'a Resource<ModuleSource, ParserPlaceholder, RelativeBindingName>>
@@ -14141,21 +14139,13 @@ where
         })
 }
 
-fn resolve_file_block_names_with_authored<
-    E,
-    D,
-    A,
-    AD,
-    K: crate::parser::BackendPhase,
-    AK: crate::parser::BackendPhase,
->(
+fn resolve_file_block_names_with_authored<E, D, A, AD>(
     parsed: &mut crate::parser::File<
         E,
         ParserPlaceholder,
         ParserPlaceholder,
         D,
         AbsoluteBindingAddress,
-        K,
     >,
     authored: &crate::parser::File<
         A,
@@ -14163,7 +14153,6 @@ fn resolve_file_block_names_with_authored<
         ParserPlaceholder,
         AD,
         RelativeBindingName,
-        AK,
     >,
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict>
@@ -14237,9 +14226,8 @@ pub fn resolve_file_block_names_with_schemas<
     T: crate::resource::PlaceholderKind,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
     B: BindingAddress,
-    K: crate::parser::BackendPhase,
 >(
-    parsed: &mut crate::parser::File<E, P, T, D, B, K>,
+    parsed: &mut crate::parser::File<E, P, T, D, B>,
     registry: &SchemaRegistry,
 ) -> Result<(), Vec<BlockNameConflict>> {
     let conflicts = resolve_file_block_names(parsed, registry);
@@ -14256,23 +14244,22 @@ pub fn resolve_file_block_names_with_schemas<
 /// This raw primitive returns plain values and carries no pairing guarantee.
 /// Only carina-cli's validated-wiring transition may mint its canonical
 /// resource pair from these values.
-pub type ParserStageBlockNameResolution<E, D, K = crate::parser::StrictBackend> = (
-    crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress, K>,
+pub type ParserStageBlockNameResolution<E, D> = (
+    crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, AbsoluteBindingAddress>,
     Vec<Resource<ModuleSource, ParserPlaceholder, AbsoluteBindingAddress>>,
 );
 
-pub fn resolve_config_block_names<E, D, K: crate::parser::BackendPhase>(
+pub fn resolve_config_block_names<E, D>(
     mut parsed: crate::parser::File<
         E,
         ParserPlaceholder,
         ParserPlaceholder,
         D,
         AbsoluteBindingAddress,
-        K,
     >,
     unresolved: UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<ParserStageBlockNameResolution<E, D, K>, Vec<BlockNameConflict>>
+) -> Result<ParserStageBlockNameResolution<E, D>, Vec<BlockNameConflict>>
 where
     D: crate::parser::DeferredForPhaseTraversal<
             ParserPlaceholder,

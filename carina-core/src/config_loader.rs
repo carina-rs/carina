@@ -324,8 +324,8 @@ impl AuthoredBindingView {
         config: &ProviderContext,
     ) -> Result<Self, parser::ParseError> {
         let files = vec![(source_file.to_path_buf(), source.to_string())];
-        let parsed_files = parse_directory_files_located(&files, config)
-            .map_err(|located| (*located.error).into_parse_error())?;
+        let parsed_files =
+            parse_directory_files_located(&files, config).map_err(|located| *located.error)?;
         Ok(Self::from_directory_files(
             &parsed_files,
             <ParsedFile>::default(),
@@ -391,28 +391,39 @@ impl ModuleResolutionContext {
 /// [`Self::parsed`]; module resolution consumes this witness before applying
 /// root scope.
 #[derive(Debug, Clone)]
-pub struct RootDirectoryParse<
-    E = crate::parser::ParsedExportParam,
-    K: parser::BackendPhase = parser::StrictBackend,
-> {
-    parsed: crate::parser::UnexpandedFile<E, K>,
+pub struct RootDirectoryParse<E = crate::parser::ParsedExportParam> {
+    parsed: crate::parser::File<E>,
     resolution: ResolutionContext,
     verdict: CompleteDirectoryVerdict,
 }
 
-pub type ParsedRootDirectory<K = parser::StrictBackend> =
-    RootDirectoryParse<crate::parser::ParsedExportParam, K>;
-pub type InferredRootDirectory<K = parser::StrictBackend> =
-    RootDirectoryParse<crate::parser::InferredExportParam, K>;
+pub type ParsedRootDirectory = RootDirectoryParse<crate::parser::ParsedExportParam>;
+pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExportParam>;
 
 /// One sealed root snapshot with the directory authority for resolving its copy.
-pub struct InferredRootAnalysis<'a, K: parser::BackendPhase = parser::StrictBackend> {
-    root: &'a InferredRootDirectory<K>,
-    tree: crate::parser::UnexpandedAnalysis<'a, parser::InferredExportParam, K>,
+pub struct InferredRootAnalysis<'a> {
+    root: &'a InferredRootDirectory,
+    tree: crate::parser::AnalysisTree<
+        'a,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        crate::parser::ParsedDeferredForPhase,
+        crate::resource::RelativeBindingName,
+        parser::InferredExportParam,
+    >,
 }
 
-impl<'a, K: parser::BackendPhase> InferredRootAnalysis<'a, K> {
-    pub fn tree(&self) -> &crate::parser::UnexpandedAnalysis<'a, parser::InferredExportParam, K> {
+impl<'a> InferredRootAnalysis<'a> {
+    pub fn tree(
+        &self,
+    ) -> &crate::parser::AnalysisTree<
+        'a,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        crate::parser::ParsedDeferredForPhase,
+        crate::resource::RelativeBindingName,
+        parser::InferredExportParam,
+    > {
         &self.tree
     }
 
@@ -421,7 +432,7 @@ impl<'a, K: parser::BackendPhase> InferredRootAnalysis<'a, K> {
         self,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> (
-        InferredRootDirectory<K>,
+        InferredRootDirectory,
         crate::validation::FileTypeResolutionReport,
     ) {
         let (parsed, report) =
@@ -444,23 +455,18 @@ impl<'a, K: parser::BackendPhase> InferredRootAnalysis<'a, K> {
 /// it to normalize references using imported signatures, then re-judges the
 /// resulting file before checking require placement.
 #[derive(Clone)]
-pub struct AdmittedRootDirectory<
-    'a,
-    E = crate::parser::ParsedExportParam,
-    K: parser::BackendPhase = parser::StrictBackend,
-> {
+pub struct AdmittedRootDirectory<'a, E = crate::parser::ParsedExportParam> {
     judged: crate::parser::retained::JudgedFile<
         'a,
         E,
         crate::parser::ParsedDeferredForPhase,
         parser::RelativeBindingName,
-        K,
     >,
     resolution: ModuleResolutionContext,
     context: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 }
 
-impl<'a, E, K: parser::BackendPhase> AdmittedRootDirectory<'a, E, K> {
+impl<'a, E> AdmittedRootDirectory<'a, E> {
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -469,7 +475,6 @@ impl<'a, E, K: parser::BackendPhase> AdmittedRootDirectory<'a, E, K> {
             E,
             crate::parser::ParsedDeferredForPhase,
             parser::RelativeBindingName,
-            K,
         >,
         ModuleResolutionContext,
         &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
@@ -478,15 +483,13 @@ impl<'a, E, K: parser::BackendPhase> AdmittedRootDirectory<'a, E, K> {
     }
 }
 
-impl<E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder>, K: parser::BackendPhase>
-    RootDirectoryParse<E, K>
-{
+impl<E: crate::parser::ExportParamLike<crate::resource::ParserPlaceholder>> RootDirectoryParse<E> {
     /// Admit the retained require scopes and judge this exact loader snapshot.
     pub fn admit<'a>(
         self,
         schemas: &'a SchemaRegistry,
         context: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> AdmittedRootDirectory<'a, E, K> {
+    ) -> AdmittedRootDirectory<'a, E> {
         let resolution = self.module_resolution_context();
         AdmittedRootDirectory {
             judged: crate::parser::retained::JudgedFile::new(
@@ -594,23 +597,16 @@ enum FirstRootDeclaration {
     Provider,
     Backend,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendOwnership {
-    Sole,
-    Multiple,
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RootDeclarations {
     Provider(RootDeclaration<ProviderRoot>),
     Backend {
         backend: RootDeclaration<BackendRoot>,
-        ownership: BackendOwnership,
     },
     Both {
         first: FirstRootDeclaration,
         provider: RootDeclaration<ProviderRoot>,
         backend: RootDeclaration<BackendRoot>,
-        ownership: BackendOwnership,
     },
 }
 impl RootDeclaration<ProviderRoot> {
@@ -769,34 +765,14 @@ impl<U, T, N> DirectoryVerdict<U, T, N> {
 }
 
 impl RootDirectoryVerdict {
-    /// Whether exactly one readable inventory declaration owns the backend.
-    pub fn has_sole_backend(&self) -> bool {
-        match self.0.as_ref() {
-            RootDeclarations::Provider(_) => false,
-            RootDeclarations::Backend {
-                backend: _,
-                ownership,
-            }
-            | RootDeclarations::Both {
-                first: _,
-                provider: _,
-                backend: _,
-                ownership,
-            } => *ownership == BackendOwnership::Sole,
-        }
-    }
     pub fn evidence(&self) -> RootEvidence {
         match self.0.as_ref() {
             RootDeclarations::Provider(provider) => provider.evidence(),
-            RootDeclarations::Backend {
-                backend,
-                ownership: _,
-            } => backend.evidence(),
+            RootDeclarations::Backend { backend } => backend.evidence(),
             RootDeclarations::Both {
                 first,
                 provider,
                 backend,
-                ownership: _,
             } => match first {
                 FirstRootDeclaration::Provider => provider.evidence(),
                 FirstRootDeclaration::Backend => backend.evidence(),
@@ -810,25 +786,17 @@ impl RootDirectoryVerdict {
                 first: _,
                 provider,
                 backend: _,
-                ownership: _,
             } => Some(provider.evidence()),
-            RootDeclarations::Backend {
-                backend: _,
-                ownership: _,
-            } => None,
+            RootDeclarations::Backend { backend: _ } => None,
         }
     }
     pub fn backend_evidence(&self) -> Option<RootEvidence> {
         match self.0.as_ref() {
-            RootDeclarations::Backend {
-                backend,
-                ownership: _,
-            }
+            RootDeclarations::Backend { backend }
             | RootDeclarations::Both {
                 first: _,
                 provider: _,
                 backend,
-                ownership: _,
             } => Some(backend.evidence()),
             RootDeclarations::Provider(_) => None,
         }
@@ -847,10 +815,7 @@ impl RootDirectoryVerdict {
                 ModuleError::ProviderInModule.with_root_evidence(provider.evidence()),
                 vec![],
             ),
-            RootDeclarations::Backend {
-                backend,
-                ownership: _,
-            } => (
+            RootDeclarations::Backend { backend } => (
                 ModuleError::BackendInModule.with_root_evidence(backend.evidence()),
                 vec![],
             ),
@@ -858,7 +823,6 @@ impl RootDirectoryVerdict {
                 first: _,
                 provider,
                 backend,
-                ownership: _,
             } => (
                 ModuleError::ProviderInModule.with_root_evidence(provider.evidence()),
                 vec![ModuleError::BackendInModule.with_root_evidence(backend.evidence())],
@@ -1054,7 +1018,6 @@ impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
         let mut backend = None;
         let mut first = FirstRootDeclaration::Provider;
         let mut module_evidence = None;
-        let mut backend_count = 0;
         for (inventory, file) in self.inventories {
             for block in inventory.configuration_blocks() {
                 let module_declaration = |kind| ModuleEvidence {
@@ -1073,7 +1036,6 @@ impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
                         });
                     }
                     ConfigurationBlock::Backend => {
-                        backend_count += 1;
                         if provider.is_none() && backend.is_none() {
                             first = FirstRootDeclaration::Backend;
                         }
@@ -1104,29 +1066,23 @@ impl<C: InventoryCompleteness> DirectoryInventories<'_, C> {
                 }
             }
         }
-        let ownership = if backend_count == 1 {
-            BackendOwnership::Sole
-        } else {
-            BackendOwnership::Multiple
-        };
         let declarations = match (provider, backend) {
             (Some(provider), Some(backend)) => RootDeclarations::Both {
                 first,
                 provider,
                 backend,
-                ownership,
             },
             (Some(provider), None) => RootDeclarations::Provider(provider),
-            (None, Some(backend)) => RootDeclarations::Backend { backend, ownership },
+            (None, Some(backend)) => RootDeclarations::Backend { backend },
             (None, None) => return self.completeness.without_root(module_evidence),
         };
         DirectoryVerdict::Root(RootDirectoryVerdict(std::sync::Arc::new(declarations)))
     }
 }
 
-impl<E, K: parser::BackendPhase> RootDirectoryParse<E, K> {
+impl<E> RootDirectoryParse<E> {
     fn with_resolution(
-        parsed: crate::parser::UnexpandedFile<E, K>,
+        parsed: crate::parser::File<E>,
         resolution: ResolutionContext,
         verdict: CompleteDirectoryVerdict,
     ) -> Self {
@@ -1146,7 +1102,7 @@ impl<E, K: parser::BackendPhase> RootDirectoryParse<E, K> {
 
     pub(crate) fn try_update<F, T>(mut self, update: F) -> Result<Self, T>
     where
-        F: FnOnce(&mut crate::parser::UnexpandedFile<E, K>) -> Result<(), T>,
+        F: FnOnce(&mut crate::parser::File<E>) -> Result<(), T>,
     {
         update(&mut self.parsed)?;
         Ok(self)
@@ -1156,18 +1112,18 @@ impl<E, K: parser::BackendPhase> RootDirectoryParse<E, K> {
         self.verdict.clone()
     }
 
-    pub fn parsed(&self) -> &crate::parser::UnexpandedFile<E, K> {
+    pub fn parsed(&self) -> &crate::parser::File<E> {
         &self.parsed
     }
 
-    pub fn into_parsed(self) -> crate::parser::UnexpandedFile<E, K> {
+    pub fn into_parsed(self) -> crate::parser::File<E> {
         self.parsed
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     /// Preserve an already-issued verdict, or load the fixture's real sibling
     /// inventories. Synthetic AST-only tests may supply no authored blocks.
-    pub fn from_parsed_for_test(parsed: crate::parser::UnexpandedFile<E, K>) -> Self
+    pub fn from_parsed_for_test(parsed: crate::parser::File<E>) -> Self
     where
         E: crate::parser::ExportParamLike,
     {
@@ -1177,10 +1133,7 @@ impl<E, K: parser::BackendPhase> RootDirectoryParse<E, K> {
     #[cfg(any(test, feature = "test-utils"))]
     /// Admit a source-backed unit fixture through a real sibling inventory,
     /// preserving the AST's original labels and transformations.
-    pub fn from_parsed_source_for_test(
-        parsed: crate::parser::UnexpandedFile<E, K>,
-        source: &str,
-    ) -> Self
+    pub fn from_parsed_source_for_test(parsed: crate::parser::File<E>, source: &str) -> Self
     where
         E: crate::parser::ExportParamLike,
     {
@@ -1188,10 +1141,7 @@ impl<E, K: parser::BackendPhase> RootDirectoryParse<E, K> {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    fn from_test_fixture(
-        parsed: crate::parser::UnexpandedFile<E, K>,
-        authored_source: Option<&str>,
-    ) -> Self
+    fn from_test_fixture(parsed: crate::parser::File<E>, authored_source: Option<&str>) -> Self
     where
         E: crate::parser::ExportParamLike,
     {
@@ -1250,7 +1200,7 @@ impl<E, K: parser::BackendPhase> RootDirectoryParse<E, K> {
     #[cfg(any(test, feature = "test-utils"))]
     /// Pair test AST transformations with the real directory that authored them.
     pub fn from_parsed_in_directory_for_test(
-        mut parsed: crate::parser::UnexpandedFile<E, K>,
+        mut parsed: crate::parser::File<E>,
         directory: &ResolvedPath,
     ) -> Self
     where
@@ -1291,8 +1241,8 @@ impl<E, K: parser::BackendPhase> RootDirectoryParse<E, K> {
     }
 }
 
-impl<K: parser::BackendPhase> RootDirectoryParse<crate::parser::InferredExportParam, K> {
-    pub fn analysis(&self) -> Result<InferredRootAnalysis<'_, K>, parser::AnalysisTreeError> {
+impl RootDirectoryParse<crate::parser::InferredExportParam> {
+    pub fn analysis(&self) -> Result<InferredRootAnalysis<'_>, parser::AnalysisTreeError> {
         Ok(InferredRootAnalysis {
             root: self,
             tree: parser::AnalysisTree::try_from_file(&self.parsed)?,
@@ -1336,67 +1286,7 @@ impl<K: parser::BackendPhase> RootDirectoryParse<crate::parser::InferredExportPa
     }
 }
 
-impl<E: parser::ExportParamLike + Clone> RootDirectoryParse<E, parser::AuthoredBackend> {
-    pub fn evaluate_backend_in_session(
-        self,
-        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Result<RootDirectoryParse<E>, parser::AnalysisResolutionError> {
-        let parsed = parser::evaluate_file_backend::<parser::StrictBackend, _>(
-            self.parsed,
-            session.catalog(),
-            Some(session),
-            self.resolution,
-        )
-        .map_err(parser::AnalysisResolutionError::from_parse_failure)?;
-        Ok(RootDirectoryParse::with_resolution(
-            parsed,
-            self.resolution,
-            self.verdict,
-        ))
-    }
-}
-
-impl<E: parser::ExportParamLike + Clone> RootDirectoryParse<E, parser::RetainedBackend> {
-    /// Demand a new strict backend evaluation from its authored operands and the
-    /// caller's session. Retained outcomes, including failures, are never inputs.
-    pub fn evaluate_backend_in_session(
-        self,
-        session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Result<RootDirectoryParse<E>, parser::AnalysisResolutionError> {
-        let mut file = self.parsed;
-        let backend = file
-            .backend
-            .take()
-            .map(|retained| {
-                let authored = parser::BackendConfig::<
-                    crate::resource::ParserPlaceholder,
-                    crate::resource::RelativeBindingName,
-                    parser::AuthoredBackend,
-                > {
-                    backend_type: retained.backend_type,
-                    attributes: retained.source.0,
-                    attribute_spans: retained.attribute_spans,
-                    source: (),
-                };
-                parser::evaluate_backend_in_scope::<parser::StrictBackend, _, _>(
-                    authored,
-                    &file,
-                    session.catalog(),
-                    Some(session),
-                    self.resolution.strict_recheck(),
-                )
-            })
-            .transpose()
-            .map_err(parser::AnalysisResolutionError::from_parse_failure)?;
-        Ok(RootDirectoryParse::with_resolution(
-            file.map_backend_phase(|_| backend),
-            self.resolution.strict_recheck(),
-            self.verdict,
-        ))
-    }
-}
-
-impl<E: parser::ExportParamLike + Clone, K: parser::BackendPhase> RootDirectoryParse<E, K> {
+impl<E: parser::ExportParamLike + Clone> RootDirectoryParse<E> {
     /// Resolve root-relative resource references while preserving this witness.
     pub fn resolve_resource_refs_in_session(
         &mut self,
@@ -1413,7 +1303,7 @@ impl<E: parser::ExportParamLike + Clone, K: parser::BackendPhase> RootDirectoryP
     }
 }
 
-impl<E, K: parser::BackendPhase> RootDirectoryParse<E, K> {
+impl<E> RootDirectoryParse<E> {
     pub fn resolve_provider_unresolved_attributes(
         &mut self,
         config: &ProviderContext,
@@ -1426,8 +1316,8 @@ impl<E, K: parser::BackendPhase> RootDirectoryParse<E, K> {
     }
 }
 
-impl<E, K: parser::BackendPhase> std::ops::Deref for RootDirectoryParse<E, K> {
-    type Target = crate::parser::UnexpandedFile<E, K>;
+impl<E> std::ops::Deref for RootDirectoryParse<E> {
+    type Target = crate::parser::File<E>;
 
     fn deref(&self) -> &Self::Target {
         self.parsed()
@@ -1451,10 +1341,10 @@ impl<E, K: parser::BackendPhase> std::ops::Deref for RootDirectoryParse<E, K> {
 /// the static-analysis pipeline and report them together with downstream
 /// findings (#2102). Blocking errors (bad parse, missing modules) still
 /// come back as `Err` from the loader.
-pub struct LoadedConfig<K: parser::BackendPhase = parser::StrictBackend> {
+pub struct LoadedConfig {
     /// Post-inference file: every export carries its origin and any typed
     /// unchecked reason directly on the parameter.
-    pub parsed: InferredRootDirectory<K>,
+    pub parsed: InferredRootDirectory,
     /// Values built from the directory parser's per-file output, after its
     /// static evaluation. That evaluation folds only fully static expressions
     /// and never folds a reference to a resource binding. This view is captured
@@ -1485,24 +1375,6 @@ pub struct LoadedConfig<K: parser::BackendPhase = parser::StrictBackend> {
 
 /// A source buffer loaded for analysis with the caller's available schemas.
 /// Its file and report are produced together, just like a directory load.
-/// Availability of the buffer's directory evaluation scope.
-#[derive(Debug, Clone)]
-pub enum BufferBackendScope {
-    Resolved,
-    Deferred(std::sync::Arc<parser::ParseError>),
-}
-
-enum SnapshotBackendScope {
-    Resolved(Box<ParsedFile>),
-    BindingsDeferred {
-        functions: IndexMap<String, parser::UserFunction>,
-        cause: std::sync::Arc<parser::ParseError>,
-    },
-    Unavailable {
-        cause: std::sync::Arc<parser::ParseError>,
-    },
-}
-
 pub struct BufferConfiguration<
     'a,
     E = crate::parser::ParsedExportParam,
@@ -1511,18 +1383,11 @@ pub struct BufferConfiguration<
         crate::resource::RelativeBindingName,
     >,
     B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
-    K: parser::BackendPhase = parser::RetainedBackend,
 > {
-    judged: crate::parser::retained::JudgedFile<'a, E, D, B, K>,
-    backend_scope: BufferBackendScope,
+    judged: crate::parser::retained::JudgedFile<'a, E, D, B>,
 }
 
-impl<E, D, B: crate::resource::BindingAddress, K: parser::BackendPhase>
-    BufferConfiguration<'_, E, D, B, K>
-{
-    pub fn backend_scope(&self) -> &BufferBackendScope {
-        &self.backend_scope
-    }
+impl<E, D, B: crate::resource::BindingAddress> BufferConfiguration<'_, E, D, B> {
     pub fn parsed(
         &self,
     ) -> &crate::parser::File<
@@ -1531,11 +1396,10 @@ impl<E, D, B: crate::resource::BindingAddress, K: parser::BackendPhase>
         crate::resource::ParserPlaceholder,
         D,
         B,
-        K,
     > {
         self.judged.file()
     }
-    pub fn judged(&self) -> &crate::parser::retained::JudgedFile<'_, E, D, B, K> {
+    pub fn judged(&self) -> &crate::parser::retained::JudgedFile<'_, E, D, B> {
         &self.judged
     }
 }
@@ -1545,7 +1409,6 @@ pub fn load_buffer_configuration<
     E: Clone + crate::parser::ExportParamLike<crate::resource::ParserPlaceholder, B>,
     D,
     B: crate::resource::BindingAddress,
-    K: crate::parser::BackendPhase,
 >(
     parsed: &crate::parser::File<
         E,
@@ -1553,11 +1416,10 @@ pub fn load_buffer_configuration<
         crate::resource::ParserPlaceholder,
         D,
         B,
-        K,
     >,
     schemas: &'a SchemaRegistry,
     config: &ProviderContext,
-) -> BufferConfiguration<'a, E, D, B, K>
+) -> BufferConfiguration<'a, E, D, B>
 where
     D: Clone
         + crate::parser::DeferredForPhaseTraversal<
@@ -1568,7 +1430,6 @@ where
 {
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed.clone(), schemas, config),
-        backend_scope: BufferBackendScope::Resolved,
     }
 }
 
@@ -1602,12 +1463,10 @@ impl ParsedSourceBuffer {
 
 struct SnapshotSource {
     file: ResolvedPath,
-    text: Option<std::sync::Arc<str>>,
     inventory: Option<parser::SyntaxInventory>,
 }
 
 struct SnapshotBufferMember {
-    index: usize,
     buffer: ParsedSourceBuffer,
 }
 
@@ -1647,7 +1506,7 @@ impl DirectoryBufferSnapshot {
         let files = DirectoryFiles::discover(directory, &overrides).map_err(|error| {
             DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error))
         })?;
-        let index = files
+        files
             .paths
             .iter()
             .position(|file| file.identity() == pinned.identity())
@@ -1677,52 +1536,13 @@ impl DirectoryBufferSnapshot {
                         parser::parse_syntax_inventory(text, &file.source_label()).ok()
                     })
                 };
-                SnapshotSource {
-                    file,
-                    text,
-                    inventory,
-                }
+                SnapshotSource { file, inventory }
             })
             .collect();
         Ok(Self {
             sources,
-            member: SnapshotBufferMember { index, buffer },
+            member: SnapshotBufferMember { buffer },
         })
-    }
-
-    fn backend_scope(&self, config: &ProviderContext) -> SnapshotBackendScope {
-        let sources = self
-            .sources
-            .iter()
-            .enumerate()
-            .filter_map(|(index, source)| {
-                source.inventory.as_ref()?;
-                let label = if index == self.member.index {
-                    self.member.buffer.file.path().to_path_buf()
-                } else {
-                    source.file.source_label()
-                };
-                Some((label, source.text.as_ref()?.to_string()))
-            })
-            .collect::<Vec<_>>();
-        match parse_directory_files(&sources, config) {
-            Ok(files) => {
-                let mut scope: ParsedFile = Default::default();
-                for (_, member) in files {
-                    merge_parsed_file(&mut scope, member.into_inner());
-                }
-                SnapshotBackendScope::Resolved(Box::new(scope))
-            }
-            Err(cause) => match parser::top_level_user_functions_in_files(&sources, config) {
-                Ok(functions) => SnapshotBackendScope::BindingsDeferred {
-                    functions,
-                    cause: std::sync::Arc::new(cause),
-                },
-                Err(cause) => SnapshotBackendScope::Unavailable {
-                    cause: std::sync::Arc::new(cause),
-                },
-            },
-        }
     }
 
     fn require_scope(&self) -> DirectoryRequireScope {
@@ -1762,84 +1582,17 @@ impl DirectoryBufferSnapshot {
 
 /// Judge the buffer parsed from the exact member text of this sealed snapshot.
 /// Readable authored root evidence decides Root even with unavailable siblings.
-/// Without it, incomplete knowledge defers placement and schema checks.
+/// Without it, incomplete knowledge defers only placement checks.
 pub fn load_buffer_configuration_in_directory<'a>(
     snapshot: DirectoryBufferSnapshot,
     schemas: &'a SchemaRegistry,
     config: &ProviderContext,
 ) -> BufferConfiguration<'a> {
-    load_buffer_configuration_in_directory_with_session(snapshot, schemas, config, None)
-}
-
-pub fn load_buffer_configuration_in_directory_in_session<'a>(
-    snapshot: DirectoryBufferSnapshot,
-    schemas: &'a SchemaRegistry,
-    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-) -> BufferConfiguration<'a> {
-    load_buffer_configuration_in_directory_with_session(
-        snapshot,
-        schemas,
-        session.catalog(),
-        Some(session),
-    )
-}
-
-fn load_buffer_configuration_in_directory_with_session<'a>(
-    snapshot: DirectoryBufferSnapshot,
-    schemas: &'a SchemaRegistry,
-    config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-) -> BufferConfiguration<'a> {
     let require_scope = snapshot.require_scope();
-    let scope = snapshot.backend_scope(config);
-    let mut authored = snapshot.member.buffer.parsed().clone();
-    let backend = authored.backend.take();
-    let (backend, backend_scope) = match scope {
-        SnapshotBackendScope::Resolved(scope) => (
-            backend.map(|backend| {
-                parser::evaluate_backend_with_scope::<parser::RetainedBackend>(
-                    backend,
-                    &parser::BackendScope::complete(&scope),
-                    config,
-                    session,
-                    diagnostics_resolution_context(),
-                )
-                .unwrap_or_else(|never| match never {})
-            }),
-            BufferBackendScope::Resolved,
-        ),
-        SnapshotBackendScope::BindingsDeferred { functions, cause } => (
-            backend.map(|backend| {
-                parser::evaluate_backend_with_scope::<parser::RetainedBackend>(
-                    backend,
-                    &parser::BackendScope::deferred(&functions),
-                    config,
-                    session,
-                    diagnostics_resolution_context(),
-                )
-                .unwrap_or_else(|never| match never {})
-            }),
-            BufferBackendScope::Deferred(cause),
-        ),
-        SnapshotBackendScope::Unavailable { cause } => (
-            backend.map(|backend| {
-                parser::evaluate_backend_with_scope::<parser::RetainedBackend>(
-                    backend,
-                    &parser::BackendScope::unavailable(&IndexMap::new()),
-                    config,
-                    session,
-                    diagnostics_resolution_context(),
-                )
-                .unwrap_or_else(|never| match never {})
-            }),
-            BufferBackendScope::Deferred(cause),
-        ),
-    };
-    let mut parsed = parser::assemble_evaluated_backend(authored, backend);
+    let mut parsed = snapshot.member.buffer.parsed().clone();
     crate::parser::retained::set_directory_require_scope(&mut parsed, require_scope);
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
-        backend_scope,
     }
 }
 
@@ -1859,35 +1612,18 @@ pub fn load_buffer_configuration_without_directory<'a>(
     .issue()
     .for_retained_nodes();
     let mut parsed = buffer.parsed().clone();
-    let backend = parsed.backend.take().map(|backend| {
-        parser::evaluate_backend_with_scope::<parser::RetainedBackend>(
-            backend,
-            &parser::BackendScope::unavailable(&IndexMap::new()),
-            config,
-            Some(session),
-            diagnostics_resolution_context(),
-        )
-        .unwrap_or_else(|never| match never {})
-    });
-    let mut parsed = parser::assemble_evaluated_backend(parsed, backend);
     crate::parser::retained::set_directory_require_scope(
         &mut parsed,
         DirectoryRequireScope(verdict),
     );
     Ok(BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
-        backend_scope: BufferBackendScope::Deferred(std::sync::Arc::new(
-            parser::ParseError::InternalError {
-                expected: "directory evaluation scope".into(),
-                context: "isolated buffer".into(),
-            },
-        )),
     })
 }
 
-impl<K: parser::BackendPhase> LoadedConfig<K> {
+impl LoadedConfig {
     /// Cross root binding resolution without expanding module calls.
-    pub fn into_root_expanded(self) -> crate::parser::RootBindingResolvedInferredFile<K> {
+    pub fn into_root_expanded(self) -> crate::parser::RootBindingResolvedInferredFile {
         crate::module_resolver::expand_root_directory_file(self.parsed.into_parsed())
     }
 }
@@ -2031,16 +1767,9 @@ fn duplicate_groups(occurrences: DeclarationGroups) -> Vec<DuplicateDeclaration>
 /// This is the degraded-mode counterpart to directory extraction for editors:
 /// it cannot diagnose cross-file collisions, but it preserves same-block
 /// diagnostics when an unrelated sibling fails to parse.
-pub fn find_duplicate_declarations_in_analysis<K: crate::parser::BackendPhase>(
+pub fn find_duplicate_declarations_in_analysis(
     file_name: &Path,
-    tree: &crate::parser::UnexpandedAnalysis<
-        '_,
-        crate::parser::ParsedExportParam<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >,
-        K,
-    >,
+    tree: &crate::parser::AnalysisTree<'_>,
 ) -> Vec<DuplicateDeclaration> {
     let mut occurrences = BTreeMap::new();
     collect_inventory_declarations(file_name, tree.syntax(), &mut occurrences);
@@ -2251,7 +1980,7 @@ pub fn load_configuration_for_metadata(
     path: &ResolvedPath,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
-) -> Result<LoadedConfig<parser::RetainedBackend>, String> {
+) -> Result<LoadedConfig, String> {
     load_configuration_in_context(
         path,
         config,
@@ -2261,22 +1990,18 @@ pub fn load_configuration_for_metadata(
     .map_err(|error| error.to_string())
 }
 
-impl<K: parser::BackendPhase> LoadedConfig<K> {
+impl LoadedConfig {
     /// Reuse this directory's parsed source for upstream export discovery,
     /// retaining metadata-only demand rather than evaluating upstream values.
     pub fn upstream_export_source(
         &self,
         catalog: &ProviderContext,
         schemas: &SchemaRegistry,
-    ) -> Result<ParsedRootDirectory<parser::RetainedBackend>, String> {
+    ) -> Result<ParsedRootDirectory, String> {
         let resolution = ResolutionContext::issue(ResolutionPhase::Bootstrap).metadata_only();
         let mut parsed = self.unresolved_parsed.parsed.clone();
         parser::resolve_resource_refs_in_context(&mut parsed, catalog, None, resolution)
             .map_err(|error| error.to_string())?;
-        let mut parsed = parser::evaluate_file_backend::<parser::RetainedBackend, _>(
-            parsed, catalog, None, resolution,
-        )
-        .unwrap_or_else(|never| match never {});
         crate::parser::retained::judge_configuration(&mut parsed, schemas, catalog);
         Ok(RootDirectoryParse::with_resolution(
             parsed,
@@ -2320,35 +2045,27 @@ impl ConfigurationLoadFailure {
     }
 
     fn located(located: LocatedParseError, fallback: &Path) -> Self {
-        let message = located.render(fallback);
-        let (kind, error) = Self::classify(*located.error);
         Self {
-            kind,
-            message,
+            kind: if located.backend {
+                ConfigurationLoadFailureKind::BackendInput
+            } else {
+                ConfigurationLoadFailureKind::Configuration
+            },
+            message: located.render(fallback),
             diagnostics: vec![ConfigurationLoadDiagnostic::Parse {
                 file: located.source_file,
-                error: Box::new(error),
+                error: located.error,
             }],
         }
     }
 
-    fn classify(
-        failure: parser::RootInputFailure,
-    ) -> (ConfigurationLoadFailureKind, parser::ParseError) {
-        match failure {
-            parser::RootInputFailure::Backend(error) => {
-                (ConfigurationLoadFailureKind::BackendInput, error)
-            }
-            parser::RootInputFailure::Value(error) => {
-                (ConfigurationLoadFailureKind::Configuration, error)
-            }
-        }
-    }
-
-    fn parse(failure: parser::RootInputFailure) -> Self {
-        let (kind, error) = Self::classify(failure);
+    fn parse(error: parser::ParseError, backend: bool) -> Self {
         Self {
-            kind,
+            kind: if backend {
+                ConfigurationLoadFailureKind::BackendInput
+            } else {
+                ConfigurationLoadFailureKind::Configuration
+            },
             message: error.to_string(),
             diagnostics: vec![ConfigurationLoadDiagnostic::Parse {
                 file: error.source_file().map(Path::to_path_buf),
@@ -2389,8 +2106,8 @@ impl From<String> for ConfigurationLoadFailure {
     }
 }
 
-/// Retain ordinary secret candidates while demanding a strict backend.
-/// A saved-plan reload cannot carry a failed backend into selection.
+/// Retain current candidate failures for typed, located saved-plan secret
+/// verification. This phase grants no plan/apply readiness.
 pub fn load_configuration_for_saved_rehydration(
     path: &ResolvedPath,
     config: &ProviderContext,
@@ -2404,12 +2121,12 @@ pub fn load_configuration_for_saved_rehydration(
     )
 }
 
-fn load_configuration_in_context<K: parser::BackendEvaluationPhase>(
+fn load_configuration_in_context(
     path: &ResolvedPath,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
     resolution: ResolutionContext,
-) -> Result<LoadedConfig<K>, ConfigurationLoadFailure> {
+) -> Result<LoadedConfig, ConfigurationLoadFailure> {
     let resolved = path.clone();
     let path_label = resolved.source_label();
     let path = path_label.as_path();
@@ -2453,49 +2170,25 @@ fn load_configuration_in_context<K: parser::BackendEvaluationPhase>(
             AuthoredBindingView::from_directory_files(&parsed_files, parsed_files.empty_assembly());
         let duplicate_declarations = find_duplicate_declarations(path, &parsed_files);
 
-        let mut scope = parsed_files.empty_assembly();
-        for (_, file) in parsed_files.iter() {
-            merge_parsed_file(&mut scope, file.parsed.clone());
-        }
-        let mut merged =
-            parser::assemble_evaluated_backend::<_, K>(parsed_files.empty_assembly(), None);
+        let mut merged = parsed_files.empty_assembly();
         let mut unresolved_merged = parsed_files.empty_assembly();
         let mut parse_errors: Vec<ConfigurationLoadFailure> = Vec::new();
         let mut backend_file: Option<ResolvedPath> = None;
 
-        for (file, resolved) in parsed_files {
-            let io_file = resolved.source.clone();
-            let authored = resolved.into_inner();
-            let mut unresolved = authored.clone();
-            let mut parsed = parser::evaluate_file_backend_in_scope::<K, _, _, _>(
-                authored, &scope, config, None, resolution,
-            )
-            .map_err(|failure| {
-                ConfigurationLoadFailure::located(
-                    LocatedParseError::in_input_file(&file, K::failure(failure)),
-                    path,
-                )
-            })?;
-            match parser::resolve_resource_refs_with_backend_failure(
+        for ((file, resolved), (io_file, _)) in parsed_files.into_iter().zip(inputs.sources) {
+            let mut parsed = resolved.into_inner();
+            let mut unresolved = parsed.clone();
+            if let Err(e) = parser::resolve_resource_refs_with_backend_failure(
                 &mut parsed,
                 config,
                 None,
                 snapshot_resolution_context(resolution),
             ) {
-                Ok(()) => {}
-                Err(failure @ parser::RootInputFailure::Backend(_)) => {
-                    return Err(ConfigurationLoadFailure::located(
-                        LocatedParseError::in_input_file(&file, failure),
-                        path,
-                    ));
-                }
-                Err(failure @ parser::RootInputFailure::Value(_)) => {
-                    parse_errors.push(ConfigurationLoadFailure::located(
-                        LocatedParseError::in_input_file(&file, failure),
-                        path,
-                    ));
-                    continue;
-                }
+                let is_backend = e.is_backend();
+                let mut located = LocatedParseError::in_file(&file, e.into_parse_error());
+                located.backend = is_backend;
+                parse_errors.push(ConfigurationLoadFailure::located(located, path));
+                continue;
             }
 
             // The legacy form unrolled both `merge_parsed_file` calls
@@ -2557,16 +2250,18 @@ fn load_configuration_in_context<K: parser::BackendEvaluationPhase>(
             None,
             resolution,
         ) {
-            return Err(ConfigurationLoadFailure::parse(e));
+            let backend = e.is_backend();
+            return Err(ConfigurationLoadFailure::parse(
+                e.into_parse_error(),
+                backend,
+            ));
         }
         if let Err(e) = parser::resolve_snapshot_function_calls_in_context(
             &mut unresolved_merged,
             config,
             snapshot_resolution_context(resolution),
         ) {
-            return Err(ConfigurationLoadFailure::parse(
-                parser::RootInputFailure::Value(e),
-            ));
+            return Err(ConfigurationLoadFailure::parse(e, false));
         }
 
         // `finalize_provider_configs` is intentionally NOT called here.
@@ -2618,7 +2313,6 @@ pub fn parse_directory_for_bootstrap(
         &IndexMap::new(),
         ResolutionContext::issue(ResolutionPhase::Bootstrap),
         &SchemaRegistry::new(),
-        None,
     )
     .map(|result| result.parsed)
     .map_err(|error| error.to_string())
@@ -2630,7 +2324,7 @@ pub fn parse_directory_for_metadata(
     config: &ProviderContext,
     overrides: &IndexMap<String, String>,
     schemas: &SchemaRegistry,
-) -> Result<ParsedRootDirectory<parser::RetainedBackend>, String> {
+) -> Result<ParsedRootDirectory, String> {
     parse_directory_for_metadata_report(dir, config, overrides, schemas)
         .map_err(|error| error.to_string())
 }
@@ -2641,7 +2335,7 @@ pub fn parse_directory_for_metadata_report(
     config: &ProviderContext,
     overrides: &IndexMap<String, String>,
     schemas: &SchemaRegistry,
-) -> Result<ParsedRootDirectory<parser::RetainedBackend>, DirectoryParseFailure> {
+) -> Result<ParsedRootDirectory, DirectoryParseFailure> {
     parse_directory_for_metadata_with_source_overrides_report(
         dir,
         config,
@@ -2656,14 +2350,13 @@ pub fn parse_directory_for_metadata_with_source_overrides_report(
     config: &ProviderContext,
     overrides: &SourceOverrides,
     schemas: &SchemaRegistry,
-) -> Result<ParsedRootDirectory<parser::RetainedBackend>, DirectoryParseFailure> {
+) -> Result<ParsedRootDirectory, DirectoryParseFailure> {
     parse_directory_with_overrides_impl(
         dir,
         config,
         overrides,
         ResolutionContext::issue(ResolutionPhase::Bootstrap).metadata_only(),
         schemas,
-        None,
     )
     .map(|result| result.parsed)
 }
@@ -2685,7 +2378,6 @@ pub fn parse_directory_with_overrides(
         &filename_source_overrides(dir, overrides),
         strict_resolution_context(),
         &SchemaRegistry::new(),
-        None,
     )
     .map(|result| result.parsed)
     .map_err(|error| error.to_string())
@@ -2693,18 +2385,21 @@ pub fn parse_directory_with_overrides(
 
 /// Directory parse result for editor and other non-blocking consumers that
 /// need the merged AST together with load-seam diagnostics.
-pub struct DirectoryParseResult<K: parser::BackendPhase = parser::RetainedBackend> {
-    pub parsed: ParsedRootDirectory<K>,
+pub struct DirectoryParseResult {
+    pub parsed: ParsedRootDirectory,
     /// A merged view of the directory parser's per-file output, after its
     /// static evaluation and before reference resolution.
     pub authored_bindings: AuthoredBindingView,
     pub duplicate_declarations: Vec<DuplicateDeclaration>,
     /// Exact source inputs used for the parse, including in-memory overrides.
     pub source_files: Vec<(ResolvedPath, String)>,
+    /// Source file that owns the backend when the directory has exactly one.
+    /// `None` means the directory has either zero or multiple backend blocks.
+    pub sole_backend_file: Option<PathBuf>,
     /// Per-file ASTs after directory seed resolution, retained for editor
     /// diagnostics that need the correctly classified value while anchoring a
     /// message in one authored file. Empty on non-diagnostic load paths.
-    semantic_files: Vec<(PathBuf, ParsedFile<K>)>,
+    semantic_files: Vec<(PathBuf, ParsedFile)>,
 }
 
 /// A directory parse failure with source ownership retained for editor
@@ -2844,15 +2539,15 @@ impl DirectoryParseFailure {
     }
 }
 
-impl<K: parser::BackendPhase> DirectoryParseResult<K> {
-    pub fn semantic_file(&self, path: &Path) -> Option<&ParsedFile<K>> {
+impl DirectoryParseResult {
+    pub fn semantic_file(&self, path: &Path) -> Option<&ParsedFile> {
         self.semantic_files
             .iter()
             .find_map(|(candidate, parsed)| (candidate == path).then_some(parsed))
     }
 
     /// Cross root binding resolution for the merged directory parse.
-    pub fn root_expanded(&self) -> crate::parser::RootBindingResolvedParsedFile<K> {
+    pub fn root_expanded(&self) -> crate::parser::RootBindingResolvedParsedFile {
         crate::module_resolver::expand_root_directory_file(self.parsed.parsed().clone())
     }
 
@@ -2860,7 +2555,7 @@ impl<K: parser::BackendPhase> DirectoryParseResult<K> {
     pub fn root_expanded_semantic_file(
         &self,
         path: &Path,
-    ) -> Option<crate::parser::RootBindingResolvedParsedFile<K>> {
+    ) -> Option<crate::parser::RootBindingResolvedParsedFile> {
         self.semantic_file(path)
             .cloned()
             .map(crate::module_resolver::expand_root_directory_file)
@@ -2882,7 +2577,6 @@ pub fn parse_directory_with_overrides_and_diagnostics(
         &filename_source_overrides(dir, overrides),
         diagnostics_resolution_context(),
         &SchemaRegistry::new(),
-        None,
     )
 }
 
@@ -2913,35 +2607,16 @@ pub fn parse_directory_with_source_overrides_and_diagnostics_with_schemas(
         overrides,
         diagnostics_resolution_context(),
         schemas,
-        None,
     )
 }
 
-/// Evaluate each backend once with the editor caller's complete session and scope.
-pub fn parse_directory_with_source_overrides_and_diagnostics_in_session(
-    dir: &ResolvedPath,
-    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    overrides: &SourceOverrides,
-    schemas: &SchemaRegistry,
-) -> Result<DirectoryParseResult, DirectoryParseFailure> {
-    parse_directory_with_overrides_impl(
-        dir,
-        session.catalog(),
-        overrides,
-        diagnostics_resolution_context(),
-        schemas,
-        Some(session),
-    )
-}
-
-fn parse_directory_with_overrides_impl<K: parser::BackendEvaluationPhase>(
+fn parse_directory_with_overrides_impl(
     dir: &ResolvedPath,
     config: &ProviderContext,
     overrides: &SourceOverrides,
     resolution: ResolutionContext,
     schemas: &SchemaRegistry,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-) -> Result<DirectoryParseResult<K>, DirectoryParseFailure> {
+) -> Result<DirectoryParseResult, DirectoryParseFailure> {
     let resolved = dir.clone();
     let dir_label = resolved.source_label();
     let dir = dir_label.as_path();
@@ -2970,7 +2645,7 @@ fn parse_directory_with_overrides_impl<K: parser::BackendEvaluationPhase>(
                 DirectoryParseFailureKind::Parse {
                     location,
                     source_file: located.source_file,
-                    error: Box::new((*located.error).into_parse_error()),
+                    error: located.error,
                 },
             ));
         }
@@ -2979,17 +2654,6 @@ fn parse_directory_with_overrides_impl<K: parser::BackendEvaluationPhase>(
     let authored_bindings =
         AuthoredBindingView::from_directory_files(&parsed_files, parsed_files.empty_assembly());
     let duplicate_declarations = find_duplicate_declarations(dir, &parsed_files);
-    let mut merged = parsed_files.empty_assembly();
-    for (_, resolved) in parsed_files.iter() {
-        merge_parsed_file(&mut merged, resolved.parsed.clone());
-    }
-
-    // Resolve cross-file references on the merged result
-    let resolve_result =
-        parser::resolve_resource_refs_in_context(&mut merged, config, session, resolution);
-    if let Err(failure) = resolve_result {
-        return Err(DirectoryParseFailure::from_parse_error(failure));
-    }
     let semantic_files = if resolution.is_diagnostics() {
         parsed_files
             .iter()
@@ -3005,16 +2669,16 @@ fn parse_directory_with_overrides_impl<K: parser::BackendEvaluationPhase>(
                 semantic
                     .parser_binding_metadata
                     .retain(|name| resolved.local_variable_names.contains(name.as_str()));
-                if let Err(error) = parser::resolve_resource_refs_in_context(
-                    &mut semantic,
-                    config,
-                    session,
-                    resolution,
-                ) {
-                    return Err(DirectoryParseFailure::from_parse_error(
-                        error.in_file(path.clone()),
-                    ));
-                }
+                parser::resolve_resource_refs_for_diagnostics(&mut semantic, config).map_err(
+                    |error| {
+                        let located = LocatedParseError::in_file(path, error);
+                        DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
+                            location: located.source_file.clone().unwrap_or_else(|| path.clone()),
+                            source_file: located.source_file,
+                            error: located.error,
+                        })
+                    },
+                )?;
                 Ok((path.clone(), semantic))
             })
             .collect::<Result<Vec<_>, DirectoryParseFailure>>()?
@@ -3022,35 +2686,28 @@ fn parse_directory_with_overrides_impl<K: parser::BackendEvaluationPhase>(
         Vec::new()
     };
 
-    let (mut merged, semantic_files) = if resolution.is_diagnostics() {
-        let semantic_files = semantic_files
-            .into_iter()
-            .map(|(path, parsed)| {
-                parser::evaluate_file_backend_in_scope::<K, _, _, _>(
-                    parsed, &merged, config, session, resolution,
-                )
-                .map(|parsed| (path, parsed))
-                .map_err(|failure| {
-                    DirectoryParseFailure::from_parse_error(K::failure(failure).into_parse_error())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let backend = semantic_files
-            .iter()
-            .rev()
-            .find_map(|(_, file)| file.backend.clone());
-        (
-            parser::assemble_evaluated_backend(merged, backend),
-            semantic_files,
-        )
-    } else {
-        let merged = parser::evaluate_file_backend::<K, _>(merged, config, session, resolution)
-            .map_err(|failure| {
-                DirectoryParseFailure::from_parse_error(K::failure(failure).into_parse_error())
-            })?;
-        (merged, Vec::new())
-    };
+    let mut merged = parsed_files.empty_assembly();
+    let mut saw_backend = false;
+    let mut sole_backend_file = None;
+    for (file, resolved) in parsed_files {
+        let parsed = resolved.into_inner();
+        if parsed.backend.is_some() {
+            if saw_backend {
+                sole_backend_file = None;
+            } else {
+                saw_backend = true;
+                sole_backend_file = Some(file.clone());
+            }
+        }
+        merge_parsed_file(&mut merged, parsed);
+    }
 
+    // Resolve cross-file references on the merged result
+    let resolve_result =
+        parser::resolve_resource_refs_in_context(&mut merged, config, None, resolution);
+    if let Err(error) = resolve_result {
+        return Err(DirectoryParseFailure::from_parse_error(error));
+    }
     // `finalize_provider_configs` is intentionally NOT called here. The
     // merged result is pre-module-expansion; deferred provider
     // attributes that reference module-call bindings cannot be resolved
@@ -3073,6 +2730,7 @@ fn parse_directory_with_overrides_impl<K: parser::BackendEvaluationPhase>(
         authored_bindings,
         duplicate_declarations,
         source_files: inputs.sources,
+        sole_backend_file,
         semantic_files,
     })
 }
@@ -3100,14 +2758,13 @@ fn parse_directory_with_overrides_impl<K: parser::BackendEvaluationPhase>(
 /// a future caller that violates the precondition; not reachable from
 /// the sole current caller (`expand_module_call` pins
 /// `export_params: Vec::new()`).
-pub(crate) fn relabel_export_phase<A, B, C: BindingAddress, K: crate::parser::BackendPhase>(
+pub(crate) fn relabel_export_phase<A, B, C: BindingAddress>(
     f: File<
         A,
         ParserPlaceholder,
         ParserPlaceholder,
         crate::parser::ParsedDeferredForPhase<ParserPlaceholder, C>,
         C,
-        K,
     >,
 ) -> File<
     B,
@@ -3115,7 +2772,6 @@ pub(crate) fn relabel_export_phase<A, B, C: BindingAddress, K: crate::parser::Ba
     ParserPlaceholder,
     crate::parser::ParsedDeferredForPhase<ParserPlaceholder, C>,
     C,
-    K,
 > {
     f.map_export_params(|export_params| {
         // Tripwire for a future caller that violates the precondition.
@@ -3140,14 +2796,13 @@ pub(crate) fn relabel_export_phase<A, B, C: BindingAddress, K: crate::parser::Ba
 /// [`File::merge_from`] performs the exhaustive private-field-preserving
 /// merge. Keeping this wrapper generic over the export-param phase lets the
 /// parser and inferred phases share that single merge contract.
-pub(crate) fn merge_parsed_file<E, B: BindingAddress, K: crate::parser::BackendPhase>(
+pub(crate) fn merge_parsed_file<E, B: BindingAddress>(
     target: &mut File<
         E,
         ParserPlaceholder,
         ParserPlaceholder,
         crate::parser::ParsedDeferredForPhase<ParserPlaceholder, B>,
         B,
-        K,
     >,
     source: File<
         E,
@@ -3155,7 +2810,6 @@ pub(crate) fn merge_parsed_file<E, B: BindingAddress, K: crate::parser::BackendP
         ParserPlaceholder,
         crate::parser::ParsedDeferredForPhase<ParserPlaceholder, B>,
         B,
-        K,
     >,
 ) {
     target.merge_from(source);
@@ -3202,37 +2856,60 @@ struct DirectorySeedState {
 #[derive(Debug)]
 pub(crate) struct LocatedParseError {
     pub(crate) source_file: Option<PathBuf>,
-    pub(crate) error: Box<parser::RootInputFailure>,
+    pub(crate) error: Box<parser::ParseError>,
+    backend: bool,
 }
 
 impl LocatedParseError {
     fn in_input_file(path: &Path, failure: parser::RootInputFailure) -> Self {
-        Self::locate(Some(path), failure)
+        let backend = failure.is_backend();
+        let mut located = Self::in_file(path, failure.into_parse_error());
+        located.backend = backend;
+        located
     }
+
     fn in_file(path: &Path, error: parser::ParseError) -> Self {
-        Self::locate(Some(path), parser::RootInputFailure::Value(error))
+        match error {
+            error @ parser::ParseError::AtElement(_) => Self {
+                source_file: error.source_file().map(Path::to_path_buf),
+                error: Box::new(error),
+                backend: false,
+            },
+            parser::ParseError::Located { path, error } => Self {
+                source_file: Some(path),
+                error,
+                backend: false,
+            },
+            error => Self {
+                source_file: Some(path.to_path_buf()),
+                error: Box::new(error),
+                backend: false,
+            },
+        }
     }
+
     fn directory_wide(error: parser::ParseError) -> Self {
-        Self::locate(None, parser::RootInputFailure::Value(error))
-    }
-    fn locate(fallback: Option<&Path>, failure: parser::RootInputFailure) -> Self {
-        let source_file = match failure.error() {
-            error @ parser::ParseError::AtElement(_) => error.source_file().map(Path::to_path_buf),
-            parser::ParseError::Located { path, .. } => Some(path.clone()),
-            _ => fallback.map(Path::to_path_buf),
-        };
-        let error = failure.map_error(|error| match error {
-            parser::ParseError::Located { error, .. } => *error,
-            error => error,
-        });
-        Self {
-            source_file,
-            error: Box::new(error),
+        match error {
+            error @ parser::ParseError::AtElement(_) => Self {
+                source_file: error.source_file().map(Path::to_path_buf),
+                error: Box::new(error),
+                backend: false,
+            },
+            parser::ParseError::Located { path, error } => Self {
+                source_file: Some(path),
+                error,
+                backend: false,
+            },
+            error => Self {
+                source_file: None,
+                error: Box::new(error),
+                backend: false,
+            },
         }
     }
 
     fn render(&self, fallback: &Path) -> String {
-        if let Some(finding) = self.error.error().element_diagnostic() {
+        if let Some(finding) = self.error.element_diagnostic() {
             let location = finding.location();
             let span = location.span();
             // Located::Display already includes the detail. Render its chain
@@ -3249,7 +2926,7 @@ impl LocatedParseError {
         format!(
             "{}: {}",
             location.display(),
-            crate::executor::render_error_chain(self.error.error())
+            crate::executor::render_error_chain(self.error.as_ref())
         )
     }
 }
@@ -3260,8 +2937,7 @@ pub fn parse_directory_files(
 ) -> Result<Vec<(PathBuf, DirectoryResolvedFile)>, parser::ParseError> {
     // This lower-level API historically returned the leaf parse error. CLI
     // and LSP callers use the located variant below when rendering a file.
-    parse_directory_files_located(files, config)
-        .map_err(|located| (*located.error).into_parse_error())
+    parse_directory_files_located(files, config).map_err(|located| *located.error)
 }
 
 pub(crate) fn parse_directory_files_located(
@@ -3695,150 +3371,6 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn round19_new_backend_phase_uses_authored_operands_and_new_context() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(
-            directory.path().join("backend.crn"),
-            "backend s3 { bucket = env('ROUND19_BUCKET') key = 'k' }\n",
-        )
-        .unwrap();
-        fs::write(
-            directory.path().join("values.crn"),
-            "let ordinary = 'value'\n",
-        )
-        .unwrap();
-        let root = ResolvedPath::new(directory.path()).unwrap();
-        let missing = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let retained = load_configuration_for_metadata(&root, &missing, &SchemaRegistry::new())
-            .unwrap()
-            .parsed;
-        assert!(matches!(
-            retained.backend.as_ref().unwrap().attributes.get("bucket"),
-            Some(parser::BackendAttributeValue::Failed(_))
-        ));
-        let ready = ProviderContext::new(crate::EnvironmentSnapshot::new([(
-            "ROUND19_BUCKET".into(),
-            "state".into(),
-        )]));
-        let strict = crate::validation::deferred_types::with_session_for_test(&ready, |session| {
-            retained.evaluate_backend_in_session(session).unwrap()
-        });
-        assert!(
-            matches!(strict.backend.as_ref().unwrap().attributes.get("bucket"), Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(value))) if value.expose_plaintext() == "state")
-        );
-    }
-
-    #[test]
-    fn round19_backend_operands_are_not_evaluated_during_parse_or_scope_recovery() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&calls);
-        let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        context.decryptor = Some(Arc::new(move |_, _| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok("private-state-path".into())
-        }));
-        let directory = tempfile::tempdir().unwrap();
-        let source = "backend local { path = decrypt('cipher', 'key') }\n";
-        for (file, text) in [
-            ("backend.crn", source),
-            ("values.crn", "let ordinary = 'value'\n"),
-            ("broken.crn", "let duplicate = 1\nlet duplicate = 2\n"),
-        ] {
-            fs::write(directory.path().join(file), text).unwrap();
-        }
-        let buffer =
-            ParsedSourceBuffer::parse(source, &directory.path().join("backend.crn"), &context)
-                .unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            0,
-            "parser output must contain authored operands"
-        );
-        let snapshot = DirectoryBufferSnapshot::capture(
-            &ResolvedPath::new(directory.path()).unwrap(),
-            buffer,
-            &Default::default(),
-        )
-        .unwrap();
-        let schemas = SchemaRegistry::new();
-        let configuration = load_buffer_configuration_in_directory(snapshot, &schemas, &context);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "the owning buffer evaluator executes once"
-        );
-        let tree = parser::AnalysisTree::try_from_file(configuration.parsed()).unwrap();
-        assert!(tree.admit_backend().is_some_and(|result| result.is_err()));
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "reporting consumes the result without evaluation"
-        );
-    }
-
-    #[test]
-    fn round19_backend_failure_does_not_swallow_independent_resolution_error() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(
-            directory.path().join("backend.crn"),
-            "backend s3 { bucket = cidr_subnet('bad', 8, 1) key = 'k' }\n",
-        )
-        .unwrap();
-        fs::write(
-            directory.path().join("main.crn"),
-            "let r = mock.test.resource { name = keys('bad') }\n",
-        )
-        .unwrap();
-        let root = ResolvedPath::new(directory.path()).unwrap();
-        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let result = parse_directory_with_overrides_and_diagnostics_with_schemas(
-            &root,
-            &context,
-            &IndexMap::new(),
-            &SchemaRegistry::new(),
-        );
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("backend failure hid the unrelated resolution error"),
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("keys() argument must be a Map, got String"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn round19_metadata_backend_call_uses_the_callers_retained_resolution() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(
-            directory.path().join("backend.crn"),
-            "backend s3 { bucket = bucket_for('state') key = 'k' }\n",
-        )
-        .unwrap();
-        fs::write(directory.path().join("main.crn"), "provider mock {}\n").unwrap();
-        fs::write(
-            directory.path().join("functions.crn"),
-            "fn bucket_for(value: mock.test.resource): String { 'state' }\n",
-        )
-        .unwrap();
-        let root = ResolvedPath::new(directory.path()).unwrap();
-        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let loaded =
-            load_configuration_for_metadata(&root, &context, &SchemaRegistry::new()).unwrap();
-        let backend = loaded.parsed.backend.as_ref().unwrap();
-        assert!(matches!(
-            backend.attributes.get("bucket"),
-            Some(parser::BackendAttributeValue::Evaluated(_))
-        ));
-    }
-
-    #[test]
     fn inferred_root_analysis_preserves_the_issued_directory_verdict() {
         for source in [
             "backend local {}\narguments {}\nrequire true, 'private'\n",
@@ -3873,51 +3405,6 @@ mod tests {
                 );
             });
         }
-    }
-
-    #[test]
-    fn round15_backend_cardinality_is_owned_by_the_verdict() {
-        let directory = tempfile::tempdir().unwrap();
-        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let root = ResolvedPath::new(directory.path()).unwrap();
-        fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
-        fs::write(directory.path().join("backend.crn"), "backend local {}\n").unwrap();
-        let parsed =
-            parse_directory_with_overrides_and_diagnostics(&root, &context, &IndexMap::new())
-                .unwrap();
-        let verdict = parsed.parsed.complete_directory_verdict();
-        let root_verdict = verdict.root().unwrap();
-        assert!(root_verdict.has_sole_backend());
-        assert!(
-            root_verdict
-                .provider_evidence()
-                .unwrap()
-                .location()
-                .file()
-                .path()
-                .ends_with("providers.crn")
-        );
-        assert!(
-            root_verdict
-                .backend_evidence()
-                .unwrap()
-                .location()
-                .file()
-                .path()
-                .ends_with("backend.crn")
-        );
-        fs::write(directory.path().join("second.crn"), "backend local {}\n").unwrap();
-        let parsed =
-            parse_directory_with_overrides_and_diagnostics(&root, &context, &IndexMap::new())
-                .unwrap();
-        assert!(
-            !parsed
-                .parsed
-                .complete_directory_verdict()
-                .root()
-                .unwrap()
-                .has_sole_backend()
-        );
     }
 
     #[test]
@@ -3991,13 +3478,9 @@ mod tests {
                 .unwrap();
 
         assert!(parsed.semantic_file(&main_path).is_some());
-        assert!(
-            parsed
-                .parsed
-                .complete_directory_verdict()
-                .root()
-                .unwrap()
-                .has_sole_backend()
+        assert_eq!(
+            parsed.sole_backend_file.as_deref(),
+            Some(main_path.as_path())
         );
         assert_eq!(
             parsed.source_files[0].0.identity(),
@@ -5983,7 +5466,7 @@ awscc.ec2.SecurityGroup {
         let failure = DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
             location,
             source_file: located.source_file,
-            error: Box::new((*located.error).into_parse_error()),
+            error: located.error,
         });
 
         assert_eq!(
@@ -6004,7 +5487,7 @@ awscc.ec2.SecurityGroup {
         let failure = DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
             location: located.source_file.clone().unwrap(),
             source_file: located.source_file,
-            error: Box::new((*located.error).into_parse_error()),
+            error: located.error,
         });
 
         assert_eq!(

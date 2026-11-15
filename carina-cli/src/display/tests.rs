@@ -1019,7 +1019,7 @@ fn deferred_validation_records_effect() -> Effect {
         template_resource,
     );
 
-    let mut configuration: carina_core::parser::ExpandedParsedFile = Default::default();
+    let mut configuration = carina_core::parser::ExpandedParsedFile::default();
     configuration.resources = vec![certificate_resource()];
     let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into())
         .expect("certificate fixture graph resolves");

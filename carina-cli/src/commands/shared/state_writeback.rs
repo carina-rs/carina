@@ -6040,7 +6040,7 @@ mod apply_state_save_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            <carina_core::parser::ExpandedInferredFile>::default().deferred_for_expressions(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
         )
         .expect("ordinary desired fixtures cross the snapshot boundary");
         let saved_desired =
@@ -6225,7 +6225,7 @@ mod apply_state_save_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            <carina_core::parser::ExpandedInferredFile>::default().deferred_for_expressions(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
         )
         .expect("ordinary desired fixtures cross the snapshot boundary");
         let saved_desired =
@@ -6359,7 +6359,7 @@ mod apply_state_save_tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
-            <carina_core::parser::ExpandedInferredFile>::default().deferred_for_expressions(),
+            carina_core::parser::ExpandedInferredFile::default().deferred_for_expressions(),
         )
         .expect("ordinary desired fixtures cross the snapshot boundary");
         let saved_desired =
@@ -8399,9 +8399,6 @@ mod stage4_unknown_err_tests {
                 }
                 ApplyTimeUnknown::PendingReRead(pending) => {
                     panic!("expected an upstream export path, got pending reread: {pending}")
-                }
-                ApplyTimeUnknown::IncompleteBackendScope => {
-                    panic!("unexpected editor backend scope")
                 }
             },
             other => {

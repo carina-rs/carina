@@ -1177,18 +1177,8 @@ mod producer_tests {
         )
     }
 
-    fn resolve<E: crate::parser::ExportParamLike, K: crate::parser::BackendPhase>(
-        parsed: &mut crate::parser::File<
-            E,
-            crate::resource::ParserPlaceholder,
-            crate::resource::ParserPlaceholder,
-            crate::parser::ParsedDeferredForPhase<
-                crate::resource::ParserPlaceholder,
-                crate::resource::RelativeBindingName,
-            >,
-            crate::resource::RelativeBindingName,
-            K,
-        >,
+    fn resolve<E: crate::parser::ExportParamLike>(
+        parsed: &mut crate::parser::File<E>,
         context: &TypeCheckSession<'_>,
     ) {
         assert!(

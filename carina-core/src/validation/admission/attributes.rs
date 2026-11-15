@@ -582,7 +582,6 @@ pub fn resource_attribute_admissions<
             B,
         >,
     E,
-    K: crate::parser::BackendPhase,
 >(
     resource: &crate::parser::AnalysisResourceRef<
         '_,
@@ -597,7 +596,6 @@ pub fn resource_attribute_admissions<
         crate::resource::ParserPlaceholder,
         D,
         B,
-        K,
     >,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     quoted: &std::collections::HashSet<String>,
@@ -615,12 +613,12 @@ pub fn resource_attribute_admissions<
             }
             let visits = std::cell::RefCell::new(std::mem::take(coverage));
             let findings = if uses_resource_attribute_admission(resource.kind()) {
-                typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _, _>(
+                typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
                     resource, parsed, schema, attributes, quoted, inputs, bindings, session,
                     schemas, &visits,
                 )
             } else {
-                typed_resource_attribute_admissions::<kind::DataSourceAttribute, _, _, _, _>(
+                typed_resource_attribute_admissions::<kind::DataSourceAttribute, _, _, _>(
                     resource, parsed, schema, attributes, quoted, inputs, bindings, session,
                     schemas, &visits,
                 )
@@ -645,7 +643,6 @@ fn typed_resource_attribute_admissions<
             B,
         >,
     E,
-    K: crate::parser::BackendPhase,
 >(
     resource: &crate::parser::AnalysisResourceRef<
         '_,
@@ -660,7 +657,6 @@ fn typed_resource_attribute_admissions<
         crate::resource::ParserPlaceholder,
         D,
         B,
-        K,
     >,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     attributes: &indexmap::IndexMap<

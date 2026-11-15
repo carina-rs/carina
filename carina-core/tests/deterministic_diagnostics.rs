@@ -21,7 +21,7 @@ const UNKNOWN: [&str; 6] = [
     "delta_knob",
 ];
 
-fn directory(name: &str) -> ParsedFile<carina_core::parser::StrictBackend> {
+fn directory(name: &str) -> ParsedFile {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/diagnostic_order")
         .join(name);
@@ -33,7 +33,7 @@ fn directory(name: &str) -> ParsedFile<carina_core::parser::StrictBackend> {
     .into_parsed()
 }
 
-fn custom_directory(source: &str) -> ParsedFile<carina_core::parser::StrictBackend> {
+fn custom_directory(source: &str) -> ParsedFile {
     let root = tempfile::tempdir().unwrap();
     for (name, source) in [
         ("main.crn", source),

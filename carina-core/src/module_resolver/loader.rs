@@ -223,9 +223,9 @@ pub(crate) fn load_imported_directory(
             Unavailable(match located.source_file {
                 Some(path) => ModuleError::ParseInFile {
                     path,
-                    error: Box::new((*located.error).into_parse_error()),
+                    error: Box::new(*located.error),
                 },
-                None => ModuleError::Parse((*located.error).into_parse_error()),
+                None => ModuleError::Parse(*located.error),
             })
         })?;
     if parsed_files.is_empty() {
@@ -373,7 +373,7 @@ pub fn load_module_from_directory(
             format!(
                 "Failed to parse directory {}: {}",
                 dir.display(),
-                e.error.error()
+                e.error.as_ref()
             )
         })?;
 

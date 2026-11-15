@@ -2204,6 +2204,15 @@ fn round12_write_upstream_state(upstream: &std::path::Path) {
 }
 
 fn round12_assert_template_rejection(output: &Output, kind: &str, evidence_dir: &std::path::Path) {
+    assert_template_rejection(output, kind, evidence_dir, true);
+}
+
+fn assert_template_rejection(
+    output: &Output,
+    kind: &str,
+    evidence_dir: &std::path::Path,
+    has_caller: bool,
+) {
     assert_eq!(output.status.code(), Some(1), "{}", output_text(output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     let message =
@@ -2213,8 +2222,13 @@ fn round12_assert_template_rejection(output: &Output, kind: &str, evidence_dir: 
         evidence_dir.join("declarations.crn").display()
     );
     assert_eq!(stderr.matches(message).count(), 1, "{stderr}");
+    let prefix = if has_caller {
+        "Error: ./upstream.crn:1:39: "
+    } else {
+        "Error: "
+    };
     assert!(
-        stderr.starts_with(&format!("Error: ./upstream.crn:1:39: {message}")),
+        stderr.starts_with(&format!("{prefix}{message}")),
         "{stderr}"
     );
     assert!(stderr.contains(&note), "{stderr}");
@@ -2323,17 +2337,18 @@ fn round12_saved_plan_apply_rejects_current_upstream_template() {
             directory.project.join("saved.plan"),
         ];
         let before = paths.each_ref().map(|path| fs::read(path).unwrap());
-        round12_assert_template_rejection(
+        assert_template_rejection(
             &directory.run(&["apply", "--auto-approve", "saved.plan"]),
             kind,
             std::path::Path::new("../mod"),
+            false,
         );
         assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
     }
 }
 
 #[test]
-fn round17_saved_plan_rejection_keeps_caller_when_current_config_cannot_load() {
+fn round21_saved_plan_rejection_keeps_evidence_without_caller_when_config_cannot_load() {
     let (directory, upstream) = round12_upstream_provider_fixture();
     fs::write(
         upstream.join("declarations.crn"),
@@ -2356,10 +2371,11 @@ fn round17_saved_plan_rejection_keeps_caller_when_current_config_cannot_load() {
         directory.project.join("saved.plan"),
     ];
     let before = paths.each_ref().map(|path| fs::read(path).unwrap());
-    round12_assert_template_rejection(
+    assert_template_rejection(
         &directory.run(&["apply", "--auto-approve", "saved.plan"]),
         "arguments block",
         std::path::Path::new("../mod"),
+        false,
     );
     assert_eq!(before, paths.each_ref().map(|path| fs::read(path).unwrap()));
 }
@@ -2451,7 +2467,7 @@ fn round12_placement_keeps_the_block_location_in_human_json_and_lsp() {
 }
 
 #[test]
-fn round19_saved_upstream_caller_is_project_relative() {
+fn round21_saved_upstream_uses_format_46_without_caller() {
     let (directory, upstream) = round12_upstream_provider_fixture();
     fs::write(
         upstream.join("declarations.crn"),
@@ -2467,11 +2483,11 @@ fn round19_saved_upstream_caller_is_project_relative() {
     ]));
     let plan: Value =
         serde_json::from_slice(&fs::read(directory.project.join("saved.plan")).unwrap()).unwrap();
-    assert_eq!(
-        plan["upstream_sources"][0]["caller"]["file"], "upstream.crn",
+    assert!(
+        plan["upstream_sources"][0].get("caller").is_none(),
         "{plan}"
     );
-    assert_eq!(plan["version"], 47);
+    assert_eq!(plan["version"], 46);
 }
 
 #[test]
@@ -2512,4 +2528,51 @@ fn round19_nested_single_file_import_preserves_root_and_module_owners() {
     );
     assert_eq!(report["errors"][0]["location"]["file"], "main.crn");
     assert_eq!(report["errors"][0]["location"]["range"]["start"]["line"], 2);
+}
+
+#[test]
+fn round21_backend_failure_aggregates_independent_sibling_errors_like_main() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = Directory {
+        project: temp.path().join("project"),
+        home: temp.path().join("home"),
+        _temp: temp,
+    };
+    fs::create_dir_all(&directory.project).unwrap();
+    fs::create_dir_all(&directory.home).unwrap();
+    for (name, source) in [
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "backend.crn",
+            "backend s3 { bucket = backend_bucket() key = 'k' }\n",
+        ),
+        (
+            "functions.crn",
+            "fn backend_bucket(): String { true }\nfn bad_keys(value: String): String { keys(value) }\n",
+        ),
+        (
+            "main.crn",
+            "mock.test.resource { name = bad_keys('other-bad') }\n",
+        ),
+    ] {
+        fs::write(directory.project.join(name), source).unwrap();
+    }
+    let human = directory.run(&["validate", "."]);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(human.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(human.stderr).unwrap(),
+        "Error: ./functions.crn:1:31: User-defined function error: function 'backend_bucket': return value: expected String, got bool (true)\nError: ./functions.crn:2:38: Invalid expression at line 2: keys() argument must be a Map, got String\n"
+    );
+    let output = directory.run(&["validate", "--json", "."]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["errors"],
+        json!([
+            {"message":"function 'backend_bucket': return value: expected String, got bool (true)","severity":"error","code":null,"location":{"file":"functions.crn","range":{"start":{"line":1,"column":31},"end":{"line":1,"column":35}}}},
+            {"message":"keys() argument must be a Map, got String","severity":"error","code":null,"location":{"file":"functions.crn","range":{"start":{"line":2,"column":38},"end":{"line":2,"column":49}}}}
+        ])
+    );
 }

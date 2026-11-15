@@ -111,7 +111,7 @@ fn resolved_fixture_graph(
     data_sources: &[DataSource],
 ) -> (Vec<ResolvedResource>, Vec<ResolvedDataSource>) {
     resolved_fixture_graph_with_parsed(
-        <crate::parser::ExpandedParsedFile>::default(),
+        crate::parser::ExpandedParsedFile::default(),
         managed,
         data_sources,
     )
@@ -209,7 +209,7 @@ fn resolved_fixture_resources_with_wait(
     wait_binding: &str,
     target_binding: &str,
 ) -> Vec<ResolvedResource> {
-    let mut parsed: crate::parser::ExpandedParsedFile = Default::default();
+    let mut parsed = crate::parser::ExpandedParsedFile::default();
     parsed.wait_bindings.push(crate::parser::WaitBinding {
         binding: absolute_binding(wait_binding),
         target: absolute_binding(target_binding),
@@ -327,8 +327,6 @@ fn anonymous_deferred_collision_fixture() -> (
                             parsed,
                             fixture_source,
                         )
-                        .evaluate_backend_in_session(session)
-                        .unwrap()
                         .admit(&crate::schema::SchemaRegistry::new(), session),
                         &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                     )
@@ -8322,8 +8320,6 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
             let consumer = mock.test.Thing { name = r0.identifier }
         "#,
                 )
-                .evaluate_backend_in_session(session)
-                .unwrap()
                 .admit(&crate::schema::SchemaRegistry::new(), session),
                 &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
             )

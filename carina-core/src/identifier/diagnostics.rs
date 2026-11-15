@@ -3,23 +3,17 @@ use super::*;
 use crate::parser::{AnalysisTree, DeclarationLocation, DeferredForPhaseTraversal, Located};
 use crate::resource::ParserPlaceholder;
 
-type IdentityAnalysis<'a, D, B, K> = AnalysisTree<
+type IdentityAnalysis<'a, D, B> = AnalysisTree<
     'a,
     ParserPlaceholder,
     ParserPlaceholder,
     D,
     B,
     crate::parser::ParsedExportParam<ParserPlaceholder, B>,
-    K,
 >;
 
-pub fn attribute_derived_conflict_diagnostics<
-    'a,
-    D,
-    B: BindingAddress,
-    K: crate::parser::BackendPhase,
->(
-    tree: &IdentityAnalysis<'_, D, B, K>,
+pub fn attribute_derived_conflict_diagnostics<'a, D, B: BindingAddress>(
+    tree: &IdentityAnalysis<'_, D, B>,
     conflicts: &'a [AttributeDerivedAnonymousResourceConflict],
     schemas: &SchemaRegistry,
 ) -> Vec<Located<&'a AttributeDerivedAnonymousResourceConflict>>
@@ -47,8 +41,8 @@ where
     findings
 }
 
-pub fn anonymous_identity_diagnostics<D, B: BindingAddress, K: crate::parser::BackendPhase>(
-    tree: &IdentityAnalysis<'_, D, B, K>,
+pub fn anonymous_identity_diagnostics<D, B: BindingAddress>(
+    tree: &IdentityAnalysis<'_, D, B>,
     error: AnonymousIdentityError,
     root: &Path,
 ) -> Vec<Located<String>>
@@ -133,8 +127,8 @@ where
     findings
 }
 
-pub fn legacy_loop_move_target_diagnostics<D, B: BindingAddress, K: crate::parser::BackendPhase>(
-    tree: &IdentityAnalysis<'_, D, B, K>,
+pub fn legacy_loop_move_target_diagnostics<D, B: BindingAddress>(
+    tree: &IdentityAnalysis<'_, D, B>,
     errors: Vec<LegacyLoopMoveTargetError>,
 ) -> Vec<Located<LegacyLoopMoveTargetError>>
 where
