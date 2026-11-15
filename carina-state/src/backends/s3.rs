@@ -82,7 +82,11 @@ fn state_put_error(
 ) -> BackendError {
     use aws_sdk_s3::error::SdkError;
     let outcome = match &error {
-        SdkError::ServiceError(context) if context.raw().status().is_server_error() => {
+        SdkError::ServiceError(context)
+            if context.raw().status().is_server_error()
+                || context.raw().status().as_u16() == 429
+                || context.err().code() == Some("SlowDown") =>
+        {
             crate::SaveFailureKind::Unconfirmed
         }
         SdkError::ConstructionFailure(_) | SdkError::ServiceError(_) => {
@@ -1383,6 +1387,30 @@ mod tests {
     }
 
     #[test]
+    fn round14_s3_throttled_put_service_errors_are_unconfirmed() {
+        use aws_sdk_s3::operation::put_object::PutObjectError;
+        let settings =
+            S3BackendSettings::from_url_parts("test-bucket".into(), "state.json".into()).unwrap();
+        for (status, code) in [(429, "TooManyRequests"), (400, "SlowDown")] {
+            let error = state_put_error(
+                SdkError::service_error(
+                    PutObjectError::generic(ErrorMetadata::builder().code(code).build()),
+                    head_bucket_http_response(status),
+                ),
+                &settings,
+            );
+            assert!(
+                matches!(&error, BackendError::UnconfirmedStateSave { .. }),
+                "HTTP {status} {code}: {error:?}"
+            );
+            assert_eq!(
+                error.save_failure_kind(),
+                crate::SaveFailureKind::Unconfirmed
+            );
+        }
+    }
+
+    #[test]
     fn round13_s3_rejected_or_undispatched_put_is_a_definite_failure() {
         use aws_sdk_s3::operation::put_object::PutObjectError;
         let settings =
@@ -1391,7 +1419,6 @@ mod tests {
             (400, "InvalidRequest"),
             (403, "AccessDenied"),
             (412, "PreconditionFailed"),
-            (429, "TooManyRequests"),
         ] {
             let error = state_put_error(
                 SdkError::service_error(

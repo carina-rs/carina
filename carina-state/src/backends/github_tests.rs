@@ -1923,6 +1923,56 @@ async fn github_round13_cleanup_put_5xx_with_prior_still_visible_is_unconfirmed(
 }
 
 #[tokio::test(start_paused = true)]
+async fn github_round14_cleanup_put_501_and_505_are_definite_without_reconciliation_or_retry() {
+    for replacing in [false, true] {
+        for status in [501, 505] {
+            let fake = Fake::default();
+            let backend = Arc::new(fake.backend());
+            if replacing {
+                backend.write_state(&StateFile::new()).await.unwrap();
+            }
+            backend.read_state().await.unwrap();
+            let lock = backend.acquire_lock("apply").await.unwrap();
+            let prior = fake.bytes("state.json");
+            {
+                let mut store = fake.0.lock().unwrap();
+                store.requests.clear();
+                store.mutation_response = Some(reply(
+                    status,
+                    json!({"message":"server did not perform the request"}),
+                ));
+            }
+
+            let error = round13_cleanup_save_error(backend, &lock, &StateFile::new()).await;
+
+            assert_eq!(error.save_failure_kind(), crate::SaveFailureKind::Failed);
+            assert!(
+                matches!(&error, BackendError::GitHub(GitHubError::Api { status: actual, .. }) if *actual == status),
+                "HTTP {status}: {error:?}"
+            );
+            assert_eq!(fake.bytes("state.json"), prior);
+            let store = fake.0.lock().unwrap();
+            assert_eq!(
+                store
+                    .requests
+                    .iter()
+                    .filter(|request| request.method == Method::Put
+                        && request.path.ends_with("/contents/state.json"))
+                    .count(),
+                1,
+                "a definite rejection must not retry the state PUT"
+            );
+            assert!(
+                store.requests.last().is_some_and(|request| {
+                    request.method == Method::Put && request.path.ends_with("/contents/state.json")
+                }),
+                "a definite rejection must not reconcile the state PUT"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn github_round13_cleanup_transport_reset_after_dispatch_is_unconfirmed() {
     let fake = Fake::default();
     let backend = Arc::new(fake.backend());

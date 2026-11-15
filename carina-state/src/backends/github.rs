@@ -260,6 +260,11 @@ pub struct GitHubBackend {
 const CLEANUP_OPERATION_MARGIN: Duration = Duration::from_millis(500);
 const OPERATION_BUDGET: Duration = Duration::from_secs(30);
 const MAX_ATTEMPTS: usize = 5;
+
+fn is_ambiguous_mutation_status(status: u16) -> bool {
+    matches!(status, 500 | 502 | 503 | 504)
+}
+
 // A locked save needs strictly more than 60s remaining, plus 5s for clock
 // skew. This narrows expiry/takeover races without renewing during cleanup.
 const WRITE_TTL_MARGIN: Duration = Duration::from_secs(60);
@@ -1344,7 +1349,7 @@ impl GitHubBackend {
             // Reconcile it like a lost transport reply, retaining the persisted
             // intent if the observation fails or exhausts this operation's budget.
             let response = self.request(request, operation).await.and_then(|response| {
-                if (500..600).contains(&response.status) {
+                if is_ambiguous_mutation_status(response.status) {
                     Err(Self::api_error(&response))
                 } else {
                     Ok(response)
@@ -1364,15 +1369,18 @@ impl GitHubBackend {
                     // a fresh operation budget to resolve the persisted intent.
                     return Err(error);
                 }
-                Err(
-                    error @ BackendError::GitHub(
-                        GitHubError::Transport { .. }
-                        | GitHubError::RateLimited { .. }
-                        | GitHubError::Api {
-                            status: 500..=599, ..
-                        },
-                    ),
-                ) => {
+                Err(error)
+                    if matches!(
+                        &error,
+                        BackendError::GitHub(
+                            GitHubError::Transport { .. } | GitHubError::RateLimited { .. }
+                        )
+                    ) || matches!(
+                        &error,
+                        BackendError::GitHub(GitHubError::Api { status, .. })
+                            if is_ambiguous_mutation_status(*status)
+                    ) =>
+                {
                     if Instant::now() < operation.deadline
                         && let Ok(current) = self.observe_mutation(path, operation).await
                     {
@@ -1409,7 +1417,9 @@ impl GitHubBackend {
                     return Err(error);
                 }
             };
-            if (400..500).contains(&response.status) {
+            // Ambiguous server errors were handled above. Remaining HTTP
+            // rejections, including 501 and 505, did not perform this attempt.
+            if (400..600).contains(&response.status) {
                 operation
                     .mutation_unconfirmed
                     .store(false, Ordering::Relaxed);
