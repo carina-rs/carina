@@ -1,3 +1,4 @@
+// Factory schemas must stay in sync with carina-core/src/validation/admission/tests/refined_destinations.rs (fixture).
 use carina_core::{
     binding_index::BindingIndex,
     provider::{

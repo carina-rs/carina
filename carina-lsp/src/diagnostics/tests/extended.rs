@@ -10309,77 +10309,6 @@ fn wider_same_identity_name_reference_is_pending_in_lsp() {
 }
 
 #[test]
-fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once() {
-    use carina_core::binding_index::{BindingIndex, BindingValueSource, ResolvedBindings};
-    use carina_core::resource::knowledge::KnowledgeContext;
-    use carina_core::resource::{ConcreteValue, Value};
-    use carina_core::validation::admission::admit;
-    let engine = named_annotation_engine(128);
-    let parsed = carina_core::parser::parse_file(
-        "provider aws {}\nlet source = aws.NameSource {}\nlet role = aws.iam.Role { role_name = source.name }\n",
-        std::path::Path::new("main.crn"), &engine.provider_context,
-    ).unwrap().resolve_root_for_test();
-    let bindings = BindingIndex::from_parsed(&parsed, &engine.schemas, &engine.provider_context);
-    let destination = engine
-        .schemas
-        .resource_attribute_destination(
-            &parsed.resources[1].id,
-            "role_name",
-            &engine.provider_context,
-        )
-        .unwrap();
-    carina_core::validation::deferred_types::with_session_for_test(
-        &engine.provider_context,
-        |session| {
-            let reference = Value::<carina_core::resource::NoPlaceholder>::Deferred(
-                carina_core::resource::DeferredValue::ResourceRef {
-                    path: carina_core::resource::AccessPath::new("source", "name")
-                        .resolve_root_for_test(),
-                },
-            );
-            let (candidate, boundary) = carina_core::test_utils::classified_candidate_for_test(
-                reference
-                    .knowledge(&KnowledgeContext::validation())
-                    .unwrap()
-                    .into_classification(),
-                Some(&bindings),
-                session,
-            );
-            let pending = admit(&destination, candidate, &boundary)
-                .unwrap()
-                .ready()
-                .expect_err("the reference must be pending");
-            let literal = Value::Concrete(ConcreteValue::String("A".repeat(65).into()));
-            let (candidate, boundary) = carina_core::test_utils::classified_candidate_for_test(
-                literal
-                    .knowledge(&KnowledgeContext::validation())
-                    .unwrap()
-                    .into_classification(),
-                Some(&bindings),
-                session,
-            );
-            let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
-            let mut resolved = ResolvedBindings::default();
-            resolved.set(
-                "source",
-                HashMap::from([("name".into(), literal)]),
-                BindingValueSource::Local,
-            );
-            let error = pending.discharge(&resolved, session).unwrap_err();
-            assert_eq!(error.resolution_error(), literal_error.resolution_error());
-            assert_eq!(
-                error
-                    .resolution_error()
-                    .to_string()
-                    .matches("role_name:")
-                    .count(),
-                1
-            );
-        },
-    );
-}
-
-#[test]
 fn registered_bare_provider_type_does_not_remain_a_fail_open_simple_in_lsp() {
     let directory = tempfile::tempdir().expect("bare type fixture");
     std::fs::write(directory.path().join("providers.crn"), "provider test {}\n")
@@ -17998,16 +17927,13 @@ fn review_r7_skipped_lookup_does_not_suppress_a_list_constraint() {
     );
 }
 
-fn widening_member_obligation_parity(decoded: bool) {
-    use carina_core::binding_index::{BindingIndex, BindingValueSource, ResolvedBindings};
-    use carina_core::resource::knowledge::KnowledgeContext;
-    use carina_core::resource::{ConcreteValue, Value};
+fn widening_member_obligation_lsp_validate_parity(decoded: bool) {
+    use carina_core::binding_index::BindingIndex;
     use carina_core::schema::{
         AttributeSchema, AttributeType, PatternMatch, PatternSpec, ResourceSchema,
         StringIdentityLayer, StringMemberConstraints, StructField, TypeIdentity,
         ValidatedConfigSchema,
     };
-    use carina_core::validation::admission::admit;
 
     let declaration = |ty: AttributeType| {
         if !decoded {
@@ -18120,107 +18046,53 @@ fn widening_member_obligation_parity(decoded: bool) {
         "{diagnostics:#?}"
     );
 
-    let parsed = parse(source).resolve_root_for_test();
-    let bindings = BindingIndex::from_parsed(&parsed, &engine.schemas, &engine.provider_context);
-    let destination = engine
-        .schemas
-        .resource_attribute_destination(&parsed.resources[1].id, "target", &engine.provider_context)
-        .unwrap();
-    let target = |value| {
-        Value::Concrete(ConcreteValue::Map(
-            [("role_arn".into(), value)].into_iter().collect(),
-        ))
-    };
-    let reference = target(Value::Deferred(
-        carina_core::resource::DeferredValue::ResourceRef {
-            path: carina_core::resource::AccessPath::new("producer", "arn").resolve_root_for_test(),
-        },
-    ));
-    carina_core::validation::deferred_types::with_session_for_test(
-        &engine.provider_context,
-        |session| {
-            let judge = |value: &Value| {
-                let (candidate, boundary) = carina_core::test_utils::classified_candidate_for_test(
-                    value
-                        .knowledge(&KnowledgeContext::validation())
-                        .unwrap()
-                        .into_classification(),
-                    Some(&bindings),
-                    session,
+    let long = format!("arn:aws:iam::123456789012:role/{}", "A".repeat(1600));
+    for (raw, failure) in [
+        ("bad", Some("does not match required pattern")),
+        (&long, Some("outside allowed range")),
+        ("arn:aws:iam::123456789012:role/Good", None),
+    ] {
+        let literal_source = source.replace("producer.arn", &serde_json::to_string(raw).unwrap());
+        let diagnostics = engine.analyze(&create_document(&literal_source), None);
+        let checked = carina_core::test_utils::legacy_validate_resources(
+            &parse(&literal_source),
+            &engine.schemas,
+            &providers,
+            &engine.provider_context,
+            &mut Vec::new(),
+        );
+        match failure {
+            None => {
+                checked.unwrap();
+                assert!(
+                    !diagnostics.iter().any(|d| d.message.contains("role_arn")),
+                    "{diagnostics:#?}"
                 );
-                admit(&destination, candidate, &boundary)
-            };
-            let long = format!("arn:aws:iam::123456789012:role/{}", "A".repeat(1600));
-            for (raw, failure) in [
-                ("bad", Some("does not match required pattern")),
-                (&long, Some("outside allowed range")),
-                ("arn:aws:iam::123456789012:role/Good", None),
-            ] {
-                let pending = judge(&reference).unwrap().ready().unwrap_err();
-                assert!(pending.local_obligation().is_some());
-                let literal = Value::Concrete(ConcreteValue::String(raw.into()));
-                let mut resolved = ResolvedBindings::default();
-                resolved.set(
-                    "producer",
-                    HashMap::from([("arn".into(), literal.clone())]),
-                    BindingValueSource::Local,
-                );
-                let literal_source =
-                    source.replace("producer.arn", &serde_json::to_string(raw).unwrap());
-                let diagnostics = engine.analyze(&create_document(&literal_source), None);
-                let checked = carina_core::test_utils::legacy_validate_resources(
-                    &parse(&literal_source),
-                    &engine.schemas,
-                    &providers,
-                    &engine.provider_context,
-                    &mut Vec::new(),
-                );
-                match failure {
-                    None => {
-                        checked.unwrap();
-                        assert!(
-                            !diagnostics.iter().any(|d| d.message.contains("role_arn")),
-                            "{diagnostics:#?}"
-                        );
-                        assert!(pending.discharge(&resolved, session).is_ok());
-                    }
-                    Some(fragment) => {
-                        let message = checked.unwrap_err();
-                        assert_eq!(message.matches(fragment).count(), 1, "{message}");
-                        assert_eq!(
-                            diagnostics
-                                .iter()
-                                .filter(|d| d.message.contains(fragment))
-                                .count(),
-                            1,
-                            "{diagnostics:#?}"
-                        );
-                        let expected = judge(&target(literal)).unwrap_err();
-                        let error = pending.discharge(&resolved, session).unwrap_err();
-                        assert_eq!(error.resolution_error(), expected.resolution_error());
-                        assert_eq!(
-                            error
-                                .resolution_error()
-                                .to_string()
-                                .matches("target.role_arn")
-                                .count(),
-                            1
-                        );
-                    }
-                }
             }
-        },
-    );
+            Some(fragment) => {
+                let message = checked.unwrap_err();
+                assert_eq!(message.matches(fragment).count(), 1, "{message}");
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .filter(|d| d.message.contains(fragment))
+                        .count(),
+                    1,
+                    "{diagnostics:#?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
-fn widening_member_obligation_has_lsp_validate_and_resolved_value_parity() {
-    widening_member_obligation_parity(false);
+fn widening_member_obligation_has_lsp_validate_parity() {
+    widening_member_obligation_lsp_validate_parity(false);
 }
 
 #[test]
 fn decoded_widening_member_obligation_has_lsp_validate_parity() {
-    widening_member_obligation_parity(true);
+    widening_member_obligation_lsp_validate_parity(true);
 }
 
 #[test]
