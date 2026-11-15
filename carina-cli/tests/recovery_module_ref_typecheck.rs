@@ -353,25 +353,23 @@ let result = f(env('CARINA_3848_SECRET'))
         .current_dir(fixture.path())
         .env("NO_COLOR", "1")
         .env("CARINA_3848_SECRET", plaintext)
+        .env_remove("CLICOLOR_FORCE")
         .args(["validate", "."])
         .output()
         .expect("run carina validate");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        !output.status.success(),
-        "validate must reject env String -> Int"
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        &*stderr,
+        "Error: ./main.crn: Invalid expression at line 2: function 'f': parameter 'x': expected Int, got string 'hunter2plaintext'\n"
     );
-    assert!(
-        stderr.contains("function 'f': parameter 'x': expected Int, got string"),
-        "stderr={stderr}"
-    );
-    assert!(stderr.contains(plaintext), "stderr={stderr}");
 }
 
 #[test]
 fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
-    type DirectoryCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+    type DirectoryCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
     let cases: &[DirectoryCase<'_>] = &[
         (
             "module literal union argument",
@@ -384,6 +382,7 @@ fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
                 ("m/main.crn", "arguments { n: 'dev' | 'prod' }\n"),
             ],
             "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'n': expected 'dev' | 'prod', got secret\n",
+            "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'n': expected 'dev' | 'prod', got string 'hunter2SECRET'\n",
         ),
         (
             "module list argument",
@@ -399,6 +398,7 @@ fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
                 ("m/main.crn", "arguments { l: list(Int) }\n"),
             ],
             "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'l': at list element 0: expected Int, got secret\n",
+            "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'l': at list element 0: expected Int, got string 'hunter2SECRET'\n",
         ),
         (
             "literal union export",
@@ -407,6 +407,7 @@ fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
                 ("exports.crn", "exports { e: 'dev' | 'prod' = f() }\n"),
             ],
             "Error: export 'e' cannot hold a secret value\n",
+            "Error: export 'e': expected 'dev' | 'prod', got string 'hunter2SECRET'\n",
         ),
         (
             "nested function export",
@@ -415,10 +416,11 @@ fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
                 ("exports.crn", "exports { q: Int = k(env('LEAKX')) }\n"),
             ],
             "Error: export 'q' cannot hold a secret value\n",
+            "Error: export 'q': expected Int, got string 'hunter2SECRET'\n",
         ),
     ];
 
-    for (label, files, expected_secret_stderr) in cases {
+    for (label, files, expected_secret_stderr, expected_public_stderr) in cases {
         for hidden in [true, false] {
             let fixture = multi_file_fixture(files);
             if hidden {
@@ -453,11 +455,9 @@ fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
                     !output.status.success(),
                     "{label} must fail; stderr={stderr}"
                 );
-                assert!(stderr.contains("got string"), "{label}: stderr={stderr}");
-                assert!(
-                    stderr.contains("hunter2SECRET"),
-                    "{label} omitted env plaintext: stderr={stderr}"
-                );
+                assert_eq!(output.status.code(), Some(1), "{label}");
+                assert_eq!(&*stdout, "Validating...\n", "{label}");
+                assert_eq!(&*stderr, *expected_public_stderr, "{label}");
             }
         }
     }

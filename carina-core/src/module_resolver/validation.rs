@@ -959,10 +959,9 @@ fn constraint_actuals_for_expression<P: PlaceholderKind, B: BindingAddress>(
 
 fn format_constraint_actual<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> String {
     match value {
-        Value::Concrete(ConcreteValue::String(value)) => value
-            .diagnostic_literal()
-            .map(display_string_literal)
-            .unwrap_or_else(|| "string".to_string()),
+        Value::Concrete(ConcreteValue::String(value)) => {
+            display_string_literal(value.expose_plaintext())
+        }
         Value::Concrete(ConcreteValue::List(values)) => format!(
             "[{}]",
             values
@@ -975,12 +974,7 @@ fn format_constraint_actual<P: PlaceholderKind, B: BindingAddress>(value: &Value
             "[{}]",
             values
                 .iter()
-                .map(|value| {
-                    value
-                        .diagnostic_literal()
-                        .map(display_string_literal)
-                        .unwrap_or_else(|| "string".to_string())
-                })
+                .map(|value| display_string_literal(value.expose_plaintext()))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

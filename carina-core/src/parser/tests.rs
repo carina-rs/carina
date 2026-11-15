@@ -21237,7 +21237,7 @@ fn invalid_secret_subscript_diagnostic_never_exposes_plaintext() {
 }
 
 #[test]
-fn secret_provider_version_is_rejected_before_sensitive_string_fallback() {
+fn secret_provider_version_rejects_secret_expressions() {
     for expression in [
         "secret('private-token')",
         "join('', [secret('private-token')])",
@@ -21260,7 +21260,7 @@ fn secret_provider_version_is_rejected_before_sensitive_string_fallback() {
 }
 
 #[test]
-fn secret_subscript_is_rejected_before_sensitive_binding_guard() {
+fn secret_subscript_rejects_secret_expressions() {
     for expression in [
         "secret('private-token')",
         "join('', [secret('private-token')])",

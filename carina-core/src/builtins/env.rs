@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn env_non_utf8_value_uses_the_unset_error_and_masks_sensitive_names() {
+    fn env_non_utf8_value_uses_unset_error_and_protects_secret_names() {
         use std::os::unix::ffi::OsStringExt;
         let name = "NON_UTF8";
         let config = ProviderContext::new(EnvironmentSnapshot::new([(
@@ -133,12 +133,15 @@ mod tests {
             evaluate_builtin("env", &args, &config).unwrap_err(),
             "environment variable 'NON_UTF8' is not set"
         );
-        let sensitive_args = [Value::Concrete(ConcreteValue::String(
-            crate::resource::ValueString::diagnostic_sensitive(name),
-        ))];
+        let parsed = crate::parser::parse("let name = secret('NON_UTF8')", &config).unwrap();
+        let argument = parsed.variables["name"]
+            .clone()
+            .resolve_root(&crate::resource::RootScope::new())
+            .into_expanded()
+            .unwrap();
         assert_eq!(
-            evaluate_builtin("env", &sensitive_args, &config).unwrap_err(),
-            "environment variable named by a sensitive value is not set"
+            evaluate_builtin("env", &[argument], &config).unwrap_err(),
+            crate::resource::INSIDE_SECRET_MESSAGE
         );
     }
 
@@ -289,7 +292,7 @@ mod tests {
             .unwrap()
         };
         let value = env("VALUE");
-        let mut observations = vec![("description", ValueDescription::of(&value).to_string())];
+        let mut actual = vec![("description", ValueDescription::of(&value).to_string())];
         let enumeration = crate::schema::ResourceSchema::new("EnvEnum")
             .attribute(
                 crate::schema::AttributeSchema::optional(
@@ -306,7 +309,7 @@ mod tests {
             )
             .validate()
             .unwrap();
-        observations.push((
+        actual.push((
             "enum literal",
             enumeration
                 .effective_attribute("mode")
@@ -349,13 +352,13 @@ mod tests {
             } else {
                 function
             };
-            observations.push((
+            actual.push((
                 function,
                 evaluate_builtin(builtin, &args, &config).unwrap_err(),
             ));
         }
         let inventory = crate::provider_text::RedactionSet::collect([&value]);
-        observations.push((
+        actual.push((
             "provider text",
             crate::provider_text::ProviderDiagnostic::message(
                 crate::provider_text::ProviderText::new("provider saw env-diagnostic-value"),
@@ -367,7 +370,7 @@ mod tests {
             panic!("env must return a string");
         };
         let strings = Value::Concrete(ConcreteValue::StringList(vec![text.clone()]));
-        observations.push((
+        actual.push((
             "provider string-list text",
             crate::provider_text::ProviderDiagnostic::message(
                 crate::provider_text::ProviderText::new("provider saw env-diagnostic-value"),
@@ -421,7 +424,7 @@ mod tests {
                     value_to_json(&value).unwrap_err().to_string()
                 }
             };
-            observations.push((label, message));
+            actual.push((label, message));
         }
         let expected = [
             ("description", "string 'env-diagnostic-value'"),
@@ -446,7 +449,7 @@ mod tests {
         .into_iter()
         .map(|(label, message)| (label, message.to_string()))
         .collect::<Vec<_>>();
-        assert_eq!(observations, expected);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -502,7 +505,9 @@ mod tests {
             ),
         ];
         let mut observed = Vec::new();
+        let mut expected_errors = Vec::new();
         for (prefix, newbits, netnum, expected) in cases {
+            let case = (prefix, newbits, netnum);
             let config = ProviderContext::new(EnvironmentSnapshot::new([(
                 "PREFIX".to_string(),
                 prefix.into(),
@@ -523,13 +528,10 @@ mod tests {
                 &config,
             )
             .unwrap_err();
-            observed.push((error, expected));
+            observed.push((case, error));
+            expected_errors.push((case, expected.to_string()));
         }
-        assert!(
-            observed
-                .iter()
-                .all(|(actual, expected)| actual.as_str() == *expected)
-        );
+        assert_eq!(observed, expected_errors);
     }
 
     #[test]

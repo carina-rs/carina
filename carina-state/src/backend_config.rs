@@ -135,7 +135,7 @@ impl BackendConfig {
                 let mut attributes = HashMap::from([
                     (
                         "bucket".to_string(),
-                        Value::Concrete(ConcreteValue::String(settings.bucket.clone())),
+                        Value::Concrete(ConcreteValue::String(settings.bucket.clone().into())),
                     ),
                     (
                         "key".to_string(),
@@ -202,7 +202,7 @@ impl BackendConfig {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3BackendSettings {
-    bucket: ValueString,
+    bucket: String,
     key: ValueString,
     region: Option<String>,
     encrypt: Option<bool>,
@@ -247,11 +247,7 @@ impl S3BackendSettings {
     }
 
     pub fn bucket(&self) -> &str {
-        self.bucket.expose_plaintext()
-    }
-
-    pub(crate) fn bucket_diagnostic_display(&self) -> String {
-        self.bucket.diagnostic_display()
+        &self.bucket
     }
 
     pub fn key(&self) -> &str {
@@ -421,7 +417,8 @@ impl From<AdmittedConfiguration<BackendAttribute>> for BackendConfig {
                 bucket: configuration
                     .string("bucket")
                     .expect("required backend bucket")
-                    .clone(),
+                    .expose_plaintext()
+                    .to_owned(),
                 key: configuration
                     .string("key")
                     .expect("required backend key")
@@ -709,10 +706,6 @@ mod tests {
         let resolved = BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
         let settings = resolved.as_s3().unwrap();
         assert_eq!(settings.bucket(), plaintext);
-        assert_eq!(
-            settings.bucket_diagnostic_display(),
-            format!("'{plaintext}'")
-        );
         assert!(format!("{settings:?}").contains(plaintext));
     }
 }

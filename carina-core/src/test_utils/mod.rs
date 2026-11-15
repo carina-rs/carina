@@ -154,9 +154,6 @@ pub fn fixture_value_type<P: crate::resource::ValueKind, B: crate::resource::Bin
             else {
                 return usize::MAX;
             };
-            if key.is_diagnostic_sensitive() {
-                return usize::MAX;
-            }
             let key = key.expose_plaintext();
             self.keys
                 .iter()

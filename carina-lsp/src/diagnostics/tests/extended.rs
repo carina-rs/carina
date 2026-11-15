@@ -8,6 +8,46 @@ use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 mod secret_origin_fixture;
 
 #[test]
+fn parsed_secret_schema_candidates_preserve_wrapper_diagnostics() {
+    for (body, expected) in [
+        (
+            "modes = [secret('CANARY_4410_SECRET')]",
+            vec![
+                "'modes[0]' (Mode) expects an enum identifier, got a string literal (secret). Use one of: mock.test.Mode.allow",
+            ],
+        ),
+        (
+            "modes = [secret(CANARY_4410_SECRET)]",
+            vec![
+                "Invalid value (secret) for 'modes[0]' (Mode): expected one of mock.test.Mode.allow",
+            ],
+        ),
+        (
+            "values = [secret('CANARY_4410_SECRET'), secret('CANARY_4410_SECRET')]",
+            vec![],
+        ),
+        (
+            "values = secret(['CANARY_4410_SECRET', 'CANARY_4410_SECRET'])",
+            vec![],
+        ),
+        (
+            "unique_rules = [{ label = secret('CANARY_4410_SECRET') }, { label = secret('CANARY_4410_SECRET') }]",
+            vec![
+                "Prefer block syntax for 'unique_rules'. Use `unique_rules { ... }` instead of `unique_rules = [{ ... }]`.",
+            ],
+        ),
+    ] {
+        let source = format!("mock.test.UniqueLists {{ name = 'candidate' {body} }}\n");
+        let messages = unique_list_source_diagnostics(&source)
+            .into_iter()
+            .map(|d| d.message)
+            .collect::<Vec<_>>();
+        assert!(!format!("{messages:?}").contains("CANARY_4410_SECRET"));
+        assert_eq!(messages, expected);
+    }
+}
+
+#[test]
 fn secret_origin_4275_directory_diagnostics_are_redacted() {
     let dir = tempfile::tempdir().unwrap();
     secret_origin_fixture::write_directory(dir.path());
@@ -14291,6 +14331,7 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
         &'a str,
         &'a [(&'a str, &'a str)],
         (&'a str, DiagnosticSeverity),
+        &'a str,
     );
 
     let cases: &[DirectoryCase<'_>] = &[
@@ -14309,6 +14350,7 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
                 "module call 'm (anonymous call)': argument 'n': expected 'dev' | 'prod', got secret",
                 DiagnosticSeverity::ERROR,
             ),
+            "module call 'm (anonymous call)': argument 'n': expected 'dev' | 'prod', got string 'hunter2SECRET'",
         ),
         (
             "module list argument",
@@ -14328,6 +14370,7 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
                 "module call 'm (anonymous call)': argument 'l': at list element 0: expected Int, got secret",
                 DiagnosticSeverity::ERROR,
             ),
+            "module call 'm (anonymous call)': argument 'l': at list element 0: expected Int, got string 'hunter2SECRET'",
         ),
         (
             "literal union export",
@@ -14340,6 +14383,7 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
                 "export 'e' cannot hold a secret value",
                 DiagnosticSeverity::WARNING,
             ),
+            "export 'e': expected 'dev' | 'prod', got string 'hunter2SECRET'",
         ),
         (
             "nested function export",
@@ -14352,12 +14396,20 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
                 "export 'q' cannot hold a secret value",
                 DiagnosticSeverity::WARNING,
             ),
+            "export 'q': expected Int, got string 'hunter2SECRET'",
         ),
     ];
 
     let environment =
         carina_core::EnvironmentSnapshot::new([("LEAKX".to_string(), "hunter2SECRET".into())]);
-    for (label, filename, files, (expected_secret_message, expected_secret_severity)) in cases {
+    for (
+        label,
+        filename,
+        files,
+        (expected_secret_message, expected_secret_severity),
+        expected_public_message,
+    ) in cases
+    {
         for hidden in [true, false] {
             let temp = write_tag_key_fixture(files);
             if hidden {
@@ -14390,18 +14442,8 @@ fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
                     "{label}"
                 );
             } else {
-                assert!(
-                    diagnostics
-                        .iter()
-                        .any(|diagnostic| diagnostic.message.contains("got string")),
-                    "{label}: diagnostics={diagnostics:#?}"
-                );
-                assert!(
-                    diagnostics
-                        .iter()
-                        .all(|diagnostic| diagnostic.message.contains("hunter2SECRET")),
-                    "{label} omitted env plaintext: diagnostics={diagnostics:#?}"
-                );
+                assert_eq!(diagnostics.len(), 1, "{label}: {diagnostics:#?}");
+                assert_eq!(diagnostics[0].message, *expected_public_message, "{label}");
             }
         }
     }

@@ -158,32 +158,60 @@ mod tests {
     use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
 
     #[test]
-    fn secret_payload_cidr_failures_use_secret_mask() {
+    fn parsed_secret_cidr_failures_remain_protected() {
         let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let mut messages = Vec::new();
         for (prefix, newbits, netnum) in [("private-token", 1, 0), ("10.0.0.0/16", -1, 0)] {
-            let payload: crate::resource::SecretPayload<
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-            > = Box::new(Value::Concrete(ConcreteValue::String(prefix.into()))).into();
-            payload.visit(|value| {
-                assert!(value.contains_diagnostic_sensitive_string());
-                let error = crate::builtins::evaluate_builtin_with_config_to_value(
-                    "cidr_subnet",
-                    &[
-                        value.clone(),
-                        Value::Concrete(ConcreteValue::Int(newbits)),
-                        Value::Concrete(ConcreteValue::Int(netnum)),
-                    ],
-                    &config,
-                )
-                .expect_err("both invalid CIDR and invalid subnet arguments must fail");
-                assert!(!error.contains(prefix), "{error}");
-                assert!(!error.contains("env"), "{error}");
-                messages.push(error);
-            });
+            let parsed = crate::parser::parse(
+                &format!(
+                    "let prefix = secret({})",
+                    crate::parser::display_string_literal(prefix)
+                ),
+                &config,
+            )
+            .unwrap();
+            let value = parsed.variables["prefix"]
+                .clone()
+                .resolve_root(&crate::resource::RootScope::new())
+                .into_expanded()
+                .unwrap();
+            let error = crate::builtins::evaluate_builtin_with_config_to_value(
+                "cidr_subnet",
+                &[
+                    value.clone(),
+                    Value::Concrete(ConcreteValue::Int(newbits)),
+                    Value::Concrete(ConcreteValue::Int(netnum)),
+                ],
+                &config,
+            )
+            .unwrap_err();
+            assert!(!error.contains(prefix), "{error}");
+            assert_eq!(error, crate::resource::INSIDE_SECRET_MESSAGE);
+
+            let mut dispatched = [crate::resource::Resource::new("test", "prefix-input")
+                .with_attribute("prefix", value)
+                .into_provider_resource()];
+            crate::executor::normalized::unwrap_dispatch_desired(&mut dispatched);
+            let arguments = [
+                dispatched[0].attributes.shift_remove("prefix").unwrap(),
+                Value::Concrete(ConcreteValue::Int(newbits)),
+                Value::Concrete(ConcreteValue::Int(netnum)),
+            ];
+            let known = arguments
+                .iter()
+                .map(|value| {
+                    value
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification()
+                        .into_known()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                super::builtin_cidr_subnet(&known).unwrap_err(),
+                "cidr_subnet() failed for prefix (secret)"
+            );
         }
-        assert_eq!(messages, ["cidr_subnet() failed for prefix (secret)"; 2]);
     }
 
     fn cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Value, String> {

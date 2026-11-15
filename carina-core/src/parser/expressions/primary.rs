@@ -1044,17 +1044,6 @@ fn parse_primary_eval_with_mode_inner(
                     }
                     match ctx.lookup_binding(binding_name.expose_plaintext()) {
                         ParseBindingRef::Value { value, .. } => Ok(value.clone()),
-                        ParseBindingRef::Structural(_) | ParseBindingRef::Unbound
-                            if binding_name.is_diagnostic_sensitive() =>
-                        {
-                            Err(ParseError::InvalidExpression {
-                                line,
-                                message: format!(
-                                    "unresolved binding containing {}",
-                                    crate::schema::SECRET_VALUE_MASK
-                                ),
-                            })
-                        }
                         ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => Ok(
                             EvalValue::from_value(Value::Deferred(DeferredValue::BindingRef {
                                 binding: RelativeBindingName::new(binding_name),

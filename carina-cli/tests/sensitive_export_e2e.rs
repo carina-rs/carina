@@ -83,7 +83,7 @@ fn env_derived_export_writes_plaintext_and_replan_is_stable() {
     assert_eq!(
         state.pointer("/exports/a"),
         Some(&serde_json::json!("PLAINEXPORTVALUE")),
-        "env provenance must not alter export persistence: {state:#}",
+        "ordinary env values must persist unchanged in exports: {state:#}",
     );
 
     let replan = run(fixture.path(), "plainExportValue", &["plan", "."]);

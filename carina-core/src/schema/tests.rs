@@ -1563,23 +1563,11 @@ fn unique_lists_compare_nested_canonical_values_and_skip_partial_objects() {
 }
 
 #[test]
-fn unique_list_skips_whole_secrets_and_secret_marked_elements() {
+fn unique_list_skips_whole_parsed_secrets() {
     let list = unique_list_from_protocol(AttributeType::string(), true);
-    let duplicate = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("private-claim".into())),
-        Value::Concrete(ConcreteValue::String("private-claim".into())),
-    ]));
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(duplicate).into()));
+    let secret = schema_source_value("secret(['private-claim', 'private-claim'])");
     assert!(list.validate(&secret).is_ok());
     assert!(Schema::flat(list).validate_collect(&secret).is_empty());
-
-    let sensitive = Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-        "secret-marked-claim",
-    )));
-    let duplicate = Value::Concrete(ConcreteValue::List(vec![sensitive.clone(), sensitive]));
-    let list = unique_list_from_protocol(AttributeType::string(), true);
-    assert!(list.validate(&duplicate).is_ok());
-    assert!(Schema::flat(list).validate_collect(&duplicate).is_empty());
 }
 
 #[test]
@@ -1748,25 +1736,16 @@ fn unique_list_constraints_collect_length_and_element_errors_together() {
     }
 }
 
-fn assert_mixed_sensitive_list_is_not_comparable(secret: bool, sensitive_first: bool) {
-    let plain = Value::Concrete(ConcreteValue::String("private-mixed-claim".into()));
-    let sensitive = if secret {
-        Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()).into()))
+fn assert_mixed_secret_list_is_not_comparable(secret_first: bool) {
+    let value = schema_source_value(if secret_first {
+        "[secret('private-mixed-claim'), 'private-mixed-claim']"
     } else {
-        Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-            "private-mixed-claim",
-        )))
-    };
-    let items = if sensitive_first {
-        vec![sensitive, plain]
-    } else {
-        vec![plain, sensitive]
-    };
+        "['private-mixed-claim', secret('private-mixed-claim')]"
+    });
     let list = unique_list_from_protocol(AttributeType::string(), true);
-    let value = Value::Concrete(ConcreteValue::List(items));
     assert!(
         list.validate(&value).is_ok(),
-        "sensitive equality must stay private"
+        "secret equality must stay private"
     );
     let errors = Schema::flat(list).validate_collect(&value);
     assert!(errors.is_empty(), "{errors:?}");
@@ -1786,8 +1765,8 @@ fn unique_list_compares_env_values_but_keeps_secrets_private() {
     .unwrap();
     let list = unique_list_from_protocol(AttributeType::string(), true);
     let plain = Value::Concrete(ConcreteValue::List(vec![value.clone(), value.clone()]));
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
-    let hidden = Value::Concrete(ConcreteValue::List(vec![secret.clone(), secret]));
+    let hidden =
+        schema_source_value("[secret('duplicate-env-value'), secret('duplicate-env-value')]");
     let errors = Schema::flat(list.clone()).validate_collect(&plain);
     assert!(
         list.validate(&hidden).is_ok(),
@@ -1800,22 +1779,12 @@ fn unique_list_compares_env_values_but_keeps_secrets_private() {
 
 #[test]
 fn unique_list_skips_secret_before_plain() {
-    assert_mixed_sensitive_list_is_not_comparable(true, true);
+    assert_mixed_secret_list_is_not_comparable(true);
 }
 
 #[test]
 fn unique_list_skips_plain_before_secret() {
-    assert_mixed_sensitive_list_is_not_comparable(true, false);
-}
-
-#[test]
-fn unique_list_skips_secret_marked_before_plain() {
-    assert_mixed_sensitive_list_is_not_comparable(false, true);
-}
-
-#[test]
-fn unique_list_skips_plain_before_secret_marked() {
-    assert_mixed_sensitive_list_is_not_comparable(false, false);
+    assert_mixed_secret_list_is_not_comparable(false);
 }
 
 #[test]
@@ -5320,8 +5289,22 @@ fn validate_enum_rejects_quoted_string_literal() {
     );
 }
 
+fn schema_source_value(expression: &str) -> Value {
+    crate::parser::parse(
+        &format!("let value = {expression}"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .variables
+    .shift_remove("value")
+    .unwrap()
+    .resolve_root(&crate::resource::RootScope::new())
+    .into_expanded()
+    .unwrap()
+}
+
 #[test]
-fn secret_payload_enum_string_diagnostic_uses_secret_mask() {
+fn parsed_secret_enum_string_diagnostic_uses_secret_mask() {
     let enum_type = AttributeType::enum_(
         crate::schema::enum_identity("Mode", None),
         Some(vec!["allowed".to_string()]),
@@ -5329,13 +5312,7 @@ fn secret_payload_enum_string_diagnostic_uses_secret_mask() {
         None,
         None,
     );
-    let payload: crate::resource::SecretPayload<
-        crate::resource::NoPlaceholder,
-        AbsoluteBindingAddress,
-    > = Box::new(Value::Concrete(ConcreteValue::String(
-        "private-token".into(),
-    )))
-    .into();
+    let secret = schema_source_value("secret('private-token')");
     assert_eq!(
         enum_type
             .validate(&Value::Concrete(ConcreteValue::String(
@@ -5345,19 +5322,102 @@ fn secret_payload_enum_string_diagnostic_uses_secret_mask() {
             .to_string(),
         "Mode expects an enum identifier, got a string literal 'public-token'. Use one of: allowed"
     );
-    payload.visit(|value| {
-        assert!(value.contains_diagnostic_sensitive_string());
-        let error = enum_type
-            .validate(value)
-            .expect_err("strings are not enum identifiers");
-        let message = error.to_string();
+    let error = enum_type
+        .validate(&secret)
+        .expect_err("strings are not enum identifiers");
+    assert_schema_secret_messages(
+        vec![error.to_string()],
+        &["Mode expects an enum identifier, got a string literal (secret). Use one of: allowed"],
+    );
+}
+
+fn assert_schema_secret_messages(actual: Vec<String>, expected: &[&str]) {
+    for message in &actual {
         assert!(!message.contains("private-token"), "{message}");
         assert!(!message.contains("env"), "{message}");
-        assert_eq!(
-            message,
-            "Mode expects an enum identifier, got a string literal (secret). Use one of: allowed"
+    }
+    assert_eq!(
+        actual,
+        expected
+            .iter()
+            .map(|text| text.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn parsed_secret_pattern_diagnostics_use_shared_mask() {
+    {
+        let value = schema_source_value("secret('private-token')");
+        let mut messages = Vec::new();
+        for (identity, attribute) in [
+            (None, None),
+            (None, Some("full")),
+            (Some("Name"), None),
+            (Some("Name"), Some("full")),
+        ] {
+            let declaration = AttributeType::refined_string(
+                identity.map(TypeIdentity::bare),
+                Some(
+                    CompiledPattern::try_new(&PatternSpec::new("^[A-Z]+$", PatternMatch::Full))
+                        .unwrap(),
+                ),
+                None,
+                None,
+            );
+            let error = declaration.validate(&value).unwrap_err();
+            let error = match attribute {
+                Some(attribute) => error.with_attribute(attribute),
+                None => error,
+            };
+            messages.push(error.to_string());
+        }
+        assert_schema_secret_messages(
+            messages,
+            &[
+                "Invalid value (secret): does not match required pattern /^[A-Z]+$/ (Full)",
+                "Invalid value (secret) for 'full': does not match required pattern /^[A-Z]+$/ (Full)",
+                "Invalid Name value (secret): does not match required pattern /^[A-Z]+$/ (Full)",
+                "Invalid value (secret) for 'full' (Name): does not match required pattern /^[A-Z]+$/ (Full)",
+            ],
         );
-    });
+    }
+}
+
+#[test]
+fn parsed_secret_length_diagnostics_use_shared_mask() {
+    {
+        let value = schema_source_value("secret('private-token')");
+        let mut messages = Vec::new();
+        for (identity, attribute) in [
+            (None, None),
+            (None, Some("full")),
+            (Some("Name"), None),
+            (Some("Name"), Some("full")),
+        ] {
+            let declaration = AttributeType::refined_string(
+                identity.map(TypeIdentity::bare),
+                None,
+                Some((Some(2), Some(4))),
+                None,
+            );
+            let error = declaration.validate(&value).unwrap_err();
+            let error = match attribute {
+                Some(attribute) => error.with_attribute(attribute),
+                None => error,
+            };
+            messages.push(error.to_string());
+        }
+        assert_schema_secret_messages(
+            messages,
+            &[
+                "Invalid value (secret): length 13 is outside allowed range 2..=4",
+                "Invalid value (secret) for 'full': length 13 is outside allowed range 2..=4",
+                "Invalid Name value (secret): length 13 is outside allowed range 2..=4",
+                "Invalid value (secret) for 'full' (Name): length 13 is outside allowed range 2..=4",
+            ],
+        );
+    }
 }
 
 #[test]

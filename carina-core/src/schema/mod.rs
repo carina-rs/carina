@@ -278,8 +278,7 @@ pub use carina_provider_protocol::types::{
 
 /// Count and element policies enforced together when walking a list.
 ///
-/// Elements containing secrets, including strings marked by the secret
-/// mechanism, are skipped for uniqueness, like unresolved elements, to avoid
+/// Elements containing secrets are skipped for uniqueness, like unresolved elements, to avoid
 /// revealing equality. The same applies when a secret encloses the list.
 /// Provider output and persisted state skip uniqueness as well; length
 /// constraints always apply.
@@ -2717,10 +2716,9 @@ impl FieldPath {
             let step = match &canonical {
                 LeafPathSegment::StructField(name) => FieldPathStep::Field(name.clone()),
                 LeafPathSegment::ListIndex(index) => FieldPathStep::Index(*index),
-                LeafPathSegment::MapKey(key) => match key.diagnostic_literal() {
-                    Some(key) => FieldPathStep::Field(key.to_owned()),
-                    None => FieldPathStep::Redacted(RedactedPathField::MapKey),
-                },
+                LeafPathSegment::MapKey(key) => {
+                    FieldPathStep::Field(key.expose_plaintext().to_owned())
+                }
             };
             path = path.pushed(step, canonical, FieldPathDirection::After);
         }
@@ -4053,7 +4051,7 @@ impl PatternAttributeType<Compiled> {
                     // produces a clear error for the common bare form.
                     let user_form = user_input
                         .map(DiagnosticValue::from)
-                        .unwrap_or_else(|| DiagnosticValue::from(s));
+                        .unwrap_or_else(|| DiagnosticValue::from(s.expose_plaintext()));
                     validate_enum_namespace(s.expose_plaintext(), identity).map_err(|message| {
                         TypeError::ValidationFailed {
                             message: format!(
@@ -4096,7 +4094,7 @@ impl PatternAttributeType<Compiled> {
                 Err(TypeError::InvalidEnumVariant {
                     value: user_input
                         .map(DiagnosticValue::from)
-                        .unwrap_or_else(|| DiagnosticValue::from(s)),
+                        .unwrap_or_else(|| DiagnosticValue::from(s.expose_plaintext())),
                     value_kind: InvalidEnumValueKind::Identifier,
                     attribute: None,
                     type_name: Some(name.to_string()),
@@ -5324,9 +5322,8 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
 }
 
 /// Compare the ordinary JSON of a value canonicalized with its successful fit
-/// for the active purpose. Unresolved elements and elements containing secrets,
-/// including strings marked by the secret mechanism, are not comparable: even a
-/// masked duplicate would reveal equality. The provider remains the final
+/// for the active purpose. Unresolved elements and elements containing secrets
+/// are not comparable: even a masked duplicate would reveal equality. The provider remains the final
 /// authority for them.
 /// Canonicalization preserves integer/float spellings and struct block aliases,
 /// so those spellings remain distinct keys: uniqueness can miss duplicates but
@@ -5343,7 +5340,7 @@ impl KnownListElement {
         defs: &BTreeMap<String, CompiledAttributeType>,
         purpose: CanonicalizationPurpose<'_>,
     ) -> Option<Self> {
-        if crate::value::contains_secret(value) || value.contains_diagnostic_sensitive_string() {
+        if crate::value::contains_secret(value) {
             return None;
         }
         crate::value::canonical_json_with_fit(value.clone(), fit, defs, purpose).map(Self)
@@ -7093,10 +7090,7 @@ fn format_string_literal_expected_enum(
     } else {
         join_expected(expected)
     };
-    let user_typed = match user_typed {
-        DiagnosticValue::TypeOnlyString => SECRET_VALUE_MASK.to_string(),
-        DiagnosticValue::Plain(_) | DiagnosticValue::Masked => user_typed.render_string_literal(),
-    };
+    let user_typed = user_typed.render_string_literal();
     format!(
         "{} expects an enum identifier, got a string literal {}. Use one of: {}",
         target, user_typed, tail
@@ -7628,8 +7622,6 @@ pub enum InvalidEnumValueKind {
 pub enum DiagnosticValue {
     Plain(String),
     Masked,
-    /// A string marked by the secret mechanism, retaining only its type.
-    TypeOnlyString,
 }
 
 /// Numeric diagnostic payload, preserving its representation until rendering.
@@ -7676,7 +7668,7 @@ impl DiagnosticValue {
     pub fn as_plain(&self) -> Option<&str> {
         match self {
             Self::Plain(value) => Some(value),
-            Self::Masked | Self::TypeOnlyString => None,
+            Self::Masked => None,
         }
     }
 
@@ -7691,7 +7683,6 @@ impl DiagnosticValue {
                 InvalidEnumValueKind::Identifier => value.clone(),
             },
             Self::Masked => SECRET_VALUE_MASK.to_string(),
-            Self::TypeOnlyString => "string".to_string(),
         };
         DiagnosticText::new(text).to_string()
     }
@@ -7719,7 +7710,7 @@ impl From<&ValueString> for DiagnosticValue {
     fn from(value: &ValueString) -> Self {
         match value.diagnostic_literal() {
             Some(value) => Self::Plain(value.to_owned()),
-            None => Self::TypeOnlyString,
+            None => Self::Masked,
         }
     }
 }

@@ -50,123 +50,109 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
     RootScope::new().resolve(RelativeBindingName::new(binding))
 }
 
-fn with_secret_payload_string(check: impl FnOnce(&ValueString)) {
-    let payload: SecretPayload<NoPlaceholder, AbsoluteBindingAddress> = Box::new(Value::Concrete(
-        ConcreteValue::String("private-token".into()),
-    ))
-    .into();
-    payload.visit(|value| {
-        let Value::Concrete(ConcreteValue::String(text)) = value else {
-            panic!("the secret fixture must contain a string");
-        };
-        assert!(text.is_diagnostic_sensitive());
-        check(text);
-    });
-}
-
-fn assert_secret_mask_message(actual: &str, expected: &str) {
-    assert!(!actual.contains("private-token"), "{actual}");
-    assert!(!actual.to_ascii_lowercase().contains("env"), "{actual}");
-    assert_eq!(actual, expected);
-}
-
-#[test]
-fn secret_payload_subscript_uses_secret_mask() {
+fn dispatched_source_value(expression: &str) -> Value {
     let parsed = crate::parser::parse(
-        "let hidden = secret(missing.value['private-token'])",
+        &format!("let value = {expression}"),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let super::Value::Deferred(super::DeferredValue::Secret(payload)) = &parsed.variables["hidden"]
-    else {
-        panic!("the parsed expression must retain its secret payload");
-    };
-    payload.visit(|value| {
-        let super::Value::Deferred(super::DeferredValue::ResourceRef { path }) = value else {
-            panic!("the payload must contain a resource reference");
-        };
-        assert_secret_mask_message(&path.to_dot_string(), "missing.value[(secret)]");
-        assert_eq!(
-            path.to_plaintext_dot_string(),
-            "missing.value[\"private-token\"]"
-        );
-    });
-    let mut public = String::new();
-    Subscript::Str {
-        key: "public-key".into(),
+    let value = parsed.variables["value"]
+        .clone()
+        .resolve_root(&RootScope::new())
+        .into_expanded()
+        .unwrap();
+    let resource = Resource::new("test", "dispatch-input")
+        .with_attribute("value", value)
+        .into_provider_resource();
+    let mut resources = [resource];
+    crate::executor::normalized::unwrap_dispatch_desired(&mut resources);
+    resources[0].attributes.shift_remove("value").unwrap()
+}
+
+#[test]
+fn real_dsl_marking_consumers_preserve_secret_boundaries() {
+    let mut context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    context.decryptor = Some(std::sync::Arc::new(|_, _| Err("CANARY_4409_SECRET".into())));
+    for (source, expected) in [
+        (
+            "let value = env(secret('CANARY_4409_SECRET'))",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: env(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "let value = cidr_subnet(secret('CANARY_4409_SECRET'), 1, 0)",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: cidr_subnet(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "let value = map(secret('.CANARY_4409_SECRET'), [{}])",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: map(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "let value = decrypt(secret('CANARY_4409_SECRET'))",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: decrypt(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "let value = decrypt('public', secret('CANARY_4409_SECRET'))",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: decrypt(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "fn f(x: Int) { x }\nlet value = f(secret('CANARY_4409_SECRET'))",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Int, got secret",
+            ),
+        ),
+        (
+            "fn f(x: Ipv4Address) { x }\nlet value = f(secret('CANARY_4409_SECRET'))",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Ipv4Address, got secret",
+            ),
+        ),
+        (
+            "fn f(x: Ipv4Address) { x }\nlet value = f(secret(['CANARY_4409_SECRET']))",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Ipv4Address, got secret",
+            ),
+        ),
+        (
+            "fn f(x: Ipv4Address) { x }\nlet value = f([secret('CANARY_4409_SECRET')])",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Ipv4Address, got list",
+            ),
+        ),
+        (
+            "fn f(x: Ipv4Address) { x }\nlet value = f(secret({ k = 'CANARY_4409_SECRET' }))",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Ipv4Address, got secret",
+            ),
+        ),
+        (
+            "let value = secret(missing.values['CANARY_4409_SECRET'])",
+            None,
+        ),
+        (
+            "let value = secret(identity(missing)['CANARY_4409_SECRET'])",
+            Some("Invalid expression at line 1, column 13"),
+        ),
+    ] {
+        let result = crate::parser::parse(source, &context).and_then(|mut parsed| {
+            crate::parser::resolve_resource_refs_with_config(&mut parsed, &context)?;
+            Ok(parsed)
+        });
+        let actual = result.map(|_| ()).map_err(|error| {
+            assert!(!format!("{error:?}").contains("CANARY_4409_SECRET"));
+            error.to_string()
+        });
+        assert_eq!(actual, expected.map(str::to_owned).map_or(Ok(()), Err));
     }
-    .append_to_dot_string(&mut public);
-    assert_eq!(public, "['public-key']");
-}
-
-#[test]
-fn secret_payload_access_binding_uses_secret_mask() {
-    with_secret_payload_string(|text| {
-        let path = AuthoredAccessPath::new(RelativeBindingName::new(text.clone()), "value");
-        assert_secret_mask_message(&path.to_dot_string(), "(secret).value");
-        assert_eq!(path.to_plaintext_dot_string(), "private-token.value");
-    });
-    assert_eq!(
-        AuthoredAccessPath::new("public", "value").to_dot_string(),
-        "public.value"
-    );
-}
-
-#[test]
-fn secret_payload_binding_reference_uses_secret_mask() {
-    with_secret_payload_string(|text| {
-        let path = ReferencePath::Binding(RelativeBindingName::new(text.clone()));
-        assert_secret_mask_message(&path.to_dot_string(), "(secret)");
-        assert_eq!(path.to_plaintext_dot_string(), "private-token");
-    });
-    assert_eq!(
-        ReferencePath::Binding(RelativeBindingName::new("public")).to_dot_string(),
-        "public"
-    );
-}
-
-#[test]
-fn secret_payload_binding_access_reference_uses_secret_mask() {
-    with_secret_payload_string(|text| {
-        let path = ReferencePath::BindingAccess {
-            binding: RelativeBindingName::new(text.clone()),
-            segments: vec![PathSegment::Field {
-                name: "value".into(),
-            }],
-        };
-        assert_secret_mask_message(&path.to_dot_string(), "(secret).value");
-        assert_eq!(path.to_plaintext_dot_string(), "private-token.value");
-    });
-    let public = ReferencePath::BindingAccess {
-        binding: RelativeBindingName::new("public"),
-        segments: vec![PathSegment::Field {
-            name: "value".into(),
-        }],
-    };
-    assert_eq!(public.to_dot_string(), "public.value");
-}
-
-#[test]
-fn secret_payload_missing_map_key_uses_secret_mask() {
-    with_secret_payload_string(|text| {
-        let Err(error) = apply_value_path_segment(
-            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
-                "available".into(),
-                Value::Concrete(ConcreteValue::Int(1)),
-            )]))),
-            PathSegment::Subscript {
-                index: Subscript::Str { key: text.clone() },
-            },
-            1,
-            AccessMissPolicy::Error,
-        ) else {
-            panic!("the protected key is missing");
-        };
-        assert_secret_mask_message(
-            &error.to_string(),
-            "key (secret) not found in map; available keys: 'available'",
-        );
-    });
 }
 
 #[test]
@@ -776,7 +762,11 @@ fn secret_marked_string_is_runtime_equivalent_but_formatting_safe() {
     use std::hash::{Hash, Hasher};
 
     let plain = ValueString::plain("hunter2SECRET");
-    let marked = ValueString::diagnostic_sensitive("hunter2SECRET");
+    let Value::Concrete(ConcreteValue::String(marked)) =
+        dispatched_source_value("secret('hunter2SECRET')")
+    else {
+        panic!("dispatch string")
+    };
 
     assert_eq!(marked, plain);
 
@@ -796,7 +786,7 @@ fn secret_marked_string_is_runtime_equivalent_but_formatting_safe() {
     );
 
     assert_eq!(marked.diagnostic_literal(), None);
-    assert!(!format!("{marked:?}").contains("hunter2SECRET"));
+    assert_eq!(format!("{marked:?}"), "<sensitive string>");
     assert_eq!(marked.expose_plaintext(), "hunter2SECRET");
 }
 
@@ -819,9 +809,7 @@ fn secret_debug_never_formats_the_inner_plaintext() {
 fn interpolation_inherits_diagnostic_sensitivity_from_string_expression() {
     let value = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("prefix-".into()),
-        InterpolationPart::Expr(Value::Concrete(ConcreteValue::String(
-            ValueString::diagnostic_sensitive("hunter2SECRET"),
-        ))),
+        InterpolationPart::Expr(dispatched_source_value("secret('hunter2SECRET')")),
     ]))
     .canonicalize();
 

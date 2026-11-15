@@ -2063,11 +2063,7 @@ impl<B: BindingAddress> AccessPath<B> {
                 PathSegment::Subscript { .. } => 4, // rough: `[xx]`
             })
             .sum();
-        let binding = if expose_plaintext {
-            self.binding.as_str()
-        } else {
-            self.binding.diagnostic_spelling()
-        };
+        let binding = self.binding.as_str();
         let mut out = String::with_capacity(binding.len() + self.attribute.len() + 1 + segment_len);
         out.push_str(binding);
         out.push('.');
@@ -2137,9 +2133,9 @@ impl<B: BindingAddress> ReferencePath<B> {
     pub fn to_dot_string(&self) -> String {
         match self {
             Self::Access(path) => path.to_dot_string(),
-            Self::Binding(binding) => binding.diagnostic_spelling().to_string(),
+            Self::Binding(binding) => binding.as_str().to_string(),
             Self::BindingAccess { binding, segments } => {
-                let mut rendered = binding.diagnostic_spelling().to_string();
+                let mut rendered = binding.as_str().to_string();
                 for segment in segments {
                     segment.append_to_dot_string(&mut rendered);
                 }
@@ -2385,7 +2381,7 @@ impl std::fmt::Display for ValueAccessError {
                 available,
                 len,
             } => {
-                let key = key.diagnostic_display();
+                let key = display_string_literal(key.expose_plaintext());
                 write!(
                     f,
                     "key {key} not found in map{}",
@@ -10401,10 +10397,26 @@ mod enum_attr_tests {
     fn invalid_sensitive_string_is_redacted_in_error_display() {
         let schema = schema_with_status();
         let secret = "enum-secret-that-must-not-leak";
-        let resource = resource_with_attr(
-            "status",
-            ConcreteValue::String(ValueString::diagnostic_sensitive(secret)),
-        );
+        let mut parsed = crate::parser::parse(
+            "let value = secret('enum-secret-that-must-not-leak')",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let value = parsed
+            .variables
+            .shift_remove("value")
+            .unwrap()
+            .resolve_root(&RootScope::new())
+            .into_expanded()
+            .unwrap();
+        let mut inputs = [Resource::new("test", "dispatch-input")
+            .with_attribute("value", value)
+            .into_provider_resource()];
+        crate::executor::normalized::unwrap_dispatch_desired(&mut inputs);
+        let Value::Concrete(value) = inputs[0].attributes.shift_remove("value").unwrap() else {
+            panic!("concrete dispatch value")
+        };
+        let resource = resource_with_attr("status", value);
 
         let error = match resource.get_enum_attr(&schema, "status") {
             Err(error) => error,
@@ -10412,7 +10424,11 @@ mod enum_attr_tests {
         };
 
         assert!(matches!(&error, EnumAttrError::NotAMember { .. }));
-        assert!(!error.to_string().contains(secret));
+        assert_eq!(
+            error.to_string(),
+            "invalid enum attribute `status`: string does not exactly match a declared API value"
+        );
+        assert!(!format!("{error:?}").contains(secret));
     }
 
     #[test]

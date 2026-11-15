@@ -1028,82 +1028,59 @@ async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_se
 }
 
 #[tokio::test]
-async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
+async fn provider_ready_inputs_preserve_dispatched_secret_strings() {
     with_type_checks(async |type_checks| {
         use carina_core::executor::{
-            ModuleConstraintGate, ProviderPreparationContext, prepare_create_request,
+            ModuleConstraintGate, ProviderPreparationContext, prepare_provider_ready_data_source,
         };
-        let environment =
-            carina_core::EnvironmentSnapshot::new([("PATH".to_string(), "/captured/path".into())]);
-        let sensitive = carina_core::builtins::evaluate_builtin_to_value(
-            "env",
-            &[string("PATH")
-                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                .map(|proof| proof.into_classification())
-                .unwrap()
-                .into_known()
-                .unwrap()],
-            &carina_core::parser::ProviderContext::new(environment),
-        )
-        .unwrap();
-        let Value::Concrete(ConcreteValue::String(text)) = &sensitive else {
-            panic!("env returns a string")
-        };
-        assert!(text.diagnostic_literal().is_none());
-        let mut resource = Resource::with_provider("test", "test.Resource", "sensitive", None)
-            .with_attribute("token", sensitive.clone())
-            .with_attribute("nested", map([("token", sensitive.clone())]))
-            .with_attribute("list", list(vec![sensitive.clone()]))
-            .with_attribute(
-                "string_list",
-                Value::Concrete(ConcreteValue::StringList(vec![text.clone()])),
-            );
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField};
+        let config = carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let mut parsed = carina_core::parser::parse_file(
+            "let token = secret('/captured/path')\nlet nested = { token = secret('/captured/path') }\nlet list = [secret('/captured/path')]\nlet string_list = split(',', secret('/captured/path'))",
+            std::path::Path::new("main.crn"),
+            &config,
+        ).unwrap();
+        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
+        let mut source = carina_core::resource::DataSource::with_provider("test", "lookup", "protected", None);
+        for name in ["token", "nested", "list", "string_list"] {
+            source.attributes.insert(name.into(), parsed.variables[name].clone()
+                .resolve_root_for_test()
+                .into_expanded().unwrap());
+        }
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let gate = ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::test_utils::preparation_schemas_with_attributes(
-            &resource.id,
-            carina_core::schema::SchemaKind::Resource,
-            &resource.attributes,
-        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", ResourceSchema::new("lookup").as_data_source()
+            .attribute(AttributeSchema::required("token", AttributeType::string()).build())
+            .attribute(AttributeSchema::required("nested", AttributeType::struct_("Nested", vec![
+                StructField::required("token", AttributeType::string()).build(),
+            ])).build())
+            .attribute(AttributeSchema::required("list", AttributeType::list(AttributeType::string())).build())
+            .attribute(AttributeSchema::required("string_list", AttributeType::union(vec![
+                AttributeType::string(), AttributeType::list(AttributeType::string()),
+            ])).build()).validate().unwrap());
         let context = ProviderPreparationContext::for_test(
-            &bindings,
-            &gate,
-            &[],
-            &carina_core::provider::NoopNormalizer,
-            &schemas,
-            type_checks,
+            &bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &schemas, type_checks,
         );
-        let request = prepare_create_request(resource.clone(), &context)
-            .await
-            .unwrap();
-        let ready = DesiredInputs::from_provider_ready(request.resource());
+        let ready_source = prepare_provider_ready_data_source(source, &context).unwrap();
+        assert!(matches!(&ready_source.attributes["string_list"], Value::Concrete(ConcreteValue::StringList(_))));
+        let ready = DesiredInputs::from_provider_ready(&ready_source);
+        let mut resource = Resource::with_provider("test", "test.Resource", "protected", None);
+        resource.attributes = ready_source.attributes.clone();
         let owner = NativeDesiredNormalization::from_core(&mut resource).unwrap();
         for inputs in [ready, owner.inputs()] {
-            let Some(DesiredValue::Known(DesiredScalar::String(text))) = inputs.attribute("token")
-            else {
-                panic!("known string")
-            };
+            let Some(DesiredValue::Known(DesiredScalar::String(text))) = inputs.attribute("token") else { panic!("known dispatch string") };
             assert!(text.diagnostic_literal().is_none());
-            let Some(DesiredValue::Map(nested)) = inputs.attribute("nested") else {
-                panic!()
-            };
-            let Some(DesiredValue::Known(DesiredScalar::String(text))) = nested.get("token") else {
-                panic!()
-            };
+            let Some(DesiredValue::Map(nested)) = inputs.attribute("nested") else { panic!("map") };
+            let Some(DesiredValue::Known(DesiredScalar::String(text))) = nested.get("token") else { panic!("nested dispatch string") };
             assert!(text.diagnostic_literal().is_none());
             for name in ["list", "string_list"] {
-                let Some(DesiredValue::List(values)) = inputs.attribute(name) else {
-                    panic!()
-                };
-                let Some(DesiredValue::Known(DesiredScalar::String(text))) = values.iter().next()
-                else {
-                    panic!()
-                };
+                let Some(DesiredValue::List(values)) = inputs.attribute(name) else { panic!("list") };
+                let Some(DesiredValue::Known(DesiredScalar::String(text))) = values.iter().next() else { panic!("dispatch list string") };
                 assert!(text.diagnostic_literal().is_none(), "{name}");
             }
         }
-    })
-    .await
+    }).await
 }
 
 #[tokio::test]

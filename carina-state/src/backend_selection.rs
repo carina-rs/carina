@@ -576,7 +576,7 @@ impl BackendSelection {
         requested_bucket: &str,
     ) -> Result<BucketDeleteBackendSelection, BucketDeleteSelectionError> {
         if settings.bucket() != requested_bucket {
-            let configured_bucket = settings.bucket_diagnostic_display();
+            let configured_bucket = carina_core::parser::display_string_literal(settings.bucket());
             return Err(BucketDeleteSelectionError {
                 message: format!(
                     "Bucket name '{requested_bucket}' does not match backend configuration bucket \
