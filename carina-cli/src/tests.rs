@@ -2517,6 +2517,10 @@ struct MockBackend {
 
 #[async_trait::async_trait]
 impl StateBackend for MockBackend {
+    fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
         Ok(Some(LoadedState::Pristine(StateFile::new())))
     }
@@ -2630,6 +2634,10 @@ impl LockTrackingBackend {
 
 #[async_trait::async_trait]
 impl StateBackend for LockTrackingBackend {
+    fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
         Ok(Some(LoadedState::Pristine(StateFile::new())))
     }
@@ -2756,6 +2764,10 @@ impl RefreshTestBackend {
 
 #[async_trait::async_trait]
 impl StateBackend for RefreshTestBackend {
+    fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
         Ok(self.initial_state.clone().map(LoadedState::Pristine))
     }
@@ -5200,6 +5212,10 @@ struct CapturingBackend {
 
 #[async_trait::async_trait]
 impl StateBackend for CapturingBackend {
+    fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget {
+        carina_core::shutdown::CleanupBudget::TWO_SECOND
+    }
+
     async fn read_state(&self) -> carina_state::BackendResult<Option<LoadedState>> {
         Ok(Some(LoadedState::Pristine(StateFile::new())))
     }

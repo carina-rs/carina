@@ -167,9 +167,25 @@ pub struct UpstreamExportReadError {
     pub error: BackendError,
 }
 
+/// How cleanup should report a failed state save.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SaveFailureKind {
+    /// A dispatched write may have committed; reconciliation is needed.
+    Unconfirmed,
+    /// Report the backend's ordinary failure diagnostic.
+    Failed,
+}
+
 /// Errors that can occur when interacting with a state backend
 #[derive(Debug, Error)]
 pub enum BackendError {
+    /// The transport could not confirm the outcome of a dispatched state PUT.
+    #[error("{error}")]
+    UnconfirmedStateSave { error: Box<BackendError> },
+    #[error(transparent)]
+    GitHub(#[from] crate::GitHubError),
+    #[error(transparent)]
+    GitHubUrl(#[from] crate::backends::GitHubUrlError),
     #[error(transparent)]
     UpstreamExportRead(Box<UpstreamExportReadError>),
     /// The state is locked by another process
@@ -577,6 +593,42 @@ fn write_cause_line(out: &mut String, source: &(dyn std::error::Error + 'static)
 }
 
 impl BackendError {
+    /// Classify cleanup save failures without inspecting rendered diagnostics.
+    /// Keep this match exhaustive so new backend failures require a decision.
+    pub fn save_failure_kind(&self) -> SaveFailureKind {
+        match self {
+            Self::UnconfirmedStateSave { .. } => SaveFailureKind::Unconfirmed,
+            Self::StateRead { error, .. } | Self::UnreadableBackendAddress { error, .. } => {
+                error.save_failure_kind()
+            }
+            Self::UpstreamExportRead(error) => error.error.save_failure_kind(),
+            Self::GitHub(_)
+            | Self::GitHubUrl(_)
+            | Self::Locked { .. }
+            | Self::LockNotFound(_)
+            | Self::LockMismatch { .. }
+            | Self::LockNotHeld(_)
+            | Self::InvalidConfig(_)
+            | Self::Configuration(_)
+            | Self::BucketNotFound(_)
+            | Self::InvalidState(_)
+            | Self::InvalidDestroyDependency(_)
+            | Self::LegacyDependencyMigration(_)
+            | Self::InvalidStateJson(_)
+            | Self::InvalidCanonicalBinding(_)
+            | Self::InvalidStateIdentity { .. }
+            | Self::InvalidResourceIdentity(_)
+            | Self::StateVersionTooNew { .. }
+            | Self::ExportsVersionTooNew { .. }
+            | Self::LineageMismatch { .. }
+            | Self::StateWriteConflict { .. }
+            | Self::LocateLocal(_)
+            | Self::Io(_)
+            | Self::Aws(_)
+            | Self::Serialization(_) => SaveFailureKind::Failed,
+        }
+    }
+
     /// Create a Locked error from a LockInfo
     pub fn locked(lock: &LockInfo) -> Self {
         Self::Locked {
@@ -781,8 +833,34 @@ impl StorageUnavailable {
 ///
 /// This trait defines the interface for storing and retrieving state files,
 /// as well as managing locks for concurrent access control.
+///
+/// A bare backend cannot enter cancellation cleanup without a publication permit:
+///
+/// ```compile_fail
+/// use carina_state::{StateBackend, StateFile};
+/// async fn bypass(backend: &dyn StateBackend, state: &StateFile) {
+///     backend.write_state_for_cleanup(state).await.unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_state::{StateBackend, StateFile, LockInfo};
+/// async fn bypass(backend: &dyn StateBackend, state: &StateFile, lock: &LockInfo) {
+///     backend.write_state_locked_for_cleanup(state, lock).await.unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use carina_state::{StateBackend, LockInfo};
+/// async fn bypass(backend: &dyn StateBackend, lock: &LockInfo) {
+///     backend.release_lock_for_cleanup(lock).await.unwrap();
+/// }
+/// ```
 #[async_trait]
 pub trait StateBackend: Send + Sync {
+    /// Cleanup limits selected explicitly by each backend's type or configuration.
+    fn cleanup_budget(&self) -> carina_core::shutdown::CleanupBudget;
+
     /// Read the current state from the backend.
     ///
     /// Returns `None` if no state exists (first-time use). When the
@@ -837,7 +915,11 @@ pub trait StateBackend: Send + Sync {
     /// Remote backends override this entry point with the fixed, short
     /// operation budget needed by the process shutdown deadline. The default
     /// preserves the normal write contract for local and test backends.
-    async fn write_state_for_cleanup(&self, state: &StateFile) -> BackendResult<()> {
+    async fn write_state_for_cleanup(
+        &self,
+        state: &StateFile,
+        _permit: &crate::CleanupPermit<'_>,
+    ) -> BackendResult<()> {
         self.write_state(state).await
     }
 
@@ -850,13 +932,18 @@ pub trait StateBackend: Send + Sync {
         &self,
         state: &StateFile,
         lock: &LockInfo,
+        _permit: &crate::CleanupPermit<'_>,
     ) -> BackendResult<()> {
         let renewed = self.renew_lock(lock).await?;
         self.write_state_locked(state, &renewed).await
     }
 
     /// Release a lock during cancellation cleanup using a bounded remote path.
-    async fn release_lock_for_cleanup(&self, lock: &LockInfo) -> BackendResult<()> {
+    async fn release_lock_for_cleanup(
+        &self,
+        lock: &LockInfo,
+        _permit: &crate::CleanupPermit<'_>,
+    ) -> BackendResult<()> {
         self.release_lock(lock).await
     }
 

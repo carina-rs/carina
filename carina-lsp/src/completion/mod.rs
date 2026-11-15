@@ -107,6 +107,48 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let text = doc.text();
 
+        if let Some(context) = crate::backend_configuration::context(&text, position) {
+            use crate::backend_configuration::Context;
+            use carina_core::validation::admission::configuration::backend::BackendKind;
+            match context {
+                Context::Header => {
+                    return BackendKind::ALL
+                        .into_iter()
+                        .map(|kind| CompletionItem {
+                            label: kind.name().into(),
+                            kind: Some(CompletionItemKind::KEYWORD),
+                            insert_text: Some(crate::backend_configuration::snippet(kind)),
+                            insert_text_format: Some(
+                                tower_lsp::lsp_types::InsertTextFormat::SNIPPET,
+                            ),
+                            detail: Some(format!("Configure {} state backend", kind.name())),
+                            ..Default::default()
+                        })
+                        .collect();
+                }
+                Context::Fields { kind, .. } => {
+                    let line = text.lines().nth(position.line as usize).unwrap_or("");
+                    let prefix = crate::position::line_prefix(line, position.character);
+                    if !prefix.rsplit('{').next().unwrap_or(prefix).contains('=') {
+                        return kind
+                            .fields()
+                            .map(|(name, ty, required)| CompletionItem {
+                                label: name.into(),
+                                kind: Some(CompletionItemKind::FIELD),
+                                insert_text: Some(format!("{name} = ")),
+                                detail: Some(format!(
+                                    "{} ({})",
+                                    ty.type_name(),
+                                    if required { "required" } else { "optional" }
+                                )),
+                                ..Default::default()
+                            })
+                            .collect();
+                    }
+                }
+            }
+        }
+
         // A module resource-handle output preserves the underlying resource
         // schema for postfix access. Detect the depth-2 shape before the
         // generic value-position dispatcher, which otherwise sees only the

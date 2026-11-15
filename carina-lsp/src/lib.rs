@@ -3,6 +3,7 @@
 #[cfg(feature = "test-utils")]
 pub mod admission_coverage;
 pub mod backend;
+mod backend_configuration;
 pub mod code_action;
 pub mod completion;
 pub mod diagnostics;

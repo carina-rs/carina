@@ -48,10 +48,10 @@ impl ConfigurationKind for kind::ProviderConfigAttribute {
 }
 
 impl ConfigurationKind for kind::BackendAttribute {
-    type Payload = ConfigurationAttributes<Value>;
+    type Payload = backend::BackendPayload;
     type Instance = backend::BackendKind;
     fn attributes(payload: &Self::Payload) -> &ConfigurationAttributes<Value> {
-        payload
+        &payload.attributes
     }
 }
 

@@ -11,11 +11,33 @@ use crate::schema::{AttributeType, DslTransform, TypeIdentity};
 
 const AWS_PROVIDER_NAME: &str = "aws";
 
+#[path = "github.rs"]
+mod github;
+pub use github::{
+    GitBranch, GitHubBackendSettings, GitHubDestinationError, LeasePath, RepositorySlug, StatePath,
+};
+
+/// Typed settings retained by the sole backend admission owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendSettings {
+    S3,
+    Local,
+    GitHub(GitHubBackendSettings),
+}
+
+/// Canonical attributes and their typed backend-specific interpretation.
+#[derive(Debug, Clone)]
+pub struct BackendPayload {
+    pub(super) attributes: crate::parser::ConfigurationAttributes<Value>,
+    pub(super) settings: BackendSettings,
+}
+
 /// A built-in destination, independent of installed providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     S3,
     Local,
+    GitHub,
 }
 
 impl BackendKind {
@@ -23,15 +45,64 @@ impl BackendKind {
         match self {
             Self::S3 => "s3",
             Self::Local => "local",
+            Self::GitHub => "github",
         }
+    }
+
+    pub const ALL: [Self; 3] = [Self::S3, Self::Local, Self::GitHub];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// Declaration-backed editor metadata; no provider loading is needed.
+    pub fn fields(
+        self,
+    ) -> impl Iterator<
+        Item = (
+            &'static str,
+            &'static crate::schema::CompiledAttributeType,
+            bool,
+        ),
+    > {
+        let declaration = self.declaration();
+        declaration
+            .configuration
+            .schema
+            .parts()
+            .iter()
+            .map(move |(name, ty)| {
+                (
+                    name.as_str(),
+                    ty,
+                    declaration.required.contains(&name.as_str()),
+                )
+            })
+    }
+
+    pub fn documentation(self) -> String {
+        let mut text = format!(
+            "## backend {}\n\nState backend configuration.\n",
+            self.name()
+        );
+        for (name, ty, required) in self.fields() {
+            text.push_str(&format!(
+                "\n- `{name}`: {} ({})",
+                ty.type_name(),
+                if required { "required" } else { "optional" }
+            ));
+        }
+        text
     }
 
     fn declaration(self) -> &'static BackendDeclaration {
         static S3: OnceLock<BackendDeclaration> = OnceLock::new();
         static LOCAL: OnceLock<BackendDeclaration> = OnceLock::new();
+        static GITHUB: OnceLock<BackendDeclaration> = OnceLock::new();
         let slot = match self {
             Self::S3 => &S3,
             Self::Local => &LOCAL,
+            Self::GitHub => &GITHUB,
         };
         slot.get_or_init(|| {
             let fields = match self {
@@ -57,6 +128,11 @@ impl BackendKind {
                     ("auto_create", AttributeType::bool(), false),
                 ],
                 Self::Local => vec![("path", AttributeType::string(), false)],
+                Self::GitHub => vec![
+                    ("repository", AttributeType::string(), true),
+                    ("branch", AttributeType::string(), true),
+                    ("path", AttributeType::string(), true),
+                ],
             };
             let required = fields
                 .iter()
@@ -353,12 +429,11 @@ impl AdmittedConfiguration<kind::BackendAttribute> {
 pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     config: &parser::BackendConfig<P, B>,
 ) -> Result<AdmittedConfiguration<kind::BackendAttribute>, BackendConfigError> {
-    let kind = match config.backend_type.as_str() {
-        "s3" => BackendKind::S3,
-        "local" => BackendKind::Local,
-        other => {
+    let kind = match BackendKind::from_name(&config.backend_type) {
+        Some(kind) => kind,
+        None => {
             return Err(UnsupportedBackendError {
-                backend_type: other.into(),
+                backend_type: config.backend_type.clone(),
             }
             .into());
         }
@@ -376,6 +451,7 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     }
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::new([]));
     let lookup = BuiltinLookup;
+    let mut github_settings = github::GitHubSettingsBuilder::default();
     let checked = crate::validation::deferred_types::TypeCheckSession::run(&catalog, |_| {
         let mut aggregate = ConfigurationBuilder::new(Arc::clone(declaration), kind);
         for (key, value) in &config.attributes {
@@ -423,6 +499,22 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
                 errors.push(invalid_shape(kind, key, ty, &canonical));
                 continue;
             }
+            if kind == BackendKind::GitHub {
+                let Value::Concrete(ConcreteValue::String(value)) = &canonical else {
+                    unreachable!()
+                };
+                let value = value.expose_plaintext();
+                if let Err(error) = github_settings.place(&destination.contract.attribute, value) {
+                    errors.push(BackendAttributeError::InvalidAttribute {
+                        backend_type: kind.name().into(),
+                        attribute: key.clone(),
+                        error: Box::new(TypeError::ValidationFailed {
+                            message: error.to_string().into(),
+                        }),
+                    });
+                    continue;
+                }
+            }
             let placed = match admission {
                 ConfigurationAdmission::Ready(placed) => placed,
                 ConfigurationAdmission::Unresolved(_) => {
@@ -451,7 +543,12 @@ pub fn admit<P: PlaceholderKind, B: BindingAddress>(
     if !errors.is_empty() {
         return Err(BackendConfigErrors::new(errors).into());
     }
-    Ok(aggregate.admit_payload())
+    let settings = match kind {
+        BackendKind::GitHub => BackendSettings::GitHub(github_settings.finish()?),
+        BackendKind::S3 => BackendSettings::S3,
+        BackendKind::Local => BackendSettings::Local,
+    };
+    Ok(aggregate.admit_payload(settings))
 }
 
 #[cfg(test)]

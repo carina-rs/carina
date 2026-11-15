@@ -1,7 +1,7 @@
 //! Carina State Management
 //!
 //! This crate provides state management for the Carina infrastructure tool.
-//! It supports storing infrastructure state in various backends (currently S3)
+//! It supports storing infrastructure state locally, in S3, and in GitHub
 //! with locking support for safe concurrent access.
 //!
 //! # Overview
@@ -34,7 +34,8 @@
 //!     // Initialize or migrate the backend lock before mutating state.
 //!     return Err("backend is not ready for mutation".into());
 //! };
-//! let backend = selected.resolve().await?;
+//! let shutdown = carina_core::shutdown::ShutdownToken::running();
+//! let backend = selected.resolve(&shutdown).await?;
 //!
 //! // Acquire lock before modifying state
 //! let lock = backend.acquire_lock("apply").await?;
@@ -78,24 +79,26 @@ pub use refresh::{
 // Re-export main types for convenience
 pub use backend::{
     BackendError, BackendResult, InvalidResourceIdentityError, LOCAL_BACKEND_TYPE, RawState,
-    S3_BACKEND_TYPE, StateBackend, StorageReadiness, StorageReadinessStatus, StorageUnavailable,
-    read_published_exports,
+    S3_BACKEND_TYPE, SaveFailureKind, StateBackend, StorageReadiness, StorageReadinessStatus,
+    StorageUnavailable, read_published_exports,
 };
 pub use backend_config::{
-    BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors,
-    LocalBackendSettings, LocalStateLocateError, S3BackendSettings,
+    BackendAttributeError, BackendConfig, BackendConfigError, BackendConfigErrors, GitBranch,
+    GitHubBackendSettings, LeasePath, LocalBackendSettings, LocalStateLocateError, RepositorySlug,
+    S3BackendSettings, StatePath,
 };
 pub use backend_lock::BackendLock;
 pub use backend_selection::{
     BackendConfigurationSource, BackendDrift, BackendDriftStatus, BackendSelection,
-    BucketDeleteBackendSelection, BucketDeleteSelectionError, MigrationBackends,
-    MutationBackendSelection, ProtectedBackendBucket, ReadBackendOrigin, ReadBackendSelection,
-    ResolvedReadBackend, VerifiedMutationBackendSelection, inspect_backend_drift,
+    BucketDeleteBackendSelection, BucketDeleteSelectionError, CleanupPermit, MigrationBackends,
+    MutationBackendSelection, ProtectedBackendBucket, PublishedBackend, ReadBackendOrigin,
+    ReadBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
+    inspect_backend_drift,
 };
 pub use backends::{
-    LocalBackend, LocalStateFile, S3AutoCreate, S3AutoCreateDisabled, S3Bootstrap, S3BootstrapInfo,
-    StateUrl, anchored_local_path, load_encoded_published_exports_from_url, load_local_state_file,
-    load_state_from_url,
+    GitHubBackend, GitHubError, LocalBackend, LocalStateFile, S3AutoCreate, S3AutoCreateDisabled,
+    S3Bootstrap, S3BootstrapInfo, StateUrl, anchored_local_path,
+    load_encoded_published_exports_from_url, load_local_state_file, load_state_from_url,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use backends::{local_backend_for_test, s3_backend_for_test};

@@ -7,6 +7,45 @@ use std::sync::atomic::Ordering;
 use carina_core::test_utils::configuration::{ConfigFactory, ConfigurationDirectory};
 
 #[test]
+fn github_admission_diagnostics_match_cli_multifile_fixture() {
+    let engine = DiagnosticEngine::new(loaded_test_providers(SchemaRegistry::new()), Vec::new());
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../carina-cli/tests/fixtures/github_backend_admission");
+    for file in ["main.crn", "backend.crn", "providers.crn"] {
+        let path = root.join(file);
+        let source = std::fs::read_to_string(&path).unwrap();
+        let errors: Vec<_> = engine
+            .analyze(&create_document_at(&source, path.clone()), Some(&path))
+            .into_iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        if file == "backend.crn" {
+            assert_eq!(errors.len(), 3, "{errors:?}");
+            let expected: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.join("expected.json")).unwrap())
+                    .unwrap();
+            for expected in expected.as_array().unwrap() {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.message == expected["message"].as_str().unwrap()),
+                    "{errors:?}"
+                );
+            }
+            for (field, line) in [("branch", 2), ("path", 3), ("repository", 1)] {
+                let error = errors
+                    .iter()
+                    .find(|d| d.message.contains(&format!("Invalid attribute '{field}'")))
+                    .unwrap();
+                assert_eq!(error.range.start, Position::new(line, 2));
+            }
+        } else {
+            assert!(errors.is_empty(), "{file}: {errors:?}");
+        }
+    }
+}
+
+#[test]
 fn backend_attribute_error_locations_match_cli_directory_fixtures() {
     let factory = carina_provider_mock::ConfiguredBuiltinMock::new(
         Default::default(),
