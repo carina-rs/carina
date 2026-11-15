@@ -2624,7 +2624,7 @@ let orphan = mock.test.resource {
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            &indexmap::IndexMap::new(),
+            &Default::default(),
         );
     assert!(
         directory_parse.is_err(),
@@ -2642,6 +2642,45 @@ let orphan = mock.test.resource {
     assert!(
         unused.iter().all(|binding| binding != "orphan"),
         "diagnostics: {diagnostics:#?}",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_override_leaf_failure_preserves_directory_unused_binding_filter() {
+    let schemas = authored_binding_regression_schemas();
+    let engine = custom_engine(schemas);
+    let fixture = tempfile::tempdir().unwrap();
+    let source = "let bucket = mock.test.resource { name = 'bucket' }\n";
+    std::fs::write(
+        fixture.path().join("consumer.crn"),
+        "mock.test.resource { name = bucket.name }\n",
+    )
+    .unwrap();
+    let path = fixture.path().join("main.crn");
+    std::os::unix::fs::symlink("main.crn", &path).unwrap();
+    let base = carina_core::paths::ResolvedPath::new(fixture.path()).unwrap();
+    assert!(base.join("main.crn").is_err());
+    let directory_failure =
+        carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
+            &base,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &Default::default(),
+        )
+        .err()
+        .expect("the looping document leaf must fail directory discovery");
+    assert!(directory_failure.io_error().is_some());
+
+    let document = create_document_at(source, path.clone());
+    assert_eq!(
+        unused_binding_names(&engine.analyze(&document, None)),
+        vec!["bucket".to_string()],
+        "the control must exercise the unused-binding check"
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    assert!(
+        unused_binding_names(&diagnostics).is_empty(),
+        "failed document resolution must retain directory context for sibling uses: {diagnostics:#?}"
     );
 }
 
@@ -13672,15 +13711,13 @@ provider awscc {
     std::fs::write(root.path().join("providers.crn"), providers).unwrap();
 
     let engine = test_engine();
-    let doc = create_document(providers);
+    let base = carina_core::paths::ResolvedPath::new(root.path()).unwrap();
+    let overrides = carina_core::config_loader::SourceOverrides::single(
+        base.join("providers.crn").unwrap(),
+        providers.to_string(),
+    );
     let finalize_error = engine
-        .with_run_for_test(|run| {
-            run.finalize_provider_diagnostic(
-                &doc.for_diagnostics().expect("public fixture"),
-                Some("providers.crn"),
-                &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
-            )
-        })
+        .with_run_for_test(|run| run.finalize_provider_diagnostic(&base, &overrides))
         .expect("independent provider finalization must survive a module witness failure");
     assert!(finalize_error.to_string().contains("default_tags"));
 
@@ -13714,14 +13751,14 @@ let instance = module { count = 'wrong' }
     std::fs::write(root.path().join("providers.crn"), providers).unwrap();
 
     let engine = test_engine();
-    let doc = create_document(providers);
+    let base = carina_core::paths::ResolvedPath::new(root.path()).unwrap();
+    let overrides = carina_core::config_loader::SourceOverrides::single(
+        base.join("providers.crn").unwrap(),
+        providers.to_string(),
+    );
     assert!(
         engine
-            .with_run_for_test(|run| run.finalize_provider_diagnostic(
-                &doc.for_diagnostics().expect("public fixture"),
-                Some("providers.crn"),
-                &carina_core::paths::ResolvedPath::new(root.path()).unwrap()
-            ))
+            .with_run_for_test(|run| run.finalize_provider_diagnostic(&base, &overrides))
             .is_none(),
         "a provider value downstream of failed expansion cannot be finalized independently"
     );
@@ -15707,7 +15744,6 @@ fn unknown_module_reference_resolver_diagnostic_uses_the_module_file_position()
         .with_run_for_test(|run| {
             run.parse_and_resolve_merged_with_buffer(
                 &call_doc.for_diagnostics().expect("public fixture"),
-                Some("call.crn"),
                 &carina_core::paths::ResolvedPath::new(root.path()).unwrap(),
             )
         })
@@ -16661,7 +16697,7 @@ fn tag_key_style_anchor_uses_character_column_after_multibyte_whitespace() {
         carina_core::config_loader::parse_directory_with_overrides_and_diagnostics(
             &carina_core::paths::ResolvedPath::new(temp.path()).unwrap(),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            &indexmap::IndexMap::new(),
+            &Default::default(),
         )
         .expect("directory fixture must parse");
     let (_, parsed_source) = merged_result

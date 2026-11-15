@@ -2780,7 +2780,7 @@ fn collect_named_provider_instance_bindings(
     let parsed = match carina_core::config_loader::parse_directory_for_metadata(
         &dir,
         provider_ctx.catalog(),
-        &indexmap::IndexMap::new(),
+        &Default::default(),
         &carina_core::schema::SchemaRegistry::new(),
     ) {
         Ok(p) => p,

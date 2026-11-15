@@ -877,8 +877,19 @@ impl DiagnosticRun<'_> {
         let current_file_name = current_file_path.map(|path| {
             path.file_name()
                 .expect("a current file path must name a file")
-                .to_string_lossy()
         });
+        // Resolve the document through the pinned base once, then share its
+        // snapshot across directory, module, upstream and recovery analysis.
+        let overrides = if let Some(base) = base_path {
+            current_file_name
+                .and_then(|file_name| base.join(file_name).ok())
+                .map(|path| carina_core::config_loader::SourceOverrides::single(path, text.clone()))
+        } else {
+            None
+        };
+        // Keep directory checks available when only the document leaf fails.
+        let overrides = overrides.unwrap_or_else(carina_core::config_loader::SourceOverrides::new);
+        let current_file_name = current_file_name.map(|name| name.to_string_lossy());
         let current_file_name = current_file_name.as_deref();
 
         // Build the directory-scoped merged parse once up-front — it is
@@ -888,8 +899,7 @@ impl DiagnosticRun<'_> {
         // filtering, and exports type validation (#2134). The buffer is
         // substituted for its on-disk copy so diagnostics update on
         // keystrokes.
-        let merged_attempt =
-            base_path.map(|base| self.parse_merged_with_buffer(doc, current_file_name, base));
+        let merged_attempt = base_path.map(|base| self.parse_merged_with_buffer(base, &overrides));
         let duplicates = match merged_attempt
             .as_ref()
             .and_then(|attempt| attempt.as_ref().ok())
@@ -1008,10 +1018,6 @@ impl DiagnosticRun<'_> {
         let merged = merged.filter(|_| merged_analysis.is_some());
         let current_parsed = current_parsed.filter(|_| current_analysis.is_some());
         let preferred_analysis = merged_analysis.as_ref().or(current_analysis.as_ref());
-        let overrides = carina_core::config_loader::SourceOverrides::from([(
-            doc.source_file().to_path_buf(),
-            text.clone(),
-        )]);
         // Module checks need declaration and upstream authority before their
         // single run. Both use the same sealed directory throughout analysis.
         let type_resolution = failed_directory_type_resolution.take().or_else(|| {
@@ -1230,7 +1236,7 @@ impl DiagnosticRun<'_> {
         // diagnostic so editors flag it the same way `carina validate`
         // does.
         if let Some(base) = base_path
-            && let Some(err) = self.finalize_provider_diagnostic(doc, current_file_name, base)
+            && let Some(err) = self.finalize_provider_diagnostic(base, &overrides)
             && let Some(diagnostic) = render_analysis_resolution_error(doc, &err)
             && !diagnostics.contains(&diagnostic)
         {
