@@ -2627,6 +2627,37 @@ EOT
     }
 
     #[test]
+    fn env_hover_values_are_public_and_secret_values_stay_masked() {
+        let config = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+            "CARINA_4409_HOVER".to_string(),
+            "hover-env-value".into(),
+        )]));
+        let mut parsed = carina_core::parser::parse_file(
+            "let value = env('CARINA_4409_HOVER')\nlet hidden = secret(env('CARINA_4409_HOVER'))",
+            std::path::Path::new("hover.crn"),
+            &config,
+        )
+        .unwrap();
+        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
+        let value = parsed.variables["value"].clone();
+        let ordinary = format_value_for_hover(&value);
+        let hidden = format_value_for_hover(&parsed.variables["hidden"]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        let hover = provider.builtin_function_hover("env").unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("builtin hover must use markup");
+        };
+        eprintln!(
+            "env hover: {ordinary}; secret hover: {hidden}; documentation: {}",
+            content.value
+        );
+        assert!(!hidden.contains("hover-env-value"));
+        assert_eq!(ordinary, "'hover-env-value'");
+        assert!(content.value.contains("ordinary string"));
+        assert!(content.value.contains("secret(env('NAME'))"));
+    }
+
+    #[test]
     fn test_all_builtin_functions_have_hover() {
         let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
         let names = [

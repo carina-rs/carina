@@ -631,11 +631,12 @@ compare equally. Integer versus float spellings and struct block aliases versus
 canonical field keys remain distinct because canonicalization preserves them.
 Nested unordered lists inside an element compare in order.
 
-Elements containing secrets, environment-derived (diagnostic-sensitive) values,
-or unresolved values are excluded from duplicate comparison; known,
-nonsensitive elements in the same list are still checked. A secret wrapping the
-whole list is also excluded. Read-side values (provider read-back and persisted
-state) and wait-condition right-hand sides are not checked for uniqueness.
+Elements containing secrets or unresolved values are excluded from duplicate
+comparison; known public elements in the same list are still checked.
+Environment values participate unless wrapped in `secret(env('NAME'))`.
+A secret wrapping the whole list is also excluded. Read-side values (provider
+read-back and persisted state) and wait-condition right-hand sides are not
+checked for uniqueness.
 List length constraints remain enforced in every case. Duplicate errors carry
 the value, duplicate index, first index, and attribute context through CLI and
 LSP diagnostics. Semantic schema fingerprints use encoding v8 to include this

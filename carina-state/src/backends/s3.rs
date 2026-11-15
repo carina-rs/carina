@@ -138,10 +138,7 @@ pub struct S3AutoCreateDisabled {
 
 impl S3AutoCreateDisabled {
     fn new(settings: &S3BackendSettings) -> Self {
-        let bucket = match settings.bucket_diagnostic_literal() {
-            Some(bucket) => format!("'{bucket}'"),
-            None => "value from env()".to_owned(),
-        };
+        let bucket = settings.bucket_diagnostic_display();
         Self { bucket }
     }
 }
@@ -1132,6 +1129,99 @@ mod tests {
     use super::*;
     use crate::state::ResourceState;
     use aws_sdk_s3::error::{ErrorMetadata, SdkError};
+
+    fn with_secret_payload_bucket(check: impl FnOnce(&crate::S3BackendSettings)) {
+        use carina_core::resource::{ConcreteValue, NoPlaceholder, SecretPayload, Value};
+        let payload: SecretPayload<NoPlaceholder, carina_core::resource::AbsoluteBindingAddress> =
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "private-token".into(),
+            )))
+            .into();
+        payload.visit(|value| {
+            let raw = carina_core::parser::BackendConfig {
+                backend_type: "s3".into(),
+                attributes: [
+                    ("bucket".to_string(), value.clone()),
+                    (
+                        "key".to_string(),
+                        Value::Concrete(ConcreteValue::String("state.json".into())),
+                    ),
+                    (
+                        "auto_create".to_string(),
+                        Value::Concrete(ConcreteValue::Bool(false)),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                attribute_spans: Default::default(),
+            };
+            let checked = crate::BackendConfig::try_from(&raw).unwrap();
+            let settings = checked.as_s3().unwrap();
+            assert_eq!(settings.bucket_diagnostic_literal(), None);
+            check(settings);
+        });
+    }
+
+    #[test]
+    fn secret_payload_bucket_auto_create_uses_secret_mask() {
+        with_secret_payload_bucket(|settings| {
+            let message = S3AutoCreateDisabled::new(settings).to_string();
+            eprintln!("secret bucket auto-create: {message}");
+            assert!(!message.contains("private-token"), "{message}");
+            assert!(!message.to_ascii_lowercase().contains("env"), "{message}");
+            assert_eq!(
+                message,
+                "Backend bucket (secret) not found and auto_create is disabled"
+            );
+        });
+    }
+
+    #[test]
+    fn secret_payload_bucket_delete_mismatch_uses_secret_mask() {
+        with_secret_payload_bucket(|settings| {
+            let message = crate::BackendSelection::for_bucket_delete(settings, "requested-bucket")
+                .unwrap_err()
+                .to_string();
+            eprintln!("secret bucket delete mismatch: {message}");
+            assert!(!message.contains("private-token"), "{message}");
+            assert!(!message.to_ascii_lowercase().contains("env"), "{message}");
+            assert_eq!(
+                message,
+                "Bucket name 'requested-bucket' does not match backend configuration bucket (secret)."
+            );
+        });
+    }
+
+    #[test]
+    fn env_backend_diagnostics_show_public_bucket_without_network() {
+        let config =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+                "CARINA_4409_BUCKET".to_string(),
+                "bucket-from-env".into(),
+            )]));
+        let mut parsed = carina_core::parser::parse_file(
+            "backend s3 { bucket = env('CARINA_4409_BUCKET') key = 'state.json' auto_create = false }",
+            std::path::Path::new("backend.crn"),
+            &config,
+        )
+        .unwrap();
+        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
+        let resolved = crate::BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
+        let settings = resolved.as_s3().unwrap();
+        let observations = [
+            S3AutoCreateDisabled::new(settings).to_string(),
+            crate::BackendSelection::for_bucket_delete(settings, "requested-bucket")
+                .unwrap_err()
+                .to_string(),
+            format!("{settings:?}"),
+        ];
+        eprintln!("env backend diagnostics: {observations:#?}");
+        assert!(
+            observations
+                .iter()
+                .all(|message| message.contains("bucket-from-env"))
+        );
+    }
 
     #[test]
     fn test_resolve_region_prefers_explicit_over_sdk_chain() {

@@ -969,7 +969,7 @@ fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
     }
 }
 
-fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
+fn assert_enum_witness_shows_env_and_masks_secret_value(base: DraftType, expected: &str) {
     let open_enum = |base| DraftType::enum_with_base(identity(), base, None, vec![], None, None);
     let strict = snapshot(vec![("p", vec![open_enum(base)])]);
     let lax = snapshot(vec![("p", vec![open_enum(DraftType::string())])]);
@@ -987,10 +987,19 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
     crate::parser::resolve_resource_refs_with_config(&mut parsed, context.as_provider_context())
         .unwrap();
     let env_value = parsed.resources[0].get_attr("value0").unwrap();
-    assert!(env_value.contains_diagnostic_sensitive_string());
+    assert!(!env_value.contains_diagnostic_sensitive_string());
+    let Value::Deferred(crate::resource::DeferredValue::Secret(payload)) =
+        env_value.clone().into_secret()
+    else {
+        panic!("the secret fixture must have a payload");
+    };
+    let secret_value = payload
+        .try_project_plaintext(|value| Ok::<_, std::convert::Infallible>(value.clone()))
+        .unwrap();
+    assert!(secret_value.contains_diagnostic_sensitive_string());
     let ty: TypeExpr =
         serde_json::from_value(serde_json::to_value(annotation(&strict)).unwrap()).unwrap();
-    for value in [env_value, &text(plaintext)] {
+    for value in [env_value, &text(plaintext), &secret_value] {
         let error = typecheck::check_type_expr_value(
             &ty,
             value,
@@ -1002,6 +1011,7 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
         .require_provider_schemas()
         .expect_err("the retained witness must reject the value");
         let message = error.to_string();
+        eprintln!("enum witness: {message}");
         assert!(message.contains(expected), "{message}");
         if value.contains_diagnostic_sensitive_string() {
             assert!(!message.contains(plaintext), "secret leaked: {message}");
@@ -1015,13 +1025,16 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
 }
 
 #[test]
-fn review_enum_witness_length_error_masks_env_value() {
-    assert_enum_witness_masks_env_value(string(2, 4, None), "outside allowed range 2..=4");
+fn review_enum_witness_length_error_shows_env_and_masks_secret_value() {
+    assert_enum_witness_shows_env_and_masks_secret_value(
+        string(2, 4, None),
+        "outside allowed range 2..=4",
+    );
 }
 
 #[test]
-fn review_enum_witness_pattern_error_masks_env_value() {
-    assert_enum_witness_masks_env_value(
+fn review_enum_witness_pattern_error_shows_env_and_masks_secret_value() {
+    assert_enum_witness_shows_env_and_masks_secret_value(
         string(
             1,
             32,

@@ -592,7 +592,7 @@ register_builtins! {
     },
     env(env::builtin_env, arity: 1) {
         signature: "env(name: String) -> String",
-        description: "Reads an environment variable. Errors if the variable is not set.",
+        description: "Reads an environment variable as an ordinary string that can appear in diagnostics and plan output. Use `secret(env('NAME'))` to keep a variable hidden. Errors if the variable is not set.",
         result_typing: BuiltinResultTyping::String,
     },
     flatten(flatten::builtin_flatten, arity: 1) {

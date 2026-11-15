@@ -1646,18 +1646,15 @@ impl Subscript {
             Subscript::Int { index } => {
                 let _ = write!(out, "[{}]", index);
             }
-            Subscript::Str { key } => match key.diagnostic_literal() {
-                Some(key) => {
-                    let _ = write!(out, "[{}]", display_string_literal(key));
-                }
-                None => out.push_str("[value from env()]"),
-            },
+            Subscript::Str { key } => {
+                let _ = write!(out, "[{}]", key.diagnostic_display());
+            }
         }
     }
 
     /// Append the runtime path spelling. This is reserved for evaluation,
     /// identity, serialization, and provider transport; diagnostics must use
-    /// [`Self::append_to_dot_string`] so an `env()`-derived key stays marked.
+    /// [`Self::append_to_dot_string`] so a key from a secret payload stays masked.
     pub fn append_to_plaintext_dot_string(&self, out: &mut String) {
         use std::fmt::Write as _;
         match self {
@@ -2069,9 +2066,7 @@ impl<B: BindingAddress> AccessPath<B> {
         let binding = if expose_plaintext {
             self.binding.as_str()
         } else {
-            self.binding
-                .diagnostic_literal()
-                .unwrap_or("value from env()")
+            self.binding.diagnostic_spelling()
         };
         let mut out = String::with_capacity(binding.len() + self.attribute.len() + 1 + segment_len);
         out.push_str(binding);
@@ -2142,15 +2137,9 @@ impl<B: BindingAddress> ReferencePath<B> {
     pub fn to_dot_string(&self) -> String {
         match self {
             Self::Access(path) => path.to_dot_string(),
-            Self::Binding(binding) => binding
-                .diagnostic_literal()
-                .unwrap_or("value from env()")
-                .to_string(),
+            Self::Binding(binding) => binding.diagnostic_spelling().to_string(),
             Self::BindingAccess { binding, segments } => {
-                let mut rendered = binding
-                    .diagnostic_literal()
-                    .unwrap_or("value from env()")
-                    .to_string();
+                let mut rendered = binding.diagnostic_spelling().to_string();
                 for segment in segments {
                     segment.append_to_dot_string(&mut rendered);
                 }
@@ -2396,9 +2385,7 @@ impl std::fmt::Display for ValueAccessError {
                 available,
                 len,
             } => {
-                let key = key
-                    .diagnostic_literal()
-                    .map_or_else(|| "value from env()".to_string(), display_string_literal);
+                let key = key.diagnostic_display();
                 write!(
                     f,
                     "key {key} not found in map{}",
@@ -2990,8 +2977,8 @@ pub type ExpandedValue = Value<NoPlaceholder, AbsoluteBindingAddress>;
 /// diagnostic rendering safe.
 ///
 /// The provenance bit is deliberately absent from equality, hashing, and the
-/// serde representation. An `env()` result therefore behaves exactly like an
-/// authored string in evaluation, plans, state, diffs, and provider payloads,
+/// serde representation. A string marked by the secret mechanism retains its
+/// runtime behavior in evaluation, plans, state, diffs, and provider payloads,
 /// while diagnostic code cannot accidentally format its plaintext. There is
 /// deliberately no `Display` implementation; `Debug` is redacted, and code
 /// that genuinely needs the bytes at an execution or serialization boundary
@@ -3003,6 +2990,8 @@ pub struct ValueString {
 }
 
 impl ValueString {
+    pub(crate) const DIAGNOSTIC_MASK: &str = crate::schema::SECRET_VALUE_MASK;
+
     /// Construct an ordinary authored/runtime string.
     pub fn plain(plaintext: impl Into<String>) -> Self {
         Self {
@@ -3012,9 +3001,8 @@ impl ValueString {
     }
 
     /// Construct a string whose contents must never be included in a
-    /// diagnostic. Kept crate-private so only trusted value producers (`env()`
-    /// and secret payload construction) can attach
-    /// the provenance mark.
+    /// diagnostic. Kept crate-private for the secret mechanism and already-masked
+    /// diagnostic placeholders.
     pub(crate) fn diagnostic_sensitive(plaintext: impl Into<String>) -> Self {
         Self {
             plaintext: plaintext.into(),
@@ -3041,6 +3029,13 @@ impl ValueString {
     /// runtime type may be rendered.
     pub fn diagnostic_literal(&self) -> Option<&str> {
         (!self.diagnostic_sensitive).then_some(self.plaintext.as_str())
+    }
+
+    /// Render a public string as a quoted DSL literal, or the shared secret mask.
+    pub fn diagnostic_display(&self) -> String {
+        self.diagnostic_literal()
+            .map(display_string_literal)
+            .unwrap_or_else(|| Self::DIAGNOSTIC_MASK.to_string())
     }
 
     /// Build a derived string and inherit diagnostic sensitivity from every
@@ -5650,8 +5645,8 @@ pub enum DeferredValueRef<
 }
 
 impl<P: ValueKind, B: BindingAddress> Value<P, B> {
-    /// Whether this value tree carries any `env()`-derived string whose
-    /// plaintext must be excluded from diagnostics.
+    /// Whether this value tree contains strings marked by the secret mechanism.
+    /// Their plaintext must be excluded from diagnostics.
     pub(crate) fn contains_diagnostic_sensitive_string(&self) -> bool {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred

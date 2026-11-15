@@ -12509,7 +12509,7 @@ async fn auto_create_backend_bucket_declared_resource_precedes_disabled_policy()
 }
 
 #[tokio::test]
-async fn auto_create_backend_bucket_apply_redacts_env_bucket_like_plan() {
+async fn auto_create_backend_bucket_apply_shows_env_bucket_like_plan() {
     let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
         "STATE_BUCKET".into(),
         "private-bucket-name".into(),
@@ -12531,10 +12531,10 @@ async fn auto_create_backend_bucket_apply_redacts_env_bucket_like_plan() {
 
     let error = select_s3_bucket_bootstrap(bootstrap, None).unwrap_err();
     assert!(matches!(&error, AppError::Config(_)));
-    // The disabled-policy message is shared with plan, including env() redaction.
+    // The disabled-policy message is shared with plan, including the ordinary env() value.
     assert_eq!(
         error.to_string(),
-        "Backend bucket value from env() not found and auto_create is disabled"
+        "Backend bucket 'private-bucket-name' not found and auto_create is disabled"
     );
     assert_eq!(
         requests

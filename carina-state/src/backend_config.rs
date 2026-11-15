@@ -225,6 +225,10 @@ impl S3BackendSettings {
         self.bucket.diagnostic_literal()
     }
 
+    pub(crate) fn bucket_diagnostic_display(&self) -> String {
+        self.bucket.diagnostic_display()
+    }
+
     pub fn key(&self) -> &str {
         self.key.expose_plaintext()
     }
@@ -659,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn environment_strings_remain_usable_and_redacted() {
+    fn environment_strings_remain_usable_and_public() {
         let variable = "CARINA_3880_BACKEND_BUCKET";
         let plaintext = "bucket-from-env";
         let source = format!(
@@ -679,8 +683,8 @@ mod tests {
         let resolved = BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
         let settings = resolved.as_s3().unwrap();
         assert_eq!(settings.bucket(), plaintext);
-        assert_eq!(settings.bucket_diagnostic_literal(), None);
-        assert!(!format!("{settings:?}").contains(plaintext));
+        assert_eq!(settings.bucket_diagnostic_literal(), Some(plaintext));
+        assert!(format!("{settings:?}").contains(plaintext));
     }
 }
 

@@ -8,13 +8,14 @@ use super::value_type_name;
 /// `env(name)` - Read an environment variable.
 ///
 /// - First argument: name of the environment variable (string)
-/// - Returns: The value of the environment variable as a string
+/// - Returns: An ordinary string that can appear in diagnostics and plan output
 /// - Errors if the variable is not set or the argument is not a string
+/// - Use `secret(env("NAME"))` for a value that must stay hidden
 ///
 /// Examples:
 /// ```text
-/// env("HOME")          // => "/home/user"
-/// env("DB_PASSWORD")   // => "s3cret"
+/// env("HOME")                    // => "/home/user"
+/// secret(env("DB_PASSWORD"))      // => (secret)
 /// ```
 pub(crate) fn builtin_env<B: BindingAddress>(
     args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
@@ -29,7 +30,7 @@ pub(crate) fn builtin_env<B: BindingAddress>(
     let value = environment
         .get(name.expose_plaintext())
         .and_then(|value| value.to_str())
-        .map(|s| Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(s))))
+        .map(|s| Value::Concrete(ConcreteValue::String(s.into())))
         .ok_or_else(|| {
             let literal = name.diagnostic_literal();
             match literal {
@@ -156,14 +157,17 @@ mod tests {
             result,
             Value::Concrete(ConcreteValue::String("hello_world".into()))
         );
-        assert_eq!(ValueDescription::of(&result).to_string(), "string");
+        assert_eq!(
+            ValueDescription::of(&result).to_string(),
+            "string 'hello_world'"
+        );
         assert_eq!(format_value(&result), "'hello_world'");
         assert_eq!(
             value_to_json(&result).unwrap(),
             serde_json::json!("hello_world")
         );
         assert!(
-            matches!(&result, Value::Concrete(ConcreteValue::String(value)) if value.is_diagnostic_sensitive())
+            matches!(&result, Value::Concrete(ConcreteValue::String(value)) if !value.is_diagnostic_sensitive())
         );
     }
 
@@ -266,7 +270,254 @@ mod tests {
     }
 
     #[test]
-    fn env_sensitivity_propagates_through_string_builtins() {
+    fn env_diagnostic_consumers_show_public_strings() {
+        let config = ProviderContext {
+            decryptor: Some(std::sync::Arc::new(|ciphertext, key| {
+                Err(format!("decrypt failed: {ciphertext}, key={key:?}"))
+            })),
+            ..ProviderContext::new(EnvironmentSnapshot::new([
+                ("VALUE".to_string(), "env-diagnostic-value".into()),
+                ("FIELD".to_string(), ".env-diagnostic-field".into()),
+            ]))
+        };
+        let env = |variable: &str| {
+            evaluate_builtin(
+                "env",
+                &[Value::Concrete(ConcreteValue::String(variable.into()))],
+                &config,
+            )
+            .unwrap()
+        };
+        let value = env("VALUE");
+        let mut observations = vec![("description", ValueDescription::of(&value).to_string())];
+        let enumeration = crate::schema::ResourceSchema::new("EnvEnum")
+            .attribute(
+                crate::schema::AttributeSchema::optional(
+                    "mode",
+                    crate::schema::AttributeType::enum_(
+                        crate::schema::TypeIdentity::bare("Mode"),
+                        Some(vec!["allowed".into()]),
+                        Vec::new(),
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        observations.push((
+            "enum literal",
+            enumeration
+                .effective_attribute("mode")
+                .unwrap()
+                .field_type()
+                .validate(&value)
+                .unwrap_err()
+                .to_string(),
+        ));
+        for (function, args) in [
+            (
+                "cidr_subnet",
+                vec![
+                    value.clone(),
+                    Value::Concrete(ConcreteValue::Int(8)),
+                    Value::Concrete(ConcreteValue::Int(0)),
+                ],
+            ),
+            ("decrypt", vec![value.clone()]),
+            (
+                "decrypt key",
+                vec![
+                    Value::Concrete(ConcreteValue::String("ciphertext".into())),
+                    value.clone(),
+                ],
+            ),
+            ("env", vec![value.clone()]),
+            (
+                "map",
+                vec![
+                    env("FIELD"),
+                    Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::Map(indexmap::IndexMap::new()),
+                    )])),
+                ],
+            ),
+        ] {
+            let builtin = if function == "decrypt key" {
+                "decrypt"
+            } else {
+                function
+            };
+            observations.push((
+                function,
+                evaluate_builtin(builtin, &args, &config).unwrap_err(),
+            ));
+        }
+        let inventory = crate::provider_text::RedactionSet::collect([&value]);
+        observations.push((
+            "provider text",
+            crate::provider_text::ProviderDiagnostic::message(
+                crate::provider_text::ProviderText::new("provider saw env-diagnostic-value"),
+            )
+            .with_secrets(&inventory)
+            .to_string(),
+        ));
+        let Value::Concrete(ConcreteValue::String(text)) = &value else {
+            panic!("env must return a string");
+        };
+        let strings = Value::Concrete(ConcreteValue::StringList(vec![text.clone()]));
+        observations.push((
+            "provider string-list text",
+            crate::provider_text::ProviderDiagnostic::message(
+                crate::provider_text::ProviderText::new("provider saw env-diagnostic-value"),
+            )
+            .with_secrets(&crate::provider_text::RedactionSet::collect([&strings]))
+            .to_string(),
+        ));
+        for (label, source) in [
+            (
+                "provider version",
+                "fn version() { env('VALUE') }\nprovider mock { version = version() }",
+            ),
+            (
+                "for iterable",
+                "let items = for v in env('VALUE') { mock.test.resource { name = v } }",
+            ),
+            (
+                "missing binding",
+                "fn key() { env('VALUE') }\nlet v = missing[key()]",
+            ),
+            (
+                "reference subscript",
+                "fn key() { env('VALUE') }\nlet v = missing.value[key()]",
+            ),
+            (
+                "reference binding subscript",
+                "fn key() { env('VALUE') }\nlet v = missing[key()].value",
+            ),
+            (
+                "missing map key",
+                "fn key() { env('VALUE') }\nlet v = { available = 1 }[key()]",
+            ),
+            (
+                "function parameter",
+                "fn f(x: Int) { x }\nlet v = f(env('VALUE'))",
+            ),
+            (
+                "custom type validation",
+                "fn f(x: Ipv4Address) { x }\nlet v = f(env('VALUE'))",
+            ),
+            ("if condition", "let v = if env('VALUE') { 1 } else { 2 }"),
+        ] {
+            let message = match crate::parser::parse(source, &config) {
+                Err(error) => error.to_string(),
+                Ok(parsed) => {
+                    let value = parsed.variables["v"]
+                        .clone()
+                        .resolve_root(&crate::resource::RootScope::new())
+                        .into_expanded()
+                        .unwrap();
+                    value_to_json(&value).unwrap_err().to_string()
+                }
+            };
+            observations.push((label, message));
+        }
+        eprintln!("env diagnostic observations: {observations:#?}");
+        assert!(
+            observations
+                .iter()
+                .all(|(_, message)| message.contains("env-diagnostic-")),
+            "ordinary env values must remain visible: {observations:#?}"
+        );
+    }
+
+    #[test]
+    fn env_cidr_diagnostic_variants_are_public() {
+        let cases = [
+            (
+                "env-cidr",
+                8,
+                0,
+                "cidr_subnet() invalid CIDR format: 'env-cidr' (expected 'address/prefix')",
+            ),
+            (
+                "bad/16",
+                8,
+                0,
+                "cidr_subnet() invalid IP address 'bad': invalid IPv4 address syntax",
+            ),
+            (
+                "10.0.0.0/bad",
+                8,
+                0,
+                "cidr_subnet() invalid prefix length 'bad': invalid digit found in string",
+            ),
+            (
+                "10.0.0.0/33",
+                0,
+                0,
+                "cidr_subnet() prefix length 33 exceeds maximum of 32",
+            ),
+            (
+                "10.0.0.0/16",
+                -1,
+                0,
+                "cidr_subnet() newbits must be non-negative",
+            ),
+            (
+                "10.0.0.0/16",
+                8,
+                -1,
+                "cidr_subnet() netnum must be non-negative",
+            ),
+            (
+                "10.0.0.0/24",
+                9,
+                0,
+                "cidr_subnet() resulting prefix length exceeds maximum of 32",
+            ),
+            (
+                "10.0.0.0/16",
+                8,
+                256,
+                "cidr_subnet() netnum is out of range for the additional bits",
+            ),
+        ];
+        let mut observed = Vec::new();
+        for (prefix, newbits, netnum, expected) in cases {
+            let config = ProviderContext::new(EnvironmentSnapshot::new([(
+                "PREFIX".to_string(),
+                prefix.into(),
+            )]));
+            let prefix = evaluate_builtin(
+                "env",
+                &[Value::Concrete(ConcreteValue::String("PREFIX".into()))],
+                &config,
+            )
+            .unwrap();
+            let error = evaluate_builtin(
+                "cidr_subnet",
+                &[
+                    prefix,
+                    Value::Concrete(ConcreteValue::Int(newbits)),
+                    Value::Concrete(ConcreteValue::Int(netnum)),
+                ],
+                &config,
+            )
+            .unwrap_err();
+            observed.push((error, expected));
+        }
+        eprintln!("env CIDR diagnostics: {observed:#?}");
+        assert!(
+            observed
+                .iter()
+                .all(|(actual, expected)| actual.as_str() == *expected)
+        );
+    }
+
+    #[test]
+    fn env_strings_stay_public_through_string_builtins() {
         let var_name = "CARINA_TEST_ENV_SENSITIVITY_PROPAGATES";
         let config = ProviderContext::new(EnvironmentSnapshot::new([(
             var_name.to_string(),
@@ -282,7 +533,10 @@ mod tests {
         .unwrap();
 
         let upper = evaluate_builtin("upper", std::slice::from_ref(&env_value), &config).unwrap();
-        assert_eq!(ValueDescription::of(&upper).to_string(), "string");
+        assert_eq!(
+            ValueDescription::of(&upper).to_string(),
+            "string 'HUNTER2SECRET'"
+        );
 
         let joined = evaluate_builtin(
             "join",
@@ -296,7 +550,10 @@ mod tests {
             &config,
         )
         .unwrap();
-        assert_eq!(ValueDescription::of(&joined).to_string(), "string");
+        assert_eq!(
+            ValueDescription::of(&joined).to_string(),
+            "string 'prefix-hunter2SECRET'"
+        );
 
         let concatenated = evaluate_builtin(
             "concat",
@@ -310,6 +567,9 @@ mod tests {
         let Value::Concrete(ConcreteValue::List(items)) = concatenated else {
             panic!("concat() must return a list");
         };
-        assert_eq!(ValueDescription::of(&items[0]).to_string(), "string");
+        assert_eq!(
+            ValueDescription::of(&items[0]).to_string(),
+            "string 'hunter2SECRET'"
+        );
     }
 }

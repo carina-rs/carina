@@ -280,7 +280,9 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 
 Reads an environment variable. Returns an error if the variable is not set.
 
-Environment values behave like ordinary strings in expressions, plans, providers, and state. To prevent accidental disclosure, diagnostics identify an environment-derived value only by type (for example, `got string`) and never include its contents. Use `secret(env(...))` when the value must also be masked in plans and hashed in state.
+`env()` returns an ordinary string that can appear in diagnostics and plan output
+and is stored as plaintext in state. An environment variable that must stay hidden
+is written `secret(env('NAME'))`; this masks the value and hashes it in state.
 
 ```
 env(name: String) -> String
@@ -289,6 +291,7 @@ env(name: String) -> String
 ```crn
 let home = env('HOME')
 let db_host = env('DB_HOST')
+let password = secret(env('DB_PASSWORD'))
 ```
 
 ## Security Functions

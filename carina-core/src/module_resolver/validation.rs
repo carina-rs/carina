@@ -1685,6 +1685,43 @@ mod tests {
     }
 
     #[test]
+    fn env_constraint_actuals_show_public_strings_and_mask_secrets() {
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "CARINA_4409_ACTUAL".to_string(),
+            "env-constraint-value".into(),
+        )]));
+        let value: crate::resource::ExpandedValue =
+            crate::builtins::evaluate_builtin_with_config_to_value(
+                "env",
+                &[Value::Concrete(ConcreteValue::String(
+                    "CARINA_4409_ACTUAL".into(),
+                ))],
+                &config,
+            )
+            .unwrap();
+        let Value::Concrete(ConcreteValue::String(text)) = &value else {
+            panic!("env must return a string");
+        };
+        let strings: crate::resource::ExpandedValue =
+            Value::Concrete(ConcreteValue::StringList(vec![text.clone()]));
+        let hidden = value.clone().into_secret();
+        let actuals = [
+            format_constraint_actual(&value),
+            format_constraint_actual(&strings),
+            format_constraint_actual(&hidden),
+        ];
+        eprintln!("env constraint actuals: {actuals:?}");
+        assert_eq!(
+            actuals,
+            [
+                "'env-constraint-value'",
+                "['env-constraint-value']",
+                "(secret)"
+            ]
+        );
+    }
+
+    #[test]
     fn list_string_constraint_actual_uses_carina_literals() {
         let expression = length_at_least("items", 3);
         let arguments = HashMap::from([(

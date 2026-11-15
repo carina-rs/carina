@@ -50,6 +50,126 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
     RootScope::new().resolve(RelativeBindingName::new(binding))
 }
 
+fn with_secret_payload_string(check: impl FnOnce(&ValueString)) {
+    let payload: SecretPayload<NoPlaceholder, AbsoluteBindingAddress> = Box::new(Value::Concrete(
+        ConcreteValue::String("private-token".into()),
+    ))
+    .into();
+    payload.visit(|value| {
+        let Value::Concrete(ConcreteValue::String(text)) = value else {
+            panic!("the secret fixture must contain a string");
+        };
+        assert!(text.is_diagnostic_sensitive());
+        check(text);
+    });
+}
+
+fn assert_secret_mask_message(actual: &str, expected: &str) {
+    eprintln!("secret mask message: {actual}");
+    assert!(!actual.contains("private-token"), "{actual}");
+    assert!(!actual.to_ascii_lowercase().contains("env"), "{actual}");
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn secret_payload_subscript_uses_secret_mask() {
+    let parsed = crate::parser::parse(
+        "let hidden = secret(missing.value['private-token'])",
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let super::Value::Deferred(super::DeferredValue::Secret(payload)) = &parsed.variables["hidden"]
+    else {
+        panic!("the parsed expression must retain its secret payload");
+    };
+    payload.visit(|value| {
+        let super::Value::Deferred(super::DeferredValue::ResourceRef { path }) = value else {
+            panic!("the payload must contain a resource reference");
+        };
+        assert_secret_mask_message(&path.to_dot_string(), "missing.value[(secret)]");
+        assert_eq!(
+            path.to_plaintext_dot_string(),
+            "missing.value[\"private-token\"]"
+        );
+    });
+    let mut public = String::new();
+    Subscript::Str {
+        key: "public-key".into(),
+    }
+    .append_to_dot_string(&mut public);
+    assert_eq!(public, "['public-key']");
+}
+
+#[test]
+fn secret_payload_access_binding_uses_secret_mask() {
+    with_secret_payload_string(|text| {
+        let path = AuthoredAccessPath::new(RelativeBindingName::new(text.clone()), "value");
+        assert_secret_mask_message(&path.to_dot_string(), "(secret).value");
+        assert_eq!(path.to_plaintext_dot_string(), "private-token.value");
+    });
+    assert_eq!(
+        AuthoredAccessPath::new("public", "value").to_dot_string(),
+        "public.value"
+    );
+}
+
+#[test]
+fn secret_payload_binding_reference_uses_secret_mask() {
+    with_secret_payload_string(|text| {
+        let path = ReferencePath::Binding(RelativeBindingName::new(text.clone()));
+        assert_secret_mask_message(&path.to_dot_string(), "(secret)");
+        assert_eq!(path.to_plaintext_dot_string(), "private-token");
+    });
+    assert_eq!(
+        ReferencePath::Binding(RelativeBindingName::new("public")).to_dot_string(),
+        "public"
+    );
+}
+
+#[test]
+fn secret_payload_binding_access_reference_uses_secret_mask() {
+    with_secret_payload_string(|text| {
+        let path = ReferencePath::BindingAccess {
+            binding: RelativeBindingName::new(text.clone()),
+            segments: vec![PathSegment::Field {
+                name: "value".into(),
+            }],
+        };
+        assert_secret_mask_message(&path.to_dot_string(), "(secret).value");
+        assert_eq!(path.to_plaintext_dot_string(), "private-token.value");
+    });
+    let public = ReferencePath::BindingAccess {
+        binding: RelativeBindingName::new("public"),
+        segments: vec![PathSegment::Field {
+            name: "value".into(),
+        }],
+    };
+    assert_eq!(public.to_dot_string(), "public.value");
+}
+
+#[test]
+fn secret_payload_missing_map_key_uses_secret_mask() {
+    with_secret_payload_string(|text| {
+        let Err(error) = apply_value_path_segment(
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "available".into(),
+                Value::Concrete(ConcreteValue::Int(1)),
+            )]))),
+            PathSegment::Subscript {
+                index: Subscript::Str { key: text.clone() },
+            },
+            1,
+            AccessMissPolicy::Error,
+        ) else {
+            panic!("the protected key is missing");
+        };
+        assert_secret_mask_message(
+            &error.to_string(),
+            "key (secret) not found in map; available keys: 'available'",
+        );
+    });
+}
+
 #[test]
 fn secret_origin_4275_round2_fully_resolved_check_masks_secret_path() {
     let reference = Value::root_resource_ref("private_producer", "private_attr", vec![]);

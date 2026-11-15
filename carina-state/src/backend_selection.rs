@@ -442,10 +442,7 @@ impl BackendSelection {
         requested_bucket: &str,
     ) -> Result<BucketDeleteBackendSelection, BucketDeleteSelectionError> {
         if settings.bucket() != requested_bucket {
-            let configured_bucket = match settings.bucket_diagnostic_literal() {
-                Some(bucket) => format!("'{bucket}'"),
-                None => "value from env()".to_string(),
-            };
+            let configured_bucket = settings.bucket_diagnostic_display();
             return Err(BucketDeleteSelectionError {
                 message: format!(
                     "Bucket name '{requested_bucket}' does not match backend configuration bucket \

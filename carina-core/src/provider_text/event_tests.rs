@@ -452,6 +452,90 @@ fn value_session(
 }
 
 #[test]
+fn env_event_values_are_public_until_wrapped_in_secret() {
+    use crate::resource::{ConcreteValue, Resource, Value};
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+    let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        "CARINA_4409_EVENT".to_string(),
+        "env-event-value".into(),
+    )]));
+    let value = crate::builtins::evaluate_builtin_with_config_to_value(
+        "env",
+        &[Value::Concrete(ConcreteValue::String(
+            "CARINA_4409_EVENT".into(),
+        ))],
+        &config,
+    )
+    .unwrap();
+    let Value::Concrete(ConcreteValue::String(text)) = &value else {
+        panic!("env must return a string");
+    };
+    let mut observations = Vec::new();
+    for hidden in [true, false] {
+        let strings = Value::Concrete(ConcreteValue::StringList(vec![text.clone()]));
+        let public = if hidden {
+            value.clone().into_secret()
+        } else {
+            value.clone()
+        };
+        let strings = if hidden {
+            strings.into_secret()
+        } else {
+            strings
+        };
+        let resource: Resource = Resource::with_provider("mock", "Widget", "event-fixture", None)
+            .with_attribute("public", public)
+            .with_attribute("strings", strings);
+        let plan = ProviderPlan::from_desired(&[resource], &[]);
+        let (session, events) = captured_session(plan.test_session_builder("mock", None, None));
+        let schema = ResourceSchema::new("Widget")
+            .attribute(AttributeSchema::optional("public", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("strings", AttributeType::list(AttributeType::string()))
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("mock", schema);
+        session.diagnostics().set_schemas(schemas);
+        let id = carina_provider_protocol::types::ResourceId {
+            provider: "mock".into(),
+            resource_type: "Widget".into(),
+            identity: "event-fixture".into(),
+        };
+        for (attribute, candidate) in [
+            ("public", serde_json::json!("observed-public-value")),
+            ("strings", serde_json::json!(["observed-public-value"])),
+        ] {
+            session.diagnostics().emit(ProviderEvent::value(
+                EventLevel::Warn,
+                ProviderValueDiagnostic::json(
+                    Some(&id),
+                    &[attribute.into()],
+                    ValueOrigin::Observed,
+                    &candidate,
+                ),
+            ));
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for event in &*events {
+            observations.push((hidden, present_event(event).to_string()));
+        }
+    }
+    eprintln!("env provider events: {observations:?}");
+    assert!(
+        observations.iter().all(|(hidden, text)| {
+            text.contains("observed-public-value") != *hidden
+                && (!*hidden || text.contains("(secret)"))
+        }),
+        "{observations:?}"
+    );
+}
+
+#[test]
 fn observed_origin_never_downgrades_host_secret_classification() {
     let (session, events, id) = value_session(true);
     let candidate = serde_json::json!({"password": "new-observed-secret-canary", "visible": "ordinary-sibling"});

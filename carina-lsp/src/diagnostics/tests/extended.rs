@@ -4157,7 +4157,7 @@ fn resource_scalar_string_mismatches_use_core_value_descriptions_once() {
 }
 
 #[test]
-fn resource_scalar_mismatches_never_display_environment_plaintext() {
+fn resource_scalar_mismatches_display_environment_plaintext() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
     let schema = ResourceSchema::new("test.resource")
@@ -4186,6 +4186,7 @@ fn resource_scalar_mismatches_never_display_environment_plaintext() {
     );
 
     let diagnostics = engine.analyze(&doc, None);
+    eprintln!("resource scalar mismatches: {diagnostics:#?}");
     let mismatches = diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.message.starts_with("Type mismatch: expected"))
@@ -4201,8 +4202,8 @@ fn resource_scalar_mismatches_never_display_environment_plaintext() {
     assert!(
         diagnostics
             .iter()
-            .all(|diagnostic| !diagnostic.message.contains(plaintext)),
-        "environment plaintext leaked: {diagnostics:#?}"
+            .all(|diagnostic| diagnostic.message.contains(plaintext)),
+        "environment plaintext missing: {diagnostics:#?}"
     );
 }
 
@@ -14317,7 +14318,7 @@ fn write_tag_key_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
 }
 
 #[test]
-fn environment_plaintext_is_redacted_across_lsp_directory_typecheck_paths() {
+fn environment_plaintext_is_shown_across_lsp_directory_typecheck_paths() {
     type DirectoryCase<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
     let cases: &[DirectoryCase<'_>] = &[
@@ -14378,6 +14379,7 @@ fn environment_plaintext_is_redacted_across_lsp_directory_typecheck_paths() {
             &buffer,
             environment.clone(),
         );
+        eprintln!("{label}: {diagnostics:#?}");
 
         assert!(
             diagnostics
@@ -14388,8 +14390,8 @@ fn environment_plaintext_is_redacted_across_lsp_directory_typecheck_paths() {
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| !diagnostic.message.contains("hunter2SECRET")),
-            "{label} leaked env plaintext: diagnostics={diagnostics:#?}"
+                .all(|diagnostic| diagnostic.message.contains("hunter2SECRET")),
+            "{label} omitted env plaintext: diagnostics={diagnostics:#?}"
         );
     }
 }

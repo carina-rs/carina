@@ -1773,6 +1773,36 @@ fn assert_mixed_sensitive_list_is_not_comparable(secret: bool, sensitive_first: 
 }
 
 #[test]
+fn unique_list_compares_env_values_but_keeps_secrets_private() {
+    let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        "CARINA_4409_UNIQUE".to_string(),
+        "duplicate-env-value".into(),
+    )]));
+    let value = crate::builtins::evaluate_builtin_with_config_to_value(
+        "env",
+        &[string_value("CARINA_4409_UNIQUE")],
+        &config,
+    )
+    .unwrap();
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    let plain = Value::Concrete(ConcreteValue::List(vec![value.clone(), value.clone()]));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
+    let hidden = Value::Concrete(ConcreteValue::List(vec![secret.clone(), secret]));
+    let errors = Schema::flat(list.clone()).validate_collect(&plain);
+    eprintln!("env unique list: {errors:?}");
+    for (_, error) in &errors {
+        eprintln!("env unique list message: {error}");
+    }
+    assert!(
+        list.validate(&hidden).is_ok(),
+        "secret equality must stay private"
+    );
+    assert_eq!(errors.len(), 1, "ordinary env duplicates must be rejected");
+    assert!(errors[0].1.to_string().contains("Duplicate list element"));
+    assert!(errors[0].1.to_string().contains("duplicate-env-value"));
+}
+
+#[test]
 fn unique_list_skips_secret_before_plain() {
     assert_mixed_sensitive_list_is_not_comparable(true, true);
 }

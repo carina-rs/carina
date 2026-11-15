@@ -528,7 +528,7 @@ async fn storage_readiness_url_origin_cannot_auto_create() {
 }
 
 #[tokio::test]
-async fn storage_readiness_auto_create_diagnostic_redacts_environment_bucket() {
+async fn storage_readiness_auto_create_diagnostic_shows_environment_bucket() {
     let (_, client) = mock_backend_with_client().await;
     let context = carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::new(
         [("STATE_BUCKET".into(), TEST_BUCKET.into())],
@@ -550,11 +550,11 @@ async fn storage_readiness_auto_create_diagnostic_redacts_environment_bucket() {
             .check_auto_create()
             .unwrap_err()
             .to_string(),
-        "Backend bucket value from env() not found and auto_create is disabled"
+        format!("Backend bucket '{TEST_BUCKET}' not found and auto_create is disabled")
     );
     assert_eq!(
         bootstrap.auto_create().unwrap_err().to_string(),
-        "Backend bucket value from env() not found and auto_create is disabled"
+        format!("Backend bucket '{TEST_BUCKET}' not found and auto_create is disabled")
     );
 }
 

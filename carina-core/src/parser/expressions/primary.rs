@@ -1049,8 +1049,10 @@ fn parse_primary_eval_with_mode_inner(
                         {
                             Err(ParseError::InvalidExpression {
                                 line,
-                                message: "unresolved binding containing a value from env()"
-                                    .to_string(),
+                                message: format!(
+                                    "unresolved binding containing {}",
+                                    ValueString::DIAGNOSTIC_MASK
+                                ),
                             })
                         }
                         ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => Ok(

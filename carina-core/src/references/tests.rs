@@ -2675,6 +2675,48 @@ async fn round2_ecr_saved_only_reference_is_collected_against_read_arn() {
 }
 
 #[tokio::test]
+async fn env_reference_resolves_and_compares_as_public_string() {
+    let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        "CARINA_4409_REFERENCE".to_string(),
+        "alias/from-env".into(),
+    )]));
+    let value = crate::builtins::evaluate_builtin_with_config_to_value(
+        "env",
+        &[string("CARINA_4409_REFERENCE")],
+        &config,
+    )
+    .unwrap();
+    let fixture = Fixture::new(
+        value,
+        string("key/a"),
+        HashMap::from([("alias/from-env".into(), resolved("key/a"))]),
+        false,
+    );
+    let unprepared = fixture.plan(&prepare_empty_for_tests());
+    let prepared = fixture.prepare().await;
+    eprintln!("env reference without witness: {unprepared:?}");
+    eprintln!("env reference preparation: {prepared:?}");
+    let references = prepared.expect("ordinary env references must reach the provider");
+    assert!(matches!(
+        unprepared,
+        Err(crate::differ::PlanComparisonError::Reference(error))
+            if matches!(error.source, ReferenceFailure::MissingWitness)
+    ));
+    let plan = fixture.plan(&references).unwrap();
+    assert!(
+        plan.effects().is_empty(),
+        "the alias resolves to the current key"
+    );
+    let calls = fixture.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0]
+            .iter()
+            .any(|request| request.value == "alias/from-env")
+    );
+}
+
+#[tokio::test]
 async fn round2_secret_reference_is_rejected_before_any_guest_call() {
     const SECRET: &str = "alias/private-secret";
     for desired_side in [true, false] {

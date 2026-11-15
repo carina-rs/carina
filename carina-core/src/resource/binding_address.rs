@@ -261,6 +261,12 @@ pub trait BindingAddress:
     fn as_str(&self) -> &str;
 
     fn diagnostic_literal(&self) -> Option<&str>;
+
+    /// Render an unquoted binding spelling, hiding protected strings.
+    fn diagnostic_spelling(&self) -> &str {
+        self.diagnostic_literal()
+            .unwrap_or(ValueString::DIAGNOSTIC_MASK)
+    }
 }
 
 impl private::Sealed for RelativeBindingName {
