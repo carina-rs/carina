@@ -5,10 +5,7 @@ use carina_core::{
     binding_index::{BindingIndex, BindingValueSource, ResolvedBindings},
     provider::LoadedProviderSnapshot,
     resource::{ConcreteValue, Value, knowledge::KnowledgeContext},
-    validation::{
-        admission::{Candidate, admit},
-        deferred_types::with_session_for_test,
-    },
+    validation::{admission::admit, deferred_types::with_session_for_test},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -105,7 +102,7 @@ pub fn check(
         )
     })
     .map_err(|e| e.to_string())?;
-    carina_core::validation::validate_resources(
+    carina_core::test_utils::legacy_validate_resources(
         &parsed,
         schemas,
         &HashSet::from(["awscc".into()]),
@@ -151,7 +148,7 @@ pub fn check(
                 .unwrap(),
             _ => &sink.attributes["name"],
         };
-        let (candidate, context) = Candidate::validation_classified(
+        let (candidate, context) = carina_core::test_utils::classified_candidate_for_test(
             value
                 .knowledge(&KnowledgeContext::validation())
                 .unwrap()

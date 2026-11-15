@@ -46,11 +46,24 @@ impl Trivia {
 pub struct Token {
     pub text: String,
     pub span: Span,
+    pub rule: Option<super::parser::Rule>,
 }
 
 impl Token {
     pub fn new(text: String, span: Span) -> Self {
-        Self { text, span }
+        Self {
+            text,
+            span,
+            rule: None,
+        }
+    }
+
+    pub fn from_rule(text: String, span: Span, rule: super::parser::Rule) -> Self {
+        Self {
+            text,
+            span,
+            rule: Some(rule),
+        }
     }
 }
 

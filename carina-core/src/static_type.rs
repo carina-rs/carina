@@ -142,7 +142,7 @@ pub enum NotInferableReason {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum InferenceError {
     #[error(transparent)]
     DirectoryConstraint(Box<crate::module_resolver::DirectoryConstraintDiagnostic>),
@@ -156,6 +156,12 @@ pub enum InferenceError {
     MissingEvidence(#[from] crate::parser::retained::MissingEvidence),
     #[error("{reason}", reason = crate::provider_text::DiagnosticText::new(reason))]
     UnknownType { reason: String },
+    #[error(transparent)]
+    SchemaResolution {
+        error: Box<crate::schema::TypeError>,
+    },
+    #[error(transparent)]
+    TypeResolution { error: StaticTypeResolutionError },
     #[error("collection element types disagree: `{}` vs `{}`", crate::provider_text::DiagnosticText::new(types.expected()), crate::provider_text::DiagnosticText::new(types.actual()))]
     HeterogeneousCollection {
         types: crate::schema::MismatchTypeNames,
@@ -198,7 +204,7 @@ impl crate::resource::InsideSecret for InferenceError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum InferenceIssue {
     #[error(transparent)]
     Failed(InferenceError),
@@ -325,6 +331,37 @@ impl crate::resource::InsideSecret for InferenceIssue {
 #[cfg(test)]
 mod provider_text_tests {
     use super::*;
+
+    #[test]
+    fn r18_resolution_adapters_preserve_cause_text_in_display_only_renderers() {
+        let cause = StaticTypeResolutionError::UnknownCustomTypeWithSuggestion {
+            name: "mock.Nope".into(),
+            suggestion: "mock.Name".into(),
+        };
+        let expected = "unknown custom type 'mock.Nope'; suggestion: use 'mock.Name'";
+        let inference = InferenceError::TypeResolution { error: cause };
+        assert_eq!(inference.to_string(), expected);
+        let deferred =
+            crate::validation::DeferredAccessTypeError::InvalidAccess { error: inference };
+        assert_eq!(deferred.to_string(), expected);
+    }
+
+    #[test]
+    fn r18_resolution_schema_adapter_preserves_cause_text_in_display_only_renderers() {
+        let cause = crate::schema::value_validation::resolve_assignment_declaration(
+            &crate::schema::CompiledAttributeType::ref_("absent"),
+            &Default::default(),
+        )
+        .unwrap_err();
+        let expected = cause.to_string();
+        let inference = InferenceError::SchemaResolution {
+            error: Box::new(cause),
+        };
+        assert_eq!(inference.to_string(), expected);
+        let deferred =
+            crate::validation::DeferredAccessTypeError::InvalidAccess { error: inference };
+        assert_eq!(deferred.to_string(), expected);
+    }
 
     #[test]
     fn provider_text_inference_and_resolution_errors_keep_raw_metadata() {

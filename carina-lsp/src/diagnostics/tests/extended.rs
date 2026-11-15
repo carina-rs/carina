@@ -1786,7 +1786,7 @@ fn render_value_type_error(
                         type_expr,
                         value,
                         provider_context,
-                        expression,
+                        (expression).ordinary().unwrap(),
                     )
                     .require_provider_schemas()
                 }
@@ -1794,7 +1794,7 @@ fn render_value_type_error(
                     type_expr,
                     value,
                     &engine.provider_context,
-                    expression,
+                    (expression).ordinary().unwrap(),
                 )
                 .record_deferred(session),
             };
@@ -3122,7 +3122,7 @@ mock.test.Thing {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("module source parses");
-    let core_error = carina_core::validation::validate_resources(
+    let core_error = carina_core::test_utils::legacy_validate_resources(
         &parsed,
         &schemas,
         &std::collections::HashSet::from(["mock".to_string()]),
@@ -8820,6 +8820,11 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                         &engine.schemas,
                         &[],
                     )
+                    .into_validation(
+                        &mut carina_core::test_utils::conversion_validation::<
+                            std::convert::Infallible,
+                        >(),
+                    )
                 },
             )
         }
@@ -8833,6 +8838,11 @@ fn resolver_module_call_error_without_covering_finding_falls_back_to_root_call()
                         session,
                         &engine.schemas,
                         &[],
+                    )
+                    .into_validation(
+                        &mut carina_core::test_utils::conversion_validation::<
+                            std::convert::Infallible,
+                        >(),
                     )
                 },
             )
@@ -10303,7 +10313,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
     use carina_core::binding_index::{BindingIndex, BindingValueSource, ResolvedBindings};
     use carina_core::resource::knowledge::KnowledgeContext;
     use carina_core::resource::{ConcreteValue, Value};
-    use carina_core::validation::admission::{Candidate, admit};
+    use carina_core::validation::admission::admit;
     let engine = named_annotation_engine(128);
     let parsed = carina_core::parser::parse_file(
         "provider aws {}\nlet source = aws.NameSource {}\nlet role = aws.iam.Role { role_name = source.name }\n",
@@ -10327,7 +10337,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                         .resolve_root_for_test(),
                 },
             );
-            let (candidate, boundary) = Candidate::validation_classified(
+            let (candidate, boundary) = carina_core::test_utils::classified_candidate_for_test(
                 reference
                     .knowledge(&KnowledgeContext::validation())
                     .unwrap()
@@ -10340,7 +10350,7 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                 .ready()
                 .expect_err("the reference must be pending");
             let literal = Value::Concrete(ConcreteValue::String("A".repeat(65).into()));
-            let (candidate, boundary) = Candidate::validation_classified(
+            let (candidate, boundary) = carina_core::test_utils::classified_candidate_for_test(
                 literal
                     .knowledge(&KnowledgeContext::validation())
                     .unwrap()
@@ -17997,7 +18007,7 @@ fn widening_member_obligation_parity(decoded: bool) {
         StringIdentityLayer, StringMemberConstraints, StructField, TypeIdentity,
         ValidatedConfigSchema,
     };
-    use carina_core::validation::admission::{Candidate, admit};
+    use carina_core::validation::admission::admit;
 
     let declaration = |ty: AttributeType| {
         if !decoded {
@@ -18079,7 +18089,7 @@ fn widening_member_obligation_parity(decoded: bool) {
             .unwrap()
     };
     let providers = std::collections::HashSet::from(["aws".into(), "awscc".into()]);
-    carina_core::validation::validate_resources(
+    carina_core::test_utils::legacy_validate_resources(
         &parse(source),
         &engine.schemas,
         &providers,
@@ -18130,7 +18140,7 @@ fn widening_member_obligation_parity(decoded: bool) {
         &engine.provider_context,
         |session| {
             let judge = |value: &Value| {
-                let (candidate, boundary) = Candidate::validation_classified(
+                let (candidate, boundary) = carina_core::test_utils::classified_candidate_for_test(
                     value
                         .knowledge(&KnowledgeContext::validation())
                         .unwrap()
@@ -18158,7 +18168,7 @@ fn widening_member_obligation_parity(decoded: bool) {
                 let literal_source =
                     source.replace("producer.arn", &serde_json::to_string(raw).unwrap());
                 let diagnostics = engine.analyze(&create_document(&literal_source), None);
-                let checked = carina_core::validation::validate_resources(
+                let checked = carina_core::test_utils::legacy_validate_resources(
                     &parse(&literal_source),
                     &engine.schemas,
                     &providers,

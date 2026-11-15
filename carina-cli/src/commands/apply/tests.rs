@@ -1661,6 +1661,12 @@ fn checked_exports(
                 params,
                 &carina_core::binding_index::ResolvedBindings::default(),
                 session,
+                carina_core::parser::retained::ProjectedPhase::plan_context::<
+                    carina_core::resource::NoPlaceholder,
+                    carina_core::resource::AbsoluteBindingAddress,
+                >(&carina_core::resource::knowledge::KnowledgeContext::plan(
+                    &carina_core::binding_index::ResolvedBindings::default(),
+                )),
             )
         },
     )
