@@ -867,7 +867,7 @@ fn module_output_chains_accept_63_and_reject_64_in_both_shapes() {
 #[test]
 fn one_reference_in_deep_expressions_is_valid_in_both_shapes() {
     // The large stack is only for the parser's syntax recursion tracked in #4481.
-    // The secrecy owner uses heap worklists, which the 256/5000-reference chain
+    // The secrecy owner uses heap worklists, which the 256/1000-reference chain
     // tests pin on the default stack.
     std::thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
@@ -889,8 +889,10 @@ fn one_reference_in_deep_expressions_is_valid_in_both_shapes() {
 
 #[test]
 fn issue_4474_deep_chains_report_the_same_limit_without_crashing() {
+    // 1000 is well beyond main's ~100-reference stack overflow; longer chains only
+    // add per-resource validation time.
     for shape in fixtures::CHAIN_SHAPES {
-        for last in [256, 5000] {
+        for last in [256, 1000] {
             assert_depth_findings(last, false, shape);
         }
     }

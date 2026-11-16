@@ -1075,9 +1075,11 @@ fn issue_4474_reference_chain_of_128_reports_the_depth_limit_in_both_shapes() {
 
 #[test]
 fn issue_4474_deep_chains_parse_and_resolve_without_stack_growth_in_both_shapes() {
-    // Parser value resolution and dependency walks traverse all 5000 hops; the secrecy walk stops at 128.
+    // Parser value resolution and dependency walks traverse all 1000 hops; the secrecy walk stops at 128.
+    // 1000 is well beyond main's ~100-reference stack overflow; longer chains only
+    // add per-resource validation time.
     for shape in CHAIN_SHAPES {
-        for last in [256, 5000] {
+        for last in [256, 1000] {
             let report = resource_chain(last, shape);
             assert_eq!(report.findings().len(), last - 127, "{shape:?}, {last}");
             assert!(report.findings().iter().all(|finding| finding.cause()
@@ -1178,7 +1180,7 @@ fn expression_steps_do_not_add_reference_depth_in_both_shapes() {
 #[test]
 fn one_reference_in_deep_expressions_does_not_reach_the_depth_limit_in_both_shapes() {
     // The large stack is only for the parser's syntax recursion tracked in #4481.
-    // The secrecy owner uses heap worklists, which the 256/5000-reference chain
+    // The secrecy owner uses heap worklists, which the 256/1000-reference chain
     // tests pin on the default stack.
     with_parser_stack(|| {
         for shape in CHAIN_SHAPES {

@@ -456,8 +456,10 @@ fn one_reference_in_deep_expressions_is_valid_in_both_shapes() {
 
 #[test]
 fn issue_4474_deep_chains_return_limit_errors_without_crashing() {
+    // 1000 is well beyond main's ~100-reference stack overflow; longer chains only
+    // add per-resource validation time.
     for shape in fixtures::CHAIN_SHAPES {
-        for last in [256, 5000] {
+        for last in [256, 1000] {
             let (fixture, findings) = fixtures::depth_fixture(last, false, shape);
             assert_validation(fixture.path(), &findings);
         }
