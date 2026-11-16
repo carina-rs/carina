@@ -21,7 +21,7 @@ fn assert_protected_constraint(error: ProviderPreparationError) {
     let ProviderPreparationError::ValueConstraint { mut errors, .. } = error else {
         panic!("expected an apply value constraint: {error:?}");
     };
-    assert!(!errors.errors().is_empty());
+    assert!(errors.errors().next().is_some());
     assert_hidden(&errors.to_string());
     assert_hidden(&format!("{errors:?}"));
     for error in errors.errors() {

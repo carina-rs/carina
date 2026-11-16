@@ -5366,7 +5366,7 @@ impl ResourceAdmissionFinding {
         finding.human = error.to_string();
         finding
     }
-    fn analysis(error: crate::parser::AnalysisTreeError) -> Self {
+    pub(crate) fn analysis(error: crate::parser::AnalysisTreeError) -> Self {
         let location = match error.diagnostic() {
             crate::parser::AnalysisTreeDiagnostic::Located(finding) => {
                 Some(finding.location().clone())
@@ -5500,14 +5500,7 @@ impl std::fmt::Display for ResourceAdmissionFinding {
         }
     }
 }
-impl std::error::Error for ResourceAdmissionFinding {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.detail {
-            ResourceAdmissionDetail::AnalysisInvariant(error) => Some(error.as_ref()),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for ResourceAdmissionFinding {}
 
 #[derive(Default)]
 struct ResourceAdmissionFindings(Vec<ResourceAdmissionFinding>);
@@ -5555,7 +5548,7 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
     )>,
     kind: ValidatableKind,
     context: &mut ResourceValidationContext<'_, B>,
-) -> Result<(), crate::parser::AnalysisTreeError> {
+) {
     match input {
         Some((schema, attributes)) => {
             let mut classification_errors = Vec::new();
@@ -5622,7 +5615,10 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                 &checked
             };
             for (diagnostic, symbolic) in values.diagnostic_errors() {
-                if diagnostic.retained_failure(values) {
+                if diagnostic
+                    .coverage_path()
+                    .is_some_and(|(root, _)| values.is_retained_failure(root))
+                {
                     continue;
                 }
                 let rendered_symbolically = context.admissions.is_some() && symbolic.owns_path();
@@ -5660,7 +5656,7 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
             // No matching-kind entry. Skip if provider is not loaded —
             // schemas are simply not available, not a configuration error.
             if !provider.is_empty() && !context.known_providers.contains(provider) {
-                return Ok(());
+                return;
             }
             let has_managed = context.registry.has_managed(provider, resource_type);
             let has_data_source = context.registry.has_data_source(provider, resource_type);
@@ -5693,7 +5689,6 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
             }
         }
     }
-    Ok(())
 }
 
 /// Validate resources against their schemas.
@@ -5729,7 +5724,7 @@ pub fn validate_resources<
         .map(ResourceAdmissionFinding::prefix)
         .collect::<Vec<_>>();
     match canonical.schema_validation_resources() {
-        Ok(inputs) => match run.walk_in(FindingSubject::Root, |coverage| {
+        Ok(inputs) => findings.extend(run.walk_in(FindingSubject::Root, |coverage| {
             resource_values_report(
                 inputs,
                 canonical.schemas(),
@@ -5742,10 +5737,7 @@ pub fn validate_resources<
                     coverage,
                 },
             )
-        }) {
-            Ok(values) => findings.extend(values),
-            Err(error) => findings.push(ResourceAdmissionFinding::analysis(error)),
-        },
+        })),
         Err(error) => findings.push(ResourceAdmissionFinding::analysis(error)),
     }
 
@@ -5766,7 +5758,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
     admissions: Option<&ResourceAdmissionValues>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     admission: ValueAdmission<'_, B>,
-) -> Result<Vec<ResourceAdmissionFinding>, crate::parser::AnalysisTreeError> {
+) -> Vec<ResourceAdmissionFinding> {
     use crate::identifier::CanonicalSchemaResource;
     let ValueAdmission { report, coverage } = admission;
     let mut all_errors = ResourceAdmissionFindings::default();
@@ -5819,7 +5811,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
                     input.as_ref().map(|(schema, values)| (*schema, values)),
                     ValidatableKind::DataSource,
                     &mut context,
-                )?,
+                ),
                 CanonicalSchemaResource::Resource(resource, input) => {
                     validate_resource_values(
                         &resource.id,
@@ -5829,7 +5821,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
                         input.as_ref().map(|(schema, values)| (*schema, values)),
                         ValidatableKind::Resource,
                         &mut context,
-                    )?;
+                    );
                     if let Some((schema, _)) = input
                         && let Err(errors) =
                             crate::resource::resolve_ignore_changes(resource, &schema)
@@ -5850,7 +5842,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
                         input.as_ref().map(|(schema, values)| (*schema, values)),
                         ValidatableKind::Resource,
                         &mut context,
-                    )?;
+                    );
                     if let Some((schema, _)) = input
                         && let Err(errors) =
                             crate::resource::resolve_ignore_changes(resource, &schema)
@@ -5865,7 +5857,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
             }
         }
     }
-    Ok(all_errors.0)
+    all_errors.0
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -6051,7 +6043,7 @@ fn complete_resource_admission_report<
                 coverage,
             },
         )
-    })?;
+    });
     findings.extend(report.findings.0);
     report.findings = ResourceAdmissionFindings(findings);
     Ok(report)

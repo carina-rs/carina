@@ -353,6 +353,7 @@ fn reference_declaration_is_independent_of_union_trial_order() {
                     Ok(())
                 };
             let findings = validate_authored_value_for_admission_with_references(
+                "input",
                 &union,
                 &knowledge,
                 empty_defs_for_schema_walks(),
@@ -522,6 +523,7 @@ fn reference_resolution_failures_keep_the_ordinary_error_once() {
                 authored: None,
             };
             let expected = validate_authored_value_for_admission(
+                "input",
                 &attr,
                 &knowledge,
                 &defs,
@@ -534,6 +536,7 @@ fn reference_resolution_failures_keep_the_ordinary_error_once() {
             .into_located();
             assert_eq!(expected.len(), 1);
             let actual = validate_authored_value_for_admission_with_references(
+                "input",
                 &attr,
                 &knowledge,
                 &defs,

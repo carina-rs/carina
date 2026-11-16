@@ -122,23 +122,21 @@ impl DiagnosticEngine {
             let use_value_location = path.is_empty()
                 && (is_duplicate
                     || crate::code_action::enum_diagnostic_data_for_error(&error).is_some());
-            let finding = match diagnostic {
-                SchemaDiagnostic::UnknownKey(key) => match resource.locate_unknown_key(&key) {
-                    Ok(finding) => finding,
-                    Err(error) => {
-                        diagnostics.extend(super::render_analysis_invariant(doc, &error));
-                        continue;
-                    }
-                },
-                SchemaDiagnostic::Other(_) => {
-                    let location = if is_duplicate || use_value_location {
-                        resource.attribute_value_location(attr_name, &path)
-                    } else {
-                        resource.attribute_path_location(attr_name, &path)
-                    };
-                    Located::new(location.clone(), error)
+            let location = match resource.locate_schema_diagnostic(&diagnostic, |_ordinary| {
+                let location = if is_duplicate || use_value_location {
+                    resource.attribute_value_location(attr_name, &path)
+                } else {
+                    resource.attribute_path_location(attr_name, &path)
+                };
+                location.clone()
+            }) {
+                Ok(finding) => finding.into_parts().0,
+                Err(error) => {
+                    diagnostics.extend(super::render_analysis_invariant(doc, &error));
+                    continue;
                 }
             };
+            let finding = Located::new(location, error);
             let diagnostic = if use_value_location {
                 render_schema_diagnostic(
                     doc,

@@ -424,24 +424,24 @@ pub struct SymbolicFinding {
     diagnostic: SchemaDiagnostic,
 }
 impl SymbolicFinding {
-    fn ordinary(path: LeafPath, error: TypeError) -> Self {
+    fn ordinary(root: &str, path: LeafPath, error: TypeError) -> Self {
         Self {
             origin: SymbolicFindingOrigin::Ordinary,
-            diagnostic: SchemaDiagnostic::from_value("", path.clone(), error),
+            diagnostic: SchemaDiagnostic::from_value(root, path.clone(), error),
             path,
         }
     }
-    fn authored_hook(path: LeafPath, error: TypeError) -> Self {
+    fn authored_hook(root: &str, path: LeafPath, error: TypeError) -> Self {
         Self {
             origin: SymbolicFindingOrigin::AuthoredHook,
-            diagnostic: SchemaDiagnostic::from_value("", path.clone(), error),
+            diagnostic: SchemaDiagnostic::from_value(root, path.clone(), error),
             path,
         }
     }
-    fn recovered_reference(path: LeafPath, error: TypeError) -> Self {
+    fn recovered_reference(root: &str, path: LeafPath, error: TypeError) -> Self {
         Self {
             origin: SymbolicFindingOrigin::RecoveredReference,
-            diagnostic: SchemaDiagnostic::from_value("", path.clone(), error),
+            diagnostic: SchemaDiagnostic::from_value(root, path.clone(), error),
             path,
         }
     }
@@ -538,18 +538,6 @@ pub struct ValueValidationFindings {
 }
 
 impl ValueValidationFindings {
-    pub(super) fn with_symbolic_attribute(mut self, root: &str) -> Self {
-        self.symbolic = self
-            .symbolic
-            .into_iter()
-            .map(|mut finding| {
-                finding.diagnostic = finding.diagnostic.at_attribute(root);
-                finding
-            })
-            .collect();
-        self
-    }
-
     pub(crate) fn rejected_by_claim(&self) -> bool {
         self.claim_effect == ClaimEffect::Rejected
     }
@@ -591,7 +579,7 @@ impl ValueValidationFindings {
             .map_or(Ok(()), |finding| Err(finding.into_error()))
     }
 
-    pub fn into_local_findings(self) -> Vec<(FieldPath, TypeError)> {
+    pub(crate) fn into_local_findings(self) -> Vec<(FieldPath, TypeError)> {
         self.local
             .into_iter()
             .map(|finding| (finding.path.clone(), finding.into_error()))
@@ -614,10 +602,9 @@ impl ValueValidationFindings {
         &self.symbolic
     }
 
-    pub fn local_findings(&self) -> impl ExactSizeIterator<Item = (&FieldPath, &TypeError)> {
-        self.local
-            .iter()
-            .map(|finding| (&finding.path, finding.error()))
+    /// Whether a local finding is nested under this value.
+    pub fn has_nested_findings(&self) -> bool {
+        self.local.iter().any(|finding| !finding.path.is_empty())
     }
 
     pub fn local_error(&self) -> Option<&TypeError> {
@@ -1291,22 +1278,22 @@ impl<'a, M: WalkMode> WalkCheckedValue<'a, M> {
             .or_else(|| self.findings.provider.first().map(|(_, error)| error))
     }
 
-    fn into_parts(mut self) -> (ValueValidationFindings, M::Channel) {
+    fn into_parts(mut self, root: &str) -> (ValueValidationFindings, M::Channel) {
         self.retain_primary_finding();
         let SupplementalData {
             authored,
             references,
         } = std::mem::take(&mut self.findings.authored).into_parts();
-        let symbolic =
-            self.findings
-                .assignment
-                .errors
-                .iter()
-                .map(|(path, error)| SymbolicFinding::ordinary(path.clone(), error.clone()))
-                .chain(authored.errors.iter().map(|(path, error)| {
-                    SymbolicFinding::authored_hook(path.clone(), error.clone())
-                }))
-                .collect();
+        let symbolic = self
+            .findings
+            .assignment
+            .errors
+            .iter()
+            .map(|(path, error)| SymbolicFinding::ordinary(root, path.clone(), error.clone()))
+            .chain(authored.errors.iter().map(|(path, error)| {
+                SymbolicFinding::authored_hook(root, path.clone(), error.clone())
+            }))
+            .collect();
         for (path, error) in authored.errors.clone() {
             let path = FieldPath::from_canonical_segments(path.segments().iter().cloned());
             if self.local.error().is_some() {
@@ -1347,7 +1334,7 @@ impl<'a, M: WalkMode> WalkCheckedValue<'a, M> {
             additional_local_errors: self.findings.additional_local_errors,
             provider: self.findings.provider,
         };
-        references.attach(&mut findings);
+        references.attach(root, &mut findings);
         (findings, conversions)
     }
 }
@@ -1357,13 +1344,18 @@ type CheckedValue<'a> = OrdinaryCheckedValue<'a>;
 type AuthoredCheckedValue<'a> = WalkCheckedValue<'a, WithAuthored>;
 impl OrdinaryCheckedValue<'_> {
     fn into_findings(self) -> ValueValidationFindings {
-        let (findings, NoConversions) = self.into_parts();
+        // A value-only walk has no resource attribute or assignment callbacks.
+        let (findings, NoConversions) = self.into_parts("");
         findings
     }
 }
 impl AuthoredCheckedValue<'_> {
-    fn into_findings_with_coverage(self, coverage: &mut WalkCoverage) -> ValueValidationFindings {
-        let (findings, conversions) = self.into_parts();
+    fn into_findings_with_coverage(
+        self,
+        root: &str,
+        coverage: &mut WalkCoverage,
+    ) -> ValueValidationFindings {
+        let (findings, conversions) = self.into_parts(root);
         coverage.record_conversions(conversions);
         findings
     }
@@ -1469,10 +1461,14 @@ impl<'a, 'lookup, M: WalkMode> ValueValidator<'a, 'lookup, M> {
     }
 }
 
-pub(crate) fn untyped_symbolic_errors(errors: Vec<TypeError>) -> ValueValidationFindings {
+pub(crate) fn untyped_symbolic_errors(
+    root: &str,
+    errors: Vec<TypeError>,
+) -> ValueValidationFindings {
     let mut findings = ValueValidationFindings::default();
     for error in errors {
         findings.symbolic.push(SymbolicFinding::ordinary(
+            root,
             LeafPath::from_segments([]),
             error.clone(),
         ));
@@ -2615,6 +2611,7 @@ pub(crate) fn validate_authored_value_for_admission<
     B: BindingAddress,
     T: StructuralPending<'v, P, B>,
 >(
+    root: &str,
     attr: &CompiledAttributeType,
     value: &Classification<'v, P, B, T>,
     defs: &BTreeMap<String, CompiledAttributeType>,
@@ -2625,7 +2622,7 @@ pub(crate) fn validate_authored_value_for_admission<
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
     validate_authored_value_with_callbacks(
-        attr, value, defs, ancestry, lookup, cursor, callbacks, None, coverage,
+        root, attr, value, defs, ancestry, lookup, cursor, callbacks, None, coverage,
     )
 }
 
@@ -2638,6 +2635,7 @@ pub(crate) fn validate_authored_value_for_admission_with_references<
     B: BindingAddress,
     T: StructuralPending<'v, P, B>,
 >(
+    root: &str,
     attr: &CompiledAttributeType,
     value: &Classification<'v, P, B, T>,
     defs: &BTreeMap<String, CompiledAttributeType>,
@@ -2649,6 +2647,7 @@ pub(crate) fn validate_authored_value_for_admission_with_references<
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
     validate_authored_value_with_callbacks(
+        root,
         attr,
         value,
         defs,
@@ -2670,6 +2669,7 @@ fn validate_authored_value_with_callbacks<
     B: BindingAddress,
     T: StructuralPending<'v, P, B>,
 >(
+    root: &str,
     attr: &CompiledAttributeType,
     value: &Classification<'v, P, B, T>,
     defs: &BTreeMap<String, CompiledAttributeType>,
@@ -2709,7 +2709,7 @@ fn validate_authored_value_with_callbacks<
         checked
     };
     *coverage = visits.into_inner();
-    let mut findings = checked.into_findings_with_coverage(coverage);
+    let mut findings = checked.into_findings_with_coverage(root, coverage);
     findings.structure = value_structure(value);
     findings
 }
@@ -5070,6 +5070,7 @@ mod tests {
             .unwrap()
             .symbolic
             .push(SymbolicFinding::ordinary(
+                "variant",
                 LeafPath::from_segments([]),
                 TypeError::MissingRequired {
                     name: "other".into(),
@@ -5120,6 +5121,7 @@ mod tests {
             "typo".into(),
             ValueValidationFindings {
                 symbolic: vec![SymbolicFinding::authored_hook(
+                    "typo",
                     LeafPath::from_segments([]),
                     TypeError::MissingRequired {
                         name: "other".into(),
@@ -5149,6 +5151,7 @@ mod tests {
                 "config".into(),
                 ValueValidationFindings {
                     symbolic: vec![SymbolicFinding::ordinary(
+                        "config",
                         path,
                         TypeError::MissingRequired {
                             name: "other".into(),
@@ -5172,6 +5175,7 @@ mod tests {
                         name.to_owned(),
                         ValueValidationFindings {
                             symbolic: vec![SymbolicFinding::authored_hook(
+                                name,
                                 LeafPath::from_segments([]),
                                 TypeError::UnknownAttribute {
                                     name: name.into(),
@@ -5212,7 +5216,7 @@ mod tests {
             attributes: indexmap::IndexMap::from([(
                 "input".into(),
                 ValueValidationFindings {
-                    symbolic: vec![SymbolicFinding::authored_hook(path, hook)],
+                    symbolic: vec![SymbolicFinding::authored_hook("input", path, hook)],
                     ..Default::default()
                 },
             )]),
@@ -5246,11 +5250,11 @@ mod tests {
         };
         for (finding, expected) in [
             (
-                SymbolicFinding::ordinary(path.clone(), error.clone()),
+                SymbolicFinding::ordinary("input", path.clone(), error.clone()),
                 SymbolicDiagnosticCoverage::Path,
             ),
             (
-                SymbolicFinding::authored_hook(path.clone(), error.clone()),
+                SymbolicFinding::authored_hook("input", path.clone(), error.clone()),
                 SymbolicDiagnosticCoverage::Finding,
             ),
         ] {
@@ -5289,8 +5293,8 @@ mod tests {
             name: "field".into(),
         };
         for finding in [
-            SymbolicFinding::ordinary(path.clone(), error.clone()),
-            SymbolicFinding::authored_hook(path, error),
+            SymbolicFinding::ordinary("input", path.clone(), error.clone()),
+            SymbolicFinding::authored_hook("input", path, error),
         ] {
             let origin = finding.origin();
             let protected = finding.inside_secret();
@@ -6538,8 +6542,11 @@ mod round3_ordinary_walk_tests {
     fn round3_plain_and_authored_walks_have_distinct_consuming_types() {
         let _: fn(OrdinaryCheckedValue<'static>) -> ValueValidationFindings =
             OrdinaryCheckedValue::into_findings;
-        let _: fn(AuthoredCheckedValue<'static>, &mut WalkCoverage) -> ValueValidationFindings =
-            AuthoredCheckedValue::into_findings_with_coverage;
+        let _: fn(
+            AuthoredCheckedValue<'static>,
+            &str,
+            &mut WalkCoverage,
+        ) -> ValueValidationFindings = AuthoredCheckedValue::into_findings_with_coverage;
         assert_eq!(std::mem::size_of::<NoConversions>(), 0);
     }
 }

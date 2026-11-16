@@ -512,7 +512,10 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
         if let Some(check) = context.untyped {
             let errors = check();
             if !errors.is_empty() {
-                let checked = crate::schema::value_validation::untyped_symbolic_errors(errors);
+                let checked = crate::schema::value_validation::untyped_symbolic_errors(
+                    &destination.label,
+                    errors,
+                );
                 let mut error = constraints(
                     checked
                         .clone()
@@ -653,6 +656,7 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
                     Ok(())
                 };
             crate::schema::value_validation::validate_authored_value_for_admission_with_references(
+                &destination.label,
                 contract.attr(),
                 proof,
                 contract.defs(),
@@ -685,6 +689,7 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
         }
         AdmissionProof::Plan(proof) => {
             crate::schema::value_validation::validate_authored_value_for_admission(
+                &destination.label,
                 contract.attr(),
                 proof.knowledge(),
                 contract.defs(),
@@ -705,6 +710,7 @@ pub(super) fn judge_with_findings<K: AssignmentKind, P: PlaceholderKind, B: Bind
         }
         AdmissionProof::Apply { known, phase } => {
             crate::schema::value_validation::validate_authored_value_for_admission(
+                &destination.label,
                 contract.attr(),
                 &crate::resource::knowledge::Classification::<P, B>::Known(known.clone()),
                 contract.defs(),

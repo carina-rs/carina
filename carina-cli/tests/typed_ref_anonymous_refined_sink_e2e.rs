@@ -726,15 +726,16 @@ fn typed_ref_int_apply_rejects_unknown_out_of_range_output_before_consumer_creat
         else {
             panic!("expected value constraint errors: {error}");
         };
+        let mut constraints = errors.errors();
         assert!(
             matches!(
-                errors.errors().as_slice(),
-                [TypeError::ValueOutOfRange {
+                (constraints.next(), constraints.next()),
+                (Some(TypeError::ValueOutOfRange {
                     value: DiagnosticNumber::Int(actual),
                     bounds: NumericRangeBounds::Int { min: Some(1), max: Some(1024) },
                     attribute: Some(attribute),
                     type_name: None,
-                }] if attribute == "port" && *actual == value
+                }), None) if attribute == "port" && *actual == value
             ),
             "{errors:?}"
         );

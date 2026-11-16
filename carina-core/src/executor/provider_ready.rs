@@ -1034,8 +1034,8 @@ pub use crate::validation::admission::configuration::provider::{
 pub struct ProviderValueConstraintErrors(Box<crate::schema::ResourceValueValidation>);
 
 impl ProviderValueConstraintErrors {
-    pub fn errors(&self) -> Vec<TypeError> {
-        self.0.errors().cloned().collect()
+    pub fn errors(&self) -> impl Iterator<Item = &TypeError> {
+        self.0.errors()
     }
 
     fn from_admission(report: crate::schema::ResourceValueValidation) -> Self {
@@ -1075,7 +1075,10 @@ fn review_r10_constraint_display_uses_the_structured_errors() {
         crate::schema::ResourceValueValidation::from_errors(vec![TypeError::MissingRequired {
             name: "current".into(),
         }]);
-    assert_eq!(errors.to_string(), errors.errors()[0].to_string());
+    assert_eq!(
+        errors.to_string(),
+        errors.errors().next().unwrap().to_string()
+    );
 }
 
 #[cfg(test)]
@@ -2231,7 +2234,6 @@ mod provider_config_tests {
                 assert_eq!(
                     errors
                         .errors()
-                        .iter()
                         .map(ToString::to_string)
                         .collect::<Vec<_>>(),
                     vec!["owner rejected `VpcId`: owner accepts `vpc-good`, not `bad`"]

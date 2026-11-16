@@ -10836,7 +10836,7 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
     else {
         panic!("typed schema error was erased: {error:?}");
     };
-    assert!(!errors.errors().is_empty());
+    assert!(errors.errors().next().is_some());
     assert_eq!(
         error
             .to_string()

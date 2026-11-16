@@ -16698,8 +16698,7 @@ impl PatternResourceSchema<Compiled> {
                         effective: effective_attribute.clone(),
                     },
                     value,
-                )
-                .with_symbolic_attribute(name);
+                );
                 for (index, primary) in findings.primary_findings().enumerate() {
                     let error = primary.error();
                     let tagged = error.clone().with_attribute(name);
@@ -16725,10 +16724,7 @@ impl PatternResourceSchema<Compiled> {
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
                 if let Some(admit) = admission.unknown {
-                    report.attributes.insert(
-                        name.clone(),
-                        admit(name, value).with_symbolic_attribute(name),
-                    );
+                    report.attributes.insert(name.clone(), admit(name, value));
                 }
                 report.errors.push(SchemaDiagnostic::from_value(
                     name,

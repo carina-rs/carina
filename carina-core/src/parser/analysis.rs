@@ -425,22 +425,26 @@ fn locate_unknown_key(
     finding: &crate::schema::KeyedSchemaFinding,
 ) -> Result<Located<crate::schema::TypeError>, AnalysisTreeError> {
     use crate::schema::diagnostic::SchemaDiagnosticKey;
-    let name = match &finding.key {
-        SchemaDiagnosticKey::Attribute { name } => name,
-        SchemaDiagnosticKey::Value { root, .. } => root,
-    };
-    let root = elements
-        .diagnostic_index()
-        .attribute(name)
-        .and_then(|node| node.root_key(elements))
-        .ok_or_else(|| {
-            AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
-                declaration: declaration.clone(),
-                element: "unknown attribute key".into(),
+    let authored_root = |name: &str| {
+        elements
+            .diagnostic_index()
+            .attribute(name)
+            .and_then(|node| node.root_key(elements))
+            .ok_or_else(|| {
+                AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
+                    declaration: declaration.clone(),
+                    element: "unknown attribute key".into(),
+                })
             })
-        })?;
+    };
     let location = match &finding.key {
-        SchemaDiagnosticKey::Attribute { .. } => {
+        // Value-only producers claim no authored key. Preserve their existing
+        // type projection without treating an authored lookup miss as one.
+        SchemaDiagnosticKey::Unlocated => elements
+            .get(super::elements::ElementKind::ResourceType)
+            .unwrap_or(declaration),
+        SchemaDiagnosticKey::Attribute { name } => {
+            let root = authored_root(name)?;
             let assignment = root.assignment_location();
             if assignment.span().start_line() == assignment.span().end_line() {
                 assignment
@@ -448,9 +452,13 @@ fn locate_unknown_key(
                 root.location()
             }
         }
-        SchemaDiagnosticKey::Value { relative, .. } => AttributeDiagnosticLocations {
+        SchemaDiagnosticKey::Value {
+            root: name,
+            relative,
+            ..
+        } => AttributeDiagnosticLocations {
             elements,
-            root: root.location(),
+            root: authored_root(name)?.location(),
         }
         .attribute_path_location(name, relative.path()),
     };
@@ -1675,14 +1683,14 @@ where
 
     /// Resolve an unknown input key using the shared parser-owned range policy.
     /// Root single-line assignments retain #4220's width; nested findings use keys.
-    pub fn locate_unknown_key(
+    fn locate_unknown_key(
         &self,
         finding: &crate::schema::KeyedSchemaFinding,
     ) -> Result<Located<crate::schema::TypeError>, AnalysisTreeError> {
         locate_unknown_key(self.elements, self.location, finding)
     }
 
-    /// Resolve a symbolic schema diagnostic; ordinary adapters receive only Other.
+    /// Resolve a schema diagnostic; ordinary adapters receive only Other.
     pub fn locate_schema_diagnostic(
         &self,
         diagnostic: &crate::schema::SchemaDiagnostic,
@@ -3250,6 +3258,34 @@ mod location_tests {
             (1, start + 1, 1, start + "unknown".len() + 1),
         );
         assert_eq!(located.detail().to_string(), "Unknown field 'unknown' in B");
+    }
+
+    #[test]
+    fn unlocated_unknown_key_keeps_the_type_projection_with_the_owner() {
+        use crate::schema::{SchemaDiagnostic, TypeError};
+        let parsed = super::super::parse_file(
+            "mock.test.Thing { config = {} }",
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let diagnostic = SchemaDiagnostic::unlocated(TypeError::StructFieldError {
+            field: "config".into(),
+            inner: Box::new(TypeError::UnknownStructField {
+                struct_name: "Config".into(),
+                field: "typo".into(),
+                suggestion: None,
+            }),
+        });
+        let finding = resource
+            .locate_schema_diagnostic(&diagnostic, |_ordinary| {
+                panic!("unlocated unknown key reached an ordinary adapter")
+            })
+            .unwrap();
+        assert_eq!(finding.location(), resource.type_location());
+        assert_eq!(finding.detail(), diagnostic.error());
     }
 
     #[test]

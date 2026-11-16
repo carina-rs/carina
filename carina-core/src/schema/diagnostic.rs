@@ -22,6 +22,7 @@ pub struct KeyedSchemaFinding {
 
 #[derive(Clone, PartialEq)]
 pub(crate) enum SchemaDiagnosticKey {
+    Unlocated,
     Attribute {
         name: String,
     },
@@ -115,8 +116,14 @@ impl SchemaDiagnostic {
     }
 
     pub(crate) fn unlocated(error: TypeError) -> Self {
-        if let TypeError::UnknownAttribute { name, .. } = &error {
-            return Self::from_value(name.clone(), LeafPath::from_segments([]), error);
+        if is_unknown_key(&error) {
+            if let TypeError::UnknownAttribute { name, .. } = &error {
+                return Self::from_value(name.clone(), LeafPath::from_segments([]), error);
+            }
+            return Self::UnknownKey(KeyedSchemaFinding {
+                key: SchemaDiagnosticKey::Unlocated,
+                error,
+            });
         }
         Self::Other(OtherSchemaFinding { error, path: None })
     }
@@ -158,6 +165,7 @@ impl SchemaDiagnostic {
     pub(super) fn at_attribute(mut self, root: &str) -> Self {
         match &mut self {
             Self::UnknownKey(finding) => match &mut finding.key {
+                SchemaDiagnosticKey::Unlocated => {}
                 SchemaDiagnosticKey::Attribute { name } => *name = root.into(),
                 SchemaDiagnosticKey::Value { root: name, .. } => *name = root.into(),
             },
@@ -173,6 +181,7 @@ impl SchemaDiagnostic {
     fn with_error(mut self, error: TypeError, source: &FieldPath) -> Self {
         let same_contract = match &self {
             Self::UnknownKey(finding) => match &finding.key {
+                SchemaDiagnosticKey::Unlocated => is_unknown_key(&error),
                 SchemaDiagnosticKey::Attribute { .. } => {
                     matches!(error, TypeError::UnknownAttribute { .. })
                 }
@@ -185,6 +194,7 @@ impl SchemaDiagnostic {
         if !same_contract {
             let root = match &self {
                 Self::UnknownKey(finding) => match &finding.key {
+                    SchemaDiagnosticKey::Unlocated => "",
                     SchemaDiagnosticKey::Attribute { name } => name.as_str(),
                     SchemaDiagnosticKey::Value { root, .. } => root.as_str(),
                 },
@@ -213,21 +223,16 @@ impl SchemaDiagnostic {
         }
     }
 
-    pub(super) fn coverage_path(&self) -> Option<(&str, &LeafPath)> {
+    pub(crate) fn coverage_path(&self) -> Option<(&str, &LeafPath)> {
         match self {
             Self::UnknownKey(finding) => match &finding.key {
-                SchemaDiagnosticKey::Attribute { .. } => None,
+                SchemaDiagnosticKey::Unlocated | SchemaDiagnosticKey::Attribute { .. } => None,
                 SchemaDiagnosticKey::Value { root, coverage, .. } => {
                     coverage.as_ref().map(|path| (root.as_str(), path))
                 }
             },
             Self::Other(finding) => finding.path(),
         }
-    }
-
-    pub(crate) fn retained_failure(&self, values: &super::ResourceValueValidation) -> bool {
-        self.coverage_path()
-            .is_some_and(|(root, _)| values.is_retained_failure(root))
     }
 
     pub(super) fn with_coverage(mut self, path: Option<&LeafPath>) -> Self {
@@ -381,6 +386,39 @@ mod tests {
             panic!("nested unknown key")
         };
         relative.path()
+    }
+
+    #[test]
+    fn unlocated_unknown_keys_keep_their_diagnostic_variant() {
+        let field = || TypeError::StructFieldError {
+            field: "nested".into(),
+            inner: Box::new(unknown_field()),
+        };
+        let errors = [
+            unknown_field(),
+            field(),
+            TypeError::ListItemError {
+                index: 1,
+                inner: Box::new(field()),
+            },
+            TypeError::MapValueError {
+                key: "entry".into(),
+                inner: Box::new(field()),
+            },
+        ];
+        let mut misclassified = Vec::new();
+        for (index, error) in errors.into_iter().enumerate() {
+            let finding = SchemaDiagnostic::unlocated(error.clone());
+            assert_eq!(finding.error(), &error);
+            assert!(finding.path().is_none());
+            if !matches!(finding, SchemaDiagnostic::UnknownKey(_)) {
+                misclassified.push(index);
+            }
+        }
+        assert!(
+            misclassified.is_empty(),
+            "unlocated unknowns classified as Other: {misclassified:?}"
+        );
     }
 
     #[test]

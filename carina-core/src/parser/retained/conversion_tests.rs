@@ -334,6 +334,7 @@ fn conversion_live_covered_and_discarded_uses_each_supply_a_verdict() {
         let result = {
             let coverage = &mut observed_coverage;
             crate::schema::value_validation::validate_authored_value_for_admission(
+                "input",
                 &schema.schema().as_schema().attributes()["input"].attr_type,
                 &proof,
                 schema.schema().as_schema().defs(),
@@ -454,6 +455,7 @@ fn conversion_claim_preserves_ordinary_checks_below_a_rejected_wrapper() {
     let result = {
         let coverage = &mut observed_coverage;
         crate::schema::value_validation::validate_authored_value_for_admission(
+            "input",
             &schema.schema().as_schema().attributes()["input"].attr_type,
             &proof,
             schema.schema().as_schema().defs(),
@@ -697,6 +699,7 @@ fn round5_unclaimed_convert_cannot_reach_ordinary_value_admission() {
         .into_classification();
     let mut coverage = crate::schema::value_validation::WalkCoverage::default();
     let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+        "input",
         &schema.schema().as_schema().attributes()["input"].attr_type,
         &proof,
         schema.schema().as_schema().defs(),
@@ -850,6 +853,7 @@ fn r5b_unloaded_transport_destinations_decline_before_child_admission() {
             .into_classification();
         let mut coverage = WalkCoverage::default();
         let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+            "input",
             &destination,
             &proof,
             &Default::default(),

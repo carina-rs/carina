@@ -2016,6 +2016,28 @@ mod tests {
     use carina_core::provider::HostError as ProviderError;
 
     #[test]
+    fn resource_analysis_invariant_cli_text_is_rendered_once() {
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let mut parsed = carina_core::parser::parse_file(
+            "mock.test.Thing {}",
+            std::path::Path::new("sibling.crn"),
+            &context,
+        )
+        .unwrap();
+        parsed.resources[0].declaration = Default::default();
+        let invariant = carina_core::parser::AnalysisTree::try_from_file(&parsed)
+            .err()
+            .expect("missing parser provenance");
+        let finding = carina_core::test_utils::resource_analysis_finding_for_test(invariant);
+        let error = AppError::ResourceAdmission(Box::new(finding));
+        assert_eq!(
+            format_error_with_source_chain(&error),
+            "missing declaration provenance for Resource mock.test.Thing.<pending>",
+        );
+    }
+
+    #[test]
     fn issue_4304_3a_review5_saved_provider_findings_precede_one_final_replan_hint() {
         use carina_core::parser::{
             ProviderConfig, ProviderConfigInvariantError, ResolvedProviderConfigs,

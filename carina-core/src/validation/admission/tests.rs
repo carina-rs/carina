@@ -1990,7 +1990,7 @@ fn provider_apply_and_discharge_use_catalog_when_factory_arguments_differ() {
                 else {
                     panic!("expected catalog rejection, got {error:?}")
                 };
-                assert_eq!(errors.errors(), &[expected]);
+                assert!(errors.errors().eq([&expected]), "{errors:?}");
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
             });
         },

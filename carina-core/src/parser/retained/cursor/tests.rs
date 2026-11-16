@@ -83,6 +83,7 @@ fn round5_resource_and_data_source_references_do_not_enter_definition_blocks() {
             Ok(Default::default())
         };
         let result = crate::schema::value_validation::validate_authored_value_for_admission(
+            "input",
             &schema.schema().as_schema().attributes()["input"].attr_type,
             &proof,
             schema.schema().as_schema().defs(),
@@ -157,6 +158,7 @@ fn round5_reference_slot_syntax_inventory() {
         Ok(Default::default())
     };
     let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+        "input",
         &schema.schema().as_schema().attributes()["input"].attr_type,
         &proof,
         schema.schema().as_schema().defs(),
@@ -223,6 +225,7 @@ fn round5_union_best_failing_hook_is_retained_once_live_and_discarded() {
         authored: Some(&hook),
     };
     let mut current = validate_authored_value_for_admission(
+        "input",
         attr,
         &proof,
         schema.as_schema().defs(),
@@ -311,6 +314,7 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
     };
     let validate = |authored| {
         validate_authored_value_for_admission(
+            "input",
             attr,
             &proof,
             schema.as_schema().defs(),
@@ -335,11 +339,13 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
         let mut actual = validate(Some(&hook));
         assert_eq!(ordinary_calls.replace(Vec::new()), expected_calls);
         assert_eq!(actual.local_error(), expected.local_error());
+        let expected_findings = expected.clone().into_diagnostic_findings("input");
+        let actual_findings = actual.clone().into_diagnostic_findings("input");
         assert!(
-            actual
-                .local_findings()
-                .take(expected.local_findings().len())
-                .eq(expected.local_findings())
+            actual_findings
+                .iter()
+                .take(expected_findings.len())
+                .eq(expected_findings.iter())
         );
         assert_eq!(actual.take_assignment().errors.len(), 1);
     }
@@ -463,6 +469,7 @@ fn round6_union_hook_fires_once_for_best_ordinary_failure() {
         authored: Some(&hook),
     };
     let current = validate_authored_value_for_admission(
+        "input",
         attr,
         &proof,
         schema.as_schema().defs(),
@@ -619,6 +626,7 @@ fn round1_seam_expansion_records_a_decision_without_a_parse_projection() {
         .unwrap()
         .into_classification();
     let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+        "input",
         &schema.as_schema().attributes()["input"].attr_type,
         &proof,
         schema.as_schema().defs(),
@@ -810,6 +818,7 @@ fn walk(source: &str, declaration: crate::schema::AttributeType) -> Vec<Visit> {
         Ok(Default::default())
     };
     let findings = validate_authored_value_for_admission(
+        "input",
         declaration,
         &proof,
         schema.schema().as_schema().defs(),
@@ -1060,6 +1069,7 @@ fn slot_coverage(
             .into_classification();
         let schema = resource.schema(schemas).unwrap();
         let findings = validate_authored_value_for_admission(
+            "input",
             &schema.schema().as_schema().attributes()["input"].attr_type,
             &proof,
             schema.schema().as_schema().defs(),
@@ -1269,6 +1279,7 @@ fn module_instances(condition: &str, rejudge: bool) {
                 .into_classification();
             let schema = schemas.get_for(resource).unwrap();
             let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+                "input",
                 &schema.schema().as_schema().attributes()["input"].attr_type,
                 &proof,
                 schema.schema().as_schema().defs(),
@@ -1437,6 +1448,7 @@ fn seam_directory_replacement_keeps_reference_root_and_covers_descendants() {
     };
     let schema = resource.schema(&schemas).unwrap();
     let result = crate::schema::value_validation::validate_authored_value_for_admission(
+        "input",
         &schema.schema().as_schema().attributes()["input"].attr_type,
         &proof,
         schema.schema().as_schema().defs(),
@@ -1539,6 +1551,7 @@ fn seam_schema_block_aliases_keep_the_synthetic_authored_containers() {
         .into_classification();
     let schema = resource.schema(&schemas).unwrap();
     let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+        "item",
         &schema.schema().as_schema().attributes()["items"].attr_type,
         &proof,
         schema.schema().as_schema().defs(),
@@ -1753,6 +1766,7 @@ fn seam_completeness_tracks_the_materialized_slot_generation() {
     let schema = schemas.get_for(resource).unwrap();
     let mut coverage = Default::default();
     let findings = crate::schema::value_validation::validate_authored_value_for_admission(
+        "input",
         &schema.schema().as_schema().attributes()["input"].attr_type,
         &proof,
         schema.schema().as_schema().defs(),
@@ -2026,6 +2040,7 @@ fn review_seam_false_if_without_else_preserves_absence() {
         .unwrap()
         .into_classification();
     let findings = validate_authored_value_for_admission(
+        "input",
         &schema.as_schema().attributes()["input"].attr_type,
         &proof,
         schema.as_schema().defs(),

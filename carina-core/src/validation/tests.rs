@@ -219,31 +219,25 @@ fn missing_authored_root_keeps_the_resource_invariant_and_other_findings() {
     let judged = loaded.judged();
     let inputs = judged.schema_validation_resources().unwrap();
     let mut run: ConversionValidation = ConversionValidation::new(judged.report());
-    let findings = run
-        .walk_in(FindingSubject::Root, |coverage| {
-            resource_values_report(
-                inputs,
-                judged.schemas(),
-                &HashSet::from(["mock".into()]),
-                config,
-                Some(&admissions),
-                &mut Vec::new(),
-                ValueAdmission {
-                    report: judged.report(),
-                    coverage,
-                },
-            )
-        })
-        .expect("one missing authored root must not abort the report");
+    let findings = run.walk_in(FindingSubject::Root, |coverage| {
+        resource_values_report(
+            inputs,
+            judged.schemas(),
+            &HashSet::from(["mock".into()]),
+            config,
+            Some(&admissions),
+            &mut Vec::new(),
+            ValueAdmission {
+                report: judged.report(),
+                coverage,
+            },
+        )
+    });
     assert_eq!(findings.len(), 3, "{findings:#?}");
-    assert!(matches!(
-        findings[0].detail,
-        ResourceAdmissionDetail::AnalysisInvariant(_)
-    ));
-    let cause = std::error::Error::source(&findings[0]).expect("keep the invariant error chain");
-    let cause = cause
-        .downcast_ref::<crate::parser::AnalysisTreeError>()
-        .unwrap();
+    let ResourceAdmissionDetail::AnalysisInvariant(cause) = &findings[0].detail else {
+        panic!("retain the typed invariant: {:?}", findings[0]);
+    };
+    assert!(std::error::Error::source(&findings[0]).is_none());
     assert!(
         matches!(cause.kind(), crate::parser::AnalysisTreeErrorKind::MissingElementProvenance { declaration, .. }
         if declaration.span().start_line() == 2)

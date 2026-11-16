@@ -1128,9 +1128,7 @@ impl DiagnosticRun<'_> {
                     continue;
                 }
 
-                let container_findings = attr_findings
-                    .local_findings()
-                    .any(|(path, _)| !path.is_empty())
+                let container_findings = attr_findings.has_nested_findings()
                     || matches!(
                         attr_findings.structure(),
                         carina_core::schema::ValueStructure::List
@@ -1319,24 +1317,20 @@ impl DiagnosticRun<'_> {
                 {
                     continue;
                 }
-                let finding = match diagnostic {
-                    carina_core::schema::SchemaDiagnostic::UnknownKey(key) => {
-                        match rref.locate_unknown_key(&key) {
-                            Ok(finding) => finding,
-                            Err(error) => {
-                                diagnostics.extend(render_analysis_invariant(doc, &error));
-                                continue;
-                            }
-                        }
-                    }
-                    carina_core::schema::SchemaDiagnostic::Other(_) => {
-                        let location = error
-                            .attribute_name()
-                            .filter(|name| resource_attributes.contains_key(*name))
-                            .map_or(rref.type_location(), |name| {
-                                rref.attribute_key_location(name)
-                            });
-                        carina_core::parser::Located::new(location.clone(), error)
+                let finding = match rref.locate_schema_diagnostic(&diagnostic, |ordinary| {
+                    let location = ordinary
+                        .error()
+                        .attribute_name()
+                        .filter(|name| resource_attributes.contains_key(*name))
+                        .map_or(rref.type_location(), |name| {
+                            rref.attribute_key_location(name)
+                        });
+                    location.clone()
+                }) {
+                    Ok(finding) => finding,
+                    Err(error) => {
+                        diagnostics.extend(render_analysis_invariant(doc, &error));
+                        continue;
                     }
                 };
                 diagnostics.extend(render_merged(
