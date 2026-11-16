@@ -523,6 +523,7 @@ fn real_secret_directory_reachability_preserves_diagnostic_boundaries() {
     "lsp": [
       "Invalid expression at line 1: backend s3 attribute 'bucket' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed",
       "Invalid expression at line 1: backend s3 attribute 'bucket' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed",
+      "Invalid expression at line 1: backend s3 attribute 'bucket' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed",
       "Invalid expression at line 1: backend s3 attribute 'bucket' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed"
     ],
     "runtime": null,
@@ -895,6 +896,9 @@ fn real_secret_directory_reachability_preserves_diagnostic_boundaries() {
         }
         assert_eq!(statuses, expected_case.validation_codes, "{label}");
         assert_eq!(messages, expected_case.errors, "CLI JSON: {label}");
+        // The `backend_attribute` case pins the same finding four times at one
+        // range: the editor publishes it from four passes (carina#4492). When that
+        // is fixed, the pinned list shrinks to one entry.
         assert_eq!(lsp_messages, expected_case.lsp, "LSP: {label}");
     }
     assert!(expected.is_empty(), "every expected case must run");
