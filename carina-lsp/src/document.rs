@@ -9,7 +9,7 @@ use carina_core::parser::{ParseError, ParsedFile, ProviderContext};
 
 pub struct Document {
     content: Rope,
-    source_text: String,
+    source_text: Arc<str>,
     parsed: Option<ParsedFile>,
     parsed_buffer: Option<ParsedSourceBuffer>,
     parse_error: Option<ParseError>,
@@ -31,7 +31,7 @@ impl Document {
     ) -> Self {
         let mut doc = Self {
             content: Rope::from_str(&content),
-            source_text: content,
+            source_text: content.into(),
             parsed: None,
             parsed_buffer: None,
             parse_error: None,
@@ -67,7 +67,7 @@ impl Document {
     }
 
     fn reparse(&mut self) {
-        self.source_text = self.content.to_string();
+        self.source_text = self.content.to_string().into();
         match ParsedSourceBuffer::parse(
             &self.source_text,
             &self.source_file,
@@ -97,7 +97,11 @@ impl Document {
     }
 
     pub fn text(&self) -> String {
-        self.source_text.clone()
+        self.source_text.to_string()
+    }
+
+    pub(crate) fn source_snapshot(&self) -> Arc<str> {
+        Arc::clone(&self.source_text)
     }
 
     #[allow(dead_code)]

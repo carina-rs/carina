@@ -10,6 +10,60 @@ fn config() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
 }
 
+#[test]
+fn merged_syntax_invalidates_the_shared_secrecy_index() {
+    let config = config();
+    let schemas = SchemaRegistry::new();
+    let first = crate::parser::parse_file(
+        "let first = mock.Resource { name = 'first' }",
+        Path::new("first.crn"),
+        &config,
+    )
+    .unwrap();
+    let second = crate::parser::parse_file(
+        "let second = mock.Resource { name = 'second' }",
+        Path::new("second.crn"),
+        &config,
+    )
+    .unwrap();
+    let first_location = first.parser_binding_metadata.syntax().expressions().roots()[0].location();
+    let second_location = second
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .roots()[0]
+        .location();
+    let mut report = judge_expressions(&first, &schemas, &config);
+    let second_report = judge_expressions(&second, &schemas, &config);
+    assert!(report.secrecy_at(first_location).is_some());
+    assert!(report.secrecy_at(second_location).is_none());
+    report.extend(second_report);
+    assert!(report.secrecy_at(first_location).is_some());
+    assert!(report.secrecy_at(second_location).is_some());
+}
+
+#[test]
+fn expressions_equality_includes_authored_secrecy_argument_roots() {
+    let parsed =
+        crate::parser::parse_file("let value = 'public'", Path::new("equality.crn"), &config())
+            .unwrap();
+    let location = parsed
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .roots()[0]
+        .location()
+        .clone();
+    let original = Expressions::<RelativeBindingName>::default();
+    let mut changed = original.clone();
+    changed.secrecy_argument_roots.insert(
+        ExpressionLocation::new(ExpressionInstance::Root, &location),
+        "argument".into(),
+    );
+    assert_eq!(original, original.clone());
+    assert_ne!(original, changed);
+}
+
 fn assert_round4_buffer_membership(buffer_text: &str, disk_text: &str, expected_template: bool) {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("guards.crn");
@@ -1229,4 +1283,71 @@ fn issue_4282_round2_collection_members_never_become_a_single_construction() {
             assert!(result.for_sink(&strings, &config).has_constructed_members());
         }
     }
+}
+
+#[test]
+fn last_owned_deep_retained_syntax_drops_iteratively() {
+    let parsed = crate::parser::parse("let leaf = 'value'", &config()).unwrap();
+    let mut root = parsed
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .roots()[0]
+        .clone();
+    let location = root.location().clone();
+    for _ in 0..20_000 {
+        root = node_at(location.clone(), ExprKind::Alias, vec![root]);
+    }
+    let shared = root.clone();
+    drop(root);
+    drop(shared);
+}
+
+#[test]
+fn condition_history_lookup_and_drop_use_heap_storage() {
+    let first = ConditionRecorder::default();
+    let known = NodeId::fresh();
+    first.extend([(known, true)]);
+    let mut snapshot = first.snapshot();
+    let missing = NodeId::fresh();
+    for _ in 0..20_000 {
+        let next = ConditionRecorder::default();
+        next.extend([(NodeId::fresh(), false)]);
+        snapshot = next.snapshot().over(&snapshot);
+    }
+    assert_eq!(snapshot.get(known), Some(true));
+    assert_eq!(snapshot.get(missing), None);
+    drop(snapshot);
+}
+
+#[test]
+fn structural_secrecy_is_lazy_and_owned_by_the_immutable_judged_graph() {
+    let config = config();
+    let schemas = SchemaRegistry::new();
+    let parsed = crate::parser::parse("let input = secret('value') ?? 'public'", &config).unwrap();
+    let judged = JudgedFile::new(parsed, &schemas, &config);
+    assert!(judged.secrecy.get().is_none());
+    assert!(judged.report().findings().is_empty());
+    assert!(
+        judged.secrecy.get().is_none(),
+        "type queries must not derive secrecy"
+    );
+
+    let secrecy = judged.secrecy();
+    assert_eq!(secrecy.findings().len(), 1);
+    assert_eq!(
+        secrecy.findings()[0].cause(),
+        &crate::secrecy::DerivationError::MixedAlternatives(crate::secrecy::MixedAlternatives {
+            operator: crate::secrecy::Alternatives::Coalesce,
+        })
+    );
+    assert!(std::ptr::eq(secrecy, judged.secrecy()));
+    let findings = secrecy.findings().to_vec();
+
+    let rejudged = JudgedFile::new(judged.into_file(), &schemas, &config);
+    assert!(
+        rejudged.secrecy.get().is_none(),
+        "a new graph must derive its own evidence"
+    );
+    assert_eq!(rejudged.secrecy().findings(), findings.as_slice());
 }

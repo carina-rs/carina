@@ -1,0 +1,9 @@
+let template = use { source = "./module" }
+let secret_instance = template {
+  name = "secret-instance"
+  value = secret("STRUCTURAL_SECRECY_4470_CANARY")
+}
+let public_instance = template {
+  name = "public-instance"
+  value = "public"
+}

@@ -531,6 +531,19 @@ impl<'s> ResolvedConfig<'s> {
     }
 }
 
+fn extend_secrecy_errors(
+    errors: &mut impl Extend<AppError>,
+    report: &carina_core::secrecy::SecrecyReport,
+) {
+    errors.extend(
+        report
+            .findings()
+            .iter()
+            .cloned()
+            .map(|finding| AppError::Secrecy(Box::new(finding))),
+    );
+}
+
 fn extend_binding_use_errors(
     errors: &mut impl Extend<AppError>,
     report: &carina_core::validation::BindingUseReport,
@@ -699,6 +712,7 @@ pub(crate) fn validate_and_resolve_report_inner<'s>(
 ) -> ConfigurationValidation<ResolvedConfig<'s>> {
     let mut warnings = Vec::new();
     let mut directive_errors = Vec::new();
+    let mut secrecy_errors = Vec::new();
     let mut authored_inputs = carina_core::input_rules::AuthoredInputs::for_directory_in_session(
         &parsed,
         enriched_context,
@@ -718,10 +732,12 @@ pub(crate) fn validate_and_resolve_report_inner<'s>(
         &mut warnings,
         &mut validation,
         &mut directive_errors,
+        &mut secrecy_errors,
     );
     // Directive findings are independent of value/type validation. Merge them only
     // after that pass so they cannot trigger an early return hiding findings.
     validation.extend(directive_errors);
+    validation.extend(secrecy_errors);
     let errors = validation
         .complete()
         .into_presented()
@@ -773,6 +789,7 @@ fn validate_and_resolve_configuration<'s>(
     warnings: &mut Vec<ConfigurationWarning>,
     validation: &mut carina_core::validation::ConversionValidation<AppError>,
     directive_errors: &mut Vec<AppError>,
+    secrecy_errors: &mut Vec<AppError>,
 ) -> Result<ResolvedConfig<'s>, ValidationStopped> {
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
@@ -903,6 +920,7 @@ fn validate_and_resolve_configuration<'s>(
         enriched_context.catalog(),
     );
     let expression_report = configuration.judged().report();
+    extend_secrecy_errors(secrecy_errors, configuration.judged().secrecy());
     errors.extend(
         expression_report
             .findings()
@@ -1005,9 +1023,8 @@ fn validate_and_resolve_configuration<'s>(
     // recursive module walk so validate/plan/apply can collect path-prefixed
     // findings alongside other validation errors. As with the duplicate
     // checks established in #3711, the directory unit includes every imported
-    // nested module, even when that import is never called. The `errors`
-    // return immediately below happens before
-    // module resolver, so the same run cannot also emit the
+    // nested module, even when that import is never called. The ordinary-error
+    // path collects expanded secrecy/placements but does not also emit the
     // resolver's expansion-phase backstops. Destroy and state refresh set
     // `skip_resource_validation = true`, bypass this walk, and rely on those
     // backstops while still expanding modules.
@@ -1019,11 +1036,10 @@ fn validate_and_resolve_configuration<'s>(
         errors.extend(validate_no_exports_in_modules(&module_walk));
     }
 
-    // Non-module-call failures do not have a sound expansion path. Authored
-    // module-call findings remain separate so diagnostic resolution can
-    // collect concrete constraint outcomes before all typed findings are
-    // merged below.
-    if errors.ordinary_failure().is_some() {
+    // Independent root failures still collect expanded secrecy findings. The
+    // resolver and its conversion channel are consumed once on either path.
+    let had_ordinary_failure = errors.ordinary_failure().is_some();
+    if had_ordinary_failure {
         // Dependency diagnostics are independent of unrelated argument-type
         // failures. The per-argument report preserves every sound result even
         // when expansion cannot proceed to the final graph check.
@@ -1049,8 +1065,6 @@ fn validate_and_resolve_configuration<'s>(
                 Err(error) => errors.push(AppError::AnalysisInvariant(error)),
             }
         }
-        extend_module_call_errors(errors, authored_module_call_findings);
-        return Err(ValidationStopped::existing(errors));
     }
 
     let module_resolution = module_resolver::resolve_modules_with_diagnostics(
@@ -1060,9 +1074,25 @@ fn validate_and_resolve_configuration<'s>(
         ctx.schemas(),
         &authored_module_call_findings,
     );
-    let mut parsed = match module_resolution.into_validation(errors) {
+    let module_resolution = module_resolution.into_validation(errors);
+    if let module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } =
+        &module_resolution
+    {
+        let configuration = carina_core::config_loader::load_buffer_configuration(
+            graph,
+            ctx.schemas(),
+            enriched_context.catalog(),
+        );
+        secrecy_errors.clear();
+        extend_secrecy_errors(secrecy_errors, configuration.judged().secrecy());
+        errors.include_file(graph);
+    }
+    if had_ordinary_failure {
+        extend_module_call_errors(errors, authored_module_call_findings);
+        return Err(ValidationStopped::existing(errors));
+    }
+    let mut parsed = match module_resolution {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
-            errors.include_file(&graph);
             *authored_inputs = graph
                 .authored_inputs()
                 .map_err(|error| {

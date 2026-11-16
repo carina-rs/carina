@@ -83,6 +83,7 @@ mod resolver_split_tests;
 pub mod resource;
 pub mod saved_replay;
 pub mod schema;
+pub mod secrecy;
 pub mod shutdown;
 pub mod static_type;
 pub mod upstream_exports;

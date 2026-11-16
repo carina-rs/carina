@@ -879,6 +879,14 @@ pub const NON_CONTEXT_RULES: &[(&str, &str)] = &[
         "validate-expression/condition grammar has no checked-conversion suffix",
     ),
     (
+        "coalesce_separator",
+        "diagnostic separator around the coalesce operator has no independently admissible value child",
+    ),
+    (
+        "coalesce_token",
+        "coalesce operator token has no independently admissible value child",
+    ),
+    (
         "null_literal",
         "lexical/type/address token or structural envelope; its expression children are classified separately",
     ),

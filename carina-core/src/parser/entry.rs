@@ -1650,7 +1650,7 @@ fn seed_bindings(ctx: &mut ParseContext<'_>, seeds: &[BindingSeed<'_>]) {
                 // A provisional name is only known to exist; inserting the
                 // resource-path placeholder must not upgrade its value binding
                 // to a confirmed structural handle.
-                ctx.resource_bindings
+                Arc::make_mut(&mut ctx.resource_bindings)
                     .insert(seed.name().to_string(), placeholder);
             }
             SeedKind::StructuralAlias(handle) => {

@@ -1,0 +1,5 @@
+arguments {
+  name: String
+  value: String
+  enabled: Bool = true
+}

@@ -314,6 +314,10 @@ Backend attributes also cannot use secret-derived values. Backends accept only
 ordinary configuration values, so validation rejects `secret()` and
 `decrypt()` results in a `backend` block.
 
+Carina decides whether a value is secret from the configuration as written: it follows references, operands, interpolation, user-function results and module outputs back to a `secret()` or `decrypt()` call. Values returned by a provider or exported from an upstream configuration are public values; wrap them with `secret()` where you use them if they must be protected. The alternatives of `??`, and the candidates and default of a `lookup()` whose map is known from the configuration, must be all secret or all public. Mixing them is a validation error, because the plan could not tell whether the selected value is a secret. Wrap the public alternatives in `secret()` to fix it. An empty list or map agrees with either kind.
+
+To make that decision, Carina follows at most 127 references in a chain from an attribute and at most 4096 reference lookups per attribute. The same limits apply to each let binding, module argument, output, export and function body. A longer chain, or one that needs more lookups, is a validation error. Only references count toward the chain: functions, lists, maps, `??`, `if` and interpolation around a reference do not. Passing a value through a module output counts two references for each module, its argument and its output, so a chain of modules reaches the limit at 64 modules.
+
 ```
 secret(value: Any) -> Secret
 ```

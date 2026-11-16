@@ -13,7 +13,11 @@ use crate::resource::{
 };
 use indexmap::IndexMap;
 use pest::iterators::{Pair, Pairs};
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 #[cfg(test)]
 mod conversion_tests;
@@ -25,6 +29,14 @@ mod tests;
 #[cfg(test)]
 thread_local! {
     static PROJECTION_COPY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SECRECY_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_secrecy_index_builds<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    SECRECY_INDEX_BUILDS.set(0);
+    let result = run();
+    (result, SECRECY_INDEX_BUILDS.get())
 }
 
 #[cfg(test)]
@@ -185,32 +197,50 @@ struct ConditionHistory {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(super) struct ConditionSnapshot {
-    history: Arc<std::sync::RwLock<ConditionHistory>>,
+pub(crate) struct ConditionSnapshot {
+    history: Option<Arc<std::sync::RwLock<ConditionHistory>>>,
     version: usize,
     previous: Option<Arc<ConditionSnapshot>>,
 }
 
 impl ConditionSnapshot {
-    fn get(&self, id: NodeId) -> Option<bool> {
-        let selected = {
-            let history = self.history.read().expect("retained conditions lock");
-            history.values.get(&id).and_then(|values| {
-                let index = values.partition_point(|(version, _)| *version <= self.version);
-                index.checked_sub(1).map(|index| values[index].1)
-            })
-        };
-        selected.or_else(|| self.previous.as_ref()?.get(id))
+    pub(crate) fn get(&self, id: NodeId) -> Option<bool> {
+        let mut snapshot = self;
+        loop {
+            if let Some(history) = &snapshot.history {
+                let history = history.read().expect("retained conditions lock");
+                if let Some(selected) = history.values.get(&id).and_then(|values| {
+                    let index = values.partition_point(|(version, _)| *version <= snapshot.version);
+                    index.checked_sub(1).map(|index| values[index].1)
+                }) {
+                    return Some(selected);
+                }
+            }
+            snapshot = snapshot.previous.as_deref()?;
+        }
     }
 
     fn over(&self, previous: &Self) -> Self {
+        if self.history.is_none() && self.previous.is_none() {
+            return previous.clone();
+        }
         let mut snapshot = self.clone();
-        snapshot.previous = Some(Arc::new(previous.clone()));
+        snapshot.previous = (previous.history.is_some() || previous.previous.is_some())
+            .then(|| Arc::new(previous.clone()));
         snapshot
     }
 }
 
-#[derive(Debug, Default)]
+impl Drop for ConditionSnapshot {
+    fn drop(&mut self) {
+        let mut previous = self.previous.take();
+        while let Some(snapshot) = previous {
+            previous = Arc::into_inner(snapshot).and_then(|mut snapshot| snapshot.previous.take());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ConditionRecorder(Arc<std::sync::RwLock<ConditionHistory>>);
 
 impl ConditionRecorder {
@@ -228,9 +258,10 @@ impl ConditionRecorder {
     }
 
     fn snapshot(&self) -> ConditionSnapshot {
+        let version = self.0.read().expect("retained conditions lock").version;
         ConditionSnapshot {
-            history: self.0.clone(),
-            version: self.0.read().expect("retained conditions lock").version,
+            history: (version != 0).then(|| self.0.clone()),
+            version,
             previous: None,
         }
     }
@@ -298,9 +329,23 @@ struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
     location: ExpressionLocation,
     kind: ExprKind<B>,
     roles: AuthoredChildRoles,
+    secrecy_operator: Option<DeclarationLocation>,
     first_conversion: Option<Arc<ConversionSite>>,
     parse_ownership: ParseOwnership,
     children: Vec<ExprValue<P, B>>,
+}
+
+// Drain the last-owned syntax edges on the heap. Shared nodes are left for
+// their last owner; each node whose Arc is consumed drops with no children.
+impl<P: ValueKind, B: BindingAddress> Drop for AuthoredExpr<P, B> {
+    fn drop(&mut self) {
+        let mut pending = std::mem::take(&mut self.children);
+        while let Some(child) = pending.pop() {
+            if let Some(mut node) = Arc::into_inner(child.authored) {
+                pending.append(&mut node.children);
+            }
+        }
+    }
 }
 
 // Named child handles are identity metadata, independent of syntax equality.
@@ -646,15 +691,63 @@ impl<B: BindingAddress> ExprKind<B> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct FunctionSignature {
     parameters: Vec<(String, Option<TypeExpr>)>,
     return_type: Option<TypeExpr>,
+    pub(crate) parameter_nodes: Vec<NodeId>,
+    pub(crate) default_nodes: Vec<Option<NodeId>>,
+}
+
+impl PartialEq for FunctionSignature {
+    fn eq(&self, other: &Self) -> bool {
+        self.parameters == other.parameters && self.return_type == other.return_type
+    }
 }
 
 impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
     pub fn node_id(&self) -> NodeId {
         self.authored.id
+    }
+
+    pub(crate) fn secrecy_kind(&self) -> &ExprKind<B> {
+        &self.authored.kind
+    }
+    pub(crate) fn secrecy_children(&self) -> &[Self] {
+        &self.authored.children
+    }
+    pub(crate) fn secrecy_instance(&self) -> &ExpressionInstance {
+        &self.authored.location.instance
+    }
+    pub(crate) fn secrecy_operator(&self) -> &DeclarationLocation {
+        self.authored
+            .secrecy_operator
+            .as_ref()
+            .unwrap_or(self.location())
+    }
+    pub(crate) fn secrecy_sink(&self) -> Option<&Self> {
+        self.authored.sink_value()
+    }
+    pub(crate) fn secrecy_condition(&self) -> Option<usize> {
+        self.authored.condition_index()
+    }
+    pub(crate) fn secrecy_function_body(&self) -> Option<&Self> {
+        match self.authored.roles {
+            AuthoredChildRoles::Function { body } => self
+                .authored
+                .children
+                .iter()
+                .find(|child| child.node_id() == body),
+            AuthoredChildRoles::Positional
+            | AuthoredChildRoles::If { condition: _ }
+            | AuthoredChildRoles::Computed
+            | AuthoredChildRoles::Sequence { result: _ }
+            | AuthoredChildRoles::Sink {
+                value: _,
+                key: _,
+                placement: _,
+            } => None,
+        }
     }
 
     pub fn projection(&self) -> Option<&Value<P, B>> {
@@ -680,8 +773,8 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
                 payload: Projection::Pending,
             };
         }
-        let authored = Arc::unwrap_or_clone(self.authored);
-        let kind = match authored.kind {
+        let mut authored = Arc::unwrap_or_clone(self.authored);
+        let kind = match std::mem::replace(&mut authored.kind, ExprKind::Declaration) {
             ExprKind::Convert { target, parsing } => ExprKind::Convert { target, parsing },
             ExprKind::Binding(binding) => ExprKind::Binding(map(binding)),
             ExprKind::Reference {
@@ -741,13 +834,13 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
         let authored = Arc::new(AuthoredExpr {
             id: authored.id,
             definition_use: authored.definition_use,
-            location: authored.location,
+            location: authored.location.clone(),
             kind,
-            roles: authored.roles,
-            first_conversion: authored.first_conversion,
+            roles: authored.roles.clone(),
+            secrecy_operator: authored.secrecy_operator.clone(),
+            first_conversion: authored.first_conversion.clone(),
             parse_ownership: authored.parse_ownership,
-            children: authored
-                .children
+            children: std::mem::take(&mut authored.children)
                 .into_iter()
                 .map(|child| child.map_bindings(map, memo))
                 .collect(),
@@ -846,6 +939,7 @@ pub(in crate::parser) fn resource_slots(
     };
     let instance = ExpansionInstanceId::fresh();
     let mut slots = AuthoredSlots::default();
+    slots.set_instance(instance);
     slots.set_declaration(
         captures
             .resource_declarations
@@ -909,6 +1003,10 @@ pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     definitions: IndexMap<B, ExprValue<ParserPlaceholder, B>>,
     report: Arc<ExpressionReport<B>>,
     arguments: IndexMap<B, TypeExpr>,
+    secrecy_arguments: IndexMap<B, Value<ParserPlaceholder, B>>,
+    secrecy_argument_modules: IndexMap<B, B>,
+    secrecy_argument_roots: IndexMap<ExpressionLocation, String>,
+    secrecy_calls: IndexMap<ExpressionInstance, crate::secrecy::CallSite>,
     instance: ExpressionInstance,
     require_scope: Option<RequireScope>,
     captures: Arc<CapturedNodes>,
@@ -918,11 +1016,32 @@ pub struct Expressions<B: BindingAddress = RelativeBindingName> {
 
 impl<B: BindingAddress> PartialEq for Expressions<B> {
     fn eq(&self, other: &Self) -> bool {
-        self.roots == other.roots
-            && self.definitions == other.definitions
-            && self.report == other.report
-            && self.arguments == other.arguments
-            && self.instance == other.instance
+        // Captures, projection caches and template admission metadata are
+        // transient authority rather than expression value semantics.
+        let Self {
+            roots,
+            definitions,
+            report,
+            arguments,
+            secrecy_arguments,
+            secrecy_argument_modules,
+            secrecy_argument_roots,
+            secrecy_calls,
+            instance,
+            require_scope: _,
+            captures: _,
+            projections: _,
+            template_placements: _,
+        } = self;
+        roots == &other.roots
+            && definitions == &other.definitions
+            && report == &other.report
+            && arguments == &other.arguments
+            && secrecy_arguments == &other.secrecy_arguments
+            && secrecy_argument_modules == &other.secrecy_argument_modules
+            && secrecy_argument_roots == &other.secrecy_argument_roots
+            && secrecy_calls == &other.secrecy_calls
+            && instance == &other.instance
     }
 }
 
@@ -944,11 +1063,69 @@ impl<B: BindingAddress> Default for Expressions<B> {
             definitions: IndexMap::new(),
             report: Arc::new(ExpressionReport::empty()),
             arguments: IndexMap::new(),
+            secrecy_arguments: IndexMap::new(),
+            secrecy_argument_modules: IndexMap::new(),
+            secrecy_argument_roots: IndexMap::new(),
+            secrecy_calls: IndexMap::new(),
             instance: ExpressionInstance::Root,
             require_scope: None,
             captures: Arc::default(),
             projections: Arc::default(),
             template_placements: Default::default(),
+        }
+    }
+}
+
+/// Resolve a let-bound builtin closure from authored definitions. Captures
+/// stay in application order, and no evaluated value can supply this identity.
+fn builtin_closure<B: BindingAddress>(
+    definitions: &IndexMap<B, ExprValue<ParserPlaceholder, B>>,
+    instance: &ExpressionInstance,
+    name: &str,
+) -> Option<(
+    crate::builtins::Builtin,
+    Vec<ExprValue<ParserPlaceholder, B>>,
+)> {
+    let named = |instance: &ExpressionInstance, name: &str| {
+        let scope = match instance {
+            ExpressionInstance::Root => None,
+            ExpressionInstance::Module(environment) => Some(environment.scope.as_ref()),
+        };
+        let binding: B = crate::resource::binding_address::binding_in_scope(
+            RelativeBindingName::new(name),
+            scope,
+        );
+        definitions
+            .get(&binding)
+            .filter(|definition| definition.secrecy_instance() == instance)
+    };
+    let mut definition = named(instance, name)?;
+    let mut seen = HashSet::new();
+    let mut captures = Vec::new();
+    loop {
+        if !seen.insert((definition.secrecy_instance().clone(), definition.node_id())) {
+            return None;
+        }
+        match definition.secrecy_kind() {
+            ExprKind::Alias | ExprKind::Parens | ExprKind::Definition => {
+                definition = definition.secrecy_children().last()?;
+            }
+            ExprKind::Binding(binding) => definition = definitions.get(binding)?,
+            ExprKind::Call(name) => {
+                captures.push(definition.secrecy_children());
+                if let Some(builtin) = crate::builtins::Builtin::from_name(name) {
+                    let captures = captures
+                        .into_iter()
+                        .rev()
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    return (!captures.is_empty() && captures.len() < builtin.arity())
+                        .then_some((builtin, captures));
+                }
+                definition = named(definition.secrecy_instance(), name)?;
+            }
+            _ => return None,
         }
     }
 }
@@ -1019,6 +1196,12 @@ impl<B: BindingAddress> Expressions<B> {
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);
         self.arguments.extend(other.arguments);
+        self.secrecy_arguments.extend(other.secrecy_arguments);
+        self.secrecy_argument_modules
+            .extend(other.secrecy_argument_modules);
+        self.secrecy_argument_roots
+            .extend(other.secrecy_argument_roots);
+        self.secrecy_calls.extend(other.secrecy_calls);
         self.template_placements.append(other.template_placements);
         if self.require_scope.is_none() {
             self.require_scope = other.require_scope;
@@ -1033,6 +1216,18 @@ impl<B: BindingAddress> Expressions<B> {
     ) -> Expressions<C> {
         let mut memo = HashMap::new();
         Expressions {
+            secrecy_arguments: self
+                .secrecy_arguments
+                .into_iter()
+                .map(|(name, value)| (map(name), value.map_bindings(map)))
+                .collect(),
+            secrecy_argument_modules: self
+                .secrecy_argument_modules
+                .into_iter()
+                .map(|(name, module)| (map(name), map(module)))
+                .collect(),
+            secrecy_argument_roots: self.secrecy_argument_roots,
+            secrecy_calls: self.secrecy_calls,
             template_placements: self.template_placements,
             captures: Arc::default(),
             projections: Arc::new(
@@ -1097,6 +1292,13 @@ impl<B: BindingAddress> Expressions<B> {
         self.report = Arc::new(ExpressionReport::empty());
     }
 
+    pub(crate) fn retain_secrecy_call(&mut self, name: String, location: DeclarationLocation) {
+        self.secrecy_calls.insert(
+            self.instance.clone(),
+            crate::secrecy::CallSite { name, location },
+        );
+    }
+
     pub(crate) fn bind_arguments(
         &mut self,
         scope: &crate::resource::ModuleInstanceScope,
@@ -1141,6 +1343,95 @@ impl<B: BindingAddress> Expressions<B> {
     }
 }
 
+impl Expressions<crate::resource::AbsoluteBindingAddress> {
+    pub(crate) fn retain_secrecy_arguments<'a>(
+        &mut self,
+        scope: &crate::resource::ModuleInstanceScope,
+        call: &super::ModuleCall,
+        caller_scope: Option<&crate::resource::ModuleInstanceScope>,
+        parameters: impl IntoIterator<
+            Item = (
+                &'a str,
+                Option<&'a Value<ParserPlaceholder, RelativeBindingName>>,
+            ),
+        >,
+    ) {
+        for (name, default) in parameters {
+            if let Some(location) = call.id().argument_value_location(name) {
+                let instance = caller_scope
+                    .map(ExpressionInstance::for_scope)
+                    .unwrap_or(ExpressionInstance::Root);
+                self.secrecy_argument_roots.insert(
+                    ExpressionLocation::new(instance, location),
+                    name.to_string(),
+                );
+            }
+            let explicit = call.argument(name).map(super::ModuleArgument::walker_value);
+            let Some(value) = explicit.or(default) else {
+                continue;
+            };
+            let reference_scope = if explicit.is_some() {
+                caller_scope
+            } else {
+                Some(scope)
+            };
+            if let Some(reference_scope) = reference_scope {
+                self.secrecy_argument_modules.insert(
+                    scope.resolve(RelativeBindingName::new(name)),
+                    crate::resource::RootScope::new()
+                        .resolve(RelativeBindingName::new(reference_scope.key())),
+                );
+            }
+            let resolve = |binding: RelativeBindingName| {
+                reference_scope.map_or_else(
+                    || crate::resource::RootScope::new().resolve(binding.clone()),
+                    |scope| scope.resolve(binding.clone()),
+                )
+            };
+            // Preserve the call's authored value before the resolver consults
+            // observations. A provider return cannot turn an authored Secret
+            // reference into a Public literal in this context.
+            let value = value.clone().map_bindings(&mut |binding| resolve(binding));
+            let value = value
+                .try_map_placeholder::<ParserPlaceholder, std::convert::Infallible>(
+                    &mut |placeholder| {
+                        Ok(match placeholder {
+                            ParserPlaceholder::ModuleArgument {
+                                name,
+                                diagnostic: _,
+                            } => Value::Deferred(crate::resource::DeferredValue::BindingRef {
+                                binding: resolve(RelativeBindingName::new(name)),
+                            }),
+                            ParserPlaceholder::FnParam { name } => {
+                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                                    ParserPlaceholder::FnParam { name },
+                                ))
+                            }
+                            ParserPlaceholder::FnLocal { name } => {
+                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                                    ParserPlaceholder::FnLocal { name },
+                                ))
+                            }
+                            ParserPlaceholder::Loop(slot) => {
+                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                                    ParserPlaceholder::Loop(slot),
+                                ))
+                            }
+                            ParserPlaceholder::EmptyInterpolation { source } => {
+                                Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                                    ParserPlaceholder::EmptyInterpolation { source },
+                                ))
+                            }
+                        })
+                    },
+                )
+                .expect("authored argument placeholder mapping is infallible");
+            self.secrecy_arguments
+                .insert(scope.resolve(RelativeBindingName::new(name)), value);
+        }
+    }
+}
+
 /// A schema-judged configuration owns its file and report and borrows the
 /// caller's schema registry. Parsing alone cannot construct this type.
 /// Consumers borrow this bundle so the file and schemas stay paired.
@@ -1148,20 +1439,34 @@ impl<B: BindingAddress> Expressions<B> {
 pub struct JudgedFile<'a, E, D, B: BindingAddress = RelativeBindingName> {
     file: super::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
     schemas: &'a crate::schema::SchemaRegistry,
+    secrecy: OnceLock<crate::secrecy::SecrecyReport>,
 }
 
-impl<E, D, B: BindingAddress> JudgedFile<'_, E, D, B> {
+impl<'a, E, D, B: BindingAddress> JudgedFile<'a, E, D, B> {
     pub fn file(&self) -> &super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         &self.file
     }
     pub fn report(&self) -> &ExpressionReport<B> {
         self.file.expression_report()
     }
-    pub fn schemas(&self) -> &crate::schema::SchemaRegistry {
+    pub fn schemas(&self) -> &'a crate::schema::SchemaRegistry {
         self.schemas
     }
     pub(crate) fn into_file(self) -> super::File<E, ParserPlaceholder, ParserPlaceholder, D, B> {
         self.file
+    }
+}
+
+impl<E, D, B: BindingAddress> JudgedFile<'_, E, D, B>
+where
+    D: super::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    /// Derive once for this immutable graph and schema registry. Type-only
+    /// consumers never need to walk structural secrecy. Consuming this owner
+    /// and editing its file requires a new judgement before admission.
+    pub fn secrecy(&self) -> &crate::secrecy::SecrecyReport {
+        self.secrecy
+            .get_or_init(|| crate::secrecy::derive(&self.file, self.report(), self.schemas))
     }
 }
 
@@ -1177,7 +1482,11 @@ where
     ) -> Self {
         admit_require_scope(&mut file);
         judge_configuration(&mut file, schemas, config);
-        Self { file, schemas }
+        Self {
+            file,
+            schemas,
+            secrecy: OnceLock::new(),
+        }
     }
 }
 
@@ -1626,6 +1935,7 @@ fn node_at_with_roles(
             location: ExpressionLocation::new(ExpressionInstance::Root, &location),
             kind,
             roles,
+            secrecy_operator: None,
             first_conversion,
             parse_ownership,
             children,
@@ -1658,6 +1968,7 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
                     location: ExpressionLocation::new(ExpressionInstance::Root, &headers[&name]),
                     kind: ExprKind::List,
                     roles: AuthoredChildRoles::Positional,
+                    secrecy_operator: None,
                     first_conversion: records
                         .iter()
                         .find_map(|child| child.authored.first_conversion.clone()),
@@ -1684,6 +1995,7 @@ fn lower_blocks(children: Vec<ExprValue>) -> Vec<ExprValue> {
                             key: None,
                             placement: SinkPlacement::Value,
                         },
+                        secrecy_operator: None,
                         first_conversion: groups[name].authored.first_conversion.clone(),
                         parse_ownership: ParseOwnership::Ordinary,
                         children: vec![groups[name].clone()],
@@ -2115,10 +2427,18 @@ fn compile_form(
         }
         Rule::map => compile_map(pair, file, source, scope, captures),
         Rule::coalesce_expr => {
+            let operands = pair.clone().into_inner().collect::<Vec<_>>();
+            let operators = operands
+                .windows(2)
+                .map(|operands| {
+                    DeclarationLocation::coalesce_operator(&operands[0], &operands[1], file, source)
+                })
+                .collect::<Vec<_>>();
             let mut children = compile_children(&pair, file, source, scope, captures);
             let mut right = children.pop().expect("coalesce operand");
-            while let Some(left) = children.pop() {
+            for (left, operator) in children.into_iter().zip(operators).rev() {
                 right = node(&pair, ExprKind::Coalesce, vec![left, right], file, source);
+                Arc::make_mut(&mut right.authored).secrecy_operator = Some(operator);
             }
             right
         }
@@ -2502,6 +2822,8 @@ fn compile_remaining_form(
             let mut scope = scope.clone();
             let mut parameters = Vec::new();
             let mut defaults = Vec::new();
+            let mut parameter_nodes = Vec::new();
+            let mut default_nodes = Vec::new();
             for parameter in pair
                 .clone()
                 .into_inner()
@@ -2513,7 +2835,11 @@ fn compile_remaining_form(
                     .into_inner()
                     .find(|part| part.as_rule() == Rule::expression)
                 {
-                    defaults.push(compile(default, file, source, &scope, captures));
+                    let default = compile(default, file, source, &scope, captures);
+                    default_nodes.push(Some(default.node_id()));
+                    defaults.push(default);
+                } else {
+                    default_nodes.push(None);
                 }
                 let mut parts = parameter.into_inner();
                 let name = parts.next().expect("function parameter name");
@@ -2535,6 +2861,7 @@ fn compile_remaining_form(
                         node(&name, ExprKind::UntypedParameter, vec![], file, source),
                     );
                 }
+                parameter_nodes.push(scope[name.as_str()].node_id());
             }
             let body_syntax = pair
                 .clone()
@@ -2558,6 +2885,8 @@ fn compile_remaining_form(
                     signature: Arc::new(FunctionSignature {
                         parameters,
                         return_type,
+                        parameter_nodes,
+                        default_nodes,
                     }),
                 },
                 children,
@@ -2829,6 +3158,8 @@ fn compile_remaining_form(
         | Rule::block_comment
         | Rule::block_content
         | Rule::coalesce_expr
+        | Rule::coalesce_separator
+        | Rule::coalesce_token
         | Rule::compare_op
         | Rule::conversion_type_path
         | Rule::divide_op
@@ -3436,6 +3767,9 @@ mod judgement {
                 data,
                 conversions: edges.sources(),
             }
+        }
+        fn failed(&self) -> bool {
+            self.data.failed()
         }
         pub(crate) fn statically_checked(&self) -> bool {
             self.static_source.as_ref().is_some_and(|receipt| {
@@ -4484,6 +4818,56 @@ mod judgement {
         }
     }
 
+    /// One pass over the syntax inventory, shared by all resource snapshots.
+    /// Preserve first-authored-node wins when several edges share an origin.
+    #[derive(Default)]
+    struct SecrecyIndex {
+        locations: HashMap<ExpressionLocation, NodeId>,
+        authored_locations: HashMap<DeclarationLocation, Vec<(ExpressionInstance, NodeId)>>,
+        attributes: HashMap<(ExpressionInstance, NodeId), DeclarationLocation>,
+        functions: HashMap<(ExpressionInstance, String), NodeId>,
+        modules: HashMap<String, ExpressionInstance>,
+    }
+
+    impl SecrecyIndex {
+        fn build<B: BindingAddress>(nodes: &AuthoredNodes<B>) -> Self {
+            #[cfg(test)]
+            SECRECY_INDEX_BUILDS.update(|builds| builds + 1);
+            let mut index = Self::default();
+            for ((instance, id), node) in nodes {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    index.locations.entry(node.location.clone())
+                {
+                    entry.insert(*id);
+                    index
+                        .authored_locations
+                        .entry(node.location.authored.clone())
+                        .or_default()
+                        .push((instance.clone(), *id));
+                }
+                if let Some(value) = node.sink_value() {
+                    index
+                        .attributes
+                        .entry((instance.clone(), value.node_id()))
+                        .or_insert_with(|| node.location.authored.clone());
+                }
+                if let ExprKind::Function { name, .. } = &node.kind {
+                    index
+                        .functions
+                        .entry((instance.clone(), name.clone()))
+                        .or_insert(*id);
+                }
+                if let ExpressionInstance::Module(environment) = instance {
+                    index
+                        .modules
+                        .entry(environment.scope.to_string())
+                        .or_insert_with(|| instance.clone());
+                }
+            }
+            index
+        }
+    }
+
     #[derive(Clone)]
     pub struct ExpressionReport<B: BindingAddress = RelativeBindingName> {
         bindings: Arc<IndexMap<B, JudgedExpr>>,
@@ -4491,6 +4875,7 @@ mod judgement {
         pub(super) nodes: Arc<HashMap<(ExpressionInstance, NodeId), JudgedExpr>>,
         pub(crate) placements: Arc<crate::ConversionChannel>,
         pub(super) syntax_nodes: Arc<AuthoredNodes<B>>,
+        secrecy_index: Arc<OnceLock<SecrecyIndex>>,
         pub(super) use_roots: Arc<Vec<cursor::UseRoot<B>>>,
         pub(super) use_interner: Arc<cursor::UseInterner>,
         pub(super) definitions: Arc<IndexMap<B, ExprValue<ParserPlaceholder, B>>>,
@@ -4502,6 +4887,10 @@ mod judgement {
         module_attributes: Arc<IndexMap<(B, String), JudgedExpr>>,
         resource_reports: Arc<IndexMap<crate::resource::ResourceId, Arc<ExpressionReport<B>>>>,
         parameters: Arc<HashMap<String, JudgedExpr>>,
+        secrecy_arguments: Arc<IndexMap<B, Value<ParserPlaceholder, B>>>,
+        secrecy_argument_modules: Arc<IndexMap<B, B>>,
+        secrecy_argument_roots: Arc<IndexMap<ExpressionLocation, String>>,
+        secrecy_calls: Arc<IndexMap<ExpressionInstance, crate::secrecy::CallSite>>,
         pub(super) instance: ExpressionInstance,
         authored: bool,
     }
@@ -4562,6 +4951,7 @@ mod judgement {
                 nodes: Arc::default(),
                 placements: Arc::default(),
                 syntax_nodes: Arc::default(),
+                secrecy_index: Arc::default(),
                 use_roots: Arc::default(),
                 use_interner: Arc::default(),
                 definitions: Arc::default(),
@@ -4572,11 +4962,24 @@ mod judgement {
                 module_attributes: Arc::default(),
                 resource_reports: Arc::default(),
                 parameters: Arc::default(),
+                secrecy_arguments: Arc::default(),
+                secrecy_argument_modules: Arc::default(),
+                secrecy_argument_roots: Arc::default(),
+                secrecy_calls: Arc::default(),
                 instance: ExpressionInstance::Root,
                 authored: false,
             }
         }
         pub(super) fn extend(&mut self, other: Self) {
+            self.secrecy_index = Arc::default();
+            Arc::make_mut(&mut self.secrecy_argument_roots)
+                .extend(Arc::unwrap_or_clone(other.secrecy_argument_roots));
+            Arc::make_mut(&mut self.secrecy_argument_modules)
+                .extend(Arc::unwrap_or_clone(other.secrecy_argument_modules));
+            Arc::make_mut(&mut self.secrecy_arguments)
+                .extend(Arc::unwrap_or_clone(other.secrecy_arguments));
+            Arc::make_mut(&mut self.secrecy_calls)
+                .extend(Arc::unwrap_or_clone(other.secrecy_calls));
             Arc::make_mut(&mut self.bindings).extend(Arc::unwrap_or_clone(other.bindings));
             Arc::make_mut(&mut self.expressions).extend(Arc::unwrap_or_clone(other.expressions));
             Arc::make_mut(&mut self.nodes).extend(Arc::unwrap_or_clone(other.nodes));
@@ -4688,8 +5091,301 @@ mod judgement {
                     .collect::<IndexMap<_, _>>()
                     .into(),
                 resource_reports,
+                secrecy_index: self.secrecy_index.clone(),
                 parameters: self.parameters.clone(),
+                secrecy_arguments: Arc::new(
+                    self.secrecy_arguments
+                        .iter()
+                        .map(|(name, value)| (map(name.clone()), value.clone().map_bindings(map)))
+                        .collect(),
+                ),
+                secrecy_argument_modules: Arc::new(
+                    self.secrecy_argument_modules
+                        .iter()
+                        .map(|(name, module)| (map(name.clone()), map(module.clone())))
+                        .collect(),
+                ),
+                secrecy_argument_roots: self.secrecy_argument_roots.clone(),
+                secrecy_calls: self.secrecy_calls.clone(),
             }
+        }
+        pub(crate) fn has_failed_expressions(&self) -> bool {
+            self.expressions.values().any(JudgedExpr::failed)
+        }
+        pub(crate) fn secrecy_instance(&self) -> &ExpressionInstance {
+            &self.instance
+        }
+        pub(crate) fn secrecy_condition_value(
+            &self,
+            expression: &ExprValue<ParserPlaceholder, B>,
+        ) -> Option<bool> {
+            let index = expression.secrecy_condition()?;
+            let condition = expression.secrecy_children().get(index)?;
+            self.secrecy_boolean(condition)
+        }
+        pub(crate) fn secrecy_boolean(
+            &self,
+            expression: &ExprValue<ParserPlaceholder, B>,
+        ) -> Option<bool> {
+            let value = self
+                .projections
+                .get(&(expression.secrecy_instance().clone(), expression.node_id()))?;
+            let proof = value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .ok()?
+                .into_classification()
+                .into_known()
+                .ok()?;
+            crate::resource::knowledge::known_bool(&proof)
+        }
+
+        pub(crate) fn secrecy_string(
+            &self,
+            expression: &ExprValue<ParserPlaceholder, B>,
+        ) -> Option<String> {
+            let value = self
+                .projections
+                .get(&(expression.secrecy_instance().clone(), expression.node_id()))?;
+            let proof = value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .ok()?
+                .into_classification()
+                .into_known()
+                .ok()?;
+            proof.visit(
+                |view| match view {
+                    crate::resource::knowledge::KnownView::String(value) => {
+                        Some(value.expose_plaintext().to_owned())
+                    }
+                    _ => None,
+                },
+                |_| None,
+            )
+        }
+
+        pub(crate) fn secrecy_non_list(
+            &self,
+            expression: &ExprValue<ParserPlaceholder, B>,
+        ) -> bool {
+            fn non_list(ty: &TypeExpr) -> bool {
+                match ty {
+                    TypeExpr::String
+                    | TypeExpr::Bool
+                    | TypeExpr::Int
+                    | TypeExpr::Float
+                    | TypeExpr::Duration
+                    | TypeExpr::Simple(_)
+                    | TypeExpr::SchemaType { .. }
+                    | TypeExpr::Map(_)
+                    | TypeExpr::Struct { .. }
+                    | TypeExpr::StringLiteral(_) => true,
+                    TypeExpr::Union(types) => types.iter().all(non_list),
+                    TypeExpr::List(_)
+                    | TypeExpr::Ref(_)
+                    | TypeExpr::DottedUnresolved(_)
+                    | TypeExpr::UnloadedSchemaType(_) => false,
+                }
+            }
+            self.node(expression.secrecy_instance(), expression.node_id())
+                .and_then(|node| node.static_type().ok())
+                .is_some_and(non_list)
+        }
+
+        pub(crate) fn secrecy_definition(
+            &self,
+            binding: &B,
+        ) -> Option<&ExprValue<ParserPlaceholder, B>> {
+            self.definitions.get(binding)
+        }
+        pub(crate) fn secrecy_builtin_closure(
+            &self,
+            instance: &ExpressionInstance,
+            name: &str,
+        ) -> Option<(
+            crate::builtins::Builtin,
+            Vec<ExprValue<ParserPlaceholder, B>>,
+        )> {
+            builtin_closure(&self.definitions, instance, name)
+        }
+        pub(crate) fn secrecy_argument(&self, binding: &B) -> Option<&Value<ParserPlaceholder, B>> {
+            self.secrecy_arguments.get(binding)
+        }
+        pub(crate) fn secrecy_argument_module(&self, binding: &B) -> Option<&B> {
+            self.secrecy_argument_modules.get(binding)
+        }
+        pub(crate) fn secrecy_call(
+            &self,
+            instance: &ExpressionInstance,
+        ) -> Option<&crate::secrecy::CallSite> {
+            self.secrecy_calls.get(instance)
+        }
+        fn secrecy_index(&self) -> &SecrecyIndex {
+            self.secrecy_index
+                .get_or_init(|| SecrecyIndex::build(&self.syntax_nodes))
+        }
+        fn secrecy_at_in(
+            &self,
+            location: &ExpressionLocation,
+        ) -> Option<ExprValue<ParserPlaceholder, B>> {
+            let id = self.secrecy_index().locations.get(location)?;
+            self.secrecy_node(&location.instance, *id)
+        }
+        pub(crate) fn secrecy_at(
+            &self,
+            location: &DeclarationLocation,
+        ) -> Option<ExprValue<ParserPlaceholder, B>> {
+            self.secrecy_at_in(&ExpressionLocation::new(self.instance.clone(), location))
+        }
+        pub(crate) fn secrecy_at_instances<'a>(
+            &'a self,
+            location: &'a DeclarationLocation,
+        ) -> impl Iterator<Item = ExprValue<ParserPlaceholder, B>> + 'a {
+            self.secrecy_index()
+                .authored_locations
+                .get(location)
+                .into_iter()
+                .flatten()
+                .filter_map(move |(instance, id)| self.secrecy_node(instance, *id))
+        }
+        pub(crate) fn secrecy_literal(&self, expression: &ExprValue<ParserPlaceholder, B>) -> bool {
+            self.node(expression.secrecy_instance(), expression.node_id())
+                .is_some_and(|judged| {
+                    matches!(
+                        judged.judgement,
+                        ExprJudgement::Typed {
+                            kind: InferredKind::Literal | InferredKind::EnumIdentifier,
+                            ..
+                        }
+                    )
+                })
+        }
+        pub(crate) fn secrecy_is_structural(
+            &self,
+            source: &ExprValue<ParserPlaceholder, B>,
+        ) -> bool {
+            self.node(source.secrecy_instance(), source.node_id())
+                .is_some_and(|expression| expression.structural_source)
+        }
+        pub(crate) fn secrecy_node(
+            &self,
+            instance: &ExpressionInstance,
+            id: NodeId,
+        ) -> Option<ExprValue<ParserPlaceholder, B>> {
+            self.syntax_nodes
+                .get(&(instance.clone(), id))
+                .map(|authored| ExprValue {
+                    authored: authored.clone(),
+                    payload: Projection::Pending,
+                })
+        }
+        pub(crate) fn secrecy_functions(
+            &self,
+        ) -> impl Iterator<Item = ExprValue<ParserPlaceholder, B>> + '_ {
+            self.syntax_nodes
+                .values()
+                .filter(|authored| matches!(authored.kind, ExprKind::Function { .. }))
+                .map(|authored| ExprValue {
+                    authored: authored.clone(),
+                    payload: Projection::Pending,
+                })
+        }
+        pub(crate) fn secrecy_attribute_location(
+            &self,
+            id: &crate::resource::ResourceId,
+            value: NodeId,
+        ) -> Option<DeclarationLocation> {
+            let instance = self
+                .resource_reports
+                .get(id)
+                .map_or(&self.instance, |report| &report.instance);
+            self.secrecy_index()
+                .attributes
+                .get(&(instance.clone(), value))
+                .cloned()
+        }
+        pub(crate) fn secrecy_root(
+            &self,
+            id: &crate::resource::ResourceId,
+            node: NodeId,
+        ) -> Option<ExprValue<ParserPlaceholder, B>> {
+            let instance = self
+                .resource_reports
+                .get(id)
+                .map_or(&self.instance, |report| &report.instance);
+            self.secrecy_node(instance, node)
+        }
+        pub(crate) fn secrecy_arguments_authored(
+            &self,
+        ) -> impl Iterator<Item = (String, ExprValue<ParserPlaceholder, B>)> + '_ {
+            self.secrecy_argument_roots
+                .iter()
+                .filter_map(move |(location, name)| {
+                    self.secrecy_at_in(location)
+                        .map(|node| (name.clone(), node))
+                })
+        }
+        pub(crate) fn secrecy_lexical_function(
+            &self,
+            module: Option<&B>,
+            name: &str,
+        ) -> Option<ExprValue<ParserPlaceholder, B>> {
+            let instance = if let Some(module) = module {
+                self.secrecy_index().modules.get(module.as_str())?.clone()
+            } else {
+                ExpressionInstance::Root
+            };
+            self.secrecy_function(&instance, name)
+        }
+        pub(crate) fn secrecy_resources(
+            &self,
+        ) -> impl Iterator<Item = ExprValue<ParserPlaceholder, B>> + '_ {
+            self.syntax_nodes
+                .values()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        ExprKind::Resource {
+                            provider: _,
+                            resource_type: _,
+                            read: _
+                        }
+                    )
+                })
+                .map(|node| ExprValue {
+                    authored: node.clone(),
+                    payload: Projection::Pending,
+                })
+        }
+        pub(crate) fn secrecy_conditions(
+            &self,
+        ) -> impl Iterator<Item = ExprValue<ParserPlaceholder, B>> + '_ {
+            self.syntax_nodes
+                .values()
+                .filter(|node| matches!(node.kind, ExprKind::If))
+                .filter_map(|node| node.condition().cloned())
+        }
+        pub(crate) fn secrecy_function(
+            &self,
+            instance: &ExpressionInstance,
+            name: &str,
+        ) -> Option<ExprValue<ParserPlaceholder, B>> {
+            let id = self
+                .secrecy_index()
+                .functions
+                .get(&(instance.clone(), name.to_string()))?;
+            self.secrecy_node(instance, *id)
+        }
+        pub(crate) fn secrecy_output(
+            &self,
+            binding: &B,
+            name: &str,
+        ) -> Option<ExprValue<ParserPlaceholder, B>> {
+            let origin = self
+                .module_attributes
+                .get(&(binding.clone(), name.to_string()))?
+                .origin
+                .as_ref()?;
+            self.secrecy_at_in(origin)
         }
         pub(crate) fn has_authored_judgement(&self) -> bool {
             self.authored
@@ -4989,25 +5685,28 @@ mod judgement {
             expression: &'a ExprValue<ParserPlaceholder, B>,
             authored: &mut IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
             visited: &mut std::collections::HashSet<usize>,
+            pending: &mut Vec<&'a ExprValue<ParserPlaceholder, B>>,
         ) {
-            if !visited.insert(Arc::as_ptr(&expression.authored) as usize) {
-                return;
-            }
-            authored
-                .entry(expression.authored.location.clone())
-                .or_insert(expression);
-            for child in &expression.authored.children {
-                index_authored(child, authored, visited);
+            pending.push(expression);
+            while let Some(expression) = pending.pop() {
+                if !visited.insert(Arc::as_ptr(&expression.authored) as usize) {
+                    continue;
+                }
+                authored
+                    .entry(expression.authored.location.clone())
+                    .or_insert(expression);
+                pending.extend(expression.authored.children.iter().rev());
             }
         }
         let mut authored = IndexMap::new();
         let mut visited = std::collections::HashSet::new();
+        let mut pending = Vec::new();
         for expression in expressions
             .roots
             .iter()
             .chain(expressions.definitions.values())
         {
-            index_authored(expression, &mut authored, &mut visited);
+            index_authored(expression, &mut authored, &mut visited, &mut pending);
         }
         let mut functions = HashMap::new();
         for expression in authored.values() {
@@ -5031,6 +5730,10 @@ mod judgement {
             schemas,
             config,
             memo: HashMap::new(),
+            work: Vec::new(),
+            active: std::collections::HashSet::new(),
+            cycle_seeds: std::collections::HashSet::new(),
+            scheduling: false,
             demand: JudgementDemand::Value,
             scope: DiagnosticScope::Public,
             placement_owner: None,
@@ -5070,6 +5773,7 @@ mod judgement {
             nodes: Arc::new(judge.by_node),
             placements: Arc::new(judge.placements.into_findings()),
             syntax_nodes: Arc::new(judge.syntax_nodes),
+            secrecy_index: Arc::default(),
             use_roots: Arc::default(),
             use_interner: Arc::default(),
             definitions: Arc::new(expressions.definitions.clone()),
@@ -5079,6 +5783,26 @@ mod judgement {
             operands: Arc::new(judge.operands),
             module_attributes: Arc::new(module_attributes),
             resource_reports: Arc::default(),
+            secrecy_arguments: {
+                let mut arguments = (*expressions.report.secrecy_arguments).clone();
+                arguments.extend(expressions.secrecy_arguments.clone());
+                Arc::new(arguments)
+            },
+            secrecy_argument_modules: {
+                let mut modules = (*expressions.report.secrecy_argument_modules).clone();
+                modules.extend(expressions.secrecy_argument_modules.clone());
+                Arc::new(modules)
+            },
+            secrecy_argument_roots: {
+                let mut roots = (*expressions.report.secrecy_argument_roots).clone();
+                roots.extend(expressions.secrecy_argument_roots.clone());
+                Arc::new(roots)
+            },
+            secrecy_calls: {
+                let mut calls = (*expressions.report.secrecy_calls).clone();
+                calls.extend(expressions.secrecy_calls.clone());
+                Arc::new(calls)
+            },
             parameters: file
                 .arguments
                 .iter()
@@ -5171,6 +5895,14 @@ mod judgement {
         PlacementSyntax,
     }
 
+    struct JudgeWork<B: BindingAddress> {
+        node: Arc<AuthoredExpr<ParserPlaceholder, B>>,
+        scope: DiagnosticScope,
+        demand: JudgementDemand,
+        owner: Option<Arc<ConversionSite>>,
+        finish: bool,
+    }
+
     struct Judge<'a, B: BindingAddress> {
         authority: Arc<super::super::ProviderContext>,
         authored: IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
@@ -5180,6 +5912,10 @@ mod judgement {
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
         memo: HashMap<(usize, DiagnosticScope, JudgementDemand), JudgedExpr>,
+        work: Vec<JudgeWork<B>>,
+        active: std::collections::HashSet<usize>,
+        cycle_seeds: std::collections::HashSet<(usize, DiagnosticScope, JudgementDemand)>,
+        scheduling: bool,
         demand: JudgementDemand,
         scope: DiagnosticScope,
         placement_owner: Option<Arc<ConversionSite>>,
@@ -5206,49 +5942,13 @@ mod judgement {
             matches!(expression.authored.kind, ExprKind::List)
         }
 
-        fn judge(&mut self, expression: &ExprValue<ParserPlaceholder, B>) -> JudgedExpr {
-            let root = &expression.authored;
-            let id = Arc::as_ptr(root) as usize;
-            let scope = if self.scope.is_secret() || matches!(root.kind, ExprKind::Secret) {
-                DiagnosticScope::Secret
-            } else {
-                DiagnosticScope::Public
-            };
-            let demand = self.demand;
-            let existing = self.memo.get(&(id, scope, demand)).or_else(|| {
-                if demand == JudgementDemand::PlacementSyntax {
-                    self.memo.get(&(id, scope, JudgementDemand::Value))
-                } else {
-                    None
-                }
-            });
-            if let Some(judged) = existing {
-                return judged.clone();
-            }
-            if self.visiting.contains(&id) {
-                let mut failure = declared(
-                    Err(InferenceError::CyclicVirtualBinding {
-                        cycle: vec!["cyclic authored binding".into()],
-                    }
-                    .into()),
-                    false,
-                );
-                failure.report_at(FailureOwner::BindingIndex);
-                return JudgedExpr::build(
-                    failure.data,
-                    conversion::flow::JudgementEdges::MissingReference(
-                        conversion::flow::MissingReferenceEdge::BindingCycle,
-                    ),
-                );
-            }
-            let outer_placement_owner = self.placement_owner.clone();
-            self.placement_owner = match &root.kind {
-                ExprKind::Convert { .. } => outer_placement_owner
-                    .clone()
-                    .or_else(|| root.first_conversion.clone()),
-                ExprKind::Alias | ExprKind::Parens | ExprKind::Sequence => {
-                    outer_placement_owner.clone()
-                }
+        fn placement_owner(
+            root: &AuthoredExpr<ParserPlaceholder, B>,
+            outer: &Option<Arc<ConversionSite>>,
+        ) -> Option<Arc<ConversionSite>> {
+            match &root.kind {
+                ExprKind::Convert { .. } => outer.clone().or_else(|| root.first_conversion.clone()),
+                ExprKind::Alias | ExprKind::Parens | ExprKind::Sequence => outer.clone(),
                 ExprKind::Scalar(_)
                 | ExprKind::Parameter(_)
                 | ExprKind::LoopSlot(_)
@@ -5282,7 +5982,221 @@ mod judgement {
                 | ExprKind::RequireCondition(_)
                 | ExprKind::ProviderDeclaration
                 | ExprKind::Unsupported(_) => None,
+            }
+        }
+
+        // Follow syntax and reference dependencies on a heap worklist. In
+        // particular, sibling-file order must not turn a long reference chain
+        // into one Rust stack frame per hop (#4474). The existing node judge
+        // still owns inference, diagnostic order, scope and placement policy.
+        fn judge(&mut self, expression: &ExprValue<ParserPlaceholder, B>) -> JudgedExpr {
+            if self.scheduling {
+                return self.judge_ready(expression);
+            }
+            if let Some(judged) = self.cached_judgement(&expression.authored) {
+                return judged.clone();
+            }
+            let outer_scope = self.scope;
+            let outer_demand = self.demand;
+            let outer_owner = self.placement_owner.clone();
+            let mut work = std::mem::take(&mut self.work);
+            let mut active = std::mem::take(&mut self.active);
+            let mut cycle_seeds = std::mem::take(&mut self.cycle_seeds);
+            work.push(JudgeWork {
+                node: expression.authored.clone(),
+                scope: outer_scope,
+                demand: outer_demand,
+                owner: outer_owner.clone(),
+                finish: false,
+            });
+            self.scheduling = true;
+            while let Some(item) = work.pop() {
+                let id = Arc::as_ptr(&item.node) as usize;
+                let scope = if item.scope.is_secret() || matches!(item.node.kind, ExprKind::Secret)
+                {
+                    DiagnosticScope::Secret
+                } else {
+                    DiagnosticScope::Public
+                };
+                let key = (id, scope, item.demand);
+                if item.finish {
+                    active.remove(&id);
+                    if cycle_seeds.remove(&key) {
+                        self.memo.remove(&key);
+                    }
+                    self.scope = item.scope;
+                    self.demand = item.demand;
+                    self.placement_owner = item.owner;
+                    self.judge_ready(&ExprValue {
+                        authored: item.node,
+                        payload: Projection::Pending,
+                    });
+                    continue;
+                }
+                if self.memo.contains_key(&key)
+                    || (item.demand == JudgementDemand::PlacementSyntax
+                        && self.memo.contains_key(&(id, scope, JudgementDemand::Value)))
+                {
+                    continue;
+                }
+                if item.node.children.is_empty()
+                    && !matches!(
+                        item.node.kind,
+                        ExprKind::Binding(_) | ExprKind::Reference { .. }
+                    )
+                {
+                    self.scope = item.scope;
+                    self.demand = item.demand;
+                    self.placement_owner = item.owner;
+                    self.judge_ready(&ExprValue {
+                        authored: item.node,
+                        payload: Projection::Pending,
+                    });
+                    continue;
+                }
+                if !active.insert(id) {
+                    // Use the same binding-cycle verdict as the recursive
+                    // judge. This seed exists only until its ancestor finishes.
+                    self.visiting.push(id);
+                    self.scope = item.scope;
+                    self.demand = item.demand;
+                    let failure = self.judge_ready(&ExprValue {
+                        authored: item.node,
+                        payload: Projection::Pending,
+                    });
+                    self.visiting.pop();
+                    self.memo.insert(key, failure);
+                    cycle_seeds.insert(key);
+                    continue;
+                }
+                let child_owner = Self::placement_owner(&item.node, &item.owner);
+                let child_demand = item.demand;
+                let key_node = item.node.key_node();
+                let directory_require = item
+                    .node
+                    .kind
+                    .require_condition()
+                    .is_some_and(|require| matches!(require.scope, RequireScope::Directory(_)));
+                work.push(JudgeWork {
+                    node: item.node.clone(),
+                    scope: item.scope,
+                    demand: item.demand,
+                    owner: item.owner,
+                    finish: true,
+                });
+                // Push dependencies directly in reverse execution order;
+                // a temporary Vec for every parent adds no traversal state.
+                if let ExprKind::Reference {
+                    binding,
+                    attribute,
+                    segments: _,
+                } = &item.node.kind
+                    && let Some(output) = self
+                        .module_attributes
+                        .and_then(|outputs| outputs.get(&(binding.clone(), attribute.clone())))
+                    && let Some(origin) = output.origin.as_ref()
+                    && let Some(authored) = self.authored.get(origin)
+                {
+                    work.push(JudgeWork {
+                        node: authored.authored.clone(),
+                        scope,
+                        demand: child_demand,
+                        owner: child_owner.clone(),
+                        finish: false,
+                    });
+                }
+                if let ExprKind::Reference {
+                    binding,
+                    attribute: _,
+                    segments: _,
+                }
+                | ExprKind::Binding(binding) = &item.node.kind
+                    && self.parameter_type(binding).is_none()
+                    && let Some(definition) = self.expressions.definitions.get(binding)
+                {
+                    work.push(JudgeWork {
+                        node: definition.authored.clone(),
+                        scope,
+                        demand: child_demand,
+                        owner: child_owner.clone(),
+                        finish: false,
+                    });
+                }
+                for child in item.node.children.iter().rev() {
+                    work.push(JudgeWork {
+                        node: child.authored.clone(),
+                        scope,
+                        demand: if directory_require || key_node == Some(child.node_id()) {
+                            JudgementDemand::PlacementSyntax
+                        } else {
+                            child_demand
+                        },
+                        owner: child_owner.clone(),
+                        finish: false,
+                    });
+                }
+            }
+            self.work = work;
+            active.clear();
+            cycle_seeds.clear();
+            self.active = active;
+            self.cycle_seeds = cycle_seeds;
+            self.scheduling = false;
+            self.scope = outer_scope;
+            self.demand = outer_demand;
+            self.placement_owner = outer_owner;
+            self.judge_ready(expression)
+        }
+
+        fn cached_judgement(
+            &self,
+            root: &Arc<AuthoredExpr<ParserPlaceholder, B>>,
+        ) -> Option<&JudgedExpr> {
+            let id = Arc::as_ptr(root) as usize;
+            let scope = if self.scope.is_secret() || matches!(root.kind, ExprKind::Secret) {
+                DiagnosticScope::Secret
+            } else {
+                DiagnosticScope::Public
             };
+            self.memo.get(&(id, scope, self.demand)).or_else(|| {
+                if self.demand == JudgementDemand::PlacementSyntax {
+                    self.memo.get(&(id, scope, JudgementDemand::Value))
+                } else {
+                    None
+                }
+            })
+        }
+
+        fn judge_ready(&mut self, expression: &ExprValue<ParserPlaceholder, B>) -> JudgedExpr {
+            let root = &expression.authored;
+            let id = Arc::as_ptr(root) as usize;
+            let scope = if self.scope.is_secret() || matches!(root.kind, ExprKind::Secret) {
+                DiagnosticScope::Secret
+            } else {
+                DiagnosticScope::Public
+            };
+            let demand = self.demand;
+            if let Some(judged) = self.cached_judgement(root) {
+                return judged.clone();
+            }
+            if self.visiting.contains(&id) {
+                let mut failure = declared(
+                    Err(InferenceError::CyclicVirtualBinding {
+                        cycle: vec!["cyclic authored binding".into()],
+                    }
+                    .into()),
+                    false,
+                );
+                failure.report_at(FailureOwner::BindingIndex);
+                return JudgedExpr::build(
+                    failure.data,
+                    conversion::flow::JudgementEdges::MissingReference(
+                        conversion::flow::MissingReferenceEdge::BindingCycle,
+                    ),
+                );
+            }
+            let outer_placement_owner = self.placement_owner.clone();
+            self.placement_owner = Self::placement_owner(root, &outer_placement_owner);
             let outer_scope = self.scope;
             self.scope = scope;
             self.visiting.push(id);

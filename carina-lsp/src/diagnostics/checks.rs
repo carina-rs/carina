@@ -71,127 +71,80 @@ impl ExpansionBoundaryScope {
     }
 }
 
-fn value_depends_on_module_output(
-    value: &Value,
+fn value_depends_on_module_output<'a>(
+    value: &'a Value,
     module_bindings: &HashSet<RelativeBindingName>,
-    variables: &indexmap::IndexMap<String, Value>,
+    variables: &'a indexmap::IndexMap<String, Value>,
     visiting_variables: &mut HashSet<RelativeBindingName>,
 ) -> bool {
-    match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            deferred.values().into_iter().any(|value| {
-                value_depends_on_module_output(
-                    value,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
-            })
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            if module_bindings.contains(path.binding()) {
-                return true;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                pending.extend(deferred.values().into_iter().rev());
             }
-            let binding = path.binding_address();
-            visiting_variables.insert(binding.clone())
-                && variables.get(binding.as_str()).is_some_and(|value| {
-                    value_depends_on_module_output(
-                        value,
-                        module_bindings,
-                        variables,
-                        visiting_variables,
-                    )
-                })
-        }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            if module_bindings.contains(binding) {
-                return true;
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                if module_bindings.contains(path.binding()) {
+                    return true;
+                }
+                let binding = path.binding_address();
+                if visiting_variables.insert(binding.clone())
+                    && let Some(value) = variables.get(binding.as_str())
+                {
+                    pending.push(value);
+                }
             }
-            visiting_variables.insert(binding.clone())
-                && variables.get(binding.as_str()).is_some_and(|value| {
-                    value_depends_on_module_output(
-                        value,
-                        module_bindings,
-                        variables,
-                        visiting_variables,
-                    )
-                })
-        }
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }),
-        Value::Concrete(ConcreteValue::Map(entries)) => entries.values().any(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(
-                part,
-                carina_core::resource::InterpolationPart::Expr(value)
-                    if value_depends_on_module_output(
-                        value,
-                        module_bindings,
-                        variables,
-                        visiting_variables,
-                    )
+            Value::Deferred(DeferredValue::BindingRef { binding }) => {
+                if module_bindings.contains(binding) {
+                    return true;
+                }
+                if visiting_variables.insert(binding.clone())
+                    && let Some(value) = variables.get(binding.as_str())
+                {
+                    pending.push(value);
+                }
+            }
+            Value::Concrete(ConcreteValue::List(items)) => pending.extend(items.iter().rev()),
+            Value::Concrete(ConcreteValue::Map(entries)) => pending.extend(entries.values().rev()),
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                pending.extend(parts.iter().rev().filter_map(|part| match part {
+                    carina_core::resource::InterpolationPart::Expr(value) => Some(value),
+                    carina_core::resource::InterpolationPart::Literal(_) => None,
+                }));
+            }
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => {
+                pending.extend(args.iter().rev().filter_map(|argument| argument.value()));
+            }
+            Value::Deferred(DeferredValue::Access(access)) => pending.push(access.base()),
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                inner.visit(|value| pending.push(value))
+            }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                pending.push(default);
+                pending.push(value);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                pending.push(expression.rhs());
+                pending.push(expression.lhs());
+            }
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
             )
-        }),
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
-        ) => args.iter().any(|argument| {
-            argument.value().is_some_and(|value| {
-                value_depends_on_module_output(
-                    value,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
-            })
-        }),
-        Value::Deferred(DeferredValue::Access(access)) => value_depends_on_module_output(
-            access.base(),
-            module_bindings,
-            variables,
-            visiting_variables,
-        ),
-        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-                || value_depends_on_module_output(
-                    default,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
+            | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::Placeholder(_)) => {}
         }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            value_depends_on_module_output(
-                expression.lhs(),
-                module_bindings,
-                variables,
-                visiting_variables,
-            ) || value_depends_on_module_output(
-                expression.rhs(),
-                module_bindings,
-                variables,
-                visiting_variables,
-            )
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::Placeholder(_)) => false,
     }
+    false
 }
 
 /// Semantic values available to source-local diagnostics.
@@ -891,6 +844,8 @@ impl DiagnosticRun<'_> {
                 return;
             }
         };
+        // The core diagnostic/import/expansion drivers use heap worklists for
+        // nested modules; editor loading shares their cycle guard and errors.
         // Module expansion is a no-op for configs without `module_call`.
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
@@ -1103,13 +1058,13 @@ impl DiagnosticRun<'_> {
                 .iter()
                 .filter_map(|call| call.binding_name.clone())
                 .collect::<HashSet<_>>();
-            let variables = merged.variables.clone();
+            let variables = &merged.variables;
             for provider in &mut merged.providers {
                 provider.unresolved_attributes.retain(|_, value| {
                     !value_depends_on_module_output(
                         value,
                         &module_bindings,
-                        &variables,
+                        variables,
                         &mut HashSet::new(),
                     )
                 });

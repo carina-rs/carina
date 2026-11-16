@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -931,8 +932,10 @@ impl CompositionCall<AbsoluteBindingAddress> {
 /// Complete non-empty module-call ancestry of one live composition.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompositionCallPath<B: BindingAddress = AbsoluteBindingAddress> {
-    root: CompositionCall<B>,
-    descendants: Vec<CompositionCall<B>>,
+    // Prefix paths share the immutable call records. Cloning the ancestry
+    // must not clone every ancestor's growing instance/address strings.
+    root: Arc<CompositionCall<B>>,
+    descendants: Vec<Arc<CompositionCall<B>>>,
 }
 
 pub type AuthoredCompositionCallPath = CompositionCallPath<RelativeBindingName>;
@@ -941,7 +944,7 @@ pub type ExpandedCompositionCallPath = CompositionCallPath<AbsoluteBindingAddres
 impl<B: BindingAddress> CompositionCallPath<B> {
     pub fn direct(call: CompositionCall<B>) -> Self {
         Self {
-            root: call,
+            root: Arc::new(call),
             descendants: Vec::new(),
         }
     }
@@ -951,11 +954,11 @@ impl<B: BindingAddress> CompositionCallPath<B> {
     }
 
     pub fn immediate(&self) -> &CompositionCall<B> {
-        self.descendants.last().unwrap_or(&self.root)
+        self.descendants.last().unwrap_or(&self.root).as_ref()
     }
 
     pub fn calls(&self) -> impl Iterator<Item = &CompositionCall<B>> {
-        std::iter::once(&self.root).chain(self.descendants.iter())
+        std::iter::once(self.root.as_ref()).chain(self.descendants.iter().map(Arc::as_ref))
     }
 
     /// Whether this call ancestry governs the node owned by `other`.
@@ -969,7 +972,8 @@ impl<B: BindingAddress> CompositionCallPath<B> {
     }
 
     pub(crate) fn calls_mut(&mut self) -> impl Iterator<Item = &mut CompositionCall<B>> {
-        std::iter::once(&mut self.root).chain(self.descendants.iter_mut())
+        std::iter::once(Arc::make_mut(&mut self.root))
+            .chain(self.descendants.iter_mut().map(Arc::make_mut))
     }
 
     pub(crate) fn prepend(self, root: CompositionCall<B>) -> Self {
@@ -980,11 +984,14 @@ impl<B: BindingAddress> CompositionCallPath<B> {
         let mut descendants = Vec::with_capacity(previous_descendants.len() + 1);
         descendants.push(previous_root);
         descendants.extend(previous_descendants);
-        Self { root, descendants }
+        Self {
+            root: Arc::new(root),
+            descendants,
+        }
     }
 
     pub(crate) fn append(mut self, call: CompositionCall<B>) -> Self {
-        self.descendants.push(call);
+        self.descendants.push(Arc::new(call));
         self
     }
 }
@@ -996,10 +1003,10 @@ impl CompositionCallPath<RelativeBindingName> {
     ) -> CompositionCallPath<AbsoluteBindingAddress> {
         let Self { root, descendants } = self;
         CompositionCallPath {
-            root: root.resolve_bindings(resolve),
+            root: Arc::new(Arc::unwrap_or_clone(root).resolve_bindings(resolve)),
             descendants: descendants
                 .into_iter()
-                .map(|call| call.resolve_bindings(resolve))
+                .map(|call| Arc::new(Arc::unwrap_or_clone(call).resolve_bindings(resolve)))
                 .collect(),
         }
     }
@@ -1011,9 +1018,9 @@ impl CompositionCallPath<AbsoluteBindingAddress> {
         map: &mut impl FnMut(&AbsoluteBindingAddress) -> AbsoluteBindingAddress,
     ) {
         let Self { root, descendants } = self;
-        root.map_absolute_bindings(map);
+        Arc::make_mut(root).map_absolute_bindings(map);
         for call in descendants {
-            call.map_absolute_bindings(map);
+            Arc::make_mut(call).map_absolute_bindings(map);
         }
     }
 }
@@ -1021,10 +1028,15 @@ impl CompositionCallPath<AbsoluteBindingAddress> {
 #[cfg(test)]
 impl Default for CompositionCallPath {
     fn default() -> Self {
+        Self::test_in_source(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+    }
+}
+
+#[cfg(test)]
+impl CompositionCallPath {
+    fn test_in_source(source_file: impl Into<PathBuf>) -> Self {
         Self::direct(CompositionCall {
-            id: crate::parser::ModuleCallId::test_dummy_in(
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
-            ),
+            id: crate::parser::ModuleCallId::test_dummy_in(source_file),
             module_name: "test_module".to_string(),
             binding: Some(RootScope::new().resolve(RelativeBindingName::new("test_call"))),
             instance: "test_call".to_string(),
@@ -2282,9 +2294,7 @@ mod tests {
         std::os::unix::fs::symlink("private-target", root.path().join("modules/alias")).unwrap();
         let pinned = crate::paths::ResolvedPath::new(root.path()).unwrap();
         let mut saved_resolver = CompositionSourceIdentityResolver::new(&pinned).unwrap();
-        let mut path = CompositionCallPath::default();
-        path.root.id =
-            crate::parser::ModuleCallId::test_dummy_in(root.path().join("modules/alias/main.crn"));
+        let path = CompositionCallPath::test_in_source(root.path().join("modules/alias/main.crn"));
         let saved = saved_resolver.saved_origin_id(&path).unwrap();
         let current = CompositionSourceIdentityResolver::new(&pinned).unwrap();
         assert!(current.display_source_file(saved.root()).is_none());
@@ -2320,8 +2330,7 @@ mod tests {
             .unwrap();
             let mut origins = Vec::new();
             for source in sources {
-                let mut call_path = CompositionCallPath::default();
-                call_path.root.id = crate::parser::ModuleCallId::test_dummy_in(source);
+                let call_path = CompositionCallPath::test_in_source(source);
                 origins.push(resolver.saved_origin_id(&call_path).unwrap());
             }
             assert_eq!(origins[0], origins[1]);
@@ -2850,5 +2859,29 @@ mod tests {
         assert!(!json.contains("capability_only"), "{json}");
         assert!(!json.contains("producer.instance"), "{json}");
         assert!(!json.contains("Handle"), "{json}");
+    }
+}
+
+#[cfg(test)]
+mod path_sharing_tests {
+    use super::*;
+
+    #[test]
+    fn ancestry_shares_call_records_and_mutation_preserves_sibling_paths() {
+        let parent = CompositionCallPath::default();
+        let mut child_call = parent.root().clone();
+        child_call.instance = "child".into();
+        let mut child = parent.clone().append(child_call);
+        let sibling = child.clone();
+        assert!(Arc::ptr_eq(&parent.root, &child.root));
+        assert!(Arc::ptr_eq(&sibling.descendants[0], &child.descendants[0]));
+        for call in child.calls_mut() {
+            call.instance.push_str(".changed");
+        }
+        assert_eq!(parent.root().instance, "test_call");
+        assert_eq!(sibling.root().instance, "test_call");
+        assert_eq!(sibling.immediate().instance, "child");
+        assert_eq!(child.immediate().instance, "child.changed");
+        assert_eq!(child.calls().count(), 2);
     }
 }
