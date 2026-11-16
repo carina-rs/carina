@@ -3,13 +3,13 @@
     "callsite_argument_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: main.crn at line 2\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
+        "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 3\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 3\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\nError: main.crn at line 4\nError: module call 'other': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 4\nError: Unknown argument 'unexpected' for module 'second'. Did you mean 'n'?\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 46\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'other': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 26\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 33\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'second'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 34\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 44\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "caller/main.crn": [
@@ -18,11 +18,11 @@
             "range": {
               "end": {
                 "character": 34,
-                "line": 1
+                "line": 2
               },
               "start": {
                 "character": 27,
-                "line": 1
+                "line": 2
               }
             },
             "severity": 1,
@@ -33,11 +33,41 @@
             "range": {
               "end": {
                 "character": 45,
-                "line": 1
+                "line": 2
               },
               "start": {
                 "character": 35,
-                "line": 1
+                "line": 2
+              }
+            },
+            "severity": 1,
+            "source": "carina"
+          },
+          {
+            "message": "module call 'other': argument 'n': expected Int, got string 'wrong'",
+            "range": {
+              "end": {
+                "character": 32,
+                "line": 3
+              },
+              "start": {
+                "character": 25,
+                "line": 3
+              }
+            },
+            "severity": 1,
+            "source": "carina"
+          },
+          {
+            "message": "Unknown argument 'unexpected' for module 'second'. Did you mean 'n'?",
+            "range": {
+              "end": {
+                "character": 43,
+                "line": 3
+              },
+              "start": {
+                "character": 33,
+                "line": 3
               }
             },
             "severity": 1,
@@ -289,11 +319,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -308,11 +338,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -327,11 +357,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -346,11 +376,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -365,11 +395,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -384,11 +414,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -403,11 +433,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -422,11 +452,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -441,11 +471,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -460,11 +490,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -479,11 +509,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -498,11 +528,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -517,11 +547,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -536,11 +566,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -555,11 +585,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -574,11 +604,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -593,11 +623,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -612,11 +642,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -631,11 +661,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -650,11 +680,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -669,11 +699,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -688,11 +718,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -707,11 +737,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -726,11 +756,11 @@
           "range": {
             "end": {
               "character": 0,
-              "line": 4
+              "line": 5
             },
             "start": {
               "character": 0,
-              "line": 4
+              "line": 5
             }
           }
         }
@@ -749,9 +779,9 @@
       }
     },
     "lint": {
-      "exit": 0,
-      "stderr": "",
-      "stdout": "No lint warnings found.\n"
+      "exit": 1,
+      "stderr": "warning: .:1  ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 1 lint warning(s).\n",
+      "stdout": ""
     },
     "lsp_caller": {
       "all_siblings_open": {
@@ -808,13 +838,13 @@
     "module_reference_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: main.crn at line 3\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
+        "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 4\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\nError: main.crn at line 6\nError: module call 'other': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 41\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'other': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 6,\n            \"column\": 26\n          },\n          \"end\": {\n            \"line\": 6,\n            \"column\": 39\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "caller/main.crn": [
@@ -823,11 +853,26 @@
             "range": {
               "end": {
                 "character": 40,
-                "line": 2
+                "line": 3
               },
               "start": {
                 "character": 27,
-                "line": 2
+                "line": 3
+              }
+            },
+            "severity": 1,
+            "source": "carina"
+          },
+          {
+            "message": "module call 'other': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)",
+            "range": {
+              "end": {
+                "character": 38,
+                "line": 5
+              },
+              "start": {
+                "character": 25,
+                "line": 5
               }
             },
             "severity": 1,
@@ -838,11 +883,26 @@
             "range": {
               "end": {
                 "character": 41,
-                "line": 3
+                "line": 4
               },
               "start": {
                 "character": 35,
-                "line": 3
+                "line": 4
+              }
+            },
+            "severity": 2,
+            "source": "carina"
+          },
+          {
+            "message": "Unknown attribute 'absent' on 'other'.",
+            "range": {
+              "end": {
+                "character": 40,
+                "line": 6
+              },
+              "start": {
+                "character": 34,
+                "line": 6
               }
             },
             "severity": 2,
@@ -853,14 +913,14 @@
       }
     },
     "validate_human": {
-      "exit": 0,
-      "stderr": "",
-      "stdout": "Validating...\n✓ 2 resources validated successfully.\n  • _virtual.result\n  • _virtual.other\n"
+      "exit": 1,
+      "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+      "stdout": "Validating...\n"
     },
     "validate_json": {
-      "exit": 0,
+      "exit": 1,
       "stderr": "",
-      "stdout": "{\n  \"status\": \"ok\",\n  \"resource_count\": 2,\n  \"resources\": [\n    \"_virtual.result\",\n    \"_virtual.other\"\n  ]\n}\n"
+      "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
     }
   },
   "revision": "66063dd7f96561c274807d6943b5441783ee3d71"

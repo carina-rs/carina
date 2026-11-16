@@ -1,0 +1,4 @@
+arguments { n: Int = 1 }
+exports { value = 1 }
+let a = 'present'
+let broken = a ?? 1

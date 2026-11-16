@@ -126,7 +126,7 @@ mod rejected_import_tests {
             &carina_core::schema::SchemaRegistry::new(),
         );
         assert!(walk.prohibitions().boundary_findings().next().is_none());
-        assert!(crate::wiring::validate_module_boundaries(&walk).is_empty());
+        assert!(crate::wiring::validate_module_boundaries(walk.prohibitions()).is_empty());
     }
 
     #[test]

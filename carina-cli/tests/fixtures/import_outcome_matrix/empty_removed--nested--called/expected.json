@@ -1,0 +1,989 @@
+{
+  "columns": {
+    "callsite_argument_checks": {
+      "classification": "main",
+      "value": {
+        "human": {
+          "exit": 1,
+          "stderr": "Error: Module resolution error: Parse error in ../bridge/../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute\n",
+          "stdout": "Validating...\n"
+        },
+        "json": {
+          "exit": 1,
+          "stderr": "",
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"removed block requires 'from' attribute\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": null\n      }\n    }\n  ]\n}\n"
+        },
+        "lsp_caller": {
+          "bridge/main.crn": [
+            {
+              "message": "Parse error in ../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 20,
+                  "line": 2
+                },
+                "start": {
+                  "character": 13,
+                  "line": 2
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/main.crn": [
+            {
+              "message": "Parse error in ../bridge/../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 24,
+                  "line": 1
+                },
+                "start": {
+                  "character": 19,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/providers.crn": []
+        }
+      }
+    },
+    "completion_export_reference": {
+      "classification": "main",
+      "value": [
+        {
+          "detail": "cidr_subnet(prefix: String, newbits: Int, netnum: Int) -> String",
+          "insertText": "cidr_subnet($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "cidr_subnet"
+        },
+        {
+          "detail": "env(name: String) -> String",
+          "insertText": "env($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "env"
+        },
+        {
+          "detail": "join(separator: String, list: list) -> String",
+          "insertText": "join($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "join"
+        },
+        {
+          "detail": "lookup(map: map, key: String, default: Any) -> Any",
+          "insertText": "lookup($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "lookup"
+        },
+        {
+          "detail": "lower(string: String) -> String",
+          "insertText": "lower($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "lower"
+        },
+        {
+          "detail": "map(accessor: String, collection: list | map) -> list | map",
+          "insertText": "map($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "map"
+        },
+        {
+          "detail": "max(a: Number, b: Number) -> Number",
+          "insertText": "max($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "max"
+        },
+        {
+          "detail": "min(a: Number, b: Number) -> Number",
+          "insertText": "min($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "min"
+        },
+        {
+          "detail": "replace(search: String, replacement: String, string: String) -> String",
+          "insertText": "replace($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "replace"
+        },
+        {
+          "detail": "trim(string: String) -> String",
+          "insertText": "trim($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "trim"
+        },
+        {
+          "detail": "upper(string: String) -> String",
+          "insertText": "upper($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "upper"
+        }
+      ]
+    },
+    "completion_parameter": {
+      "classification": "main",
+      "value": []
+    },
+    "completion_parameter_empty": {
+      "classification": "main",
+      "value": []
+    },
+    "completion_snippet": {
+      "classification": "main",
+      "value": [
+        {
+          "detail": "Module call",
+          "insertText": "service {\n  ${1}\n}",
+          "insertTextFormat": 2,
+          "kind": 9,
+          "label": "service"
+        }
+      ]
+    },
+    "completion_top_level": {
+      "classification": "main",
+      "value": [
+        {
+          "detail": "Define a provider block",
+          "insertText": "provider ${1:aws} {\n    region = aws.Region.${2:ap_northeast_1}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "provider"
+        },
+        {
+          "detail": "Define a named resource or variable",
+          "insertText": "let ${1:name} = ",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "let"
+        },
+        {
+          "detail": "Read existing resource (data source)",
+          "insertText": "let ${1:name} = read ${2:aws.s3.Bucket} {\n    name = \"${3:existing-resource}\"\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "read"
+        },
+        {
+          "detail": "Define module argument parameters",
+          "insertText": "arguments {\n    ${1:param}: ${2:type}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "arguments"
+        },
+        {
+          "detail": "Define module attribute values",
+          "insertText": "attributes {\n    ${1:name}: ${2:type} = ${3:value}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "attributes"
+        },
+        {
+          "detail": "Publish values for upstream_state consumers",
+          "insertText": "exports {\n    ${1:name}: ${2:type} = ${3:value}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "exports"
+        },
+        {
+          "detail": "Define a pure function",
+          "insertText": "fn ${1:name}(${2:params}) {\n    ${3:body}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "fn"
+        },
+        {
+          "detail": "Load a module from a directory",
+          "insertText": "let ${1:module_name} = use {\n    source = '${2:./modules/name}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "let use"
+        },
+        {
+          "detail": "Import existing resource into state",
+          "insertText": "import {\n    to = ${1:awscc.ec2.Vpc} '${2:name}'\n    id = '${3:resource-id}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "import"
+        },
+        {
+          "detail": "Remove resource from state without destroying",
+          "insertText": "removed {\n    from = ${1:awscc.ec2.Vpc} '${2:name}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "removed"
+        },
+        {
+          "detail": "Move/rename resource in state",
+          "insertText": "moved {\n    from = ${1:awscc.ec2.Vpc} '${2:old-name}'\n    to   = ${3:awscc.ec2.Vpc} '${4:new-name}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "moved"
+        },
+        {
+          "detail": "Configure state backend",
+          "insertText": "backend ${1|s3,local,github|} {\n    $0\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "backend"
+        },
+        {
+          "detail": "Reference another project's exported state",
+          "insertText": "let ${1:binding} = upstream_state {\n    source = '${2:../other-project}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "upstream_state"
+        },
+        {
+          "detail": "Cross-argument constraint",
+          "insertText": "require ${1:condition}, \"${2:error message}\"",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "require"
+        },
+        {
+          "detail": "Block downstream resources until target reaches a condition",
+          "insertText": "let ${1:waited} = wait ${2:target} {\n    until = ${2:target}.${3:status} == ${4:value}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "wait"
+        },
+        {
+          "detail": "Module call",
+          "insertText": "service {\n  ${1}\n}",
+          "insertTextFormat": 2,
+          "kind": 9,
+          "label": "service"
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.budgets.Budget",
+          "textEdit": {
+            "newText": "mock.budgets.Budget {\n    budget = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.compute.Instance",
+          "textEdit": {
+            "newText": "mock.compute.Instance {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.example.consumer",
+          "textEdit": {
+            "newText": "mock.example.consumer {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.example.thing",
+          "textEdit": {
+            "newText": "mock.example.thing {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.iam.Role",
+          "textEdit": {
+            "newText": "mock.iam.Role {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.iam.Roles",
+          "textEdit": {
+            "newText": "mock.iam.Roles {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.logs.LogGroup",
+          "textEdit": {
+            "newText": "mock.logs.LogGroup {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.route53.HostedZone",
+          "textEdit": {
+            "newText": "mock.route53.HostedZone {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.route53.RecordSet",
+          "textEdit": {
+            "newText": "mock.route53.RecordSet {\n    hosted_zone_id = ${1}\n    name = ${2}\n    type = ${3}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.Thing",
+          "textEdit": {
+            "newText": "mock.test.Thing {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.creation_conflicting",
+          "textEdit": {
+            "newText": "mock.test.creation_conflicting {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.creation_constrained",
+          "textEdit": {
+            "newText": "mock.test.creation_constrained {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.default_prevent_destroy",
+          "textEdit": {
+            "newText": "mock.test.default_prevent_destroy {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.deferred_source",
+          "textEdit": {
+            "newText": "mock.test.deferred_source {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.estimated_input",
+          "textEdit": {
+            "newText": "mock.test.estimated_input {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.input_constrained",
+          "textEdit": {
+            "newText": "mock.test.input_constrained {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.keyed_partial_update_list",
+          "textEdit": {
+            "newText": "mock.test.keyed_partial_update_list {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.nested_identity",
+          "textEdit": {
+            "newText": "mock.test.nested_identity {\n    identity = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.pattern_modes",
+          "textEdit": {
+            "newText": "mock.test.pattern_modes {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.reference",
+          "textEdit": {
+            "newText": "mock.test.reference {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.resource",
+          "textEdit": {
+            "newText": "mock.test.resource {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.server_added_list",
+          "textEdit": {
+            "newText": "mock.test.server_added_list {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.unique_identity",
+          "textEdit": {
+            "newText": "mock.test.unique_identity {\n    name = ${1}\n    replacement_key = ${2}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "read mock.iam.Roles",
+          "textEdit": {
+            "newText": "let ${1:name} = read mock.iam.Roles {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        }
+      ]
+    },
+    "hover_argument": {
+      "classification": "main",
+      "value": null
+    },
+    "hover_module": {
+      "classification": "main",
+      "value": null
+    },
+    "lint": {
+      "classification": "main",
+      "value": {
+        "exit": 1,
+        "stderr": "Error: Module resolution error: Parse error in ../bridge/../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute\n",
+        "stdout": ""
+      }
+    },
+    "lsp_caller": {
+      "classification": "main",
+      "value": {
+        "all_siblings_open": {
+          "bridge/main.crn": [
+            {
+              "message": "Parse error in ../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 20,
+                  "line": 2
+                },
+                "start": {
+                  "character": 13,
+                  "line": 2
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/main.crn": [
+            {
+              "message": "Parse error in ../bridge/../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 24,
+                  "line": 1
+                },
+                "start": {
+                  "character": 19,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/providers.crn": []
+        },
+        "faithful_disk_error": {
+          "bridge/main.crn": [
+            {
+              "message": "Parse error in ../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 20,
+                  "line": 2
+                },
+                "start": {
+                  "character": 13,
+                  "line": 2
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/main.crn": [
+            {
+              "message": "Parse error in ../bridge/../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 24,
+                  "line": 1
+                },
+                "start": {
+                  "character": 19,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/providers.crn": []
+        }
+      }
+    },
+    "lsp_target": {
+      "classification": "main",
+      "value": {
+        "all_siblings_open": {
+          "module/main.crn": [
+            {
+              "message": "removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 100,
+                  "line": 0
+                },
+                "start": {
+                  "character": 0,
+                  "line": 0
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ]
+        },
+        "faithful_disk_error": {
+          "module/main.crn": [
+            {
+              "message": "removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 100,
+                  "line": 0
+                },
+                "start": {
+                  "character": 0,
+                  "line": 0
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ]
+        }
+      }
+    },
+    "module_reference_checks": {
+      "classification": "main",
+      "value": {
+        "human": {
+          "exit": 1,
+          "stderr": "Error: Module resolution error: Parse error in ../bridge/../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute\n",
+          "stdout": "Validating...\n"
+        },
+        "json": {
+          "exit": 1,
+          "stderr": "",
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"removed block requires 'from' attribute\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": null\n      }\n    }\n  ]\n}\n"
+        },
+        "lsp_caller": {
+          "bridge/main.crn": [
+            {
+              "message": "Parse error in ../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 20,
+                  "line": 3
+                },
+                "start": {
+                  "character": 13,
+                  "line": 3
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/main.crn": [
+            {
+              "message": "Parse error in ../bridge/../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute",
+              "range": {
+                "end": {
+                  "character": 24,
+                  "line": 1
+                },
+                "start": {
+                  "character": 19,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/providers.crn": []
+        }
+      }
+    },
+    "validate_human": {
+      "classification": "main",
+      "value": {
+        "exit": 1,
+        "stderr": "Error: Module resolution error: Parse error in ../bridge/../module/main.crn: Invalid expression at line 0: removed block requires 'from' attribute\n",
+        "stdout": "Validating...\n"
+      }
+    },
+    "validate_json": {
+      "classification": "main",
+      "value": {
+        "exit": 1,
+        "stderr": "",
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"removed block requires 'from' attribute\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": null\n      }\n    }\n  ]\n}\n"
+      }
+    }
+  },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
+  "fixture": {
+    "associated_io": false,
+    "caller": "caller/main.crn",
+    "directories": [
+      "caller"
+    ],
+    "files": {},
+    "id": "empty_removed--nested--called",
+    "immediate_importer": "bridge/main.crn",
+    "import_path": "../module",
+    "route": "nested",
+    "row": "empty_removed",
+    "runtime_unreadable": {},
+    "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
+    "supplemental": true,
+    "target_paths": [
+      "module/main.crn"
+    ],
+    "unreadable_paths": [],
+    "usage": "called"
+  },
+  "signatures": {
+    "bootstrap:bridge/main.crn": {},
+    "bootstrap:caller/main.crn": {
+      "outer": {
+        "arguments": [
+          {
+            "default": true,
+            "name": "outer_n",
+            "type": "Int"
+          }
+        ],
+        "attributes": {},
+        "requires": 0
+      }
+    },
+    "loaded-mock:bridge/main.crn": {},
+    "loaded-mock:caller/main.crn": {
+      "outer": {
+        "arguments": [
+          {
+            "default": true,
+            "name": "outer_n",
+            "type": "Int"
+          }
+        ],
+        "attributes": {},
+        "requires": 0
+      }
+    }
+  }
+}

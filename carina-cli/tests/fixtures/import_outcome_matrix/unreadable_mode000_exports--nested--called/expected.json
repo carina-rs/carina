@@ -1142,6 +1142,7 @@
   },
   "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
+    "associated_io": true,
     "caller": "caller/main.crn",
     "directories": [
       "caller"

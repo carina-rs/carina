@@ -5350,9 +5350,10 @@ pub(crate) fn validate_module_internal_ref_types(
 
 /// Present the resolver's complete collection in its issued order. Adapters
 /// retain each finding's typed prohibition or ordinary-read presentation.
-pub(crate) fn validate_module_boundaries(module_walk: &ModuleWalk) -> Vec<AppError> {
-    module_walk
-        .prohibitions()
+pub(crate) fn validate_module_boundaries(
+    findings: &carina_core::module_resolver::CollectedImportProhibitions,
+) -> Vec<AppError> {
+    findings
         .boundary_findings()
         .map(|finding| {
             let error = std::sync::Arc::new(finding.error());
@@ -5363,7 +5364,7 @@ pub(crate) fn validate_module_boundaries(module_walk: &ModuleWalk) -> Vec<AppErr
                 },
                 None => AppError::ModuleImportResolution {
                     error,
-                    base: Box::new(module_walk.base_dir().clone()),
+                    base: Box::new(findings.base_dir().clone()),
                 },
             }
         })

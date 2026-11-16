@@ -1,1 +1,1 @@
-exports {}
+exports { value = 1 }

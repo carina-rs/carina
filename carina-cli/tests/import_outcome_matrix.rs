@@ -11,6 +11,7 @@ use std::{
 use carina_core::provider::loaded_provider_snapshot_from_factories;
 use carina_core::{EnvironmentSnapshot, parser::ProviderContext, paths::ResolvedPath};
 use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
+use futures::FutureExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -49,6 +50,7 @@ struct Fixture {
     // Only runtime-only unreadable inputs have inline text in the metadata.
     files: BTreeMap<String, String>,
     schema_readiness: String,
+    associated_io: bool,
 }
 
 #[derive(Deserialize)]
@@ -84,8 +86,8 @@ enum Classification {
     Placement,
     #[serde(rename = "changed:4398-importability")]
     Importability,
-    #[serde(rename = "changed:4398-readable-prohibitions")]
-    ReadableProhibitions,
+    #[serde(rename = "changed:4398-empty-block")]
+    EmptyBlock,
     #[serde(rename = "changed:A")]
     EmptyInterface,
     #[serde(rename = "changed:C")]
@@ -248,6 +250,17 @@ fn cli(root: &Path, args: &[&str]) -> Value {
 
 fn overlay(fixture: &Fixture, files: &BTreeMap<String, String>, mode: &str) -> String {
     let original = &files[&fixture.immediate_importer];
+    let original = if fixture.row == "two_uses_prohibited" {
+        original
+            .lines()
+            .filter(|line| {
+                !line.starts_with("let result = service") && !line.starts_with("let other = second")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        original.clone()
+    };
     let prefix = original
         .split("let result = service")
         .next()
@@ -265,7 +278,19 @@ fn overlay(fixture: &Fixture, files: &BTreeMap<String, String>, mode: &str) -> S
         }
         mode => panic!("unknown editor overlay {mode}"),
     };
-    format!("{prefix}\n{call}")
+    let duplicate = if fixture.row == "two_uses_prohibited" {
+        match mode {
+            "argument" => "let other = second { n = 'wrong' unexpected = 1 }\n",
+            "reference" => {
+                "let other = second { n = supplied.name }\nmock.test.resource { name = other.absent }\n"
+            }
+            "ui" | "empty" | "exports" => "",
+            mode => panic!("unknown editor overlay {mode}"),
+        }
+    } else {
+        ""
+    };
+    format!("{prefix}\n{call}{duplicate}")
 }
 
 fn caller(fixture: &Fixture, snapshot: &BTreeMap<String, Value>) -> Value {
@@ -391,7 +416,7 @@ fn assert_decisions(fixture: &Fixture, cells: &BTreeMap<String, Value>) {
     );
     let report: Value =
         serde_json::from_str(cells["validate_json"]["stdout"].as_str().unwrap()).unwrap();
-    if !fixture.runtime_unreadable.is_empty()
+    if fixture.associated_io
         && let Some(errors) = report["errors"].as_array()
         && errors.iter().any(|error| {
             error["message"]
@@ -656,8 +681,7 @@ async fn measure(fixture: &Fixture, inputs: &Inputs) -> BTreeMap<String, Value> 
     cells
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn import_outcome_matrix() {
+async fn import_outcome_matrix_shard(shard: usize) {
     let fixtures_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/import_outcome_matrix");
     let mut directories = fs::read_dir(&fixtures_path)
@@ -670,7 +694,17 @@ async fn import_outcome_matrix() {
         .iter()
         .map(|column| column.to_string())
         .collect::<BTreeSet<_>>();
-    for directory in directories {
+    let mut all_failures = Vec::new();
+    for (index, directory) in directories.into_iter().enumerate() {
+        if index % 4 != shard {
+            continue;
+        }
+        let label = directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let outcome = std::panic::AssertUnwindSafe(async {
         let expected: ExpectedFixture =
             serde_json::from_slice(&fs::read(directory.join("expected.json")).unwrap()).unwrap();
         let fixture = &expected.fixture;
@@ -687,17 +721,15 @@ async fn import_outcome_matrix() {
             "{}: expected columns",
             fixture.id
         );
+        let mut failures = Vec::new();
         for column in COLUMNS {
             let id = format!("{}:{column}", fixture.id);
             let cell = &expected.columns[column];
             if matches!(
                 cell.classification,
                 Classification::Main | Classification::Main4485
-            ) {
-                assert_eq!(
-                    cell.value, main.columns[column],
-                    "{id}: main classification must equal stored genuine main"
-                );
+            ) && cell.value != main.columns[column] {
+                failures.push(format!("{id}: main classification must equal stored genuine main"));
             }
         }
         if fixture
@@ -710,12 +742,11 @@ async fn import_outcome_matrix() {
                 "SKIP {}: mode-000 fixtures require an unprivileged Unix runner; root can read mode 000",
                 fixture.id
             );
-            continue;
+            return failures;
         }
         let inputs = Inputs::new(&fixtures_path, fixture);
         let cells = measure(fixture, &inputs).await;
         let actual_signatures = signatures(fixture, &inputs);
-        let mut failures = Vec::new();
         for column in COLUMNS {
             let id = format!("{}:{column}", fixture.id);
             let actual = normalize(&cells[column], inputs.root());
@@ -730,15 +761,54 @@ async fn import_outcome_matrix() {
                 fixture.id, expected.signatures
             ));
         }
-        inputs.assert_restored();
+        if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inputs.assert_restored())) {
+            failures.push(format!("{}: input restoration: {}", fixture.id, panic_message(error.as_ref())));
+        }
+        if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assert_decisions(fixture, &cells))) {
+            failures.push(format!("{}: decision audit: {}", fixture.id, panic_message(error.as_ref())));
+        }
         if !failures.is_empty() {
             let retained = inputs.root().to_path_buf();
             inputs.restore_permissions();
             std::mem::forget(inputs);
-            panic!("{}\nRetained: {}", failures.join("\n"), retained.display());
+            failures.push(format!("Retained: {}", retained.display()));
         }
-        assert_decisions(fixture, &cells);
+        failures
+        }).catch_unwind().await;
+        match outcome {
+            Ok(failures) => all_failures.extend(failures),
+            Err(error) => all_failures.push(format!(
+                "{label}: fixture failed: {}",
+                panic_message(error.as_ref())
+            )),
+        }
     }
+    assert!(all_failures.is_empty(), "{}", all_failures.join("\n"));
+}
+
+fn panic_message(error: &(dyn std::any::Any + Send)) -> &str {
+    error
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| error.downcast_ref::<&str>().copied())
+        .unwrap_or("non-string panic")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_outcome_matrix_shard_0() {
+    import_outcome_matrix_shard(0).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_outcome_matrix_shard_1() {
+    import_outcome_matrix_shard(1).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_outcome_matrix_shard_2() {
+    import_outcome_matrix_shard(2).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_outcome_matrix_shard_3() {
+    import_outcome_matrix_shard(3).await;
 }
 
 fn mode000_supported() -> bool {

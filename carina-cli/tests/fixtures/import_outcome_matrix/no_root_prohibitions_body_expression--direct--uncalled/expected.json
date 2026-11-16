@@ -1,7 +1,7 @@
 {
   "columns": {
     "callsite_argument_checks": {
-      "classification": "changed:user-prohibitions",
+      "classification": "changed:4398-empty-block",
       "value": {
         "human": {
           "exit": 1,
@@ -796,7 +796,7 @@
       }
     },
     "lint": {
-      "classification": "changed:user-prohibitions",
+      "classification": "changed:4398-empty-block",
       "value": {
         "exit": 1,
         "stderr": "warning: .:1  ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Module resolution error: Parse error: ../module/main.crn:3:19: Invalid expression at line 3: coalesce default type `Int` does not match left type `String`\n",
@@ -804,7 +804,7 @@
       }
     },
     "lsp_caller": {
-      "classification": "changed:user-prohibitions",
+      "classification": "changed:4398-empty-block",
       "value": {
         "all_siblings_open": {
           "caller/main.crn": [
@@ -926,7 +926,7 @@
       }
     },
     "module_reference_checks": {
-      "classification": "changed:user-prohibitions",
+      "classification": "changed:4398-empty-block",
       "value": {
         "human": {
           "exit": 1,
@@ -1006,7 +1006,7 @@
       }
     },
     "validate_human": {
-      "classification": "changed:user-prohibitions",
+      "classification": "changed:4398-empty-block",
       "value": {
         "exit": 1,
         "stderr": "Error: ./../module/main.crn at line 3\nError: coalesce default type `Int` does not match left type `String`\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
@@ -1014,7 +1014,7 @@
       }
     },
     "validate_json": {
-      "classification": "changed:user-prohibitions",
+      "classification": "changed:4398-empty-block",
       "value": {
         "exit": 1,
         "stderr": "",
@@ -1024,6 +1024,7 @@
   },
   "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
+    "associated_io": false,
     "caller": "caller/main.crn",
     "directories": [
       "caller"

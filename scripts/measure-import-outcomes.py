@@ -25,7 +25,7 @@ DECISION_KEYS = {
     "user-prohibitions",
     "4398-placement",
     "4398-importability",
-    "4398-readable-prohibitions",
+    "4398-empty-block",
     "A",
     "C",
 }
@@ -280,19 +280,23 @@ def cli(binary, root, output, env, label, args):
 
 def interface_overlay(fixture, files, mode):
     original = files[fixture["immediate_importer"]]
+    if fixture["row"] == "two_uses_prohibited":
+        original = "\n".join(line for line in original.splitlines() if not line.startswith(("let result = service", "let other = second")))
     prefix = original.split("let result = service", 1)[0].rstrip() + "\n"
+    duplicate = fixture["row"] == "two_uses_prohibited"
     if mode == "ui":
         return prefix + "let result = service {\n  n = 1\n}\n\n"
     if mode == "empty":
         return prefix + "let result = service {\n  \n}\n"
     if mode == "argument":
-        return prefix + "let result = service { n = 'wrong' unexpected = 1 }\n"
+        return prefix + "let result = service { n = 'wrong' unexpected = 1 }\n" + ("let other = second { n = 'wrong' unexpected = 1 }\n" if duplicate else "")
     if mode == "reference":
         return (
             prefix
             + "let supplied = mock.test.resource { name = 'supplied' }\n"
             + "let result = service { n = supplied.name }\n"
             + "mock.test.resource { name = result.absent }\n"
+            + ("let other = second { n = supplied.name }\nmock.test.resource { name = other.absent }\n" if duplicate else "")
         )
     if mode == "exports":
         return (

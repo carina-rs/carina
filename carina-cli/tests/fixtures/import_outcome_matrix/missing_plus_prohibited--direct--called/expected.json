@@ -46,21 +46,6 @@
               "source": "carina"
             },
             {
-              "message": "IO error: No such file or directory (os error 2)",
-              "range": {
-                "end": {
-                  "character": 8,
-                  "line": 2
-                },
-                "start": {
-                  "character": 0,
-                  "line": 2
-                }
-              },
-              "severity": 1,
-              "source": "carina"
-            },
-            {
               "message": "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
               "range": {
                 "end": {
@@ -70,6 +55,21 @@
                 "start": {
                   "character": 13,
                   "line": 3
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "IO error: No such file or directory (os error 2)",
+              "range": {
+                "end": {
+                  "character": 8,
+                  "line": 2
+                },
+                "start": {
+                  "character": 0,
+                  "line": 2
                 }
               },
               "severity": 1,
@@ -816,21 +816,6 @@
         "all_siblings_open": {
           "caller/main.crn": [
             {
-              "message": "IO error: No such file or directory (os error 2)",
-              "range": {
-                "end": {
-                  "character": 8,
-                  "line": 2
-                },
-                "start": {
-                  "character": 0,
-                  "line": 2
-                }
-              },
-              "severity": 1,
-              "source": "carina"
-            },
-            {
               "message": "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
               "range": {
                 "end": {
@@ -840,6 +825,21 @@
                 "start": {
                   "character": 13,
                   "line": 3
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "IO error: No such file or directory (os error 2)",
+              "range": {
+                "end": {
+                  "character": 8,
+                  "line": 2
+                },
+                "start": {
+                  "character": 0,
+                  "line": 2
                 }
               },
               "severity": 1,
@@ -851,21 +851,6 @@
         "faithful_disk_error": {
           "caller/main.crn": [
             {
-              "message": "IO error: No such file or directory (os error 2)",
-              "range": {
-                "end": {
-                  "character": 8,
-                  "line": 2
-                },
-                "start": {
-                  "character": 0,
-                  "line": 2
-                }
-              },
-              "severity": 1,
-              "source": "carina"
-            },
-            {
               "message": "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
               "range": {
                 "end": {
@@ -875,6 +860,21 @@
                 "start": {
                   "character": 13,
                   "line": 3
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "IO error: No such file or directory (os error 2)",
+              "range": {
+                "end": {
+                  "character": 8,
+                  "line": 2
+                },
+                "start": {
+                  "character": 0,
+                  "line": 2
                 }
               },
               "severity": 1,
@@ -961,21 +961,6 @@
               "source": "carina"
             },
             {
-              "message": "IO error: No such file or directory (os error 2)",
-              "range": {
-                "end": {
-                  "character": 8,
-                  "line": 2
-                },
-                "start": {
-                  "character": 0,
-                  "line": 2
-                }
-              },
-              "severity": 1,
-              "source": "carina"
-            },
-            {
               "message": "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
               "range": {
                 "end": {
@@ -985,6 +970,21 @@
                 "start": {
                   "character": 13,
                   "line": 4
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "IO error: No such file or directory (os error 2)",
+              "range": {
+                "end": {
+                  "character": 8,
+                  "line": 2
+                },
+                "start": {
+                  "character": 0,
+                  "line": 2
                 }
               },
               "severity": 1,
@@ -1029,6 +1029,7 @@
   },
   "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
+    "associated_io": false,
     "caller": "caller/main.crn",
     "directories": [
       "caller"

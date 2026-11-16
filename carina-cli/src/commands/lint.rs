@@ -13,7 +13,6 @@ use carina_core::module_resolver;
 use carina_core::parser::ProviderContext;
 
 use crate::error::AppError;
-use crate::module_walk::ModuleWalk;
 use crate::wiring::{ProviderLoad, validate_module_boundaries};
 
 /// A lint warning with file, line, and message info.
@@ -306,16 +305,7 @@ fn lint_result(
     let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
 
-    let mut module_walk = ModuleWalk::load(
-        &parsed,
-        base_dir,
-        provider_context,
-        &carina_core::schema::SchemaRegistry::new(),
-    );
-    let (module_boundary_findings, mut import_errors): (Vec<_>, Vec<_>) =
-        validate_module_boundaries(&module_walk)
-            .into_iter()
-            .partition(|finding| matches!(finding, AppError::ModuleImport { .. }));
+    let mut import_errors = Vec::new();
 
     let (providers, provider_factory_error) = ProviderLoad::load_reporting(
         runtime,
@@ -363,6 +353,15 @@ fn lint_result(
             {
                 type_findings.push(error.to_string());
             }
+            let (module_walk, captured_imports) = module_resolver::collect_module_imports(
+                parsed.clone().admit(schemas, catalog),
+                base_dir,
+            );
+            let (module_boundary_findings, boundary_errors): (Vec<_>, Vec<_>) =
+                validate_module_boundaries(module_walk.prohibitions())
+                    .into_iter()
+                    .partition(|finding| matches!(finding, AppError::ModuleImport { .. }));
+            import_errors.extend(boundary_errors);
             for module in module_walk.iter() {
                 type_findings.extend(
                     carina_core::validation::resolve_file_type_exprs(
@@ -380,11 +379,8 @@ fn lint_result(
             // the existing root-only policy; fatal import errors publish after
             // the prohibition warnings instead of discarding them.
             let mut parsed = if type_findings.is_empty() {
-                let resolution = module_resolver::resolve_module_template_with_imports(
-                    parsed.clone().admit(schemas, catalog),
-                    base_dir,
-                    &mut module_walk,
-                );
+                let resolution =
+                    module_resolver::resolve_module_template_with_imports(captured_imports);
                 match resolution {
                     Ok(resolved) => LintFile::Resolved(resolved),
                     Err(error) if !module_boundary_findings.is_empty() => {

@@ -19,10 +19,10 @@ or `changed:<decision-key>`. The closed decision-key list is:
 
 | Key | Decision |
 | --- | --- |
-| `user-prohibitions` | The user's full-reach decision: the resolver traverses prohibited directories and failing bridges and issues one complete set per root use. CLI validate, lint, and caller LSP publish every child's prohibitions. Captured sibling read failures accompany the prohibitions in category-first order. JSON and LSP use the same non-null root use/call anchor. Ordinary findings retain main's values; #4485 stays separate. |
+| `user-prohibitions` | The user's full-reach decision: the resolver traverses prohibited directories and failing bridges and issues one complete set per root use. CLI validate, lint, and caller LSP publish every child's prohibitions. Read failures beside a prohibition or below a prohibited ancestor accompany the prohibitions in category-first order. JSON and LSP use the same non-null root use/call anchor. Ordinary findings retain main's values; #4485 stays separate. |
+| `4398-empty-block` | #4398 rejects an authored empty exports block, which main accepted because its export-parameter list was empty. Separate single-use controls distinguish block presence from repeated-use multiplicity. |
 | `4398-placement` | #4398: root evidence owns placement errors and their evidence locations. Arguments, attributes, and require establish module evidence, including empty blocks. |
 | `4398-importability` | #4398: an importable directory has .crn files and no root evidence; argument/output entry counts do not determine importability. Root evidence suppresses imported body checks. |
-| `4398-readable-prohibitions` | #4398: readable root evidence is monotone; publish its complete prohibition set at the root use/call even beside an unreadable sibling. Retain the captured read failure beside the prohibitions and preserve main's readable-sibling signature/UI policy. |
 | `A` | Admit an empty interface; keep the reviewed bare module hover and extra-argument finding. Whole changed cells may also expose the unchanged LSP-only #4485 rule. |
 | `C` | Report an empty directory as the typed no-configuration-files error; an uncalled import has no use anchor. |
 
@@ -40,7 +40,7 @@ using saved binary pairs and an explicit output directory outside the repository
 Pass `--refresh-main-baselines` to regenerate `main.json` from the measured main
 cells after a fixture path change. The saved binary hashes and baseline revision
 must match; candidate output is never used for these baselines.
-The stored baselines cover 144 fixtures. Empty-interface body expectations derive
+The stored baselines cover 192 fixtures. Empty-interface body expectations derive
 from genuine main's equivalent declared-argument modules. Added shapes cover two
 uses of one prohibited directory, two prohibited children, body-failing and
 unreadable bridges, prohibited parents with prohibited or unreadable children,
@@ -52,3 +52,7 @@ endpoints between JSON and LSP. For actual partial reads beside prohibitions,
 it also compares the captured IO messages, counts, and ranges. Opening the unreadable sibling does not repair its disk input. Both editor
 epochs retain main's handling of document buffers and imported disk reads. Native text, provenance receipts, classification audits,
 and PR review ledgers belong in the caller-selected external evidence directory.
+
+The four deterministic matrix shards collect every differing cell before failing. Added controls isolate unrelated unreadable cousins in both import orders, clean descendants of prohibited parents, resolver-only body failures behind main's boundary gate, and empty blocks. Argument/reference overlays preserve and call both aliases in duplicate-use fixtures.
+
+`associated_io` declares that the fixture's unreadable inputs are beside a prohibition or below a prohibited ancestor. These rows require cross-transport IO count, text, and range parity. Ordinary IO keeps the independently measured main value in every column, including main's different CLI/LSP reach; every native cell is still compared exactly. A clean bridge's unreadable child or cousin does not become associated merely because another child is prohibited.

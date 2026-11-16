@@ -43,6 +43,242 @@ fn fixture() -> Directory {
     directory
 }
 
+#[test]
+fn lint_keeps_main_boundary_gate_for_resolution_only_body_failures() {
+    for nested in [false, true] {
+        for called in [false, true] {
+            let directory = fixture();
+            fs::remove_dir_all(directory._temp.path().join("rooted")).unwrap();
+            fs::create_dir(directory._temp.path().join("rooted")).unwrap();
+            fs::write(directory._temp.path().join("rooted/main.crn"),
+                "arguments { n: Int = 1 }\nexports { value = 1 }\nlet a = 'present'\nlet broken = a ?? 1\n").unwrap();
+            let mut caller = "let service = use { source = '../rooted' }\n".to_owned();
+            if called {
+                caller.push_str("let result = service {}\n");
+            }
+            if nested {
+                fs::create_dir(directory._temp.path().join("bridge")).unwrap();
+                fs::write(
+                    directory._temp.path().join("bridge/main.crn"),
+                    format!("arguments {{ n: Int = 1 }}\n{caller}"),
+                )
+                .unwrap();
+                caller = "let outer = use { source = '../bridge' }\n".into();
+                if called {
+                    caller.push_str("let result = outer {}\n");
+                }
+            }
+            fs::write(directory.project.join("main.crn"), caller).unwrap();
+            let lint = directory.run(&["lint", "."]);
+            let text = String::from_utf8(lint.stderr).unwrap();
+            assert!(text.contains("exports blocks are not allowed"), "{text}");
+            assert!(
+                text.ends_with("Error: Found 1 lint warning(s).\n"),
+                "{text}"
+            );
+            assert!(!text.contains("Module resolution error"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn failing_clean_bridge_keeps_mains_ordinary_io_scope_and_location() {
+    let directory = fixture();
+    fs::remove_dir_all(directory._temp.path().join("rooted")).unwrap();
+    fs::create_dir_all(directory._temp.path().join("rooted/child")).unwrap();
+    fs::write(
+        directory._temp.path().join("rooted/main.crn"),
+        "arguments { n: Int = 1 }\nlet child = use { source = './child' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory._temp.path().join("rooted/child/main.crn"),
+        "arguments {}\nexports {}\n",
+    )
+    .unwrap();
+    fs::write(directory._temp.path().join("rooted/unreadable.crn"), [0xff]).unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let service = use { source = '../rooted' }\n",
+    )
+    .unwrap();
+    let output = directory.run(&["validate", "--json", "."]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let errors = report["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2, "{report}");
+    let io = errors
+        .iter()
+        .find(|error| error["message"] == "IO error: stream did not contain valid UTF-8")
+        .unwrap();
+    assert!(
+        io["location"].is_null(),
+        "ordinary uncalled IO keeps main's null location: {report}"
+    );
+    for command in ["validate", "lint"] {
+        let output = directory.run(&[command, "."]);
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(stderr.matches("IO error:").count(), 1, "{stderr}");
+    }
+    fs::write(
+        directory.project.join("main.crn"),
+        "let service = use { source = '../rooted' }\nlet result = service { n = 'wrong' unexpected = 1 }\n",
+    )
+    .unwrap();
+    let output = directory.run(&["validate", "--json", "."]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let errors = report["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 4, "{report}");
+    assert!(
+        errors[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exports blocks"),
+        "{report}"
+    );
+    assert!(
+        errors[1]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expected Int"),
+        "{report}"
+    );
+    assert!(
+        errors[2]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown argument"),
+        "{report}"
+    );
+    assert!(
+        errors[3]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("IO error:"),
+        "{report}"
+    );
+    let output = directory.run(&["validate", "."]);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.find("Unknown argument").unwrap() < stderr.find("IO error:").unwrap(),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn shared_reads_keep_main_ordinary_scope_on_each_route() {
+    for child in [false, true] {
+        for nested in [false, true] {
+            for parent_first in [false, true] {
+                for called in [false, true] {
+                    let directory = fixture();
+                    let root = directory._temp.path();
+                    for name in ["x", "parent", "bridge"] {
+                        fs::create_dir(root.join(name)).unwrap();
+                    }
+                    fs::write(root.join("x/main.crn"), "arguments { n: Int = 1 }\n").unwrap();
+                    fs::write(root.join("x/unreadable.crn"), [0xff]).unwrap();
+                    fs::write(
+                        root.join("parent/main.crn"),
+                        format!(
+                            "arguments {{ n: Int = 1 }}\nexports {{}}\n{}",
+                            if child {
+                                "let child = use { source = '../x' }\n"
+                            } else {
+                                ""
+                            },
+                        ),
+                    )
+                    .unwrap();
+                    let mut uses = [
+                        "let plain = use { source = '../x' }\n",
+                        "let parent = use { source = '../parent' }\n",
+                    ];
+                    if parent_first {
+                        uses.reverse();
+                    }
+                    let body = format!(
+                        "{}{}",
+                        uses.concat(),
+                        if called {
+                            "let left = plain {}\nlet right = parent {}\n"
+                        } else {
+                            ""
+                        }
+                    );
+                    let caller = if nested {
+                        fs::write(
+                            root.join("bridge/main.crn"),
+                            format!("arguments {{ bridge_id: Int = 1 }}\n{body}"),
+                        )
+                        .unwrap();
+                        format!(
+                            "let bridge = use {{ source = '../bridge' }}\n{}",
+                            if called {
+                                "let outer = bridge {}\n"
+                            } else {
+                                ""
+                            }
+                        )
+                    } else {
+                        body
+                    };
+                    fs::write(directory.project.join("main.crn"), caller).unwrap();
+                    let label = format!(
+                        "child={child}, nested={nested}, parent_first={parent_first}, called={called}"
+                    );
+                    let expected_validate = if child && (!nested || !parent_first) {
+                        2
+                    } else {
+                        1
+                    };
+                    let output = directory.run(&["validate", "--json", "."]);
+                    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    let errors = report["errors"].as_array().unwrap();
+                    let io = errors
+                        .iter()
+                        .filter(|error| error["message"].as_str().unwrap().starts_with("IO error:"))
+                        .collect::<Vec<_>>();
+                    assert_eq!(io.len(), expected_validate, "{label}: {report}");
+                    assert_eq!(errors.len(), expected_validate + 1, "{label}: {report}");
+                    let nulls = io
+                        .iter()
+                        .filter(|error| error["location"].is_null())
+                        .count();
+                    assert_eq!(
+                        nulls,
+                        if called {
+                            0
+                        } else {
+                            expected_validate - usize::from(child)
+                        },
+                        "{label}: {report}"
+                    );
+                    let human = directory.run(&["validate", "."]);
+                    let text = String::from_utf8(human.stderr).unwrap();
+                    assert_eq!(
+                        text.matches("IO error:").count(),
+                        expected_validate,
+                        "{label}: {text}"
+                    );
+                    let lint = directory.run(&["lint", "."]);
+                    let text = String::from_utf8(lint.stderr).unwrap();
+                    let expected_lint = if child && !parent_first { 2 } else { 1 };
+                    assert_eq!(
+                        text.matches("IO error:").count(),
+                        expected_lint,
+                        "{label}: {text}"
+                    );
+                    assert_eq!(
+                        text.matches("exports blocks are not allowed").count(),
+                        1,
+                        "{label}: {text}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn assert_transports(directory: &Directory, stderr: &str, json: &str, lsp: &str) {
     let human = directory.run(&["validate", "."]);
     assert_eq!(human.status.code(), Some(1));

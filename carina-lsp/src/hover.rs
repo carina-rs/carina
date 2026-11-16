@@ -489,7 +489,7 @@ impl HoverProvider {
                         signature: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Partial {
-                        prohibitions: _,
+                        analysis: _,
                         signature: _,
                         read_failure: _,
                     }
@@ -568,7 +568,7 @@ impl HoverProvider {
                         signature: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Partial {
-                        prohibitions: _,
+                        analysis: _,
                         signature: _,
                         read_failure: _,
                     }

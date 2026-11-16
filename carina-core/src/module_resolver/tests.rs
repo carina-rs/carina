@@ -45,6 +45,149 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
 }
 
 #[test]
+fn collected_read_failures_belong_to_their_ancestor_path() {
+    for prohibited_parent in [false, true] {
+        for unreadable_first in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            for child in ["x", "y"] {
+                fs::create_dir_all(directory.path().join("bridge").join(child)).unwrap();
+            }
+            fs::write(directory.path().join("bridge/x/main.crn"), [0xff]).unwrap();
+            fs::write(
+                directory.path().join("bridge/y/main.crn"),
+                "arguments { n: Int = 1 }\nexports { value = 1 }\n",
+            )
+            .unwrap();
+            let children = if unreadable_first {
+                ["x", "y"]
+            } else {
+                ["y", "x"]
+            };
+            let mut bridge = "arguments { n: Int = 1 }\n".to_owned();
+            if prohibited_parent {
+                bridge.push_str("exports { value = 1 }\n");
+            }
+            for child in children {
+                bridge.push_str(&format!("let {child} = use {{ source = './{child}' }}\n"));
+            }
+            fs::write(directory.path().join("bridge/main.crn"), bridge).unwrap();
+            fs::write(
+                directory.path().join("main.crn"),
+                "let bridge = use { source = './bridge' }\n",
+            )
+            .unwrap();
+            let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+            let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+            let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
+            let imports = ModuleImportTraversal::load(
+                &parsed,
+                &root,
+                &context,
+                &crate::schema::SchemaRegistry::new(),
+            );
+            let io = imports
+                .prohibitions()
+                .boundary_findings()
+                .filter(|finding| finding.error().to_string().starts_with("IO error:"))
+                .count();
+            assert_eq!(
+                io,
+                usize::from(prohibited_parent),
+                "parent={prohibited_parent}, x_first={unreadable_first}"
+            );
+        }
+    }
+}
+
+#[test]
+fn imported_read_failure_preserves_the_original_io_source() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("main.crn"), [0xff]).unwrap();
+    let error = load_module(
+        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap_err()
+    .into_error();
+    let mut source: &dyn std::error::Error = &error;
+    while let Some(next) = source.source() {
+        source = next;
+    }
+    assert!(
+        source.downcast_ref::<std::io::Error>().is_some(),
+        "IO source lost: {error}"
+    );
+}
+
+#[test]
+fn repeated_routes_inspect_a_directory_once() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("child")).unwrap();
+    fs::write(
+        directory.path().join("child/main.crn"),
+        "arguments { n: Int = 1 }\n",
+    )
+    .unwrap();
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let mut counts = Vec::new();
+    for uses in [
+        "let first = use { source = './child' }\n",
+        "let first = use { source = './child' }\nlet second = use { source = './child' }\n",
+    ] {
+        fs::write(directory.path().join("main.crn"), uses).unwrap();
+        let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
+        super::loader::DIRECTORY_INSPECTIONS.set(0);
+        let _ = ModuleImportTraversal::load(&parsed, &root, &context, &schemas);
+        counts.push(super::loader::DIRECTORY_INSPECTIONS.get());
+    }
+    assert_eq!(
+        counts[0], 1,
+        "the single-use control must inspect its directory"
+    );
+    assert_eq!(
+        counts[0], counts[1],
+        "a second import route must reuse the inspection"
+    );
+}
+
+#[test]
+fn empty_import_rendering_keeps_provider_type_warnings() {
+    let warning = crate::parser::ParseWarning {
+        kind: crate::parser::WarningKind::ProviderSchemasNotLoaded,
+        file: Some("main.crn".into()),
+        line: 1,
+        message: "provider catalog unavailable".into(),
+        span: None,
+    };
+    let error = ModuleError::NoConfigurationFiles {
+        path: crate::paths::DisplayPath::new(Path::new("empty")).unwrap(),
+        import_path: Some("./empty".into()),
+    }
+    .with_provider_type_warnings(vec![warning]);
+    let expected = "Module resolution error: Module not found: ./empty\nwarning: main.crn:1: provider catalog unavailable";
+    assert_eq!(
+        error.display_resolution_relative_to(Path::new(".")),
+        expected
+    );
+    let lines = error
+        .resolution_diagnostic_lines_relative_to(Some(Path::new(".")))
+        .into_iter()
+        .map(|line| match line {
+            DiagnosticLine::Message(message) => message,
+            DiagnosticLine::RootEvidence(evidence) => panic!("unexpected evidence: {evidence:?}"),
+            DiagnosticLine::ModuleEvidence(evidence) => panic!("unexpected evidence: {evidence:?}"),
+            DiagnosticLine::ModuleEvidenceRelative { evidence, root } => {
+                panic!("unexpected evidence: {evidence:?} at {root:?}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(lines, expected);
+}
+
+#[test]
 fn collected_imports_reuse_the_partial_read_and_its_failure() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("child")).unwrap();
@@ -63,21 +206,16 @@ fn collected_imports_reuse_the_partial_read_and_its_failure() {
     let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
     let schemas = crate::schema::SchemaRegistry::new();
     let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
-    let mut imports = ModuleImportTraversal::load(&parsed, &root, &context, &schemas);
-    // A consumer re-read would replace the captured IO failure with this new
-    // expression failure. Only the original reader's two findings may survive.
-    fs::write(
-        directory.path().join("child/unreadable.crn"),
-        "let a = 'present'\nlet broken = a ?? 1\n",
-    )
-    .unwrap();
     crate::validation::deferred_types::with_session_for_test(&context, |session| {
-        let report = resolve_modules_with_collected_imports(
-            parsed.admit(&schemas, session),
-            &root,
-            &[],
-            &mut imports,
-        );
+        let (_imports, captured) = collect_module_imports(parsed.admit(&schemas, session), &root);
+        // A consumer re-read would replace the captured IO failure with this new
+        // expression failure. Only the original reader's two findings may survive.
+        fs::write(
+            directory.path().join("child/unreadable.crn"),
+            "let a = 'present'\nlet broken = a ?? 1\n",
+        )
+        .unwrap();
+        let report = resolve_modules_with_collected_imports(captured, &[]);
         let mut run = crate::test_utils::conversion_validation::<std::convert::Infallible>();
         let ModuleResolutionDiagnosticResult::Unowned { errors } = report.into_validation(&mut run)
         else {
@@ -122,15 +260,10 @@ fn ordinary_unreadable_bridges_keep_main_fail_fast() {
     let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
     let schemas = crate::schema::SchemaRegistry::new();
     let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
-    let mut imports = ModuleImportTraversal::load(&parsed, &root, &context, &schemas);
-    assert_eq!(imports.prohibitions().boundary_findings().count(), 0);
     crate::validation::deferred_types::with_session_for_test(&context, |session| {
-        let report = resolve_modules_with_collected_imports(
-            parsed.admit(&schemas, session),
-            &root,
-            &[],
-            &mut imports,
-        );
+        let (imports, captured) = collect_module_imports(parsed.admit(&schemas, session), &root);
+        assert_eq!(imports.prohibitions().boundary_findings().count(), 0);
+        let report = resolve_modules_with_collected_imports(captured, &[]);
         let mut run = crate::test_utils::conversion_validation::<std::convert::Infallible>();
         let ModuleResolutionDiagnosticResult::Unowned { errors } = report.into_validation(&mut run)
         else {
@@ -151,7 +284,11 @@ fn collected_lint_body_failures_keep_main_unrelated_rejection_gate() {
         fs::create_dir_all(directory.path().join("bridge/child")).unwrap();
         fs::write(
             directory.path().join("bridge/child/main.crn"),
-            "arguments {}\nexports {}\n",
+            if failing_bridge {
+                "arguments {}\nexports {}\n"
+            } else {
+                "arguments { n: Int = 1 }\nexports { value = 1 }\n"
+            },
         )
         .unwrap();
         fs::write(
@@ -169,15 +306,11 @@ fn collected_lint_body_failures_keep_main_unrelated_rejection_gate() {
         let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
         let schemas = crate::schema::SchemaRegistry::new();
         let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
-        let mut imports = ModuleImportTraversal::load(&parsed, &root, &context, &schemas);
-        assert_eq!(imports.prohibitions().boundary_findings().count(), 1);
         crate::validation::deferred_types::with_session_for_test(&context, |session| {
-            let error = resolve_module_template_with_imports(
-                parsed.admit(&schemas, session),
-                &root,
-                &mut imports,
-            )
-            .unwrap_err();
+            let (imports, captured) =
+                collect_module_imports(parsed.admit(&schemas, session), &root);
+            assert_eq!(imports.prohibitions().boundary_findings().count(), 1);
+            let error = resolve_module_template_with_imports(captured).unwrap_err();
             let ordinary = imports.ordinary_resolution_error(error);
             assert_eq!(ordinary.is_some(), failing_bridge);
             if let Some(error) = ordinary {
@@ -6183,7 +6316,10 @@ fn test_load_module_parse_error_cleans_resolving_set() {
             );
             let err = result.unwrap_err();
             assert!(
-                matches!(&err, ModuleError::ParseInFile { path: _, error: _ }),
+                matches!(
+                    err.root_cause(),
+                    ModuleError::ParseInFile { path: _, error: _ }
+                ),
                 "expected located Parse error on first attempt, got: {err:?}"
             );
 
@@ -6193,7 +6329,10 @@ fn test_load_module_parse_error_cleans_resolving_set() {
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(
-                matches!(&err, ModuleError::ParseInFile { path: _, error: _ }),
+                matches!(
+                    err.root_cause(),
+                    ModuleError::ParseInFile { path: _, error: _ }
+                ),
                 "expected located Parse error on second attempt, not CircularImport, got: {err:?}"
             );
 

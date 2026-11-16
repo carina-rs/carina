@@ -1,0 +1,3 @@
+arguments { n: Int = 1 }
+let x = use { source = './x' }
+let y = use { source = './y' }

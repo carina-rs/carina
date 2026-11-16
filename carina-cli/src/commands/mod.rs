@@ -787,8 +787,10 @@ fn validate_and_resolve_configuration<'s>(
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
     // policy checks remain gated by `skip_resource_validation`.
-    let mut module_walk =
-        ModuleWalk::load(&parsed, base_dir, enriched_context.catalog(), ctx.schemas());
+    let (module_walk, captured_imports) = module_resolver::collect_module_imports(
+        parsed.clone().admit(ctx.schemas(), enriched_context),
+        base_dir,
+    );
     for metadata in std::iter::once(&parsed.parser_binding_metadata).chain(
         module_walk
             .iter()
@@ -998,51 +1000,59 @@ fn validate_and_resolve_configuration<'s>(
         }
     };
 
-    // Core's issued traversal owns every reachable prohibition, including
-    // children of failed or unusable bridges. Static checks only present it.
-    if !skip_resource_validation {
-        errors.extend(validate_module_boundaries(&module_walk));
-    }
-
-    // Non-module-call failures do not have a sound expansion path. Authored
-    // module-call findings remain separate so diagnostic resolution can
-    // collect concrete constraint outcomes before all typed findings are
-    // merged below.
-    if errors.ordinary_failure().is_some() {
-        // Dependency diagnostics are independent of unrelated argument-type
-        // failures. The per-argument report preserves every sound result even
-        // when expansion cannot proceed to the final graph check.
-        if !skip_resource_validation {
-            // Resolution mutated the authored input. Seal this stage only on
-            // the early-error path; success uses the shared expanded tree.
-            match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
-                Ok(tree) => {
-                    for finding in carina_core::validation::depends_on::validate_depends_on(
-                        &tree,
-                        &resolved_argument_types,
-                    ) {
-                        match finding.severity {
-                            carina_core::validation::depends_on::Severity::Error => {
-                                errors.push(AppError::DependsOn(Box::new(finding)))
-                            }
-                            carina_core::validation::depends_on::Severity::Warning => {
-                                warnings.push(ConfigurationWarning::Dependency(finding))
+    // The core transition consumes captured inputs. A blocked command cannot
+    // resolve them again; a ready command retains its exact admitted context.
+    let mut stopped =
+        |errors: &mut carina_core::validation::ConversionValidation<AppError>,
+         findings: Vec<carina_core::validation::ModuleCallFinding>| {
+            // Dependency diagnostics are independent of unrelated argument-type
+            // failures. The per-argument report preserves every sound result even
+            // when expansion cannot proceed to the final graph check.
+            if !skip_resource_validation {
+                // Resolution mutated the authored input. Seal this stage only on
+                // the early-error path; success uses the shared expanded tree.
+                match carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()) {
+                    Ok(tree) => {
+                        for finding in carina_core::validation::depends_on::validate_depends_on(
+                            &tree,
+                            &resolved_argument_types,
+                        ) {
+                            match finding.severity {
+                                carina_core::validation::depends_on::Severity::Error => {
+                                    errors.push(AppError::DependsOn(Box::new(finding)))
+                                }
+                                carina_core::validation::depends_on::Severity::Warning => {
+                                    warnings.push(ConfigurationWarning::Dependency(finding))
+                                }
                             }
                         }
                     }
+                    Err(error) => errors.push(AppError::AnalysisInvariant(error)),
                 }
-                Err(error) => errors.push(AppError::AnalysisInvariant(error)),
+            }
+            extend_module_call_errors(errors, findings);
+            ValidationStopped::existing(errors)
+        };
+    let captured_imports = if !skip_resource_validation {
+        match captured_imports.validate_imports(errors, &authored_module_call_findings) {
+            Ok(imports) => imports,
+            Err(blocked) => {
+                errors.extend(validate_module_boundaries(blocked.boundaries()));
+                let stopped = stopped(errors, authored_module_call_findings);
+                extend_module_resolution_errors(errors, blocked.into_residuals(), base_dir);
+                return Err(stopped);
             }
         }
-        extend_module_call_errors(errors, authored_module_call_findings);
-        return Err(ValidationStopped::existing(errors));
+    } else {
+        captured_imports
+    };
+    if errors.ordinary_failure().is_some() {
+        return Err(stopped(errors, authored_module_call_findings));
     }
 
     let module_resolution = module_resolver::resolve_modules_with_collected_imports(
-        parsed.clone().admit(ctx.schemas(), enriched_context),
-        base_dir,
+        captured_imports,
         &authored_module_call_findings,
-        &mut module_walk,
     );
     let mut parsed = match module_resolution.into_validation(errors) {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {

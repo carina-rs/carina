@@ -457,7 +457,7 @@ impl CompletionProvider {
         ) {
             Ok(module) => Some(module),
             Err(carina_core::module_resolver::ModuleLoadError::Partial {
-                prohibitions: _,
+                analysis: _,
                 signature: _,
                 read_failure: _,
             })

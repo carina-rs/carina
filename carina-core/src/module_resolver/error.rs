@@ -70,6 +70,11 @@ impl std::fmt::Display for ImportReadFailure {
         self.source.fmt(formatter)
     }
 }
+impl std::error::Error for ImportReadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 impl ImportReadFailure {
     fn with_owners(
         mut self,
@@ -228,6 +233,8 @@ fn require_outside_module_message(
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
+    #[error("{0}")]
+    CapturedSource(#[source] super::loader::ModuleSourceFailure),
     #[error(transparent)]
     AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
     /// Terminal providerless failure together with every unresolved type site.
@@ -243,7 +250,7 @@ pub enum ModuleError {
     ImportDiagnostics(Box<ImportDiagnostics>),
 
     #[error("{0}")]
-    ImportReadFailure(Box<ImportReadFailure>),
+    ImportReadFailure(#[source] Box<ImportReadFailure>),
 
     /// Resolver failure owned by concrete call sites in the containing
     /// configuration. Nested wrappers preserve the full import chain; editor
@@ -510,6 +517,7 @@ impl ModuleError {
             | Self::UnexpandedModuleTemplate { context: _ }
             | Self::ReferenceType(_)
             | Self::Io(_)
+            | Self::CapturedSource(_)
             | Self::ImportReadFailure(_)
             | Self::Parse(_)
             | Self::ParseInFile { path: _, error: _ }
@@ -532,6 +540,7 @@ impl ModuleError {
 
     pub fn root_evidence(&self) -> Option<&crate::config_loader::RootEvidence> {
         match self {
+            Self::CapturedSource(source) => source.error().root_evidence(),
             Self::ProviderInModule { evidence } | Self::BackendInModule { evidence } => {
                 Some(evidence)
             }
@@ -606,6 +615,7 @@ impl ModuleError {
             return self.display_relative_to(root);
         }
         match self {
+            Self::CapturedSource(source) => source.error().lsp_message_relative_to(root),
             Self::ProviderInModule { evidence: _ } => Self::PROVIDER_IN_MODULE.to_string(),
             Self::BackendInModule { evidence: _ } => Self::BACKEND_IN_MODULE.to_string(),
             Self::ImportProhibitions(error) | Self::AtImport { location: _, error } => {
@@ -689,6 +699,7 @@ impl ModuleError {
     // path or command presents it. Other failures retain main's resolver label.
     fn resolution_prefix(&self) -> String {
         match self {
+            Self::CapturedSource(source) => source.error().resolution_prefix(),
             Self::NoConfigurationFiles {
                 path: _,
                 import_path: _,
@@ -757,6 +768,19 @@ impl ModuleError {
 
     pub fn display_resolution_relative_to(&self, root: &Path) -> String {
         if let Self::NoConfigurationFiles { path, import_path } = self.root_cause() {
+            if let Self::WithProviderTypeWarnings { error, warnings } = self {
+                return format!(
+                    "{}\n{}",
+                    error.display_resolution_relative_to(root),
+                    render_provider_type_warnings(warnings)
+                );
+            }
+            if let Self::OwnedByCalls { calls: _, error } | Self::AtCall { call: _, error } = self {
+                return error.display_resolution_relative_to(root);
+            }
+            if let Self::CapturedSource(source) = self {
+                return source.error().display_resolution_relative_to(root);
+            }
             let requested = import_path
                 .as_deref()
                 .map_or_else(|| path.to_string(), str::to_owned);
@@ -802,6 +826,7 @@ impl ModuleError {
             return vec![plain()];
         }
         match self {
+            Self::CapturedSource(source) => source.error().diagnostic_lines_relative_to(root),
             Self::ProviderInModule { evidence } => vec![
                 DiagnosticLine::Message(Self::PROVIDER_IN_MODULE.to_string()),
                 DiagnosticLine::RootEvidence(evidence.clone()),
@@ -900,6 +925,7 @@ impl ModuleError {
         &self,
     ) -> Option<&crate::parser::Located<super::validation::RequireOutsideModuleDiagnostic>> {
         match self.root_cause() {
+            Self::CapturedSource(source) => source.error().require_outside_module(),
             Self::RequireOutsideModule(finding) => Some(finding),
             Self::WithProviderTypeWarnings {
                 error: _,
@@ -1000,6 +1026,7 @@ impl ModuleError {
 
     pub fn provider_type_warnings(&self) -> Vec<&crate::parser::ParseWarning> {
         match self {
+            Self::CapturedSource(source) => source.error().provider_type_warnings(),
             Self::WithProviderTypeWarnings { warnings, error } => warnings
                 .iter()
                 .chain(error.provider_type_warnings())
@@ -1075,17 +1102,6 @@ impl ModuleError {
             | Self::ExportsInModule => Vec::new(),
         }
     }
-    pub(super) fn with_empty_import_spelling(mut self, requested: &str) -> Self {
-        if let Self::NoConfigurationFiles {
-            import_path,
-            path: _,
-        } = &mut self
-        {
-            *import_path = Some(requested.into());
-        }
-        self
-    }
-
     pub(super) fn from_import_read_failure(source: super::loader::ModuleReadFailure) -> Self {
         Self::ImportReadFailure(Box::new(ImportReadFailure {
             source,
@@ -1099,7 +1115,11 @@ impl ModuleError {
         collected: &super::resolver::CollectedImportProhibitions,
     ) -> Option<Self> {
         match self {
-            Self::ImportProhibitions(_) | Self::AtImport { .. } => None,
+            Self::ImportProhibitions(_)
+            | Self::AtImport {
+                location: _,
+                error: _,
+            } => None,
             Self::ImportReadFailure(failure) => (!collected.contains_read_failure(&failure.source))
                 .then_some(Self::ImportReadFailure(failure)),
             Self::ImportDiagnostics(group) => Self::from_errors(
@@ -1169,6 +1189,7 @@ impl ModuleError {
             | ModuleError::AnalysisInvariant(_)
             | ModuleError::TypeResolution(_)
             | ModuleError::Io(_)
+            | ModuleError::CapturedSource(_)
             | ModuleError::Parse(_)
             | ModuleError::ParseInFile { path: _, error: _ }
             | ModuleError::UnknownArgument {
@@ -1293,6 +1314,7 @@ impl ModuleError {
                 | ModuleError::UnexpandedModuleTemplate { context: _ }
                 | ModuleError::ReferenceType(_)
                 | ModuleError::Io(_)
+                | ModuleError::CapturedSource(_)
                 | ModuleError::ImportReadFailure(_)
                 | ModuleError::Parse(_)
                 | ModuleError::ParseInFile { path: _, error: _ }
@@ -1350,6 +1372,7 @@ impl ModuleError {
     /// Outermost typed source ownership for this failure.
     pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
         match self {
+            Self::CapturedSource(source) => source.error().call_source(),
             Self::ImportReadFailure(failure) => failure.call_source(),
             Self::WithProviderTypeWarnings { error, warnings: _ } => error.call_source(),
             Self::Multiple(_) | Self::ImportDiagnostics(_) | Self::ImportProhibitions(_) => {
@@ -1417,6 +1440,7 @@ impl ModuleError {
 
     pub(crate) fn failing_call(&self) -> Option<&ModuleCallId> {
         match self {
+            Self::CapturedSource(source) => source.error().failing_call(),
             Self::WithProviderTypeWarnings { error, warnings: _ } => error.failing_call(),
             Self::ImportDiagnostics(_errors) => None,
             Self::Multiple(_errors) => None,
@@ -1496,6 +1520,7 @@ impl ModuleError {
                 owners
             };
             match error {
+                ModuleError::CapturedSource(source) => collect(source.error(), owners, findings),
                 ModuleError::Multiple(errors) => {
                     for error in errors.iter() {
                         collect(error, owners, findings);
@@ -1581,6 +1606,7 @@ impl ModuleError {
     /// Semantic leaf after removing typed import ownership wrappers.
     pub fn root_cause(&self) -> &Self {
         match self {
+            Self::CapturedSource(source) => source.error().root_cause(),
             Self::ImportProhibitions(error) | Self::AtImport { location: _, error } => {
                 error.root_cause()
             }
@@ -1653,6 +1679,7 @@ impl ModuleError {
     /// the same stable, project-relative path in either case.
     pub fn display_relative_to(&self, root: &Path) -> String {
         match self {
+            Self::CapturedSource(source) => source.error().display_relative_to(root),
             Self::WithProviderTypeWarnings { error, warnings } => format!(
                 "{}\n{}",
                 error.display_relative_to(root),
@@ -1787,8 +1814,79 @@ impl ModuleError {
         }
     }
 
+    pub(super) fn is_read_failure(&self) -> bool {
+        match self.root_cause() {
+            Self::Io(_) | Self::ImportReadFailure(_) => true,
+            Self::CapturedSource(source) => source.error().is_read_failure(),
+            Self::OwnedByCalls { calls: _, error }
+            | Self::AtCall { call: _, error }
+            | Self::WithProviderTypeWarnings { error, warnings: _ } => error.is_read_failure(),
+            Self::Multiple(errors) => errors.iter().all(Self::is_read_failure),
+            Self::ImportDiagnostics(errors) => errors.iter().all(Self::is_read_failure),
+            Self::ImportProhibitions(_)
+            | Self::AtImport {
+                location: _,
+                error: _,
+            } => false,
+            Self::NoConfigurationFiles {
+                path: _,
+                import_path: _,
+            }
+            | Self::NotFound(_)
+            | Self::CircularImport(_)
+            | Self::MissingArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::InvalidArgumentType {
+                module: _,
+                argument: _,
+                mismatch: _,
+            }
+            | Self::BareStructuralHandleArgument {
+                module: _,
+                argument: _,
+                source_path: _,
+                line: _,
+                message: _,
+            }
+            | Self::ArgumentValueAccess {
+                module: _,
+                source_path: _,
+                line: _,
+                diagnostic: _,
+            }
+            | Self::DroppedConditionalBinding {
+                binding: _,
+                condition: _,
+                source_path: _,
+                line: _,
+            }
+            | Self::UnexpandedModuleTemplate { context: _ }
+            | Self::ReferenceType(_)
+            | Self::AnalysisInvariant(_)
+            | Self::TypeResolution(_)
+            | Self::Parse(_)
+            | Self::ParseInFile { path: _, error: _ }
+            | Self::UnknownArgument {
+                module: _,
+                argument: _,
+            }
+            | Self::UnknownModule(_)
+            | Self::ProviderInModule { evidence: _ }
+            | Self::StateBlockInModule
+            | Self::BackendInModule { evidence: _ }
+            | Self::UpstreamStateInModule
+            | Self::ExportsInModule
+            | Self::Constraint(_)
+            | Self::RequireOutsideModule(_)
+            | Self::NotADirectory { path: _ } => false,
+        }
+    }
+
     fn is_deferred_for_body_rejection(&self) -> bool {
         match self.root_cause() {
+            Self::CapturedSource(source) => source.error().is_deferred_for_body_rejection(),
             Self::WithProviderTypeWarnings { error, warnings: _ } => {
                 error.is_deferred_for_body_rejection()
             }
