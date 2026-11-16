@@ -494,6 +494,10 @@ fn mixed_alternatives_use_current_buffer_instead_of_disk() {
 
 fn assert_depth_findings(last: usize, shallow_first: bool, shape: fixtures::ChainShape) {
     let (fixture, findings) = fixtures::depth_fixture(last, shallow_first, shape);
+    assert_chain_findings(&fixture, &findings);
+}
+
+fn assert_chain_findings(fixture: &tempfile::TempDir, findings: &[Finding]) {
     let engine = engine();
     for file in ["main.crn", "resources.crn"] {
         if !fixture.path().join(file).exists() {
@@ -504,7 +508,7 @@ fn assert_depth_findings(last: usize, shallow_first: bool, shape: fixtures::Chai
             .filter(|finding| finding.site.file == file)
             .copied()
             .collect::<Vec<_>>();
-        let diagnostics = analyze(&engine, &fixture, file);
+        let diagnostics = analyze(&engine, fixture, file);
         assert_findings(fixture.path(), &diagnostics, &expected);
     }
 }
@@ -518,6 +522,69 @@ fn reference_depth_accepts_127_and_rejects_128_in_both_file_shapes_and_orders() 
             }
         }
     }
+}
+
+#[test]
+fn expression_wrapped_chains_accept_127_and_reject_128_in_both_shapes_and_orders() {
+    for shape in fixtures::CHAIN_SHAPES {
+        for wrapper in fixtures::EXPRESSION_WRAPPERS {
+            for shallow_first in [true, false] {
+                for last in [127, 128] {
+                    let (fixture, findings) =
+                        fixtures::expression_depth_fixture(last, shallow_first, shape, wrapper);
+                    assert_chain_findings(&fixture, &findings);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn module_output_chains_accept_63_and_reject_64_in_both_shapes() {
+    for shape in fixtures::CHAIN_SHAPES {
+        for instances in [63, 64] {
+            let (fixture, findings) = fixtures::module_output_depth_fixture(instances, shape);
+            let root_path = fixture.path().join("main.crn");
+            let root = Document::new_with_path(
+                std::fs::read_to_string(&root_path).unwrap(),
+                root_path.clone(),
+                Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+            );
+            let report = engine().analyze_document_set(&root, Some(&root_path), &[]);
+            assert!(report.contains_key(&root_path), "{report:#?}");
+            for (path, diagnostics) in &report {
+                let expected = findings
+                    .iter()
+                    .filter(|finding| fixture.path().join(finding.site.file) == *path)
+                    .copied()
+                    .collect::<Vec<_>>();
+                assert_findings(fixture.path(), diagnostics, &expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn one_reference_in_deep_expressions_is_valid_in_both_shapes() {
+    // The large stack is only for the parser's syntax recursion tracked in #4481.
+    // The secrecy owner uses heap worklists, which the 256/5000-reference chain
+    // tests pin on the default stack.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            for shape in fixtures::CHAIN_SHAPES {
+                for (wrapper, levels) in [
+                    (fixtures::ExpressionWrapper::Builtin, 130),
+                    (fixtures::ExpressionWrapper::List, 70),
+                ] {
+                    let fixture = fixtures::deep_expression_fixture(shape, wrapper, levels);
+                    assert_chain_findings(&fixture, &[]);
+                }
+            }
+        })
+        .expect("failed to spawn deep-expression test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 #[test]

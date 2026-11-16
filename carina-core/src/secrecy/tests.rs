@@ -465,6 +465,14 @@ enum ChainShape {
 const CHAIN_SHAPES: [ChainShape; 2] = [ChainShape::SingleFile, ChainShape::SiblingFiles];
 
 fn resource_chain(last: usize, shape: ChainShape) -> SecrecyReport {
+    resource_chain_with_expression(last, shape, |previous| format!("r{previous}.comment"))
+}
+
+fn resource_chain_with_expression(
+    last: usize,
+    shape: ChainShape,
+    expression: impl Fn(usize) -> String,
+) -> SecrecyReport {
     use std::fmt::Write as _;
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
@@ -473,14 +481,14 @@ fn resource_chain(last: usize, shape: ChainShape) -> SecrecyReport {
     for index in 1..last {
         writeln!(
             resources,
-            "let r{index} = mock.test.Resource {{ name = 'r{index}' comment = r{}.comment }}",
-            index - 1
+            "let r{index} = mock.test.Resource {{ name = 'r{index}' comment = {} }}",
+            expression(index - 1)
         )
         .unwrap();
     }
     let consumer = format!(
-        "let r{last} = mock.test.Resource {{ name = 'r{last}' comment = r{}.comment }}\n",
-        last - 1
+        "let r{last} = mock.test.Resource {{ name = 'r{last}' comment = {} }}\n",
+        expression(last - 1)
     );
     let parsed = match shape {
         ChainShape::SingleFile => {
@@ -532,7 +540,7 @@ fn issue_4474_reference_chain_of_128_reports_the_depth_limit_in_both_shapes() {
         );
         assert_eq!(
             report.findings()[0].message(),
-            "Attribute 'comment': the value follows a chain of 128 or more reference or expression steps from this attribute; Carina cannot decide whether it is a secret."
+            "Attribute 'comment': the value follows a chain of 128 or more references from this attribute; Carina cannot decide whether it is a secret."
         );
         assert!(report.admitted().is_none());
         assert!(report.traversals().iter().any(|stats| {
@@ -602,33 +610,186 @@ fn reference_visits_pin_4096_accepted_and_4097_rejected_including_memo_hits() {
 }
 
 #[test]
-fn depth_keeps_charging_expression_steps_as_well_as_reference_hops() {
-    use std::fmt::Write as _;
-    let mut source =
-        "let r0 = mock.test.Resource { name = 'r0' comment = secret('canary') }\n".to_string();
-    for index in 1..=64 {
-        writeln!(
-            source,
-            "let r{index} = mock.test.Resource {{ name = 'r{index}' comment = upper(r{}.comment) }}",
-            index - 1
-        )
-        .unwrap();
+fn expression_steps_do_not_add_reference_depth_in_both_shapes() {
+    for shape in CHAIN_SHAPES {
+        for wrap_in_list in [false, true] {
+            for last in [127, 128] {
+                let report = resource_chain_with_expression(last, shape, |previous| {
+                    if wrap_in_list {
+                        format!("join('', [r{previous}.comment])")
+                    } else {
+                        format!("upper(r{previous}.comment)")
+                    }
+                });
+                assert_eq!(
+                    report.findings().len(),
+                    usize::from(last == 128),
+                    "{shape:?}, list={wrap_in_list}, {last}: {report:?}"
+                );
+                if last == 128 {
+                    assert_eq!(
+                        report.findings()[0].cause(),
+                        &DerivationError::LimitReached(LimitReached {
+                            kind: LimitKind::Depth
+                        })
+                    );
+                    assert!(report.admitted().is_none());
+                } else {
+                    assert!(!report.is_pending(), "{report:?}");
+                    assert!(report.admitted().is_some());
+                    assert_eq!(
+                        attribute(&report, "r127", "comment"),
+                        Evidence::Leaf(Secrecy::Secret)
+                    );
+                }
+                assert!(report.traversals().iter().any(|stats| {
+                    stats.attribute == "comment"
+                        && stats.maximum_depth == last
+                        && stats.limit == (last == 128).then_some(LimitKind::Depth)
+                }));
+            }
+        }
     }
-    let report = report(&source);
-    // Each upper input and each resource reference costs one depth step.
-    // This is the existing counting rule, not a new limit for function calls.
-    assert_eq!(report.findings().len(), 1, "{report:?}");
-    assert_eq!(
-        report.findings()[0].cause(),
-        &DerivationError::LimitReached(LimitReached {
-            kind: LimitKind::Depth
+}
+
+#[test]
+fn one_reference_in_deep_expressions_does_not_reach_the_depth_limit_in_both_shapes() {
+    // The large stack is only for the parser's syntax recursion tracked in #4481.
+    // The secrecy owner uses heap worklists, which the 256/5000-reference chain
+    // tests pin on the default stack.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            for shape in CHAIN_SHAPES {
+                for (wrap_in_list, levels) in [(false, 130), (true, 70)] {
+                    let report = resource_chain_with_expression(1, shape, |previous| {
+                        (0..levels).fold(format!("r{previous}.comment"), |expression, _| {
+                            if wrap_in_list {
+                                format!("join('', [{expression}])")
+                            } else {
+                                format!("upper({expression})")
+                            }
+                        })
+                    });
+                    assert!(
+                        report.findings().is_empty(),
+                        "{shape:?}, {levels}: {report:?}"
+                    );
+                    assert!(!report.is_pending(), "{report:?}");
+                    assert!(report.admitted().is_some());
+                    assert_eq!(
+                        attribute(&report, "r1", "comment"),
+                        Evidence::Leaf(Secrecy::Secret)
+                    );
+                    assert!(report.traversals().iter().any(|stats| {
+                        stats.attribute == "comment"
+                            && stats.maximum_depth == 1
+                            && stats.reference_visits == 1
+                            && stats.limit.is_none()
+                    }));
+                }
+            }
         })
+        .expect("failed to spawn deep-expression test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn module_output_chain(instances: usize, shape: ChainShape) -> SecrecyReport {
+    use std::fmt::Write as _;
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    let arguments = "arguments { value: String }\n";
+    let output = "attributes { output: String = value }\n";
+    match shape {
+        ChainShape::SingleFile => {
+            std::fs::write(module.join("main.crn"), arguments.to_string() + output).unwrap();
+        }
+        ChainShape::SiblingFiles => {
+            std::fs::write(module.join("arguments.crn"), arguments).unwrap();
+            std::fs::write(module.join("main.crn"), output).unwrap();
+        }
+    }
+    let mut modules = "let template = use { source = './module' }\n".to_string();
+    for index in 1..=instances {
+        let value = if index == 1 {
+            "secret('canary')".to_string()
+        } else {
+            format!("m{}.output", index - 1)
+        };
+        writeln!(modules, "let m{index} = template {{ value = {value} }}").unwrap();
+    }
+    let consumer = format!(
+        "let sink = mock.test.Resource {{ name = 'sink' comment = m{instances}.output }}\n"
     );
-    assert!(report.traversals().iter().any(|stats| {
-        stats.attribute == "comment"
-            && stats.maximum_depth == 128
-            && stats.limit == Some(LimitKind::Depth)
-    }));
+    match shape {
+        ChainShape::SingleFile => {
+            std::fs::write(
+                directory.path().join("main.crn"),
+                "provider mock {}\n".to_string() + &modules + &consumer,
+            )
+            .unwrap();
+        }
+        ChainShape::SiblingFiles => {
+            std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+            std::fs::write(directory.path().join("resources.crn"), modules).unwrap();
+            std::fs::write(directory.path().join("main.crn"), consumer).unwrap();
+        }
+    }
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let context = context();
+    let schemas = schemas();
+    let root = crate::config_loader::parse_directory(&base, &context).unwrap();
+    let expanded = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            root, &base, session, &schemas,
+        )
+        .unwrap()
+    });
+    crate::config_loader::load_buffer_configuration(&expanded, &schemas, &context)
+        .judged()
+        .secrecy()
+        .clone()
+}
+
+#[test]
+fn module_output_chains_accept_63_and_reject_64_in_both_shapes() {
+    for shape in CHAIN_SHAPES {
+        for instances in [63, 64] {
+            let report = module_output_chain(instances, shape);
+            assert_eq!(
+                report.findings().len(),
+                usize::from(instances == 64),
+                "{shape:?}, {instances}: {report:?}"
+            );
+            if instances == 64 {
+                assert_eq!(
+                    report.findings()[0].cause(),
+                    &DerivationError::LimitReached(LimitReached {
+                        kind: LimitKind::Depth
+                    })
+                );
+                assert_eq!(
+                    report.findings()[0].message(),
+                    LimitKind::Depth.message("Attribute", "comment")
+                );
+                assert!(report.admitted().is_none());
+            } else {
+                assert!(!report.is_pending(), "{report:?}");
+                assert!(report.admitted().is_some());
+                assert_eq!(
+                    attribute(&report, "sink", "comment"),
+                    Evidence::Leaf(Secrecy::Secret)
+                );
+            }
+            assert!(report.traversals().iter().any(|stats| {
+                stats.attribute == "comment"
+                    && stats.maximum_depth == instances * 2
+                    && stats.limit == (instances == 64).then_some(LimitKind::Depth)
+            }));
+        }
+    }
 }
 
 #[test]

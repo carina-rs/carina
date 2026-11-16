@@ -1,15 +1,20 @@
-//! Shared CLI/LSP acceptance inputs; no proposed `carina_core::secrecy` API is needed.
+//! Shared CLI/LSP acceptance inputs and core-owned limit messages.
 
 #![allow(dead_code)]
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::LazyLock;
+
+use carina_core::secrecy::LimitKind;
 
 pub const CANARY: &str = "STRUCTURAL_SECRECY_4470_CANARY";
 pub const COALESCE_MESSAGE: &str = "Attribute 'comment': ?? alternatives mix secret and public values; all alternatives must be secret or all public.";
 pub const LOOKUP_MESSAGE: &str = "Attribute 'comment': lookup() alternatives mix secret and public values; all alternatives must be secret or all public.";
-pub const DEPTH_LIMIT_MESSAGE: &str = "Attribute 'comment': the value follows a chain of 128 or more reference or expression steps from this attribute; Carina cannot decide whether it is a secret.";
-pub const VISITS_LIMIT_MESSAGE: &str = "Attribute 'comment': deciding whether the value is a secret needs more than 4096 reference lookups from this attribute.";
+pub static DEPTH_LIMIT_MESSAGE: LazyLock<String> =
+    LazyLock::new(|| LimitKind::Depth.message("Attribute", "comment"));
+pub static VISITS_LIMIT_MESSAGE: LazyLock<String> =
+    LazyLock::new(|| LimitKind::ReferenceVisits.message("Attribute", "comment"));
 pub const LET_COALESCE_MESSAGE: &str = "Let binding 't': ?? alternatives mix secret and public values; all alternatives must be secret or all public.";
 pub const ARGUMENT_COALESCE_MESSAGE: &str = "Module argument 'value': ?? alternatives mix secret and public values; all alternatives must be secret or all public.";
 pub const EXPORT_COALESCE_MESSAGE: &str = "Export 'x': ?? alternatives mix secret and public values; all alternatives must be secret or all public.";
@@ -65,17 +70,17 @@ impl Finding {
         }
     }
 
-    pub const fn depth_limit(line: u32) -> Self {
+    pub fn depth_limit(line: u32) -> Self {
         Self {
             site: Site::attribute(line),
-            message: DEPTH_LIMIT_MESSAGE,
+            message: DEPTH_LIMIT_MESSAGE.as_str(),
         }
     }
 
-    pub const fn visits_limit(line: u32) -> Self {
+    pub fn visits_limit(line: u32) -> Self {
         Self {
             site: Site::attribute(line),
-            message: VISITS_LIMIT_MESSAGE,
+            message: VISITS_LIMIT_MESSAGE.as_str(),
         }
     }
 }
@@ -262,22 +267,75 @@ pub fn depth_fixture(
     shallow_first: bool,
     shape: ChainShape,
 ) -> (tempfile::TempDir, Vec<Finding>) {
+    depth_fixture_with_expression(last, shallow_first, shape, str::to_owned)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ExpressionWrapper {
+    Builtin,
+    List,
+}
+
+pub const EXPRESSION_WRAPPERS: [ExpressionWrapper; 2] =
+    [ExpressionWrapper::Builtin, ExpressionWrapper::List];
+
+impl ExpressionWrapper {
+    fn wrap(self, expression: &str) -> String {
+        match self {
+            Self::Builtin => format!("upper({expression})"),
+            Self::List => format!("join(\"\", [{expression}])"),
+        }
+    }
+}
+
+pub fn expression_depth_fixture(
+    last: usize,
+    shallow_first: bool,
+    shape: ChainShape,
+    wrapper: ExpressionWrapper,
+) -> (tempfile::TempDir, Vec<Finding>) {
+    depth_fixture_with_expression(last, shallow_first, shape, |reference| {
+        wrapper.wrap(reference)
+    })
+}
+
+/// A single reference, with enough expression nesting to expose depth charging
+/// while staying below the parser's separate syntax stack limits (#4481).
+pub fn deep_expression_fixture(
+    shape: ChainShape,
+    wrapper: ExpressionWrapper,
+    levels: usize,
+) -> tempfile::TempDir {
+    depth_fixture_with_expression(1, false, shape, |reference| {
+        (0..levels).fold(reference.to_string(), |expression, _| {
+            wrapper.wrap(&expression)
+        })
+    })
+    .0
+}
+
+fn depth_fixture_with_expression(
+    last: usize,
+    shallow_first: bool,
+    shape: ChainShape,
+    expression: impl Fn(&str) -> String,
+) -> (tempfile::TempDir, Vec<Finding>) {
     let fixture = fixture("limits");
     let path = fixture.path().join("resources.crn");
     let mut resources = std::fs::read_to_string(&path).unwrap();
     for index in 1..last {
         writeln!(
             resources,
-            "let r{index} = mock.test.resource {{\n  name = \"r{index}\"\n  comment = r{}.comment\n}}",
-            index - 1
+            "let r{index} = mock.test.resource {{\n  name = \"r{index}\"\n  comment = {}\n}}",
+            expression(&format!("r{}.comment", index - 1))
         )
         .unwrap();
     }
     let resource_lines = resources.lines().count() as u32;
     let shallow = "let shallow = mock.test.resource { name = \"shallow\" comment = r0.comment }\n";
     let deep = format!(
-        "let r{last} = mock.test.resource {{\n  name = \"r{last}\"\n  comment = r{}.comment\n}}\n",
-        last - 1
+        "let r{last} = mock.test.resource {{\n  name = \"r{last}\"\n  comment = {}\n}}\n",
+        expression(&format!("r{}.comment", last - 1))
     );
     let main = if shallow_first {
         format!("{shallow}{deep}")
@@ -311,11 +369,16 @@ pub fn depth_fixture(
                 file: resource_file,
                 end: Some((
                     line,
-                    format!("  comment = r{}.comment", index - 1).len() as u32 + 1,
+                    format!(
+                        "  comment = {}",
+                        expression(&format!("r{}.comment", index - 1))
+                    )
+                    .len() as u32
+                        + 1,
                 )),
                 ..Site::attribute(line)
             },
-            message: DEPTH_LIMIT_MESSAGE,
+            message: DEPTH_LIMIT_MESSAGE.as_str(),
         });
     }
     if last >= 128 {
@@ -323,10 +386,75 @@ pub fn depth_fixture(
         let mut finding = Finding::depth_limit(line);
         finding.site.end = Some((
             line,
-            format!("  comment = r{}.comment", last - 1).len() as u32 + 1,
+            format!(
+                "  comment = {}",
+                expression(&format!("r{}.comment", last - 1))
+            )
+            .len() as u32
+                + 1,
         ));
         findings.push(finding);
     }
+    (fixture, findings)
+}
+
+/// Each forwarding instance adds an output reference and an argument reference.
+/// The sink follows 126 references with 63 instances and 128 with 64 instances.
+pub fn module_output_depth_fixture(
+    instances: usize,
+    shape: ChainShape,
+) -> (tempfile::TempDir, Vec<Finding>) {
+    assert!(matches!(instances, 63 | 64));
+    let fixture = fixture("limits");
+    let module = fixture.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    let arguments = "arguments { value: String }\n";
+    let output = "attributes { output: String = value }\n";
+    match shape {
+        ChainShape::SingleFile => {
+            std::fs::write(module.join("main.crn"), arguments.to_string() + output).unwrap();
+        }
+        ChainShape::SiblingFiles => {
+            std::fs::write(module.join("arguments.crn"), arguments).unwrap();
+            std::fs::write(module.join("main.crn"), output).unwrap();
+        }
+    }
+    let mut resources = "let template = use { source = './module' }\n".to_string();
+    for index in 1..=instances {
+        let value = if index == 1 {
+            format!("secret(\"{CANARY}\")")
+        } else {
+            format!("m{}.output", index - 1)
+        };
+        writeln!(resources, "let m{index} = template {{ value = {value} }}").unwrap();
+    }
+    let consumer = format!(
+        "let sink = mock.test.resource {{\n  name = \"sink\"\n  comment = m{instances}.output\n}}\n"
+    );
+    let (main, offset) = match shape {
+        ChainShape::SingleFile => {
+            let preamble = single_file_preamble(fixture.path());
+            let offset = (preamble.lines().count() + resources.lines().count()) as u32;
+            std::fs::remove_file(fixture.path().join("resources.crn")).unwrap();
+            (preamble + &resources + &consumer, offset)
+        }
+        ChainShape::SiblingFiles => {
+            std::fs::write(fixture.path().join("resources.crn"), resources).unwrap();
+            (consumer, 0)
+        }
+    };
+    std::fs::write(fixture.path().join("main.crn"), main).unwrap();
+    let findings = if instances == 64 {
+        let line = offset + 3;
+        let mut finding = Finding::depth_limit(line);
+        finding.site.end = Some((
+            line,
+            format!("  comment = m{instances}.output").len() as u32 + 1,
+        ));
+        vec![finding]
+    } else {
+        vec![]
+    };
     (fixture, findings)
 }
 
@@ -390,8 +518,8 @@ pub fn is_secrecy_message(message: &str) -> bool {
     [
         COALESCE_MESSAGE,
         LOOKUP_MESSAGE,
-        DEPTH_LIMIT_MESSAGE,
-        VISITS_LIMIT_MESSAGE,
+        DEPTH_LIMIT_MESSAGE.as_str(),
+        VISITS_LIMIT_MESSAGE.as_str(),
         LET_COALESCE_MESSAGE,
         ARGUMENT_COALESCE_MESSAGE,
         EXPORT_COALESCE_MESSAGE,

@@ -17,8 +17,8 @@ use crate::schema::{SchemaKind, SchemaRegistry};
 pub const MAX_REFERENCE_DEPTH: usize = 128;
 pub const MAX_REFERENCE_VISITS: usize = 4096;
 
-/// References and expression steps share this counting policy.
-fn depth_after_step(depth: usize) -> usize {
+/// Follow one more reference; expression nesting does not add reference depth.
+fn depth_after_reference(depth: usize) -> usize {
     depth + 1
 }
 
@@ -106,6 +106,20 @@ pub struct MixedAlternatives {
 pub enum LimitKind {
     Depth,
     ReferenceVisits,
+}
+
+impl LimitKind {
+    /// Render the core-owned limit message for an authored declaration.
+    pub fn message(self, declaration_kind: &str, name: &str) -> String {
+        match self {
+            Self::Depth => format!(
+                "{declaration_kind} '{name}': the value follows a chain of {MAX_REFERENCE_DEPTH} or more references from this attribute; Carina cannot decide whether it is a secret."
+            ),
+            Self::ReferenceVisits => format!(
+                "{declaration_kind} '{name}': deciding whether the value is a secret needs more than {MAX_REFERENCE_VISITS} reference lookups from this attribute."
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -204,20 +218,9 @@ impl Finding {
                     self.attribute
                 )
             }
-            DerivationError::LimitReached(LimitReached {
-                kind: LimitKind::Depth,
-            }) => format!(
-                "{kind} '{}': the value follows a chain of {MAX_REFERENCE_DEPTH} or more reference or expression steps from this {}; Carina cannot decide whether it is a secret.",
-                self.attribute,
-                kind.to_lowercase()
-            ),
-            DerivationError::LimitReached(LimitReached {
-                kind: LimitKind::ReferenceVisits,
-            }) => format!(
-                "{kind} '{}': deciding whether the value is a secret needs more than {MAX_REFERENCE_VISITS} reference lookups from this {}.",
-                self.attribute,
-                kind.to_lowercase()
-            ),
+            DerivationError::LimitReached(LimitReached { kind: limit }) => {
+                limit.message(kind, &self.attribute)
+            }
             DerivationError::RecursiveFunction(name) => {
                 crate::parser::ParseError::RecursiveFunction(name.clone()).to_string()
             }
@@ -1138,6 +1141,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         C::IntoIter: ExactSizeIterator + DoubleEndedIterator,
     {
         let children = children.into_iter();
+        // Expression operations preserve the number of references followed.
         let child_depth = match &operation {
             Operation::Propagate
             | Operation::List
@@ -1148,8 +1152,10 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             }
             | Operation::If { selected: _ }
             | Operation::Selection { path: _ }
-            | Operation::Key => depth_after_step(depth),
-            Operation::Secret | Operation::Last | Operation::Pending => depth,
+            | Operation::Key
+            | Operation::Secret
+            | Operation::Last
+            | Operation::Pending => depth,
         };
         // Transparent wrappers must pass selection to their result child.
         // A resource argument has no whole-value evidence; its authored path
@@ -1186,7 +1192,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             values.push(None);
             return;
         }
-        let next_depth = depth_after_step(depth);
+        let next_depth = depth_after_reference(depth);
         if next_depth >= MAX_REFERENCE_DEPTH {
             self.max_depth = self.max_depth.max(next_depth);
             self.limit(LimitKind::Depth);

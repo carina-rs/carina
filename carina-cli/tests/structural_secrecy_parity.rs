@@ -1,5 +1,5 @@
 //! Failing-first #4470 acceptance tests through today's CLI binary.
-//! No core secrecy API, backend writes, provider initialization, or apply is needed.
+//! Limit messages are shared with core; validation needs no backend writes or apply.
 
 #[path = "support/structural_secrecy.rs"]
 mod fixtures;
@@ -158,8 +158,8 @@ fn assert_validation(root: &Path, expected: &[Finding]) -> (Value, String) {
         for message in [
             fixtures::COALESCE_MESSAGE,
             fixtures::LOOKUP_MESSAGE,
-            fixtures::DEPTH_LIMIT_MESSAGE,
-            fixtures::VISITS_LIMIT_MESSAGE,
+            fixtures::DEPTH_LIMIT_MESSAGE.as_str(),
+            fixtures::VISITS_LIMIT_MESSAGE.as_str(),
         ] {
             assert!(!human_text.contains(message), "{human_text}");
             assert!(!machine_text.contains(message), "{machine_text}");
@@ -331,6 +331,44 @@ fn reference_depth_limit_accepts_r127_after_shallow_and_deep_cache_roots() {
     for shape in fixtures::CHAIN_SHAPES {
         for shallow_first in [true, false] {
             let (fixture, _) = fixtures::depth_fixture(127, shallow_first, shape);
+            assert_validation(fixture.path(), &[]);
+        }
+    }
+}
+
+#[test]
+fn expression_wrapped_chains_accept_127_and_reject_128_in_both_shapes_and_orders() {
+    for shape in fixtures::CHAIN_SHAPES {
+        for wrapper in fixtures::EXPRESSION_WRAPPERS {
+            for shallow_first in [true, false] {
+                for last in [127, 128] {
+                    let (fixture, findings) =
+                        fixtures::expression_depth_fixture(last, shallow_first, shape, wrapper);
+                    assert_validation(fixture.path(), &findings);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn module_output_chains_accept_63_and_reject_64_in_both_shapes() {
+    for shape in fixtures::CHAIN_SHAPES {
+        for instances in [63, 64] {
+            let (fixture, findings) = fixtures::module_output_depth_fixture(instances, shape);
+            assert_validation(fixture.path(), &findings);
+        }
+    }
+}
+
+#[test]
+fn one_reference_in_deep_expressions_is_valid_in_both_shapes() {
+    for shape in fixtures::CHAIN_SHAPES {
+        for (wrapper, levels) in [
+            (fixtures::ExpressionWrapper::Builtin, 130),
+            (fixtures::ExpressionWrapper::List, 70),
+        ] {
+            let fixture = fixtures::deep_expression_fixture(shape, wrapper, levels);
             assert_validation(fixture.path(), &[]);
         }
     }
