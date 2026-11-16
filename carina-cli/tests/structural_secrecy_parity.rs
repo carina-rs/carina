@@ -178,6 +178,41 @@ fn mixed_coalesce_rejects_both_directions_pending_selected_and_wrapped() {
 }
 
 #[test]
+fn mixed_alternatives_do_not_hide_later_default_tag_diagnostics_or_duplicate_placements() {
+    let fixture = fixtures::mixed_and_default_tag_fixture();
+    for json in [false, true] {
+        let output = validate(fixture.path(), json);
+        let text = output_text(&output);
+        assert_eq!(output.status.code(), Some(1), "{text}");
+        assert!(text.contains(fixtures::COALESCE_MESSAGE), "{text}");
+        assert!(text.contains("default_tags.Owner"), "{text}");
+        if json {
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let errors = report["errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 2, "{report}");
+            assert_eq!(
+                errors
+                    .iter()
+                    .filter(|error| error["message"] == fixtures::COALESCE_MESSAGE)
+                    .count(),
+                1,
+                "{report}"
+            );
+            let distinct = errors
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<HashSet<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                distinct.len(),
+                errors.len(),
+                "placements must be included only once: {report}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mixed_lookup_rejects_known_pending_unused_defaults_and_public_upstream_map() {
     let fixture = fixtures::fixture("mixed_lookup");
     assert_validation(fixture.path(), fixtures::LOOKUP_FINDINGS);
@@ -296,6 +331,51 @@ fn ordinary_root_errors_still_collect_expanded_secrecy_findings() {
             "{report}"
         );
     }
+}
+
+#[test]
+fn failed_validation_reuses_expansion_placements_without_duplicates() {
+    let fixture = fixtures::root_and_module_with_backend_error_fixture();
+    let path = fixture.path().join("main.crn");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("\nlet converted = 'ok' as String\nlet conversion_sink = mock.test.resource { name = converted }\n");
+    std::fs::write(path, text).unwrap();
+    let output = validate(fixture.path(), true);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    let errors = report["errors"].as_array().unwrap();
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error["message"]
+                .as_str()
+                .is_some_and(|message| message
+                    .contains("conversion target must be a loaded named scalar type")))
+            .count(),
+        1,
+        "{report}"
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|error| error["message"]
+                .as_str()
+                .is_some_and(fixtures::is_secrecy_message))
+            .count(),
+        2,
+        "{report}"
+    );
+    assert_eq!(errors.len(), 4, "{report}");
+    assert_eq!(
+        errors
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<HashSet<_>, _>>()
+            .unwrap()
+            .len(),
+        errors.len(),
+        "{report}"
+    );
 }
 
 #[test]

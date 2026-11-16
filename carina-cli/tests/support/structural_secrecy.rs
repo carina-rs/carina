@@ -19,6 +19,18 @@ pub const LET_COALESCE_MESSAGE: &str = "Let binding 't': ?? alternatives mix sec
 pub const ARGUMENT_COALESCE_MESSAGE: &str = "Module argument 'value': ?? alternatives mix secret and public values; all alternatives must be secret or all public.";
 pub const EXPORT_COALESCE_MESSAGE: &str = "Export 'x': ?? alternatives mix secret and public values; all alternatives must be secret or all public.";
 
+pub fn mixed_and_default_tag_fixture() -> tempfile::TempDir {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.path().join("providers.crn"),
+        "provider mock { default_tags = { Owner = seed.identifier } }\n",
+    )
+    .unwrap();
+    std::fs::write(fixture.path().join("backend.crn"), "backend local {}\n").unwrap();
+    std::fs::write(fixture.path().join("main.crn"), format!("let seed = mock.test.resource {{ name = 'seed' }}\nlet sink = mock.test.resource {{ name = 'sink' comment = 'public' ?? secret('{CANARY}') }}\n")).unwrap();
+    fixture
+}
+
 /// One-based Unicode scalar coordinates, matching CLI source metadata.
 /// LSP converts these to zero-based UTF-16 only when rendering.
 #[derive(Clone, Copy, Debug)]

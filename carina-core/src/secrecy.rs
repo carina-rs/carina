@@ -1,8 +1,9 @@
 //! Structural secrecy of authored configuration. Values obtained from providers
 //! and state never enter this owner. Availability and secrecy are separate facts.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use indexmap::IndexMap;
 
@@ -33,8 +34,8 @@ pub enum Secrecy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Evidence {
     Leaf(Secrecy),
-    Map(BTreeMap<String, Evidence>),
-    List(Vec<Evidence>),
+    Map(Arc<BTreeMap<String, Evidence>>),
+    List(Arc<Vec<Evidence>>),
 }
 
 impl Evidence {
@@ -148,6 +149,7 @@ enum DeclarationKind {
     ModuleArgument,
     Output,
     Export,
+    Function,
 }
 impl DeclarationKind {
     fn label(self) -> &'static str {
@@ -157,6 +159,7 @@ impl DeclarationKind {
             Self::ModuleArgument => "Module argument",
             Self::Output => "Output",
             Self::Export => "Export",
+            Self::Function => "Function",
         }
     }
     fn from_syntax(kind: crate::config_loader::DeclarationKind) -> Option<Self> {
@@ -166,12 +169,28 @@ impl DeclarationKind {
             Syntax::Argument => Some(Self::ModuleArgument),
             Syntax::ModuleAttribute => Some(Self::Output),
             Syntax::Export => Some(Self::Export),
-            Syntax::UserFunction | Syntax::ProviderKind => None,
+            Syntax::UserFunction => Some(Self::Function),
+            Syntax::ProviderKind => None,
         }
     }
 }
 
 type DeclarationIdentity = (ExpressionInstance, NodeId);
+
+fn literal_root<B: BindingAddress>(mut source: &ExprValue<ParserPlaceholder, B>) -> bool {
+    loop {
+        match source.secrecy_kind() {
+            ExprKind::Scalar(_) | ExprKind::EmptyInterpolation => return true,
+            ExprKind::Interpolation { .. } if source.secrecy_children().is_empty() => return true,
+            ExprKind::Alias | ExprKind::Parens | ExprKind::Definition
+                if source.secrecy_children().len() == 1 =>
+            {
+                source = &source.secrecy_children()[0]
+            }
+            _ => return false,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Declaration {
@@ -267,6 +286,7 @@ struct TraversalStats {
     pub maximum_depth: usize,
     pub reference_visits: usize,
     pub memo_hits: usize,
+    pub syntax_entries: usize,
     pub limit: Option<LimitKind>,
 }
 
@@ -313,6 +333,7 @@ impl SecrecyReport {
             maximum_depth: walk.max_depth,
             reference_visits: walk.visits,
             memo_hits: walk.memo_hits,
+            syntax_entries: walk.syntax_entries,
             limit: walk
                 .findings
                 .iter()
@@ -390,6 +411,7 @@ enum Source<B: BindingAddress> {
         authored: Box<Thunk<B>>,
         proof: Option<Evidence>,
         boolean: Option<bool>,
+        activation: Arc<FunctionActivation>,
     },
 }
 #[derive(Clone)]
@@ -427,10 +449,7 @@ impl<B: BindingAddress> Environment<B> {
         source: &ExprValue<ParserPlaceholder, B>,
         empty: &Arc<Self>,
     ) -> Arc<Self> {
-        if matches!(
-            source.secrecy_kind(),
-            ExprKind::Scalar(_) | ExprKind::EmptyInterpolation
-        ) {
+        if literal_root(source) {
             return empty.clone();
         }
         Arc::new(Self {
@@ -468,26 +487,202 @@ struct Owner<'a, B: BindingAddress> {
     resources: IndexMap<B, ResourceSource<B>>,
     upstream: HashSet<B>,
     declarations: Vec<Declaration>,
+    declaration_index: OnceLock<DeclarationIndex>,
+    reference_free: RefCell<HashMap<DeclarationIdentity, bool>>,
+    literal_evidence: RefCell<HashMap<DeclarationIdentity, Evidence>>,
+    argument_environments: RefCell<HashMap<B, Arc<Environment<B>>>>,
     empty_environment: Arc<Environment<B>>,
 }
 
+type DeclarationIndex = IndexMap<(crate::parser::SourceFileId, Option<CallSite>), DeclarationSpans>;
+
+#[derive(Default)]
+struct DeclarationSpans {
+    declarations: Vec<usize>,
+    /// A balanced interval index prunes disjoint siblings even when a large
+    /// enclosing let declaration covers all their spans.
+    max_ends: Vec<usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DECLARATION_INDEX_OPERATIONS: std::cell::Cell<(usize, usize)> = const {
+        std::cell::Cell::new((0, 0))
+    };
+    static DECLARATION_SPAN_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl<B: BindingAddress> Owner<'_, B> {
+    fn declaration_index(&self) -> &DeclarationIndex {
+        self.declaration_index.get_or_init(|| {
+            #[cfg(test)]
+            DECLARATION_INDEX_OPERATIONS.with(|counts| {
+                let (builds, lookups) = counts.get();
+                counts.set((builds + 1, lookups));
+            });
+            let mut index = DeclarationIndex::new();
+            for (position, declaration) in self.declarations.iter().enumerate() {
+                index
+                    .entry((
+                        declaration.location.file().clone(),
+                        self.syntax.secrecy_call(&declaration.identity.0).cloned(),
+                    ))
+                    .or_default()
+                    .declarations
+                    .push(position);
+            }
+            for entries in index.values_mut() {
+                entries.declarations.sort_by_key(|position| {
+                    let span = self.declarations[*position].location.span();
+                    (span.start_byte(), std::cmp::Reverse(span.end_byte()))
+                });
+                let base = entries.declarations.len().next_power_of_two();
+                entries.max_ends.resize(base * 2, 0);
+                for (index, position) in entries.declarations.iter().enumerate() {
+                    entries.max_ends[base + index] =
+                        self.declarations[*position].location.span().end_byte();
+                }
+                for index in (1..base).rev() {
+                    entries.max_ends[index] =
+                        entries.max_ends[index * 2].max(entries.max_ends[index * 2 + 1]);
+                }
+            }
+            index
+        })
+    }
+
     fn declaration(
         &self,
         location: &DeclarationLocation,
         call: Option<&CallSite>,
     ) -> Option<&Declaration> {
-        self.declarations
-            .iter()
-            .filter(|declaration| {
-                declaration.location.file() == location.file()
-                    && declaration.location.span().start_byte() <= location.span().start_byte()
-                    && declaration.location.span().end_byte() >= location.span().end_byte()
-                    && self.syntax.secrecy_call(&declaration.identity.0) == call
-            })
-            .min_by_key(|declaration| {
-                declaration.location.span().end_byte() - declaration.location.span().start_byte()
-            })
+        #[cfg(test)]
+        DECLARATION_INDEX_OPERATIONS.with(|counts| {
+            let (builds, lookups) = counts.get();
+            counts.set((builds, lookups + 1));
+        });
+        let entries = self
+            .declaration_index()
+            .get(&(location.file().clone(), call.cloned()))?;
+        let span = location.span();
+        let end = entries.declarations.partition_point(|position| {
+            self.declarations[*position].location.span().start_byte() <= span.start_byte()
+        });
+        let mut best: Option<usize> = None;
+        let mut pending = vec![(1, 0, entries.max_ends.len() / 2)];
+        while let Some((node, left, right)) = pending.pop() {
+            if left >= end || entries.max_ends[node] < span.end_byte() {
+                continue;
+            }
+            if right - left == 1 {
+                #[cfg(test)]
+                DECLARATION_SPAN_CHECKS.with(|checks| checks.set(checks.get() + 1));
+                let position = entries.declarations[left];
+                let rank = |position: usize| {
+                    let span = self.declarations[position].location.span();
+                    (span.end_byte() - span.start_byte(), position)
+                };
+                if best.is_none_or(|previous| rank(position) < rank(previous)) {
+                    best = Some(position);
+                }
+            } else {
+                let middle = (left + right) / 2;
+                pending.push((node * 2, left, middle));
+                pending.push((node * 2 + 1, middle, right));
+            }
+        }
+        best.map(|position| &self.declarations[position])
+    }
+
+    /// Only context-independent syntax may share evidence between attributes.
+    /// This classification is itself memoized, so a large literal is indexed
+    /// once rather than scanned again at each use. Reference memos stay local.
+    fn is_reference_free(&self, expression: &ExprValue<ParserPlaceholder, B>) -> bool {
+        let key = |source: &ExprValue<ParserPlaceholder, B>| {
+            (source.secrecy_instance().clone(), source.node_id())
+        };
+        let mut pending = vec![(expression, false)];
+        let mut known = self.reference_free.borrow_mut();
+        while let Some((source, children_done)) = pending.pop() {
+            if known.contains_key(&key(source)) {
+                continue;
+            }
+            let independent = match source.secrecy_kind() {
+                ExprKind::Binding(binding) => {
+                    !self.resources.contains_key(binding)
+                        && self.syntax.secrecy_definition(binding).is_none()
+                        && self.syntax.secrecy_argument(binding).is_none()
+                        && !self.upstream.contains(binding)
+                        && self.syntax.secrecy_literal(source)
+                }
+                ExprKind::Reference {
+                    binding, attribute, ..
+                } => {
+                    !self.resources.contains_key(binding)
+                        && self.syntax.secrecy_definition(binding).is_none()
+                        && self.syntax.secrecy_argument(binding).is_none()
+                        && !self.upstream.contains(binding)
+                        && self.syntax.secrecy_literal(source)
+                        && self.syntax.secrecy_output(binding, attribute).is_none()
+                }
+                ExprKind::Parameter(_)
+                | ExprKind::UntypedParameter
+                | ExprKind::LoopSlot(_)
+                // Loop instances share authored nodes but retain distinct
+                // condition snapshots. Cache their pure branches, never the
+                // instance-dependent branch selection itself.
+                | ExprKind::If
+                | ExprKind::Function { .. }
+                | ExprKind::Resource { .. }
+                | ExprKind::For
+                | ExprKind::ModuleCall
+                | ExprKind::ProviderDeclaration
+                | ExprKind::RequireCondition(_)
+                | ExprKind::Compose
+                | ExprKind::Unsupported(_) => false,
+                ExprKind::Call(name) => {
+                    self.syntax
+                        .secrecy_function(source.secrecy_instance(), name)
+                        .is_none()
+                        && crate::builtins::Builtin::from_name(name).is_some()
+                }
+                ExprKind::Scalar(_)
+                | ExprKind::EmptyInterpolation
+                | ExprKind::Secret
+                | ExprKind::List
+                | ExprKind::Map(_)
+                | ExprKind::Coalesce
+                | ExprKind::Sequence
+                | ExprKind::Sink { .. }
+                | ExprKind::Access(_)
+                | ExprKind::Alias
+                | ExprKind::Parens
+                | ExprKind::Definition
+                | ExprKind::Convert { .. }
+                | ExprKind::NestedBlock { .. }
+                | ExprKind::Wait
+                | ExprKind::Iterable
+                | ExprKind::Interpolation { .. }
+                | ExprKind::Integer { .. }
+                | ExprKind::Boolean
+                | ExprKind::DynamicAccess
+                | ExprKind::Declaration
+                | ExprKind::Element => true,
+            };
+            if !independent {
+                known.insert(key(source), false);
+            } else if children_done {
+                let independent = source
+                    .secrecy_children()
+                    .iter()
+                    .all(|child| known[&key(child)]);
+                known.insert(key(source), independent);
+            } else {
+                pending.push((source, true));
+                pending.extend(source.secrecy_children().iter().map(|child| (child, false)));
+            }
+        }
+        known[&key(expression)]
     }
 }
 
@@ -507,6 +702,10 @@ where
         schemas,
         resources: IndexMap::new(),
         declarations: Vec::new(),
+        declaration_index: OnceLock::new(),
+        reference_free: RefCell::default(),
+        literal_evidence: RefCell::default(),
+        argument_environments: RefCell::default(),
         empty_environment: Arc::default(),
         upstream: file
             .upstream_states
@@ -572,6 +771,17 @@ where
             }
         }
     }
+    for function in syntax.secrecy_functions() {
+        if let ExprKind::Function { name, signature: _ } = function.secrecy_kind() {
+            owner.declarations.push(Declaration {
+                identity: (function.secrecy_instance().clone(), function.node_id()),
+                kind: DeclarationKind::Function,
+                name: name.clone(),
+                location: function.location().clone(),
+            });
+        }
+    }
+    owner.declaration_index();
     for resource in file
         .iter_all_resources()
         .chain(file.deferred_for_phase.analysis_resource_refs())
@@ -716,10 +926,7 @@ where
             {
                 // This pass only adds diagnostics from discarded syntax.
                 // Literal leaves cannot add findings or pending evidence.
-                if matches!(
-                    value.secrecy_kind(),
-                    ExprKind::Scalar(_) | ExprKind::EmptyInterpolation
-                ) {
+                if literal_root(value) {
                     continue;
                 }
                 report.inspect_source(
@@ -844,6 +1051,12 @@ enum Work<B: BindingAddress> {
         depth: usize,
         errors: usize,
         max_before: usize,
+        pending_before: usize,
+    },
+    Literal {
+        identity: DeclarationIdentity,
+        errors: usize,
+        path: Vec<PathSegment>,
     },
     Function {
         identity: (ExpressionInstance, NodeId),
@@ -870,6 +1083,12 @@ enum Work<B: BindingAddress> {
     ValueFunction {
         location: DeclarationLocation,
     },
+    Activation(FunctionActivation),
+}
+#[derive(Clone, Default)]
+struct FunctionActivation {
+    syntax: HashSet<DeclarationIdentity>,
+    values: HashSet<DeclarationLocation>,
 }
 enum Operation {
     Propagate,
@@ -889,19 +1108,52 @@ enum Operation {
     },
     Key,
     Pending,
+    Concat,
+    Flatten(Option<Vec<bool>>),
+    Keys,
+    Values,
+    Length,
+    Project(Option<String>),
 }
 
 fn builtin_operation(
     name: &str,
     origin: Option<(DeclarationLocation, Option<CallSite>)>,
+    accessor: Option<String>,
+    flatten_non_lists: Option<Vec<bool>>,
 ) -> Operation {
-    match name {
-        "secret" | "decrypt" => Operation::Secret,
-        "lookup" => Operation::Alternatives {
-            operator: Alternatives::Lookup,
-            origin,
+    use crate::builtins::{Builtin, BuiltinFunction};
+    let Some(builtin) = Builtin::from_name(name) else {
+        return Operation::Pending;
+    };
+    match builtin {
+        Builtin::Secret => Operation::Secret,
+        Builtin::Function(function) => match function {
+            BuiltinFunction::decrypt => Operation::Secret,
+            BuiltinFunction::lookup => Operation::Alternatives {
+                operator: Alternatives::Lookup,
+                origin,
+            },
+            BuiltinFunction::concat => Operation::Concat,
+            BuiltinFunction::flatten => Operation::Flatten(flatten_non_lists),
+            BuiltinFunction::keys => Operation::Keys,
+            BuiltinFunction::values => Operation::Values,
+            BuiltinFunction::length => Operation::Length,
+            BuiltinFunction::map => Operation::Project(accessor),
+            // Scalar builtins unwrap direct Secret inputs and protect the
+            // entire result (builtins::evaluate_secret_arguments). join also
+            // protects the result when any list element is Secret.
+            BuiltinFunction::cidr_subnet
+            | BuiltinFunction::env
+            | BuiltinFunction::join
+            | BuiltinFunction::lower
+            | BuiltinFunction::max
+            | BuiltinFunction::min
+            | BuiltinFunction::replace
+            | BuiltinFunction::split
+            | BuiltinFunction::trim
+            | BuiltinFunction::upper => Operation::Propagate,
         },
-        _ => Operation::Propagate,
     }
 }
 
@@ -923,13 +1175,15 @@ struct Walk<'a, B: BindingAddress> {
     visits: usize,
     #[cfg(test)]
     memo_hits: usize,
+    #[cfg(test)]
+    syntax_entries: usize,
     max_depth: usize,
     // Visit/depth accounting is private to this declaration walk.
     memo: HashMap<ReferenceKey<B>, Memo>,
     active_references: HashSet<ReferenceKey<B>>,
-    active_functions: HashSet<(ExpressionInstance, NodeId)>,
-    active_value_functions: HashSet<DeclarationLocation>,
+    activation: FunctionActivation,
     pending_validation: bool,
+    pending_events: usize,
     limited: bool,
 }
 impl<'a, B: BindingAddress> Walk<'a, B> {
@@ -944,16 +1198,21 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             visits: 0,
             #[cfg(test)]
             memo_hits: 0,
+            #[cfg(test)]
+            syntax_entries: 0,
             max_depth: 0,
             memo: HashMap::new(),
             active_references: HashSet::new(),
-            active_functions: HashSet::new(),
-            active_value_functions: HashSet::new(),
+            activation: FunctionActivation::default(),
             pending_validation: false,
+            pending_events: 0,
             limited: false,
         }
     }
     fn in_source(mut self, source: &ExprValue<ParserPlaceholder, B>) -> Self {
+        if literal_root(source) {
+            return self;
+        }
         self.call_site = self
             .owner
             .syntax
@@ -1007,10 +1266,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
     fn run(&mut self, thunk: Thunk<B>) -> Option<Evidence> {
         if let Source::Syntax(expression) = &thunk.source
             && thunk.environment.nodes.is_empty()
-            && matches!(
-                expression.secrecy_kind(),
-                ExprKind::Scalar(_) | ExprKind::EmptyInterpolation
-            )
+            && literal_root(expression)
         {
             return Some(Evidence::Leaf(Secrecy::Public));
         }
@@ -1025,8 +1281,74 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                 return None;
             }
             match item {
-                Work::Enter { thunk, path, depth } => {
-                    self.enter(thunk, path, depth, &mut work, &mut values)
+                Work::Enter {
+                    mut thunk,
+                    path,
+                    depth,
+                } => {
+                    // Tail-enter transparent syntax instead of scheduling a
+                    // finish frame for every parser wrapper. Substituted
+                    // parameter nodes retain their own dispatch below.
+                    while let Source::Syntax(expression) = &thunk.source {
+                        if !thunk.environment.nodes.contains_key(&(
+                            expression.secrecy_instance().clone(),
+                            expression.node_id(),
+                        )) && matches!(
+                            expression.secrecy_kind(),
+                            ExprKind::Alias
+                                | ExprKind::Parens
+                                | ExprKind::Definition
+                                | ExprKind::Declaration
+                        ) && expression.secrecy_children().len() == 1
+                        {
+                            thunk.source = Source::Syntax(expression.secrecy_children()[0].clone());
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Source::Syntax(expression) = &thunk.source
+                        && thunk.environment.nodes.is_empty()
+                        && literal_root(expression)
+                    {
+                        values.push(Some(Evidence::Leaf(Secrecy::Public)));
+                        continue;
+                    }
+                    if let Source::Syntax(expression) = &thunk.source
+                        && self.owner.is_reference_free(expression)
+                    {
+                        let identity =
+                            (expression.secrecy_instance().clone(), expression.node_id());
+                        if let Some(evidence) = self.owner.literal_evidence.borrow().get(&identity)
+                        {
+                            values.push(evidence.select(&path));
+                            continue;
+                        }
+                        work.push(Work::Literal {
+                            identity,
+                            errors: self.findings.len(),
+                            path,
+                        });
+                        self.enter(thunk, Vec::new(), depth, &mut work, &mut values);
+                    } else {
+                        self.enter(thunk, path, depth, &mut work, &mut values);
+                    }
+                }
+                Work::Literal {
+                    identity,
+                    errors,
+                    path,
+                } => {
+                    if let Some(value) = values.last_mut() {
+                        if errors == self.findings.len()
+                            && let Some(evidence) = value.as_ref()
+                        {
+                            self.owner
+                                .literal_evidence
+                                .borrow_mut()
+                                .insert(identity, evidence.clone());
+                        }
+                        *value = value.as_ref().and_then(|evidence| evidence.select(&path));
+                    }
                 }
                 Work::Finish {
                     operation,
@@ -1043,10 +1365,11 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     depth,
                     errors,
                     max_before,
+                    pending_before,
                 } => {
                     self.active_references.remove(&key);
                     if errors == self.findings.len()
-                        && !self.pending_validation
+                        && pending_before == self.pending_events
                         && let Some(Some(evidence)) = values.last()
                     {
                         self.memo.insert(
@@ -1060,7 +1383,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     self.max_depth = self.max_depth.max(max_before);
                 }
                 Work::Function { identity } => {
-                    self.active_functions.remove(&identity);
+                    self.activation.syntax.remove(&identity);
                 }
                 Work::Call {
                     function,
@@ -1072,6 +1395,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     depth,
                 } => {
                     let start = values.len() - count;
+                    let activation = Arc::new(self.activation.clone());
                     let arguments = values
                         .drain(start..)
                         .enumerate()
@@ -1080,6 +1404,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                                 authored: Box::new(authored_arguments[index].clone()),
                                 proof: value,
                                 boolean: booleans[index],
+                                activation: activation.clone(),
                             },
                             environment: environment.clone(),
                         })
@@ -1123,8 +1448,9 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     );
                 }
                 Work::ValueFunction { location } => {
-                    self.active_value_functions.remove(&location);
+                    self.activation.values.remove(&location);
                 }
+                Work::Activation(activation) => self.activation = activation,
             }
         }
         values.pop().flatten()
@@ -1156,6 +1482,12 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             | Operation::Secret
             | Operation::Last
             | Operation::Pending => depth,
+            Operation::Concat
+            | Operation::Flatten(_)
+            | Operation::Keys
+            | Operation::Values
+            | Operation::Length
+            | Operation::Project(_) => depth,
         };
         // Transparent wrappers must pass selection to their result child.
         // A resource argument has no whole-value evidence; its authored path
@@ -1234,6 +1566,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         if !self.active_references.insert(key.clone()) {
             // Existing binding admission owns reference-cycle diagnostics.
             self.pending_validation = true;
+            self.pending_events += 1;
             values.push(None);
             return;
         }
@@ -1248,6 +1581,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             }
             ReferenceSource::Pending => {
                 self.pending_validation = true;
+                self.pending_events += 1;
                 self.active_references.remove(&key);
                 values.push(None);
             }
@@ -1259,6 +1593,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     depth: next_depth,
                     errors: self.findings.len(),
                     max_before,
+                    pending_before: self.pending_events,
                 });
                 work.push(Work::Enter {
                     thunk: source,
@@ -1291,12 +1626,20 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                 authored,
                 proof,
                 boolean: _,
+                activation,
             } => {
                 if let Some(proof) = proof {
                     values.push(proof.select(&path));
                 } else if path.is_empty() {
                     values.push(None);
                 } else {
+                    // The argument was authored in the caller. Re-enter it
+                    // under that activation, then restore the callee before
+                    // resuming its remaining work.
+                    work.push(Work::Activation(std::mem::replace(
+                        &mut self.activation,
+                        (*activation).clone(),
+                    )));
                     work.push(Work::Enter {
                         thunk: *authored,
                         path,
@@ -1305,6 +1648,10 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                 }
             }
             Source::Syntax(expression) => {
+                #[cfg(test)]
+                {
+                    self.syntax_entries += 1;
+                }
                 if let Some(parameter) = environment
                     .nodes
                     .get(&(expression.secrecy_instance().clone(), expression.node_id()))
@@ -1435,6 +1782,20 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                                         .secrecy_call(expression.secrecy_instance())
                                         .cloned(),
                                 )),
+                                (builtin == "map")
+                                    .then(|| {
+                                        arguments
+                                            .first()
+                                            .and_then(|argument| self.known_string(argument))
+                                    })
+                                    .flatten(),
+                                (builtin == "flatten")
+                                    .then(|| {
+                                        arguments
+                                            .first()
+                                            .and_then(|argument| self.non_list_members(argument))
+                                    })
+                                    .flatten(),
                             );
                             self.schedule(operation, arguments, path, depth, work);
                         }
@@ -1611,6 +1972,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     authored,
                     proof: _,
                     boolean,
+                    activation: _,
                 } => {
                     if let Some(boolean) = boolean {
                         return Some(*boolean);
@@ -1713,6 +2075,129 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         }
     }
 
+    fn non_list_members(&self, input: &Thunk<B>) -> Option<Vec<bool>> {
+        let mut thunk = input.clone();
+        let mut seen = HashSet::new();
+        loop {
+            match &thunk.source {
+                Source::Argument { authored, .. } => thunk = (**authored).clone(),
+                Source::Syntax(expression) => {
+                    if !seen.insert((
+                        thunk.environment.id,
+                        expression.secrecy_instance().clone(),
+                        expression.node_id(),
+                    )) {
+                        return None;
+                    }
+                    if let Some(parameter) = thunk
+                        .environment
+                        .nodes
+                        .get(&(expression.secrecy_instance().clone(), expression.node_id()))
+                    {
+                        thunk = parameter.clone();
+                    } else if matches!(
+                        expression.secrecy_kind(),
+                        ExprKind::Alias
+                            | ExprKind::Parens
+                            | ExprKind::Definition
+                            | ExprKind::Declaration
+                    ) && expression.secrecy_children().len() == 1
+                    {
+                        thunk.source = Source::Syntax(expression.secrecy_children()[0].clone());
+                    } else if let ExprKind::Binding(binding) = expression.secrecy_kind() {
+                        thunk.source =
+                            Source::Syntax(self.owner.syntax.secrecy_definition(binding)?.clone());
+                    } else if matches!(expression.secrecy_kind(), ExprKind::List) {
+                        return Some(
+                            expression
+                                .secrecy_children()
+                                .iter()
+                                .map(|item| self.owner.syntax.secrecy_non_list(item))
+                                .collect(),
+                        );
+                    } else {
+                        return None;
+                    }
+                }
+                Source::Value(value) => {
+                    let Value::Concrete(ConcreteValue::List(items)) = value.as_ref() else {
+                        return None;
+                    };
+                    return Some(
+                        items
+                            .iter()
+                            .map(|item| {
+                                matches!(
+                                    item,
+                                    Value::Concrete(
+                                        ConcreteValue::String(_)
+                                            | ConcreteValue::Int(_)
+                                            | ConcreteValue::Float(_)
+                                            | ConcreteValue::Bool(_)
+                                            | ConcreteValue::Duration(_)
+                                            | ConcreteValue::Map(_)
+                                            | ConcreteValue::EnumIdentifier(_)
+                                            | ConcreteValue::CanonicalEnum(_)
+                                    )
+                                )
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn known_string(&self, input: &Thunk<B>) -> Option<String> {
+        let mut thunk = input.clone();
+        let mut seen = HashSet::new();
+        loop {
+            match &thunk.source {
+                Source::Argument { authored, .. } => thunk = (**authored).clone(),
+                Source::Value(value) => match value.as_ref() {
+                    Value::Concrete(ConcreteValue::String(value)) => {
+                        return Some(value.expose_plaintext().to_owned());
+                    }
+                    Value::Deferred(DeferredValue::Placeholder(
+                        ParserPlaceholder::FnParam { name } | ParserPlaceholder::FnLocal { name },
+                    )) => {
+                        thunk = thunk.environment.names.get(name)?.clone();
+                    }
+                    _ => return None,
+                },
+                Source::Syntax(expression) => {
+                    let identity = (
+                        thunk.environment.id,
+                        expression.secrecy_instance().clone(),
+                        expression.node_id(),
+                    );
+                    if !seen.insert(identity) {
+                        return None;
+                    }
+                    if let Some(parameter) = thunk
+                        .environment
+                        .nodes
+                        .get(&(expression.secrecy_instance().clone(), expression.node_id()))
+                    {
+                        thunk = parameter.clone();
+                    } else if matches!(
+                        expression.secrecy_kind(),
+                        ExprKind::Alias
+                            | ExprKind::Parens
+                            | ExprKind::Definition
+                            | ExprKind::Sequence
+                            | ExprKind::Declaration
+                    ) {
+                        thunk.source =
+                            Source::Syntax(expression.secrecy_children().last()?.clone());
+                    } else {
+                        return self.owner.syntax.secrecy_string(expression);
+                    }
+                }
+            }
+        }
+    }
+
     fn function(
         &mut self,
         function: ExprValue<ParserPlaceholder, B>,
@@ -1772,7 +2257,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         let ExprKind::Function { name, signature } = function.secrecy_kind() else {
             unreachable!("function syntax")
         };
-        if !self.active_functions.insert(identity.clone()) {
+        if !self.activation.syntax.insert(identity.clone()) {
             self.finding(
                 function.location().clone(),
                 self.owner
@@ -1810,7 +2295,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         }
         let Some(body) = function.secrecy_function_body() else {
             values.push(None);
-            self.active_functions.remove(&identity);
+            self.activation.syntax.remove(&identity);
             return;
         };
         let mut children = defaults;
@@ -1931,7 +2416,24 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         .filter_map(|argument| argument.value())
                         .map(thunk)
                         .collect::<Vec<_>>();
-                    let operation = builtin_operation(name.as_str(), None);
+                    let operation = builtin_operation(
+                        name.as_str(),
+                        None,
+                        (*name == crate::builtins::BuiltinFunction::map)
+                            .then(|| {
+                                children
+                                    .first()
+                                    .and_then(|argument| self.known_string(argument))
+                            })
+                            .flatten(),
+                        (*name == crate::builtins::BuiltinFunction::flatten)
+                            .then(|| {
+                                children
+                                    .first()
+                                    .and_then(|argument| self.non_list_members(argument))
+                            })
+                            .flatten(),
+                    );
                     self.schedule(operation, children, path, depth, work);
                 }
                 DeferredValue::ResolvedFunctionCall {
@@ -2058,7 +2560,8 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             values,
         } = context;
         let location = function.body.location.clone();
-        if !self.active_value_functions.insert(location.clone()) {
+        let activation = Arc::new(self.activation.clone());
+        if !self.activation.values.insert(location.clone()) {
             self.finding(
                 location,
                 None,
@@ -2079,6 +2582,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         authored: Box::new(authored_arguments[index].clone()),
                         proof: value.clone(),
                         boolean: booleans[index],
+                        activation: activation.clone(),
                     },
                     environment: environment.clone(),
                 })
@@ -2119,6 +2623,108 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         match operation {
             Operation::Secret => Some(Evidence::Leaf(Secrecy::Secret)),
             Operation::Pending => None,
+            Operation::Length => match children.first()?.as_ref()? {
+                Evidence::Map(_) | Evidence::List(_) => Some(Evidence::Leaf(Secrecy::Public)),
+                Evidence::Leaf(secrecy) => Some(Evidence::Leaf(*secrecy)),
+            },
+            Operation::Keys => match children.first()?.as_ref()? {
+                Evidence::Map(fields) => Some(Evidence::List(Arc::new(vec![
+                    Evidence::Leaf(
+                        Secrecy::Public
+                    );
+                    fields.len()
+                ]))),
+                Evidence::Leaf(secrecy) => Some(Evidence::Leaf(*secrecy)),
+                Evidence::List(_) => None,
+            },
+            Operation::Values => match children.first()?.as_ref()? {
+                Evidence::Map(fields) => {
+                    Some(Evidence::List(Arc::new(fields.values().cloned().collect())))
+                }
+                Evidence::Leaf(secrecy) => Some(Evidence::Leaf(*secrecy)),
+                Evidence::List(_) => None,
+            },
+            Operation::Concat => {
+                // with_secret_values protects the whole result only for a
+                // direct wrapper. Secret members retain their own positions.
+                if children
+                    .iter()
+                    .any(|child| matches!(child, Some(Evidence::Leaf(Secrecy::Secret))))
+                {
+                    return Some(Evidence::Leaf(Secrecy::Secret));
+                }
+                let [Some(items), Some(base)] = children else {
+                    return None;
+                };
+                match (items, base) {
+                    (Evidence::List(items), Evidence::List(base)) => Some(Evidence::List(
+                        Arc::new(base.iter().chain(items.iter()).cloned().collect()),
+                    )),
+                    (items, base)
+                        if items.secrecy() == Secrecy::Public
+                            && base.secrecy() == Secrecy::Public =>
+                    {
+                        Some(Evidence::Leaf(Secrecy::Public))
+                    }
+                    _ => None,
+                }
+            }
+            Operation::Flatten(non_lists) => match children.first()?.as_ref()? {
+                Evidence::List(items)
+                    if items.iter().enumerate().any(|(index, item)| {
+                        matches!(item, Evidence::Leaf(Secrecy::Public))
+                            && !non_lists
+                                .as_ref()
+                                .and_then(|items| items.get(index))
+                                .copied()
+                                .unwrap_or(false)
+                    }) =>
+                {
+                    // A uniform Public reference may itself be a list of
+                    // unknown length. It cannot occupy an invented single
+                    // position before a Secret member.
+                    (aggregate(items.iter()) == Secrecy::Public)
+                        .then_some(Evidence::Leaf(Secrecy::Public))
+                }
+                Evidence::List(items) => Some(Evidence::List(Arc::new(
+                    items
+                        .iter()
+                        .flat_map(|item| match item {
+                            Evidence::List(items) => items.as_ref().clone(),
+                            item => vec![item.clone()],
+                        })
+                        .collect(),
+                ))),
+                Evidence::Leaf(secrecy) => Some(Evidence::Leaf(*secrecy)),
+                Evidence::Map(_) => None,
+            },
+            Operation::Project(accessor) => {
+                if children
+                    .iter()
+                    .any(|child| matches!(child, Some(Evidence::Leaf(Secrecy::Secret))))
+                {
+                    return Some(Evidence::Leaf(Secrecy::Secret));
+                }
+                let field = accessor?.strip_prefix('.')?.to_owned();
+                let select = |value: &Evidence| {
+                    value.select(&[PathSegment::Field {
+                        name: field.clone(),
+                    }])
+                };
+                match children.get(1)?.as_ref()? {
+                    Evidence::List(items) => items
+                        .iter()
+                        .map(select)
+                        .collect::<Option<Vec<_>>>()
+                        .map(|items| Evidence::List(Arc::new(items))),
+                    Evidence::Map(fields) => fields
+                        .iter()
+                        .map(|(key, value)| select(value).map(|value| (key.clone(), value)))
+                        .collect::<Option<BTreeMap<_, _>>>()
+                        .map(|fields| Evidence::Map(Arc::new(fields))),
+                    Evidence::Leaf(secrecy) => Some(Evidence::Leaf(*secrecy)),
+                }
+            }
             Operation::Key => match children.first_mut()?.take()? {
                 Evidence::Leaf(secrecy) => Some(Evidence::Leaf(secrecy)),
                 Evidence::Map(_) | Evidence::List(_) => Some(Evidence::Leaf(Secrecy::Public)),
@@ -2126,8 +2732,8 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             Operation::Selection { path } => {
                 let base = children.first_mut()?.take()?;
                 let candidates = match base {
-                    Evidence::Map(fields) => fields.into_values().collect(),
-                    Evidence::List(elements) => elements,
+                    Evidence::Map(fields) => fields.values().cloned().collect(),
+                    Evidence::List(elements) => Arc::unwrap_or_clone(elements),
                     Evidence::Leaf(secrecy) => return Some(Evidence::Leaf(secrecy)),
                 };
                 let candidates = candidates
@@ -2156,13 +2762,13 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                 .iter_mut()
                 .map(Option::take)
                 .collect::<Option<Vec<_>>>()
-                .map(Evidence::List),
+                .map(|values| Evidence::List(Arc::new(values))),
             Operation::Map(keys) => keys
                 .into_iter()
                 .zip(children.iter_mut())
                 .map(|(key, value)| value.take().map(|value| (key, value)))
                 .collect::<Option<BTreeMap<_, _>>>()
-                .map(Evidence::Map),
+                .map(|values| Evidence::Map(Arc::new(values))),
             Operation::Last => children.last_mut()?.take(),
             Operation::If { selected } => match selected {
                 Some(index) => children.get_mut(index)?.take(),
@@ -2175,13 +2781,19 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                 }
             },
             Operation::Alternatives { operator, origin } => {
+                // lookup's key participates in the runtime wrapper, while D2
+                // still checks only map members and the authored default.
+                let protects_result = operator == Alternatives::Lookup
+                    && children
+                        .iter()
+                        .any(|child| matches!(child, Some(Evidence::Leaf(Secrecy::Secret))));
                 let alternatives = match operator {
                     Alternatives::Coalesce => children.iter_mut().map(Option::take).collect(),
                     Alternatives::Lookup => {
                         let mut alternatives = Vec::new();
                         match children.first_mut().and_then(Option::take) {
                             Some(Evidence::Map(fields)) => {
-                                alternatives.extend(fields.into_values().map(Some))
+                                alternatives.extend(fields.values().cloned().map(Some))
                             }
                             Some(Evidence::Leaf(secrecy)) => {
                                 alternatives.push(Some(Evidence::Leaf(secrecy)))
@@ -2207,7 +2819,11 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         }
                         None
                     }
-                    Agreement::Known(evidence) if complete => Some(evidence),
+                    Agreement::Known(evidence) if complete => Some(if protects_result {
+                        Evidence::Leaf(Secrecy::Secret)
+                    } else {
+                        evidence
+                    }),
                     Agreement::Known(_) | Agreement::Pending => None,
                 }
             }
@@ -2232,13 +2848,25 @@ impl<B: BindingAddress> Owner<'_, B> {
             return ReferenceSource::Public;
         }
         if let Some(value) = self.syntax.secrecy_argument(binding) {
+            // One fresh identity per authored argument source. Repeated
+            // encounters still share that source's per-attribute reference
+            // memo, without aliasing the empty environment (id zero).
+            let environment = self
+                .argument_environments
+                .borrow_mut()
+                .entry(binding.clone())
+                .or_insert_with(|| {
+                    Arc::new(Environment {
+                        id: next_environment(),
+                        module: self.syntax.secrecy_argument_module(binding).cloned(),
+                        ..Environment::default()
+                    })
+                })
+                .clone();
             return ReferenceSource::Source(
                 Thunk {
                     source: Source::Value(Arc::new(value.clone())),
-                    environment: Arc::new(Environment {
-                        module: self.syntax.secrecy_argument_module(binding).cloned(),
-                        ..Environment::default()
-                    }),
+                    environment,
                 },
                 path.to_vec(),
             );
@@ -2374,7 +3002,7 @@ fn pair_agreement(left: &Evidence, right: &Evidence) -> Agreement {
     match (left, right) {
         (Evidence::Map(left), Evidence::Map(right)) if left.keys().eq(right.keys()) => {
             let mut common = BTreeMap::new();
-            for (key, left) in left {
+            for (key, left) in left.iter() {
                 match pair_agreement(left, &right[key]) {
                     Agreement::Known(value) => {
                         common.insert(key.clone(), value);
@@ -2383,18 +3011,18 @@ fn pair_agreement(left: &Evidence, right: &Evidence) -> Agreement {
                     Agreement::Pending => return Agreement::Pending,
                 }
             }
-            Agreement::Known(Evidence::Map(common))
+            Agreement::Known(Evidence::Map(Arc::new(common)))
         }
         (Evidence::List(left), Evidence::List(right)) if left.len() == right.len() => {
             let mut common = Vec::new();
-            for (left, right) in left.iter().zip(right) {
+            for (left, right) in left.iter().zip(right.iter()) {
                 match pair_agreement(left, right) {
                     Agreement::Known(value) => common.push(value),
                     Agreement::Mixed => return Agreement::Mixed,
                     Agreement::Pending => return Agreement::Pending,
                 }
             }
-            Agreement::Known(Evidence::List(common))
+            Agreement::Known(Evidence::List(Arc::new(common)))
         }
         (Evidence::Leaf(_), Evidence::Leaf(_) | Evidence::Map(_) | Evidence::List(_))
         | (Evidence::Map(_) | Evidence::List(_), Evidence::Leaf(_))

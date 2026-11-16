@@ -12,7 +12,7 @@ mod tests;
 
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -359,16 +359,18 @@ fn secrecy_related_message(cause: &carina_core::secrecy::DerivationError, name: 
 
 fn secrecy_range(
     location: &carina_core::parser::DeclarationLocation,
-    open_sources: &[(PathBuf, String)],
+    open_sources: &[(PathBuf, Arc<str>)],
+    analyzed_sources: &carina_core::config_loader::SourceOverrides,
 ) -> Option<Range> {
     let identity = PathIdentity::new(location.file().path());
-    let source = match open_sources
+    let source = analyzed_sources.analyzed_source(location.file().path())?;
+    if open_sources
         .iter()
         .find(|(path, _)| PathIdentity::new(path) == identity)
+        .is_some_and(|(_, buffer)| buffer.as_ref() != source.as_ref())
     {
-        Some((_, source)) => std::borrow::Cow::Borrowed(source.as_str()),
-        None => std::borrow::Cow::Owned(std::fs::read_to_string(location.file().path()).ok()?),
-    };
+        return None;
+    }
     let span = location.span();
     Some(Range::new(
         secrecy_related_position(&source, span.start_line(), span.start_column())?,
@@ -379,9 +381,20 @@ fn secrecy_range(
 fn render_secrecy(
     doc: &Document,
     finding: &carina_core::secrecy::Finding,
-    open_sources: &[(PathBuf, String)],
+    open_sources: &[(PathBuf, Arc<str>)],
+    analyzed_sources: &carina_core::config_loader::SourceOverrides,
 ) -> Option<(PathBuf, Diagnostic)> {
     let authored = finding.location();
+    let is_current =
+        PathIdentity::new(authored.file().path()) == PathIdentity::new(doc.source_file());
+    // Each sibling owns findings from its own buffer analysis. Only a module
+    // in another directory needs the caller's instantiated context.
+    if !is_current
+        && authored.file().path().parent().map(PathIdentity::new)
+            == doc.source_file().parent().map(PathIdentity::new)
+    {
+        return None;
+    }
     let mut message = finding.message();
     if let Some(call) = finding.call_site() {
         let span = call.location.span();
@@ -393,7 +406,7 @@ fn render_secrecy(
             span.start_column()
         ));
     }
-    let mut diagnostic = if authored.file().path() == doc.source_file() {
+    let mut diagnostic = if is_current {
         render_merged(
             doc,
             &carina_core::parser::Located::new(authored.clone(), ()),
@@ -401,23 +414,8 @@ fn render_secrecy(
             message,
         )?
     } else {
-        // The expanded finding belongs to the module URI. Open sources are
-        // consulted only here, for rendering its authored source range.
-        let span = authored.span();
-        let fallback = || {
-            Some(Range::new(
-                Position::new(
-                    u32::try_from(span.start_line().checked_sub(1)?).ok()?,
-                    u32::try_from(span.start_column().checked_sub(1)?).ok()?,
-                ),
-                Position::new(
-                    u32::try_from(span.end_line().checked_sub(1)?).ok()?,
-                    u32::try_from(span.end_column().checked_sub(1)?).ok()?,
-                ),
-            ))
-        };
         Diagnostic {
-            range: secrecy_range(authored, open_sources).or_else(fallback)?,
+            range: secrecy_range(authored, open_sources, analyzed_sources)?,
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("carina".into()),
             message,
@@ -434,7 +432,7 @@ fn render_secrecy(
             )
             .map(|diagnostic| diagnostic.range)
         } else {
-            secrecy_range(&call.location, open_sources)
+            secrecy_range(&call.location, open_sources, analyzed_sources)
         };
         // Missing or unmappable related text never suppresses the operator.
         diagnostic.related_information = range.and_then(|range| {
@@ -448,7 +446,78 @@ fn render_secrecy(
             }])
         });
     }
-    Some((authored.file().path().to_path_buf(), diagnostic))
+    Some((
+        if is_current {
+            doc.source_file()
+        } else {
+            authored.file().path()
+        }
+        .to_path_buf(),
+        diagnostic,
+    ))
+}
+
+fn same_diagnostic(left: &Diagnostic, right: &Diagnostic) -> bool {
+    left.range == right.range && left.message == right.message && left.code == right.code
+}
+
+#[derive(Default)]
+pub(crate) struct DocumentDiagnostics {
+    pub(crate) documents: BTreeMap<PathBuf, Vec<AnalyzedDiagnostic>>,
+    pub(crate) imported_directories: BTreeSet<PathIdentity>,
+}
+
+type SecrecyCauses = HashMap<(PathBuf, [u32; 4], String), carina_core::secrecy::DerivationError>;
+
+fn secrecy_site(path: PathBuf, diagnostic: &Diagnostic) -> (PathBuf, [u32; 4], String) {
+    let range = diagnostic.range;
+    (
+        path,
+        [
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+        ],
+        diagnostic.message.clone(),
+    )
+}
+
+#[derive(Clone)]
+pub(crate) struct AnalyzedDiagnostic {
+    pub(crate) diagnostic: Diagnostic,
+    cause: Option<carina_core::secrecy::DerivationError>,
+}
+
+impl AnalyzedDiagnostic {
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        match (&self.cause, &other.cause) {
+            (Some(left), Some(right)) => {
+                left == right
+                    && self.diagnostic.range == other.diagnostic.range
+                    && self.diagnostic.message == other.diagnostic.message
+            }
+            (None, None) => self.diagnostic == other.diagnostic,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+}
+
+impl DocumentDiagnostics {
+    fn into_documents(self) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+        self.documents
+            .into_iter()
+            .map(|(path, diagnostics)| {
+                (
+                    path,
+                    diagnostics
+                        .into_iter()
+                        .map(|finding| finding.diagnostic)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
 }
 
 /// Syntax errors can use coordinates only from this buffer's own parser.
@@ -802,8 +871,15 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for LspTypeC
 pub(super) struct DiagnosticRun<'a> {
     engine: &'a DiagnosticEngine,
     provider_context: &'a dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-    open_sources: &'a [(PathBuf, String)],
+    open_sources: &'a [(PathBuf, Arc<str>)],
+    analysis_sources: &'a RefCell<carina_core::config_loader::SourceOverrides>,
+    secrecy_causes: &'a RefCell<SecrecyCauses>,
     routed_secrecy: &'a RefCell<BTreeMap<PathBuf, Vec<Diagnostic>>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ANALYZED_DOCUMENTS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
 
 impl std::ops::Deref for DiagnosticRun<'_> {
@@ -1005,11 +1081,11 @@ impl DiagnosticRun<'_> {
             None
         };
         // Only the analyzed document overrides parsing. Other open buffers
-        // are available solely to secrecy source-range rendering.
+        // determine whether a routed module diagnostic still matches its text.
         let entries = current_override;
         let overrides = match carina_core::config_loader::SourceOverrides::try_from_entries(entries)
         {
-            Ok(overrides) => overrides,
+            Ok(overrides) => overrides.tracking_reads(),
             Err(error) => {
                 diagnostics.push(Diagnostic {
                     severity: Some(DiagnosticSeverity::ERROR),
@@ -1020,6 +1096,7 @@ impl DiagnosticRun<'_> {
                 return diagnostics;
             }
         };
+        *self.analysis_sources.borrow_mut() = overrides.clone();
         let current_file_name = current_file_name.map(|name| name.to_string_lossy());
         let current_file_name = current_file_name.as_deref();
 
@@ -1642,16 +1719,54 @@ impl DiagnosticRun<'_> {
                 || pre_expansion_configuration.judged().secrecy(),
                 |configuration| configuration.judged().secrecy(),
             );
+            // Cross-directory findings also depend on the root's inputs.
+            // Another open root file may have changed a call or its argument.
+            // Publish those contexts only from an analysis whose root texts
+            // match the open buffers; each document still owns its local
+            // diagnostics and remains the sole parser override for its run.
+            let root_directory = doc.source_file().parent().map(PathIdentity::new);
+            let current_root_context = self
+                .open_sources
+                .iter()
+                .filter(|(path, _)| path.parent().map(PathIdentity::new) == root_directory)
+                .all(|(path, buffer)| {
+                    overrides
+                        .analyzed_source(path)
+                        .is_some_and(|source| source.as_ref() == buffer.as_ref())
+                });
             for finding in secrecy_report.findings() {
-                if let Some((path, diagnostic)) = render_secrecy(doc, finding, self.open_sources) {
+                if !current_root_context
+                    && finding
+                        .location()
+                        .file()
+                        .path()
+                        .parent()
+                        .map(PathIdentity::new)
+                        != root_directory
+                {
+                    continue;
+                }
+                if let Some((path, diagnostic)) =
+                    render_secrecy(doc, finding, self.open_sources, &overrides)
+                {
+                    self.secrecy_causes.borrow_mut().insert(
+                        secrecy_site(path.clone(), &diagnostic),
+                        finding.cause().clone(),
+                    );
                     if path == doc.source_file() {
-                        if !diagnostics.contains(&diagnostic) {
+                        if !diagnostics
+                            .iter()
+                            .any(|existing| same_diagnostic(existing, &diagnostic))
+                        {
                             diagnostics.push(diagnostic);
                         }
                     } else {
                         let mut routed = self.routed_secrecy.borrow_mut();
                         let findings = routed.entry(path).or_default();
-                        if !findings.contains(&diagnostic) {
+                        if !findings
+                            .iter()
+                            .any(|existing| same_diagnostic(existing, &diagnostic))
+                        {
                             findings.push(diagnostic);
                         }
                     }
@@ -2990,6 +3105,8 @@ impl DiagnosticEngine {
                     engine: self,
                     provider_context: session,
                     open_sources: &[],
+                    analysis_sources: &RefCell::default(),
+                    secrecy_causes: &RefCell::default(),
                     routed_secrecy: &RefCell::default(),
                 })
             },
@@ -3019,13 +3136,13 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let open_sources = open_documents
             .iter()
-            .map(|doc| (doc.source_file().to_path_buf(), doc.text()))
+            .map(|doc| (doc.source_file().to_path_buf(), doc.source_snapshot()))
             .collect::<Vec<_>>();
         self.analyze_with_open_sources(raw, current_file_path, &open_sources)
     }
 
     /// Analyze the current document and route instantiated secrecy findings to
-    /// their authored files. Other buffers affect only secrecy range rendering.
+    /// their authored files. Dirty module buffers suppress routed findings.
     /// Results iterate in file-path order.
     pub fn analyze_document_set(
         &self,
@@ -3035,7 +3152,7 @@ impl DiagnosticEngine {
     ) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
         let open_sources = open_documents
             .iter()
-            .map(|doc| (doc.source_file().to_path_buf(), doc.text()))
+            .map(|doc| (doc.source_file().to_path_buf(), doc.source_snapshot()))
             .collect::<Vec<_>>();
         self.analyze_document_set_with_open_sources(raw, current_file_path, &open_sources)
     }
@@ -3044,7 +3161,7 @@ impl DiagnosticEngine {
         &self,
         raw: &crate::document::Document,
         current_file_path: Option<&Path>,
-        open_sources: &[(PathBuf, String)],
+        open_sources: &[(PathBuf, Arc<str>)],
     ) -> Vec<Diagnostic> {
         self.analyze_document_set_with_open_sources(raw, current_file_path, open_sources)
             .remove(raw.source_file())
@@ -3055,9 +3172,33 @@ impl DiagnosticEngine {
         &self,
         raw: &crate::document::Document,
         current_file_path: Option<&Path>,
-        open_sources: &[(PathBuf, String)],
+        open_sources: &[(PathBuf, Arc<str>)],
     ) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
-        let single = |diagnostics| BTreeMap::from([(raw.source_file().to_path_buf(), diagnostics)]);
+        self.analyze_document_snapshot(raw, current_file_path, open_sources)
+            .into_documents()
+    }
+
+    pub(crate) fn analyze_document_snapshot(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_sources: &[(PathBuf, Arc<str>)],
+    ) -> DocumentDiagnostics {
+        #[cfg(test)]
+        ANALYZED_DOCUMENTS.with(|paths| paths.borrow_mut().push(raw.source_file().to_path_buf()));
+        let single = |diagnostics: Vec<Diagnostic>| DocumentDiagnostics {
+            documents: BTreeMap::from([(
+                raw.source_file().to_path_buf(),
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| AnalyzedDiagnostic {
+                        diagnostic,
+                        cause: None,
+                    })
+                    .collect(),
+            )]),
+            ..Default::default()
+        };
         let doc = match raw.for_diagnostics() {
             Ok(doc) => doc,
             Err(protected) => return single(vec![buffer::protected_parse_error(protected)]),
@@ -3079,12 +3220,16 @@ impl DiagnosticEngine {
             doc
         };
         let routed_secrecy = RefCell::default();
+        let analysis_sources = RefCell::default();
+        let secrecy_causes = RefCell::default();
         let terminal =
             carina_core::validation::deferred_types::TypeCheckSession::run(&context, |session| {
                 DiagnosticRun {
                     engine: self,
                     provider_context: session,
                     open_sources,
+                    analysis_sources: &analysis_sources,
+                    secrecy_causes: &secrecy_causes,
                     routed_secrecy: &routed_secrecy,
                 }
                 .collect_diagnostics(&doc, current_file_path)
@@ -3094,7 +3239,27 @@ impl DiagnosticEngine {
             raw.source_file().to_path_buf(),
             Self::publish_type_diagnostics(terminal, &doc),
         );
-        report
+        DocumentDiagnostics {
+            documents: {
+                let causes = secrecy_causes.into_inner();
+                report
+                    .into_iter()
+                    .map(|(path, diagnostics)| {
+                        let diagnostics = diagnostics
+                            .into_iter()
+                            .map(|diagnostic| {
+                                let cause = causes
+                                    .get(&secrecy_site(path.clone(), &diagnostic))
+                                    .cloned();
+                                AnalyzedDiagnostic { diagnostic, cause }
+                            })
+                            .collect();
+                        (path, diagnostics)
+                    })
+                    .collect()
+            },
+            imported_directories: analysis_sources.into_inner().imported_directories(),
+        }
     }
 
     pub(crate) fn catalog_for_document(

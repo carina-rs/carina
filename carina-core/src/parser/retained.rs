@@ -5142,6 +5142,58 @@ mod judgement {
             crate::resource::knowledge::known_bool(&proof)
         }
 
+        pub(crate) fn secrecy_string(
+            &self,
+            expression: &ExprValue<ParserPlaceholder, B>,
+        ) -> Option<String> {
+            let value = self
+                .projections
+                .get(&(expression.secrecy_instance().clone(), expression.node_id()))?;
+            let proof = value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .ok()?
+                .into_classification()
+                .into_known()
+                .ok()?;
+            proof.visit(
+                |view| match view {
+                    crate::resource::knowledge::KnownView::String(value) => {
+                        Some(value.expose_plaintext().to_owned())
+                    }
+                    _ => None,
+                },
+                |_| None,
+            )
+        }
+
+        pub(crate) fn secrecy_non_list(
+            &self,
+            expression: &ExprValue<ParserPlaceholder, B>,
+        ) -> bool {
+            fn non_list(ty: &TypeExpr) -> bool {
+                match ty {
+                    TypeExpr::String
+                    | TypeExpr::Bool
+                    | TypeExpr::Int
+                    | TypeExpr::Float
+                    | TypeExpr::Duration
+                    | TypeExpr::Simple(_)
+                    | TypeExpr::SchemaType { .. }
+                    | TypeExpr::Map(_)
+                    | TypeExpr::Struct { .. }
+                    | TypeExpr::StringLiteral(_) => true,
+                    TypeExpr::Union(types) => types.iter().all(non_list),
+                    TypeExpr::List(_)
+                    | TypeExpr::Ref(_)
+                    | TypeExpr::DottedUnresolved(_)
+                    | TypeExpr::UnloadedSchemaType(_) => false,
+                }
+            }
+            self.node(expression.secrecy_instance(), expression.node_id())
+                .and_then(|node| node.static_type().ok())
+                .is_some_and(non_list)
+        }
+
         pub(crate) fn secrecy_definition(
             &self,
             binding: &B,
@@ -5224,6 +5276,17 @@ mod judgement {
         ) -> Option<ExprValue<ParserPlaceholder, B>> {
             self.syntax_nodes
                 .get(&(instance.clone(), id))
+                .map(|authored| ExprValue {
+                    authored: authored.clone(),
+                    payload: Projection::Pending,
+                })
+        }
+        pub(crate) fn secrecy_functions(
+            &self,
+        ) -> impl Iterator<Item = ExprValue<ParserPlaceholder, B>> + '_ {
+            self.syntax_nodes
+                .values()
+                .filter(|authored| matches!(authored.kind, ExprKind::Function { .. }))
                 .map(|authored| ExprValue {
                     authored: authored.clone(),
                     payload: Projection::Pending,

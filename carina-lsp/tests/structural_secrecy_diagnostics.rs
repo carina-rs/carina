@@ -126,6 +126,35 @@ fn mixed_coalesce_matches_cli_message_authored_file_and_utf16_span() {
 }
 
 #[test]
+fn mixed_alternatives_and_default_tag_diagnostics_are_both_reported() {
+    let fixture = fixtures::mixed_and_default_tag_fixture();
+    let engine = engine();
+    let diagnostics = ["main.crn", "providers.crn"]
+        .into_iter()
+        .flat_map(|file| analyze(&engine, &fixture, file))
+        .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == fixtures::COALESCE_MESSAGE)
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("default_tags.Owner"))
+            .count(),
+        1,
+        "{diagnostics:#?}"
+    );
+    assert_no_payload(&diagnostics);
+}
+
+#[test]
 fn mixed_lookup_matches_cli_message_authored_file_and_call_span() {
     let fixture = fixtures::fixture("mixed_lookup");
     let diagnostics = analyze(&engine(), &fixture, "main.crn");
@@ -383,15 +412,15 @@ fn module_instances_report_authored_operator_with_secret_call_context() {
 }
 
 #[test]
-fn open_module_buffer_supplies_utf16_ranges_without_overriding_semantic_inputs() {
+fn module_finding_uses_the_analyzed_text_for_utf16_range() {
     let fixture = fixtures::fixture("module_instances");
     let root_path = fixture.path().join("main.crn");
     let module_path = fixture.path().join("module/main.crn");
     let disk = std::fs::read_to_string(&module_path)
         .unwrap()
-        .replace("??", "/* x */ ??");
+        .replace("??", "/* 😀 */ ??");
     std::fs::write(&module_path, &disk).unwrap();
-    let edited = disk.replace("/* x */", "/* 😀 */");
+    let edited = disk.clone();
     let document = |path: &Path, text: String| {
         Document::new_with_path(
             text,
@@ -416,6 +445,179 @@ fn open_module_buffer_supplies_utf16_ranges_without_overriding_semantic_inputs()
     );
     assert_eq!(std::fs::read_to_string(&module_path).unwrap(), disk);
     assert_no_payload(findings);
+}
+
+#[test]
+fn dirty_sibling_findings_are_owned_only_by_the_siblings_buffer_analysis() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root_path = fixture.path().join("providers.crn");
+    let sibling_path = fixture.path().join("sibling.crn");
+    std::fs::write(&root_path, "provider mock {}\n").unwrap();
+    std::fs::write(
+        &sibling_path,
+        "mock.test.resource { name = 'sink' comment = 'public' ?? secret('canary') }\n",
+    )
+    .unwrap();
+    let document = |path: &Path, text: String| {
+        Document::new_with_path(
+            text,
+            path.to_path_buf(),
+            Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+        )
+    };
+    let root = document(&root_path, std::fs::read_to_string(&root_path).unwrap());
+    for (edited, expected_count) in [
+        (
+            "mock.test.resource { name = 'sink' comment = 'fixed' }\n",
+            0,
+        ),
+        (
+            "\n\nmock.test.resource { name = 'sink' comment = 'public' /* 😀 */ ?? secret('canary') }\n",
+            1,
+        ),
+    ] {
+        let sibling = document(&sibling_path, edited.into());
+        let engine = engine();
+        let report = engine.analyze_document_set(&root, Some(&root_path), &[&sibling]);
+        assert_eq!(
+            report.keys().collect::<Vec<_>>(),
+            vec![&root_path],
+            "a sibling must never be routed: {report:#?}"
+        );
+        let sibling_report = engine.analyze_document_set(&sibling, Some(&sibling_path), &[&root]);
+        let findings = sibling_report[&sibling_path]
+            .iter()
+            .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), expected_count, "{sibling_report:#?}");
+        if expected_count == 1 {
+            let prefix = &edited[..edited.find("??").unwrap()];
+            let start = Position::new(
+                2,
+                prefix.rsplit('\n').next().unwrap().encode_utf16().count() as u32,
+            );
+            assert_eq!(
+                findings[0].range,
+                Range::new(start, Position::new(2, start.character + 2))
+            );
+        }
+    }
+}
+
+#[test]
+fn dirty_module_buffer_is_not_routed_until_the_analyzed_text_matches() {
+    let fixture = fixtures::fixture("module_instances");
+    let root_path = fixture.path().join("main.crn");
+    let module_path = fixture.path().join("module/main.crn");
+    let document = |path: &Path, text: String| {
+        Document::new_with_path(
+            text,
+            path.to_path_buf(),
+            Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+        )
+    };
+    let root = document(&root_path, std::fs::read_to_string(&root_path).unwrap());
+    let edited = std::fs::read_to_string(&module_path)
+        .unwrap()
+        .replace("??", "/* 😀 */ ??");
+    let module = document(&module_path, edited.clone());
+    let engine = engine();
+    let dirty = engine.analyze_document_set(&root, Some(&root_path), &[&module]);
+    assert!(!dirty.contains_key(&module_path), "{dirty:#?}");
+    std::fs::write(&module_path, &edited).unwrap();
+    let saved = engine.analyze_document_set(&root, Some(&root_path), &[&module]);
+    let findings = &saved[&module_path];
+    assert_eq!(findings.len(), 1, "{saved:#?}");
+    let prefix = &edited[..edited.find("??").unwrap()];
+    let start = Position::new(
+        prefix.bytes().filter(|byte| *byte == b'\n').count() as u32,
+        prefix.rsplit('\n').next().unwrap().encode_utf16().count() as u32,
+    );
+    assert_eq!(
+        findings[0].range,
+        Range::new(start, Position::new(start.line, start.character + 2))
+    );
+    assert_no_payload(findings);
+}
+
+#[test]
+fn dirty_sibling_call_context_is_owned_by_the_callers_buffer_analysis() {
+    let fixture = fixtures::fixture("module_instances");
+    let root_path = fixture.path().join("main.crn");
+    let sibling_path = fixture.path().join("providers.crn");
+    let module_path = fixture.path().join("module/main.crn");
+    let document = |path: &Path, text: String| {
+        Document::new_with_path(
+            text,
+            path.to_path_buf(),
+            Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+        )
+    };
+    let edited = std::fs::read_to_string(&root_path)
+        .unwrap()
+        .replace("secret(", "(");
+    let caller = document(&root_path, edited);
+    let sibling = document(
+        &sibling_path,
+        std::fs::read_to_string(&sibling_path).unwrap(),
+    );
+    let engine = engine();
+    let current = engine.analyze_document_set(&caller, Some(&root_path), &[&sibling]);
+    assert!(
+        !current.contains_key(&module_path),
+        "the caller buffer made both module instances public: {current:#?}"
+    );
+    let other = engine.analyze_document_set(&sibling, Some(&sibling_path), &[&caller]);
+    assert!(
+        !other.contains_key(&module_path),
+        "a sibling must not restore the on-disk caller's stale context: {other:#?}"
+    );
+}
+
+#[test]
+fn dirty_sibling_module_inputs_do_not_publish_stale_instance_findings() {
+    for (saved, edited, expected) in [
+        ("secret('canary')", "'public'", 0),
+        ("'public'", "secret('canary')", 1),
+    ] {
+        let fixture = fixtures::fixture("module_instances");
+        let root_path = fixture.path().join("main.crn");
+        let sibling_path = fixture.path().join("providers.crn");
+        let module_path = fixture.path().join("module/main.crn");
+        let text = std::fs::read_to_string(&root_path)
+            .unwrap()
+            .replace(&format!("secret(\"{}\")", fixtures::CANARY), "input");
+        std::fs::write(&root_path, &text).unwrap();
+        std::fs::write(
+            &sibling_path,
+            format!("provider mock {{}}\nlet input = {saved}\n"),
+        )
+        .unwrap();
+        let document = |path: &Path, text: String| {
+            Document::new_with_path(
+                text,
+                path.to_path_buf(),
+                Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+            )
+        };
+        let root = document(&root_path, text);
+        let sibling = document(
+            &sibling_path,
+            format!("provider mock {{}}\nlet input = {edited}\n"),
+        );
+        let engine = engine();
+        let stale = engine.analyze_document_set(&root, Some(&root_path), &[&sibling]);
+        assert!(
+            !stale.contains_key(&module_path),
+            "the root must not publish from stale sibling inputs: {stale:#?}"
+        );
+        let current = engine.analyze_document_set(&sibling, Some(&sibling_path), &[&root]);
+        assert_eq!(
+            current.get(&module_path).map_or(0, Vec::len),
+            expected,
+            "the edited sibling supplies the current module input: {current:#?}"
+        );
+    }
 }
 
 #[test]

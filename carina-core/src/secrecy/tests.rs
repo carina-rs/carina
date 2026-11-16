@@ -18,6 +18,7 @@ fn schemas() -> SchemaRegistry {
             .attribute(Attribute::optional("n", Type::int()).build())
             .attribute(Attribute::optional("tags", Type::map(Type::string())).build())
             .attribute(Attribute::provider_populated("identifier", Type::string()).build())
+            .attribute(Attribute::provider_populated("enabled", Type::bool()).build())
             .validate()
             .unwrap(),
     );
@@ -69,10 +70,13 @@ let sink = mock.test.Resource {
     );
     assert_eq!(
         attribute(&report, "sink", "tags"),
-        Evidence::Map(BTreeMap::from([
-            ("private".into(), Evidence::Leaf(Secrecy::Secret)),
-            ("public".into(), Evidence::Leaf(Secrecy::Public)),
-        ]))
+        Evidence::Map(
+            BTreeMap::from([
+                ("private".into(), Evidence::Leaf(Secrecy::Secret)),
+                ("public".into(), Evidence::Leaf(Secrecy::Public)),
+            ])
+            .into()
+        )
     );
 }
 
@@ -348,6 +352,10 @@ fn repeated_errors_block_memo_admission_and_deduplicate_only_in_the_report() {
         schemas: &schemas,
         resources: IndexMap::new(),
         declarations: Vec::new(),
+        declaration_index: OnceLock::new(),
+        reference_free: RefCell::default(),
+        literal_evidence: RefCell::default(),
+        argument_environments: RefCell::default(),
         upstream: HashSet::new(),
         empty_environment: Arc::default(),
     };
@@ -431,6 +439,10 @@ fn unavailable_builtin_keeps_argument_secrecy_separate_from_failure() {
         schemas: &schemas,
         resources: IndexMap::new(),
         declarations: Vec::new(),
+        declaration_index: OnceLock::new(),
+        reference_free: RefCell::default(),
+        literal_evidence: RefCell::default(),
+        argument_environments: RefCell::default(),
         upstream: HashSet::new(),
         empty_environment: Arc::default(),
     };
@@ -811,10 +823,13 @@ let sink = mock.test.Resource {
     );
     assert_eq!(
         attribute(&report, "sink", "tags"),
-        Evidence::Map(BTreeMap::from([
-            ("protected".into(), Evidence::Leaf(Secrecy::Secret)),
-            ("public".into(), Evidence::Leaf(Secrecy::Public)),
-        ]))
+        Evidence::Map(
+            BTreeMap::from([
+                ("protected".into(), Evidence::Leaf(Secrecy::Secret)),
+                ("public".into(), Evidence::Leaf(Secrecy::Public)),
+            ])
+            .into()
+        )
     );
 }
 
@@ -1249,10 +1264,7 @@ let sink = mock.test.Resource { name = "sink" comment = token(seed) tags = { pub
     );
     assert_eq!(
         attribute(&report, "sink", "tags"),
-        Evidence::Map(BTreeMap::from([(
-            "public".into(),
-            Evidence::Leaf(Secrecy::Public),
-        )]))
+        Evidence::Map(BTreeMap::from([("public".into(), Evidence::Leaf(Secrecy::Public),)]).into())
     );
     assert!(report.admitted().is_some(), "{report:?}");
 }
@@ -1313,4 +1325,450 @@ fn independent_resource_attributes_share_one_location_index() {
                 .all(|value| value == &Evidence::Leaf(Secrecy::Public))
         );
     }
+}
+
+#[test]
+fn pending_reference_does_not_disable_memoization_of_later_dag() {
+    use std::fmt::Write as _;
+    for operands in ["${p}${r13.comment}", "${r13.comment}${p}"] {
+        let mut source = "let pending = mock.test.Resource {}\nlet p = pending.missing\nlet r0 = mock.test.Resource { comment = 'x' }\n".to_string();
+        for index in 1..=13 {
+            writeln!(source, "let r{index} = mock.test.Resource {{ comment = join('', [r{previous}.comment, r{previous}.comment]) }}", previous = index - 1).unwrap();
+        }
+        writeln!(
+            source,
+            "let sink = mock.test.Resource {{ comment = \"{operands}\" }}"
+        )
+        .unwrap();
+        let report = report(&source);
+        assert!(report.findings().is_empty(), "{operands}: {report:?}");
+        assert!(report.is_pending());
+        assert!(
+            report
+                .traversals()
+                .iter()
+                .any(|stats| stats.attribute == "comment"
+                    && stats.reference_visits == 29
+                    && stats.memo_hits == 13
+                    && stats.limit.is_none()),
+            "{operands}: {:?}",
+            report.traversals()
+        );
+    }
+}
+
+#[test]
+fn literal_roots_skip_declaration_lookup_and_build_the_index_once() {
+    DECLARATION_INDEX_OPERATIONS.with(|counts| counts.set((0, 0)));
+    let source = (0..1000)
+        .map(|index| {
+            format!(
+                "let r{index} = mock.test.Resource {{ name = 'r{index}' comment = 'literal' }}\n"
+            )
+        })
+        .collect::<String>();
+    let report = report(&source);
+    assert!(report.admitted().is_some());
+    assert_eq!(
+        DECLARATION_INDEX_OPERATIONS.with(std::cell::Cell::get),
+        (1, 0)
+    );
+}
+
+#[test]
+fn declaration_index_prunes_disjoint_attribute_spans_inside_one_resource() {
+    use std::fmt::Write as _;
+    let mut schema = Schema::new("test.Wide");
+    let mut source = "let value = 'public'\nlet wide = mock.test.Wide {\n".to_string();
+    for index in 0..1000 {
+        schema = schema.attribute(Attribute::optional(format!("a{index}"), Type::string()).build());
+        writeln!(source, "a{index} = value").unwrap();
+    }
+    source.push_str("}\n");
+    let mut schemas = schemas();
+    schemas.insert("mock", schema.validate().unwrap());
+    DECLARATION_SPAN_CHECKS.with(|checks| checks.set(0));
+    let report = secrecy_report(&parsed(&source), &schemas);
+    assert!(report.admitted().is_some());
+    assert_eq!(report.rows.values().next().unwrap().attributes.len(), 1000);
+    let checks = DECLARATION_SPAN_CHECKS.with(std::cell::Cell::get);
+    assert!(
+        checks < 10_000,
+        "disjoint siblings were scanned for each lookup: {checks}"
+    );
+}
+
+#[test]
+fn large_reference_free_let_reuses_evidence_across_attributes_without_changing_visits() {
+    let fields = (0..1024)
+        .map(|index| format!("k{index} = secret('canary')"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut source = format!("let shared = {{ {fields} }}\n");
+    for index in 0..50 {
+        source.push_str(&format!(
+            "let r{index} = mock.test.Resource {{ name = 'r{index}' tags = shared }}\n"
+        ));
+    }
+    let report = report(&source);
+    assert!(report.admitted().is_some(), "{report:?}");
+    let expected = Evidence::Map(
+        (0..1024)
+            .map(|index| (format!("k{index}"), Evidence::Leaf(Secrecy::Secret)))
+            .collect::<BTreeMap<_, _>>()
+            .into(),
+    );
+    for index in 0..50 {
+        assert_eq!(attribute(&report, &format!("r{index}"), "tags"), expected);
+    }
+    let Evidence::Map(first) = &report.rows.values().next().unwrap().attributes["tags"] else {
+        panic!("the literal let retains its map evidence")
+    };
+    for row in report.rows.values() {
+        let Evidence::Map(fields) = &row.attributes["tags"] else {
+            panic!("the shared map keeps its shape")
+        };
+        assert!(
+            Arc::ptr_eq(first, fields),
+            "memo hits must share the immutable evidence"
+        );
+    }
+    let traversals = report
+        .traversals()
+        .iter()
+        .filter(|stats| stats.attribute == "tags")
+        .collect::<Vec<_>>();
+    assert!(
+        traversals.iter().all(|stats| stats.reference_visits == 1
+            && stats.memo_hits == 0
+            && stats.limit.is_none())
+    );
+    assert!(
+        report
+            .traversals()
+            .iter()
+            .map(|stats| stats.syntax_entries)
+            .sum::<usize>()
+            < 10_000,
+        "reference-free syntax was walked again for each attribute: {:?}",
+        report.traversals()
+    );
+}
+
+#[test]
+fn pending_selected_argument_reentry_is_outside_the_callee_activation() {
+    let file = parsed(
+        r#"
+arguments { c: Bool }
+fn g(m: map(String)): String { m.a }
+let sink = mock.test.Resource { comment = g({ a = g({ a = if c { secret("x") } else { "y" } }) }) }
+"#,
+    );
+    let schemas = schemas();
+    let syntax = crate::parser::retained::judge_expressions(&file, &schemas, &context());
+    let owner = Owner {
+        syntax: &syntax,
+        schemas: &schemas,
+        resources: IndexMap::new(),
+        declarations: Vec::new(),
+        declaration_index: OnceLock::new(),
+        reference_free: RefCell::default(),
+        literal_evidence: RefCell::default(),
+        argument_environments: RefCell::default(),
+        upstream: HashSet::new(),
+        empty_environment: Arc::default(),
+    };
+    let resource = &file.resources[0];
+    let slot = resource.authored_slots.get("comment").unwrap();
+    let source = syntax
+        .secrecy_root(&resource.id, slot.secrecy_node())
+        .unwrap();
+    let mut walk =
+        Walk::new(&owner, "comment".into(), source.location().clone()).in_source(&source);
+    let evidence = walk.run(Thunk {
+        source: Source::Syntax(source),
+        environment: owner.empty_environment.clone(),
+    });
+    assert!(walk.findings.is_empty(), "{:?}", walk.findings);
+    assert!(evidence.is_none());
+}
+
+fn expanded_test_module(
+    body: &str,
+    arguments: &str,
+) -> (tempfile::TempDir, crate::parser::ModuleResolvedInferredFile) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("child")).unwrap();
+    std::fs::write(directory.path().join("child/main.crn"), body).unwrap();
+    std::fs::write(directory.path().join("main.crn"), format!("provider mock {{}}\nlet seed = mock.test.Resource {{ name = 'seed' }}\nlet child = use {{ source = './child' }}\nlet instance = child {{ {arguments} }}\n")).unwrap();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let context = context();
+    let schemas = schemas();
+    let file = crate::config_loader::load_configuration_with_config(&base, &context, &schemas)
+        .unwrap()
+        .parsed;
+    let expanded = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            file, &base, session, &schemas,
+        )
+        .unwrap()
+    });
+    (directory, expanded)
+}
+
+#[test]
+fn module_argument_sources_have_distinct_nonempty_environment_identities() {
+    let (_directory, file) = expanded_test_module(
+        "arguments { value: String = 'public' }\nattributes { output: String = value }\n",
+        "",
+    );
+    let schemas = schemas();
+    let syntax = crate::parser::retained::judge_expressions(&file, &schemas, &context());
+    let owner = Owner {
+        syntax: &syntax,
+        schemas: &schemas,
+        resources: IndexMap::new(),
+        declarations: Vec::new(),
+        declaration_index: OnceLock::new(),
+        reference_free: RefCell::default(),
+        literal_evidence: RefCell::default(),
+        argument_environments: RefCell::default(),
+        upstream: HashSet::new(),
+        empty_environment: Arc::default(),
+    };
+    let binding = crate::resource::binding_address::binding_selected_attribute(
+        &file.compositions[0].binding_address(),
+        "value",
+    );
+    let ReferenceSource::Source(source, path) =
+        owner.reference_source(&binding, &[], owner.empty_environment.clone())
+    else {
+        panic!("the expanded argument has an authored source")
+    };
+    assert!(path.is_empty());
+    assert_ne!(source.environment.id, owner.empty_environment.id);
+    assert_ne!(source.environment.id, 0);
+    let ReferenceSource::Source(repeated, _) =
+        owner.reference_source(&binding, &[], owner.empty_environment.clone())
+    else {
+        panic!("the same argument remains available")
+    };
+    assert_eq!(
+        source.environment.id, repeated.environment.id,
+        "repeated encounters must retain their reference memo identity"
+    );
+}
+
+#[test]
+fn module_argument_fan_out_keeps_the_existing_reference_visit_count() {
+    use std::fmt::Write as _;
+    let mut body = "arguments { value: String = r13.comment }\nlet r0 = mock.test.Resource { comment = 'x' }\n".to_string();
+    for index in 1..=13 {
+        writeln!(body, "let r{index} = mock.test.Resource {{ comment = join('', [r{previous}.comment, r{previous}.comment]) }}", previous = index - 1).unwrap();
+    }
+    body.push_str("let sink = mock.test.Resource { comment = \"${value}${value}\" }\n");
+    let (_directory, file) = expanded_test_module(&body, "");
+    let report = crate::config_loader::load_buffer_configuration(&file, &schemas(), &context())
+        .judged()
+        .secrecy()
+        .clone();
+    assert!(report.admitted().is_some(), "{report:?}");
+    assert!(
+        report
+            .traversals()
+            .iter()
+            .any(|stats| stats.attribute == "comment"
+                && stats.reference_visits == 29
+                && stats.memo_hits == 14
+                && stats.limit.is_none()),
+        "{:?}",
+        report.traversals()
+    );
+}
+
+#[test]
+fn shape_builtins_preserve_public_selected_members_and_secret_controls() {
+    for expression in [
+        "keys(tokens)[0] ?? 'k'",
+        "values(tokens)[1] ?? 'x'",
+        "flatten([[secret('a')], ['b']])[1] ?? 'x'",
+        "flatten([secret('a'), 'b'])[1] ?? 'x'",
+        "\"${length(tokens)}\" ?? 'x'",
+        "map('.public', [{ private = secret('a') public = 'b' }])[0] ?? 'x'",
+    ] {
+        let report = report(&format!(
+            "let tokens = {{ a = secret('a') b = 'b' }}\nlet sink = mock.test.Resource {{ comment = {expression} }}\n"
+        ));
+        assert!(report.findings().is_empty(), "{expression}: {report:?}");
+        assert!(report.admitted().is_some(), "{expression}: {report:?}");
+        assert_eq!(
+            attribute(&report, "sink", "comment"),
+            Evidence::Leaf(Secrecy::Public)
+        );
+    }
+    for expression in [
+        "values(tokens)[0] ?? 'x'",
+        "join('', values(tokens)) ?? 'x'",
+        "keys(secret(tokens))[0] ?? 'k'",
+    ] {
+        let report = report(&format!(
+            "let tokens = {{ a = secret('a') b = 'b' }}\nlet sink = mock.test.Resource {{ comment = {expression} }}\n"
+        ));
+        assert_eq!(report.findings().len(), 1, "{expression}: {report:?}");
+        assert_eq!(
+            report.findings()[0].cause(),
+            &DerivationError::MixedAlternatives(MixedAlternatives {
+                operator: Alternatives::Coalesce
+            })
+        );
+    }
+}
+
+#[test]
+fn concat_evidence_preserves_runtime_data_last_order_and_secret_members() {
+    for (index, expected_findings) in [(0, 0), (1, 1)] {
+        let report = report(&format!(
+            "let sink = mock.test.Resource {{ comment = concat([secret('a')], ['b'])[{index}] ?? 'x' }}\n"
+        ));
+        assert_eq!(
+            report.findings().len(),
+            expected_findings,
+            "{index}: {report:?}"
+        );
+        if index == 0 {
+            assert!(report.admitted().is_some());
+            assert_eq!(
+                attribute(&report, "sink", "comment"),
+                Evidence::Leaf(Secrecy::Public)
+            );
+        } else {
+            assert_eq!(
+                report.findings()[0].cause(),
+                &DerivationError::MixedAlternatives(MixedAlternatives {
+                    operator: Alternatives::Coalesce
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn flatten_keeps_unknown_list_lengths_pending_instead_of_inventing_positions() {
+    let mut schemas = schemas();
+    schemas.insert(
+        "mock",
+        Schema::new("test.ListSource")
+            .attribute(Attribute::provider_populated("items", Type::list(Type::string())).build())
+            .validate()
+            .unwrap(),
+    );
+    let file = parsed(
+        "let seed = mock.test.ListSource {}\nlet sink = mock.test.Resource { comment = flatten([seed.items, [secret('a')]])[1] ?? secret('fallback') }\n",
+    );
+    let report = secrecy_report(&file, &schemas);
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(
+        report.is_pending(),
+        "the selected element depends on the unknown list length: {report:?}"
+    );
+    assert!(report.admitted().is_none());
+}
+
+#[test]
+fn lookup_with_a_secret_key_protects_the_result_after_checking_alternatives() {
+    let valid = report(
+        "let sink = mock.test.Resource { comment = lookup({ a = 'public' }, secret('a'), 'default') ?? secret('fallback') }\n",
+    );
+    assert!(valid.findings().is_empty(), "{valid:?}");
+    assert!(valid.admitted().is_some());
+    assert_eq!(
+        attribute(&valid, "sink", "comment"),
+        Evidence::Leaf(Secrecy::Secret)
+    );
+    let mixed = report(
+        "let sink = mock.test.Resource { comment = lookup({ a = secret('canary') }, secret('a'), 'public') }\n",
+    );
+    assert_eq!(mixed.findings().len(), 1, "{mixed:?}");
+    assert_eq!(
+        mixed.findings()[0].cause(),
+        &DerivationError::MixedAlternatives(MixedAlternatives {
+            operator: Alternatives::Lookup
+        })
+    );
+}
+
+#[test]
+fn mixed_function_body_operator_is_reported_once_with_function_owner() {
+    let report = report(
+        r#"
+fn g(x: String): String { x ?? secret("canary") }
+let first = mock.test.Resource { comment = g("a") }
+let second = mock.test.Resource { comment = g("b") }
+"#,
+    );
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    assert_eq!(
+        report.findings()[0].message(),
+        "Function 'g': ?? alternatives mix secret and public values; all alternatives must be secret or all public."
+    );
+    assert!(report.findings()[0].call_site().is_none());
+    assert_eq!(report.findings()[0].location().span().start_line(), 2);
+    assert_eq!(
+        report.findings()[0].location().span().end_column()
+            - report.findings()[0].location().span().start_column(),
+        2
+    );
+}
+
+#[test]
+fn issue_4490_resource_parameter_interpolation_is_secret_at_root_and_in_module() {
+    let body = r#"
+let seed = mock.test.Resource { name = "seed" tags = { token = secret("canary") } }
+fn g(r: mock.test.Resource): String { "prefix-${r.tags.token}" }
+let sink = mock.test.Resource { name = "sink" comment = g(seed) }
+"#;
+    let root = report(body);
+    assert!(root.findings().is_empty(), "{root:?}");
+    assert!(root.admitted().is_some(), "{root:?}");
+    assert_eq!(
+        attribute(&root, "sink", "comment"),
+        Evidence::Leaf(Secrecy::Secret)
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("child")).unwrap();
+    std::fs::write(
+        directory.path().join("child/main.crn"),
+        format!("arguments {{ unused: String = 'unused' }}\n{body}"),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("main.crn"),
+        "provider mock {}\nlet child = use { source = './child' }\nlet instance = child {}\n",
+    )
+    .unwrap();
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let context = context();
+    let schemas = schemas();
+    let file = crate::config_loader::load_configuration_with_config(&base, &context, &schemas)
+        .unwrap()
+        .parsed;
+    let expanded = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        crate::module_resolver::resolve_modules_with_providerless_config(
+            file, &base, session, &schemas,
+        )
+        .unwrap()
+    });
+    let report = crate::config_loader::load_buffer_configuration(&expanded, &schemas, &context)
+        .judged()
+        .secrecy()
+        .clone();
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(report.admitted().is_some(), "{report:?}");
+    let comments = report
+        .rows
+        .values()
+        .filter_map(|row| row.attributes.get("comment"))
+        .collect::<Vec<_>>();
+    assert_eq!(comments, vec![&Evidence::Leaf(Secrecy::Secret)]);
 }
