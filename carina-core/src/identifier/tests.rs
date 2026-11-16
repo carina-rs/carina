@@ -8,7 +8,7 @@ use crate::resource::{
     ExpandedInterpolationPart as InterpolationPart, ExpandedResource as Resource,
     ExpandedValue as Value, LoopModulePrefixOrigin, LoopProvenance, LoopSlot, ModuleInstanceScope,
     ModuleSource, PendingReRead, ReReadReason, RelativeBindingName, ResourceIdentity, RootScope,
-    Subscript, ValueString,
+    ValueString,
 };
 use crate::schema::{
     DslTransform, ReferenceForm, ReferenceForms, ReferenceTemplate, SchemaRegistry, TypeIdentity,
@@ -1741,43 +1741,6 @@ fn unresolved_identity_prefix_values_produce_distinct_anonymous_addresses() {
 }
 
 #[test]
-fn diagnostic_sensitive_strings_preserve_plaintext_anonymous_identity() {
-    let schema = PatternResourceSchema::new("test.resource").attribute(
-        PatternAttributeSchema::optional("name", PatternAttributeType::string())
-            .create_only()
-            .build(),
-    );
-    let mut registry = SchemaRegistry::new();
-    registry.insert(
-        "mock",
-        schema.validate().expect("schema fixture must be valid"),
-    );
-
-    let resource = |name: ValueString| {
-        let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
-        resource.set_attr(
-            "name".to_string(),
-            Value::Concrete(ConcreteValue::String(name)),
-        );
-        resource
-    };
-
-    let mut literal = vec![resource("one".into())];
-    let mut from_env = vec![resource(ValueString::diagnostic_sensitive("one"))];
-    compute_anonymous_identifiers_for_test(&mut literal, &[], &registry, &|_| Vec::new())
-        .expect("literal identity");
-    compute_anonymous_identifiers_for_test(&mut from_env, &[], &registry, &|_| Vec::new())
-        .expect("env-derived identity");
-
-    assert_eq!(from_env[0].id, literal[0].id);
-    assert_eq!(
-        from_env[0].id.identity_str(),
-        Some("mock_test_resource_96081a11"),
-        "diagnostic provenance must not change the identifier generated on main",
-    );
-}
-
-#[test]
 fn bare_handle_is_rejected_before_anonymous_identity_hashing() {
     let parsed = crate::parser::parse(
         r#"
@@ -1853,83 +1816,6 @@ fn module_handle_dependency_does_not_change_anonymous_identity_hash() {
         with_dependency[0].id, without_dependency[0].id,
         "dependency capabilities are graph metadata, never identity-hash input",
     );
-}
-
-#[test]
-fn distinct_diagnostic_sensitive_strings_produce_distinct_anonymous_identities() {
-    let schema = PatternResourceSchema::new("test.resource").attribute(
-        PatternAttributeSchema::optional("name", PatternAttributeType::string())
-            .create_only()
-            .build(),
-    );
-    let mut registry = SchemaRegistry::new();
-    registry.insert(
-        "mock",
-        schema.validate().expect("schema fixture must be valid"),
-    );
-
-    let resource = |name| {
-        let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
-        resource.set_attr(
-            "name".to_string(),
-            Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-                name,
-            ))),
-        );
-        resource
-    };
-    let mut resources = vec![resource("one"), resource("two")];
-
-    compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| Vec::new())
-        .expect("distinct env-derived values must not collide");
-
-    assert_ne!(resources[0].id, resources[1].id);
-}
-
-#[test]
-fn diagnostic_sensitive_subscript_paths_use_plaintext_for_identity() {
-    let schema = PatternResourceSchema::new("test.resource").attribute(
-        PatternAttributeSchema::optional("source", PatternAttributeType::string())
-            .create_only()
-            .build(),
-    );
-    let mut registry = SchemaRegistry::new();
-    registry.insert(
-        "mock",
-        schema.validate().expect("schema fixture must be valid"),
-    );
-
-    let resource = |key: ValueString| {
-        let mut resource = Resource::pending_with_provider("mock", "test.resource", None);
-        resource.set_attr(
-            "source".to_string(),
-            Value::Deferred(DeferredValue::ResourceRef {
-                path: AccessPath::root_with_fields_and_subscripts(
-                    "source",
-                    "values",
-                    vec![],
-                    vec![Subscript::Str { key }],
-                ),
-            }),
-        );
-        resource
-    };
-
-    let mut literal = vec![resource("one".into())];
-    let mut from_env = vec![resource(ValueString::diagnostic_sensitive("one"))];
-    compute_anonymous_identifiers_for_test(&mut literal, &[], &registry, &|_| Vec::new())
-        .expect("literal subscript identity");
-    compute_anonymous_identifiers_for_test(&mut from_env, &[], &registry, &|_| Vec::new())
-        .expect("env-derived subscript identity");
-    assert_eq!(from_env[0].id, literal[0].id);
-
-    let mut distinct = vec![
-        resource(ValueString::diagnostic_sensitive("one")),
-        resource(ValueString::diagnostic_sensitive("two")),
-    ];
-    compute_anonymous_identifiers_for_test(&mut distinct, &[], &registry, &|_| Vec::new())
-        .expect("distinct env-derived subscript paths must not collide");
-    assert_ne!(distinct[0].id, distinct[1].id);
 }
 
 #[test]
@@ -10286,5 +10172,47 @@ fn review2_f5_secret_reference_keeps_main_identity_completeness_and_exact_names(
         compute_anonymous_identifiers_for_test(&mut resources, &[], &registry, &|_| vec![])
             .unwrap();
         assert_eq!(resources[0].id.identity_str(), Some(expected));
+    }
+}
+
+#[test]
+fn parsed_secrets_and_secret_subscripts_keep_distinct_anonymous_identities() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        PatternResourceSchema::new("test.resource")
+            .attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for expression in ["secret('one')", "secret(source.values['one'])"] {
+        let resource = |expression: &str| {
+            let value = crate::parser::parse(
+                &format!("let value = {expression}"),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap()
+            .variables
+            .shift_remove("value")
+            .unwrap()
+            .resolve_root(&RootScope::new())
+            .into_expanded()
+            .unwrap();
+            Resource::pending_with_provider("mock", "test.resource", None)
+                .with_attribute("name", value)
+        };
+        let mut first = vec![resource(expression)];
+        let mut repeated = vec![resource(expression)];
+        let mut distinct = vec![resource(&expression.replace("one", "two"))];
+        for resources in [&mut first, &mut repeated, &mut distinct] {
+            compute_anonymous_identifiers_for_test(resources, &[], &registry, &|_| Vec::new())
+                .unwrap();
+        }
+        assert_eq!(first[0].id, repeated[0].id);
+        assert_ne!(first[0].id, distinct[0].id);
     }
 }

@@ -708,7 +708,7 @@ let module_named = for key, name in keyed { child { name = "${name}-module" } }
             else {
                 panic!("env must produce a string");
             };
-            assert!(key.is_diagnostic_sensitive());
+            assert!(!key.is_diagnostic_sensitive());
             let key = serde_json::to_string(key).unwrap();
             fs::write(
                 temporary.path().join("map-loops.crn"),

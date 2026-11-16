@@ -41,10 +41,12 @@ impl ValueDescription {
     pub fn of<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> Self {
         Self(match value {
             Value::Deferred(DeferredValue::ModuleIf(_)) => "module conditional".to_string(),
-            Value::Concrete(ConcreteValue::String(value)) => value
-                .diagnostic_literal()
-                .map(|value| format!("string {}", display_string_literal(value)))
-                .unwrap_or_else(|| "string".to_string()),
+            Value::Concrete(ConcreteValue::String(value)) => {
+                format!(
+                    "string {}",
+                    display_string_literal(value.expose_plaintext())
+                )
+            }
             Value::Concrete(ConcreteValue::Int(value)) => format!("int ({value})"),
             Value::Concrete(ConcreteValue::Float(value)) => format!("float ({value:?})"),
             Value::Concrete(ConcreteValue::Bool(value)) => format!("bool ({value})"),
