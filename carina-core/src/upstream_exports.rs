@@ -310,10 +310,6 @@ impl ResolvedUpstreamSource {
     pub fn upstream_states(&self) -> &[UpstreamState<RelativeBindingName>] {
         &self.upstream_states
     }
-    pub fn unavailable_reason(&self) -> Option<&str> {
-        self.surface.entries.as_ref().err().map(String::as_str)
-    }
-
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(binding: impl Into<String>, entries: Option<&UpstreamExportEntries>) -> Self {
         Self {
@@ -328,9 +324,7 @@ impl ResolvedUpstreamSource {
             backend: None,
             upstream_states: vec![],
             surface: SourceSurface {
-                entries: entries
-                    .cloned()
-                    .ok_or_else(|| "test fixture has no source surface".into()),
+                entries: entries.cloned(),
             },
         }
     }
@@ -338,7 +332,7 @@ impl ResolvedUpstreamSource {
 
 #[derive(Debug, Clone)]
 struct SourceSurface {
-    entries: Result<UpstreamExportEntries, String>,
+    entries: Option<UpstreamExportEntries>,
 }
 
 // These witnesses have private fields in a child module. Their only
@@ -394,10 +388,10 @@ mod root_witness {
             &self,
             catalog: &crate::parser::ProviderContext,
             schemas: &crate::schema::SchemaRegistry,
-        ) -> Result<RootUpstreamParse, String> {
+        ) -> Option<RootUpstreamParse> {
             // LoadedConfig preserves this checked snapshot's verdict while
             // projecting its export parse. Carry the witness across that projection.
-            Ok(RootUpstreamParse {
+            Some(RootUpstreamParse {
                 parsed: self.loaded.upstream_export_source(catalog, schemas)?,
                 _admission: self.admission,
             })
@@ -428,22 +422,18 @@ fn resolve_upstream_source_surface(
     context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<SourceSurface, crate::parser::AnalysisTreeError> {
-    let entries = match source.export_source(context.catalog(), schemas) {
-        Ok(parsed) => match resolve_upstream_root_exports(
-            parsed,
-            source.source(),
-            context,
-            Some(schemas),
-            &Default::default(),
-        ) {
-            Ok(entries) => Ok(entries),
-            Err(RootUpstreamExportError::Invariant(error)) => return Err(error),
-            Err(
-                reason @ (RootUpstreamExportError::Module { base: _, error: _ }
-                | RootUpstreamExportError::Boundaries(_)),
-            ) => Err(UpstreamExportSourceError::from(reason).to_string()),
-        },
-        Err(reason) => Err(reason),
+    let Some(parsed) = source.export_source(context.catalog(), schemas) else {
+        return Ok(SourceSurface { entries: None });
+    };
+    let entries = match resolve_upstream_root_exports(
+        parsed,
+        source.source(),
+        context,
+        Some(schemas),
+        &Default::default(),
+    ) {
+        Err(RootUpstreamExportError::Invariant(error)) => return Err(error),
+        result => result.ok(),
     };
     Ok(SourceSurface { entries })
 }

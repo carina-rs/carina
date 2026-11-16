@@ -1295,7 +1295,6 @@ fn deferred_value_mismatch<B: BindingAddress>(
     source: ValueSource<'_, B>,
     expression: &crate::parser::retained::JudgedExprData,
     target: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
-    schemas: &SchemaRegistry,
     bindings: &BindingIndex<'_, B>,
     authored_binding: &str,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
@@ -1311,7 +1310,6 @@ fn deferred_value_mismatch<B: BindingAddress>(
                     },
                     expression,
                     target,
-                    schemas,
                     bindings,
                     authored_binding,
                     diagnostic_path,
@@ -1364,7 +1362,7 @@ fn deferred_value_mismatch<B: BindingAddress>(
             | crate::resource::DeferredValue::Secret(_)
             | crate::resource::DeferredValue::Unknown(_)
             | crate::resource::DeferredValue::Placeholder(_),
-        ) => check_deferred_access_type(value, target, expression, schemas, bindings)
+        ) => check_deferred_access_type(value, target, expression, bindings)
             .err()
             .map(|error| match error {
                 DeferredAccessTypeError::TypeMismatch {
@@ -1524,7 +1522,6 @@ fn precheck_value_source<B: BindingAddress>(
         },
         &expression,
         target,
-        context.schemas,
         &context.scope_bindings,
         &use_site.name,
         diagnostic_path,
@@ -3114,7 +3111,6 @@ pub fn check_deferred_access_type<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
     expression: &crate::parser::retained::JudgedExprData,
-    _schemas: &SchemaRegistry,
     binding_index: &BindingIndex<'_, B>,
 ) -> Result<(), DeferredAccessTypeError> {
     let value = expression.assignment_value(value);
@@ -3159,23 +3155,6 @@ pub fn check_deferred_access_type<B: BindingAddress>(
         value,
         expected,
         expression.static_type().cloned(),
-        binding_index,
-    )
-}
-
-/// Check values produced by state/runtime evaluation, which have no authored
-/// expression. Parser-phase projections cannot enter this API.
-pub fn check_runtime_value_type<B: BindingAddress>(
-    input: inference::RuntimeTypeInput<'_, B>,
-    expected: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
-    bindings: &inference::InferenceBindings<crate::resource::NoPlaceholder, B>,
-    schemas: &SchemaRegistry,
-    binding_index: &BindingIndex<'_, B>,
-) -> Result<(), DeferredAccessTypeError> {
-    check_inferred_assignment(
-        input.value(),
-        expected,
-        inference::infer_runtime_type(input, bindings, schemas, binding_index.provider_context()),
         binding_index,
     )
 }
@@ -3225,7 +3204,6 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
         | Err(crate::static_type::InferenceIssue::NotInferable(
             crate::static_type::NotInferableReason::MissingValue
             | crate::static_type::NotInferableReason::ValueDependent { .. }
-            | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
             | crate::static_type::NotInferableReason::NonInferableBinding { .. }
             | crate::static_type::NotInferableReason::SchemaUnavailable { .. }
             | crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
@@ -4072,28 +4050,6 @@ impl std::fmt::Display for ModuleCallRefError {
 }
 
 impl std::error::Error for ModuleCallRefError {}
-
-/// Validate references carried by module-call argument values against binding
-/// surfaces and the called module's declared argument types.
-///
-/// Unknown bindings and enclosing-module argument names are intentionally
-/// ignored here: their resolution belongs to the existing scope/module-call
-/// passes. This walk only closes attribute-existence gaps for binding targets
-/// that have a statically known schema or module signature.
-pub fn validate_module_call_argument_ref_types_with_bindings(
-    module_calls: &[ModuleCall],
-    imported_modules: &crate::module_resolver::ResolvedModuleSignatures,
-    _argument_names: &HashSet<String>,
-    bindings: &BindingIndex<'_>,
-) -> Vec<ModuleCallRefError> {
-    validate_module_call_argument_ref_types_inner(
-        module_calls,
-        imported_modules,
-        bindings,
-        UnknownReferencePolicy::Report,
-        None,
-    )
-}
 
 fn validate_module_call_argument_ref_types_inner(
     module_calls: &[ModuleCall],
@@ -6192,10 +6148,8 @@ fn resource_admission_report<
     boundary: presentation::AdmissionBoundary,
 ) -> Result<ResourceAdmissionReport, crate::parser::AnalysisTreeError> {
     let parsed = judged.parsed();
-    let registry = judged.schemas();
     let mut all_errors = ResourceAdmissionFindings::default();
     let mut attributes = HashMap::new();
-    let inference_bindings = parsed.inference_bindings();
 
     // Validate declarations directly instead of relying on a later resource
     // attribute to happen to expose an expression. Keep the authored
@@ -6316,10 +6270,8 @@ fn resource_admission_report<
     )?;
 
     if parsed.deferred_for_sites().next().is_some() {
-        all_errors.extend(validate_deferred_for_iterable_types_with_bindings(
+        all_errors.extend(validate_deferred_for_iterable_types(
             &parsed.analysis_tree()?,
-            registry,
-            &inference_bindings,
             bindings.provider_context(),
         ));
     }
@@ -6346,29 +6298,6 @@ impl From<crate::parser::retained::CollectionKind> for DeferredIterableShape {
             crate::parser::retained::CollectionKind::List => Self::List,
             crate::parser::retained::CollectionKind::Map => Self::Map,
         }
-    }
-}
-
-#[cfg(test)]
-fn deferred_iterable_shape(
-    value: &Value,
-    bindings: &inference::InferenceBindings<ParserPlaceholder>,
-    schemas: &SchemaRegistry,
-) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
-    match value {
-        GenericValue::Concrete(crate::resource::ConcreteValue::List(_)) => {
-            Ok(DeferredIterableShape::List)
-        }
-        GenericValue::Concrete(crate::resource::ConcreteValue::Map(_)) => {
-            Ok(DeferredIterableShape::Map)
-        }
-        _ => inference::infer_projected_type(
-            value,
-            bindings,
-            schemas,
-            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        )
-        .map(iterable_shape_from_type),
     }
 }
 
@@ -6428,37 +6357,18 @@ pub fn validate_module_iteration_shape<P: PlaceholderKind, B: BindingAddress>(
 /// apply for a loop that requires a list or map.
 ///
 /// ```compile_fail,E0308
-/// use carina_core::{parser::{ParsedFile, ProviderContext}, schema::SchemaRegistry, validation::validate_deferred_for_iterable_types};
+/// use carina_core::{parser::{ParsedFile, ProviderContext}, validation::validate_deferred_for_iterable_types};
 /// fn analyze(file: &ParsedFile, context: &ProviderContext) {
-///     validate_deferred_for_iterable_types(file, &SchemaRegistry::new(), context);
+///     validate_deferred_for_iterable_types(file, context);
 /// }
 /// ```
-pub fn validate_deferred_for_iterable_types<D, B: BindingAddress>(
-    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
-    schemas: &SchemaRegistry,
+pub fn validate_deferred_for_iterable_types<D, B: BindingAddress, E>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     provider_context: &ProviderContext,
 ) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    validate_deferred_for_iterable_types_with_bindings(
-        tree,
-        schemas,
-        &tree.inference_bindings(),
-        provider_context,
-    )
-}
-
-fn validate_deferred_for_iterable_types_with_bindings<
-    E,
-    B: BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
->(
-    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
-    _schemas: &SchemaRegistry,
-    _bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    provider_context: &ProviderContext,
-) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();
     for deferred in tree.for_iterables() {
         let expected = match deferred.binding() {
@@ -6634,7 +6544,6 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         | Err(crate::static_type::InferenceIssue::NotInferable(
             crate::static_type::NotInferableReason::MissingValue
             | crate::static_type::NotInferableReason::ValueDependent { .. }
-            | crate::static_type::NotInferableReason::PlaceholderTypeUnavailable { .. }
             | crate::static_type::NotInferableReason::NonInferableBinding { .. }
             | crate::static_type::NotInferableReason::SchemaUnavailable { .. }
             | crate::static_type::NotInferableReason::CustomTypeSchemaUnavailable { .. },
@@ -10668,26 +10577,6 @@ where
     }
 }
 
-/// Resolve and structurally validate exports without loaded providers.
-/// Provider-owned custom-type leaves are left unchecked, while container
-/// shapes and provider-independent sibling values retain normal diagnostics.
-pub fn check_export_values_pre_apply_providerless<E, P: PlaceholderKind, B: BindingAddress>(
-    export_params: &[E],
-    bindings: &crate::binding_index::ResolvedBindings<P, B>,
-    config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    phase: crate::parser::retained::ProjectedPhase,
-) -> Result<ExportsCheckedPreApply<E>, String>
-where
-    E: crate::parser::ExportParamLike<P, B> + Clone,
-{
-    let display_params =
-        resolve_and_validate_export_values(export_params, bindings, config, phase)?;
-    Ok(ExportsCheckedPreApply {
-        original_params: export_params.to_vec(),
-        display_params,
-    })
-}
-
 /// Resolve every export through the pre-apply value binding graph, evaluate
 /// builtins that become concrete, and accumulate both secret-boundary and
 /// value-type errors in one pass.
@@ -10764,16 +10653,6 @@ where
 /// Reference-valued attributes are deferred here and checked separately by
 /// [`validate_attribute_param_ref_types_with_bindings`], whose binding index
 /// has the source type authority needed for directional checks.
-pub fn validate_attribute_params<P: PlaceholderKind, B: BindingAddress>(
-    attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
-    config: &LoadedProviderContext,
-) -> SinkFindings<Result<(), String>> {
-    validate_attribute_params_impl(
-        attribute_params,
-        typecheck::TypecheckProviderContext::loaded(config),
-    )
-}
-
 pub fn validate_attribute_params_with_context<P: PlaceholderKind, B: BindingAddress>(
     attribute_params: &[crate::parser::AttributeParameter<TypeExpr, P, B>],
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,

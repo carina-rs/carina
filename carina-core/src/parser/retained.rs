@@ -2883,10 +2883,7 @@ fn access_step(pair: Pair<'_, Rule>) -> Option<PathSegment> {
 use judgement::ConversionEvidence;
 pub(crate) use judgement::judge_expressions;
 pub(in crate::parser) use judgement::unjudged as missing_judgement;
-pub(crate) use judgement::{
-    AdmissionContext, EmptyCoalesceDefault, admit_ordinary_with_context, admit_with_context,
-    coalesce_type,
-};
+pub(crate) use judgement::{AdmissionContext, admit_ordinary_with_context, admit_with_context};
 pub use judgement::{
     CollectionKind, ExpressionAdmission, ExpressionCheckOwner, ExpressionReport, JudgedExpr,
     JudgedExprData, NoConversion, NoTypeProjection, OrdinaryJudgedExpr,
@@ -5119,11 +5116,11 @@ mod judgement {
         PlacementSyntax,
     }
 
-    struct Judge<'a, P: crate::resource::PlaceholderKind, B: BindingAddress> {
+    struct Judge<'a, B: BindingAddress> {
         authority: Arc<super::super::ProviderContext>,
         authored: IndexMap<ExpressionLocation, &'a ExprValue<ParserPlaceholder, B>>,
         expressions: &'a Expressions<B>,
-        bindings: &'a InferenceBindings<P, B>,
+        bindings: &'a InferenceBindings,
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
@@ -5142,7 +5139,7 @@ mod judgement {
         module_attributes: Option<&'a IndexMap<(B, String), JudgedExpr>>,
     }
 
-    impl<P: crate::resource::PlaceholderKind, B: BindingAddress> Judge<'_, P, B> {
+    impl<B: BindingAddress> Judge<'_, B> {
         fn is_list_literal(mut expression: &ExprValue<ParserPlaceholder, B>) -> bool {
             while matches!(
                 expression.authored.kind,
@@ -5378,7 +5375,7 @@ mod judgement {
                         Some(InferenceBinding::Resource { .. }) | None => {
                             N::SchemaAttributeReference
                         }
-                        Some(InferenceBinding::UserFunction { .. }) => N::FunctionParameter,
+                        Some(InferenceBinding::UserFunction) => N::FunctionParameter,
                     };
                     E::NonCrossed(cut)
                 }
@@ -5842,7 +5839,7 @@ mod judgement {
                     }
                     if let Some(InferenceBinding::Virtual { attributes }) =
                         self.bindings.get(binding.as_str())
-                        && !attributes.contains_key(attribute)
+                        && !attributes.contains(attribute)
                     {
                         return ordinary(
                             Err(InferenceError::UnknownAttribute {
@@ -6699,8 +6696,7 @@ mod judgement {
             )),
             Err(InferenceIssue::NotInferable(
                 reason @ (NotInferableReason::ValueDependent { .. }
-                | NotInferableReason::NonInferableBinding { .. }
-                | NotInferableReason::PlaceholderTypeUnavailable { .. }),
+                | NotInferableReason::NonInferableBinding { .. }),
             )) => ExprJudgement::ValueDependent {
                 reason,
                 shape: None,

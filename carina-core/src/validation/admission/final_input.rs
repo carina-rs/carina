@@ -201,15 +201,12 @@ impl<'a> FailureContext<'a> {
             )
         });
         let origin = if from_defaults {
-            let keys = if failing_key.is_some_and(|key| key.is_diagnostic_sensitive()) {
-                Vec::new()
-            } else {
-                self.merged_default_keys
-                    .iter()
-                    .filter(|key| failing_key.is_none_or(|failed| failed == *key))
-                    .cloned()
-                    .collect()
-            };
+            let keys = self
+                .merged_default_keys
+                .iter()
+                .filter(|key| failing_key.is_none_or(|failed| failed == *key))
+                .cloned()
+                .collect();
             FinalInputOrigin::ProviderDefaultTags {
                 keys,
                 instance: self.id.provider_instance.clone(),

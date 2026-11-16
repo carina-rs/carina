@@ -975,7 +975,7 @@ fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
     }
 }
 
-fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
+fn assert_enum_witness_shows_env_and_masks_secret_value(base: DraftType, expected: &str) {
     let open_enum = |base| DraftType::enum_with_base(identity(), base, None, vec![], None, None);
     let strict = snapshot(vec![("p", vec![open_enum(base)])]);
     let lax = snapshot(vec![("p", vec![open_enum(DraftType::string())])]);
@@ -993,10 +993,25 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
     crate::parser::resolve_resource_refs_with_config(&mut parsed, context.as_provider_context())
         .unwrap();
     let env_value = parsed.resources[0].get_attr("value0").unwrap();
-    assert!(env_value.contains_diagnostic_sensitive_string());
+    assert!(!env_value.contains_diagnostic_sensitive_string());
+    let mut secret_parsed = crate::parser::parse(
+        "let source = p.Values { value0 = secret(env('ANNOTATION_SECRET')) }",
+        context.as_provider_context(),
+    )
+    .unwrap();
+    crate::parser::resolve_resource_refs_with_config(
+        &mut secret_parsed,
+        context.as_provider_context(),
+    )
+    .unwrap();
+    let secret_value = secret_parsed.resources[0].get_attr("value0").unwrap();
     let ty: TypeExpr =
         serde_json::from_value(serde_json::to_value(annotation(&strict)).unwrap()).unwrap();
-    for value in [env_value, &text(plaintext)] {
+    for (value, hidden) in [
+        (env_value, false),
+        (&text(plaintext), false),
+        (secret_value, true),
+    ] {
         let error = typecheck::check_type_expr_value(
             &ty,
             value,
@@ -1008,26 +1023,28 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
         .require_provider_schemas()
         .expect_err("the retained witness must reject the value");
         let message = error.to_string();
-        assert!(message.contains(expected), "{message}");
-        if value.contains_diagnostic_sensitive_string() {
+        if hidden {
             assert!(!message.contains(plaintext), "secret leaked: {message}");
             assert!(!format!("{error:?}").contains(plaintext));
-            assert!(message.contains("(secret)"), "{message}");
-            assert!(!message.contains("'(secret)'"), "{message}");
+            assert_eq!(message, "expected aws.iam.Role.Name, got secret");
         } else {
+            assert_eq!(message, expected);
             assert!(message.contains(plaintext), "{message}");
         }
     }
 }
 
 #[test]
-fn review_enum_witness_length_error_masks_env_value() {
-    assert_enum_witness_masks_env_value(string(2, 4, None), "outside allowed range 2..=4");
+fn review_enum_witness_length_error_shows_env_and_masks_secret_value() {
+    assert_enum_witness_shows_env_and_masks_secret_value(
+        string(2, 4, None),
+        "expected aws.iam.Role.Name, got string 'private-token': p rejected `aws.iam.Role.Name`: Invalid Name value 'private-token': length 13 is outside allowed range 2..=4",
+    );
 }
 
 #[test]
-fn review_enum_witness_pattern_error_masks_env_value() {
-    assert_enum_witness_masks_env_value(
+fn review_enum_witness_pattern_error_shows_env_and_masks_secret_value() {
+    assert_enum_witness_shows_env_and_masks_secret_value(
         string(
             1,
             32,
@@ -1036,7 +1053,7 @@ fn review_enum_witness_pattern_error_masks_env_value() {
                 crate::schema::PatternMatch::Full,
             )),
         ),
-        "required pattern",
+        "expected aws.iam.Role.Name, got string 'private-token': p rejected `aws.iam.Role.Name`: Invalid Name value 'private-token': does not match required pattern /^[A-Z]+$/ (Full)",
     );
 }
 
@@ -1511,41 +1528,33 @@ fn computed_access_rejects_heterogeneous_collection_in_typecheck() {
 #[test]
 fn coalesce_and_collection_inference_share_the_identity_layer() {
     let snapshot = snapshot(vec![("p", vec![member(1, 64, None), member(1, 128, None)])]);
-    let bindings = inference::InferenceBindings::from([(
-        "source".into(),
-        inference::InferenceBinding::Resource {
-            provider: "p".into(),
-            resource_type: "Values".into(),
-        },
-    )]);
-    let first = Value::resource_ref("source", "value0", Vec::new());
-    let second = Value::resource_ref("source", "value1", Vec::new());
+    let context = snapshot.provider_context().as_provider_context();
     let canonical = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
-    for (value, expected) in [
+    for (expression, expected) in [
+        ("source.value0 ?? source.value1", canonical.clone()),
         (
-            Value::Deferred(crate::resource::DeferredValue::Coalesce {
-                value: Box::new(first.clone()),
-                default: Box::new(second.clone()),
-            }),
-            canonical.clone(),
-        ),
-        (
-            list(vec![first.clone(), second.clone()]),
+            "[source.value0, source.value1]",
             TypeExpr::List(Box::new(canonical.clone())),
         ),
         (
-            map(IndexMap::from([("a".into(), first), ("b".into(), second)])),
+            "{ a = source.value0 b = source.value1 }",
             TypeExpr::Map(Box::new(canonical)),
         ),
     ] {
-        let inferred = inference::infer_projected_type(
-            &value,
-            &bindings,
-            snapshot.schema_registry(),
-            snapshot.provider_context().as_provider_context(),
+        let parsed = crate::parser::parse(
+            &format!("let source = p.Values {{}}\nlet result = {expression}\n"),
+            context,
         )
         .unwrap();
-        assert_eq!(inferred, expected);
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            snapshot.schema_registry(),
+            context,
+        );
+        let inferred = report
+            .binding(&crate::resource::RelativeBindingName::new("result"))
+            .unwrap();
+        assert_eq!(inferred.static_type(), Ok(&expected), "{expression}");
     }
 }
 
@@ -1650,66 +1659,6 @@ fn enum_resource_binding_mismatch_keeps_the_exact_enum_name() {
 }
 
 #[test]
-fn production_inference_compares_identity_only_value_types() {
-    let snapshot = snapshot(vec![("p", vec![member(1, 64, None), member(1, 128, None)])]);
-    let first = typed_function_result(inference::attribute_type_to_type_expr(
-        declaration(&snapshot, "p", 0),
-        "p",
-    ));
-    let second = typed_function_result(inference::attribute_type_to_type_expr(
-        declaration(&snapshot, "p", 1),
-        "p",
-    ));
-    let values = [
-        Value::Deferred(crate::resource::DeferredValue::Coalesce {
-            value: Box::new(first.clone()),
-            default: Box::new(second.clone()),
-        }),
-        list(vec![first.clone(), second.clone()]),
-        map(IndexMap::from([
-            ("a".into(), first.clone()),
-            ("b".into(), second.clone()),
-        ])),
-        Value::Deferred(crate::resource::DeferredValue::ModuleIf(Box::new(
-            crate::parser::DeferredValueIf::new(
-                crate::parser::DeferredIfCondition::new(
-                    Value::Deferred(crate::resource::DeferredValue::Placeholder(
-                        ParserPlaceholder::ModuleArgument {
-                            name: "flag".into(),
-                            diagnostic: Default::default(),
-                        },
-                    )),
-                    "main.crn".into(),
-                    1,
-                ),
-                first,
-                second,
-            ),
-        ))),
-    ];
-    for value in values {
-        let inferred = inference::infer_projected_type(
-            &value,
-            &inference::InferenceBindings::new(),
-            snapshot.schema_registry(),
-            snapshot.provider_context().as_provider_context(),
-        )
-        .unwrap();
-        let canonical = inference::attribute_type_to_type_expr(declaration(&snapshot, "p", 0), "p");
-        let expected = match &value {
-            Value::Concrete(crate::resource::ConcreteValue::List(_)) => {
-                TypeExpr::List(Box::new(canonical))
-            }
-            Value::Concrete(crate::resource::ConcreteValue::Map(_)) => {
-                TypeExpr::Map(Box::new(canonical))
-            }
-            _ => canonical,
-        };
-        assert_eq!(inferred, expected);
-    }
-}
-
-#[test]
 fn every_boundary_admits_same_identity_member_restrictions() {
     let snapshot = snapshot(vec![("p", vec![member(1, 128, None), member(1, 64, None)])]);
     let context = snapshot.provider_context().as_provider_context();
@@ -1794,7 +1743,6 @@ fn function_reads_ignore_slot_members_and_coalesce_keeps_destination_checks() {
         report
             .binding(&crate::resource::RelativeBindingName::new("result"))
             .unwrap(),
-        snapshot.schema_registry(),
         &bindings,
     )
     .expect("the coalesce can select the fitting branch; the selected value remains checked at its destination");
@@ -1901,13 +1849,13 @@ fn integer_operand_mismatches_do_not_hide_a_named_strings_constraints() {
         context,
     )
     .unwrap();
-    let error = inference::infer_projected_type(
-        &parsed.variables["result"],
-        &inference::bindings_from_parsed(&parsed),
-        snapshot.schema_registry(),
-        context,
-    )
-    .unwrap_err();
+    let report =
+        crate::parser::retained::judge_expressions(&parsed, snapshot.schema_registry(), context);
+    let error = report
+        .binding(&crate::resource::RelativeBindingName::new("result"))
+        .unwrap()
+        .static_type()
+        .unwrap_err();
     assert_eq!(
         error.to_string(),
         "operator '+': left operand must be Int, got Int (length 1..=16)"

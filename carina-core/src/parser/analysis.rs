@@ -1859,7 +1859,6 @@ pub struct AnalysisTree<
     value_references: Vec<AnalysisValueReference<B>>,
     validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
     iterables: Vec<AnalysisForRef<'a, P, B>>,
-    arguments: &'a [super::ArgumentParameter<super::TypeExpr, P, B>],
     functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
@@ -2706,7 +2705,6 @@ where
             value_references,
             validation_values,
             iterables,
-            arguments: &file.arguments,
             functions: &file.user_functions,
             module_calls: &file.module_calls,
             module_definition: !file.arguments.is_empty() || !file.attribute_params.is_empty(),
@@ -3043,56 +3041,6 @@ where
                 },
             ));
         }
-    }
-
-    pub fn inference_bindings(
-        &self,
-    ) -> crate::validation::inference::InferenceBindings<ParserPlaceholder, B> {
-        use crate::validation::inference::InferenceBinding;
-        let mut bindings = std::collections::HashMap::new();
-        for upstream in self.upstream_states() {
-            bindings.insert(
-                upstream.binding.to_string(),
-                InferenceBinding::UpstreamState,
-            );
-        }
-        for resource in self.resources() {
-            if let Some(binding) = resource.binding_address() {
-                let kind = if resource.kind() == AnalysisItemKind::Composition {
-                    InferenceBinding::Virtual {
-                        attributes: resource.attributes().into_owned(),
-                    }
-                } else {
-                    InferenceBinding::Resource {
-                        provider: resource.id().provider.clone(),
-                        resource_type: resource.id().resource_type.clone(),
-                    }
-                };
-                bindings.insert(binding.to_string(), kind);
-            }
-        }
-        for call in self.module_calls {
-            if let Some(binding) = &call.binding_name {
-                bindings
-                    .entry(binding.to_string())
-                    .or_insert(InferenceBinding::ModuleCall);
-            }
-        }
-        for argument in self.arguments {
-            bindings
-                .entry(argument.name.clone())
-                .or_insert_with(|| InferenceBinding::Argument {
-                    type_expr: argument.static_type.clone(),
-                });
-        }
-        for function in self.functions.values() {
-            bindings.entry(function.name.clone()).or_insert_with(|| {
-                InferenceBinding::UserFunction {
-                    return_type: function.return_type.clone(),
-                }
-            });
-        }
-        bindings
     }
 }
 

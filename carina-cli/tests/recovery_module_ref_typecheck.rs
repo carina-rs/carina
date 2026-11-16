@@ -342,7 +342,7 @@ let b = mock.test.resource {
 }
 
 #[test]
-fn evaluated_environment_value_is_redacted_at_function_boundary() {
+fn evaluated_environment_value_is_shown_at_function_boundary() {
     let fixture = ordinary_resource_reference_fixture(
         r#"fn f(x: Int): String { 'ok' }
 let result = f(env('CARINA_3848_SECRET'))
@@ -353,25 +353,24 @@ let result = f(env('CARINA_3848_SECRET'))
         .current_dir(fixture.path())
         .env("NO_COLOR", "1")
         .env("CARINA_3848_SECRET", plaintext)
+        .env_remove("CLICOLOR_FORCE")
         .args(["validate", "."])
         .output()
         .expect("run carina validate");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        !output.status.success(),
-        "validate must reject env String -> Int"
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+    assert_eq!(
+        &*stderr,
+        "Error: ./main.crn: Invalid expression at line 2: function 'f': parameter 'x': expected Int, got string 'hunter2plaintext'\n"
     );
-    assert!(
-        stderr.contains("function 'f': parameter 'x': expected Int, got string"),
-        "stderr={stderr}"
-    );
-    assert!(!stderr.contains(plaintext), "stderr={stderr}");
 }
 
 #[test]
-fn environment_plaintext_is_redacted_across_cli_directory_typecheck_paths() {
-    let cases: &[(&str, &[(&str, &str)])] = &[
+fn environment_plaintext_is_shown_across_cli_directory_typecheck_paths() {
+    type DirectoryCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
+    let cases: &[DirectoryCase<'_>] = &[
         (
             "module literal union argument",
             &[
@@ -382,6 +381,8 @@ fn environment_plaintext_is_redacted_across_cli_directory_typecheck_paths() {
                 ("functions.crn", "fn f() { env('LEAKX') }\n"),
                 ("m/main.crn", "arguments { n: 'dev' | 'prod' }\n"),
             ],
+            "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'n': expected 'dev' | 'prod', got secret\n",
+            "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'n': expected 'dev' | 'prod', got string 'hunter2SECRET'\n",
         ),
         (
             "module list argument",
@@ -396,6 +397,8 @@ fn environment_plaintext_is_redacted_across_cli_directory_typecheck_paths() {
                 ),
                 ("m/main.crn", "arguments { l: list(Int) }\n"),
             ],
+            "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'l': at list element 0: expected Int, got secret\n",
+            "Error: main.crn at line 2\nError: module call 'm (anonymous call)': argument 'l': at list element 0: expected Int, got string 'hunter2SECRET'\n",
         ),
         (
             "literal union export",
@@ -403,6 +406,8 @@ fn environment_plaintext_is_redacted_across_cli_directory_typecheck_paths() {
                 ("functions.crn", "fn f() { env('LEAKX') }\n"),
                 ("exports.crn", "exports { e: 'dev' | 'prod' = f() }\n"),
             ],
+            "Error: export 'e' cannot hold a secret value\n",
+            "Error: export 'e': expected 'dev' | 'prod', got string 'hunter2SECRET'\n",
         ),
         (
             "nested function export",
@@ -410,29 +415,51 @@ fn environment_plaintext_is_redacted_across_cli_directory_typecheck_paths() {
                 ("functions.crn", "fn k(x) { x }\n"),
                 ("exports.crn", "exports { q: Int = k(env('LEAKX')) }\n"),
             ],
+            "Error: export 'q' cannot hold a secret value\n",
+            "Error: export 'q': expected Int, got string 'hunter2SECRET'\n",
         ),
     ];
 
-    for (label, files) in cases {
-        let fixture = multi_file_fixture(files);
-        let output = Command::new(env!("CARGO_BIN_EXE_carina"))
-            .current_dir(fixture.path())
-            .env("NO_COLOR", "1")
-            .env("LEAKX", "hunter2SECRET")
-            .args(["validate", "."])
-            .output()
-            .expect("run carina validate");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        assert!(
-            !output.status.success(),
-            "{label} must fail; stderr={stderr}"
-        );
-        assert!(stderr.contains("got string"), "{label}: stderr={stderr}");
-        assert!(
-            !stderr.contains("hunter2SECRET"),
-            "{label} leaked env plaintext: stderr={stderr}"
-        );
+    for (label, files, expected_secret_stderr, expected_public_stderr) in cases {
+        for hidden in [true, false] {
+            let fixture = multi_file_fixture(files);
+            if hidden {
+                for (filename, source) in *files {
+                    std::fs::write(
+                        fixture.path().join(filename),
+                        source.replace("env('LEAKX')", "secret(env('LEAKX'))"),
+                    )
+                    .unwrap();
+                }
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_carina"))
+                .current_dir(fixture.path())
+                .env("NO_COLOR", "1")
+                .env_remove("CLICOLOR_FORCE")
+                .env("LEAKX", "hunter2SECRET")
+                .args(["validate", "."])
+                .output()
+                .expect("run carina validate");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if hidden {
+                assert!(
+                    !stdout.contains("hunter2SECRET") && !stderr.contains("hunter2SECRET"),
+                    "SECRET CONTROL PLAINTEXT LEAK: {label}; stdout={stdout:?}; stderr={stderr:?}"
+                );
+                assert_eq!(output.status.code(), Some(1), "{label}: {output:?}");
+                assert_eq!(&*stdout, "Validating...\n", "{label}");
+                assert_eq!(&*stderr, *expected_secret_stderr, "{label}");
+            } else {
+                assert!(
+                    !output.status.success(),
+                    "{label} must fail; stderr={stderr}"
+                );
+                assert_eq!(output.status.code(), Some(1), "{label}");
+                assert_eq!(&*stdout, "Validating...\n", "{label}");
+                assert_eq!(&*stderr, *expected_public_stderr, "{label}");
+            }
+        }
     }
 }
 

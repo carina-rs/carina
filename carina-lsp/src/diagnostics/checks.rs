@@ -1266,7 +1266,6 @@ impl DiagnosticRun<'_> {
         diagnostics.extend(
             carina_core::validation::validate_deferred_for_iterable_types(
                 tree,
-                &self.schemas,
                 self.provider_context.catalog(),
             )
             .iter()

@@ -144,12 +144,7 @@ pub(in crate::parser) fn parse_provider_block(
     )? {
         Some((version, line)) => Some(
             VersionConstraint::parse(version.expose_plaintext()).map_err(|error| {
-                let message = match version.diagnostic_literal() {
-                    Some(_) => format!("Provider '{name}': {error}"),
-                    None => {
-                        format!("Provider '{name}': Invalid version constraint: value from env()")
-                    }
-                };
+                let message = format!("Provider '{name}': {error}");
                 ParseError::InvalidExpression { line, message }
             })?,
         ),

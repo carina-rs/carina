@@ -313,22 +313,21 @@ mod decision_contract {
     #[test]
     fn reference_cycles_use_selector_identity_not_redacted_display() {
         use crate::binding_index::{BindingCompleteness, BindingValueSource};
-        use crate::resource::{RedactedSecretHash, SnapshotValue, Subscript};
-        let path = |key| {
-            AccessPath::root_with_fields_and_subscripts(
-                "producer",
-                "items",
-                vec![],
-                vec![Subscript::Str {
-                    key: ValueString::diagnostic_sensitive(key),
-                }],
-            )
-        };
-        assert_eq!(path("first").to_string(), path("second").to_string());
-        assert_ne!(path("first"), path("second"));
-        let alias: Value = Value::Deferred(DeferredValue::ResourceRef {
-            path: path("second"),
+        use crate::resource::{RedactedSecretHash, SnapshotValue};
+        let parsed = crate::parser::parse(
+            "let first = secret(producer.items['first'])\nlet second = secret(producer.items['second'])",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        ).unwrap();
+        let values = ["first", "second"].map(|name| {
+            parsed.variables[name]
+                .clone()
+                .resolve_root(&crate::resource::RootScope::new())
+                .into_expanded()
+                .unwrap()
         });
+        assert_eq!(format!("{:?}", values[0]), format!("{:?}", values[1]));
+        assert_ne!(values[0], values[1]);
+        let alias = values[1].clone();
         let digest = RedactedSecretHash::from_encoded_digest(&format!(
             "argon2-legacy:73616c74:{}",
             "ab".repeat(32)
@@ -351,9 +350,7 @@ mod decision_contract {
             BindingValueSource::Local,
             BindingCompleteness::Complete,
         );
-        let value: Value = Value::Deferred(DeferredValue::ResourceRef {
-            path: path("first"),
-        });
+        let value = &values[0];
         let proof = value.knowledge(&KnowledgeContext::plan(&bindings));
         assert!(
             matches!(proof, Ok(ref proof) if proof.sites().all(|site| site.phase() == Phase::Plan)),
@@ -3783,57 +3780,134 @@ mod selection_tests {
         }
     }
     #[test]
-    fn sensitive_selection_site_never_displays_key_plaintext() {
-        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
-            "CARINA_KNOWLEDGE_SELECTION_KEY".to_owned(),
-            "PRIVATE_SELECTION_ENV_KEY".into(),
-        )]));
-        let key_value: Value = crate::builtins::evaluate_builtin_with_config_to_value(
-            "env",
-            &[Value::Concrete(ConcreteValue::String(
-                "CARINA_KNOWLEDGE_SELECTION_KEY".into(),
-            ))],
-            &context,
-        )
-        .unwrap();
-        let Value::Concrete(ConcreteValue::String(key)) = key_value else {
-            panic!("env string")
-        };
-        let base = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-            key.expose_plaintext().to_owned(),
-            Value::root_resource_ref("future", "identifier", vec![]),
-        )])));
-        let access = super::super::deferred_access(
-            base,
-            super::super::PathSegment::Subscript {
-                index: super::super::Subscript::Str { key },
-            },
-            0,
-        );
-        let bindings = ResolvedBindings::default();
-        let proof = access
-            .knowledge(&KnowledgeContext::plan(&bindings))
-            .map(|proof| proof.into_classification())
-            .unwrap();
-        let site = proof
-            .sites()
-            .find(|site| !site.path.segments().is_empty())
-            .unwrap();
-        assert!(!site.path.to_string().contains("PRIVATE_SELECTION_ENV_KEY"));
-        assert!(!format!("{:?}", site.path).contains("PRIVATE_SELECTION_ENV_KEY"));
-        let violation = PhaseViolation {
-            required: Requirement::ShapeForPlan,
-            site: Box::new(site),
-            source: None,
-        };
-        assert!(
-            !violation.to_string().contains("PRIVATE_SELECTION_ENV_KEY"),
-            "{violation}"
-        );
-        assert!(
-            violation.to_string().contains("<sensitive string>"),
-            "{violation}"
-        );
+    fn real_secret_selection_paths_preserve_diagnostic_boundaries() {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut actual = Vec::new();
+        for (case, expression) in [
+            "secret(missing.value['PRIVATE_SELECTION_SECRET_KEY'])",
+            "secret((missing.value ?? { PRIVATE_SELECTION_SECRET_KEY = future.identifier })['PRIVATE_SELECTION_SECRET_KEY'])",
+            "secret((missing ?? { PRIVATE_SELECTION_SECRET_KEY = future.identifier })['PRIVATE_SELECTION_SECRET_KEY'])",
+            "secret(lookup(missing.value, 'PRIVATE_SELECTION_SECRET_KEY', future.identifier))",
+            "secret(identity(missing.value)['PRIVATE_SELECTION_SECRET_KEY'])",
+        ].into_iter().enumerate() {
+            let source = format!("fn identity(x) {{ x }}\nlet result = {expression}\n");
+            match crate::parser::parse(&source, &context) {
+                Ok(parsed) => {
+                    let value = parsed.variables["result"].clone().resolve_root(&super::super::RootScope::new()).into_expanded().unwrap();
+                    let bindings = ResolvedBindings::default();
+                    let proof = value.knowledge(&KnowledgeContext::plan(&bindings)).unwrap().into_classification();
+                    let violation = proof.module_iteration_violation().expect("pending apply-time Secret has the production shape violation");
+                    let violation_display = violation.to_string();
+                    let violation_debug = format!("{violation:?}");
+                    let sites = proof.sites().map(|site| {
+                        let debug = format!("{site:?}");
+                        let inspected = site.inspect::<(), String>(|path, _, _| Err(path.to_string())).unwrap_err();
+                        let surfaces = [debug, violation_display.clone(), violation_debug.clone(), inspected];
+                        for rendered in &surfaces {
+                            assert!(!rendered.contains("PRIVATE_SELECTION_SECRET_KEY"), "PUBLIC SURFACE PLAINTEXT LEAK, case {case}: {rendered}");
+                        }
+                        surfaces
+                    }).collect::<Vec<_>>();
+                    actual.push(sites);
+                }
+                Err(error) => {
+                    let rendered = format!("{error:?} {error}");
+                    assert!(!rendered.contains("PRIVATE_SELECTION_SECRET_KEY"), "PUBLIC SURFACE PLAINTEXT LEAK, case {case}: {rendered}");
+                    actual.push(vec![[error.to_string(), String::new(), String::new(), String::new()]]);
+                }
+            }
+        }
+        let expected: Vec<Vec<[String; 4]>> = serde_json::from_str(r#"[
+  [
+    [
+      "PendingSite { phase: Apply, reason: ResourceSelection, scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: ResourceSelection, scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ]
+  ],
+  [
+    [
+      "PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ],
+    [
+      "PendingSite { phase: Apply, reason: Evaluation(Coalesce), scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ],
+    [
+      "PendingSite { phase: Apply, reason: ResourceSelection, scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ],
+    [
+      "PendingSite { phase: Apply, reason: ResourceSelection, scope: Secret, guard: CoalesceFallback, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ]
+  ],
+  [
+    [
+      "Invalid expression at line 2, column 14",
+      "",
+      "",
+      ""
+    ]
+  ],
+  [
+    [
+      "PendingSite { phase: Apply, reason: Evaluation(Builtin), scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Builtin), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ],
+    [
+      "PendingSite { phase: Apply, reason: ResourceSelection, scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Builtin), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ],
+    [
+      "PendingSite { phase: Apply, reason: ResourceSelection, scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Builtin), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ]
+  ],
+  [
+    [
+      "PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ],
+    [
+      "PendingSite { phase: Apply, reason: Evaluation(UserFunction), scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ],
+    [
+      "PendingSite { phase: Apply, reason: ResourceSelection, scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ],
+    [
+      "PendingSite { phase: Apply, reason: Evaluation(UserFunction), scope: Secret, guard: Required, .. }",
+      "requires ShapeForPlan, available at Apply (protected value)",
+      "PhaseViolation { required: ShapeForPlan, site: PendingSite { phase: Apply, reason: Evaluation(Access), scope: Secret, guard: Required, .. } }",
+      "invalid value inside secret(...)"
+    ]
+  ]
+]"#).unwrap();
+        assert_eq!(actual, expected);
     }
 }
 

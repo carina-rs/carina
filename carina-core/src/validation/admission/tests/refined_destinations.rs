@@ -1,6 +1,7 @@
 // Boundary/directory must stay in sync with carina-core/tests/support/refined_destinations.rs.
 //! Directory-backed forwarding boundaries. Authored annotations name an
 //! identity; the final schema slot owns its separate member constraints.
+use crate::validation::admission::{kind, tests::selected_destination};
 use crate::{
     binding_index::{BindingIndex, BindingValueSource, ResolvedBindings},
     provider::LoadedProviderSnapshot,
@@ -145,9 +146,18 @@ pub fn check(
         .iter()
         .find(|r| r.id.resource_type == "MemberSink")
         .expect("the actual member-bearing slot exists");
-    let destination = schemas
-        .resource_attribute_destination(&sink.id, "name", context)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &sink.id.provider,
+                &sink.id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &sink.id,
+        "name",
+        context,
+    );
     with_session_for_test(snapshot.provider_context(), |session| {
         use crate::parser::ExportParamLike;
         let value = match boundary {

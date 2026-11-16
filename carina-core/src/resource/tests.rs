@@ -50,6 +50,111 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
     RootScope::new().resolve(RelativeBindingName::new(binding))
 }
 
+fn dispatched_source_value(expression: &str) -> Value {
+    let parsed = crate::parser::parse(
+        &format!("let value = {expression}"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let value = parsed.variables["value"]
+        .clone()
+        .resolve_root(&RootScope::new())
+        .into_expanded()
+        .unwrap();
+    let resource = Resource::new("test", "dispatch-input")
+        .with_attribute("value", value)
+        .into_provider_resource();
+    let mut resources = [resource];
+    crate::executor::normalized::unwrap_dispatch_desired(&mut resources);
+    resources[0].attributes.shift_remove("value").unwrap()
+}
+
+#[test]
+fn real_dsl_marking_consumers_preserve_secret_boundaries() {
+    let mut context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    context.decryptor = Some(std::sync::Arc::new(|_, _| Err("CANARY_4409_SECRET".into())));
+    for (source, expected) in [
+        (
+            "let value = env(secret('CANARY_4409_SECRET'))",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: env(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "let value = cidr_subnet(secret('CANARY_4409_SECRET'), 1, 0)",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: cidr_subnet(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "let value = map(secret('.CANARY_4409_SECRET'), [{}])",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: map(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "let value = decrypt(secret('CANARY_4409_SECRET'))",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: decrypt(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "let value = decrypt('public', secret('CANARY_4409_SECRET'))",
+            Some(
+                "test.crn:1:5: Invalid expression at line 1: decrypt(): invalid value inside secret(...)",
+            ),
+        ),
+        (
+            "fn f(x: Int) { x }\nlet value = f(secret('CANARY_4409_SECRET'))",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Int, got secret",
+            ),
+        ),
+        (
+            "fn f(x: Ipv4Address) { x }\nlet value = f(secret('CANARY_4409_SECRET'))",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Ipv4Address, got secret",
+            ),
+        ),
+        (
+            "fn f(x: Ipv4Address) { x }\nlet value = f(secret(['CANARY_4409_SECRET']))",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Ipv4Address, got secret",
+            ),
+        ),
+        (
+            "fn f(x: Ipv4Address) { x }\nlet value = f([secret('CANARY_4409_SECRET')])",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Ipv4Address, got list",
+            ),
+        ),
+        (
+            "fn f(x: Ipv4Address) { x }\nlet value = f(secret({ k = 'CANARY_4409_SECRET' }))",
+            Some(
+                "Invalid expression at line 2: function 'f': parameter 'x': expected Ipv4Address, got secret",
+            ),
+        ),
+        (
+            "let value = secret(missing.values['CANARY_4409_SECRET'])",
+            None,
+        ),
+        (
+            "let value = secret(identity(missing)['CANARY_4409_SECRET'])",
+            Some("Invalid expression at line 1, column 13"),
+        ),
+    ] {
+        let result = crate::parser::parse(source, &context).and_then(|mut parsed| {
+            crate::parser::resolve_resource_refs_with_config(&mut parsed, &context)?;
+            Ok(parsed)
+        });
+        let actual = result.map(|_| ()).map_err(|error| {
+            assert!(!format!("{error:?}").contains("CANARY_4409_SECRET"));
+            error.to_string()
+        });
+        assert_eq!(actual, expected.map(str::to_owned).map_or(Ok(()), Err));
+    }
+}
+
 #[test]
 fn secret_origin_4275_round2_fully_resolved_check_masks_secret_path() {
     let reference = Value::root_resource_ref("private_producer", "private_attr", vec![]);
@@ -652,12 +757,16 @@ fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_has
 }
 
 #[test]
-fn diagnostic_sensitive_string_is_runtime_equivalent_but_formatting_safe() {
+fn secret_marked_string_is_runtime_equivalent_but_formatting_safe() {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let plain = ValueString::plain("hunter2SECRET");
-    let marked = ValueString::diagnostic_sensitive("hunter2SECRET");
+    let Value::Concrete(ConcreteValue::String(marked)) =
+        dispatched_source_value("secret('hunter2SECRET')")
+    else {
+        panic!("dispatch string")
+    };
 
     assert_eq!(marked, plain);
 
@@ -677,7 +786,7 @@ fn diagnostic_sensitive_string_is_runtime_equivalent_but_formatting_safe() {
     );
 
     assert_eq!(marked.diagnostic_literal(), None);
-    assert!(!format!("{marked:?}").contains("hunter2SECRET"));
+    assert_eq!(format!("{marked:?}"), "<sensitive string>");
     assert_eq!(marked.expose_plaintext(), "hunter2SECRET");
 }
 
@@ -694,24 +803,6 @@ fn secret_debug_never_formats_the_inner_plaintext() {
 
     assert!(rendered.contains("Secret((secret))"), "rendered={rendered}");
     assert!(!rendered.contains("hunter2SECRET"), "rendered={rendered}");
-}
-
-#[test]
-fn interpolation_inherits_diagnostic_sensitivity_from_string_expression() {
-    let value = Value::Deferred(DeferredValue::Interpolation(vec![
-        InterpolationPart::Literal("prefix-".into()),
-        InterpolationPart::Expr(Value::Concrete(ConcreteValue::String(
-            ValueString::diagnostic_sensitive("hunter2SECRET"),
-        ))),
-    ]))
-    .canonicalize();
-
-    assert_eq!(crate::ValueDescription::of(&value).to_string(), "string");
-    assert_eq!(crate::value::format_value(&value), "'prefix-hunter2SECRET'");
-    assert_eq!(
-        crate::value::value_to_json(&value).unwrap(),
-        serde_json::json!("prefix-hunter2SECRET")
-    );
 }
 
 #[test]

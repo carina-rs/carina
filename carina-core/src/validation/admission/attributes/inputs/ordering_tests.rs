@@ -125,7 +125,6 @@ fn admission_uses_owning_resource_order_even_for_reversed_classifications() {
             &inputs,
             &bindings,
             session,
-            &schemas,
             &std::cell::RefCell::new(Default::default()),
         );
         assert_eq!(

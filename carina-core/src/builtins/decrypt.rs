@@ -30,16 +30,7 @@ pub(crate) fn builtin_decrypt_with_config<B: BindingAddress>(
     let plaintext = decryptor(
         ciphertext.expose_plaintext(),
         key.map(ValueString::expose_plaintext),
-    )
-    .map_err(|error| {
-        if ciphertext.is_diagnostic_sensitive()
-            || key.is_some_and(ValueString::is_diagnostic_sensitive)
-        {
-            "decrypt() failed for a sensitive value".to_string()
-        } else {
-            error
-        }
-    })?;
+    )?;
     Ok(Value::Deferred(DeferredValue::Secret(
         Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
     )))
@@ -100,6 +91,46 @@ mod tests {
             decryptor: Some(decrypt_fn),
             resource_types: Default::default(),
             ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
+        }
+    }
+
+    #[test]
+    fn parsed_secret_decryptor_failures_use_payload_boundary() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for (expression, private_literal) in [
+            (
+                "decrypt(secret('F12_PRIVATE_CIPHERTEXT'))",
+                "F12_PRIVATE_CIPHERTEXT",
+            ),
+            (
+                "decrypt('public-ciphertext', secret('F12_PRIVATE_KEY'))",
+                "F12_PRIVATE_KEY",
+            ),
+        ] {
+            let called = Arc::new(AtomicBool::new(false));
+            let called_by_decryptor = Arc::clone(&called);
+            let config = mock_config(Arc::new(move |ciphertext, key| {
+                called_by_decryptor.store(true, Ordering::Relaxed);
+                Err(format!("decryptor rejected {ciphertext}; key={key:?}"))
+            }));
+            let error = crate::parser::parse_file(
+                &format!("let value = {expression}"),
+                std::path::Path::new("test.crn"),
+                &config,
+            )
+            .and_then(|mut parsed| {
+                crate::parser::resolve_resource_refs_with_config(&mut parsed, &config)?;
+                Ok(parsed)
+            })
+            .unwrap_err();
+            assert!(called.load(Ordering::Relaxed));
+            assert_eq!(
+                error.to_string(),
+                "test.crn:1:5: Invalid expression at line 1: decrypt(): invalid value inside secret(...)"
+            );
+            assert!(!format!("{error:?} {error}").contains(private_literal));
         }
     }
 

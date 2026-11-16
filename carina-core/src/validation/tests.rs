@@ -741,37 +741,46 @@ fn ref_validation_rejects_missing_provenance_without_panicking() {
 
 #[test]
 fn deferred_iterable_shape_classifies_concrete_list_without_placeholder_type() {
-    let shape = deferred_iterable_shape(
-        &Value::Concrete(ConcreteValue::List(Vec::new())),
-        &inference::InferenceBindings::new(),
-        &SchemaRegistry::new(),
-    )
-    .expect("concrete list shape");
-
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse("let result = []", &context).unwrap();
+    let report =
+        crate::parser::retained::judge_expressions(&parsed, &SchemaRegistry::new(), &context);
+    let expression = report
+        .binding(&crate::resource::RelativeBindingName::new("result"))
+        .unwrap();
+    let sink = TypeExpr::List(Box::new(TypeExpr::String));
+    let shape = deferred_iterable_shape_for_phase(&expression.for_sink(&sink, &context))
+        .expect("authored iterable shape");
     assert_eq!(shape, DeferredIterableShape::List);
 }
 
 #[test]
 fn deferred_iterable_shape_classifies_concrete_map_without_placeholder_type() {
-    let shape = deferred_iterable_shape(
-        &Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-        &inference::InferenceBindings::new(),
-        &SchemaRegistry::new(),
-    )
-    .expect("concrete map shape");
-
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse("let result = {}", &context).unwrap();
+    let report =
+        crate::parser::retained::judge_expressions(&parsed, &SchemaRegistry::new(), &context);
+    let expression = report
+        .binding(&crate::resource::RelativeBindingName::new("result"))
+        .unwrap();
+    let sink = TypeExpr::Map(Box::new(TypeExpr::String));
+    let shape = deferred_iterable_shape_for_phase(&expression.for_sink(&sink, &context))
+        .expect("authored iterable shape");
     assert_eq!(shape, DeferredIterableShape::Map);
 }
 
 #[test]
 fn deferred_iterable_shape_preserves_non_iterable_scalar_type() {
-    let shape = deferred_iterable_shape(
-        &Value::Concrete(ConcreteValue::Int(1)),
-        &inference::InferenceBindings::new(),
-        &SchemaRegistry::new(),
-    )
-    .expect("concrete scalar shape");
-
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse("let result = 1", &context).unwrap();
+    let report =
+        crate::parser::retained::judge_expressions(&parsed, &SchemaRegistry::new(), &context);
+    let expression = report
+        .binding(&crate::resource::RelativeBindingName::new("result"))
+        .unwrap();
+    let sink = TypeExpr::List(Box::new(TypeExpr::String));
+    let shape = deferred_iterable_shape_for_phase(&expression.for_sink(&sink, &context))
+        .expect("authored iterable shape");
     assert_eq!(shape, DeferredIterableShape::NonIterable(TypeExpr::Int));
 }
 
@@ -970,19 +979,19 @@ fn module_call_findings_for_test(
     parsed: &ParsedFile,
     signatures: &crate::module_resolver::ResolvedModuleSignatures,
     provider_context: &LoadedProviderContext,
+    schemas: &SchemaRegistry,
 ) -> Vec<ModuleCallFinding> {
-    let schemas = SchemaRegistry::new();
     let mut fixture = parsed.clone();
     crate::parser::retained::judge_configuration(
         &mut fixture,
-        &schemas,
+        schemas,
         provider_context.as_provider_context(),
     );
     let parsed = &fixture;
     let binding_use_report = check_bare_binding_uses(
         &crate::test_utils::load_canonical_buffer_configuration(
             parsed,
-            &schemas,
+            schemas,
             provider_context.as_provider_context(),
         )
         .judged()
@@ -990,9 +999,9 @@ fn module_call_findings_for_test(
     );
     let bindings = BindingIndex::from_parsed_with_module_signatures(
         parsed,
-        &schemas,
+        schemas,
         signatures,
-        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        provider_context.as_provider_context(),
     );
     crate::validation::deferred_types::with_session_for_test(provider_context, |session| {
         check_module_calls(ModuleCallCheckInput {
@@ -1001,7 +1010,7 @@ fn module_call_findings_for_test(
             base_dir: Some(&crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap()),
             imported_signatures: signatures,
             provider_context: session,
-            schemas: &schemas,
+            schemas,
             binding_use_report: &binding_use_report,
             bindings: &bindings,
             reference_checks: ModuleCallReferenceChecks::Enabled,
@@ -1170,7 +1179,6 @@ fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
             crate::schema::SinkAuthority::Owner(&TEST_OWNER),
         ),
         expression,
-        &schemas,
         &index,
     )
     .expect_err("a loaded catalog must reject an unknown operand type");
@@ -2786,7 +2794,8 @@ fn module_call_diagnostics_preserve_symlink_parent_source_spelling() {
             requires: Vec::new(),
         },
     )]);
-    let findings = module_call_findings_for_test(&parsed, &signatures, &provider);
+    let findings =
+        module_call_findings_for_test(&parsed, &signatures, &provider, &SchemaRegistry::new());
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].anchor().source_file.path(), path);
     assert_eq!(
@@ -5598,7 +5607,8 @@ fn check_module_calls_rejects_custom_type() {
         },
     );
 
-    let findings = module_call_findings_for_test(&parsed, &imported_modules, &config);
+    let findings =
+        module_call_findings_for_test(&parsed, &imported_modules, &config, &SchemaRegistry::new());
     assert!(
         findings.iter().any(|finding| finding
             .message()
@@ -5639,6 +5649,7 @@ fn check_module_calls_rejects_literal_union_mismatch() {
         &parsed,
         &imported_modules,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
 
     assert!(
@@ -5681,7 +5692,12 @@ fn check_module_calls_reports_parameter_type_resolution_errors() {
     )]);
     let provider_context = context_with_known_custom_types(HashSet::new());
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &provider_context);
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &provider_context,
+        &SchemaRegistry::new(),
+    );
 
     assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
     assert!(
@@ -5737,7 +5753,12 @@ fn check_module_calls_reports_unnameable_signature_type_resolution_errors() {
         },
     )]);
 
-    let findings = module_call_findings_for_test(&parsed, &signatures, &provider_context);
+    let findings = module_call_findings_for_test(
+        &parsed,
+        &signatures,
+        &provider_context,
+        &SchemaRegistry::new(),
+    );
 
     assert_eq!(findings.len(), 1, "unexpected findings: {findings:#?}");
     assert!(
@@ -5851,6 +5872,7 @@ let inst = m { n = 'abc' }
         &parsed,
         &imported_modules,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     let finding = findings
         .first()
@@ -5893,6 +5915,7 @@ child {}
         &parsed,
         &signatures,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     let first_call = &parsed.module_calls[0];
     let second_call = &parsed.module_calls[1];
@@ -5966,6 +5989,7 @@ for item in ["first", "second"] {
         &parsed,
         &signatures,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     let mismatches = findings
         .iter()
@@ -6013,6 +6037,7 @@ child { values = [vpc] }
         &parsed,
         &signatures,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
 
     assert_eq!(
@@ -6225,6 +6250,7 @@ fn check_module_calls_defers_compatible_binding_refs_to_binding_use_authority() 
         &parsed,
         &imported_modules,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     assert!(
         findings.is_empty(),
@@ -6305,18 +6331,28 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
         },
     )]);
     assert!(
-        module_call_findings_for_test(&module_parsed, &imported_modules, &config).is_empty(),
+        module_call_findings_for_test(
+            &module_parsed,
+            &imported_modules,
+            &config,
+            &SchemaRegistry::new()
+        )
+        .is_empty(),
         "module argument must validate"
     );
 
-    crate::test_utils::ordinary_sink_findings_for_test(validate_attribute_params(
-        &[AttributeParameter::dummy(
-            "mode".to_string(),
-            Some(schema_type.clone()),
-            Some(authored()),
-        )],
-        &config,
-    ))
+    crate::test_utils::ordinary_sink_findings_for_test(
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            validate_attribute_params_with_context(
+                &[AttributeParameter::dummy(
+                    "mode".to_string(),
+                    Some(schema_type.clone()),
+                    Some(authored()),
+                )],
+                session,
+            )
+        }),
+    )
     .expect("attribute parameter must validate");
 
     let exports = [RuntimeInferredExportParam {
@@ -7046,13 +7082,6 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         .expect("schema fixture must be valid"),
     );
 
-    let mut parsed = empty_parsed();
-    parsed
-        .resources
-        .push(Resource::with_provider("aws", "ec2.Subnet", "a", None).with_binding("a"));
-    parsed
-        .resources
-        .push(Resource::with_provider("aws", "ec2.SecurityGroup", "web", None).with_binding("web"));
     let context = context_with_accepting_custom_type_resolver(HashSet::from([
         crate::parser::OwnedTypeIdentity::provider(
             "aws",
@@ -7065,19 +7094,11 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
             crate::schema::RefinedScalarKind::String,
         ),
     ]));
-    let bindings = crate::binding_index::BindingIndex::from_parsed(&parsed, &schemas, &context);
 
-    let call = ModuleCall::test(
-        "consumer".to_string(),
-        Some("instance".to_string()),
-        module_arguments([(
-            "subnet_ids".to_string(),
-            Value::Concrete(ConcreteValue::List(vec![
-                Value::resource_ref("a".to_string(), "subnet_id".to_string(), vec![]),
-                Value::resource_ref("web".to_string(), "group_id".to_string(), vec![]),
-            ])),
-        )]),
-    );
+    let parsed = crate::parser::parse(
+        "let a = aws.ec2.Subnet {}\nlet web = aws.ec2.SecurityGroup {}\nlet consumer = use { source = './consumer' }\nlet instance = consumer { subnet_ids = [a.subnet_id, web.group_id] }\n",
+        &context,
+    ).unwrap();
     let imported_modules = HashMap::from([(
         "consumer".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -7100,19 +7121,14 @@ fn module_call_argument_checks_each_ref_inside_a_typed_list() {
         },
     )]);
 
-    let errors = validate_module_call_argument_ref_types_with_bindings(
-        &[call],
-        &imported_modules,
-        &HashSet::new(),
-        &bindings,
-    );
+    let errors = module_call_findings_for_test(&parsed, &imported_modules, &context, &schemas);
 
     assert_eq!(
         errors.len(),
         1,
         "only the SecurityGroup Id should fail the list element sink: {errors:?}",
     );
-    let err = errors[0].to_string();
+    let err = errors[0].message().to_string();
     assert!(
         err.contains("argument 'subnet_ids'")
             && err.contains("expected aws.ec2.Subnet.Id")
@@ -7135,23 +7151,11 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         .validate()
         .expect("schema fixture must be valid"),
     );
-    let mut parsed = empty_parsed();
-    parsed
-        .resources
-        .push(Resource::with_provider("mock", "counter", "source", None).with_binding("source"));
-    let bindings = crate::binding_index::BindingIndex::from_parsed(
-        &parsed,
-        &schemas,
-        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    );
-    let call = ModuleCall::test(
-        "consumer".to_string(),
-        None,
-        module_arguments([(
-            "number".to_string(),
-            Value::resource_ref("source", "count", Vec::new()),
-        )]),
-    );
+    let context = LoadedProviderContext::empty_for_test();
+    let parsed = crate::parser::parse(
+        "let source = mock.counter {}\nlet consumer = use { source = './consumer' }\nconsumer { number = source.count }\n",
+        &context,
+    ).unwrap();
     let imported_modules = HashMap::from([(
         "consumer".to_string(),
         crate::module_resolver::ResolvedModuleSignature {
@@ -7167,12 +7171,7 @@ fn module_call_argument_ref_type_widens_int_source_to_float_sink() {
         },
     )]);
 
-    let errors = validate_module_call_argument_ref_types_with_bindings(
-        &[call],
-        &imported_modules,
-        &HashSet::new(),
-        &bindings,
-    );
+    let errors = module_call_findings_for_test(&parsed, &imported_modules, &context, &schemas);
 
     assert!(
         errors.is_empty(),
@@ -7644,7 +7643,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            check_export_values_pre_apply_providerless(
+            check_export_values_pre_apply(
                 std::slice::from_ref(&builtin),
                 &ResolvedBindings::default(),
                 session,
@@ -7681,7 +7680,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            check_export_values_pre_apply_providerless(
+            check_export_values_pre_apply(
                 std::slice::from_ref(&custom),
                 &ResolvedBindings::default(),
                 session,
@@ -7709,7 +7708,7 @@ fn unloaded_export_context_checks_builtins_but_cannot_check_provider_custom_type
     crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            check_export_values_pre_apply_providerless(
+            check_export_values_pre_apply(
                 std::slice::from_ref(&builtin_custom),
                 &ResolvedBindings::default(),
                 session,
@@ -10530,7 +10529,7 @@ fn composition_error_identity_survives_symlink_retarget() {
 fn deferred_loop_placeholder_access_checks_after_materialization() {
     use crate::resource::{AccessMissPolicy, LoopSlot, PathSegment, apply_postfix_access};
     let parsed = ParsedFile::default();
-    let schemas = SchemaRegistry::new();
+    let mut schemas = SchemaRegistry::new();
     let provider = crate::parser::LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
     let inference = crate::parser::retained::value_dependent_judgement_for_test();
@@ -10555,10 +10554,18 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
                 crate::schema::SinkAuthority::Owner(&TEST_OWNER)
             ),
             &inference,
-            &schemas,
             &index
         ),
         Ok(())
+    );
+    schemas.insert(
+        "test",
+        PatternResourceSchema::new("Sink")
+            .attribute(
+                PatternAttributeSchema::optional("action", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
     );
     for (action, assignable) in [
         (Value::Concrete(ConcreteValue::String("part".into())), true),
@@ -10574,17 +10581,25 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
             AccessMissPolicy::Defer,
         )
         .unwrap();
-        let materialized = materialized.into_expanded().unwrap();
-        let result = check_runtime_value_type(
-            inference::RuntimeTypeInput::computed_for_test(&materialized),
-            crate::schema::TypeInSchema::schemaless(&expected).with_authority(
-                crate::schema::assignment_catalog_without_edges_for_test(),
-                crate::schema::SinkAuthority::Owner(&TEST_OWNER),
-            ),
-            &inference::InferenceBindings::new(),
-            &schemas,
-            &index,
-        );
+        let materialized = materialized
+            .resolve_root(&RootScope::new())
+            .into_expanded()
+            .unwrap();
+        let resource = crate::resource::Resource::<
+            crate::resource::ModuleSource,
+            crate::resource::NoPlaceholder,
+        >::with_provider("test", "Sink", "materialized", None)
+        .with_attribute("action", materialized);
+        let result =
+            crate::validation::deferred_types::with_session_for_test(&provider, |session| {
+                admission::attributes::admit_apply_resource(
+                    &resource,
+                    None,
+                    schemas.get_for(&resource).unwrap(),
+                    &crate::binding_index::ResolvedBindings::default(),
+                    session,
+                )
+            });
         assert_eq!(
             result.is_ok(),
             assignable,
@@ -10748,6 +10763,7 @@ fn module_argument_fallback_requires_authored_evidence() {
         &parsed,
         &signatures,
         &LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
     assert!(
         findings
