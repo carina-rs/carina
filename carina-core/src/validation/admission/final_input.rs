@@ -165,11 +165,11 @@ impl<'a> FailureContext<'a> {
         id: &'a ResourceId,
         name: &'a str,
         value: Option<&Value>,
-        diagnostic: Option<&Value>,
+        diagnostic: Option<&crate::value::SecretProtection>,
         defaults: Option<&'a DefaultTagKeys>,
         stage: &Stage<'_>,
     ) -> Self {
-        let protected = diagnostic.is_some_and(crate::value::contains_secret);
+        let protected = diagnostic.is_some_and(crate::value::SecretProtection::is_secret);
         let default_keys = defaults.filter(|_| name == TAGS_ATTRIBUTE);
         let merged_default_keys = match value {
             Some(Value::Concrete(crate::resource::ConcreteValue::Map(tags))) if !protected => tags
@@ -243,7 +243,7 @@ impl<'a> FailureContext<'a> {
 fn check(
     id: &ResourceId,
     attributes: &IndexMap<String, Value>,
-    diagnostic_attributes: &IndexMap<String, Value>,
+    diagnostic_attributes: &IndexMap<String, crate::value::SecretProtection>,
     defaults: Option<&DefaultTagKeys>,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     stage: Stage<'_>,
@@ -355,7 +355,7 @@ pub(crate) fn admit_dispatch<T: ResourceWirePayload>(
     check(
         input.payload().as_inner().resource_id(),
         input.payload().as_inner().attributes(),
-        input.diagnostic_attributes(),
+        input.diagnostic_protection(),
         defaults,
         schema,
         Stage::Apply(bindings, FinalInputOrigin::ProviderNormalization),
@@ -383,13 +383,22 @@ pub(crate) fn admit_update_patch(
     let mut attributes = resource.attributes.clone();
     let mut diagnostic_attributes = attributes
         .iter()
-        .map(|(name, value)| (name.clone(), resource.diagnostic_value(name, value)))
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                crate::value::SecretProtection::for_output(&resource.diagnostic_value(name, value)),
+            )
+        })
         .collect::<IndexMap<_, _>>();
     for op in &patch.as_inner().ops {
         if let Some(value) = op.sent_value() {
             attributes.insert(op.key().into(), value.clone());
-            diagnostic_attributes
-                .insert(op.key().into(), resource.diagnostic_value(op.key(), value));
+            diagnostic_attributes.insert(
+                op.key().into(),
+                crate::value::SecretProtection::for_output(
+                    &resource.diagnostic_value(op.key(), value),
+                ),
+            );
         } else {
             attributes.shift_remove(op.key());
             diagnostic_attributes.shift_remove(op.key());
@@ -430,7 +439,7 @@ impl<S> FinalPlanInputs<S> {
                 Some(schema) => check(
                     &raw.id,
                     &raw.attributes,
-                    &raw.attributes,
+                    &crate::value::SecretProtection::attributes(&raw.attributes),
                     Some(&raw.default_tag_keys),
                     schema,
                     Stage::Plan(bindings),
@@ -450,7 +459,7 @@ impl<S> FinalPlanInputs<S> {
                 Some(schema) => check(
                     &raw.id,
                     &raw.attributes,
-                    &raw.attributes,
+                    &crate::value::SecretProtection::attributes(&raw.attributes),
                     None,
                     schema,
                     Stage::Plan(bindings),

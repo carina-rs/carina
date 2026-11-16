@@ -29,6 +29,9 @@ use carina_state::{ResourceState, StateFile};
 mod fixture;
 use fixture::{EchoFactory, EchoMock, Failure, MASK, PUBLIC, SECRET};
 
+#[path = "provider_text_secret_redaction_e2e/observed_graft.rs"]
+mod observed_graft;
+
 const CHILD: &str = "CARINA_4305_PROVIDER_TEXT_CHILD";
 
 #[path = "provider_text_secret_redaction_e2e/round5.rs"]

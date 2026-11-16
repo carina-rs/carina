@@ -1342,8 +1342,7 @@ async fn run_saved_plan_schema_fingerprint_case(
             binding: None,
         }]),
         backend_config: crate::commands::plan::SavedBackendConfig::default(),
-        plan: carina_core::value::redact_secrets_in_plan(&plan)
-            .expect("redact saved-plan secret fixture"),
+        plan: crate::test_support::creation_fixture::recorded_snapshot(&plan),
         sorted_resources: vec![
             carina_core::value::redact_secrets_in_resource(&resource)
                 .unwrap()
@@ -4404,7 +4403,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &None,
+        &carina_state::ObservedStateFile::for_test(None),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
@@ -6620,7 +6619,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
     let plan_ctx = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
@@ -6738,7 +6737,7 @@ let nat = mock.ec2.NatGateway {{
     let clean_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &step1_state,
+        &carina_state::ObservedStateFile::for_test((step1_state).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
@@ -6798,7 +6797,7 @@ let nat = mock.ec2.NatGateway {{
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &step2_state,
+        &carina_state::ObservedStateFile::for_test((step2_state).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
@@ -6927,7 +6926,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &saved,
+        &carina_state::ObservedStateFile::for_test((saved).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
@@ -7070,7 +7069,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let removal_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &before_failure,
+        &carina_state::ObservedStateFile::for_test((before_failure).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
@@ -7152,7 +7151,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let retry = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &saved,
+        &carina_state::ObservedStateFile::for_test((saved).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),
@@ -7228,7 +7227,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
     let final_plan = crate::wiring::create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &Some(applied),
+        &carina_state::ObservedStateFile::for_test(Some(applied)),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
         &HashMap::new(),

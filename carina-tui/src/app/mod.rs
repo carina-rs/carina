@@ -102,7 +102,7 @@ pub struct App {
 impl App {
     #[cfg(test)]
     pub(crate) fn for_plan(plan: &Plan, schemas: &SchemaRegistry) -> Self {
-        let historical_display = HistoricalDisplayAttributes::for_plan(plan);
+        let historical_display = HistoricalDisplayAttributes::for_test_plan(plan);
         let (schemas, provider) = carina_core::provider::comparison_fixture_for_test(
             schemas,
             plan.effects().iter().map(Effect::resource_id),

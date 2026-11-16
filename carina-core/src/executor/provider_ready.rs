@@ -134,47 +134,18 @@ impl<T: ResourceWirePayload, K: RechecksResolved> ProviderReady<T, K> {
         self.diagnostic_attributes().values()
     }
     pub(crate) fn diagnostic_value(&self, key: &str, sent: &Value) -> Value {
-        fn annotate(sent: &Value, source: &Value) -> Value {
-            use crate::resource::{ConcreteValue, DeferredValue};
-            match (sent, source) {
-                (_, Value::Deferred(DeferredValue::Secret(_))) => sent.clone().into_secret(),
-                (
-                    Value::Concrete(ConcreteValue::Map(values)),
-                    Value::Concrete(ConcreteValue::Map(source)),
-                ) => Value::Concrete(ConcreteValue::Map(
-                    values
-                        .iter()
-                        .map(|(key, value)| {
-                            (
-                                key.clone(),
-                                source.get(key).map_or_else(
-                                    || value.clone(),
-                                    |source| annotate(value, source),
-                                ),
-                            )
-                        })
-                        .collect(),
-                )),
-                (
-                    Value::Concrete(ConcreteValue::List(values)),
-                    Value::Concrete(ConcreteValue::List(source)),
-                ) => Value::Concrete(ConcreteValue::List(
-                    values
-                        .iter()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            source
-                                .get(index)
-                                .map_or_else(|| value.clone(), |source| annotate(value, source))
-                        })
-                        .collect(),
-                )),
-                _ => sent.clone(),
-            }
-        }
-        self.diagnostic_attributes()
+        self.admission
+            .payload()
+            .diagnostic_protection
             .get(key)
-            .map_or_else(|| sent.clone(), |source| annotate(sent, source))
+            .map_or_else(|| sent.clone(), |protection| protection.mask(sent))
+    }
+
+    pub(crate) fn rule_input_value(&self, key: &str, sent: &Value) -> Value {
+        self.diagnostic_attributes().get(key).map_or_else(
+            || sent.clone(),
+            |source| crate::value::SecretProtection::for_dispatch_rule_input(source).mask(sent),
+        )
     }
 
     /// Borrow the checked payload.
@@ -208,14 +179,29 @@ impl<T: ResourceWirePayload, K: RechecksResolved> Deref for ProviderReady<T, K> 
 pub(crate) struct DispatchPayload<T> {
     payload: T,
     diagnostic_attributes: IndexMap<String, Value>,
+    diagnostic_protection: IndexMap<String, crate::value::SecretProtection>,
 }
 
 impl<T> DispatchPayload<T> {
+    fn new(payload: T, diagnostic_attributes: IndexMap<String, Value>) -> Self {
+        let diagnostic_protection =
+            crate::value::SecretProtection::attributes(&diagnostic_attributes);
+        Self {
+            payload,
+            diagnostic_attributes,
+            diagnostic_protection,
+        }
+    }
     pub(crate) fn payload(&self) -> &T {
         &self.payload
     }
     pub(crate) fn diagnostic_attributes(&self) -> &IndexMap<String, Value> {
         &self.diagnostic_attributes
+    }
+    pub(crate) fn diagnostic_protection(
+        &self,
+    ) -> &IndexMap<String, crate::value::SecretProtection> {
+        &self.diagnostic_protection
     }
 }
 
@@ -228,10 +214,10 @@ impl DispatchPayload<ResolvedResource<ProviderModuleSource>> {
         let diagnostic_attributes = resource.as_resource().attributes.clone();
         let mut resource = resource.into_inner();
         restored.remove(&mut resource.attributes);
-        Ok(Self {
-            payload: ResolvedResource::resolve_with_schemas(resource, schemas)?,
+        Ok(Self::new(
+            ResolvedResource::resolve_with_schemas(resource, schemas)?,
             diagnostic_attributes,
-        })
+        ))
     }
 }
 
@@ -242,10 +228,7 @@ impl DispatchPayload<ResolvedDataSource<ProviderModuleSource>> {
         for attribute in value.attributes.values_mut() {
             *attribute = unwrap_secret(attribute);
         }
-        Self {
-            payload: ResolvedDataSource::new(value),
-            diagnostic_attributes,
-        }
+        Self::new(ResolvedDataSource::new(value), diagnostic_attributes)
     }
 }
 
@@ -260,6 +243,7 @@ impl<T: ResourceWirePayload> DispatchPayload<T> {
                 }
             })?,
             diagnostic_attributes: self.diagnostic_attributes,
+            diagnostic_protection: self.diagnostic_protection,
         })
     }
 }
@@ -1463,10 +1447,7 @@ mod provider_config_tests {
                 )
                 .unwrap();
                 assert_final_wire_shape(
-                    DispatchPayload {
-                        payload,
-                        diagnostic_attributes,
-                    },
+                    DispatchPayload::new(payload, diagnostic_attributes),
                     schema,
                     session,
                 );

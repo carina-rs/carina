@@ -428,7 +428,7 @@ mod tests {
             changed_attributes: vec!["name".to_string()],
         });
         let historical_display =
-            carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+            carina_core::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
 
         let error = match app_for_run(
             &plan,

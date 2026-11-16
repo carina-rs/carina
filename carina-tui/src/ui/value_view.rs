@@ -116,7 +116,7 @@ pub(super) fn value_lines_styled<'a>(
 mod tests {
     use super::*;
     use carina_core::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
-    use carina_core::value::render_value;
+    use carina_core::value::render_fixture_value as render_value;
 
     #[test]
     fn semantic_styles_follow_core_span_kinds() {

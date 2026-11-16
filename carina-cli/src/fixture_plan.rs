@@ -296,7 +296,7 @@ impl FixturePlan {
         );
         carina_core::references::ReferencePreparation::default()
             .display(
-                checked.clone(),
+                checked,
                 &self.references.0,
                 historical,
                 detail,
@@ -796,7 +796,7 @@ where
                     normalizer: &provider_router,
                     provider_configs: raw_provider_configs,
                     remote_bindings: &remote_bindings,
-                    state_file: &state_file,
+                    state_file: &carina_state::ObservedStateFile::for_test(state_file.clone()),
                     state_block_claims: &state_block_claims,
                     resolved_state_block_targets: &resolved_state_block_targets,
                     preparation_errors: None,
@@ -896,15 +896,11 @@ where
             }
             let (checked, references) = match plan {
                 crate::wiring::PlannedPlan::Unrendered { plan, references } => {
-                    (*plan, FixtureReferences(references))
+                    (plan.into_checked(), FixtureReferences(references))
                 }
                 crate::wiring::PlannedPlan::Rendered {
-                    display,
-                    references,
-                } => (
-                    display.checked_plan().clone(),
-                    FixtureReferences(references),
-                ),
+                    plan, references, ..
+                } => (plan.into_checked(), FixtureReferences(references)),
             };
             let plan = checked.plan().clone().into_unadmitted();
             let moved_hints =
@@ -1674,7 +1670,12 @@ pub fn delete_instance_attributes_from_plan(
     managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
 ) -> carina_core::detail_rows::HistoricalDisplayAttributes {
-    crate::commands::plan::collect_historical_display_attributes(plan, managed_current, state_file)
+    crate::commands::plan::collect_historical_display_attributes(
+        plan,
+        managed_current,
+        &carina_state::ObservedStateFile::for_test(state_file.cloned()),
+    )
+    .expect("fixture historical identities are valid")
 }
 
 #[cfg(test)]
