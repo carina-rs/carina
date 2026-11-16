@@ -418,16 +418,18 @@ def measure(binaries, root, output, env, fixture, files):
             ("reference", "module_reference_checks"),
         ]:
             text = interface_overlay(fixture, files, mode)
-            lsp.document(owner, text)
-            snapshot = lsp.snapshot()
-            dump(
-                output / (mode + "-overlay.json"),
-                {"document": owner, "text": text, "diagnostics": snapshot},
-            )
             owner_path = root / owner
             before = owner_path.read_bytes()
             owner_path.write_text(text)
             try:
+                lsp.document(owner, text)
+                if owner != fixture["caller"]:
+                    lsp.document(fixture["caller"], files[fixture["caller"]])
+                snapshot = lsp.snapshot()
+                dump(
+                    output / (mode + "-overlay.json"),
+                    {"document": owner, "text": text, "diagnostics": snapshot},
+                )
                 human = cli(
                     binaries / "carina", root, output, env, mode + "-human",
                     ["validate", "."],
@@ -444,16 +446,14 @@ def measure(binaries, root, output, env, fixture, files):
                 "lsp_caller": caller_part(fixture, snapshot),
             }
         lsp.document(owner, files[owner])
+        if owner != fixture["caller"]:
+            lsp.document(fixture["caller"], files[fixture["caller"]])
         restored = lsp.snapshot()
         dump(output / "diagnostics.restored.json", restored)
         if restored != all_open:
             raise RuntimeError(f"{fixture['id']}: editor overlays were not restored")
     finally:
         lsp.finish()
-    cells["resolved_signature"] = {
-        "argument_checks": cells["callsite_argument_checks"],
-        "module_reference_checks": cells["module_reference_checks"],
-    }
     for column, data in cells.items():
         dump(output / (column + ".cell.json"), data)
     report = {
@@ -490,6 +490,8 @@ def compare(output, expectations):
     for directory, expected in expectations:
         ident = directory.name
         for column, cell in expected["columns"].items():
+            if column == "resolved_signature":
+                continue
             values = {}
             for phase in ["main", "head"]:
                 path = output / "raw" / ident / phase / (column + ".cell.json")
@@ -556,6 +558,14 @@ def main():
     ]
     if not expectations:
         parser.error("--fixtures contains no fixture directories")
+    if os.name != "posix" or os.geteuid() == 0:
+        skipped = [directory.name for directory, expected in expectations
+                   if "mode000" in expected["fixture"]["runtime_unreadable"].values()]
+        expectations = [(directory, expected) for directory, expected in expectations
+                        if directory.name not in skipped]
+        if skipped:
+            print("SKIP mode-000 fixtures: root can read mode 000; "
+                  "an unprivileged Unix runner is required: " + ", ".join(skipped), flush=True)
     allowed = {"main", "main-4485"} | {"changed:" + key for key in DECISION_KEYS}
     for directory, expected in expectations:
         if expected["fixture"]["id"] != directory.name:

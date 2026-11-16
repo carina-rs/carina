@@ -1113,10 +1113,11 @@ impl std::fmt::Debug for ModuleResolutionFailure {
 }
 impl std::fmt::Display for ModuleResolutionFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if !self.error.is_constraint() {
-            formatter.write_str("Module resolution error: ")?;
-        }
-        formatter.write_str(&self.error.display_relative_to(&self.base.source_label()))
+        formatter.write_str(
+            &self
+                .error
+                .display_resolution_relative_to(&self.base.source_label()),
+        )
     }
 }
 impl std::error::Error for ModuleResolutionFailure {}
@@ -1237,13 +1238,13 @@ pub enum AppError {
         path: carina_core::paths::DisplayPath,
         error: std::sync::Arc<carina_core::module_resolver::ModuleError>,
     },
-    #[error("Module resolution error: {}", error.display_relative_to(&base.source_label()))]
+    #[error("{}", error.display_resolution_relative_to(&base.source_label()))]
     ModuleImportResolution {
         error: std::sync::Arc<carina_core::module_resolver::ModuleError>,
         base: Box<carina_core::paths::ResolvedPath>,
     },
     /// Lint aborts expansion with the typed resolver failure and original path presentation.
-    #[error("Module resolution error: {}", error.display_relative_to(base))]
+    #[error("{}", error.display_resolution_relative_to(base))]
     LintModuleResolution {
         error: Box<carina_core::module_resolver::ModuleError>,
         base: PathBuf,
@@ -2089,24 +2090,14 @@ pub fn human_error_lines(error: &AppError) -> Vec<HumanErrorLine> {
             lines
         }
         AppError::ModuleImportResolution { error, base } => {
-            let mut lines = error.diagnostic_lines_relative_to(Some(&base.source_label()));
-            prefix_first_message(&mut lines, "Module resolution error: ");
-            lines
+            error.resolution_diagnostic_lines_relative_to(Some(&base.source_label()))
         }
         AppError::LintModuleResolution { error, base } => {
-            let mut lines = error.diagnostic_lines_relative_to(Some(base));
-            prefix_first_message(&mut lines, "Module resolution error: ");
-            lines
+            error.resolution_diagnostic_lines_relative_to(Some(base))
         }
-        AppError::ModuleResolution(failure) => {
-            let mut lines = failure
-                .error
-                .diagnostic_lines_relative_to(&failure.base.source_label());
-            if !failure.error.is_constraint() {
-                prefix_first_message(&mut lines, "Module resolution error: ");
-            }
-            lines
-        }
+        AppError::ModuleResolution(failure) => failure
+            .error
+            .resolution_diagnostic_lines_relative_to(&failure.base.source_label()),
         AppError::UpstreamResolution(finding) => {
             let mut lines = finding.detail().diagnostic_lines();
             if let Some(HumanErrorLine::Message(message)) = lines.first_mut() {

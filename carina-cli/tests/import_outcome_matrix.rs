@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 #[path = "import_outcome_matrix/lsp.rs"]
 mod lsp;
 
-const COLUMNS: [&str; 15] = [
+const COLUMNS: [&str; 14] = [
     "validate_human",
     "validate_json",
     "lint",
@@ -30,7 +30,6 @@ const COLUMNS: [&str; 15] = [
     "completion_parameter_empty",
     "completion_snippet",
     "completion_export_reference",
-    "resolved_signature",
     "callsite_argument_checks",
     "module_reference_checks",
 ];
@@ -61,7 +60,36 @@ struct ExpectedFixture {
 
 #[derive(Deserialize)]
 struct Expected {
+    classification: Classification,
     value: Value,
+}
+
+#[derive(Deserialize)]
+struct MainFixture {
+    revision: String,
+    columns: BTreeMap<String, Value>,
+}
+
+// Keep this closed list in sync with the fixture README. Unknown labels must
+// fail deserialization instead of silently bypassing the baseline assertion.
+#[derive(Deserialize)]
+enum Classification {
+    #[serde(rename = "main")]
+    Main,
+    #[serde(rename = "main-4485")]
+    Main4485,
+    #[serde(rename = "changed:user-prohibitions")]
+    UserProhibitions,
+    #[serde(rename = "changed:4398-placement")]
+    Placement,
+    #[serde(rename = "changed:4398-importability")]
+    Importability,
+    #[serde(rename = "changed:4398-readable-prohibitions")]
+    ReadableProhibitions,
+    #[serde(rename = "changed:A")]
+    EmptyInterface,
+    #[serde(rename = "changed:C")]
+    EmptyDirectory,
 }
 
 #[derive(Deserialize)]
@@ -89,7 +117,7 @@ fn collect_files(root: &Path, directory: &Path, files: &mut BTreeMap<String, Str
         let path = entry.unwrap().path();
         if path.is_dir() {
             collect_files(root, &path, files);
-        } else if path == root.join("expected.json") {
+        } else if path == root.join("expected.json") || path == root.join("main.json") {
             continue;
         } else {
             assert_eq!(path.extension().unwrap(), "crn");
@@ -338,7 +366,7 @@ fn assert_decisions(fixture: &Fixture, cells: &BTreeMap<String, Value>) {
             serde_json::from_str(cells["validate_json"]["stdout"].as_str().unwrap()).unwrap();
         assert_eq!(
             report["errors"][0]["message"],
-            "../target: No .crn files found in ../target"
+            "No .crn files found in ../target"
         );
         if fixture.usage == "uncalled" {
             assert!(
@@ -486,9 +514,14 @@ async fn measure(fixture: &Fixture, inputs: &Inputs) -> BTreeMap<String, Value> 
         ("reference", "module_reference_checks"),
     ] {
         let text = overlay(fixture, &inputs.files, mode);
+        fs::write(root.join(owner), &text).unwrap();
         client.document(root, owner, &text).await;
+        if owner != &fixture.caller {
+            client
+                .document(root, &fixture.caller, &inputs.files[&fixture.caller])
+                .await;
+        }
         let diagnostics = caller(fixture, &client.snapshot(root));
-        fs::write(root.join(owner), text).unwrap();
         let human = cli(root, &["validate", "."]);
         let json = cli(root, &["validate", "--json", "."]);
         fs::write(root.join(owner), &inputs.disk[owner]).unwrap();
@@ -498,13 +531,17 @@ async fn measure(fixture: &Fixture, inputs: &Inputs) -> BTreeMap<String, Value> 
         );
     }
     client.document(root, owner, &inputs.files[owner]).await;
+    if owner != &fixture.caller {
+        client
+            .document(root, &fixture.caller, &inputs.files[&fixture.caller])
+            .await;
+    }
     assert_eq!(
         client.snapshot(root),
         all,
         "{}: editor overlays were not restored",
         fixture.id
     );
-    cells.insert("resolved_signature".into(), json!({"argument_checks": cells["callsite_argument_checks"], "module_reference_checks": cells["module_reference_checks"]}));
     client.finish().await;
     cells
 }
@@ -527,12 +564,44 @@ async fn import_outcome_matrix() {
         let expected: ExpectedFixture =
             serde_json::from_slice(&fs::read(directory.join("expected.json")).unwrap()).unwrap();
         let fixture = &expected.fixture;
+        let main: MainFixture =
+            serde_json::from_slice(&fs::read(directory.join("main.json")).unwrap()).unwrap();
+        assert_eq!(main.revision, "980dd4e9dea5cce43552b3d1802175f924c83d12");
+        assert_eq!(
+            main.columns.keys().cloned().collect::<BTreeSet<_>>(),
+            columns
+        );
         assert_eq!(
             expected.columns.keys().cloned().collect::<BTreeSet<_>>(),
             columns,
             "{}: expected columns",
             fixture.id
         );
+        for column in COLUMNS {
+            let id = format!("{}:{column}", fixture.id);
+            let cell = &expected.columns[column];
+            if matches!(
+                cell.classification,
+                Classification::Main | Classification::Main4485
+            ) {
+                assert_eq!(
+                    cell.value, main.columns[column],
+                    "{id}: main classification must equal stored genuine main"
+                );
+            }
+        }
+        if fixture
+            .runtime_unreadable
+            .values()
+            .any(|kind| matches!(kind, Unreadable::Mode000))
+            && !mode000_supported()
+        {
+            eprintln!(
+                "SKIP {}: mode-000 fixtures require an unprivileged Unix runner; root can read mode 000",
+                fixture.id
+            );
+            continue;
+        }
         let inputs = Inputs::new(&fixtures_path, fixture);
         let cells = measure(fixture, &inputs).await;
         let actual_signatures = signatures(fixture, &inputs);
@@ -560,4 +629,36 @@ async fn import_outcome_matrix() {
         }
         assert_decisions(fixture, &cells);
     }
+}
+
+fn mode000_supported() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions and does not change process state.
+        unsafe { libc::geteuid() != 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_negative_calls_republish_root_diagnostics() {
+    let fixtures_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/import_outcome_matrix");
+    let expected: ExpectedFixture = serde_json::from_slice(
+        &fs::read(fixtures_path.join("normal--nested--called/expected.json")).unwrap(),
+    )
+    .unwrap();
+    let inputs = Inputs::new(&fixtures_path, &expected.fixture);
+    let cells = measure(&expected.fixture, &inputs).await;
+    let diagnostics = &cells["callsite_argument_checks"]["lsp_caller"]["caller/main.crn"];
+    assert!(
+        diagnostics
+            .to_string()
+            .contains("expected Int, got string 'wrong'"),
+        "{diagnostics}"
+    );
+    inputs.assert_restored();
 }

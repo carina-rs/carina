@@ -1,0 +1,2 @@
+let inner = use { source = './child' }
+let child_call = inner { n = 'wrong' }

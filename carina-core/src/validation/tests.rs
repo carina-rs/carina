@@ -4215,8 +4215,8 @@ fn assert_imported_prohibition(
     use crate::module_resolver::{ModuleLoadError, ModuleRejection};
     let Err(ModuleLoadError::NotModule {
         error,
-        imports: _,
         signature: _,
+        body: _,
     }) = result
     else {
         panic!("expected a typed import prohibition, not success or an unrelated load failure");
@@ -4250,8 +4250,8 @@ fn imported_root_block_error(
     std::fs::write(&evidence, block).unwrap();
     let Err(ModuleLoadError::NotModule {
         error,
-        imports: _,
         signature: _,
+        body: _,
     }) = crate::module_resolver::load_module_with_diagnostics(
         &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
         &context,

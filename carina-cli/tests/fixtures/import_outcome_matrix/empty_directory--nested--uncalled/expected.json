@@ -11,7 +11,7 @@
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
@@ -723,7 +723,7 @@
       "classification": "changed:C",
       "value": {
         "exit": 1,
-        "stderr": "warning: .:1  ../target: No .crn files found in ../target\nError: Found 1 lint warning(s).\n",
+        "stderr": "Error: ../target: No .crn files found in ../target\n",
         "stdout": ""
       }
     },
@@ -760,7 +760,7 @@
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
@@ -785,77 +785,6 @@
         }
       }
     },
-    "resolved_signature": {
-      "classification": "changed:C",
-      "value": {
-        "argument_checks": {
-          "human": {
-            "exit": 1,
-            "stderr": "Error: ../target: No .crn files found in ../target\n",
-            "stdout": "Validating...\n"
-          },
-          "json": {
-            "exit": 1,
-            "stderr": "",
-            "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
-          },
-          "lsp_caller": {
-            "bridge/main.crn": [
-              {
-                "message": "No .crn files found in ../target",
-                "range": {
-                  "end": {
-                    "character": 20,
-                    "line": 2
-                  },
-                  "start": {
-                    "character": 13,
-                    "line": 2
-                  }
-                },
-                "severity": 1,
-                "source": "carina"
-              }
-            ],
-            "caller/main.crn": [],
-            "caller/providers.crn": []
-          }
-        },
-        "module_reference_checks": {
-          "human": {
-            "exit": 1,
-            "stderr": "Error: ../target: No .crn files found in ../target\n",
-            "stdout": "Validating...\n"
-          },
-          "json": {
-            "exit": 1,
-            "stderr": "",
-            "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
-          },
-          "lsp_caller": {
-            "bridge/main.crn": [
-              {
-                "message": "No .crn files found in ../target",
-                "range": {
-                  "end": {
-                    "character": 20,
-                    "line": 3
-                  },
-                  "start": {
-                    "character": 13,
-                    "line": 3
-                  }
-                },
-                "severity": 1,
-                "source": "carina"
-              }
-            ],
-            "caller/main.crn": [],
-            "caller/providers.crn": []
-          }
-        }
-      }
-    },
     "validate_human": {
       "classification": "changed:C",
       "value": {
@@ -869,7 +798,7 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
       }
     }
   },

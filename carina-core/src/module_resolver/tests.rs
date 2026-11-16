@@ -48,29 +48,55 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
 fn imported_prohibitions_remain_complete_on_every_resolver_load_and_retry() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../carina-cli/tests/fixtures/import_root_boundary");
-    for (root_evidence, arguments, body_error) in [
-        (true, false, ""),
-        (false, false, ""),
-        (false, true, ""),
+    let expression = "let a = 'present'\nlet broken = a ?? { inner = { leaf = 1 } }\n";
+    // Genuine main's declared-interface control checks this body before
+    // interface admission. Empty interfaces retain that same ordinary finding.
+    let expression_finding = "Parse error: rooted/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`";
+    for (root_evidence, arguments, body_error, body_finding, residual_finding) in [
+        (true, false, "", None, None),
+        (false, false, "", None, None),
+        (false, true, "", None, None),
+        (
+            true,
+            false,
+            expression,
+            Some(expression_finding),
+            Some(expression_finding),
+        ),
+        (
+            false,
+            false,
+            expression,
+            Some(expression_finding),
+            Some(expression_finding),
+        ),
         (
             true,
             true,
-            "let a = 'present'\nlet broken = a ?? { inner = { leaf = 1 } }\n",
+            expression,
+            Some(expression_finding),
+            Some(expression_finding),
         ),
         (
             false,
             true,
-            "let a = 'present'\nlet broken = a ?? { inner = { leaf = 1 } }\n",
+            expression,
+            Some(expression_finding),
+            Some(expression_finding),
         ),
         (
             true,
             true,
             "attributes { bad: TotallyMadeUpType = 'one' }\n",
+            None,
+            None,
         ),
         (
             false,
             true,
             "attributes { bad: TotallyMadeUpType = 'one' }\n",
+            None,
+            None,
         ),
     ] {
         let directory = tempfile::tempdir().unwrap();
@@ -93,6 +119,22 @@ fn imported_prohibitions_remain_complete_on_every_resolver_load_and_retry() {
         };
         let expected: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(fixture.join(golden)).unwrap()).unwrap();
+        let expected = expected
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["message"].clone())
+            .collect::<Vec<_>>();
+        let mut body_expected = expected.clone();
+        if let (false, Some(message)) = (root_evidence, body_finding) {
+            body_expected.insert(0, serde_json::Value::String(message.into()));
+        }
+        // Main's call-finding producer owns declaration type errors before
+        // residual failures are published; expression failures remain residual.
+        let mut residual_expected = expected;
+        if let (false, Some(message)) = (root_evidence, residual_finding) {
+            residual_expected.insert(0, serde_json::Value::String(message.into()));
+        }
         crate::validation::deferred_types::with_session_for_test(
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
@@ -101,7 +143,7 @@ fn imported_prohibitions_remain_complete_on_every_resolver_load_and_retry() {
                     session,
                     resolver_context(),
                 );
-                for _attempt in 0..2 {
+                for attempt in 0..2 {
                     let error = resolver.load_module("rooted").unwrap_err();
                     let leaves = error.individual_errors();
                     let messages = leaves
@@ -113,14 +155,8 @@ fn imported_prohibitions_remain_complete_on_every_resolver_load_and_retry() {
                         })
                         .collect::<Vec<_>>();
                     assert_eq!(
-                        messages,
-                        expected
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|item| item["message"].clone())
-                            .collect::<Vec<_>>(),
-                        "root evidence: {root_evidence}, arguments: {arguments}"
+                        messages, body_expected,
+                        "root evidence: {root_evidence}, arguments: {arguments}, attempt: {attempt}"
                     );
                     assert_eq!(
                         leaves
@@ -155,12 +191,7 @@ fn imported_prohibitions_remain_complete_on_every_resolver_load_and_retry() {
                             error.lsp_message_relative_to(directory.path())
                         ))
                         .collect::<Vec<_>>(),
-                    expected
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|item| item["message"].clone())
-                        .collect::<Vec<_>>()
+                    residual_expected
                 );
             },
         );

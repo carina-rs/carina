@@ -1,0 +1,4 @@
+let ordinary = use { source = '../ordinary' }
+let service = use { source = '../target' }
+ordinary {}
+let result = service {}

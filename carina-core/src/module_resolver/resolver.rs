@@ -195,6 +195,25 @@ impl ResidualModuleResolutionError {
         self.0.diagnostic_lines_relative_to(Some(root))
     }
 
+    pub fn display_resolution_relative_to(&self, root: &Path) -> String {
+        if self.is_constraint() {
+            self.0.display_relative_to(root)
+        } else {
+            self.0.display_resolution_relative_to(root)
+        }
+    }
+
+    pub fn resolution_diagnostic_lines_relative_to(
+        &self,
+        root: &Path,
+    ) -> Vec<super::error::DiagnosticLine> {
+        if self.is_constraint() {
+            self.0.diagnostic_lines_relative_to(Some(root))
+        } else {
+            self.0.resolution_diagnostic_lines_relative_to(Some(root))
+        }
+    }
+
     pub fn lsp_message_relative_to(&self, root: &Path) -> String {
         self.0.lsp_message_relative_to(root)
     }
@@ -337,6 +356,7 @@ impl ResidualModuleResolutionError {
             | ModuleError::BackendInModule { evidence: _ }
             | ModuleError::NotADirectory { path: _ }
             | ModuleError::Multiple(_)
+            | ModuleError::ImportDiagnostics(_)
             | ModuleError::NotFound(_)
             | ModuleError::CircularImport(_)
             | ModuleError::ReferenceType(_)
@@ -368,6 +388,9 @@ impl ResidualModuleResolutionError {
                 warnings: _,
             } => {
                 unreachable!("root_cause removes diagnostic wrappers")
+            }
+            ModuleError::ImportDiagnostics(_errors) => {
+                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
             ModuleError::Multiple(_errors) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::Constraint(diagnostic) => {
@@ -486,6 +509,7 @@ impl ResidualModuleResolutionError {
             } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
+            ModuleError::ImportDiagnostics(_errors) => false,
             ModuleError::Multiple(_errors) => false,
             ModuleError::MissingArgument { module, argument } => findings.iter().any(|finding| {
                 self.finding_owns_error(finding)
@@ -695,6 +719,13 @@ fn without_covered_reference_type_members(
             without_covered_reference_type_members(*error, findings)
                 .map(|error| error.with_provider_type_warnings(warnings))
         }
+        ModuleError::ImportDiagnostics(errors) => ModuleError::from_errors(
+            errors
+                .into_vec()
+                .into_iter()
+                .filter_map(|error| without_covered_reference_type_members(error, findings))
+                .collect(),
+        ),
         ModuleError::Multiple(errors) => ModuleError::from_errors(
             errors
                 .into_vec()
@@ -1418,16 +1449,37 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     /// in `main.crn` would be invisible to `${env}` interpolations in
     /// sibling `role.crn` (#2815). #2817.
     fn load_directory_module(&self, dir_path: &ResolvedPath) -> Result<ParsedFile, ModuleError> {
-        let module = super::loader::load_imported_directory(
+        use super::loader::{ModuleBodyAnalysis, ModuleLoadError};
+        match super::loader::load_imported_directory(
             dir_path,
             self.config(),
             &self.source_overrides,
             self.schemas,
             &self.configuration_root,
-        )
-        .map_err(super::loader::ModuleLoadError::into_error)?;
-        let mut merged = module.into_parsed();
+        ) {
+            Ok(module) => self.prepare_module_body(module.into_parsed()),
+            Err(ModuleLoadError::NotModule {
+                error,
+                signature: _,
+                body,
+            }) => match body {
+                ModuleBodyAnalysis::Available(body) => {
+                    match self.prepare_module_body(body.into_parsed()) {
+                        Ok(_) => Err(error.into_error()),
+                        Err(body_error) => Err(error.with_body_error(body_error)),
+                    }
+                }
+                ModuleBodyAnalysis::ProhibitionsOnly | ModuleBodyAnalysis::Unavailable => {
+                    Err(error.into_error())
+                }
+            },
+            Err(error) => Err(error.into_error()),
+        }
+    }
 
+    /// Main's body preflight is shared by admitted and no-root rejected inputs.
+    /// A rejected input is still returned exclusively as a resolver failure.
+    fn prepare_module_body(&self, mut merged: ParsedFile) -> Result<ParsedFile, ModuleError> {
         // Preserve authored value trees while this file is a reusable
         // template. Reference resolution may fold a direct reference, but an
         // argument-dependent `if` must derive dependencies only after its

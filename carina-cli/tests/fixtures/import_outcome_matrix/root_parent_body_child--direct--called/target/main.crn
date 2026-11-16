@@ -1,0 +1,3 @@
+arguments { n: Int = 1 }
+let inner = use { source = './child' }
+attributes { bad: ParentType = 1 }

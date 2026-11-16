@@ -46,7 +46,38 @@
               "source": "carina"
             }
           ],
-          "caller/main.crn": [],
+          "caller/main.crn": [
+            {
+              "message": "module call 'result': argument 'n': expected Int, got string 'wrong'",
+              "range": {
+                "end": {
+                  "character": 40,
+                  "line": 0
+                },
+                "start": {
+                  "character": 0,
+                  "line": 0
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?",
+              "range": {
+                "end": {
+                  "character": 40,
+                  "line": 0
+                },
+                "start": {
+                  "character": 0,
+                  "line": 0
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
           "caller/providers.crn": []
         }
       }
@@ -846,109 +877,24 @@
               "source": "carina"
             }
           ],
-          "caller/main.crn": [],
+          "caller/main.crn": [
+            {
+              "message": "module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)",
+              "range": {
+                "end": {
+                  "character": 40,
+                  "line": 0
+                },
+                "start": {
+                  "character": 0,
+                  "line": 0
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
           "caller/providers.crn": []
-        }
-      }
-    },
-    "resolved_signature": {
-      "classification": "main-4485",
-      "value": {
-        "argument_checks": {
-          "human": {
-            "exit": 1,
-            "stderr": "Error: ../bridge/main.crn at line 3\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: ../bridge/main.crn at line 3\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\nError: Module resolution error: Circular import detected: ../target\n",
-            "stdout": "Validating...\n"
-          },
-          "json": {
-            "exit": 1,
-            "stderr": "",
-            "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 46\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Circular import detected: ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
-          },
-          "lsp_caller": {
-            "bridge/main.crn": [
-              {
-                "message": "module call 'result': argument 'n': expected Int, got string 'wrong'",
-                "range": {
-                  "end": {
-                    "character": 34,
-                    "line": 2
-                  },
-                  "start": {
-                    "character": 27,
-                    "line": 2
-                  }
-                },
-                "severity": 1,
-                "source": "carina"
-              },
-              {
-                "message": "Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?",
-                "range": {
-                  "end": {
-                    "character": 45,
-                    "line": 2
-                  },
-                  "start": {
-                    "character": 35,
-                    "line": 2
-                  }
-                },
-                "severity": 1,
-                "source": "carina"
-              }
-            ],
-            "caller/main.crn": [],
-            "caller/providers.crn": []
-          }
-        },
-        "module_reference_checks": {
-          "human": {
-            "exit": 1,
-            "stderr": "Error: ../bridge: mock.test.resource.<pending>: unknown attribute 'absent' on 'result' in reference result.absent\nError: ../bridge/main.crn at line 4\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
-            "stdout": "Validating...\n"
-          },
-          "json": {
-            "exit": 1,
-            "stderr": "",
-            "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"unknown attribute 'absent' on 'result' in reference result.absent\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 22\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 26\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
-          },
-          "lsp_caller": {
-            "bridge/main.crn": [
-              {
-                "message": "module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)",
-                "range": {
-                  "end": {
-                    "character": 40,
-                    "line": 3
-                  },
-                  "start": {
-                    "character": 27,
-                    "line": 3
-                  }
-                },
-                "severity": 1,
-                "source": "carina"
-              },
-              {
-                "message": "Unknown attribute 'absent' on 'result'.",
-                "range": {
-                  "end": {
-                    "character": 41,
-                    "line": 4
-                  },
-                  "start": {
-                    "character": 35,
-                    "line": 4
-                  }
-                },
-                "severity": 2,
-                "source": "carina"
-              }
-            ],
-            "caller/main.crn": [],
-            "caller/providers.crn": []
-          }
         }
       }
     },

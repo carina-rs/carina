@@ -1,0 +1,79 @@
+{
+  "status": "error",
+  "resource_count": 0,
+  "resources": [],
+  "errors": [
+    {
+      "message": "coalesce default type `Map<Map<Int>>` does not match left type `String`",
+      "severity": "error",
+      "code": null,
+      "location": {
+        "file": "../rooted/errors.crn",
+        "range": {
+          "start": {
+            "line": 2,
+            "column": 19
+          },
+          "end": {
+            "line": 2,
+            "column": 43
+          }
+        }
+      }
+    },
+    {
+      "message": "../rooted: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
+      "severity": "error",
+      "code": null,
+      "location": {
+        "file": "main.crn",
+        "range": {
+          "start": {
+            "line": 2,
+            "column": 1
+          },
+          "end": {
+            "line": 2,
+            "column": 2
+          }
+        }
+      }
+    },
+    {
+      "message": "../rooted: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.",
+      "severity": "error",
+      "code": null,
+      "location": {
+        "file": "main.crn",
+        "range": {
+          "start": {
+            "line": 2,
+            "column": 1
+          },
+          "end": {
+            "line": 2,
+            "column": 2
+          }
+        }
+      }
+    },
+    {
+      "message": "../rooted: exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+      "severity": "error",
+      "code": null,
+      "location": {
+        "file": "main.crn",
+        "range": {
+          "start": {
+            "line": 2,
+            "column": 1
+          },
+          "end": {
+            "line": 2,
+            "column": 2
+          }
+        }
+      }
+    }
+  ]
+}

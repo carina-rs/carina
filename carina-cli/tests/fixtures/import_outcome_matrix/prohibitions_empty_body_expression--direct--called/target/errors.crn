@@ -1,0 +1,2 @@
+let a = 'present'
+let broken = a ?? { inner = { leaf = 1 } }

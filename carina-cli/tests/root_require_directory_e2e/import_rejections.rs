@@ -92,7 +92,7 @@ fn imported_root_pins_all_five_errors_and_call_site_on_every_transport() {
 }
 
 #[test]
-fn round31_nonroot_prohibition_keeps_body_and_call_findings() {
+fn nonroot_prohibition_keeps_body_and_call_findings() {
     let directory = fixture();
     fs::remove_dir_all(directory._temp.path().join("rooted")).unwrap();
     fs::create_dir(directory._temp.path().join("rooted")).unwrap();
@@ -115,7 +115,7 @@ fn round31_nonroot_prohibition_keeps_body_and_call_findings() {
 }
 
 #[test]
-fn round31_readable_exports_precede_unreadable_sibling() {
+fn readable_exports_precede_unreadable_sibling() {
     let directory = fixture();
     fs::remove_dir_all(directory._temp.path().join("rooted")).unwrap();
     fs::create_dir(directory._temp.path().join("rooted")).unwrap();
@@ -142,7 +142,7 @@ fn round31_readable_exports_precede_unreadable_sibling() {
 }
 
 #[test]
-fn round31_nested_uncalled_prohibitions_belong_to_root_use() {
+fn nested_uncalled_prohibitions_belong_to_root_use() {
     let directory = fixture();
     fs::create_dir(directory.project.join("bridge")).unwrap();
     fs::write(
@@ -277,12 +277,12 @@ fn uncalled_prohibited_imports_pin_use_locations_on_every_transport() {
 }
 
 #[test]
-fn prohibited_imports_precede_body_expression_and_type_errors_on_every_transport() {
+fn root_evidence_suppresses_body_checks_and_nonroot_keeps_main_findings() {
     for root_evidence in [true, false] {
         for (body_error, nonroot_prefix) in [
             (
                 "let a = 'present'\nlet broken = a ?? { inner = { leaf = 1 } }\n",
-                "three",
+                "three-body-expression",
             ),
             (
                 "attributes { bad: TotallyMadeUpType = 'one' }\n",
@@ -391,7 +391,7 @@ Error:   = expected discard_pattern or identifier
   "resources": [],
   "errors": [
     {
-      "message": "../target: No .crn files found in ../target",
+      "message": "No .crn files found in ../target",
       "severity": "error",
       "code": null,
       "location": null
@@ -571,5 +571,163 @@ fn imported_roots_keep_main_category_order_across_directories() {
             .collect::<String>()
             + suffix;
         assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
+    }
+}
+
+#[test]
+fn readable_prohibitions_beside_unreadable_siblings_keep_call_locations() {
+    let directory = fixture();
+    fs::write(
+        directory._temp.path().join("rooted/z-unreadable.crn"),
+        [0xff],
+    )
+    .unwrap();
+    let output = directory.run(&["validate", "--json", "."]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let errors = report["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 5, "{report}");
+    for error in errors {
+        assert_eq!(error["location"]["range"]["start"]["line"], 2, "{report}");
+    }
+}
+
+// Expected body findings were measured on genuine main with an otherwise
+// equivalent module declaring `arguments { unused: Int = 1 }`.
+#[test]
+fn empty_interfaces_keep_duplicate_type_and_nested_call_checks() {
+    let mut failures = Vec::new();
+    for interface in ["", "arguments {}\n", "arguments { unused: Int = 1 }\n"] {
+        for (kind, body, expected) in [
+            (
+                "duplicate",
+                "let x = 1\n",
+                "duplicate binding 'x': declared in main.crn and sibling.crn",
+            ),
+            (
+                "expression",
+                "let a = 'present'\nlet broken = a ?? 1\n",
+                "coalesce default type `Int` does not match left type `String`",
+            ),
+            (
+                "nested",
+                "let inner = use { source = './child' }\nlet child_call = inner { n = 'wrong' }\n",
+                "expected Int, got string 'wrong'",
+            ),
+        ] {
+            let directory = fixture();
+            let target = directory._temp.path().join("rooted");
+            fs::remove_dir_all(&target).unwrap();
+            fs::create_dir_all(target.join("child")).unwrap();
+            fs::write(target.join("arguments.crn"), interface).unwrap();
+            fs::write(target.join("main.crn"), body).unwrap();
+            fs::write(
+                target.join("sibling.crn"),
+                if kind == "duplicate" {
+                    "let x = 2\n"
+                } else {
+                    "// sibling\n"
+                },
+            )
+            .unwrap();
+            fs::write(target.join("child/main.crn"), "arguments { n: Int }\n").unwrap();
+            fs::write(
+                directory.project.join("main.crn"),
+                "let service = use { source = '../rooted' }\nlet result = service {}\n",
+            )
+            .unwrap();
+            for command in ["validate", "lint"] {
+                let output = directory.run(&[command, "."]);
+                let text = output_text(&output);
+                if output.status.code() != Some(1) || !text.contains(expected) {
+                    failures.push(format!("{interface:?}/{kind}/{command}: {text}"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn rejected_parents_stop_before_child_prohibitions_and_body_findings() {
+    for (root_evidence, child) in [
+        (true, "arguments { n: Int = 1 }\nexports { value = 1 }\n"),
+        (
+            true,
+            "arguments { n: Int = 1 }\nattributes { bad: ChildType = 1 }\n",
+        ),
+        (false, "arguments { n: Int = 1 }\nexports { value = 1 }\n"),
+    ] {
+        let directory = fixture();
+        let target = directory._temp.path().join("rooted");
+        fs::remove_dir_all(&target).unwrap();
+        fs::create_dir_all(target.join("child")).unwrap();
+        fs::write(target.join("arguments.crn"), "arguments { n: Int = 1 }\n").unwrap();
+        fs::write(
+            target.join("main.crn"),
+            "let inner = use { source = './child' }\nattributes { bad: ParentType = 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            target.join("boundary.crn"),
+            if root_evidence {
+                "provider mock {}\n"
+            } else {
+                "exports { value = 1 }\n"
+            },
+        )
+        .unwrap();
+        fs::write(target.join("child/main.crn"), child).unwrap();
+        let output = directory.run(&["validate", "--json", "."]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let errors = report["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), if root_evidence { 1 } else { 2 }, "{report}");
+        assert!(!report.to_string().contains("ChildType"), "{report}");
+        assert_eq!(
+            report
+                .to_string()
+                .matches("not allowed inside modules")
+                .count(),
+            1,
+            "{report}"
+        );
+        assert_eq!(
+            report.to_string().contains("ParentType"),
+            !root_evidence,
+            "{report}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_import_failures_share_resolver_order_beside_prohibitions() {
+    // Main's category pass publishes the prohibition and stops before ordinary
+    // resolution, for both missing paths and single files. Empty follows suit.
+    for ordinary in ["empty", "file", "missing"] {
+        let directory = fixture();
+        let root = directory._temp.path();
+        fs::write(root.join("rooted/main.crn"), "arguments { n: Int = 1 }\n").unwrap();
+        for name in ["providers.crn", "backend.crn"] {
+            fs::remove_file(root.join("rooted").join(name)).unwrap();
+        }
+        // Keep just exports as the parent's prohibition.
+        fs::write(root.join("rooted/exports.crn"), "exports { value = 1 }\n").unwrap();
+        if ordinary == "empty" {
+            fs::create_dir(root.join("ordinary")).unwrap();
+        }
+        if ordinary == "file" {
+            fs::write(root.join("ordinary"), "arguments {}\n").unwrap();
+        }
+        fs::write(directory.project.join("main.crn"), "let ordinary = use { source = '../ordinary' }\nlet service = use { source = '../rooted' }\nordinary {}\nservice {}\n").unwrap();
+        let output = directory.run(&["validate", "--json", "."]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let errors = report["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1, "{ordinary}: {report}");
+        assert!(
+            errors[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("exports blocks are not allowed"),
+            "{report}"
+        );
     }
 }

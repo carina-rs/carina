@@ -489,12 +489,11 @@ impl HoverProvider {
                 Err(
                     carina_core::module_resolver::ModuleLoadError::NotModule {
                         error: _,
-                        imports: _,
                         signature: _,
+                        body: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Partial {
                         prohibitions: _,
-                        imports: _,
                         signature: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
@@ -504,9 +503,9 @@ impl HoverProvider {
         let mut content = format!("## {}\n\n`{}`\n", word, import_path);
 
         // Show arguments
-        if !module_parsed.arguments.is_empty() {
+        if !module_parsed.arguments().is_empty() {
             content.push_str("\n### Arguments\n\n");
-            for arg in &module_parsed.arguments {
+            for arg in module_parsed.arguments() {
                 let required = if arg.default.is_none() {
                     " **(required)**"
                 } else {
@@ -525,9 +524,9 @@ impl HoverProvider {
         }
 
         // Show attributes (outputs)
-        if !module_parsed.attribute_params.is_empty() {
+        if !module_parsed.attribute_params().is_empty() {
             content.push_str("\n### Attributes\n\n");
-            for attr in &module_parsed.attribute_params {
+            for attr in module_parsed.attribute_params() {
                 let type_str = attr
                     .static_type
                     .as_ref()
@@ -569,12 +568,11 @@ impl HoverProvider {
                 Err(
                     carina_core::module_resolver::ModuleLoadError::NotModule {
                         error: _,
-                        imports: _,
                         signature: _,
+                        body: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Partial {
                         prohibitions: _,
-                        imports: _,
                         signature: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
@@ -582,7 +580,7 @@ impl HoverProvider {
             };
 
         // Find the argument matching the word
-        let arg = module_parsed.arguments.iter().find(|a| a.name == word)?;
+        let arg = module_parsed.arguments().iter().find(|a| a.name == word)?;
 
         // Build hover content
         self.build_module_argument_hover(arg, module_name)

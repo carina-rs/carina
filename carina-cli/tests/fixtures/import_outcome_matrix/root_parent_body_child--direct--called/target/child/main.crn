@@ -1,0 +1,2 @@
+arguments { n: Int = 1 }
+attributes { bad: ChildType = 1 }

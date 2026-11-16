@@ -36,10 +36,12 @@ mod resolver;
 mod signature;
 mod validation;
 
-pub use error::{DiagnosticLine, ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
+pub use error::{
+    DiagnosticLine, ImportDiagnostics, ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic,
+};
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
 pub use loader::{
-    LoadedModule, ModuleBodyAnalysis, ModuleLoadError, ModuleProhibition,
+    LoadedModule, ModuleAnalysisOutcome, ModuleBodyAnalysis, ModuleLoadError, ModuleProhibition,
     ModuleProhibitionCategory, ModuleProhibitions, ModuleRejection, ModuleSignatureSource,
     ModuleSignatureView, ModuleTemplate, ModuleTemplatePreflight, PartialModule,
     PartialModuleAnalysis, PartialModuleSignatureSource, derive_module_name, get_parsed_file,

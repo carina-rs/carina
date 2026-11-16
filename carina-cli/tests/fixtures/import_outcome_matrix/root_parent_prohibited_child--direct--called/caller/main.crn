@@ -1,0 +1,3 @@
+let service = use { source = '../target' }
+let result = service {}
+

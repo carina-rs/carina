@@ -1,0 +1,2 @@
+let a = 'present'
+let broken = a ?? 1

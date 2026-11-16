@@ -489,7 +489,12 @@ fn static_validation_walks_multifile_modules_using_environment_snapshot() {
     let context = carina_core::parser::ProviderContext::new(runtime.environment().clone());
     let result =
         carina_core::module_resolver::load_module(&project_path.join("child").unwrap(), &context);
-    let Err(carina_core::module_resolver::ModuleLoadError::NotModule { error, .. }) = result else {
+    let Err(carina_core::module_resolver::ModuleLoadError::NotModule {
+        error,
+        signature: _,
+        body: _,
+    }) = result
+    else {
         panic!("supplied env must allow parsing through to the provider prohibition");
     };
     assert!(matches!(

@@ -458,14 +458,13 @@ impl CompletionProvider {
             Ok(module) => Some(module),
             Err(carina_core::module_resolver::ModuleLoadError::Partial {
                 prohibitions: _,
-                imports: _,
                 signature: _,
             })
             | Err(carina_core::module_resolver::ModuleLoadError::Unavailable(_))
             | Err(carina_core::module_resolver::ModuleLoadError::NotModule {
                 error: _,
-                imports: _,
                 signature: _,
+                body: _,
             }) => None,
         }
     }
@@ -681,16 +680,16 @@ impl CompletionProvider {
                     &carina_core::schema::SchemaRegistry::new(),
                     &module_path.source_label(),
                 )
-            && !parsed.arguments.is_empty()
+            && !parsed.arguments().is_empty()
         {
             let mut snippet = format!("{} {{\n", binding);
             let max_len = parsed
-                .arguments
+                .arguments()
                 .iter()
                 .map(|a| a.name.len())
                 .max()
                 .unwrap_or(0);
-            for (i, arg) in parsed.arguments.iter().enumerate() {
+            for (i, arg) in parsed.arguments().iter().enumerate() {
                 let padding = " ".repeat(max_len - arg.name.len());
                 snippet.push_str(&format!("  {}{} = ${{{}}}\n", arg.name, padding, i + 1));
             }
