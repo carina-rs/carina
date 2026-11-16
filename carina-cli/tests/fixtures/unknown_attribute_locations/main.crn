@@ -1,0 +1,2 @@
+let main_decoy = 'typo multiline'
+mock.test.resource { name = 'main' }

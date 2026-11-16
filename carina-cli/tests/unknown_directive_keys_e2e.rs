@@ -463,7 +463,7 @@ fn nested_directives_get_the_ordinary_schema_error_in_cli_and_lsp() {
     assert_eq!(
         errors[0]["location"]["range"],
         serde_json::json!({
-            "start": {"line": 3, "column": 3}, "end": {"line": 3, "column": 7}
+            "start": {"line": 4, "column": 5}, "end": {"line": 4, "column": 15}
         })
     );
     assert!(String::from_utf8(human.stderr).unwrap().contains(message));
@@ -491,7 +491,16 @@ fn nested_directives_get_the_ordinary_schema_error_in_cli_and_lsp() {
         ordinary["errors"][0]["message"],
         message.replace("'directives'", "'ordinary'")
     );
-    assert_eq!(ordinary["errors"][0]["location"], errors[0]["location"]);
+    assert_eq!(
+        ordinary["errors"][0]["location"]["file"],
+        errors[0]["location"]["file"]
+    );
+    assert_eq!(
+        ordinary["errors"][0]["location"]["range"],
+        serde_json::json!({
+            "start": {"line": 4, "column": 5}, "end": {"line": 4, "column": 13}
+        })
+    );
     let ordinary = lsp(directory.path(), "resources.crn");
     assert_eq!(ordinary.len(), 1, "{ordinary:#?}");
     assert_eq!(ordinary[0].severity, diagnostics[0].severity);

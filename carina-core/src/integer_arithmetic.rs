@@ -626,6 +626,17 @@ impl<P: ValueKind, B: BindingAddress> PartialEq for ValidatedIntegerExpr<P, B> {
 
 #[cfg(feature = "test-utils")]
 impl<P: ValueShape, B: BindingAddress> ValidatedIntegerExpr<P, B> {
+    pub(crate) fn visit_storage<'a>(&'a self, mut visit: impl FnMut(&'a Value<P, B>)) {
+        let Self {
+            lhs,
+            op: _,
+            rhs,
+            operator_span: _,
+        } = self;
+        visit(lhs);
+        visit(rhs);
+    }
+
     pub(crate) fn copy_storage<Q: ValueShape>(
         &self,
         map: &mut impl FnMut(&Value<P, B>) -> Value<Q, B>,

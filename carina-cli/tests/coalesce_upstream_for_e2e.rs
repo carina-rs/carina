@@ -719,6 +719,8 @@ fn updating_authored_map_iterable_keeps_stable_children_and_converges() {
 
 #[test]
 fn update_selected_coalesce_secret_is_hashed_in_state() {
+    // Both inner alternatives are Public; the use-site wrapper protects the
+    // selected result during the update, including the absent-source fallback.
     const SECRET: &str = "coalesce-update-secret-must-not-leak-3961";
     let root = tempfile::tempdir().expect("create temporary root");
     let project = root.path().join("project");
@@ -732,7 +734,7 @@ fn update_selected_coalesce_secret_is_hashed_in_state() {
 
 let s = mock.test.resource {
   name = "consumer"
-  comment = r.comment ?? secret(env("SECRET_V"))
+  comment = secret(r.comment ?? env("SECRET_V"))
 }
 "#,
     )
@@ -756,7 +758,7 @@ let s = mock.test.resource {
 
 let s = mock.test.resource {
   name = "consumer"
-  comment = r.comment ?? secret(env("SECRET_V"))
+  comment = secret(r.comment ?? env("SECRET_V"))
 }
 "#,
     )
@@ -782,7 +784,9 @@ let s = mock.test.resource {
 }
 
 #[test]
-fn selected_public_coalesce_branch_stays_plain_and_plans_only_unrelated_update() {
+fn public_coalesce_branch_stays_plain_and_plans_only_unrelated_update() {
+    // A selected Public result requires a Public fallback under #4470.
+    // Keep the unused environment canary and nested no-phantom-diff assertions.
     const SECRET: &str = "unselected-nested-secret-must-not-taint-siblings-3961";
     let root = tempfile::tempdir().expect("create temporary root");
     let project = root.path().join("project");
@@ -796,17 +800,17 @@ fn selected_public_coalesce_branch_stays_plain_and_plans_only_unrelated_update()
 let t = mock.test.resource {
   name = "target"
   tags = {
-    k = r.identifier ?? secret(env("SECRET_V"))
+    k = r.identifier ?? env("SECRET_V")
     p = "plain"
   }
   rule {
-    action = r.identifier ?? secret(env("SECRET_V"))
+    action = r.identifier ?? env("SECRET_V")
   }
 }
 
 let leaf = mock.test.resource {
   name = "leaf"
-  comment = r.identifier ?? secret(env("SECRET_V"))
+  comment = r.identifier ?? env("SECRET_V")
 }
 "#,
     )
@@ -834,7 +838,7 @@ let leaf = mock.test.resource {
     let state = fs::read_to_string(project.join("carina.state.json")).expect("read state");
     assert!(
         !state.contains("\"$secret\"") && !state.contains(SECRET),
-        "an unselected secret fallback must not taint any state position:\n{state}",
+        "an unselected public fallback must not change any state position:\n{state}",
     );
 
     fs::write(
@@ -847,17 +851,17 @@ let t = mock.test.resource {
   name = "target"
   comment = "unrelated"
   tags = {
-    k = r.identifier ?? secret(env("SECRET_V"))
+    k = r.identifier ?? env("SECRET_V")
     p = "plain"
   }
   rule {
-    action = r.identifier ?? secret(env("SECRET_V"))
+    action = r.identifier ?? env("SECRET_V")
   }
 }
 
 let leaf = mock.test.resource {
   name = "leaf"
-  comment = r.identifier ?? secret(env("SECRET_V"))
+  comment = r.identifier ?? env("SECRET_V")
 }
 "#,
     )
@@ -878,6 +882,7 @@ let leaf = mock.test.resource {
 
 #[test]
 fn selected_secret_coalesce_branch_hashes_only_its_nested_child() {
+    // Wrap the homogeneous Public coalesce at the selected nested use site.
     const SECRET: &str = "selected-nested-secret-must-not-leak-3961";
     let root = tempfile::tempdir().expect("create temporary root");
     let project = root.path().join("project");
@@ -891,7 +896,7 @@ fn selected_secret_coalesce_branch_hashes_only_its_nested_child() {
 let t = mock.test.resource {
   name = "target"
   tags = {
-    k = r.comment ?? secret(env("SECRET_V"))
+    k = secret(r.comment ?? env("SECRET_V"))
     p = "plain"
   }
 }

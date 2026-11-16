@@ -106,7 +106,7 @@ fn secret_predicate_cli_validate_and_lsp_leave_public_pending_values_for_plan() 
     for expression in [
         "value = upstream.output",
         "value = \"${secret('a')}-${upstream.output}\"",
-        "value = upstream.output ?? secret('fallback')",
+        "value = secret(upstream.output ?? 'fallback')",
     ] {
         let fixture = secret_predicate_fixture("secure_string", expression);
         let schemas = secret_predicate_schemas();

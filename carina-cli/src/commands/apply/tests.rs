@@ -8008,7 +8008,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     else {
         panic!("typed schema error was erased: {error:?}");
     };
-    assert!(!errors.errors().is_empty());
+    assert!(errors.errors().next().is_some());
     assert_eq!(
         message
             .matches("does not match required pattern /^state-/")

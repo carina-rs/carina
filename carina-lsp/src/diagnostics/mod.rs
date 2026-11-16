@@ -12,8 +12,9 @@ mod tests;
 
 #[cfg(test)]
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
@@ -357,6 +358,189 @@ fn render_merged<F: MergedFinding>(
         message,
         ..Default::default()
     })
+}
+
+fn secrecy_related_position(source: &str, line: usize, column: usize) -> Option<Position> {
+    let line = line.checked_sub(1)?;
+    let column = column.checked_sub(1)?;
+    let text = source.lines().nth(line)?;
+    Some(Position::new(
+        u32::try_from(line).ok()?,
+        position::char_offset_to_utf16_offset(text, column),
+    ))
+}
+
+fn secrecy_related_message(cause: &carina_core::secrecy::DerivationError, name: &str) -> String {
+    use carina_core::secrecy::DerivationError;
+    let description = match cause {
+        DerivationError::MixedAlternatives(_) => "Authored alternative",
+        DerivationError::LimitReached(_) => "Secrecy derivation limit reached",
+        DerivationError::RecursiveFunction(_) => "Recursive function",
+    };
+    format!("{description} in module instance '{name}'")
+}
+
+fn secrecy_range(
+    location: &carina_core::parser::DeclarationLocation,
+    open_sources: &[(PathBuf, Arc<str>)],
+    analyzed_sources: &carina_core::config_loader::SourceOverrides,
+) -> Option<Range> {
+    let identity = PathIdentity::new(location.file().path());
+    let source = analyzed_sources.analyzed_source(location.file().path())?;
+    if open_sources
+        .iter()
+        .find(|(path, _)| PathIdentity::new(path) == identity)
+        .is_some_and(|(_, buffer)| buffer.as_ref() != source.as_ref())
+    {
+        return None;
+    }
+    let span = location.span();
+    Some(Range::new(
+        secrecy_related_position(&source, span.start_line(), span.start_column())?,
+        secrecy_related_position(&source, span.end_line(), span.end_column())?,
+    ))
+}
+
+fn render_secrecy(
+    doc: &Document,
+    finding: &carina_core::secrecy::Finding,
+    open_sources: &[(PathBuf, Arc<str>)],
+    analyzed_sources: &carina_core::config_loader::SourceOverrides,
+) -> Option<(PathBuf, Diagnostic)> {
+    let authored = finding.location();
+    let is_current =
+        PathIdentity::new(authored.file().path()) == PathIdentity::new(doc.source_file());
+    // Each sibling owns findings from its own buffer analysis. Only a module
+    // in another directory needs the caller's instantiated context.
+    if !is_current
+        && authored.file().path().parent().map(PathIdentity::new)
+            == doc.source_file().parent().map(PathIdentity::new)
+    {
+        return None;
+    }
+    let mut message = finding.message();
+    if let Some(call) = finding.call_site() {
+        let span = call.location.span();
+        message.push_str(&format!(
+            " (module instance '{}' at {}:{}:{})",
+            call.name,
+            call.location.file().path().display(),
+            span.start_line(),
+            span.start_column()
+        ));
+    }
+    let mut diagnostic = if is_current {
+        render_merged(
+            doc,
+            &carina_core::parser::Located::new(authored.clone(), ()),
+            DiagnosticSeverity::ERROR,
+            message,
+        )?
+    } else {
+        Diagnostic {
+            range: secrecy_range(authored, open_sources, analyzed_sources)?,
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("carina".into()),
+            message,
+            ..Default::default()
+        }
+    };
+    if let Some(call) = finding.call_site() {
+        let range = if call.location.file().path() == doc.source_file() {
+            render_merged(
+                doc,
+                &carina_core::parser::Located::new(call.location.clone(), ()),
+                DiagnosticSeverity::ERROR,
+                String::new(),
+            )
+            .map(|diagnostic| diagnostic.range)
+        } else {
+            secrecy_range(&call.location, open_sources, analyzed_sources)
+        };
+        // Missing or unmappable related text never suppresses the operator.
+        diagnostic.related_information = range.and_then(|range| {
+            Some(vec![tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                location: tower_lsp::lsp_types::Location {
+                    uri: tower_lsp::lsp_types::Url::from_file_path(call.location.file().path())
+                        .ok()?,
+                    range,
+                },
+                message: secrecy_related_message(finding.cause(), &call.name),
+            }])
+        });
+    }
+    Some((
+        if is_current {
+            doc.source_file()
+        } else {
+            authored.file().path()
+        }
+        .to_path_buf(),
+        diagnostic,
+    ))
+}
+
+fn same_diagnostic(left: &Diagnostic, right: &Diagnostic) -> bool {
+    left.range == right.range && left.message == right.message && left.code == right.code
+}
+
+#[derive(Default)]
+pub(crate) struct DocumentDiagnostics {
+    pub(crate) documents: BTreeMap<PathBuf, Vec<AnalyzedDiagnostic>>,
+    pub(crate) imported_directories: BTreeSet<PathIdentity>,
+}
+
+type SecrecyCauses = HashMap<(PathBuf, [u32; 4], String), carina_core::secrecy::DerivationError>;
+
+fn secrecy_site(path: PathBuf, diagnostic: &Diagnostic) -> (PathBuf, [u32; 4], String) {
+    let range = diagnostic.range;
+    (
+        path,
+        [
+            range.start.line,
+            range.start.character,
+            range.end.line,
+            range.end.character,
+        ],
+        diagnostic.message.clone(),
+    )
+}
+
+#[derive(Clone)]
+pub(crate) struct AnalyzedDiagnostic {
+    pub(crate) diagnostic: Diagnostic,
+    cause: Option<carina_core::secrecy::DerivationError>,
+}
+
+impl AnalyzedDiagnostic {
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        match (&self.cause, &other.cause) {
+            (Some(left), Some(right)) => {
+                left == right
+                    && self.diagnostic.range == other.diagnostic.range
+                    && self.diagnostic.message == other.diagnostic.message
+            }
+            (None, None) => self.diagnostic == other.diagnostic,
+            (Some(_), None) | (None, Some(_)) => false,
+        }
+    }
+}
+
+impl DocumentDiagnostics {
+    fn into_documents(self) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+        self.documents
+            .into_iter()
+            .map(|(path, diagnostics)| {
+                (
+                    path,
+                    diagnostics
+                        .into_iter()
+                        .map(|finding| finding.diagnostic)
+                        .collect(),
+                )
+            })
+            .collect()
+    }
 }
 
 /// Syntax errors can use coordinates only from this buffer's own parser.
@@ -708,9 +892,54 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for LspTypeC
     }
 }
 
+/// Every root-directory consumer receives the same editor inputs. Imported
+/// directories retain main's disk model and routed findings still require
+/// their analyzed source to match any open module buffer.
+fn directory_source_snapshot(
+    doc: &Document,
+    current_file_path: Option<&Path>,
+    open_sources: &[(PathBuf, Arc<str>)],
+) -> Result<
+    carina_core::config_loader::SourceOverrides,
+    carina_core::config_loader::SourceOverrideConflict,
+> {
+    let base = current_file_path
+        .and_then(Path::parent)
+        .and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
+    let current = base.as_ref().and_then(|base| {
+        base.join(current_file_path?.file_name()?)
+            .ok()
+            .map(|path| (path, doc.text()))
+    });
+    let directory = doc.source_file().parent().map(PathIdentity::new);
+    let siblings = open_sources
+        .iter()
+        .filter(|(path, _)| base.is_some() && path.parent().map(PathIdentity::new) == directory)
+        .filter(|(path, _)| path.as_path() != doc.source_file())
+        .filter_map(|(path, source)| {
+            carina_core::paths::ResolvedPath::new(path)
+                .ok()
+                .map(|path| (path, source.to_string()))
+        });
+    carina_core::config_loader::SourceOverrides::try_from_entries(
+        current.into_iter().chain(siblings),
+    )
+    .map(carina_core::config_loader::SourceOverrides::tracking_reads)
+}
+
 pub(super) struct DiagnosticRun<'a> {
     engine: &'a DiagnosticEngine,
     provider_context: &'a dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    open_sources: &'a [(PathBuf, Arc<str>)],
+    source_snapshot: Option<&'a carina_core::config_loader::SourceOverrides>,
+    analysis_sources: &'a RefCell<carina_core::config_loader::SourceOverrides>,
+    secrecy_causes: &'a RefCell<SecrecyCauses>,
+    routed_secrecy: &'a RefCell<BTreeMap<PathBuf, Vec<Diagnostic>>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ANALYZED_DOCUMENTS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
 
 impl std::ops::Deref for DiagnosticRun<'_> {
@@ -834,7 +1063,7 @@ impl DiagnosticRun<'_> {
         // core's diagnostic ownership before taking those entries.
         let resource_diagnostic_errors = value_validation
             .diagnostic_errors()
-            .map(|(error, _, coverage)| (error.clone(), coverage))
+            .map(|(diagnostic, coverage)| (diagnostic.clone(), coverage))
             .collect::<Vec<_>>();
         let mut reported_attribute_diagnostics = HashSet::new();
         let retained_failures = resource_attributes
@@ -944,7 +1173,7 @@ impl DiagnosticRun<'_> {
                     continue;
                 }
 
-                let attr_findings = value_validation
+                let (attr_findings, symbolic) = value_validation
                     .take_attribute(attr_name)
                     .unwrap_or_default();
                 // Admission owns the syntax verdict. Parser-owned
@@ -977,7 +1206,6 @@ impl DiagnosticRun<'_> {
                 }
 
                 let assignment_value = judged_expression.assignment_value(typecheck_value);
-                let symbolic = attr_findings.symbolic_findings().to_vec();
                 let has_exact_findings = symbolic.iter().any(|finding| !finding.covers_path());
                 let mut handled_enum_diagnostic = false;
                 if matches!(
@@ -1029,22 +1257,18 @@ impl DiagnosticRun<'_> {
                     if handled_enum_diagnostic && covers_path {
                         continue;
                     }
-                    let (path, error) = finding.diagnostic();
+                    let (path, diagnostic) = finding.diagnostic();
+                    let error = diagnostic.error();
                     use carina_core::resource::SecretDiagnosticError;
                     use carina_core::validation::admission::AdmissionReferenceError;
-                    let (location, severity, message) = match error {
+                    let (severity, message) = match error {
                         TypeError::Reference { error, .. } => match error.as_ref() {
                             SecretDiagnosticError::Public(AdmissionReferenceError::Arithmetic(
                                 finding,
-                            )) => (
-                                finding.location(),
-                                DiagnosticSeverity::ERROR,
-                                finding.detail().to_string(),
-                            ),
+                            )) => (DiagnosticSeverity::ERROR, finding.detail().to_string()),
                             SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
                                 error,
                             )) => (
-                                rref.attribute_key_location(attr_name),
                                 match error {
                                     DeferredAccessTypeError::InvalidAccess { .. } => {
                                         DiagnosticSeverity::ERROR
@@ -1068,7 +1292,6 @@ impl DiagnosticRun<'_> {
                             SecretDiagnosticError::Public(
                                 AdmissionReferenceError::ResourceHandle { reference, types },
                             ) => (
-                                rref.attribute_key_location(attr_name),
                                 DiagnosticSeverity::WARNING,
                                 format!("Type mismatch: {types} (from {reference})"),
                             ),
@@ -1076,11 +1299,9 @@ impl DiagnosticRun<'_> {
                                 AdmissionReferenceError::Resolution(_)
                                 | AdmissionReferenceError::Authored(_),
                             )
-                            | SecretDiagnosticError::InsideSecret => (
-                                rref.attribute_key_location(attr_name),
-                                DiagnosticSeverity::ERROR,
-                                error.to_string(),
-                            ),
+                            | SecretDiagnosticError::InsideSecret => {
+                                (DiagnosticSeverity::ERROR, error.to_string())
+                            }
                         },
                         TypeError::TypeMismatch { types } => {
                             let message = validation::reference_mismatch_message(
@@ -1089,19 +1310,29 @@ impl DiagnosticRun<'_> {
                                 attr_name,
                                 types,
                             );
-                            (
-                                rref.attribute_key_location(attr_name),
-                                DiagnosticSeverity::WARNING,
-                                message,
-                            )
+                            (DiagnosticSeverity::WARNING, message)
                         }
-                        _ => (
-                            rref.attribute_key_location(attr_name),
-                            DiagnosticSeverity::WARNING,
-                            error.to_string(),
-                        ),
+                        _ => (DiagnosticSeverity::WARNING, error.to_string()),
                     };
-                    let finding = carina_core::parser::Located::new(location.clone(), message);
+                    let located = match rref.locate_schema_diagnostic(diagnostic, |ordinary| {
+                        if let TypeError::Reference { error, .. } = ordinary.error()
+                            && let SecretDiagnosticError::Public(
+                                AdmissionReferenceError::Arithmetic(finding),
+                            ) = error.as_ref()
+                        {
+                            finding.location().clone()
+                        } else {
+                            rref.attribute_key_location(attr_name).clone()
+                        }
+                    }) {
+                        Ok(located) => located,
+                        Err(error) => {
+                            diagnostics.extend(render_analysis_invariant(doc, &error));
+                            continue;
+                        }
+                    };
+                    let finding =
+                        carina_core::parser::Located::new(located.location().clone(), message);
                     if let Some(diagnostic) =
                         render_merged(doc, &finding, severity, finding.detail().clone())
                     {
@@ -1125,10 +1356,7 @@ impl DiagnosticRun<'_> {
                     continue;
                 }
 
-                let container_findings = attr_findings
-                    .local_findings()
-                    .iter()
-                    .any(|(path, _)| !path.is_empty())
+                let container_findings = attr_findings.has_nested_findings()
                     || matches!(
                         attr_findings.structure(),
                         carina_core::schema::ValueStructure::List
@@ -1144,11 +1372,15 @@ impl DiagnosticRun<'_> {
                     );
                 if container_findings {
                     let findings = attr_findings
-                        .into_local_findings()
+                        .into_diagnostic_findings(attr_name)
                         .into_iter()
-                        .filter(|(path, error)| {
+                        .filter(|(path, diagnostic)| {
                             (!path.is_empty() || !authored_has_function_call)
-                                && !validation::covered_by_symbolic_findings(path, error, &symbolic)
+                                && !validation::covered_by_symbolic_findings(
+                                    path,
+                                    diagnostic.error(),
+                                    &symbolic,
+                                )
                         })
                         .collect();
                     let (nested, reported_duplicate) =
@@ -1217,7 +1449,8 @@ impl DiagnosticRun<'_> {
 
         // Render the report produced by the single owner-bound walk.
         {
-            for (error, symbolic_coverage) in resource_diagnostic_errors {
+            for (diagnostic, symbolic_coverage) in resource_diagnostic_errors {
+                let error = diagnostic.error().clone();
                 if error
                     .attribute_name()
                     .is_some_and(|name| retained_failures.contains(name))
@@ -1312,25 +1545,22 @@ impl DiagnosticRun<'_> {
                 {
                     continue;
                 }
-                let location = error
-                    .attribute_name()
-                    .filter(|name| resource_attributes.contains_key(*name))
-                    .map_or(rref.type_location(), |name| {
-                        let assignment = rref.attribute_assignment_location(name);
-                        let span = assignment.span();
-                        if matches!(
-                            error,
-                            carina_core::schema::TypeError::UnknownAttribute { .. }
-                        ) && span.start_line() == span.end_line()
-                        {
-                            assignment
-                        } else {
-                            // Multiline containers retain the precise key instead
-                            // of widening beyond main's single-line anchor.
+                let finding = match rref.locate_schema_diagnostic(&diagnostic, |ordinary| {
+                    let location = ordinary
+                        .error()
+                        .attribute_name()
+                        .filter(|name| resource_attributes.contains_key(*name))
+                        .map_or(rref.type_location(), |name| {
                             rref.attribute_key_location(name)
-                        }
-                    });
-                let finding = carina_core::parser::Located::new(location.clone(), error);
+                        });
+                    location.clone()
+                }) {
+                    Ok(finding) => finding,
+                    Err(error) => {
+                        diagnostics.extend(render_analysis_invariant(doc, &error));
+                        continue;
+                    }
+                };
                 diagnostics.extend(render_merged(
                     doc,
                     &finding,
@@ -1508,17 +1738,22 @@ impl DiagnosticRun<'_> {
             path.file_name()
                 .expect("a current file path must name a file")
         });
-        // Resolve the document through the pinned base once, then share its
-        // snapshot across directory, module, upstream and recovery analysis.
-        let overrides = if let Some(base) = base_path {
-            current_file_name
-                .and_then(|file_name| base.join(file_name).ok())
-                .map(|path| carina_core::config_loader::SourceOverrides::single(path, text.clone()))
-        } else {
-            None
+        let overrides = match self.source_snapshot.cloned().map_or_else(
+            || directory_source_snapshot(doc, current_file_path, self.open_sources),
+            Ok,
+        ) {
+            Ok(overrides) => overrides,
+            Err(error) => {
+                diagnostics.push(Diagnostic {
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("carina".into()),
+                    message: error.to_string(),
+                    ..Default::default()
+                });
+                return diagnostics;
+            }
         };
-        // Keep directory checks available when only the document leaf fails.
-        let overrides = overrides.unwrap_or_else(carina_core::config_loader::SourceOverrides::new);
+        *self.analysis_sources.borrow_mut() = overrides.clone();
         let current_file_name = current_file_name.map(|name| name.to_string_lossy());
         let current_file_name = current_file_name.as_deref();
 
@@ -2140,6 +2375,63 @@ impl DiagnosticRun<'_> {
             let expanded_configuration = expanded_canonical
                 .as_ref()
                 .map(|graph| graph.judge(self.provider_context.catalog()));
+            let secrecy_report = expanded_configuration.as_ref().map_or_else(
+                || pre_expansion_configuration.judged().secrecy(),
+                |configuration| configuration.judged().secrecy(),
+            );
+            // Cross-directory findings also depend on the root's inputs.
+            // Another open root file may have changed a call or its argument.
+            // Publish those contexts only from an analysis whose root texts
+            // match the directory snapshot. Local diagnostics still belong to
+            // the analyzed document; the snapshot contains every open sibling.
+            let root_directory = doc.source_file().parent().map(PathIdentity::new);
+            let current_root_context = self
+                .open_sources
+                .iter()
+                .filter(|(path, _)| path.parent().map(PathIdentity::new) == root_directory)
+                .all(|(path, buffer)| {
+                    overrides
+                        .analyzed_source(path)
+                        .is_some_and(|source| source.as_ref() == buffer.as_ref())
+                });
+            for finding in secrecy_report.findings() {
+                if !current_root_context
+                    && finding
+                        .location()
+                        .file()
+                        .path()
+                        .parent()
+                        .map(PathIdentity::new)
+                        != root_directory
+                {
+                    continue;
+                }
+                if let Some((path, diagnostic)) =
+                    render_secrecy(doc, finding, self.open_sources, &overrides)
+                {
+                    self.secrecy_causes.borrow_mut().insert(
+                        secrecy_site(path.clone(), &diagnostic),
+                        finding.cause().clone(),
+                    );
+                    if path == doc.source_file() {
+                        if !diagnostics
+                            .iter()
+                            .any(|existing| same_diagnostic(existing, &diagnostic))
+                        {
+                            diagnostics.push(diagnostic);
+                        }
+                    } else {
+                        let mut routed = self.routed_secrecy.borrow_mut();
+                        let findings = routed.entry(path).or_default();
+                        if !findings
+                            .iter()
+                            .any(|existing| same_diagnostic(existing, &diagnostic))
+                        {
+                            findings.push(diagnostic);
+                        }
+                    }
+                }
+            }
             let expanded_validation_tree =
                 expanded_configuration.as_ref().and_then(|configuration| {
                     analysis_result(doc, configuration.analysis_tree(), &mut diagnostics)
@@ -2971,6 +3263,11 @@ impl DiagnosticEngine {
                 produce(&DiagnosticRun {
                     engine: self,
                     provider_context: session,
+                    open_sources: &[],
+                    source_snapshot: None,
+                    analysis_sources: &RefCell::default(),
+                    secrecy_causes: &RefCell::default(),
+                    routed_secrecy: &RefCell::default(),
                 })
             },
         )
@@ -2986,11 +3283,99 @@ impl DiagnosticEngine {
         raw: &crate::document::Document,
         current_file_path: Option<&Path>,
     ) -> Vec<Diagnostic> {
+        self.analyze_with_open_documents(raw, current_file_path, &[])
+    }
+
+    /// Analyze against a snapshot of the open editor buffers, including imported
+    /// module sources used for authored diagnostic locations.
+    pub fn analyze_with_open_documents(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_documents: &[&crate::document::Document],
+    ) -> Vec<Diagnostic> {
+        let open_sources = open_documents
+            .iter()
+            .map(|doc| (doc.source_file().to_path_buf(), doc.source_snapshot()))
+            .collect::<Vec<_>>();
+        self.analyze_with_open_sources(raw, current_file_path, &open_sources)
+    }
+
+    /// Analyze the current document and route instantiated secrecy findings to
+    /// their authored files. Dirty module buffers suppress routed findings.
+    /// Results iterate in file-path order.
+    pub fn analyze_document_set(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_documents: &[&crate::document::Document],
+    ) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+        let open_sources = open_documents
+            .iter()
+            .map(|doc| (doc.source_file().to_path_buf(), doc.source_snapshot()))
+            .collect::<Vec<_>>();
+        self.analyze_document_set_with_open_sources(raw, current_file_path, &open_sources)
+    }
+
+    pub(crate) fn analyze_with_open_sources(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_sources: &[(PathBuf, Arc<str>)],
+    ) -> Vec<Diagnostic> {
+        self.analyze_document_set_with_open_sources(raw, current_file_path, open_sources)
+            .remove(raw.source_file())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn analyze_document_set_with_open_sources(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_sources: &[(PathBuf, Arc<str>)],
+    ) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+        self.analyze_document_snapshot(raw, current_file_path, open_sources)
+            .into_documents()
+    }
+
+    pub(crate) fn analyze_document_snapshot(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_sources: &[(PathBuf, Arc<str>)],
+    ) -> DocumentDiagnostics {
+        #[cfg(test)]
+        ANALYZED_DOCUMENTS.with(|paths| paths.borrow_mut().push(raw.source_file().to_path_buf()));
+        let single = |diagnostics: Vec<Diagnostic>| DocumentDiagnostics {
+            documents: BTreeMap::from([(
+                raw.source_file().to_path_buf(),
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| AnalyzedDiagnostic {
+                        diagnostic,
+                        cause: None,
+                    })
+                    .collect(),
+            )]),
+            ..Default::default()
+        };
         let doc = match raw.for_diagnostics() {
             Ok(doc) => doc,
-            Err(protected) => return vec![buffer::protected_parse_error(protected)],
+            Err(protected) => return single(vec![buffer::protected_parse_error(protected)]),
         };
-        let context = self.catalog_for_public_document(&doc, current_file_path);
+        let source_snapshot = match directory_source_snapshot(&doc, current_file_path, open_sources)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return single(vec![Diagnostic {
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("carina".into()),
+                    message: error.to_string(),
+                    ..Default::default()
+                }]);
+            }
+        };
+        let context = self.catalog_for_public_document(&doc, current_file_path, &source_snapshot);
         let reparsed;
         let doc = if doc.provider_context().custom_types_loaded() && !context.custom_types_loaded()
         {
@@ -3001,20 +3386,53 @@ impl DiagnosticEngine {
             );
             match reparsed.for_diagnostics() {
                 Ok(doc) => doc,
-                Err(protected) => return vec![buffer::protected_parse_error(protected)],
+                Err(protected) => return single(vec![buffer::protected_parse_error(protected)]),
             }
         } else {
             doc
         };
+        let routed_secrecy = RefCell::default();
+        let analysis_sources = RefCell::default();
+        let secrecy_causes = RefCell::default();
         let terminal =
             carina_core::validation::deferred_types::TypeCheckSession::run(&context, |session| {
                 DiagnosticRun {
                     engine: self,
                     provider_context: session,
+                    open_sources,
+                    source_snapshot: Some(&source_snapshot),
+                    analysis_sources: &analysis_sources,
+                    secrecy_causes: &secrecy_causes,
+                    routed_secrecy: &routed_secrecy,
                 }
                 .collect_diagnostics(&doc, current_file_path)
             });
-        Self::publish_type_diagnostics(terminal, &doc)
+        let mut report = routed_secrecy.into_inner();
+        report.insert(
+            raw.source_file().to_path_buf(),
+            Self::publish_type_diagnostics(terminal, &doc),
+        );
+        DocumentDiagnostics {
+            documents: {
+                let causes = secrecy_causes.into_inner();
+                report
+                    .into_iter()
+                    .map(|(path, diagnostics)| {
+                        let diagnostics = diagnostics
+                            .into_iter()
+                            .map(|diagnostic| {
+                                let cause = causes
+                                    .get(&secrecy_site(path.clone(), &diagnostic))
+                                    .cloned();
+                                AnalyzedDiagnostic { diagnostic, cause }
+                            })
+                            .collect();
+                        (path, diagnostics)
+                    })
+                    .collect()
+            },
+            imported_directories: analysis_sources.into_inner().imported_directories(),
+        }
     }
 
     pub(crate) fn catalog_for_document(
@@ -3023,7 +3441,11 @@ impl DiagnosticEngine {
         current_file_path: Option<&Path>,
     ) -> carina_core::parser::ProviderContext {
         match doc.for_diagnostics() {
-            Ok(doc) => self.catalog_for_public_document(&doc, current_file_path),
+            Ok(doc) => {
+                let snapshot =
+                    directory_source_snapshot(&doc, current_file_path, &[]).unwrap_or_default();
+                self.catalog_for_public_document(&doc, current_file_path, &snapshot)
+            }
             Err(_) => carina_core::parser::ProviderContext::new(
                 doc.provider_context().environment.clone(),
             ),
@@ -3034,11 +3456,12 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         current_file_path: Option<&Path>,
+        source_snapshot: &carina_core::config_loader::SourceOverrides,
     ) -> carina_core::parser::ProviderContext {
         let mut context = match current_file_path.and_then(Path::parent) {
             Some(directory) => carina_core::paths::ResolvedPath::new(directory)
                 .ok()
-                .and_then(|directory| self.directory_catalog(doc, &directory))
+                .and_then(|directory| self.directory_catalog(doc, &directory, source_snapshot))
                 .unwrap_or_else(|| {
                     if let Some(scope) = &self.directory_providers
                         && scope.directory == PathIdentity::new(directory)
@@ -3077,34 +3500,14 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         directory: &carina_core::paths::ResolvedPath,
+        source_snapshot: &carina_core::config_loader::SourceOverrides,
     ) -> Option<carina_core::parser::ProviderContext> {
-        let files = carina_core::config_loader::find_crn_files_in_dir(directory).ok()?;
         let mut providers = Vec::new();
-        let mut has_buffer = false;
-        let buffer_identity = carina_core::paths::ResolvedPath::new(doc.source_file())
-            .ok()
-            .map(|path| path.identity());
-        for file in files {
-            let source = if Some(file.identity()) == buffer_identity {
-                has_buffer = true;
-                doc.text()
-            } else {
-                file.read_to_string().ok()?
-            };
+        for (file, source) in source_snapshot.directory_sources(directory).ok()? {
             providers.extend(
                 carina_core::parser::parse_provider_factory_declarations(
                     &source,
                     &file.source_label(),
-                    doc.provider_context(),
-                )
-                .ok()?,
-            );
-        }
-        if !has_buffer {
-            providers.extend(
-                carina_core::parser::parse_provider_factory_declarations(
-                    &doc.text(),
-                    doc.source_file(),
                     doc.provider_context(),
                 )
                 .ok()?,

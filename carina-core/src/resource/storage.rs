@@ -12,12 +12,150 @@ pub(crate) fn copy_storage<P: ValueShape, Q: ValueShape, B: BindingAddress>(
     reference: &mut ReferenceCopy<'_, P, Q, B>,
     conversion: &mut ConversionCopy<'_, P, Q, B>,
 ) -> Value<Q, B> {
-    Copier {
+    enum Work<'a, P: ValueShape, B: BindingAddress> {
+        Enter(&'a Value<P, B>),
+        Finish(&'a Value<P, B>, usize),
+    }
+    let mut copier = Copier {
         leaf,
         reference,
         conversion,
+    };
+    let mut work = vec![Work::Enter(value)];
+    let mut values = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(value) => {
+                let start = work.len();
+                for_each_storage_child(value, |child| work.push(Work::Enter(child)));
+                let count = work.len() - start;
+                work.push(Work::Finish(value, count));
+                work[start..].reverse();
+            }
+            Work::Finish(value, count) => {
+                let start = values.len() - count;
+                let mut children = values.drain(start..);
+                let result = copier.value(value, &mut |_| {
+                    children.next().expect("scheduled storage child")
+                });
+                debug_assert!(children.next().is_none());
+                drop(children);
+                values.push(result);
+            }
+        }
     }
-    .value(value)
+    values.pop().expect("scheduled storage root")
+}
+
+// Storage traversal does not classify, select or evaluate any value. Keeping it
+// iterative prevents the output kind's projection from adding native recursion
+// to the resolver's heap traversal.
+fn for_each_storage_child<'a, P: ValueShape, B: BindingAddress>(
+    value: &'a Value<P, B>,
+    mut enqueue: impl FnMut(&'a Value<P, B>),
+) {
+    fn argument<'a, P: ValueShape, B: BindingAddress>(
+        argument: &'a FunctionArgument<P, B>,
+        enqueue: &mut impl FnMut(&'a Value<P, B>),
+    ) {
+        let FunctionArgument { operand } = argument;
+        match operand {
+            StructuralOperand::Value { value, access_base } => {
+                enqueue(value);
+                if let Some(base) = access_base {
+                    enqueue(base);
+                }
+            }
+            StructuralOperand::Handle {
+                handle: _,
+                access_base,
+            }
+            | StructuralOperand::Parameter {
+                name: _,
+                access_base,
+            } => enqueue(access_base),
+        }
+    }
+    match value {
+        Value::Reference(_) | Value::Conversion(_) => {}
+        Value::Concrete(value) => match value {
+            ConcreteValue::List(items) => items.iter().for_each(&mut enqueue),
+            ConcreteValue::Map(items) => items.values().for_each(&mut enqueue),
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_) => {}
+        },
+        Value::Deferred(value) => match value {
+            DeferredValue::ModuleIf(deferred) => {
+                let crate::parser::DeferredValueIf {
+                    condition,
+                    then_value,
+                    else_value,
+                } = deferred.as_ref();
+                let crate::parser::DeferredIfCondition {
+                    value,
+                    source_file: _,
+                    source_line: _,
+                    source_expression: _,
+                    node_id: _,
+                } = condition;
+                enqueue(value);
+                enqueue(then_value);
+                enqueue(else_value);
+            }
+            DeferredValue::Coalesce { value, default } => {
+                enqueue(value);
+                enqueue(default);
+            }
+            DeferredValue::IntegerArithmetic(expression) => expression.visit_storage(enqueue),
+            DeferredValue::Interpolation(parts) => {
+                for part in parts {
+                    match part {
+                        InterpolationPart::Expr(value) => enqueue(value),
+                        InterpolationPart::Literal(_) => {}
+                    }
+                }
+            }
+            DeferredValue::FunctionCall {
+                name: _,
+                args,
+                source_line: _,
+            }
+            | DeferredValue::Unavailable {
+                name: _,
+                args,
+                reason: _,
+                source_line: _,
+            }
+            | DeferredValue::ResolvedFunctionCall {
+                function: _,
+                functions: _,
+                args,
+                source_line: _,
+            } => {
+                for arg in args {
+                    argument(arg, &mut enqueue);
+                }
+            }
+            DeferredValue::Access(AccessExpr {
+                base,
+                step: _,
+                source_line: _,
+                display_root: _,
+                reference: _,
+            }) => enqueue(base),
+            DeferredValue::Secret(secret) => secret.visit_storage(enqueue),
+            DeferredValue::ResourceRef { path: _ }
+            | DeferredValue::BindingRef { binding: _ }
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_) => {}
+        },
+    }
 }
 
 struct Copier<'a, P: ValueShape, Q: ValueShape, B: BindingAddress> {
@@ -27,29 +165,37 @@ struct Copier<'a, P: ValueShape, Q: ValueShape, B: BindingAddress> {
 }
 
 impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
-    fn argument(&mut self, argument: &FunctionArgument<P, B>) -> FunctionArgument<Q, B> {
+    fn argument(
+        &mut self,
+        argument: &FunctionArgument<P, B>,
+        child: &mut impl FnMut(&Value<P, B>) -> Value<Q, B>,
+    ) -> FunctionArgument<Q, B> {
         let FunctionArgument { operand } = argument;
         let operand = match operand {
             StructuralOperand::Value { value, access_base } => StructuralOperand::Value {
-                value: self.value(value),
-                access_base: access_base.as_ref().map(|base| self.value(base)),
+                value: child(value),
+                access_base: access_base.as_ref().map(&mut *child),
             },
             StructuralOperand::Handle {
                 handle,
                 access_base,
             } => StructuralOperand::Handle {
                 handle: handle.clone(),
-                access_base: self.value(access_base),
+                access_base: child(access_base),
             },
             StructuralOperand::Parameter { name, access_base } => StructuralOperand::Parameter {
                 name: name.clone(),
-                access_base: self.value(access_base),
+                access_base: child(access_base),
             },
         };
         FunctionArgument { operand }
     }
 
-    fn value(&mut self, value: &Value<P, B>) -> Value<Q, B> {
+    fn value(
+        &mut self,
+        value: &Value<P, B>,
+        child: &mut impl FnMut(&Value<P, B>) -> Value<Q, B>,
+    ) -> Value<Q, B> {
         match value {
             Value::Reference(payload) => (self.reference)(payload),
             Value::Conversion(payload) => (self.conversion)(payload),
@@ -65,14 +211,11 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                 ConcreteValue::Duration(value) => ConcreteValue::Duration(*value),
                 ConcreteValue::StringList(value) => ConcreteValue::StringList(value.clone()),
                 ConcreteValue::List(values) => {
-                    ConcreteValue::List(values.iter().map(|v| self.value(v)).collect())
+                    ConcreteValue::List(values.iter().map(&mut *child).collect())
                 }
-                ConcreteValue::Map(values) => ConcreteValue::Map(
-                    values
-                        .iter()
-                        .map(|(k, v)| (k.clone(), self.value(v)))
-                        .collect(),
-                ),
+                ConcreteValue::Map(values) => {
+                    ConcreteValue::Map(values.iter().map(|(k, v)| (k.clone(), child(v))).collect())
+                }
             }),
             Value::Deferred(value) => Value::Deferred(match value {
                 DeferredValue::ModuleIf(deferred) => {
@@ -90,14 +233,14 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                     } = condition;
                     DeferredValue::ModuleIf(Box::new(crate::parser::DeferredValueIf {
                         condition: crate::parser::DeferredIfCondition {
-                            value: self.value(value),
+                            value: child(value),
                             source_file: source_file.clone(),
                             source_line: *source_line,
                             source_expression: source_expression.clone(),
                             node_id: *node_id,
                         },
-                        then_value: self.value(then_value),
-                        else_value: self.value(else_value),
+                        then_value: child(then_value),
+                        else_value: child(else_value),
                     }))
                 }
                 DeferredValue::ResourceRef { path } => {
@@ -107,11 +250,11 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                     binding: binding.clone(),
                 },
                 DeferredValue::Coalesce { value, default } => DeferredValue::Coalesce {
-                    value: Box::new(self.value(value)),
-                    default: Box::new(self.value(default)),
+                    value: Box::new(child(value)),
+                    default: Box::new(child(default)),
                 },
                 DeferredValue::IntegerArithmetic(expr) => {
-                    DeferredValue::IntegerArithmetic(expr.copy_storage(&mut |v| self.value(v)))
+                    DeferredValue::IntegerArithmetic(expr.copy_storage(child))
                 }
                 DeferredValue::Interpolation(parts) => DeferredValue::Interpolation(
                     parts
@@ -120,9 +263,7 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                             InterpolationPart::Literal(text) => {
                                 InterpolationPart::Literal(text.clone())
                             }
-                            InterpolationPart::Expr(value) => {
-                                InterpolationPart::Expr(self.value(value))
-                            }
+                            InterpolationPart::Expr(value) => InterpolationPart::Expr(child(value)),
                         })
                         .collect(),
                 ),
@@ -132,7 +273,7 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                     source_line,
                 } => DeferredValue::FunctionCall {
                     name: *name,
-                    args: args.iter().map(|a| self.argument(a)).collect(),
+                    args: args.iter().map(|a| self.argument(a, child)).collect(),
                     source_line: *source_line,
                 },
                 DeferredValue::Unavailable {
@@ -142,7 +283,7 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                     source_line,
                 } => DeferredValue::Unavailable {
                     name: *name,
-                    args: args.iter().map(|a| self.argument(a)).collect(),
+                    args: args.iter().map(|a| self.argument(a, child)).collect(),
                     reason: reason.clone(),
                     source_line: *source_line,
                 },
@@ -154,7 +295,7 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                 } => DeferredValue::ResolvedFunctionCall {
                     function: function.clone(),
                     functions: functions.clone(),
-                    args: args.iter().map(|a| self.argument(a)).collect(),
+                    args: args.iter().map(|a| self.argument(a, child)).collect(),
                     source_line: *source_line,
                 },
                 DeferredValue::Access(access) => {
@@ -166,7 +307,7 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                         reference,
                     } = access;
                     DeferredValue::Access(AccessExpr {
-                        base: Box::new(self.value(base)),
+                        base: Box::new(child(base)),
                         step: step.clone(),
                         source_line: *source_line,
                         display_root: display_root.clone(),
@@ -174,7 +315,7 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
                     })
                 }
                 DeferredValue::Secret(payload) => {
-                    DeferredValue::Secret(payload.copy_storage(&mut |v| self.value(v)))
+                    DeferredValue::Secret(payload.copy_storage(child))
                 }
                 DeferredValue::Unknown(reason) => DeferredValue::Unknown(reason.clone()),
                 DeferredValue::Placeholder(placeholder) => {

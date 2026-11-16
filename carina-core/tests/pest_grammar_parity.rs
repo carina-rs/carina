@@ -43,6 +43,10 @@ const ALLOWED_MISSING: &[&str] = &[
     // The same parser-only capture for each selected field. The formatter
     // preserves these segments inside its existing atomic `namespaced_id`.
     "reference_field",
+    // Parser-only separator for diagnostic `??` spans; the formatter uses `coalesce_op`.
+    "coalesce_separator",
+    // Parser-only `??` span capture; the formatter already preserves `coalesce_op`.
+    "coalesce_token",
     // pest built-ins with matching semantics but different spellings —
     // the formatter uses explicit `trivia` / `ws` / `newline` / `comment`
     // productions instead of the implicit `WHITESPACE` / `COMMENT` hooks.

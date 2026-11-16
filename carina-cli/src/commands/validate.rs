@@ -1066,6 +1066,7 @@ let observed_names = roles.names
                     code: None,
                     location: None,
                     file: None,
+                    related: Vec::new(),
                 },
                 ValidateWarning {
                     warning_type: Some("duplicate_attribute"),
@@ -1074,6 +1075,7 @@ let observed_names = roles.names
                     code: None,
                     location: None,
                     file: Some("main.crn".to_string()),
+                    related: Vec::new(),
                 },
             ],
             errors: vec![],

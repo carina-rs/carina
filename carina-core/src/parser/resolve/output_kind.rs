@@ -2,7 +2,6 @@
 use super::*;
 use crate::resource::{NoReferencePayload, SecretPayload, ValueShapeSealed, copy_storage};
 use crate::test_utils::resolver_kind::{InputObservation, PathObservation};
-use std::cell::RefCell;
 use std::fmt;
 use std::sync::Arc;
 
@@ -56,7 +55,7 @@ impl ResolveKind for EnrichedAuthored {
         project_storage(value)
     }
     fn split_operand<B: BindingAddress>(value: V<Self, B>) -> (S<B>, V<Self, B>) {
-        (Self::project(&value).into_owned(), value)
+        (own_projection(Self::project(&value)), value)
     }
     fn protect_operand<B: BindingAddress>(operand: V<Self, B>) -> V<Self, B> {
         V::Deferred(DeferredValue::Secret(SecretPayload::wrap_storage(
@@ -79,6 +78,24 @@ impl ResolveKind for EnrichedAuthored {
     }
 }
 
+// A cached result may be arbitrarily deep. Cow::into_owned would use Value's
+// recursive Clone here, adding native recursion to the iterative resolver.
+fn clone_plain<B: BindingAddress>(value: &S<B>) -> S<B> {
+    copy_storage(
+        value,
+        &mut Clone::clone,
+        &mut |never: &NoReferencePayload| match *never {},
+        &mut |never: &NoReferencePayload| match *never {},
+    )
+}
+
+fn own_projection<B: BindingAddress>(value: Cow<'_, S<B>>) -> S<B> {
+    match value {
+        Cow::Borrowed(value) => clone_plain(value),
+        Cow::Owned(value) => value,
+    }
+}
+
 fn project_storage<B: BindingAddress>(value: &V<EnrichedAuthored, B>) -> Cow<'_, S<B>> {
     match value {
         V::Reference(payload) => Cow::Borrowed(&payload.plain_result),
@@ -86,48 +103,71 @@ fn project_storage<B: BindingAddress>(value: &V<EnrichedAuthored, B>) -> Cow<'_,
         _ => Cow::Owned(copy_storage(
             value,
             &mut |p| p.0.clone(),
-            &mut |payload| (*payload.plain_result).clone(),
-            &mut |payload| (*payload.plain_result).clone(),
+            &mut |payload| clone_plain(&payload.plain_result),
+            &mut |payload| clone_plain(&payload.plain_result),
         )),
     }
 }
 
 pub(super) fn project_for_comparison<B: BindingAddress>(value: &V<EnrichedAuthored, B>) -> S<B> {
-    project_storage(value).into_owned()
+    own_projection(project_storage(value))
 }
 
 pub(super) fn observe_paths(
     value: &V<EnrichedAuthored, RelativeBindingName>,
 ) -> Vec<PathObservation> {
-    fn walk(
-        value: &V<EnrichedAuthored, RelativeBindingName>,
-        depth: usize,
-        found: &RefCell<Vec<PathObservation>>,
-    ) {
-        // Reuse the exhaustive storage walk; its return value is irrelevant here.
+    enum Envelope {
+        Reference(Arc<EnrichedReference<RelativeBindingName>>),
+        Conversion(Arc<EnrichedConversion<RelativeBindingName>>),
+    }
+    fn envelopes(value: &V<EnrichedAuthored, RelativeBindingName>, found: &mut Vec<Envelope>) {
+        // Use the storage copier's existing envelope callbacks. No additional
+        // API exposes a secret's child to an ordinary reader.
+        let found = std::cell::RefCell::new(found);
         let _: S<RelativeBindingName> = copy_storage(
             value,
             &mut |p| p.0.clone(),
             &mut |payload| {
-                found.borrow_mut().push(PathObservation {
-                    path: payload.path.to_dot_string(),
-                    segmented: !payload.path.segments().is_empty(),
-                    conversion_depth: depth,
-                });
-                (*payload.plain_result).clone()
+                found
+                    .borrow_mut()
+                    .push(Envelope::Reference(Arc::clone(payload)));
+                clone_plain(&payload.plain_result)
             },
             &mut |payload| {
-                for operand in &payload.operands {
-                    walk(operand, depth + 1, found);
-                }
-                (*payload.plain_result).clone()
+                found
+                    .borrow_mut()
+                    .push(Envelope::Conversion(Arc::clone(payload)));
+                clone_plain(&payload.plain_result)
             },
         );
     }
-    let found = RefCell::new(Vec::new());
-    walk(value, 0, &found);
-    found.into_inner()
+    let mut initial = Vec::new();
+    envelopes(value, &mut initial);
+    let mut pending = initial
+        .into_iter()
+        .rev()
+        .map(|node| (node, 0))
+        .collect::<Vec<_>>();
+    let mut found = Vec::new();
+    while let Some((node, depth)) = pending.pop() {
+        match node {
+            Envelope::Reference(payload) => found.push(PathObservation {
+                path: payload.path.to_dot_string(),
+                segmented: !payload.path.segments().is_empty(),
+                conversion_depth: depth,
+            }),
+            Envelope::Conversion(payload) => {
+                let mut children = Vec::new();
+                for operand in &payload.operands {
+                    envelopes(operand, &mut children);
+                }
+                pending.extend(children.into_iter().rev().map(|node| (node, depth + 1)));
+            }
+        }
+    }
+    found
 }
+
 pub(super) fn input_observation(value: &S<RelativeBindingName>) -> InputObservation {
     let shape = match value {
         S::Reference(never) | S::Conversion(never) => match *never {},

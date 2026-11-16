@@ -602,7 +602,13 @@ pub(in crate::parser) fn declaration_inventory(
                 }
                 _ => continue,
             };
-            let name = pair.into_inner().next().expect("named declaration grammar");
+            let mut parts = pair.into_inner();
+            let name = parts.next().expect("named declaration grammar");
+            // An unused value binding still owns its authored RHS, which
+            // structural secrecy checks independently of its evaluated value.
+            let value = parts
+                .find(|part| part.as_rule() == Rule::expression)
+                .map(|value| DeclarationLocation::from_pair(&value, file, source));
             if name.as_str() != "_" {
                 out.push(Located::new(
                     DeclarationLocation::from_pair(&name, file, source),
@@ -610,7 +616,7 @@ pub(in crate::parser) fn declaration_inventory(
                         kind,
                         name: name.as_str().to_string(),
                         annotation: DeclarationAnnotation::Unannotated,
-                        value: None,
+                        value,
                     },
                 ));
             }

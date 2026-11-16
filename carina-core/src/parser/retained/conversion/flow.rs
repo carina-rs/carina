@@ -418,6 +418,8 @@ mod tests {
                     signature: Arc::new(FunctionSignature {
                         parameters: Vec::new(),
                         return_type: None,
+                        parameter_nodes: Vec::new(),
+                        default_nodes: Vec::new(),
                     }),
                 },
             ),

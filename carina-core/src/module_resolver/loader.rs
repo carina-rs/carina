@@ -188,6 +188,7 @@ pub(crate) fn load_module_with_overrides(
     config: &ProviderContext,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Option<ParsedFile> {
+    overrides.record_module_directory(path);
     if !path.is_dir() {
         return None;
     }
@@ -204,6 +205,7 @@ pub(super) fn source_paths_with_overrides(
     dir: &ResolvedPath,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> std::io::Result<Vec<ResolvedPath>> {
+    overrides.record_module_directory(dir);
     crate::config_loader::DirectoryFiles::discover(dir, overrides)
         .map(crate::config_loader::DirectoryFiles::into_paths)
 }

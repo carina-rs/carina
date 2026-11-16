@@ -202,61 +202,58 @@ pub(crate) fn dependency_order<B: BindingAddress>(
     let binding_to_index: HashMap<_, _> = bindings
         .iter()
         .enumerate()
-        .filter_map(|(index, binding)| binding.map(|binding| (binding.clone(), index)))
+        .filter_map(|(index, binding)| binding.map(|binding| (binding, index)))
         .collect();
     let mut sorted = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = vec![false; bindings.len()];
     let mut visiting = Vec::new();
+    let mut positions = vec![None; bindings.len()];
 
-    fn visit<B: BindingAddress>(
-        index: usize,
-        bindings: &HashMap<B, usize>,
-        dependencies: &mut impl FnMut(usize) -> HashSet<B>,
-        visited: &mut HashSet<usize>,
-        visiting: &mut Vec<usize>,
-        sorted: &mut Vec<usize>,
-    ) -> Result<(), Vec<usize>> {
-        if visited.contains(&index) {
-            return Ok(());
-        }
-        if let Some(pos) = visiting.iter().position(|visiting| *visiting == index) {
-            return Err(visiting[pos..]
-                .iter()
-                .copied()
-                .chain(std::iter::once(index))
-                .collect());
-        }
-        visiting.push(index);
-        let mut dependency_indices = dependencies(index)
-            .iter()
-            .filter_map(|dependency| bindings.get(dependency).copied())
-            .collect::<Vec<_>>();
-        dependency_indices.sort_unstable();
-        dependency_indices.dedup();
-        for dependency in dependency_indices {
-            visit(
-                dependency,
-                bindings,
-                dependencies,
-                visited,
-                visiting,
-                sorted,
-            )?;
-        }
-        visiting.pop();
-        visited.insert(index);
-        sorted.push(index);
-        Ok(())
+    enum Work {
+        Enter(usize),
+        Finish(usize),
     }
+    // The same graph is checked by validate and editor diagnostics before
+    // publishing secrecy findings. A long acyclic reference chain must not
+    // exhaust the stack here either. Preserve DFS order and cycle spelling.
+    let mut work = Vec::new();
+    let mut dependency_indices = Vec::new();
     for index in 0..bindings.len() {
-        visit(
-            index,
-            &binding_to_index,
-            &mut dependencies,
-            &mut visited,
-            &mut visiting,
-            &mut sorted,
-        )?;
+        work.push(Work::Enter(index));
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Enter(index) => {
+                    if visited[index] {
+                        continue;
+                    }
+                    if let Some(pos) = positions[index] {
+                        return Err(visiting[pos..]
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(index))
+                            .collect());
+                    }
+                    positions[index] = Some(visiting.len());
+                    visiting.push(index);
+                    dependency_indices.clear();
+                    dependency_indices.extend(
+                        dependencies(index)
+                            .iter()
+                            .filter_map(|dependency| binding_to_index.get(dependency).copied()),
+                    );
+                    dependency_indices.sort_unstable();
+                    dependency_indices.dedup();
+                    work.push(Work::Finish(index));
+                    work.extend(dependency_indices.iter().rev().copied().map(Work::Enter));
+                }
+                Work::Finish(index) => {
+                    visiting.pop();
+                    positions[index] = None;
+                    visited[index] = true;
+                    sorted.push(index);
+                }
+            }
+        }
     }
     Ok(sorted)
 }
@@ -317,6 +314,31 @@ mod tests {
             );
         }
         r
+    }
+
+    #[test]
+    fn deep_dependency_chains_preserve_order_and_cycle_path_without_recursion() {
+        for last in [127, 128, 256, 5000] {
+            // A consumer-first directory merge starts DFS at the deepest node.
+            let names = (0..=last)
+                .rev()
+                .map(|index| absolute_binding(&format!("r{index}")))
+                .collect::<Vec<_>>();
+            let bindings = names.iter().map(Some).collect::<Vec<_>>();
+            let order = dependency_order(&bindings, |index| {
+                names.get(index + 1).cloned().into_iter().collect()
+            })
+            .unwrap();
+            assert_eq!(order, (0..=last).rev().collect::<Vec<_>>());
+            let cycle = dependency_order(&bindings, |index| {
+                std::iter::once(names[(index + 1) % names.len()].clone()).collect()
+            })
+            .unwrap_err();
+            assert_eq!(
+                cycle,
+                (0..=last).chain(std::iter::once(0)).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

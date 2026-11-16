@@ -292,6 +292,35 @@ fn output_kind_first_gate() {
     }
 }
 
+#[test]
+fn output_kind_lookup_chains_stay_iterative() {
+    const HOPS: usize = 256;
+    let mut source = "let r0 = mock.Source { name = 'same' }\n".to_string();
+    for index in 1..=HOPS {
+        source.push_str(&format!(
+            "let r{index} = mock.Source {{ name = r{}.name }}\n",
+            index - 1,
+        ));
+    }
+    let report = observe(&[
+        ("main.crn".into(), source),
+        ("providers.crn".into(), "provider mock {}\n".into()),
+        (
+            "backend.crn".into(),
+            "backend local { path = 'state.json' }\n".into(),
+        ),
+    ]);
+    assert_projection(&report, "lookup chain");
+    // Pin traversal of the chain, rather than an already folded literal. Both
+    // kinds resolve the target using heap continuations in the same work loop.
+    assert!(
+        report
+            .roots
+            .iter()
+            .any(|root| root.oracle_counts.get("lookup_hit") >= HOPS)
+    );
+}
+
 // Ambiguous inference makes these fail to compile if a forbidden impl appears.
 macro_rules! assert_not_impl {
     ($ty:ty, $bound:path) => {

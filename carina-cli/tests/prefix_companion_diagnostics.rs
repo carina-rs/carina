@@ -113,30 +113,7 @@ async fn assert_prefix_parity(source: &str, expected: Option<&str>) {
         )
     };
     let cli_range = Range::new(position("start"), position("end"));
-    if message.starts_with("Unknown attribute '") {
-        // #4220 intentionally anchors LSP unknowns at the authored assignment;
-        // CLI unknowns retain the resource type anchor.
-        assert_eq!(
-            cli_range,
-            Range::new(Position::new(0, 0), Position::new(0, 18))
-        );
-        let key = message.split('\'').nth(1).unwrap();
-        let (line, assignment) = source
-            .lines()
-            .enumerate()
-            .find(|(_, line)| line.trim_start().starts_with(&format!("{key} =")))
-            .unwrap();
-        let column = assignment.find(key).unwrap();
-        assert_eq!(
-            lsp[0].range,
-            Range::new(
-                Position::new(line as u32, column as u32),
-                Position::new(line as u32, assignment.len() as u32),
-            )
-        );
-    } else {
-        assert_eq!(lsp[0].range, cli_range);
-    }
+    assert_eq!(lsp[0].range, cli_range);
 }
 
 #[tokio::test]

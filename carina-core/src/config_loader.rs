@@ -1019,6 +1019,13 @@ pub fn find_duplicate_declarations_in_analysis(
 #[derive(Clone, Default)]
 pub struct SourceOverrides {
     entries: IndexMap<CanonicalPath, (ResolvedPath, String)>,
+    reads: Option<std::sync::Arc<std::sync::Mutex<AnalysisSourceReads>>>,
+}
+
+#[derive(Default)]
+struct AnalysisSourceReads {
+    sources: HashMap<CanonicalPath, std::sync::Arc<str>>,
+    modules: BTreeSet<crate::paths::PathIdentity>,
 }
 
 /// Two spellings of one file supplied different source text.
@@ -1032,6 +1039,58 @@ pub struct SourceOverrideConflict {
 impl SourceOverrides {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pin disk reads for one analysis. Clones share that analysis's inputs;
+    /// open-buffer overrides remain explicit and retain their precedence.
+    pub fn tracking_reads(mut self) -> Self {
+        self.reads = Some(Default::default());
+        self
+    }
+
+    /// Discover one directory, including unsaved siblings, and read all sources
+    /// through this analysis snapshot. Catalog discovery and merged parsing
+    /// can then share the same buffers and pinned disk reads.
+    pub fn directory_sources(
+        &self,
+        directory: &ResolvedPath,
+    ) -> std::io::Result<Vec<(ResolvedPath, String)>> {
+        DirectoryFiles::discover(directory, self)?
+            .paths
+            .into_iter()
+            .map(|path| read_source_with_overrides(&path, self).map(|source| (path, source)))
+            .collect()
+    }
+
+    pub fn analyzed_source(&self, file: &Path) -> Option<std::sync::Arc<str>> {
+        let identity = ResolvedPath::new(file).ok()?.identity();
+        if let Some(source) = self.get(&identity) {
+            return Some(std::sync::Arc::from(source));
+        }
+        self.reads
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .sources
+            .get(&identity)
+            .cloned()
+    }
+
+    pub fn imported_directories(&self) -> BTreeSet<crate::paths::PathIdentity> {
+        self.reads
+            .as_ref()
+            .map(|reads| reads.lock().unwrap().modules.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn record_module_directory(&self, directory: &ResolvedPath) {
+        if let Some(reads) = &self.reads {
+            reads
+                .lock()
+                .unwrap()
+                .modules
+                .insert(crate::paths::PathIdentity::new(directory.source_label()));
+        }
     }
 
     pub fn single(path: ResolvedPath, text: String) -> Self {
@@ -1184,6 +1243,18 @@ pub(crate) fn read_source_with_overrides(
 ) -> std::io::Result<String> {
     if let Some(text) = overrides.get(&path.identity()) {
         return Ok(text.to_string());
+    }
+    if let Some(reads) = &overrides.reads {
+        let mut reads = reads.lock().unwrap();
+        let identity = path.identity();
+        if let Some(source) = reads.sources.get(&identity) {
+            return Ok(source.to_string());
+        }
+        let source = path.read_to_string()?;
+        reads
+            .sources
+            .insert(identity, std::sync::Arc::from(source.as_str()));
+        return Ok(source);
     }
     path.read_to_string()
 }

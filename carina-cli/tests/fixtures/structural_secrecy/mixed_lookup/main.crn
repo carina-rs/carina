@@ -1,0 +1,28 @@
+let known_secret_key = mock.test.resource {
+  name = "known-secret-key"
+  comment = lookup({ private = other.comment, public = "visible" }, "private", other.comment)
+}
+let known_public_key = mock.test.resource {
+  name = "known-public-key"
+  comment = lookup({ public = "visible", private = other.comment }, "public", "default")
+}
+let pending_key = mock.test.resource {
+  name = "pending-key"
+  comment = lookup({ private = other.comment, public = "visible" }, seed.identifier, "default")
+}
+let unused_public_default = mock.test.resource {
+  name = "unused-public-default"
+  comment = lookup({ private = other.comment }, "private", "default")
+}
+let unused_secret_default = mock.test.resource {
+  name = "unused-secret-default"
+  comment = lookup({ public = "visible" }, "public", other.comment)
+}
+let public_upstream_map = mock.test.resource {
+  name = "public-upstream-map"
+  comment = lookup(up.values, "chosen", secret("STRUCTURAL_SECRECY_4470_CANARY"))
+}
+let wrapped_lookup = mock.test.resource {
+  name = "wrapped-lookup"
+  comment = secret(lookup({ private = other.comment, public = "visible" }, "public", "default"))
+}

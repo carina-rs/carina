@@ -335,10 +335,13 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
         let mut actual = validate(Some(&hook));
         assert_eq!(ordinary_calls.replace(Vec::new()), expected_calls);
         assert_eq!(actual.local_error(), expected.local_error());
+        let expected_findings = expected.clone().into_diagnostic_findings("input");
+        let actual_findings = actual.clone().into_diagnostic_findings("input");
         assert!(
-            actual
-                .local_findings()
-                .starts_with(expected.local_findings())
+            actual_findings
+                .iter()
+                .take(expected_findings.len())
+                .eq(expected_findings.iter())
         );
         assert_eq!(actual.take_assignment().errors.len(), 1);
     }
@@ -559,8 +562,9 @@ fn round1_seam_children_are_fallible_instead_of_panicking() {
         .unwrap()
         .unwrap()
         .node_id();
-    let instance = slot.snapshot.instance.clone();
-    Arc::make_mut(&mut Arc::make_mut(&mut slot.snapshot).nodes).remove(&(instance, child));
+    let snapshot = Arc::make_mut(slot.snapshot.as_mut().unwrap());
+    let instance = snapshot.instance.clone();
+    Arc::make_mut(&mut snapshot.nodes).remove(&(instance, child));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         slot.cursor().unwrap().node().children().collect::<Vec<_>>()
     }));
@@ -577,9 +581,9 @@ fn round1_seam_expansion_records_a_decision_without_a_parse_projection() {
     }
     let condition = usage.node.node.children[0].node_id();
     let instance = usage.node.environment.clone();
-    let mut snapshot = (*slot.snapshot).clone();
+    let mut snapshot = slot.snapshot.as_deref().unwrap().clone();
     Arc::make_mut(&mut snapshot.projections).shift_remove(&(instance, condition));
-    slot.snapshot = Arc::new(snapshot);
+    slot.snapshot = Some(Arc::new(snapshot));
     slot.conditions = ConditionSnapshot::default();
     // Model an unavailable parse-time projection and the value already
     // selected by module expansion. Main admits this String without findings.
@@ -672,7 +676,7 @@ fn cursor_api_children_and_edges_share_the_judged_snapshot() {
 #[test]
 fn cursor_api_rebuilding_a_projection_advances_its_generation() {
     let mut slot = slot("let input = 'before'");
-    let snapshot = slot.snapshot.clone();
+    let snapshot = slot.snapshot.clone().unwrap();
     let generation = slot.generation();
     let node = slot.cursor().unwrap().node().node_id();
     slot.replace_projection(slot.projection().unwrap().clone());
@@ -2163,7 +2167,11 @@ fn review_seam_composition_computed_values_keep_main_checks() {
             assert!(
                 findings
                     .errors()
-                    .chain(findings.symbolic_errors().map(|(_, _, error)| error))
+                    .chain(
+                        findings
+                            .symbolic_errors()
+                            .map(|(_, _, diagnostic)| diagnostic.error())
+                    )
                     .any(|error| error.to_string().contains("expected String, got Int")),
                 "{expression}: {findings:?}"
             );
