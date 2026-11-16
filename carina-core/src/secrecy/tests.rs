@@ -49,6 +49,16 @@ fn attribute(report: &SecrecyReport, binding: &str, name: &str) -> Evidence {
         .clone()
 }
 
+// The stack covers parse-time knowledge classification of nested user-function calls (#4481), not the secrecy walk.
+fn with_parser_stack(test: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(test)
+        .expect("failed to spawn deep-expression test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 #[test]
 fn references_operands_interpolation_and_selected_paths_retain_secrecy() {
     let report = report(
@@ -121,6 +131,502 @@ let sink = mock.test.Resource { name = "sink" comment = protect(protect(seed.ide
     assert_eq!(
         attribute(&report, "sink", "comment").secrecy(),
         Secrecy::Secret
+    );
+}
+
+// Kept at 3 levels: the parser itself is super-exponential on this shape (#4495); raise once that is fixed.
+// f0 is the leaf: f3 has 4 bodies, or 2^4 - 1 = 15 body evaluations without memoization.
+fn function_fan_out_source(last: usize, conditional: bool) -> String {
+    use std::fmt::Write as _;
+    let mut source = "fn f0(x: String): String { x }\n".to_string();
+    for index in 1..=last {
+        let previous = index - 1;
+        let body = if conditional {
+            format!("if true {{ f{previous}(x) }} else {{ f{previous}(x) }}")
+        } else {
+            format!("f{previous}(x) ?? f{previous}(x)")
+        };
+        writeln!(source, "fn f{index}(x: String): String {{ {body} }}").unwrap();
+    }
+    source
+}
+
+#[test]
+fn function_coalesce_fan_out_evaluates_each_body_once() {
+    assert_function_fan_out_evaluates_each_body_once(false);
+}
+
+#[test]
+fn function_if_fan_out_evaluates_each_body_once() {
+    assert_function_fan_out_evaluates_each_body_once(true);
+}
+
+#[test]
+fn function_declaration_walks_share_unbound_argument_memos() {
+    for conditional in [false, true] {
+        let file = parsed(&function_fan_out_source(3, conditional));
+        let schemas = schemas();
+        let syntax = crate::parser::retained::judge_expressions(&file, &schemas, &context());
+        let owner = Owner {
+            syntax: &syntax,
+            schemas: &schemas,
+            resources: IndexMap::new(),
+            declarations: Vec::new(),
+            declaration_index: OnceLock::new(),
+            reference_free: RefCell::default(),
+            literal_evidence: RefCell::default(),
+            function_evidence: RefCell::default(),
+            function_observations: RefCell::default(),
+            argument_environments: RefCell::default(),
+            upstream: HashSet::new(),
+            empty_environment: Arc::default(),
+        };
+        let mut evaluations = 0;
+        for function in syntax.secrecy_functions() {
+            let mut walk = Walk::new(&owner, "function".into(), function.location().clone())
+                .in_source(&function);
+            assert_eq!(
+                walk.run(Thunk {
+                    source: Source::Syntax(function),
+                    environment: owner.empty_environment.clone()
+                }),
+                None
+            );
+            assert!(walk.findings.is_empty());
+            assert_eq!(walk.visits, 0);
+            evaluations += walk.function_body_evaluations;
+        }
+        // Memoized: 3 unbound callee bodies (f0..f2); without memos: 2 + 6 + 14 = 22.
+        assert_eq!(evaluations, 3);
+    }
+}
+
+fn assert_function_fan_out_evaluates_each_body_once(conditional: bool) {
+    let mut source = function_fan_out_source(3, conditional);
+    for index in 0..4 {
+        source.push_str(&format!(
+            "let sink{index} = mock.test.Resource {{ comment = f3('a') }}\n"
+        ));
+    }
+    let report = report(&source);
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(report.admitted().is_some(), "{report:?}");
+    for index in 0..4 {
+        assert_eq!(
+            attribute(&report, &format!("sink{index}"), "comment"),
+            Evidence::Leaf(Secrecy::Public)
+        );
+    }
+    // Memoized: 4 bodies for one Public argument evidence; without memos: at least 4 * 15 = 60.
+    assert_eq!(
+        report
+            .traversals()
+            .iter()
+            .map(|stats| stats.function_body_evaluations)
+            .sum::<usize>(),
+        4,
+        "consumers must share reference-free results: {:?}",
+        report.traversals()
+    );
+    assert!(
+        report
+            .traversals()
+            .iter()
+            .all(|stats| stats.reference_visits == 0 && stats.limit.is_none())
+    );
+}
+
+#[test]
+fn function_memo_replays_warm_reference_dags_at_4096_and_4097_visits() {
+    for calls in [4095, 4096] {
+        let arguments = std::iter::repeat_n("g('x')", calls)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let report = report(&format!(
+            "let leaf = mock.test.Resource {{ comment = 'public' }}\nlet seed = mock.test.Resource {{ comment = leaf.comment }}\nfn g(x: String): String {{ seed.comment }}\nlet sink = mock.test.Resource {{ comment = join('', [{arguments}]) }}\n"
+        ));
+        let stats = report
+            .traversals()
+            .iter()
+            .find(|stats| stats.reference_visits == calls + 1)
+            .unwrap();
+        assert_eq!(stats.maximum_depth, 2);
+        assert_eq!(stats.function_body_evaluations, 1);
+        assert_eq!(stats.function_memo_hits, calls - 1);
+        if calls == 4095 {
+            assert!(report.admitted().is_some(), "{report:?}");
+            assert!(report.findings().is_empty());
+            assert_eq!(stats.limit, None);
+        } else {
+            assert_eq!(report.findings().len(), 1, "{report:?}");
+            assert_eq!(stats.limit, Some(LimitKind::ReferenceVisits));
+            assert_eq!(
+                report.findings()[0].message(),
+                "Attribute 'comment': deciding whether the value is a secret needs more than 4096 reference lookups from this attribute."
+            );
+        }
+    }
+}
+
+#[test]
+fn function_memo_replays_fresh_local_reference_identities_at_the_visit_boundary() {
+    for calls in [2048, 2049] {
+        let arguments = std::iter::repeat_n("g('x')", calls)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let report = report(&format!(
+            "let leaf = mock.test.Resource {{ comment = 'public' }}\nlet captured = {{ value = leaf.comment }}\nfn g(x: String): String {{ captured.value }}\nlet sink = mock.test.Resource {{ comment = join('', [{arguments}]) }}\n"
+        ));
+        let visits = (calls * 2).min(4097);
+        let stats = report
+            .traversals()
+            .iter()
+            .find(|stats| stats.reference_visits == visits)
+            .unwrap();
+        assert_eq!(stats.maximum_depth, 2);
+        assert_eq!(stats.function_body_evaluations, 1);
+        assert_eq!(stats.function_memo_hits, calls - 1);
+        assert_eq!(
+            stats.limit,
+            (calls == 2049).then_some(LimitKind::ReferenceVisits)
+        );
+        assert_eq!(report.findings().len(), usize::from(calls == 2049));
+        assert_eq!(report.admitted().is_some(), calls == 2048);
+    }
+}
+
+#[test]
+fn nested_function_memo_replays_each_invocations_local_reference_identity() {
+    let calls = std::iter::repeat_n("f('x')", 100)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let report = report(&format!(
+        "let leaf = mock.test.Resource {{ comment = 'public' }}\nlet captured = {{ value = leaf.comment }}\nfn g(x: String): String {{ captured.value }}\nfn f(x: String): String {{ g(x) ?? g(x) }}\nlet sink = mock.test.Resource {{ comment = join('', [{calls}]) }}\n"
+    ));
+    assert!(report.admitted().is_some(), "{report:?}");
+    let stats = report
+        .traversals()
+        .iter()
+        .find(|stats| stats.reference_visits == 400)
+        .unwrap();
+    assert_eq!(stats.maximum_depth, 2);
+    assert_eq!(stats.function_body_evaluations, 2);
+    assert_eq!(stats.limit, None);
+}
+
+#[test]
+fn function_memo_replays_nested_reference_calls_with_outer_environment_renaming() {
+    let calls = std::iter::repeat_n("f('x')", 100)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let report = report(&format!(
+        "let leaf = mock.test.Resource {{ comment = 'public' }}\nlet captured = {{ value = leaf.comment }}\nfn g(x: String): String {{ captured.value }}\nlet entry = {{ value = g('x') }}\nfn f(x: String): String {{ entry.value ?? entry.value }}\nlet sink = mock.test.Resource {{ comment = join('', [{calls}]) }}\n"
+    ));
+    assert!(report.admitted().is_some(), "{report:?}");
+    let stats = report
+        .traversals()
+        .iter()
+        .find(|stats| stats.reference_visits == 400)
+        .unwrap();
+    assert_eq!(stats.maximum_depth, 3);
+    assert_eq!(stats.function_body_evaluations, 2);
+    assert_eq!(stats.limit, None);
+}
+
+#[test]
+fn function_memo_replays_resource_argument_references_outside_the_callee_activation() {
+    let report = report(
+        r#"
+fn g(r: mock.test.Resource): String { r.comment }
+let leaf = mock.test.Resource { comment = "public" }
+let pending = mock.test.Resource {}
+let middle = mock.test.Resource { comment = join("", [g(leaf), pending.missing]) }
+let sink = mock.test.Resource { comment = join("", [g(middle), g(middle)]) }
+"#,
+    );
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(report.is_pending());
+    let stats = report
+        .traversals()
+        .iter()
+        .find(|stats| stats.reference_visits == 10)
+        .unwrap();
+    assert_eq!(stats.maximum_depth, 2);
+    assert!(stats.function_memo_hits >= 2);
+    assert_eq!(stats.limit, None);
+}
+
+#[test]
+fn value_function_fan_out_shares_reference_free_results_by_argument_evidence() {
+    let functions = parsed(&function_fan_out_source(3, false)).user_functions;
+    let functions = Arc::new(functions);
+    // Omit retained function syntax to exercise begin_value_function itself,
+    // rather than the usual lexical-syntax route for module argument values.
+    let file = parsed("mock.test.Resource { comment = 'public' }");
+    let schemas = schemas();
+    let syntax = crate::parser::retained::judge_expressions(&file, &schemas, &context());
+    let owner = Owner {
+        syntax: &syntax,
+        schemas: &schemas,
+        resources: IndexMap::new(),
+        declarations: Vec::new(),
+        declaration_index: OnceLock::new(),
+        reference_free: RefCell::default(),
+        literal_evidence: RefCell::default(),
+        function_evidence: RefCell::default(),
+        function_observations: RefCell::default(),
+        argument_environments: RefCell::default(),
+        upstream: HashSet::new(),
+        empty_environment: Arc::default(),
+    };
+    let location = functions["f3"].body.location.clone();
+    let mut evaluations = 0;
+    for argument in ["a", "b"] {
+        let mut walk = Walk::new(&owner, "comment".into(), location.clone());
+        let value = Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: Arc::new(functions["f3"].clone()),
+            functions: functions.clone(),
+            args: vec![crate::resource::FunctionArgument::from_value(
+                Value::Concrete(ConcreteValue::String(argument.into())),
+            )],
+            source_line: 1.into(),
+        });
+        assert_eq!(
+            walk.run(Thunk {
+                source: Source::Value(Arc::new(value)),
+                environment: owner.empty_environment.clone()
+            }),
+            Some(Evidence::Leaf(Secrecy::Public))
+        );
+        assert!(walk.findings.is_empty());
+        assert_eq!(walk.visits, 0);
+        evaluations += walk.function_body_evaluations;
+    }
+    // Memoized: 4 bodies for shared Public argument evidence; without memos: 2 * 15 = 30.
+    assert_eq!(evaluations, 4);
+}
+
+#[test]
+fn function_memo_replays_reference_depth_at_127_and_128_in_both_orders() {
+    use std::fmt::Write as _;
+    for last in [126, 127] {
+        for shallow_first in [false, true] {
+            let mut source = "let leaf = mock.test.Resource { comment = 'public' }\nfn g(x: String): String { leaf.comment }\nlet r1 = mock.test.Resource { comment = g('x') }\n".to_string();
+            for index in 2..=last {
+                writeln!(
+                    source,
+                    "let r{index} = mock.test.Resource {{ comment = r{}.comment }}",
+                    index - 1
+                )
+                .unwrap();
+            }
+            let operands = if shallow_first {
+                format!("g('x'), r{last}.comment")
+            } else {
+                format!("r{last}.comment, g('x')")
+            };
+            writeln!(
+                source,
+                "let sink = mock.test.Resource {{ comment = join('', [{operands}]) }}"
+            )
+            .unwrap();
+            let report = report(&source);
+            let stats = report
+                .traversals()
+                .iter()
+                .find(|stats| stats.maximum_depth == last + 1)
+                .unwrap();
+            assert_eq!(
+                stats.reference_visits,
+                last + 1 + usize::from(shallow_first || last == 126)
+            );
+            assert_eq!(stats.limit, (last == 127).then_some(LimitKind::Depth));
+            assert_eq!(report.findings().len(), usize::from(last == 127));
+            assert_eq!(report.admitted().is_some(), last == 126);
+            if last == 127 {
+                assert_eq!(
+                    report.findings()[0].message(),
+                    "Attribute 'comment': the value follows a chain of 128 or more references from this attribute; Carina cannot decide whether it is a secret."
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn function_memo_distinguishes_secret_public_and_selected_path_arguments() {
+    // Function-parameter conditions are runtime values and cannot be parsed.
+    let report = report(
+        r#"
+fn g(x: String): String { x }
+fn project(key: String, values: list(map(String))): String { map(key, values)[0] }
+let sink = mock.test.Resource { tags = {
+  private = g(secret("a")) public = g("b")
+  selected_private = project(".private", [{ private = secret("x") public = "y" }])
+  selected_public = project(".public", [{ private = secret("x") public = "y" }])
+} }
+"#,
+    );
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(report.admitted().is_some(), "{report:?}");
+    let Evidence::Map(fields) = attribute(&report, "sink", "tags") else {
+        panic!("map evidence")
+    };
+    for (key, secrecy) in [
+        ("private", Secrecy::Secret),
+        ("public", Secrecy::Public),
+        ("selected_private", Secrecy::Secret),
+        ("selected_public", Secrecy::Public),
+    ] {
+        assert_eq!(fields[key], Evidence::Leaf(secrecy), "{key}");
+    }
+}
+
+#[test]
+fn function_memo_keeps_pending_resource_arguments_and_requested_paths_distinct() {
+    let report = report(
+        r#"
+let private = mock.test.Resource { tags = { token = secret("a") public = "b" } }
+let public = mock.test.Resource { tags = { token = "c" public = "d" } }
+fn g(r: mock.test.Resource): map(String) { r.tags }
+let sink = mock.test.Resource { tags = {
+  private = g(private).token public = g(public).token sibling = g(private).public
+} }
+"#,
+    );
+    assert!(report.admitted().is_some(), "{report:?}");
+    assert!(report.findings().is_empty());
+    let Evidence::Map(fields) = attribute(&report, "sink", "tags") else {
+        panic!("map evidence")
+    };
+    assert_eq!(fields["private"], Evidence::Leaf(Secrecy::Secret));
+    assert_eq!(fields["public"], Evidence::Leaf(Secrecy::Public));
+    assert_eq!(fields["sibling"], Evidence::Leaf(Secrecy::Public));
+}
+
+#[test]
+fn function_memo_keys_hash_and_compare_deep_argument_evidence_on_the_heap() {
+    fn facts(secrecy: Secrecy) -> ArgumentFacts {
+        let mut proof = Evidence::Leaf(secrecy);
+        for index in 0..10_000 {
+            proof = if index % 2 == 0 {
+                Evidence::List(Arc::new(vec![proof]))
+            } else {
+                Evidence::Map(Arc::new(BTreeMap::from([("field".into(), proof)])))
+            };
+        }
+        ArgumentFacts {
+            proof: Some(proof),
+            observations: ArgumentObservations::default(),
+            origin: None,
+        }
+    }
+    let mut first = facts(Secrecy::Secret);
+    let mut same = facts(Secrecy::Secret);
+    let mut public = facts(Secrecy::Public);
+    let hash = |facts: &ArgumentFacts| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        facts.hash(&mut hash);
+        hash.finish()
+    };
+    assert!(first == same);
+    assert!(first != public);
+    assert_eq!(hash(&first), hash(&same));
+    // Release these intentionally deep fixtures on the heap as well.
+    let mut remaining = vec![
+        first.proof.take().unwrap(),
+        same.proof.take().unwrap(),
+        public.proof.take().unwrap(),
+    ];
+    while let Some(proof) = remaining.pop() {
+        match proof {
+            Evidence::Leaf(_) => {}
+            Evidence::List(items) => remaining.extend(Arc::try_unwrap(items).unwrap()),
+            Evidence::Map(fields) => {
+                remaining.extend(Arc::try_unwrap(fields).unwrap().into_values())
+            }
+        }
+    }
+}
+
+#[test]
+fn function_memo_keeps_mixed_body_findings_once_with_the_function_owner() {
+    let calls = std::iter::repeat_n("g('a')", 100)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let report = report(&format!(
+        "fn g(x: String): String {{ x ?? secret('canary') }}\nlet sink = mock.test.Resource {{ comment = join('', [{calls}]) }}\n"
+    ));
+    assert_eq!(report.findings().len(), 1, "{report:?}");
+    assert_eq!(
+        report.findings()[0].message(),
+        "Function 'g': ?? alternatives mix secret and public values; all alternatives must be secret or all public."
+    );
+    assert_eq!(report.findings()[0].location().span().start_line(), 1);
+    assert!(report.findings()[0].call_site().is_none());
+    assert!(
+        report
+            .traversals()
+            .iter()
+            .map(|stats| stats.function_body_evaluations)
+            .sum::<usize>()
+            <= 2
+    );
+}
+
+#[test]
+fn module_argument_function_fan_out_uses_the_same_memo() {
+    let mut body = function_fan_out_source(3, false);
+    body.push_str("arguments { value: String = f3('a') }\nlet sink = mock.test.Resource { comment = value }\n");
+    let (_directory, file) = expanded_test_module(&body, "");
+    let report = crate::config_loader::load_buffer_configuration(&file, &schemas(), &context())
+        .judged()
+        .secrecy()
+        .clone();
+    assert!(report.admitted().is_some(), "{report:?}");
+    assert!(report.findings().is_empty());
+    // Memoized: 4 bodies for one Public argument evidence; without memos: at least 15.
+    assert_eq!(
+        report
+            .traversals()
+            .iter()
+            .map(|stats| stats.function_body_evaluations)
+            .sum::<usize>(),
+        4
+    );
+    assert!(
+        report
+            .traversals()
+            .iter()
+            .all(|stats| stats.reference_visits <= 1 && stats.limit.is_none())
+    );
+}
+
+#[test]
+fn loop_slot_function_fan_out_reuses_only_matching_argument_evidence() {
+    let mut source = function_fan_out_source(3, true);
+    source.push_str("for item in [{ name = 'one' private = true }, { name = 'two' private = false }] {\nmock.test.Resource { name = item.name comment = f3(if item.private { secret('a') } else { 'b' }) }\n}\n");
+    let report = report(&source);
+    assert!(report.admitted().is_some(), "{report:?}");
+    assert!(report.findings().is_empty());
+    let mut rows = report.rows.values();
+    assert_eq!(
+        rows.next().unwrap().attributes["comment"],
+        Evidence::Leaf(Secrecy::Secret)
+    );
+    assert_eq!(
+        rows.next().unwrap().attributes["comment"],
+        Evidence::Leaf(Secrecy::Public)
+    );
+    assert!(rows.next().is_none());
+    // Memoized: 8 bodies (4 per Secret/Public argument evidence); without memos: at least 2 * 15 = 30.
+    assert_eq!(
+        report
+            .traversals()
+            .iter()
+            .map(|stats| stats.function_body_evaluations)
+            .sum::<usize>(),
+        8
     );
 }
 
@@ -355,6 +861,8 @@ fn repeated_errors_block_memo_admission_and_deduplicate_only_in_the_report() {
         declaration_index: OnceLock::new(),
         reference_free: RefCell::default(),
         literal_evidence: RefCell::default(),
+        function_evidence: RefCell::default(),
+        function_observations: RefCell::default(),
         argument_environments: RefCell::default(),
         upstream: HashSet::new(),
         empty_environment: Arc::default(),
@@ -442,6 +950,8 @@ fn unavailable_builtin_keeps_argument_secrecy_separate_from_failure() {
         declaration_index: OnceLock::new(),
         reference_free: RefCell::default(),
         literal_evidence: RefCell::default(),
+        function_evidence: RefCell::default(),
+        function_observations: RefCell::default(),
         argument_environments: RefCell::default(),
         upstream: HashSet::new(),
         empty_environment: Arc::default(),
@@ -669,42 +1179,37 @@ fn one_reference_in_deep_expressions_does_not_reach_the_depth_limit_in_both_shap
     // The large stack is only for the parser's syntax recursion tracked in #4481.
     // The secrecy owner uses heap worklists, which the 256/5000-reference chain
     // tests pin on the default stack.
-    std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(|| {
-            for shape in CHAIN_SHAPES {
-                for (wrap_in_list, levels) in [(false, 130), (true, 70)] {
-                    let report = resource_chain_with_expression(1, shape, |previous| {
-                        (0..levels).fold(format!("r{previous}.comment"), |expression, _| {
-                            if wrap_in_list {
-                                format!("join('', [{expression}])")
-                            } else {
-                                format!("upper({expression})")
-                            }
-                        })
-                    });
-                    assert!(
-                        report.findings().is_empty(),
-                        "{shape:?}, {levels}: {report:?}"
-                    );
-                    assert!(!report.is_pending(), "{report:?}");
-                    assert!(report.admitted().is_some());
-                    assert_eq!(
-                        attribute(&report, "r1", "comment"),
-                        Evidence::Leaf(Secrecy::Secret)
-                    );
-                    assert!(report.traversals().iter().any(|stats| {
-                        stats.attribute == "comment"
-                            && stats.maximum_depth == 1
-                            && stats.reference_visits == 1
-                            && stats.limit.is_none()
-                    }));
-                }
+    with_parser_stack(|| {
+        for shape in CHAIN_SHAPES {
+            for (wrap_in_list, levels) in [(false, 130), (true, 70)] {
+                let report = resource_chain_with_expression(1, shape, |previous| {
+                    (0..levels).fold(format!("r{previous}.comment"), |expression, _| {
+                        if wrap_in_list {
+                            format!("join('', [{expression}])")
+                        } else {
+                            format!("upper({expression})")
+                        }
+                    })
+                });
+                assert!(
+                    report.findings().is_empty(),
+                    "{shape:?}, {levels}: {report:?}"
+                );
+                assert!(!report.is_pending(), "{report:?}");
+                assert!(report.admitted().is_some());
+                assert_eq!(
+                    attribute(&report, "r1", "comment"),
+                    Evidence::Leaf(Secrecy::Secret)
+                );
+                assert!(report.traversals().iter().any(|stats| {
+                    stats.attribute == "comment"
+                        && stats.maximum_depth == 1
+                        && stats.reference_visits == 1
+                        && stats.limit.is_none()
+                }));
             }
-        })
-        .expect("failed to spawn deep-expression test thread")
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+    });
 }
 
 fn module_output_chain(instances: usize, shape: ChainShape) -> SecrecyReport {
@@ -1474,6 +1979,8 @@ let sink = mock.test.Resource { comment = g({ a = g({ a = if c { secret("x") } e
         declaration_index: OnceLock::new(),
         reference_free: RefCell::default(),
         literal_evidence: RefCell::default(),
+        function_evidence: RefCell::default(),
+        function_observations: RefCell::default(),
         argument_environments: RefCell::default(),
         upstream: HashSet::new(),
         empty_environment: Arc::default(),
@@ -1532,6 +2039,8 @@ fn module_argument_sources_have_distinct_nonempty_environment_identities() {
         declaration_index: OnceLock::new(),
         reference_free: RefCell::default(),
         literal_evidence: RefCell::default(),
+        function_evidence: RefCell::default(),
+        function_observations: RefCell::default(),
         argument_environments: RefCell::default(),
         upstream: HashSet::new(),
         empty_environment: Arc::default(),

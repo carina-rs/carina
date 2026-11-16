@@ -205,6 +205,27 @@ impl TestClient {
         .await;
     }
 
+    pub async fn change_document(&mut self, uri: &str, version: i32, text: &str) {
+        self.send_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": [{ "text": text }]
+            }
+        }))
+        .await;
+    }
+
+    pub async fn save_document(&mut self, uri: &str) {
+        self.send_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didSave",
+            "params": { "textDocument": { "uri": uri } }
+        }))
+        .await;
+    }
+
     pub async fn wait_for_diagnostics(&mut self, uri: &str) -> Value {
         self.wait_for_server_notification("textDocument/publishDiagnostics", |params| {
             params["uri"] == uri

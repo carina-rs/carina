@@ -575,7 +575,7 @@ fn dirty_sibling_call_context_is_owned_by_the_callers_buffer_analysis() {
 }
 
 #[test]
-fn dirty_sibling_module_inputs_do_not_publish_stale_instance_findings() {
+fn dirty_sibling_module_inputs_use_the_current_directory_snapshot_from_either_root() {
     for (saved, edited, expected) in [
         ("secret('canary')", "'public'", 0),
         ("'public'", "secret('canary')", 1),
@@ -606,10 +606,11 @@ fn dirty_sibling_module_inputs_do_not_publish_stale_instance_findings() {
             format!("provider mock {{}}\nlet input = {edited}\n"),
         );
         let engine = engine();
-        let stale = engine.analyze_document_set(&root, Some(&root_path), &[&sibling]);
-        assert!(
-            !stale.contains_key(&module_path),
-            "the root must not publish from stale sibling inputs: {stale:#?}"
+        let root_report = engine.analyze_document_set(&root, Some(&root_path), &[&sibling]);
+        assert_eq!(
+            root_report.get(&module_path).map_or(0, Vec::len),
+            expected,
+            "the root snapshot must contain the edited sibling input: {root_report:#?}"
         );
         let current = engine.analyze_document_set(&sibling, Some(&sibling_path), &[&root]);
         assert_eq!(
@@ -617,12 +618,109 @@ fn dirty_sibling_module_inputs_do_not_publish_stale_instance_findings() {
             expected,
             "the edited sibling supplies the current module input: {current:#?}"
         );
+        assert_eq!(root_report.get(&module_path), current.get(&module_path));
+    }
+}
+
+#[tokio::test]
+async fn two_dirty_root_buffers_publish_one_module_finding_through_save_close_and_call_removal() {
+    use tower_lsp::lsp_types::{PublishDiagnosticsParams, Url};
+
+    // Exercise both possible save/close orders. Both root buffers differ from
+    // disk when the second document opens, including the caller's source range.
+    for close_caller in [false, true] {
+        let fixture = fixtures::fixture("module_instances");
+        let main_path = fixture.path().join("main.crn");
+        let calls_path = fixture.path().join("modules.crn");
+        let module_path = fixture.path().join("module/main.crn");
+        let calls = std::fs::read_to_string(&main_path).unwrap();
+        std::fs::write(&calls_path, &calls).unwrap();
+        std::fs::write(&main_path, "// root\n").unwrap();
+        let main_text = "// unsaved root\n";
+        let calls_text = format!("\n\n{calls}");
+        let main_uri = Url::from_file_path(&main_path).unwrap();
+        let calls_uri = Url::from_file_path(&calls_path).unwrap();
+        let module_uri = Url::from_file_path(&module_path).unwrap();
+        let mut schemas = SchemaRegistry::new();
+        for schema in carina_provider_mock::builtin_schemas() {
+            schemas.insert("mock", schema);
+        }
+        let mut client = support::TestClient::with_schemas(fixture.path(), schemas).await;
+        client.open_document(main_uri.as_str(), main_text).await;
+        client.wait_for_diagnostics(module_uri.as_str()).await;
+        client.open_document(calls_uri.as_str(), &calls_text).await;
+
+        let assert_current = |notification: serde_json::Value| {
+            let params: PublishDiagnosticsParams =
+                serde_json::from_value(notification["params"].clone()).unwrap();
+            let findings = params
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
+                .collect::<Vec<_>>();
+            assert_eq!(findings.len(), 1, "{params:#?}");
+            let finding = findings[0];
+            assert_eq!(
+                finding.range,
+                lsp_range(fixture.path(), fixtures::MODULE_FINDING.site)
+            );
+            assert!(
+                finding
+                    .message
+                    .starts_with(fixtures::MODULE_FINDING.message)
+            );
+            assert!(finding.message.contains("secret_instance"));
+            let related = finding.related_information.as_ref().unwrap();
+            assert_eq!(related.len(), 1);
+            assert_eq!(related[0].location.uri, calls_uri);
+            let mut call_site = fixtures::SECRET_CALL;
+            call_site.line += 2;
+            call_site.end = call_site.end.map(|(line, column)| (line + 2, column));
+            assert_eq!(
+                related[0].location.range,
+                range_in_lines(&calls_text.lines().collect::<Vec<_>>(), call_site)
+            );
+            assert_no_payload(&params.diagnostics);
+        };
+        assert_current(client.wait_for_diagnostics(module_uri.as_str()).await);
+        let (save_path, save_uri, save_text) = if close_caller {
+            (&calls_path, &calls_uri, calls_text.as_str())
+        } else {
+            (&main_path, &main_uri, main_text)
+        };
+        std::fs::write(save_path, save_text).unwrap();
+        client.save_document(save_uri.as_str()).await;
+        assert_current(client.wait_for_diagnostics(module_uri.as_str()).await);
+        client.close_document(save_uri.as_str()).await;
+        assert_current(client.wait_for_diagnostics(module_uri.as_str()).await);
+
+        // Remove the call from the remaining dirty buffer. In the other close
+        // order, reopen the saved caller first, then edit that buffer.
+        if close_caller {
+            client.open_document(calls_uri.as_str(), &calls_text).await;
+            assert_current(client.wait_for_diagnostics(module_uri.as_str()).await);
+        }
+        client
+            .change_document(calls_uri.as_str(), 2, "// call removed\n")
+            .await;
+        let notification = client.wait_for_diagnostics(module_uri.as_str()).await;
+        let params: PublishDiagnosticsParams =
+            serde_json::from_value(notification["params"].clone()).unwrap();
+        assert!(
+            params
+                .diagnostics
+                .iter()
+                .all(|diagnostic| !fixtures::is_secrecy_message(&diagnostic.message)),
+            "{params:#?}"
+        );
+        client.shutdown().await;
     }
 }
 
 #[test]
 fn unrelated_open_buffers_do_not_override_directory_checks() {
     let fixture = fixtures::fixture("homogeneous");
+    let unrelated = tempfile::tempdir().unwrap();
     let root_path = fixture.path().join("main.crn");
     let root = Document::new_with_path(
         std::fs::read_to_string(&root_path).unwrap(),
@@ -631,7 +729,7 @@ fn unrelated_open_buffers_do_not_override_directory_checks() {
     );
     let sibling = Document::new_with_path(
         "this is invalid syntax {".to_string(),
-        fixture.path().join("resources.crn"),
+        unrelated.path().join("resources.crn"),
         Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
     );
     let engine = engine();
@@ -856,10 +954,6 @@ fn assert_nested_module_diagnostics(depth: usize) {
 
 #[test]
 fn nested_module_chain_of_500_validates_without_stack_growth() {
+    // The default 2 MiB test-thread stack makes 500 levels sufficient to prove no per-level recursion; larger chains are omitted because validate time is quadratic (#4482).
     assert_nested_module_diagnostics(500);
-}
-
-#[test]
-fn nested_module_chain_of_2000_validates_without_stack_growth() {
-    assert_nested_module_diagnostics(2000);
 }

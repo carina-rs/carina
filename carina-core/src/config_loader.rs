@@ -1042,6 +1042,20 @@ impl SourceOverrides {
         self
     }
 
+    /// Discover one directory, including unsaved siblings, and read all sources
+    /// through this analysis snapshot. Catalog discovery and merged parsing
+    /// can then share the same buffers and pinned disk reads.
+    pub fn directory_sources(
+        &self,
+        directory: &ResolvedPath,
+    ) -> std::io::Result<Vec<(ResolvedPath, String)>> {
+        DirectoryFiles::discover(directory, self)?
+            .paths
+            .into_iter()
+            .map(|path| read_source_with_overrides(&path, self).map(|source| (path, source)))
+            .collect()
+    }
+
     pub fn analyzed_source(&self, file: &Path) -> Option<std::sync::Arc<str>> {
         let identity = ResolvedPath::new(file).ok()?.identity();
         if let Some(source) = self.get(&identity) {

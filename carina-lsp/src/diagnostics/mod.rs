@@ -868,10 +868,46 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for LspTypeC
     }
 }
 
+/// Every root-directory consumer receives the same editor inputs. Imported
+/// directories retain main's disk model and routed findings still require
+/// their analyzed source to match any open module buffer.
+fn directory_source_snapshot(
+    doc: &Document,
+    current_file_path: Option<&Path>,
+    open_sources: &[(PathBuf, Arc<str>)],
+) -> Result<
+    carina_core::config_loader::SourceOverrides,
+    carina_core::config_loader::SourceOverrideConflict,
+> {
+    let base = current_file_path
+        .and_then(Path::parent)
+        .and_then(|path| carina_core::paths::ResolvedPath::new(path).ok());
+    let current = base.as_ref().and_then(|base| {
+        base.join(current_file_path?.file_name()?)
+            .ok()
+            .map(|path| (path, doc.text()))
+    });
+    let directory = doc.source_file().parent().map(PathIdentity::new);
+    let siblings = open_sources
+        .iter()
+        .filter(|(path, _)| base.is_some() && path.parent().map(PathIdentity::new) == directory)
+        .filter(|(path, _)| path.as_path() != doc.source_file())
+        .filter_map(|(path, source)| {
+            carina_core::paths::ResolvedPath::new(path)
+                .ok()
+                .map(|path| (path, source.to_string()))
+        });
+    carina_core::config_loader::SourceOverrides::try_from_entries(
+        current.into_iter().chain(siblings),
+    )
+    .map(carina_core::config_loader::SourceOverrides::tracking_reads)
+}
+
 pub(super) struct DiagnosticRun<'a> {
     engine: &'a DiagnosticEngine,
     provider_context: &'a dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     open_sources: &'a [(PathBuf, Arc<str>)],
+    source_snapshot: Option<&'a carina_core::config_loader::SourceOverrides>,
     analysis_sources: &'a RefCell<carina_core::config_loader::SourceOverrides>,
     secrecy_causes: &'a RefCell<SecrecyCauses>,
     routed_secrecy: &'a RefCell<BTreeMap<PathBuf, Vec<Diagnostic>>>,
@@ -1071,21 +1107,11 @@ impl DiagnosticRun<'_> {
             path.file_name()
                 .expect("a current file path must name a file")
         });
-        // Resolve the document through the pinned base once, then share its
-        // snapshot across directory, module, upstream and recovery analysis.
-        let current_override = if let Some(base) = base_path {
-            current_file_name
-                .and_then(|file_name| base.join(file_name).ok())
-                .map(|path| (path, text.clone()))
-        } else {
-            None
-        };
-        // Only the analyzed document overrides parsing. Other open buffers
-        // determine whether a routed module diagnostic still matches its text.
-        let entries = current_override;
-        let overrides = match carina_core::config_loader::SourceOverrides::try_from_entries(entries)
-        {
-            Ok(overrides) => overrides.tracking_reads(),
+        let overrides = match self.source_snapshot.cloned().map_or_else(
+            || directory_source_snapshot(doc, current_file_path, self.open_sources),
+            Ok,
+        ) {
+            Ok(overrides) => overrides,
             Err(error) => {
                 diagnostics.push(Diagnostic {
                     severity: Some(DiagnosticSeverity::ERROR),
@@ -1722,8 +1748,8 @@ impl DiagnosticRun<'_> {
             // Cross-directory findings also depend on the root's inputs.
             // Another open root file may have changed a call or its argument.
             // Publish those contexts only from an analysis whose root texts
-            // match the open buffers; each document still owns its local
-            // diagnostics and remains the sole parser override for its run.
+            // match the directory snapshot. Local diagnostics still belong to
+            // the analyzed document; the snapshot contains every open sibling.
             let root_directory = doc.source_file().parent().map(PathIdentity::new);
             let current_root_context = self
                 .open_sources
@@ -3105,6 +3131,7 @@ impl DiagnosticEngine {
                     engine: self,
                     provider_context: session,
                     open_sources: &[],
+                    source_snapshot: None,
                     analysis_sources: &RefCell::default(),
                     secrecy_causes: &RefCell::default(),
                     routed_secrecy: &RefCell::default(),
@@ -3203,7 +3230,19 @@ impl DiagnosticEngine {
             Ok(doc) => doc,
             Err(protected) => return single(vec![buffer::protected_parse_error(protected)]),
         };
-        let context = self.catalog_for_public_document(&doc, current_file_path);
+        let source_snapshot = match directory_source_snapshot(&doc, current_file_path, open_sources)
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return single(vec![Diagnostic {
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("carina".into()),
+                    message: error.to_string(),
+                    ..Default::default()
+                }]);
+            }
+        };
+        let context = self.catalog_for_public_document(&doc, current_file_path, &source_snapshot);
         let reparsed;
         let doc = if doc.provider_context().custom_types_loaded() && !context.custom_types_loaded()
         {
@@ -3228,6 +3267,7 @@ impl DiagnosticEngine {
                     engine: self,
                     provider_context: session,
                     open_sources,
+                    source_snapshot: Some(&source_snapshot),
                     analysis_sources: &analysis_sources,
                     secrecy_causes: &secrecy_causes,
                     routed_secrecy: &routed_secrecy,
@@ -3268,7 +3308,11 @@ impl DiagnosticEngine {
         current_file_path: Option<&Path>,
     ) -> carina_core::parser::ProviderContext {
         match doc.for_diagnostics() {
-            Ok(doc) => self.catalog_for_public_document(&doc, current_file_path),
+            Ok(doc) => {
+                let snapshot =
+                    directory_source_snapshot(&doc, current_file_path, &[]).unwrap_or_default();
+                self.catalog_for_public_document(&doc, current_file_path, &snapshot)
+            }
             Err(_) => carina_core::parser::ProviderContext::new(
                 doc.provider_context().environment.clone(),
             ),
@@ -3279,11 +3323,12 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         current_file_path: Option<&Path>,
+        source_snapshot: &carina_core::config_loader::SourceOverrides,
     ) -> carina_core::parser::ProviderContext {
         let mut context = match current_file_path.and_then(Path::parent) {
             Some(directory) => carina_core::paths::ResolvedPath::new(directory)
                 .ok()
-                .and_then(|directory| self.directory_catalog(doc, &directory))
+                .and_then(|directory| self.directory_catalog(doc, &directory, source_snapshot))
                 .unwrap_or_else(|| {
                     if let Some(scope) = &self.directory_providers
                         && scope.directory == PathIdentity::new(directory)
@@ -3322,34 +3367,14 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         directory: &carina_core::paths::ResolvedPath,
+        source_snapshot: &carina_core::config_loader::SourceOverrides,
     ) -> Option<carina_core::parser::ProviderContext> {
-        let files = carina_core::config_loader::find_crn_files_in_dir(directory).ok()?;
         let mut providers = Vec::new();
-        let mut has_buffer = false;
-        let buffer_identity = carina_core::paths::ResolvedPath::new(doc.source_file())
-            .ok()
-            .map(|path| path.identity());
-        for file in files {
-            let source = if Some(file.identity()) == buffer_identity {
-                has_buffer = true;
-                doc.text()
-            } else {
-                file.read_to_string().ok()?
-            };
+        for (file, source) in source_snapshot.directory_sources(directory).ok()? {
             providers.extend(
                 carina_core::parser::parse_provider_factory_declarations(
                     &source,
                     &file.source_label(),
-                    doc.provider_context(),
-                )
-                .ok()?,
-            );
-        }
-        if !has_buffer {
-            providers.extend(
-                carina_core::parser::parse_provider_factory_declarations(
-                    &doc.text(),
-                    doc.source_file(),
                     doc.provider_context(),
                 )
                 .ok()?,

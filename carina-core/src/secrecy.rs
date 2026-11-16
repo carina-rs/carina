@@ -2,16 +2,17 @@
 //! and state never enter this owner. Availability and secrecy are separate facts.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
 use crate::parser::retained::{ExprKind, ExprValue, ExpressionInstance, ExpressionReport, NodeId};
 use crate::parser::{DeclarationLocation, File, ResourceRef};
 use crate::resource::{
-    BindingAddress, ConcreteValue, DeferredValue, InterpolationPart, ParserPlaceholder,
-    PathSegment, ResourceId, Subscript, Value,
+    BindingAddress, ConcreteValue, DeferredValue, FunctionArgument, InterpolationPart,
+    ParserPlaceholder, PathSegment, ResourceId, Subscript, Value,
 };
 use crate::schema::{SchemaKind, SchemaRegistry};
 
@@ -24,7 +25,7 @@ fn depth_after_reference(depth: usize) -> usize {
 }
 
 /// The only leaves admitted into runtime evidence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Secrecy {
     Secret,
     Public,
@@ -287,6 +288,8 @@ struct TraversalStats {
     pub reference_visits: usize,
     pub memo_hits: usize,
     pub syntax_entries: usize,
+    pub function_body_evaluations: usize,
+    pub function_memo_hits: usize,
     pub limit: Option<LimitKind>,
 }
 
@@ -334,6 +337,8 @@ impl SecrecyReport {
             reference_visits: walk.visits,
             memo_hits: walk.memo_hits,
             syntax_entries: walk.syntax_entries,
+            function_body_evaluations: walk.function_body_evaluations,
+            function_memo_hits: walk.function_memo_hits,
             limit: walk
                 .findings
                 .iter()
@@ -409,8 +414,7 @@ enum Source<B: BindingAddress> {
     Value(Arc<Value<ParserPlaceholder, B>>),
     Argument {
         authored: Box<Thunk<B>>,
-        proof: Option<Evidence>,
-        boolean: Option<bool>,
+        facts: ArgumentFacts,
         activation: Arc<FunctionActivation>,
     },
 }
@@ -474,6 +478,242 @@ struct Memo {
     relative_depth: usize,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ArgumentOrigin {
+    UnboundParameter,
+    Reference {
+        instance: Option<ExpressionInstance>,
+        binding: String,
+        path: Vec<PathSegment>,
+        environment: usize,
+        activation: Arc<FunctionActivation>,
+    },
+    Syntax(DeclarationIdentity, usize, Arc<FunctionActivation>),
+    Value(usize, usize, Arc<FunctionActivation>),
+}
+
+/// Payload observations are needed only by the existing condition/shape
+/// helpers. Ordinary string arguments share a key by their secrecy evidence.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+struct ArgumentObservations {
+    boolean: Option<bool>,
+    string: Option<String>,
+    non_lists: Option<Vec<bool>>,
+}
+
+#[derive(Clone)]
+struct ArgumentFacts {
+    proof: Option<Evidence>,
+    observations: ArgumentObservations,
+    // Whole resource handles and pending selections need their authored
+    // source, rather than treating all missing evidence as the same argument.
+    origin: Option<ArgumentOrigin>,
+}
+
+// Memo keys must not introduce Rust-stack recursion for deeply nested
+// expression evidence. Both hashing and equality use the same heap traversal
+// as the secrecy walk, with no expression-depth limit.
+impl PartialEq for ArgumentFacts {
+    fn eq(&self, other: &Self) -> bool {
+        if self.observations != other.observations || self.origin != other.origin {
+            return false;
+        }
+        let mut pending = match (&self.proof, &other.proof) {
+            (None, None) => return true,
+            (Some(left), Some(right)) => vec![(left, right)],
+            (None, Some(_)) | (Some(_), None) => return false,
+        };
+        while let Some((left, right)) = pending.pop() {
+            match (left, right) {
+                (Evidence::Leaf(left), Evidence::Leaf(right)) => {
+                    if left != right {
+                        return false;
+                    }
+                }
+                (Evidence::List(left), Evidence::List(right)) => {
+                    if Arc::ptr_eq(left, right) {
+                        continue;
+                    }
+                    if left.len() != right.len() {
+                        return false;
+                    }
+                    pending.extend(left.iter().zip(right.iter()));
+                }
+                (Evidence::Map(left), Evidence::Map(right)) => {
+                    if Arc::ptr_eq(left, right) {
+                        continue;
+                    }
+                    if left.len() != right.len() {
+                        return false;
+                    }
+                    for ((left_key, left), (right_key, right)) in left.iter().zip(right.iter()) {
+                        if left_key != right_key {
+                            return false;
+                        }
+                        pending.push((left, right));
+                    }
+                }
+                (Evidence::Leaf(_), Evidence::Map(_) | Evidence::List(_))
+                | (Evidence::Map(_) | Evidence::List(_), Evidence::Leaf(_))
+                | (Evidence::Map(_), Evidence::List(_))
+                | (Evidence::List(_), Evidence::Map(_)) => return false,
+            }
+        }
+        true
+    }
+}
+
+impl Eq for ArgumentFacts {}
+
+impl Hash for ArgumentFacts {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.observations.hash(state);
+        self.origin.hash(state);
+        let Some(proof) = &self.proof else {
+            state.write_u8(0);
+            return;
+        };
+        state.write_u8(1);
+        let mut pending = vec![proof];
+        while let Some(proof) = pending.pop() {
+            match proof {
+                Evidence::Leaf(secrecy) => {
+                    state.write_u8(0);
+                    secrecy.hash(state);
+                }
+                Evidence::Map(fields) => {
+                    state.write_u8(1);
+                    fields.len().hash(state);
+                    for key in fields.keys() {
+                        key.hash(state);
+                    }
+                    pending.extend(fields.values().rev());
+                }
+                Evidence::List(items) => {
+                    state.write_u8(2);
+                    items.len().hash(state);
+                    pending.extend(items.iter().rev());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ArgumentDependencies {
+    booleans: bool,
+    strings: bool,
+    list_shapes: bool,
+}
+
+impl ArgumentDependencies {
+    fn merge(&mut self, other: Self) -> bool {
+        let changed = (other.booleans && !self.booleans)
+            || (other.strings && !self.strings)
+            || (other.list_shapes && !self.list_shapes);
+        self.booleans |= other.booleans;
+        self.strings |= other.strings;
+        self.list_shapes |= other.list_shapes;
+        changed
+    }
+}
+
+impl ArgumentFacts {
+    fn for_key(&self, dependencies: ArgumentDependencies) -> Self {
+        let mut facts = self.clone();
+        if !dependencies.booleans {
+            facts.observations.boolean = None;
+        }
+        if !dependencies.strings {
+            facts.observations.string = None;
+        }
+        if !dependencies.list_shapes {
+            facts.observations.non_lists = None;
+        }
+        facts
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FunctionIdentity<B: BindingAddress> {
+    Syntax(DeclarationIdentity),
+    Value(DeclarationLocation, Option<B>),
+}
+
+impl<B: BindingAddress> FunctionIdentity<B> {
+    fn active_in(&self, activation: &FunctionActivation) -> bool {
+        match self {
+            Self::Syntax(identity) => activation.syntax.contains(identity),
+            Self::Value(location, _) => activation.values.contains(location),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ReferenceActivation {
+    Body(FunctionActivation),
+    Argument(FunctionActivation),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FunctionKey<B: BindingAddress> {
+    identity: FunctionIdentity<B>,
+    arguments: Vec<ArgumentFacts>,
+    path: Vec<PathSegment>,
+    // Only reference-bearing bodies depend on the caller's recursion context.
+    // Reference-free results use None, including declaration-only walks.
+    activation: Option<Arc<FunctionActivation>>,
+}
+
+struct FunctionDependencies<B: BindingAddress> {
+    observations: ArgumentDependencies,
+    callees: IndexSet<FunctionIdentity<B>>,
+}
+
+impl<B: BindingAddress> Default for FunctionDependencies<B> {
+    fn default() -> Self {
+        Self {
+            observations: ArgumentDependencies::default(),
+            callees: IndexSet::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ReferenceEffect<B: BindingAddress> {
+    binding: B,
+    path: Vec<PathSegment>,
+    environment: Arc<Environment<B>>,
+    relative_depth: usize,
+    environments: Arc<BTreeMap<usize, usize>>,
+    activation: ReferenceActivation,
+}
+
+struct FunctionMemo<B: BindingAddress> {
+    evidence: Option<Evidence>,
+    findings: Vec<Finding>,
+    relative_depth: usize,
+    // Replaying encounters (rather than adding the first run's visit total)
+    // preserves reference memo hits, including warm vs cold shared DAGs.
+    references: Vec<ReferenceEffect<B>>,
+    local_environments: BTreeSet<usize>,
+    // Pending Value origins use allocation identity; retain those allocations
+    // for as long as their memo keys can be reused.
+    _arguments: Vec<Thunk<B>>,
+}
+
+struct FunctionRecording<B: BindingAddress> {
+    key: FunctionKey<B>,
+    depth: usize,
+    max_before: usize,
+    errors: usize,
+    reference_nesting: usize,
+    references: Vec<ReferenceEffect<B>>,
+    local_environments: BTreeSet<usize>,
+    arguments: Vec<Thunk<B>>,
+    activation: FunctionActivation,
+}
+
 struct ResourceSource<B: BindingAddress> {
     provider: String,
     resource_type: String,
@@ -490,6 +730,8 @@ struct Owner<'a, B: BindingAddress> {
     declaration_index: OnceLock<DeclarationIndex>,
     reference_free: RefCell<HashMap<DeclarationIdentity, bool>>,
     literal_evidence: RefCell<HashMap<DeclarationIdentity, Evidence>>,
+    function_evidence: RefCell<HashMap<FunctionKey<B>, Arc<FunctionMemo<B>>>>,
+    function_observations: RefCell<HashMap<FunctionIdentity<B>, ArgumentDependencies>>,
     argument_environments: RefCell<HashMap<B, Arc<Environment<B>>>>,
     empty_environment: Arc<Environment<B>>,
 }
@@ -513,6 +755,220 @@ thread_local! {
 }
 
 impl<B: BindingAddress> Owner<'_, B> {
+    fn cache_function_observations(
+        &self,
+        graph: IndexMap<FunctionIdentity<B>, FunctionDependencies<B>>,
+    ) {
+        let mut known = self.function_observations.borrow_mut();
+        let mut callers: HashMap<FunctionIdentity<B>, Vec<FunctionIdentity<B>>> = HashMap::new();
+        let mut pending = Vec::new();
+        for (identity, dependencies) in graph {
+            known
+                .entry(identity.clone())
+                .or_default()
+                .merge(dependencies.observations);
+            pending.push(identity.clone());
+            for callee in dependencies.callees {
+                callers
+                    .entry(callee.clone())
+                    .or_default()
+                    .push(identity.clone());
+                pending.push(callee);
+            }
+        }
+        // Each observation bit propagates once along each call edge. Indexing
+        // a fan-out call graph must not itself re-expand that graph.
+        while let Some(identity) = pending.pop() {
+            let observations = known.get(&identity).copied().unwrap_or_default();
+            for caller in callers.get(&identity).into_iter().flatten() {
+                if known.entry(caller.clone()).or_default().merge(observations) {
+                    pending.push(caller.clone());
+                }
+            }
+        }
+    }
+
+    fn function_observations(
+        &self,
+        function: &ExprValue<ParserPlaceholder, B>,
+    ) -> ArgumentDependencies {
+        let identity =
+            FunctionIdentity::Syntax((function.secrecy_instance().clone(), function.node_id()));
+        if let Some(uses) = self.function_observations.borrow().get(&identity) {
+            return *uses;
+        }
+        let mut pending = vec![(function.clone(), identity.clone())];
+        let mut seen = HashSet::new();
+        let mut graph: IndexMap<FunctionIdentity<B>, FunctionDependencies<B>> = IndexMap::new();
+        while let Some((source, owner)) = pending.pop() {
+            if !seen.insert((
+                (source.secrecy_instance().clone(), source.node_id()),
+                owner.clone(),
+            )) {
+                continue;
+            }
+            let dependencies = graph.entry(owner.clone()).or_default();
+            dependencies.observations.booleans |= matches!(source.secrecy_kind(), ExprKind::If);
+            if let ExprKind::Call(name) = source.secrecy_kind() {
+                if let Some(callee) = self
+                    .syntax
+                    .secrecy_function(source.secrecy_instance(), name)
+                {
+                    let callee_identity = FunctionIdentity::Syntax((
+                        callee.secrecy_instance().clone(),
+                        callee.node_id(),
+                    ));
+                    dependencies.callees.insert(callee_identity.clone());
+                    if !self
+                        .function_observations
+                        .borrow()
+                        .contains_key(&callee_identity)
+                    {
+                        pending.push((callee, callee_identity));
+                    }
+                } else {
+                    let closure = self
+                        .syntax
+                        .secrecy_builtin_closure(source.secrecy_instance(), name);
+                    let builtin = crate::builtins::Builtin::from_name(name)
+                        .or_else(|| closure.as_ref().map(|(builtin, _)| *builtin));
+                    if let Some((_, captures)) = closure {
+                        pending
+                            .extend(captures.into_iter().map(|capture| (capture, owner.clone())));
+                    }
+                    dependencies.observations.strings |= builtin
+                        == Some(crate::builtins::Builtin::Function(
+                            crate::builtins::BuiltinFunction::map,
+                        ));
+                    dependencies.observations.list_shapes |= builtin
+                        == Some(crate::builtins::Builtin::Function(
+                            crate::builtins::BuiltinFunction::flatten,
+                        ));
+                }
+            }
+            if let ExprKind::Binding(binding) | ExprKind::Reference { binding, .. } =
+                source.secrecy_kind()
+                && let Some(definition) = self.syntax.secrecy_definition(binding)
+            {
+                pending.push((definition.clone(), owner.clone()));
+            }
+            pending.extend(
+                source
+                    .secrecy_children()
+                    .iter()
+                    .cloned()
+                    .map(|child| (child, owner.clone())),
+            );
+        }
+        self.cache_function_observations(graph);
+        self.function_observations.borrow()[&identity]
+    }
+
+    fn value_function_observations(
+        &self,
+        identity: &FunctionIdentity<B>,
+        function: &Arc<crate::parser::UserFunction<B>>,
+        functions: &IndexMap<String, crate::parser::UserFunction<B>>,
+    ) -> ArgumentDependencies {
+        if let Some(uses) = self.function_observations.borrow().get(identity) {
+            return *uses;
+        }
+        let FunctionIdentity::Value(_, module) = identity else {
+            unreachable!("value function")
+        };
+        let mut pending = vec![function.clone()];
+        let mut seen = HashSet::new();
+        let mut graph = IndexMap::new();
+        while let Some(function) = pending.pop() {
+            let owner = FunctionIdentity::Value(function.body.location.clone(), module.clone());
+            if !seen.insert(owner.clone())
+                || self.function_observations.borrow().contains_key(&owner)
+            {
+                continue;
+            }
+            let mut dependencies = FunctionDependencies::default();
+            let mut values = function
+                .params
+                .iter()
+                .filter_map(|parameter| parameter.default.as_ref())
+                .chain(function.local_lets.iter().map(|(_, value, _)| value))
+                .chain(std::iter::once(&function.body.value))
+                .collect::<Vec<_>>();
+            while let Some(value) = values.pop() {
+                match value {
+                    Value::Concrete(ConcreteValue::List(items)) => values.extend(items),
+                    Value::Concrete(ConcreteValue::Map(fields)) => values.extend(fields.values()),
+                    Value::Deferred(
+                        DeferredValue::FunctionCall { name, args, .. }
+                        | DeferredValue::Unavailable { name, args, .. },
+                    ) => {
+                        dependencies.observations.strings |=
+                            *name == crate::builtins::BuiltinFunction::map;
+                        dependencies.observations.list_shapes |=
+                            *name == crate::builtins::BuiltinFunction::flatten;
+                        values.extend(args.iter().filter_map(FunctionArgument::value));
+                    }
+                    Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                        function, args, ..
+                    }) => {
+                        let callee = functions
+                            .get(&function.name)
+                            .cloned()
+                            .map(Arc::new)
+                            .unwrap_or_else(|| function.clone());
+                        dependencies.callees.insert(FunctionIdentity::Value(
+                            callee.body.location.clone(),
+                            module.clone(),
+                        ));
+                        pending.push(callee);
+                        values.extend(args.iter().map(FunctionArgument::walker_value));
+                    }
+                    Value::Deferred(DeferredValue::Secret(secret)) => {
+                        values.push(secret.expose_plaintext())
+                    }
+                    Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                        values.push(value);
+                        values.push(default);
+                    }
+                    Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                        values.push(expression.lhs());
+                        values.push(expression.rhs());
+                    }
+                    Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                        values.extend(parts.iter().filter_map(|part| match part {
+                            InterpolationPart::Expr(value) => Some(value),
+                            InterpolationPart::Literal(_) => None,
+                        }))
+                    }
+                    Value::Deferred(DeferredValue::Access(access)) => values.push(access.base()),
+                    Value::Deferred(DeferredValue::ModuleIf(conditional)) => {
+                        dependencies.observations.booleans = true;
+                        values.extend(conditional.values());
+                    }
+                    Value::Concrete(
+                        ConcreteValue::String(_)
+                        | ConcreteValue::StringList(_)
+                        | ConcreteValue::Int(_)
+                        | ConcreteValue::Float(_)
+                        | ConcreteValue::Bool(_)
+                        | ConcreteValue::Duration(_)
+                        | ConcreteValue::EnumIdentifier(_)
+                        | ConcreteValue::CanonicalEnum(_),
+                    )
+                    | Value::Deferred(
+                        DeferredValue::ResourceRef { .. }
+                        | DeferredValue::BindingRef { .. }
+                        | DeferredValue::Placeholder(_)
+                        | DeferredValue::Unknown(_),
+                    ) => {}
+                }
+            }
+            graph.insert(owner, dependencies);
+        }
+        self.cache_function_observations(graph);
+        self.function_observations.borrow()[identity]
+    }
+
     fn declaration_index(&self) -> &DeclarationIndex {
         self.declaration_index.get_or_init(|| {
             #[cfg(test)]
@@ -705,6 +1161,8 @@ where
         declaration_index: OnceLock::new(),
         reference_free: RefCell::default(),
         literal_evidence: RefCell::default(),
+        function_evidence: RefCell::default(),
+        function_observations: RefCell::default(),
         argument_environments: RefCell::default(),
         empty_environment: Arc::default(),
         upstream: file
@@ -1064,7 +1522,7 @@ enum Work<B: BindingAddress> {
     Call {
         function: ExprValue<ParserPlaceholder, B>,
         count: usize,
-        booleans: Vec<Option<bool>>,
+        observations: Vec<ArgumentObservations>,
         arguments: Vec<Thunk<B>>,
         environment: Arc<Environment<B>>,
         path: Vec<PathSegment>,
@@ -1074,7 +1532,7 @@ enum Work<B: BindingAddress> {
         function: Arc<crate::parser::UserFunction<B>>,
         functions: Arc<IndexMap<String, crate::parser::UserFunction<B>>>,
         count: usize,
-        booleans: Vec<Option<bool>>,
+        observations: Vec<ArgumentObservations>,
         arguments: Vec<Thunk<B>>,
         environment: Arc<Environment<B>>,
         path: Vec<PathSegment>,
@@ -1083,12 +1541,57 @@ enum Work<B: BindingAddress> {
     ValueFunction {
         location: DeclarationLocation,
     },
+    ReplayReference {
+        effect: ReferenceEffect<B>,
+        depth: usize,
+    },
+    ReferenceReplayFinished {
+        environments: Arc<BTreeMap<usize, usize>>,
+        activation: FunctionActivation,
+    },
+    FunctionResult(Option<Evidence>),
+    MemoFunction(FunctionIdentity<B>),
     Activation(FunctionActivation),
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct FunctionActivation {
-    syntax: HashSet<DeclarationIdentity>,
-    values: HashSet<DeclarationLocation>,
+    syntax: IndexSet<DeclarationIdentity>,
+    values: BTreeSet<DeclarationLocation>,
+}
+
+impl Hash for FunctionActivation {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        fn unordered<'a, T: Hash + 'a, H: Hasher>(
+            values: impl ExactSizeIterator<Item = &'a T>,
+            state: &mut H,
+        ) {
+            values.len().hash(state);
+            let hash = values.fold(0u64, |sum, value| {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                value.hash(&mut hash);
+                sum.wrapping_add(hash.finish())
+            });
+            hash.hash(state);
+        }
+        unordered(self.syntax.iter(), state);
+        unordered(self.values.iter(), state);
+    }
+}
+
+impl FunctionActivation {
+    fn added_since(&self, base: &Self) -> Self {
+        Self {
+            syntax: self.syntax.difference(&base.syntax).cloned().collect(),
+            values: self.values.difference(&base.values).cloned().collect(),
+        }
+    }
+
+    fn with(&self, additions: Self) -> Self {
+        let mut activation = self.clone();
+        activation.syntax.extend(additions.syntax);
+        activation.values.extend(additions.values);
+        activation
+    }
 }
 enum Operation {
     Propagate,
@@ -1177,10 +1680,17 @@ struct Walk<'a, B: BindingAddress> {
     memo_hits: usize,
     #[cfg(test)]
     syntax_entries: usize,
+    #[cfg(test)]
+    function_body_evaluations: usize,
+    #[cfg(test)]
+    function_memo_hits: usize,
     max_depth: usize,
     // Visit/depth accounting is private to this declaration walk.
     memo: HashMap<ReferenceKey<B>, Memo>,
     active_references: HashSet<ReferenceKey<B>>,
+    function_memo: HashMap<FunctionKey<B>, Arc<FunctionMemo<B>>>,
+    function_recordings: Vec<FunctionRecording<B>>,
+    reference_environments: Arc<BTreeMap<usize, usize>>,
     activation: FunctionActivation,
     pending_validation: bool,
     pending_events: usize,
@@ -1200,9 +1710,16 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             memo_hits: 0,
             #[cfg(test)]
             syntax_entries: 0,
+            #[cfg(test)]
+            function_body_evaluations: 0,
+            #[cfg(test)]
+            function_memo_hits: 0,
             max_depth: 0,
             memo: HashMap::new(),
             active_references: HashSet::new(),
+            function_memo: HashMap::new(),
+            function_recordings: Vec::new(),
+            reference_environments: Arc::default(),
             activation: FunctionActivation::default(),
             pending_validation: false,
             pending_events: 0,
@@ -1383,12 +1900,13 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     self.max_depth = self.max_depth.max(max_before);
                 }
                 Work::Function { identity } => {
-                    self.activation.syntax.remove(&identity);
+                    self.finish_function(&values);
+                    self.activation.syntax.shift_remove(&identity);
                 }
                 Work::Call {
                     function,
                     count,
-                    booleans,
+                    observations,
                     arguments: authored_arguments,
                     environment,
                     path,
@@ -1402,8 +1920,11 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         .map(|(index, value)| Thunk {
                             source: Source::Argument {
                                 authored: Box::new(authored_arguments[index].clone()),
-                                proof: value,
-                                boolean: booleans[index],
+                                facts: self.argument_facts(
+                                    &authored_arguments[index],
+                                    value,
+                                    observations[index].clone(),
+                                ),
                                 activation: activation.clone(),
                             },
                             environment: environment.clone(),
@@ -1425,7 +1946,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     function,
                     functions,
                     count,
-                    booleans,
+                    observations,
                     arguments: authored_arguments,
                     environment,
                     path,
@@ -1436,7 +1957,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         function,
                         functions,
                         arguments,
-                        booleans,
+                        observations,
                         authored_arguments,
                         FunctionContext {
                             environment,
@@ -1448,8 +1969,47 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     );
                 }
                 Work::ValueFunction { location } => {
+                    self.finish_function(&values);
                     self.activation.values.remove(&location);
                 }
+                Work::ReplayReference { effect, depth } => {
+                    let activation = match effect.activation {
+                        ReferenceActivation::Body(additions) => self.activation.with(additions),
+                        ReferenceActivation::Argument(activation) => activation,
+                    };
+                    work.push(Work::ReferenceReplayFinished {
+                        environments: std::mem::replace(
+                            &mut self.reference_environments,
+                            effect.environments,
+                        ),
+                        activation: std::mem::replace(&mut self.activation, activation),
+                    });
+                    self.reference(
+                        effect.binding,
+                        effect.path,
+                        effect.environment,
+                        depth + effect.relative_depth,
+                        &mut work,
+                        &mut values,
+                    );
+                }
+                Work::ReferenceReplayFinished {
+                    environments,
+                    activation,
+                } => {
+                    values.pop();
+                    self.reference_environments = environments;
+                    self.activation = activation;
+                }
+                Work::FunctionResult(evidence) => values.push(evidence),
+                Work::MemoFunction(identity) => match identity {
+                    FunctionIdentity::Syntax(identity) => {
+                        self.activation.syntax.shift_remove(&identity);
+                    }
+                    FunctionIdentity::Value(location, _) => {
+                        self.activation.values.remove(&location);
+                    }
+                },
                 Work::Activation(activation) => self.activation = activation,
             }
         }
@@ -1518,6 +2078,27 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         work: &mut Vec<Work<B>>,
         values: &mut Vec<Option<Evidence>>,
     ) {
+        for recording in &mut self.function_recordings {
+            if recording.reference_nesting == self.active_references.len() {
+                recording.references.push(ReferenceEffect {
+                    binding: binding.clone(),
+                    path: path.clone(),
+                    environment: environment.clone(),
+                    relative_depth: depth - recording.depth,
+                    environments: self.reference_environments.clone(),
+                    // Parameter path re-entry runs in the argument's authored
+                    // activation. Body references retain the current caller
+                    // and any nested callees instead of capturing old callers.
+                    activation: if recording.key.identity.active_in(&self.activation) {
+                        ReferenceActivation::Body(
+                            self.activation.added_since(&recording.activation),
+                        )
+                    } else {
+                        ReferenceActivation::Argument(self.activation.clone())
+                    },
+                });
+            }
+        }
         self.visits += 1;
         if self.visits > MAX_REFERENCE_VISITS {
             self.limit(LimitKind::ReferenceVisits);
@@ -1541,7 +2122,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             }
         };
         let key = ReferenceKey {
-            environment: source_environment,
+            environment: self.reference_environment(source_environment),
             binding: binding.clone(),
             path: path.clone(),
         };
@@ -1624,11 +2205,10 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         match source {
             Source::Argument {
                 authored,
-                proof,
-                boolean: _,
+                facts,
                 activation,
             } => {
-                if let Some(proof) = proof {
+                if let Some(proof) = facts.proof {
                     values.push(proof.select(&path));
                 } else if path.is_empty() {
                     values.push(None);
@@ -1968,18 +2548,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         let mut bindings = HashSet::new();
         loop {
             match &thunk.source {
-                Source::Argument {
-                    authored,
-                    proof: _,
-                    boolean,
-                    activation: _,
-                } => {
-                    if let Some(boolean) = boolean {
-                        return Some(*boolean);
-                    }
-                    thunk = (**authored).clone();
-                    continue;
-                }
+                Source::Argument { facts, .. } => return facts.observations.boolean,
                 Source::Value(value) => {
                     let substitution = match value.as_ref() {
                         Value::Deferred(DeferredValue::Placeholder(
@@ -2080,7 +2649,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         let mut seen = HashSet::new();
         loop {
             match &thunk.source {
-                Source::Argument { authored, .. } => thunk = (**authored).clone(),
+                Source::Argument { facts, .. } => return facts.observations.non_lists.clone(),
                 Source::Syntax(expression) => {
                     if !seen.insert((
                         thunk.environment.id,
@@ -2153,7 +2722,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         let mut seen = HashSet::new();
         loop {
             match &thunk.source {
-                Source::Argument { authored, .. } => thunk = (**authored).clone(),
+                Source::Argument { facts, .. } => return facts.observations.string.clone(),
                 Source::Value(value) => match value.as_ref() {
                     Value::Concrete(ConcreteValue::String(value)) => {
                         return Some(value.expose_plaintext().to_owned());
@@ -2198,6 +2767,285 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         }
     }
 
+    fn reference_environment(&self, id: usize) -> usize {
+        self.reference_environments.get(&id).copied().unwrap_or(id)
+    }
+
+    fn function_environment(&mut self) -> usize {
+        let id = next_environment();
+        for recording in &mut self.function_recordings {
+            recording.local_environments.insert(id);
+        }
+        id
+    }
+
+    fn argument_facts(
+        &self,
+        argument: &Thunk<B>,
+        proof: Option<Evidence>,
+        observations: ArgumentObservations,
+    ) -> ArgumentFacts {
+        let origin = proof.is_none().then(|| {
+            let mut thunk = argument;
+            loop {
+                match &thunk.source {
+                    Source::Argument { facts, .. } => {
+                        return facts
+                            .origin
+                            .clone()
+                            .expect("pending argument has an origin");
+                    }
+                    Source::Syntax(source) => {
+                        let mut source = source;
+                        loop {
+                            if let Some(parameter) = thunk
+                                .environment
+                                .nodes
+                                .get(&(source.secrecy_instance().clone(), source.node_id()))
+                            {
+                                thunk = parameter;
+                                break;
+                            }
+                            if matches!(
+                                source.secrecy_kind(),
+                                ExprKind::Alias
+                                    | ExprKind::Parens
+                                    | ExprKind::Definition
+                                    | ExprKind::Declaration
+                            ) && source.secrecy_children().len() == 1
+                            {
+                                source = &source.secrecy_children()[0];
+                                continue;
+                            }
+                            return match source.secrecy_kind() {
+                                ExprKind::Parameter(_) | ExprKind::UntypedParameter => {
+                                    ArgumentOrigin::UnboundParameter
+                                }
+                                ExprKind::Binding(binding) => self.argument_reference_origin(
+                                    binding,
+                                    Vec::new(),
+                                    &thunk.environment,
+                                    Some(source.secrecy_instance().clone()),
+                                ),
+                                ExprKind::Reference {
+                                    binding,
+                                    attribute,
+                                    segments,
+                                } => self.argument_reference_origin(
+                                    binding,
+                                    std::iter::once(PathSegment::Field {
+                                        name: attribute.clone(),
+                                    })
+                                    .chain(segments.iter().cloned())
+                                    .collect(),
+                                    &thunk.environment,
+                                    Some(source.secrecy_instance().clone()),
+                                ),
+                                _ => ArgumentOrigin::Syntax(
+                                    (source.secrecy_instance().clone(), source.node_id()),
+                                    self.reference_environment(thunk.environment.id),
+                                    Arc::new(self.activation.clone()),
+                                ),
+                            };
+                        }
+                    }
+                    Source::Value(value) => {
+                        if let Value::Deferred(DeferredValue::Placeholder(
+                            ParserPlaceholder::FnParam { name }
+                            | ParserPlaceholder::FnLocal { name },
+                        )) = value.as_ref()
+                            && let Some(parameter) = thunk.environment.names.get(name)
+                        {
+                            thunk = parameter;
+                            continue;
+                        }
+                        if matches!(
+                            value.as_ref(),
+                            Value::Deferred(DeferredValue::Placeholder(
+                                ParserPlaceholder::FnParam { .. }
+                                    | ParserPlaceholder::FnLocal { .. }
+                            ))
+                        ) {
+                            return ArgumentOrigin::UnboundParameter;
+                        }
+                        return match value.as_ref() {
+                            Value::Deferred(DeferredValue::BindingRef { binding }) => self
+                                .argument_reference_origin(
+                                    binding,
+                                    Vec::new(),
+                                    &thunk.environment,
+                                    None,
+                                ),
+                            Value::Deferred(DeferredValue::ResourceRef { path }) => self
+                                .argument_reference_origin(
+                                    path.binding_address(),
+                                    std::iter::once(PathSegment::Field {
+                                        name: path.attribute().to_string(),
+                                    })
+                                    .chain(path.segments().iter().cloned())
+                                    .collect(),
+                                    &thunk.environment,
+                                    None,
+                                ),
+                            _ => ArgumentOrigin::Value(
+                                Arc::as_ptr(value) as usize,
+                                self.reference_environment(thunk.environment.id),
+                                Arc::new(self.activation.clone()),
+                            ),
+                        };
+                    }
+                }
+            }
+        });
+        ArgumentFacts {
+            proof,
+            observations,
+            origin,
+        }
+    }
+
+    fn argument_reference_origin(
+        &self,
+        binding: &B,
+        path: Vec<PathSegment>,
+        environment: &Environment<B>,
+        instance: Option<ExpressionInstance>,
+    ) -> ArgumentOrigin {
+        ArgumentOrigin::Reference {
+            instance,
+            binding: binding.as_str().to_owned(),
+            path,
+            environment: self.reference_environment(environment.id),
+            activation: Arc::new(self.activation.clone()),
+        }
+    }
+
+    fn record_function(&mut self, mut key: FunctionKey<B>, depth: usize, arguments: Vec<Thunk<B>>) {
+        #[cfg(test)]
+        {
+            self.function_body_evaluations += 1;
+        }
+        key.activation = Some(Arc::new(self.activation.clone()));
+        self.function_recordings.push(FunctionRecording {
+            key,
+            depth,
+            max_before: self.max_depth,
+            errors: self.findings.len(),
+            reference_nesting: self.active_references.len(),
+            references: Vec::new(),
+            local_environments: BTreeSet::new(),
+            arguments,
+            activation: self.activation.clone(),
+        });
+        self.max_depth = depth;
+    }
+
+    fn finish_function(&mut self, values: &[Option<Evidence>]) {
+        let mut recording = self
+            .function_recordings
+            .pop()
+            .expect("active function recording");
+        let relative_depth = self.max_depth.saturating_sub(recording.depth);
+        self.max_depth = self.max_depth.max(recording.max_before);
+        let mut keys = HashSet::new();
+        let findings = self.findings[recording.errors..]
+            .iter()
+            .filter(|finding| keys.insert((**finding).clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        // Recursion depends on the active call stack and is never reusable.
+        if findings
+            .iter()
+            .any(|finding| matches!(finding.cause(), DerivationError::RecursiveFunction(_)))
+        {
+            return;
+        }
+        let memo = Arc::new(FunctionMemo {
+            evidence: values.last().cloned().flatten(),
+            findings,
+            relative_depth,
+            references: recording.references,
+            local_environments: recording.local_environments,
+            _arguments: recording.arguments,
+        });
+        if memo.references.is_empty() {
+            recording.key.activation = None;
+        }
+        if memo.references.is_empty() && memo.findings.is_empty() {
+            // Function bodies use argument observations for their conditions,
+            // not the caller's slot snapshot. A body with no reference effects
+            // is therefore independent of unrelated loop/attribute snapshots.
+            self.owner
+                .function_evidence
+                .borrow_mut()
+                .insert(recording.key, memo);
+        } else {
+            self.function_memo.insert(recording.key, memo);
+        }
+    }
+
+    fn reuse_function(
+        &mut self,
+        key: &FunctionKey<B>,
+        depth: usize,
+        work: &mut Vec<Work<B>>,
+    ) -> bool {
+        let memo = self
+            .owner
+            .function_evidence
+            .borrow()
+            .get(key)
+            .cloned()
+            .or_else(|| self.function_memo.get(key).cloned())
+            .or_else(|| {
+                let mut key = key.clone();
+                key.activation = Some(Arc::new(self.activation.clone()));
+                self.function_memo.get(&key).cloned()
+            });
+        let Some(memo) = memo else {
+            return false;
+        };
+        #[cfg(test)]
+        {
+            self.function_memo_hits += 1;
+        }
+        self.findings.extend(memo.findings.iter().cloned());
+        work.push(Work::MemoFunction(key.identity.clone()));
+        work.push(Work::FunctionResult(memo.evidence.clone()));
+        if memo.references.is_empty() {
+            self.max_depth = self.max_depth.max(depth + memo.relative_depth);
+            return true;
+        }
+        // Every invocation used to allocate fresh local environments. Rename
+        // those identities when replaying, while retaining the identities of
+        // module arguments, resource slots and authored caller arguments.
+        let renamed = memo
+            .local_environments
+            .iter()
+            .map(|id| (*id, self.function_environment()))
+            .collect::<BTreeMap<_, _>>();
+        for effect in memo.references.iter().rev() {
+            let mut environments = (*self.reference_environments).clone();
+            for (raw, effective) in effect.environments.iter() {
+                let target = renamed
+                    .get(effective)
+                    .or_else(|| self.reference_environments.get(effective))
+                    .copied()
+                    .unwrap_or(*effective);
+                environments.insert(*raw, target);
+            }
+            for (old, new) in &renamed {
+                if !effect.environments.contains_key(old) {
+                    environments.insert(*old, *new);
+                }
+            }
+            let mut effect = effect.clone();
+            effect.environments = Arc::new(environments);
+            work.push(Work::ReplayReference { effect, depth });
+        }
+        true
+    }
+
     fn function(
         &mut self,
         function: ExprValue<ParserPlaceholder, B>,
@@ -2211,14 +3059,16 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             work,
             values: _,
         } = context;
-        self.push_call(arguments, depth, work, |booleans, arguments| Work::Call {
-            function,
-            count: arguments.len(),
-            booleans,
-            arguments,
-            environment,
-            path,
-            depth,
+        self.push_call(arguments, depth, work, |observations, arguments| {
+            Work::Call {
+                function,
+                count: arguments.len(),
+                observations,
+                arguments,
+                environment,
+                path,
+                depth,
+            }
         });
     }
 
@@ -2227,13 +3077,17 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         arguments: Vec<Thunk<B>>,
         depth: usize,
         work: &mut Vec<Work<B>>,
-        call: impl FnOnce(Vec<Option<bool>>, Vec<Thunk<B>>) -> Work<B>,
+        call: impl FnOnce(Vec<ArgumentObservations>, Vec<Thunk<B>>) -> Work<B>,
     ) {
-        let booleans = arguments
+        let observations = arguments
             .iter()
-            .map(|argument| self.known_boolean(argument))
+            .map(|argument| ArgumentObservations {
+                boolean: self.known_boolean(argument),
+                string: self.known_string(argument),
+                non_lists: self.non_list_members(argument),
+            })
             .collect();
-        work.push(call(booleans, arguments.clone()));
+        work.push(call(observations, arguments.clone()));
         work.extend(arguments.into_iter().rev().map(|thunk| Work::Enter {
             thunk,
             path: Vec::new(),
@@ -2269,8 +3123,25 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             values.push(None);
             return;
         }
+        let observations = self.owner.function_observations(&function);
+        let key = FunctionKey {
+            identity: FunctionIdentity::Syntax(identity.clone()),
+            arguments: arguments
+                .iter()
+                .map(|argument| match &argument.source {
+                    Source::Argument { facts, .. } => facts.for_key(observations),
+                    _ => unreachable!("call arguments have been evaluated"),
+                })
+                .collect(),
+            path: path.clone(),
+            activation: None,
+        };
+        if self.reuse_function(&key, depth, work) {
+            return;
+        }
+        self.record_function(key, depth, arguments.clone());
         let mut parameters = (*environment).clone();
-        parameters.id = next_environment();
+        parameters.id = self.function_environment();
         parameters.in_function = true;
         let mut defaults = Vec::new();
         for (index, node) in signature.parameter_nodes.iter().enumerate() {
@@ -2295,7 +3166,8 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         }
         let Some(body) = function.secrecy_function_body() else {
             values.push(None);
-            self.activation.syntax.remove(&identity);
+            self.finish_function(values);
+            self.activation.syntax.shift_remove(&identity);
             return;
         };
         let mut children = defaults;
@@ -2474,12 +3346,12 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         .iter()
                         .map(|argument| thunk(argument.walker_value()))
                         .collect::<Vec<_>>();
-                    self.push_call(arguments, depth, work, |booleans, arguments| {
+                    self.push_call(arguments, depth, work, |observations, arguments| {
                         Work::ValueCall {
                             function: lexical_function,
                             functions: lexical_functions,
                             count: arguments.len(),
-                            booleans,
+                            observations,
                             arguments,
                             environment,
                             path,
@@ -2548,7 +3420,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
         function: Arc<crate::parser::UserFunction<B>>,
         functions: Arc<IndexMap<String, crate::parser::UserFunction<B>>>,
         args: Vec<Option<Evidence>>,
-        booleans: Vec<Option<bool>>,
+        observations: Vec<ArgumentObservations>,
         authored_arguments: Vec<Thunk<B>>,
         context: FunctionContext<'_, B>,
     ) {
@@ -2570,18 +3442,46 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             values.push(None);
             return;
         }
+        let argument_count = args.len();
+        let arguments = args
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                self.argument_facts(
+                    &authored_arguments[index],
+                    value,
+                    observations[index].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let identity = FunctionIdentity::Value(location.clone(), environment.module.clone());
+        let dependencies = self
+            .owner
+            .value_function_observations(&identity, &function, &functions);
+        let key = FunctionKey {
+            identity,
+            arguments: arguments
+                .iter()
+                .map(|facts| facts.for_key(dependencies))
+                .collect(),
+            path: path.clone(),
+            activation: None,
+        };
+        if self.reuse_function(&key, depth, work) {
+            return;
+        }
+        self.record_function(key, depth, authored_arguments.clone());
         let mut parameters = (*environment).clone();
-        parameters.id = next_environment();
+        parameters.id = self.function_environment();
         parameters.in_function = true;
         parameters.functions = Some(functions);
         let mut defaults = Vec::new();
         for (index, parameter) in function.params.iter().enumerate() {
-            let argument = if let Some(value) = args.get(index) {
+            let argument = if let Some(facts) = arguments.get(index) {
                 Some(Thunk {
                     source: Source::Argument {
                         authored: Box::new(authored_arguments[index].clone()),
-                        proof: value.clone(),
-                        boolean: booleans[index],
+                        facts: facts.clone(),
                         activation: activation.clone(),
                     },
                     environment: environment.clone(),
@@ -2593,7 +3493,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                 })
             };
             if let Some(argument) = argument {
-                if index >= args.len() {
+                if index >= argument_count {
                     defaults.push(argument.clone());
                 }
                 Arc::make_mut(&mut parameters.names).insert(parameter.name.clone(), argument);
