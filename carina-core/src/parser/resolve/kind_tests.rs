@@ -350,8 +350,7 @@ fn reader_kinds_exclude_enriched() {
         ParserPlaceholder::project(&value),
         Cow::Borrowed(_)
     ));
-    let (value, ()) = ParserPlaceholder::split_operand(value);
-    assert!(crate::resource::same_plain_representation(&value, &value));
+    let (_, ()) = ParserPlaceholder::split_operand(value);
 }
 
 const DEFECTS: [&str; 16] = [

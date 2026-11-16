@@ -346,13 +346,6 @@ impl<P: ValueShape, B: BindingAddress> SecretPayload<P, B> {
         }
     }
 
-    // Deliberately does not mark or inspect the retained operand. Debug remains masked.
-    pub(crate) fn wrap_storage(value: Value<P, B>) -> Self {
-        Self {
-            value: Box::new(value),
-        }
-    }
-
     pub(crate) fn same_storage(
         &self,
         other: &Self,
@@ -361,6 +354,16 @@ impl<P: ValueShape, B: BindingAddress> SecretPayload<P, B> {
         let Self { value: a } = self;
         let Self { value: b } = other;
         compare(a, b)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl<B: BindingAddress> SecretPayload<crate::parser::EnrichedAuthored, B> {
+    // Retained operands may contain unmarked plaintext; readers cannot call this.
+    pub(crate) fn wrap_storage(value: Value<crate::parser::EnrichedAuthored, B>) -> Self {
+        Self {
+            value: Box::new(value),
+        }
     }
 }
 

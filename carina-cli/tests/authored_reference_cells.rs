@@ -3,8 +3,10 @@
 //! Refresh with this fixed command, then review the diff:
 //! cargo nextest run -p carina-cli --test authored_reference_cells --run-ignored only -E 'test(=record_authored_reference_cells)'
 //! A PR that correctly changes diagnostic wording refreshes and reviews this file's golden.
-//! The golden also pins Debug rendering of errors: renaming an error field changes
-//! it too. Refresh and read the diff.
+//! The golden pins the original typed error vector, including Debug field names,
+//! and rendered errors. Facade/replay equality is asserted without recording a
+//! duplicate. JSON is stored once and its compact serialized bytes are compared.
+//! Refresh and read the diff when an error field or diagnostic changes.
 //! The 16 erased-reference rows and their same-file twins record main's
 //! known-accept / unknown-reject behaviour where observed. The node-judge PR
 //! of #4400 changes those outcomes ON PURPOSE. An unexplained accept/reject
@@ -446,8 +448,7 @@ fn observe(path: &carina_core::paths::ResolvedPath) -> Json {
         .collect::<Vec<_>>();
     // A BindingUseReport can present several diagnostics from one AppError.
     // Expand only this typed grouping for classification/instance ownership;
-    // keep the original facade and replay vectors verbatim in the record.
-    let json_bytes = serde_json::to_string(&detailed.json).unwrap();
+    // retain the original typed vector and facade rendering in the record.
     let parse_warnings = detailed
         .warnings
         .iter()
@@ -480,23 +481,19 @@ fn observe(path: &carina_core::paths::ResolvedPath) -> Json {
         .cloned()
         .unwrap_or_default();
     let aligned = errors.len() == typed_errors.len();
-    let facade_aligned = errors.len() == facade.len();
     let mut all = Vec::new();
     for (index, diagnostic) in errors.into_iter().enumerate() {
         let typed = aligned.then(|| &typed_errors[index]);
         let (class, reason) = classify(typed, &diagnostic);
         all.push(json!({"channel": "errors", "index": index, "class": class,
-            "reason": reason, "diagnostic": diagnostic,
-            "facade_error": if facade_aligned { facade.get(index) } else { None },
-            "typed_rendered_error": typed.map(|error| carina_cli::error::format_error_with_source_chain(error)),
-            "resource_id": typed.and_then(error_resource_id),
-            "typed_error_debug": typed.map(|e| format!("{e:#?}"))}));
+            "reason": reason,
+            "resource_id": typed.and_then(error_resource_id)}));
     }
     for (index, diagnostic) in warnings.into_iter().enumerate() {
         let (class, reason) = classify(None, &diagnostic);
         all.push(
             json!({"channel": "warnings", "index": index, "class": class,
-            "reason": reason, "diagnostic": diagnostic}),
+            "reason": reason}),
         );
     }
     assert_eq!(
@@ -505,8 +502,8 @@ fn observe(path: &carina_core::paths::ResolvedPath) -> Json {
     );
     json!({"status": if facade.is_empty() { "accept" } else { "reject" },
         "typed_error_vector": typed_error_vector,
-        "json_bytes": json_bytes, "typed_parse_warnings": parse_warnings,
-        "typed_input_warnings": input_warnings, "facade_errors": facade, "replayed_errors": replay, "facade_matches": facade == replay,
+        "typed_parse_warnings": parse_warnings,
+        "typed_input_warnings": input_warnings, "facade_errors": facade,
         "json": detailed.json, "diagnostics": all})
 }
 
@@ -682,6 +679,27 @@ fn authored_reference_cells_match_recorded() {
     assert_eq!(golden["skipped_probes"], json!(SKIPPED_PROBES));
     assert_eq!(golden["rows"].as_array().unwrap().len(), 108);
     let actual = cells();
+    for (recorded_row, actual_row) in golden["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(actual.as_array().unwrap())
+    {
+        for (recorded, actual) in recorded_row["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(actual_row["cells"].as_array().unwrap())
+        {
+            assert!(
+                serde_json::to_vec(&recorded["observation"]["json"]).unwrap()
+                    == serde_json::to_vec(&actual["observation"]["json"]).unwrap(),
+                "{} known={}: compact validate JSON bytes differ",
+                recorded_row["row"],
+                recorded["known"]
+            );
+        }
+    }
     if golden["rows"] != actual {
         eprintln!(
             "actual cells: {}",
@@ -696,7 +714,6 @@ fn authored_reference_cells_match_recorded() {
 fn record_authored_reference_cells() {
     let header = json!({"first_recorded_on": FIRST_RECORDED_ON, "original_rows": 92, "samefile_rows": 16, "rows": 108, "cells": 216});
     let golden = json!({"header": header, "normalization": "temporary directory prefix only",
-        "json_bytes": "compact serialization of validate_diagnostics_with_factories.json",
         "skipped_probes": SKIPPED_PROBES, "rows": cells()});
 
     std::fs::write(

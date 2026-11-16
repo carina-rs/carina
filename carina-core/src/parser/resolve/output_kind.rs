@@ -7,14 +7,14 @@ use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
-pub(super) struct EnrichedAuthored(ParserPlaceholder);
+pub(crate) struct EnrichedAuthored(ParserPlaceholder);
 #[derive(Clone)]
-pub(super) struct EnrichedReference<B: BindingAddress> {
+pub(crate) struct EnrichedReference<B: BindingAddress> {
     path: AccessPath<B>,
     plain_result: Box<S<B>>,
 }
 #[derive(Clone)]
-pub(super) struct EnrichedConversion<B: BindingAddress> {
+pub(crate) struct EnrichedConversion<B: BindingAddress> {
     operands: Vec<V<EnrichedAuthored, B>>,
     plain_result: Box<S<B>>,
 }
@@ -52,8 +52,8 @@ impl ResolveKind for EnrichedAuthored {
             _ => Cow::Owned(copy_storage(
                 value,
                 &mut |p| p.0.clone(),
-                &mut |payload| clone_plain(&payload.plain_result),
-                &mut |payload| clone_plain(&payload.plain_result),
+                &mut |payload| (*payload.plain_result).clone(),
+                &mut |payload| (*payload.plain_result).clone(),
             )),
         }
     }
@@ -79,21 +79,8 @@ impl ResolveKind for EnrichedAuthored {
     }
 }
 
-// Keep owned projection copies in the counted, exhaustive storage copier as
-// well. Cow::into_owned would hide stored-result tree copies in derived Clone.
-fn clone_plain<B: BindingAddress>(value: &S<B>) -> S<B> {
-    copy_storage(
-        value,
-        &mut Clone::clone,
-        &mut |never: &NoReferencePayload| match *never {},
-        &mut |never: &NoReferencePayload| match *never {},
-    )
-}
 pub(super) fn project_owned<B: BindingAddress>(value: &V<EnrichedAuthored, B>) -> S<B> {
-    match EnrichedAuthored::project(value) {
-        Cow::Borrowed(value) => clone_plain(value),
-        Cow::Owned(value) => value,
-    }
+    EnrichedAuthored::project(value).into_owned()
 }
 
 pub(super) fn observe_paths(

@@ -7,12 +7,14 @@ Example (run separately from the Rust tests):
 
 Only validate is measured: plan can open state backends and contact providers.
 The closure follows literal local source/import paths, preserving their relative
-layout and project .carina directories. Absolute local sources and interpolated
+layout. Only .crn files and provider/backend lock files are copied. Absolute local sources and interpolated
 local paths are refused rather than letting a subprocess use the original tree.
-Already installed user trust/plugin artifacts are copied from
-CARINA_RESOLVER_KIND_HOME (default: the caller's home). No init or download runs.
+Installed trust/plugin directories are shared through explicit directory overrides;
+no .carina or state files are copied. Credentials are removed from the inherited
+environment; HOME/cache and temporary files are placed under --out. Other
+environment variables are retained. No init or download runs.
 Build/toolchain/features may be described in CARINA_RESOLVER_KIND_BUILD_INFO.
-All writes, subprocess logs, HOME, caches and temporary files live under --out.
+Subprocess logs and generated output live under --out.
 No configuration or command output is printed.
 """
 
@@ -64,16 +66,30 @@ def literal(token):
     return token[1:-1].replace("\\'", "'").replace("\\\\", "\\")
 
 
+LOCK_FILES = ("carina-providers.lock", "carina-backend.lock")
+EXCLUDED_DIRECTORIES = {".git", ".carina", "target", "__pycache__"}
+
+
 def closure(config):
-    pending, directories, files = [config], set(), set()
+    pending, visited, directories, files = [config], set(), set(), set()
     while pending:
-        directory = pending.pop()
-        if directory in directories:
+        entry = pending.pop()
+        if entry in visited:
             continue
-        directories.add(directory)
-        for source in directory.rglob("*.crn"):
-            if any(part in {".git", ".carina", "target"} for part in source.relative_to(directory).parts):
+        visited.add(entry)
+        if entry.is_dir():
+            directories.add(entry)
+            sources = (source for source in entry.rglob("*.crn")
+                       if not any(part in EXCLUDED_DIRECTORIES for part in source.relative_to(entry).parts))
+        else:
+            if entry.suffix != ".crn":
+                raise Unavailable("a local source is not a .crn file")
+            directories.add(entry.parent)
+            sources = [entry]
+        for source in sources:
+            if source in files:
                 continue
+            files.add(source)
             text = TOKEN.sub(lambda match: match[0] if match[0][0] in "'\"" else "", source.read_text())
             for match in LOCAL_SOURCE.finditer(text):
                 value = literal(match[1])
@@ -82,28 +98,25 @@ def closure(config):
                 if value.startswith("file://"):
                     value = value[7:]
                 elif not value.startswith((".", "/")) and not match[0].startswith(("import", "use")):
-                    continue  # A remote provider source, not a local module.
+                    continue
                 if Path(value).is_absolute():
-                    raise Unavailable("closure contains an interpolated or absolute local source")
+                    raise Unavailable("closure contains an absolute local source")
+                if ".carina" in Path(value).parts:
+                    raise Unavailable("a local source requires an excluded .carina directory")
                 target = (source.parent / value).resolve()
                 if not target.exists():
                     raise Unavailable("a local source in the configuration closure is missing")
-                if target.is_dir():
-                    pending.append(target)
-                else:
-                    files.add(target)
+                pending.append(target)
     checkout = git_value(config, "--show-toplevel")
     boundary = Path(checkout).resolve() if checkout else Path(os.path.commonpath(directories))
-    # Provider artifacts/locks can belong to an ancestor project, not the module.
-    for directory in list(directories):
+    for directory in directories:
         for parent in (directory, *directory.parents):
             if not parent.is_relative_to(boundary):
                 break
-            if (parent / ".carina").is_dir():
-                directories.add(parent / ".carina")
-            lock = parent / "carina-providers.lock"
-            if lock.is_file():
-                files.add(lock)
+            for name in LOCK_FILES:
+                lock = parent / name
+                if lock.is_file():
+                    files.add(lock)
             if parent == boundary:
                 break
     return directories, files, checkout
@@ -111,28 +124,18 @@ def closure(config):
 
 def copy_configuration(config, out, scratch):
     directories, files, checkout = closure(config)
-    sources = directories | files
     if any(out.is_relative_to(path) for path in directories):
         raise Unavailable("--out must be outside the configuration closure")
-    anchor = Path(os.path.commonpath([str(path.parent) for path in sources]))
+    anchor = Path(os.path.commonpath([str(path.parent) for path in files] + [str(config.parent)]))
     destination = scratch / "configuration"
     destination.mkdir()
-    for source in sorted(directories, key=lambda path: (len(path.parts), str(path))):
-        target = destination / source.relative_to(anchor)
-        if target.exists():
-            continue
-        shutil.copytree(source, target,
-                        symlinks=False, ignore=shutil.ignore_patterns(".git", "target", "__pycache__"))
-    for source in files:
-        target = destination / source.relative_to(anchor)
-        if not target.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
     records = []
-    for source in sorted(destination.rglob("*")):
-        if source.is_file():
-            records.append({"path": str(source.relative_to(destination)),
-                            "bytes": source.stat().st_size, "sha256": digest(source)})
+    for source in sorted(files):
+        target = destination / source.relative_to(anchor)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        records.append({"path": str(target.relative_to(destination)),
+                        "bytes": target.stat().st_size, "sha256": digest(target)})
     return destination / config.relative_to(anchor), {
         "checkout_sha": git_value(checkout or config, "HEAD"),
         "closure_directories": len(directories),
@@ -143,19 +146,15 @@ def copy_configuration(config, out, scratch):
     }
 
 
-def isolated_environment(scratch):
+def credentials_removed_environment(scratch):
     home, temporary = scratch / "home", scratch / "tmp"
     home.mkdir()
     temporary.mkdir()
-    original = Path(os.environ.get("CARINA_RESOLVER_KIND_HOME", str(Path.home())))
-    artifacts = []
-    for name, override in (("trust", "CARINA_TRUST_RECORD_DIR"), ("plugin-cache", "CARINA_PLUGIN_CACHE_DIR")):
-        source = Path(os.environ.get(override, str(original / ".carina" / name)))
-        target = home / ".carina" / name
-        if source.is_dir():
-            shutil.copytree(source, target, symlinks=False)
-            artifacts.extend({"path": str(path.relative_to(home)), "sha256": digest(path)}
-                             for path in sorted(target.rglob("*")) if path.is_file())
+    original = Path.home()
+    artifact_directories = {
+        "trust": os.environ.get("CARINA_TRUST_RECORD_DIR", str(original / ".carina/trust")),
+        "plugin_cache": os.environ.get("CARINA_PLUGIN_CACHE_DIR", str(original / ".carina/plugin-cache")),
+    }
     env = os.environ.copy()
     credential_variables = {
         "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
@@ -165,16 +164,15 @@ def isolated_environment(scratch):
     }
     for key in list(env):
         if (key in credential_variables or key.upper().endswith(("_TOKEN", "_KEY"))
-                or "_SECRET" in key.upper() or key in {"GITHUB_TOKEN", "GH_TOKEN"}
-                or key in {
-            "CARINA_TEST_HOME", "NEXTEST_RUN_ID", "CARINA_TRUST_RECORD_DIR", "CARINA_PLUGIN_CACHE_DIR",
-        }):
+                or "_SECRET" in key.upper() or key in {"CARINA_TEST_HOME", "NEXTEST_RUN_ID"}):
             del env[key]
     env.update(HOME=str(home), TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary),
+               CARINA_TRUST_RECORD_DIR=artifact_directories["trust"],
+               CARINA_PLUGIN_CACHE_DIR=artifact_directories["plugin_cache"],
                AWS_EC2_METADATA_DISABLED="true", AWS_CONFIG_FILE=str(home / "absent-aws-config"),
                AWS_SHARED_CREDENTIALS_FILE=str(home / "absent-aws-credentials"),
                NO_COLOR="1", CLICOLOR="0")
-    return env, artifacts
+    return env, artifact_directories
 
 
 def normalize(document, scratch):
@@ -230,53 +228,71 @@ def exceeds_thresholds(delta):
         delta["p95_percent"] > 10 and delta["p95_ms"] > 10)
 
 
-def measure(label, left, right, config, scratch, env):
-    log_dir = scratch / label
-    log_dir.mkdir()
-    expected, warmups, pairs = None, [], []
-    for number in range(WARMUPS):
-        for lane, binary in (("main", left), ("candidate", right)):
-            sample = run(binary, config, scratch, env, log_dir / f"warmup-{number}-{lane}", expected)
-            expected = sample["json_sha256"]
-            warmups.append({"lane": lane, **sample})
-    for number in range(PAIRS):
-        lanes = [("main", left), ("candidate", right)]
-        if number % 2:
-            lanes.reverse()
-        pair = {"order": [lane for lane, _ in lanes]}
-        for lane, binary in lanes:
-            pair[lane] = run(binary, config, scratch, env, log_dir / f"pair-{number:02}-{lane}", expected)
-        pairs.append(pair)
-    stats = {}
-    for lane in ("main", "candidate"):
-        values = sorted(pair[lane]["wall_ms"] for pair in pairs)
-        stats[lane] = {"median_ms": statistics.median(values), "p95_ms": values[math.ceil(0.95 * len(values)) - 1]}
-    delta = {}
+def paired_statistics(pairs):
+    values = {lane: [pair[lane]["wall_ms"] for pair in pairs] for lane in ("main", "candidate")}
+    if not pairs or any(not math.isfinite(value) or value <= 0 for lane in values.values() for value in lane):
+        raise ValueError("paired timings must be nonempty, positive and finite")
+    def stats(samples):
+        return {"median_ms": statistics.median(samples),
+                "p95_ms": sorted(samples)[math.ceil(0.95 * len(samples)) - 1]}
+    lane_stats = {lane: stats(samples) for lane, samples in values.items()}
+    differences = [pair["candidate"]["wall_ms"] - pair["main"]["wall_ms"] for pair in pairs]
+    delta = stats(differences)
+    baseline = lane_stats["main"]["median_ms"]
     for metric in ("median", "p95"):
-        baseline, candidate = stats["main"][metric + "_ms"], stats["candidate"][metric + "_ms"]
-        delta[metric + "_ms"] = candidate - baseline
-        delta[metric + "_percent"] = (candidate / baseline - 1) * 100
-    return {"warmups": warmups, "pairs": pairs, "statistics": stats, "delta": delta,
+        delta[metric + "_percent"] = delta[metric + "_ms"] / baseline * 100
+    return {"statistics": lane_stats, "delta": delta,
             "verdict": "regression" if exceeds_thresholds(delta) else "within_thresholds"}
+
+
+def comparison_verdict(experiments):
+    # Both experiments use signed candidate-minus-main paired differences.
+    # Noise has no preferred direction; threshold its summary magnitudes.
+    noise = {key: abs(value) for key, value in experiments["main_vs_main_noise"]["delta"].items()}
+    return ("inconclusive" if exceeds_thresholds(noise)
+            else experiments["main_vs_head"]["verdict"]), noise
+
+
+def measure_interleaved(binaries, config, scratch, env):
+    experiments = {name: {"warmups": [], "pairs": []}
+                   for name in ("main_vs_main_noise", "main_vs_head")}
+    for name in experiments:
+        (scratch / name).mkdir()
+    expected = None
+    for stage, count in (("warmup", WARMUPS), ("pair", PAIRS)):
+        for number in range(count):
+            # One main/main pair, then one main/head pair, throughout sampling.
+            for name, experiment in experiments.items():
+                candidate = binaries["main" if name == "main_vs_main_noise" else "head"]
+                lanes = [("main", binaries["main"]), ("candidate", candidate)]
+                if number % 2:
+                    lanes.reverse()
+                pair = {"order": [lane for lane, _ in lanes]}
+                for lane, binary in lanes:
+                    pair[lane] = run(binary, config, scratch, env,
+                                     scratch / name / f"{stage}-{number:02}-{lane}", expected)
+                    expected = pair[lane]["json_sha256"]
+                experiment["warmups" if stage == "warmup" else "pairs"].append(pair)
+    for experiment in experiments.values():
+        experiment.update(paired_statistics(experiment["pairs"]))
+    return experiments
 
 
 def markdown(result):
     lines = ["validate only; plan excluded because it may contact providers or state backends.", "",
-             "| Experiment | Main median ms | Candidate median ms | Change % | Main p95 ms | Candidate p95 ms | Change % | Verdict |",
+             "| Experiment | Main median ms | Candidate median ms | Paired median delta ms | Delta % | Paired p95 delta ms | Delta % | Verdict |",
              "|---|---:|---:|---:|---:|---:|---:|---|"]
     for name, experiment in result.get("experiments", {}).items():
         left, right, delta = experiment["statistics"]["main"], experiment["statistics"]["candidate"], experiment["delta"]
-        lines.append(f"| {name} | {left['median_ms']:.3f} | {right['median_ms']:.3f} | {delta['median_percent']:.2f} | "
-                     f"{left['p95_ms']:.3f} | {right['p95_ms']:.3f} | {delta['p95_percent']:.2f} | {experiment['verdict']} |")
+        lines.append(f"| {name} | {left['median_ms']:.3f} | {right['median_ms']:.3f} | {delta['median_ms']:.3f} | {delta['median_percent']:.2f} | "
+                     f"{delta['p95_ms']:.3f} | {delta['p95_percent']:.2f} | {experiment['verdict']} |")
     lines.extend(["", f"Verdict: {result['verdict']}.",
-                  "Regression: median >5% and >5 ms, or p95 >10% and >10 ms. Noise exceeding those thresholds makes the result inconclusive; noise is never subtracted.",
-                  "Each experiment: 5 warmups per lane, then 30 pairs reversing order each pair; p95 uses nearest rank."])
+                  "Regression: paired median >5% and >5 ms, or paired p95 >10% and >10 ms; percentages use the main lane's median.",
+                  "Main/main noise uses the same paired statistics; a summary magnitude exceeding a threshold makes the result inconclusive.",
+                  "5 warmup pairs and 30 measured pairs per experiment, interleaved main/main then main/head; lane order reverses each pair; p95 uses nearest rank.",
+                  "Credentials removed; other environment is inherited, with temporary HOME/cache and shared installed trust/plugin directories."])
     if "reason" in result:
         lines.extend(["", result["reason"]])
-    if "noise_floor" in result:
-        noise = result["noise_floor"]
-        lines.extend(["", f"Main-versus-main absolute differences: median {noise['median_ms']:.3f} ms / "
-                      f"{noise['median_percent']:.2f}%; p95 {noise['p95_ms']:.3f} ms / {noise['p95_percent']:.2f}%."])
     return "\n".join(lines) + "\n"
 
 
@@ -288,7 +304,8 @@ def main():
     config, out = args.config.resolve(), args.out.resolve()
     result = {"command": "validate --json", "plan": "excluded: providers/state backends may require network or AWS",
               "warmups_per_lane": WARMUPS, "alternating_pairs": PAIRS, "experiments": {},
-              "cache_mode": "copied trust/plugins; shared isolated compiled cache, warmed per lane",
+              "cache_mode": "temporary compiled cache; shared installed trust/plugins; credentials removed",
+              "sampling": "interleaved main/main and main/head pairs",
               "build_info": os.environ.get("CARINA_RESOLVER_KIND_BUILD_INFO", "not supplied; binary hashes recorded")}
     writable_output = False
     try:
@@ -312,16 +329,12 @@ def main():
         result["binaries"] = {name: {"path": str(binary), "sha256": digest(binary)} for name, binary in binaries.items()}
         scratch = Path(tempfile.mkdtemp(prefix="resolver-kind-", dir=out))
         copied, result["configuration"] = copy_configuration(config, out, scratch)
-        env, result["user_artifacts"] = isolated_environment(scratch)
+        env, result["artifact_directories"] = credentials_removed_environment(scratch)
         result["scratch"] = str(scratch)
-        result["experiments"]["main_vs_main_noise"] = measure("main-vs-main", binaries["main"], binaries["main"], copied, scratch, env)
-        result["noise_floor"] = {key: abs(value) for key, value in result["experiments"]["main_vs_main_noise"]["delta"].items()}
-        result["experiments"]["main_vs_head"] = measure("main-vs-head", binaries["main"], binaries["head"], copied, scratch, env)
-        if exceeds_thresholds(result["noise_floor"]):
+        result["experiments"] = measure_interleaved(binaries, copied, scratch, env)
+        result["verdict"], result["noise_floor"] = comparison_verdict(result["experiments"])
+        if result["verdict"] == "inconclusive":
             result["experiments"]["main_vs_main_noise"]["verdict"] = "inconclusive"
-            result["verdict"] = "inconclusive"
-        else:
-            result["verdict"] = result["experiments"]["main_vs_head"]["verdict"]
     except (Unavailable, OSError, ValueError, subprocess.SubprocessError) as error:
         # Exception text from the OS can contain paths, but never print source or CLI output.
         result.update(verdict="unavailable", reason=str(error) if isinstance(error, Unavailable) else type(error).__name__)
@@ -330,7 +343,7 @@ def main():
         (out / "resolver-kind.json").write_text(json.dumps(result, indent=2) + "\n")
         (out / "resolver-kind.md").write_text(table)
     print(table, end="")
-    return {"within_thresholds": 0, "regression": 1, "unavailable": 2, "inconclusive": 3}[result["verdict"]]
+    return {"within_thresholds": 0, "regression": 1, "unavailable": 4, "inconclusive": 3}[result["verdict"]]
 
 
 if __name__ == "__main__":

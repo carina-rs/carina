@@ -59,7 +59,6 @@ pub struct InvocationObservation {
     pub same_inputs: bool,
     pub same_roots: bool,
     pub same_error: bool,
-    pub errored: bool,
 }
 /// Publication identity contains no values or parse IDs. The ordinal preserves
 /// multiplicity and source order within each invocation.
@@ -101,8 +100,6 @@ pub struct ProjectionReport {
     pub diagnostics_succeeded: bool,
     pub strict_error_matches: bool,
     pub diagnostics_error_matches: bool,
-    pub strict_error: Option<String>,
-    pub diagnostics_error: Option<String>,
 }
 impl ProjectionReport {
     pub fn publications(&self) -> Vec<RootPublication> {
@@ -115,7 +112,6 @@ struct State {
     plain_capture: bool,
     oracle: bool,
     per_file: bool,
-    bookkeeping: bool,
     entry: &'static str,
     ordinal: usize,
     invocation: Option<Frame>,
@@ -135,7 +131,6 @@ struct Frame {
     same_inputs: bool,
     same_roots: bool,
     same_error: bool,
-    errored: bool,
 }
 thread_local! {static OBSERVER:RefCell<State>=RefCell::new(State::default());}
 struct ObserverGuard(State);
@@ -173,17 +168,14 @@ pub(crate) fn count(event: usize) {
             return;
         }
         let oracle = s.oracle;
-        let bookkeeping = s.bookkeeping;
         if let Some(frame) = &mut s.invocation {
             if event >= EVENTS.len() {
-                if !bookkeeping {
-                    let counts = if oracle {
-                        &mut frame.oracle_storage_counts
-                    } else {
-                        &mut frame.storage_counts
-                    };
-                    counts.0[event - EVENTS.len()] += 1;
-                }
+                let counts = if oracle {
+                    &mut frame.oracle_storage_counts
+                } else {
+                    &mut frame.storage_counts
+                };
+                counts.0[event - EVENTS.len()] += 1;
             } else if oracle {
                 frame.oracle_counts.0[event] += 1;
                 frame.root_oracle_counts.0[event] += 1;
@@ -236,7 +228,6 @@ impl InvocationGuard {
                 same_inputs: false,
                 same_roots: false,
                 same_error: false,
-                errored: false,
             });
             Self(previous)
         })
@@ -258,7 +249,6 @@ impl Drop for InvocationGuard {
                 same_inputs: frame.same_inputs,
                 same_roots: frame.same_roots,
                 same_error: frame.same_error,
-                errored: frame.errored,
             });
             s.invocation = self.0.take();
         });
@@ -331,17 +321,119 @@ pub(crate) fn same_parse_error(
     {
         return false;
     }
-    match (a, b) {
-        (
-            ParseError::Located { path: a, error: ae },
-            ParseError::Located { path: b, error: be },
-        ) => a == b && same_parse_error(ae, be),
-        (ParseError::AtElement(a), ParseError::AtElement(b)) => {
-            a.location() == b.location() && same_parse_error(a.detail(), b.detail())
+    match a {
+        ParseError::Located { path, error } => {
+            if let ParseError::Located {
+                path: other_path,
+                error: other_error,
+            } = b
+            {
+                path == other_path && same_parse_error(error, other_error)
+            } else {
+                false
+            }
         }
-        _ => true,
+        ParseError::AtElement(error) => {
+            if let ParseError::AtElement(other) = b {
+                error.location() == other.location()
+                    && same_parse_error(error.detail(), other.detail())
+            } else {
+                false
+            }
+        }
+        ParseError::RetainedEvidence(_)
+        | ParseError::InsideSecret { line: _ }
+        | ParseError::SecretInConstraint { line: _ }
+        | ParseError::InterpolationInConstraintString {
+            kind: _,
+            line: _,
+            column: _,
+            span: _,
+        }
+        | ParseError::UnavailableSecret(_)
+        | ParseError::ValueWalk(_)
+        | ParseError::ProtectedFile(_)
+        | ParseError::Syntax(_)
+        | ParseError::InvalidExpression {
+            line: _,
+            message: _,
+        }
+        | ParseError::InvalidAuthoredExpression {
+            line: _,
+            diagnostic: _,
+        }
+        | ParseError::Evaluation { line: _, error: _ }
+        | ParseError::InvalidFloatLiteral { line: _, source: _ }
+        | ParseError::IntegerArithmetic {
+            line: _,
+            column: _,
+            end_column: _,
+            message: _,
+        }
+        | ParseError::UnboundLoopRead {
+            kind: _,
+            line: _,
+            span: _,
+        }
+        | ParseError::DeferredForBodyUnsupported(_)
+        | ParseError::DeferredForBodyTemplate {
+            line: _,
+            header: _,
+            span: _,
+            error: _,
+        }
+        | ParseError::UnresolvedDeclarationType {
+            token: _,
+            line: _,
+            message: _,
+        }
+        | ParseError::UnknownFunction {
+            name: _,
+            line: _,
+            column: _,
+        }
+        | ParseError::ReservedResourceAttribute {
+            attribute: _,
+            line: _,
+            column: _,
+            end_line: _,
+            end_column: _,
+        }
+        | ParseError::SecretDerivedBackendAttribute {
+            backend_type: _,
+            attribute: _,
+            line: _,
+            start_column: _,
+            end_column: _,
+        }
+        | ParseError::InterpolationNotAllowedInLiteralString { line: _ }
+        | ParseError::InvalidResourceIdentity { line: _, error: _ }
+        | ParseError::InvalidResourceType(_)
+        | ParseError::DuplicateBinding { name: _, line: _ }
+        | ParseError::UndefinedIdentifier {
+            name: _,
+            line: _,
+            span: _,
+            suggestion: _,
+            in_scope: _,
+        }
+        | ParseError::UndefinedDeferredIterable {
+            name: _,
+            line: _,
+            span: _,
+            suggestion: _,
+            in_scope: _,
+        }
+        | ParseError::InternalError {
+            expected: _,
+            context: _,
+        }
+        | ParseError::RecursiveFunction(_)
+        | ParseError::CyclicLetBinding { chain: _ }
+        | ParseError::UserFunctionError(_) => true,
     }
 }
+
 pub(crate) fn take_oracle_root_counts() -> Counts {
     OBSERVER.with(|s| {
         std::mem::take(
@@ -363,85 +455,76 @@ pub(crate) fn set_oracle_root_counts(counts: Counts) {
             .root_oracle_counts = counts
     });
 }
-pub(crate) fn finish_invocation(
-    same_inputs: bool,
-    same_roots: bool,
-    same_error: bool,
-    errored: bool,
-) {
+pub(crate) fn finish_invocation(same_inputs: bool, same_roots: bool, same_error: bool) {
     OBSERVER.with(|s| {
         let mut s = s.borrow_mut();
         let frame = s.invocation.as_mut().expect("invocation");
         frame.same_inputs = same_inputs;
         frame.same_roots = same_roots;
         frame.same_error = same_error;
-        frame.errored = errored;
     });
-}
-pub(crate) struct BookkeepingGuard(bool);
-impl BookkeepingGuard {
-    pub(crate) fn enter() -> Self {
-        Self(OBSERVER.with(|s| {
-            let mut s = s.borrow_mut();
-            let old = s.bookkeeping;
-            s.bookkeeping = true;
-            old
-        }))
-    }
-}
-impl Drop for BookkeepingGuard {
-    fn drop(&mut self) {
-        OBSERVER.with(|s| s.borrow_mut().bookkeeping = self.0);
-    }
 }
 fn same_configuration_failure(
     a: Option<&config_loader::ConfigurationLoadFailure>,
     b: Option<&config_loader::ConfigurationLoadFailure>,
 ) -> bool {
     use config_loader::ConfigurationLoadDiagnostic;
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => {
+    match a {
+        None => b.is_none(),
+        Some(a) => {
+            let Some(b) = b else {
+                return false;
+            };
             a.kind() == b.kind()
                 && a.to_string() == b.to_string()
                 && a.diagnostics().len() == b.diagnostics().len()
                 && a.diagnostics()
                     .iter()
                     .zip(b.diagnostics())
-                    .all(|(a, b)| match (a, b) {
-                        (
-                            ConfigurationLoadDiagnostic::Parse { file: a, error: ae },
-                            ConfigurationLoadDiagnostic::Parse { file: b, error: be },
-                        ) => a == b && same_parse_error(ae, be),
-                        (
-                            ConfigurationLoadDiagnostic::Message {
-                                file: a,
-                                message: ae,
-                            },
-                            ConfigurationLoadDiagnostic::Message {
-                                file: b,
-                                message: be,
-                            },
-                        ) => a == b && ae == be,
-                        _ => false,
+                    .all(|(a, b)| match a {
+                        ConfigurationLoadDiagnostic::Parse { file, error } => {
+                            if let ConfigurationLoadDiagnostic::Parse {
+                                file: other_file,
+                                error: other_error,
+                            } = b
+                            {
+                                file == other_file && same_parse_error(error, other_error)
+                            } else {
+                                false
+                            }
+                        }
+                        ConfigurationLoadDiagnostic::Message { file, message } => {
+                            if let ConfigurationLoadDiagnostic::Message {
+                                file: other_file,
+                                message: other_message,
+                            } = b
+                            {
+                                file == other_file && message == other_message
+                            } else {
+                                false
+                            }
+                        }
                     })
         }
-        _ => false,
     }
 }
 fn same_directory_failure(
     a: Option<&config_loader::DirectoryParseFailure>,
     b: Option<&config_loader::DirectoryParseFailure>,
 ) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => {
+    match a {
+        None => b.is_none(),
+        Some(a) => {
+            let Some(b) = b else {
+                return false;
+            };
             a.to_string() == b.to_string()
                 && a.source_file() == b.source_file()
-                && match (a.parse_error(), b.parse_error()) {
-                    (None, None) => true,
-                    (Some(a), Some(b)) => same_parse_error(a, b),
-                    _ => false,
+                && match a.parse_error() {
+                    None => b.parse_error().is_none(),
+                    Some(error) => b
+                        .parse_error()
+                        .is_some_and(|other| same_parse_error(error, other)),
                 }
                 && a.element_diagnostic().map(|error| error.location())
                     == b.element_diagnostic().map(|error| error.location())
@@ -450,7 +533,6 @@ fn same_directory_failure(
                     == b.io_error()
                         .map(|error| (error.kind(), error.raw_os_error()))
         }
-        _ => false,
     }
 }
 /// Every invocation replays the original saved input, including failures and
@@ -514,7 +596,5 @@ pub fn compare_directory(
             plain_diagnostics.as_ref(),
             diagnostics_error.as_ref(),
         ),
-        strict_error: strict_error.map(|error| error.to_string()),
-        diagnostics_error: diagnostics_error.map(|error| error.to_string()),
     }
 }

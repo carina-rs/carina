@@ -1,5 +1,7 @@
 //! Full-corpus and per-invocation work observations through production entries.
-use carina_core::test_utils::resolver_kind::{EVENTS, ProjectionReport, compare_directory};
+use carina_core::test_utils::resolver_kind::{
+    EVENTS, ProjectionReport, STORAGE_EVENTS, compare_directory,
+};
 use carina_core::{
     EnvironmentSnapshot, parser::ProviderContext, paths::ResolvedPath, schema::SchemaRegistry,
 };
@@ -157,15 +159,27 @@ fn all_fixture_directories_project_identically() {
         .iter()
         .filter(|(_, report)| !report.strict_succeeded || !report.diagnostics_succeeded)
         .count();
+    let publishing_directories = reports
+        .iter()
+        .filter(|(_, report)| !report.roots.is_empty())
+        .count();
     let totals = format!(
-        "{} directories; {invocations} invocations; {published} publications; {failed} failed directories",
+        "{} directories; {invocations} invocations; {published} publications in {publishing_directories} directories; {failed} failed directories",
         reports.len()
     );
     for (label, report) in &reports {
         check(report, &format!("{label}; {totals}"));
+        assert!(
+            (!report.strict_succeeded
+                && !report.plain_strict_succeeded
+                && !report.diagnostics_succeeded
+                && !report.plain_diagnostics_succeeded)
+                || !report.invocations.is_empty(),
+            "{label}: neither an identical failure nor a resolver invocation; {totals}"
+        );
     }
     assert!(
-        failed > 0 && published > 0,
+        failed > 0 && publishing_directories * 4 >= reports.len() * 3,
         "vacuous corpus comparison: {totals}"
     );
 }
@@ -233,5 +247,19 @@ fn enriched_kind_does_no_extra_resolution_work() {
             .map(|invocation| invocation.oracle_counts.0[index])
             .sum::<usize>();
         assert!(total > 0, "CI input set never exercised {event}");
+    }
+    for (index, event) in STORAGE_EVENTS.iter().enumerate() {
+        let mut enriched = 0;
+        for report in &records {
+            for invocation in &report.invocations {
+                assert_eq!(
+                    invocation.oracle_storage_counts.0[index], 0,
+                    "plain kind emitted {event} in {} invocation {}",
+                    invocation.entry, invocation.ordinal
+                );
+                enriched += invocation.storage_counts.0[index];
+            }
+        }
+        assert!(enriched > 0, "enriched kind never exercised {event}");
     }
 }

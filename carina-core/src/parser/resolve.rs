@@ -105,8 +105,6 @@ resolver_events! {
         ReferenceEnvelope => "reference_envelope",
         ConversionEnvelope => "conversion_envelope",
         ProjectionVisit => "projection_visit",
-        CopyValue => "copy_value",
-        CopyContainer => "copy_container",
     }
 }
 
@@ -123,6 +121,8 @@ mod kind_tests;
 mod oracle;
 #[cfg(feature = "test-utils")]
 mod output_kind;
+#[cfg(feature = "test-utils")]
+pub(crate) use output_kind::EnrichedAuthored;
 
 /// Authored provider attribute holding defaults for desired resource tags.
 pub const DEFAULT_TAGS_ATTRIBUTE: &str = "default_tags";

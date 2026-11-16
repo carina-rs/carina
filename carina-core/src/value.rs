@@ -2326,7 +2326,7 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
             | DeferredValue::Unknown(_),
         ) => false,
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
-              crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => match *never {},
+        Value::Reference(never) | Value::Conversion(never) => match *never {},
     }
 }
 

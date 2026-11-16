@@ -167,10 +167,7 @@ pub(super) fn compare_invocation<E: ExportParamLike>(
                 same_inputs = false;
                 false
             };
-            let paths = {
-                let _bookkeeping = observation::BookkeepingGuard::enter();
-                output_kind::observe_paths(&lowered)
-            };
+            let paths = output_kind::observe_paths(&lowered);
             observation::publish(
                 matches,
                 matches!(kind, RootKind::Full),
@@ -184,7 +181,6 @@ pub(super) fn compare_invocation<E: ExportParamLike>(
         same_inputs,
         roots.is_empty(),
         same_failure(&plain, &enriched),
-        enriched.is_err(),
     );
     enriched
 }
@@ -212,6 +208,6 @@ pub(super) fn collect_plain_invocation<E: ExportParamLike>(
             value
         },
     );
-    observation::finish_invocation(true, true, true, result.is_err());
+    observation::finish_invocation(true, true, true);
     result
 }

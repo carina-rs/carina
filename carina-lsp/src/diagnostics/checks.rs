@@ -298,7 +298,7 @@ impl<'a> ContextFreeValue<'a> {
                 }
                 Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
                     is_context_free(expression.lhs()) && is_context_free(expression.rhs())
-                },
+                }
                 Value::Reference(never) | Value::Conversion(never) => match *never {},
             }
         }

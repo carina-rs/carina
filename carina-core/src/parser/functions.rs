@@ -546,7 +546,7 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         ) => false,
-              crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => match *never {},
+        GenericValue::Reference(never) | GenericValue::Conversion(never) => match *never {},
     }
 }
 
