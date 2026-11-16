@@ -521,9 +521,7 @@ impl ResidualModuleResolutionError {
                 }
                 | ParseError::InterpolationNotAllowedInLiteralString { line: _ }
                 | ParseError::InvalidResourceIdentity { line: _, error: _ }
-                | ParseError::UndefinedVariable(_)
                 | ParseError::InvalidResourceType(_)
-                | ParseError::DuplicateModule(_)
                 | ParseError::DuplicateBinding { name: _, line: _ }
                 | ParseError::UndefinedIdentifier {
                     name: _,
@@ -539,7 +537,6 @@ impl ResidualModuleResolutionError {
                     suggestion: _,
                     in_scope: _,
                 }
-                | ParseError::ModuleNotFound(_)
                 | ParseError::InternalError {
                     expected: _,
                     context: _,

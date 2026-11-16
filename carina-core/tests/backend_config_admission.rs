@@ -114,7 +114,7 @@ fn backend_config_directory_admits_before_concrete_extraction() {
 }
 
 #[test]
-fn backend_config_directory_preserves_region_defaults_and_env_strings() {
+fn backend_config_directory_preserves_region_defaults_and_shows_env_strings() {
     let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
         "CARINA_BACKEND_BUCKET".into(),
         "protected-bucket".into(),
@@ -125,7 +125,7 @@ fn backend_config_directory_preserves_region_defaults_and_env_strings() {
         &context,
     )
     .unwrap();
-    assert!(!format!("{admitted:?}").contains("protected-bucket"));
+    assert!(format!("{admitted:?}").contains("protected-bucket"));
     assert!(!admitted.attributes().contains_key("auto_create"));
     assert_eq!(
         admitted.attributes()["encrypt"],

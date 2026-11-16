@@ -683,15 +683,40 @@ mod tests {
         }
     }
 
+    fn dispatch_marked_string(text: &str) -> crate::resource::ValueString {
+        let source = format!(
+            "let value = secret({})",
+            crate::parser::display_string_literal(text)
+        );
+        let parsed = crate::parser::parse(
+            &source,
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let value = parsed.variables["value"]
+            .clone()
+            .resolve_root(&crate::resource::RootScope::new())
+            .into_expanded()
+            .unwrap();
+        let resource: crate::resource::ProviderResource = Resource::new("test", "dispatch-input")
+            .with_attribute("value", value)
+            .into();
+        let mut resources = [resource];
+        crate::executor::normalized::unwrap_dispatch_desired(&mut resources);
+        let Value::Concrete(ConcreteValue::String(value)) =
+            resources[0].attributes.shift_remove("value").unwrap()
+        else {
+            panic!("dispatch string")
+        };
+        value
+    }
+
     #[test]
     fn reordered_known_leaves_retain_sensitivity_but_edits_are_plain() {
-        use crate::resource::ValueString;
         let original = vec![Resource::new("test", "sensitive").with_attribute(
             "items",
             Value::Concrete(ConcreteValue::List(vec![
-                Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-                    "sensitive",
-                ))),
+                Value::Concrete(ConcreteValue::String(dispatch_marked_string("sensitive"))),
                 Value::Concrete(ConcreteValue::String("plain".into())),
             ])),
         )];
@@ -722,9 +747,8 @@ mod tests {
 
     #[test]
     fn unchanged_sensitive_leaf_keeps_its_own_metadata_after_an_equal_sibling_is_edited() {
-        use crate::resource::ValueString;
         for string_list in [false, true] {
-            let values = vec!["x".into(), ValueString::diagnostic_sensitive("x")];
+            let values = vec!["x".into(), dispatch_marked_string("x")];
             let value = if string_list {
                 ConcreteValue::StringList(values)
             } else {
@@ -840,13 +864,12 @@ mod tests {
 
     #[test]
     fn original_known_leaf_metadata_is_consumed_once_and_scoped_to_its_attribute() {
-        use crate::resource::ValueString;
         let original = vec![
             Resource::new("test", "sensitive")
                 .with_attribute(
                     "items",
                     Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                        ConcreteValue::String(ValueString::diagnostic_sensitive("same")),
+                        ConcreteValue::String(dispatch_marked_string("same")),
                     )])),
                 )
                 .with_attribute(
@@ -910,14 +933,11 @@ mod tests {
 
     #[test]
     fn a_renamed_known_map_key_does_not_inherit_original_scalar_metadata() {
-        use crate::resource::ValueString;
         let original = vec![Resource::new("test", "map-move").with_attribute(
             "settings",
             Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "old".into(),
-                Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-                    "moved",
-                ))),
+                Value::Concrete(ConcreteValue::String(dispatch_marked_string("moved"))),
             )]))),
         )];
         let batch = NormalizationBatch::new(&original).unwrap();
@@ -1016,7 +1036,7 @@ mod tests {
 
     #[test]
     fn reordering_maps_in_a_list_preserves_nested_enum_and_sensitive_leaves() {
-        use crate::resource::{EnumValueResolver, ValueString};
+        use crate::resource::EnumValueResolver;
         use crate::schema::{CompiledAttributeType, TypeIdentity};
         let ty = CompiledAttributeType::enum_(
             TypeIdentity::new(Some("test"), ["Rule"], "Status"),
@@ -1039,9 +1059,7 @@ mod tests {
                     ),
                     (
                         "token".into(),
-                        Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-                            token,
-                        ))),
+                        Value::Concrete(ConcreteValue::String(dispatch_marked_string(token))),
                     ),
                 ])))
             })

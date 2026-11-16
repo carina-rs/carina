@@ -840,6 +840,16 @@ impl DirectoryBufferSnapshot {
         })
     }
 
+    /// Retain this snapshot's require scope without judging or admitting raw keys.
+    pub fn into_scoped_file(self) -> parser::ParsedFile {
+        let scope = self.require_scope();
+        let member = &self.sources[self.member.index];
+        debug_assert!(member.text.as_deref() == Some(self.member.buffer.text.as_ref()));
+        let mut parsed = self.member.buffer.parsed().clone();
+        crate::parser::retained::set_require_scope(&mut parsed, scope);
+        parsed
+    }
+
     fn require_scope(&self) -> crate::parser::retained::RequireScope {
         let inventories = self
             .sources
@@ -879,11 +889,7 @@ pub fn load_buffer_configuration_in_directory<'a>(
     schemas: &'a SchemaRegistry,
     config: &ProviderContext,
 ) -> BufferConfiguration<'a> {
-    let scope = snapshot.require_scope();
-    let member = &snapshot.sources[snapshot.member.index];
-    debug_assert!(member.text.as_deref() == Some(snapshot.member.buffer.text.as_ref()));
-    let mut parsed = snapshot.member.buffer.parsed().clone();
-    crate::parser::retained::set_require_scope(&mut parsed, scope);
+    let parsed = snapshot.into_scoped_file();
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
     }
@@ -1332,13 +1338,12 @@ impl LoadedConfig {
         &self,
         catalog: &ProviderContext,
         schemas: &SchemaRegistry,
-    ) -> Result<ParsedRootDirectory, String> {
+    ) -> Option<ParsedRootDirectory> {
         let resolution = ResolutionContext::issue(ResolutionPhase::Bootstrap).metadata_only();
         let mut parsed = self.unresolved_parsed.parsed.clone();
-        parser::resolve_resource_refs_in_context(&mut parsed, catalog, None, resolution)
-            .map_err(|error| error.to_string())?;
+        parser::resolve_resource_refs_in_context(&mut parsed, catalog, None, resolution).ok()?;
         crate::parser::retained::judge_configuration(&mut parsed, schemas, catalog);
-        Ok(RootDirectoryParse::with_resolution(parsed, resolution))
+        Some(RootDirectoryParse::with_resolution(parsed, resolution))
     }
 }
 
@@ -2872,9 +2877,10 @@ mod tests {
         )
         .unwrap();
         let schemas = SchemaRegistry::new();
-        let configuration = load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration =
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
-        let tree = parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let _tree = parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         let mut validation =
@@ -2884,12 +2890,12 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             validation
                 .admitted_resources(
-                    &tree,
                     judged,
                     &bindings,
                     session,
                     crate::validation::FindingSubject::Root,
                 )
+                .unwrap()
                 .for_each(drop);
         });
         let presented = validation.complete().into_presented();

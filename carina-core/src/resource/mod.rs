@@ -1640,24 +1640,22 @@ pub enum Subscript {
 impl Subscript {
     /// Append this subscript to `out` in canonical source form: `[0]` or
     /// `['k']`. String keys use the same literal encoder as `carina fmt`.
+    /// The enclosing payload or diagnostic scope controls secret visibility.
     pub fn append_to_dot_string(&self, out: &mut String) {
         use std::fmt::Write as _;
         match self {
             Subscript::Int { index } => {
                 let _ = write!(out, "[{}]", index);
             }
-            Subscript::Str { key } => match key.diagnostic_literal() {
-                Some(key) => {
-                    let _ = write!(out, "[{}]", display_string_literal(key));
-                }
-                None => out.push_str("[value from env()]"),
-            },
+            Subscript::Str { key } => {
+                let _ = write!(out, "[{}]", display_string_literal(key.expose_plaintext()));
+            }
         }
     }
 
-    /// Append the runtime path spelling. This is reserved for evaluation,
-    /// identity, serialization, and provider transport; diagnostics must use
-    /// [`Self::append_to_dot_string`] so an `env()`-derived key stays marked.
+    /// Append the runtime path spelling for evaluation, identity, serialization,
+    /// and provider transport. [`Self::append_to_dot_string`] uses the canonical
+    /// DSL literal encoder instead; neither method controls secret visibility.
     pub fn append_to_plaintext_dot_string(&self, out: &mut String) {
         use std::fmt::Write as _;
         match self {
@@ -1690,8 +1688,7 @@ pub enum PathSegment {
 
 impl PathSegment {
     /// Append this segment in DSL source form (`.field`, `[0]`, or
-    /// `['key']`). Diagnostic-sensitive string keys stay redacted through
-    /// [`Subscript::append_to_dot_string`].
+    /// `['key']`).
     pub fn append_to_dot_string(&self, out: &mut String) {
         match self {
             Self::Field { name } => {
@@ -1709,8 +1706,7 @@ impl PathSegment {
         out
     }
 
-    /// Return this segment in runtime source form, exposing a string
-    /// subscript only for internal identity and hashing paths.
+    /// Return this segment in the runtime spelling used by identity and hashing.
     pub(crate) fn to_plaintext_dot_string(&self) -> String {
         let mut out = String::new();
         match self {
@@ -2066,13 +2062,7 @@ impl<B: BindingAddress> AccessPath<B> {
                 PathSegment::Subscript { .. } => 4, // rough: `[xx]`
             })
             .sum();
-        let binding = if expose_plaintext {
-            self.binding.as_str()
-        } else {
-            self.binding
-                .diagnostic_literal()
-                .unwrap_or("value from env()")
-        };
+        let binding = self.binding.as_str();
         let mut out = String::with_capacity(binding.len() + self.attribute.len() + 1 + segment_len);
         out.push_str(binding);
         out.push('.');
@@ -2142,15 +2132,9 @@ impl<B: BindingAddress> ReferencePath<B> {
     pub fn to_dot_string(&self) -> String {
         match self {
             Self::Access(path) => path.to_dot_string(),
-            Self::Binding(binding) => binding
-                .diagnostic_literal()
-                .unwrap_or("value from env()")
-                .to_string(),
+            Self::Binding(binding) => binding.as_str().to_string(),
             Self::BindingAccess { binding, segments } => {
-                let mut rendered = binding
-                    .diagnostic_literal()
-                    .unwrap_or("value from env()")
-                    .to_string();
+                let mut rendered = binding.as_str().to_string();
                 for segment in segments {
                     segment.append_to_dot_string(&mut rendered);
                 }
@@ -2396,9 +2380,7 @@ impl std::fmt::Display for ValueAccessError {
                 available,
                 len,
             } => {
-                let key = key
-                    .diagnostic_literal()
-                    .map_or_else(|| "value from env()".to_string(), display_string_literal);
+                let key = display_string_literal(key.expose_plaintext());
                 write!(
                     f,
                     "key {key} not found in map{}",
@@ -2986,16 +2968,15 @@ pub enum Value<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBinding
 pub type AuthoredValue = Value<ParserPlaceholder, RelativeBindingName>;
 pub type ExpandedValue = Value<NoPlaceholder, AbsoluteBindingAddress>;
 
-/// A runtime string together with provenance used exclusively to make
-/// diagnostic rendering safe.
+/// A runtime string with a display flag set by the secret mechanism's payload
+/// marking and the three diagnostic placeholder constructors in `references.rs`.
+/// Derived strings inherit the flag from their string inputs.
 ///
-/// The provenance bit is deliberately absent from equality, hashing, and the
-/// serde representation. An `env()` result therefore behaves exactly like an
-/// authored string in evaluation, plans, state, diffs, and provider payloads,
-/// while diagnostic code cannot accidentally format its plaintext. There is
-/// deliberately no `Display` implementation; `Debug` is redacted, and code
-/// that genuinely needs the bytes at an execution or serialization boundary
-/// must opt in through [`Self::expose_plaintext`].
+/// The flag is read by the list-uniqueness check at dispatch admission, the
+/// provider text inventory in `provider_text.rs`, provider event path collection
+/// in `provider_text/events.rs`, and this type's `Debug` implementation. It is
+/// absent from equality, hashing, and the serde representation. This type has
+/// no `Display` implementation.
 #[derive(Clone)]
 pub struct ValueString {
     plaintext: String,
@@ -3003,7 +2984,7 @@ pub struct ValueString {
 }
 
 impl ValueString {
-    /// Construct an ordinary authored/runtime string.
+    /// Construct a string with the display flag unset.
     pub fn plain(plaintext: impl Into<String>) -> Self {
         Self {
             plaintext: plaintext.into(),
@@ -3011,10 +2992,8 @@ impl ValueString {
         }
     }
 
-    /// Construct a string whose contents must never be included in a
-    /// diagnostic. Kept crate-private so only trusted value producers (`env()`
-    /// and secret payload construction) can attach
-    /// the provenance mark.
+    /// Construct a flagged string, used by the three diagnostic placeholder
+    /// constructors in `references.rs`.
     pub(crate) fn diagnostic_sensitive(plaintext: impl Into<String>) -> Self {
         Self {
             plaintext: plaintext.into(),
@@ -3022,29 +3001,28 @@ impl ValueString {
         }
     }
 
-    /// Expose the runtime bytes for evaluation, plan/state serialization, or
-    /// provider transport. Do not use this method to build diagnostics.
+    /// Return the string's plaintext.
     pub fn expose_plaintext(&self) -> &str {
         &self.plaintext
     }
 
-    /// Consume this value at an evaluation/serialization boundary.
+    /// Consume this value and return its plaintext.
     pub fn into_plaintext(self) -> String {
         self.plaintext
     }
 
+    /// Return whether the display flag is set.
     pub fn is_diagnostic_sensitive(&self) -> bool {
         self.diagnostic_sensitive
     }
 
-    /// Return a diagnostic-safe authored literal, or `None` when only the
-    /// runtime type may be rendered.
+    /// Return the plaintext when the display flag is unset, or `None` when set.
     pub fn diagnostic_literal(&self) -> Option<&str> {
         (!self.diagnostic_sensitive).then_some(self.plaintext.as_str())
     }
 
-    /// Build a derived string and inherit diagnostic sensitivity from every
-    /// string input that contributed to it.
+    /// Build a derived string and inherit the secret mechanism's marking from
+    /// every string input that contributed to it.
     pub(crate) fn derived_from<'a>(
         plaintext: impl Into<String>,
         sources: impl IntoIterator<Item = &'a Self>,
@@ -3951,11 +3929,10 @@ impl Hash for ModuleArgumentDiagnostic {
 /// failed during permissive resolution.
 ///
 /// The inner string has no public constructor. Built-in handlers are the
-/// diagnostic-safety boundary: values derived from sensitive inputs must be
-/// masked before their errors reach the resolver (as `env()` and `decrypt()`
-/// do). Keeping the constructor crate-private prevents downstream callers from
-/// attaching arbitrary, potentially sensitive payloads to an unavailable
-/// value.
+/// diagnostic-safety boundary: strings marked by the secret mechanism must be
+/// masked before their errors reach the resolver. Keeping the constructor
+/// crate-private prevents downstream callers from attaching arbitrary,
+/// potentially sensitive payloads to an unavailable value.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct UnavailableReason(UnavailableFailure);
 
@@ -5650,8 +5627,8 @@ pub enum DeferredValueRef<
 }
 
 impl<P: ValueKind, B: BindingAddress> Value<P, B> {
-    /// Whether this value tree carries any `env()`-derived string whose
-    /// plaintext must be excluded from diagnostics.
+    /// Whether this value tree contains strings marked by the secret mechanism.
+    /// Their plaintext must be excluded from diagnostics.
     pub(crate) fn contains_diagnostic_sensitive_string(&self) -> bool {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
@@ -6316,14 +6293,6 @@ impl std::fmt::Display for ParserPlaceholder {
     }
 }
 
-/// The authority that can establish a parser/template placeholder's type.
-#[doc(hidden)]
-pub enum PlaceholderTypeAuthority<'a> {
-    Binding(&'a str),
-    AwaitingSubstitution,
-    MissingExpression,
-}
-
 /// Internal behavior shared by the three stage marker types.
 #[doc(hidden)]
 pub trait ValueKind: Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize {
@@ -6416,8 +6385,6 @@ mod evaluable_leaf {
 /// A leaf permitted in evaluation, validation, and expansion inputs.
 /// Snapshot leaves cannot implement this sealed trait.
 pub trait PlaceholderKind: ValueKind + evaluable_leaf::Sealed {
-    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_>;
-
     /// Persisted serde identity used for deferred-secret hash material.
     /// Display wording must not affect this representation.
     #[doc(hidden)]
@@ -6425,27 +6392,9 @@ pub trait PlaceholderKind: ValueKind + evaluable_leaf::Sealed {
         serde_json::to_value(self)
     }
 }
-impl PlaceholderKind for NoPlaceholder {
-    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
-        match *self {}
-    }
-}
-impl PlaceholderKind for ParserPlaceholder {
-    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
-        match self {
-            Self::FnParam { name } | Self::FnLocal { name } | Self::ModuleArgument { name, .. } => {
-                PlaceholderTypeAuthority::Binding(name)
-            }
-            Self::Loop(_) => PlaceholderTypeAuthority::AwaitingSubstitution,
-            Self::EmptyInterpolation { .. } => PlaceholderTypeAuthority::MissingExpression,
-        }
-    }
-}
-impl PlaceholderKind for LoopSlot {
-    fn inference_type_authority(&self) -> PlaceholderTypeAuthority<'_> {
-        PlaceholderTypeAuthority::AwaitingSubstitution
-    }
-}
+impl PlaceholderKind for NoPlaceholder {}
+impl PlaceholderKind for ParserPlaceholder {}
+impl PlaceholderKind for LoopSlot {}
 
 impl ValueKind for NoPlaceholder {
     fn construct_access<B: BindingAddress>(
@@ -10403,24 +10352,6 @@ mod enum_attr_tests {
             resource.get_enum_attr(&schema, "status"),
             Err(EnumAttrError::UnexpectedShape { path, .. }) if path == "status"
         ));
-    }
-
-    #[test]
-    fn invalid_sensitive_string_is_redacted_in_error_display() {
-        let schema = schema_with_status();
-        let secret = "enum-secret-that-must-not-leak";
-        let resource = resource_with_attr(
-            "status",
-            ConcreteValue::String(ValueString::diagnostic_sensitive(secret)),
-        );
-
-        let error = match resource.get_enum_attr(&schema, "status") {
-            Err(error) => error,
-            Ok(_) => panic!("invalid closed enum member must fail"),
-        };
-
-        assert!(matches!(&error, EnumAttrError::NotAMember { .. }));
-        assert!(!error.to_string().contains(secret));
     }
 
     #[test]

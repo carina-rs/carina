@@ -278,10 +278,12 @@ pub use carina_provider_protocol::types::{
 
 /// Count and element policies enforced together when walking a list.
 ///
-/// Elements containing secrets or diagnostic-sensitive strings are skipped for
-/// uniqueness, like unresolved elements, to avoid revealing equality. The
-/// same applies when a secret encloses the list. Provider output and persisted
-/// state skip uniqueness as well; length constraints always apply.
+/// Elements containing Secret wrappers or diagnostic-sensitive strings are
+/// skipped for uniqueness to avoid revealing equality. This includes flagged
+/// strings after dispatch removes their wrappers, and a secret enclosing the list.
+/// Unresolved elements are skipped as well.
+/// `Desired(ProviderOutput)` and `State` purposes skip uniqueness; length
+/// constraints always apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListConstraints {
     length: Option<(Option<u64>, Option<u64>)>,
@@ -1182,8 +1184,8 @@ impl<R: PatternForm> ProviderPopulatedStructFieldBuilder<R> {
 pub enum LeafPathSegment {
     StructField(String),
     ListIndex(usize),
-    // Preserve producer sensitivity through every diagnostic rendering of a
-    // selected key; serde and key identity retain their existing string form.
+    // Keep string metadata alongside the key's runtime and serde spelling.
+    // Diagnostic callers choose the visibility of the path.
     MapKey(crate::resource::ValueString),
 }
 
@@ -2716,10 +2718,9 @@ impl FieldPath {
             let step = match &canonical {
                 LeafPathSegment::StructField(name) => FieldPathStep::Field(name.clone()),
                 LeafPathSegment::ListIndex(index) => FieldPathStep::Index(*index),
-                LeafPathSegment::MapKey(key) => match key.diagnostic_literal() {
-                    Some(key) => FieldPathStep::Field(key.to_owned()),
-                    None => FieldPathStep::Redacted(RedactedPathField::MapKey),
-                },
+                LeafPathSegment::MapKey(key) => {
+                    FieldPathStep::Field(key.expose_plaintext().to_owned())
+                }
             };
             path = path.pushed(step, canonical, FieldPathDirection::After);
         }
@@ -4052,7 +4053,7 @@ impl PatternAttributeType<Compiled> {
                     // produces a clear error for the common bare form.
                     let user_form = user_input
                         .map(DiagnosticValue::from)
-                        .unwrap_or_else(|| DiagnosticValue::from(s));
+                        .unwrap_or_else(|| DiagnosticValue::from(s.expose_plaintext()));
                     validate_enum_namespace(s.expose_plaintext(), identity).map_err(|message| {
                         TypeError::ValidationFailed {
                             message: format!(
@@ -4095,7 +4096,7 @@ impl PatternAttributeType<Compiled> {
                 Err(TypeError::InvalidEnumVariant {
                     value: user_input
                         .map(DiagnosticValue::from)
-                        .unwrap_or_else(|| DiagnosticValue::from(s)),
+                        .unwrap_or_else(|| DiagnosticValue::from(s.expose_plaintext())),
                     value_kind: InvalidEnumValueKind::Identifier,
                     attribute: None,
                     type_name: Some(name.to_string()),
@@ -5323,9 +5324,10 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
 }
 
 /// Compare the ordinary JSON of a value canonicalized with its successful fit
-/// for the active purpose. Unresolved elements and elements containing secrets
-/// or diagnostic-sensitive strings are not comparable: even a masked duplicate
-/// would reveal equality. The provider remains the final authority for them.
+/// for the active purpose. Unresolved elements, elements containing Secret
+/// wrappers, and dispatch-unwrapped diagnostic-sensitive strings are not
+/// comparable: even a masked duplicate would reveal equality. The provider
+/// remains the final authority for them.
 /// Canonicalization preserves integer/float spellings and struct block aliases,
 /// so those spellings remain distinct keys: uniqueness can miss duplicates but
 /// must never invent them (including by rounding large integers to floats).
@@ -7623,7 +7625,6 @@ pub enum InvalidEnumValueKind {
 pub enum DiagnosticValue {
     Plain(String),
     Masked,
-    TypeOnlyString,
 }
 
 /// Numeric diagnostic payload, preserving its representation until rendering.
@@ -7670,7 +7671,7 @@ impl DiagnosticValue {
     pub fn as_plain(&self) -> Option<&str> {
         match self {
             Self::Plain(value) => Some(value),
-            Self::Masked | Self::TypeOnlyString => None,
+            Self::Masked => None,
         }
     }
 
@@ -7685,7 +7686,6 @@ impl DiagnosticValue {
                 InvalidEnumValueKind::Identifier => value.clone(),
             },
             Self::Masked => SECRET_VALUE_MASK.to_string(),
-            Self::TypeOnlyString => "string".to_string(),
         };
         DiagnosticText::new(text).to_string()
     }
@@ -7711,10 +7711,7 @@ impl From<ValueString> for DiagnosticValue {
 
 impl From<&ValueString> for DiagnosticValue {
     fn from(value: &ValueString) -> Self {
-        match value.diagnostic_literal() {
-            Some(value) => Self::Plain(value.to_owned()),
-            None => Self::TypeOnlyString,
-        }
+        Self::Plain(value.expose_plaintext().to_owned())
     }
 }
 
@@ -7828,6 +7825,7 @@ fn format_union_alternatives_mismatch(failures: &UnionArmFailures) -> String {
 
 fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
     match error {
+        TypeError::AttributePrefix(_error) => false,
         TypeError::UnionAlternativesMismatch { .. } => true,
         TypeError::ListItemError { inner, .. }
         | TypeError::MapKeyError { inner, .. }
@@ -7887,6 +7885,9 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
+    #[error(transparent)]
+    AttributePrefix(Box<crate::identifier::AttributePrefixError>),
+
     #[error("Type mismatch: {types}")]
     TypeMismatch { types: MismatchTypeNames },
 
@@ -8297,6 +8298,7 @@ impl TypeError {
     /// New TypeError variants must choose a shape here before they compile.
     pub(crate) fn diagnostic_shape(&self) -> ValidationDiagnostic<'_> {
         match self {
+            Self::AttributePrefix(_error) => ValidationDiagnostic::Plain(self),
             Self::ValidationFailed { message } => ValidationDiagnostic::Reason {
                 prefix: "Validation failed: ".into(),
                 reason: message,
@@ -8383,6 +8385,7 @@ impl TypeError {
     /// consumers do not need variant-specific position recovery.
     pub fn attribute_name(&self) -> Option<&str> {
         match self {
+            TypeError::AttributePrefix(_error) => None,
             TypeError::InvalidEnumVariant { attribute, .. }
             | TypeError::PatternMismatch { attribute, .. }
             | TypeError::LengthOutOfRange { attribute, .. }
@@ -16762,6 +16765,7 @@ impl crate::resource::InsideSecret for FieldPath {
 impl crate::resource::InsideSecret for TypeError {
     fn inside_secret(self) -> Self {
         match self {
+            TypeError::AttributePrefix(error) => TypeError::AttributePrefix(error),
             TypeError::InvalidEnumVariant {
                 value_kind,
                 attribute,

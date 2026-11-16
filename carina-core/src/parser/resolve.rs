@@ -3631,12 +3631,12 @@ let item = mock.test.resource {
     }
 
     #[test]
-    fn unavailable_reason_does_not_expose_an_env_derived_variable_name() {
+    fn unavailable_reason_shows_an_env_derived_variable_name() {
         const NAME_SOURCE: &str = "CARINA_TEST_UNAVAILABLE_NAME_SOURCE_3974";
-        const SENSITIVE_NAME: &str = "CARINA_TEST_SENSITIVE_VARIABLE_NAME_3974";
+        const MISSING_NAME: &str = "CARINA_TEST_MISSING_VARIABLE_NAME_3974";
         let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
             NAME_SOURCE.to_string(),
-            SENSITIVE_NAME.into(),
+            MISSING_NAME.into(),
         )]));
         let mut parsed =
             parsed_with_comment_and_config(&format!(r#"env(env("{NAME_SOURCE}"))"#), &config);
@@ -3651,9 +3651,9 @@ let item = mock.test.resource {
         };
         assert_eq!(
             reason.as_str(),
-            "environment variable named by a sensitive value is not set"
+            format!("environment variable '{MISSING_NAME}' is not set")
         );
-        assert!(!format!("{reason:?}").contains(SENSITIVE_NAME));
+        assert!(format!("{reason:?}").contains(MISSING_NAME));
     }
 }
 

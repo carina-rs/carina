@@ -68,6 +68,39 @@ pub(super) fn without_admission_work<R>(operation: impl FnOnce() -> R) -> R {
     result
 }
 
+fn selected_destination<K: AssignmentKind>(
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
+    id: &crate::resource::ResourceId,
+    attribute: &str,
+    catalog: &ProviderContext,
+) -> Destination<K> {
+    try_selected_destination(schema, id, attribute, catalog).unwrap()
+}
+
+fn try_selected_destination<K: AssignmentKind>(
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
+    id: &crate::resource::ResourceId,
+    attribute: &str,
+    catalog: &ProviderContext,
+) -> Result<Destination<K>, String> {
+    let effective = schema
+        .effective_attribute_by_authored_name(attribute)
+        .ok_or_else(|| format!("unknown attribute '{attribute}' on {id}"))?;
+    let ordinal = schema
+        .schema()
+        .as_schema()
+        .attributes()
+        .keys()
+        .position(|name| name == effective.name())
+        .ok_or_else(|| format!("unknown attribute '{attribute}' on {id}"))?;
+    Ok(schema.admission_selected_attribute_for_test(
+        id,
+        attribute,
+        crate::schema::value_validation::SchemaAttribute { ordinal, effective },
+        catalog,
+    ))
+}
+
 fn text(value: &str) -> Value {
     Value::Concrete(crate::resource::ConcreteValue::String(value.into()))
 }
@@ -138,9 +171,18 @@ fn fixture_in<R>(
     .unwrap()
     .resolve_root_for_test();
     let bindings = BindingIndex::from_parsed(&parsed, &schemas, catalog);
-    let destination = schemas
-        .resource_attribute_destination(&parsed.resources[1].id, "target", catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &parsed.resources[1].id.provider,
+                &parsed.resources[1].id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &parsed.resources[1].id,
+        "target",
+        catalog,
+    );
     f(catalog, &schemas, &bindings, &destination)
 }
 
@@ -180,9 +222,18 @@ fn destination_contracts_share_the_registered_schema_allocation() {
         .get("test", "Sink", crate::schema::SchemaKind::Resource)
         .unwrap();
     for name in ["first", "second"] {
-        let destination = schemas
-            .resource_attribute_destination(&id, name, &catalog)
-            .unwrap();
+        let destination = selected_destination::<kind::ResourceAttribute>(
+            schemas
+                .get(
+                    &id.provider,
+                    &id.resource_type,
+                    crate::schema::SchemaKind::Resource,
+                )
+                .unwrap(),
+            &id,
+            name,
+            &catalog,
+        );
         for destination in [&destination, &destination.clone()] {
             let contract = destination.contract.as_deref().unwrap();
             let schema = &contract.schema;
@@ -247,10 +298,10 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
                 .find(|resource| resource.id().resource_type == "Sink")
                 .unwrap();
             let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-            let inputs = attributes::ResourceAttributeInputs::new(resource);
+            let inputs = attributes::ResourceAttributeInputs::new_for_test(resource);
             with_session_for_test(&catalog, |session| {
                 let (findings, work) = count_admission_work(|| {
-                    let outcome = attributes::resource_attribute_admissions(
+                    let outcome = attributes::resource_attribute_admissions_for_test(
                         resource,
                         judged.file(),
                         resource.schema(&schemas).unwrap(),
@@ -565,7 +616,7 @@ fn resource_callers_admit_wider_same_identity_references() {
             .resolve_root_for_test();
             let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
             let configuration =
-                crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+                crate::test_utils::load_canonical_buffer_configuration(&parsed, schemas, catalog);
             crate::test_utils::legacy_validate_resources(
                 &parsed,
                 schemas,
@@ -634,8 +685,9 @@ fn issue_4362_resource_reference_admission_uses_anonymous_overlap() {
                     catalog,
                 );
                 let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
-                let configuration =
-                    crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+                let configuration = crate::test_utils::load_canonical_buffer_configuration(
+                    &parsed, schemas, catalog,
+                );
                 crate::validation::validate_attribute_param_ref_types_with_bindings(
                     &configuration.judged().file().attribute_params,
                     &bindings,
@@ -670,9 +722,18 @@ fn issue_4362_resource_reference_admission_uses_anonymous_overlap() {
                                         .is_some_and(|binding| binding.as_str() == name)
                                 })
                                 .unwrap();
-                            let destination = schemas
-                                .resource_attribute_destination(&resource.id, "target", catalog)
-                                .unwrap();
+                            let destination = selected_destination::<kind::ResourceAttribute>(
+                                schemas
+                                    .get(
+                                        &resource.id.provider,
+                                        &resource.id.resource_type,
+                                        crate::schema::SchemaKind::Resource,
+                                    )
+                                    .unwrap(),
+                                &resource.id,
+                                "target",
+                                catalog,
+                            );
                             let value = resource.attributes["target"].to_expanded().expect(
                                 "forwarded resource references have no parser placeholders",
                             );
@@ -1266,9 +1327,18 @@ fn infra_case(binding: &str, nested: bool, uuid: bool) {
     } else {
         1
     };
-    let destination = schemas
-        .resource_attribute_destination(&parsed.resources[index].id, attribute, &catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &parsed.resources[index].id.provider,
+                &parsed.resources[index].id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &parsed.resources[index].id,
+        attribute,
+        &catalog,
+    );
     let bindings = &bindings;
     let destination = &destination;
     with_session_for_test(&catalog, |session| {
@@ -1713,9 +1783,18 @@ fn unavailable_reference_authority_cannot_be_erased_by_resolution() {
     .unwrap()
     .resolve_root_for_test();
     let bindings = BindingIndex::from_parsed(&parsed, &schemas, &catalog);
-    let destination = schemas
-        .resource_attribute_destination(&parsed.resources[1].id, "target", &catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &parsed.resources[1].id.provider,
+                &parsed.resources[1].id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &parsed.resources[1].id,
+        "target",
+        &catalog,
+    );
     with_session_for_test(&catalog, |session| {
         let pending = validate(&destination, &reference(), &bindings, session)
             .unwrap()
@@ -2057,9 +2136,18 @@ fn data_source_attributes_use_the_same_local_obligation_and_discharge() {
     .unwrap()
     .resolve_root_for_test();
     let bindings = BindingIndex::from_parsed(&parsed, &schemas, &catalog);
-    let destination = schemas
-        .data_source_attribute_destination(&parsed.data_sources[1].id, "target", &catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::DataSourceAttribute>(
+        schemas
+            .get(
+                &parsed.data_sources[1].id.provider,
+                &parsed.data_sources[1].id.resource_type,
+                crate::schema::SchemaKind::DataSource,
+            )
+            .unwrap(),
+        &parsed.data_sources[1].id,
+        "target",
+        &catalog,
+    );
     with_session_for_test(&catalog, |session| {
         let pending = validate(&destination, &reference(), &bindings, session)
             .unwrap()
@@ -2797,9 +2885,18 @@ fn round13_cross_owner_same_identity_defers_in_reference_and_declared_admission(
     .unwrap()
     .resolve_root_for_test();
     let bindings = BindingIndex::from_parsed(&parsed, &schemas, &catalog);
-    let destination = schemas
-        .resource_attribute_destination(&parsed.resources[1].id, "value0", &catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &parsed.resources[1].id.provider,
+                &parsed.resources[1].id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &parsed.resources[1].id,
+        "value0",
+        &catalog,
+    );
     let source_schema = schemas
         .get("awscc", "Values", crate::schema::SchemaKind::Resource)
         .unwrap();
@@ -2879,7 +2976,6 @@ fn round13_cross_owner_same_identity_defers_in_reference_and_declared_admission(
 fn round2_plain_reference_skips_expression_callback() {
     use crate::parser::ProviderContext;
     use crate::resource::RelativeBindingName;
-    use crate::resource::knowledge::{KnowledgeContext, collect_classified_attributes};
     use crate::validation::admission::{attributes, kind};
     let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let mut schemas = crate::schema::SchemaRegistry::new();
@@ -2901,20 +2997,19 @@ fn round2_plain_reference_skips_expression_callback() {
         "let source = mock.Source {}\nlet sink = mock.Sink { input = source.output }",
     )
     .unwrap();
-    let judged = crate::parser::retained::JudgedFile::new(parsed, &schemas, &config);
-    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let canonical = crate::identifier::canonicalize_file_prefixes(
+        parsed,
+        &schemas,
+        crate::identifier::SuffixSource::Preview,
+    );
+    let judged = canonical.judge(&config);
+    let tree = judged.analysis_tree().unwrap();
     let resource = tree
         .project_resources()
         .find(|resource| resource.id().resource_type == "Sink")
         .unwrap();
-    let bindings =
-        crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &config);
-    let values = resource.attributes();
-    let classified = collect_classified_attributes(
-        values.iter().map(|(name, value)| (name.clone(), value)),
-        &KnowledgeContext::validation(),
-        |_, error| panic!("{error}"),
-    );
+    let bindings = judged.parsed().binding_index(&config);
+    let values = resource.values();
     let actual: Vec<String> =
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
             let check =
@@ -2936,9 +3031,8 @@ fn round2_plain_reference_skips_expression_callback() {
                     })
                 };
             let result = attributes::admit_validation_attributes::<kind::ResourceAttribute, _, _>(
-                resource.schema(&schemas).unwrap(),
+                resource.resource_schema(),
                 resource.id(),
-                &classified,
                 resource.quoted_string_attrs(),
                 Some(&bindings),
                 session,
@@ -2946,13 +3040,16 @@ fn round2_plain_reference_skips_expression_callback() {
                 None,
                 attributes::SchemaInputAuthority::new(
                     resource.authored_slots().unwrap(),
+                    &values,
                     judged.report(),
                     &mut Default::default(),
                 ),
             );
+            assert!(result.classification_diagnostics.0.is_empty());
             result
+                .values
                 .errors()
-                .chain(result.symbolic_errors().map(|(_, _, error)| error))
+                .chain(result.values.symbolic_errors().map(|(_, _, error)| error))
                 .map(ToString::to_string)
                 .collect()
         });
@@ -3012,9 +3109,18 @@ fn round3_admission_hook(source: &str, declaration: AttributeType) -> Vec<Round3
         .unwrap()
         .into_classification();
     let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-    let destination = schemas
-        .resource_attribute_destination(resource.id(), "input", &catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &resource.id().provider,
+                &resource.id().resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        resource.id(),
+        "input",
+        &catalog,
+    );
     let visits = std::cell::RefCell::new(Vec::new());
     let seen = std::cell::RefCell::new(std::collections::HashSet::new());
     with_session_for_test(&catalog, |session| {
@@ -3192,9 +3298,18 @@ fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
         .unwrap()
         .into_classification();
     let attributes = indexmap::IndexMap::from([("input".into(), proof)]);
-    let destination = schemas
-        .resource_attribute_destination(resource.id(), "input", &catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &resource.id().provider,
+                &resource.id().resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        resource.id(),
+        "input",
+        &catalog,
+    );
     let report = with_session_for_test(&catalog, |session| {
         let hook = |_: &crate::schema::CompiledAttributeType,
                     _: CheckValue<'_, ParserPlaceholder, RelativeBindingName>,
@@ -3274,9 +3389,15 @@ pub(crate) fn check_conversion_pending_discharge(
         .map_err(|e| e.to_string())?
         .into_classification();
     let bindings = BindingIndex::from_parsed(judged.file(), schemas, catalog);
-    let destination = schemas
-        .resource_attribute_destination(sink.id(), "target", catalog)
-        .map_err(|e| e.to_string())?;
+    let schema = schemas
+        .get(
+            &sink.id().provider,
+            &sink.id().resource_type,
+            crate::schema::SchemaKind::Resource,
+        )
+        .ok_or_else(|| format!("schema unavailable for {}", sink.id()))?;
+    let destination =
+        try_selected_destination::<kind::ResourceAttribute>(schema, sink.id(), "target", catalog)?;
     with_session_for_test(catalog, |session| {
         let (candidate, context) =
             Candidate::validation_slot(slot, proof, Some(&bindings), session)

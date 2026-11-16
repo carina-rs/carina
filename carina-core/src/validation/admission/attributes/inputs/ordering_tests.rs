@@ -73,7 +73,8 @@ fn classifications_keep_authored_attribute_order() {
     let loaded = load_buffer_configuration(&parsed, &schemas, &config);
     let tree = AnalysisTree::try_from_file(loaded.judged().file()).unwrap();
     let resource = tree.resources().next().unwrap();
-    let inputs = ResourceAttributeInputs::for_resource(resource, loaded.judged().report()).unwrap();
+    let inputs =
+        ResourceAttributeInputs::for_resource_for_test(resource, loaded.judged().report()).unwrap();
     let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
         panic!("{error}")
     });
@@ -92,7 +93,7 @@ fn admission_uses_owning_resource_order_even_for_reversed_classifications() {
     let judged = loaded.judged();
     let tree = AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
-    let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+    let inputs = ResourceAttributeInputs::for_resource_for_test(resource, judged.report()).unwrap();
     let classified = inputs.classify(&KnowledgeContext::validation(), |_, error| {
         panic!("{error}")
     });
@@ -109,14 +110,13 @@ fn admission_uses_owning_resource_order_even_for_reversed_classifications() {
             _,
         >(
             resource,
-            judged.file(),
+            crate::identifier::PrefixFileRead::for_test(judged.file(), &schemas),
             resource.schema(&schemas).unwrap(),
             &classified,
             resource.quoted_string_attrs(),
             &inputs,
             &bindings,
             session,
-            &schemas,
             &std::cell::RefCell::new(Default::default()),
         );
         assert_eq!(
@@ -194,8 +194,10 @@ fn resolved_and_reported_inputs_order_aliases_and_replacements_by_the_owner() {
         Value::Concrete(ConcreteValue::String("extra".into())),
     );
     let resolved =
-        ResourceAttributeInputs::from_resolved(resource, &values, judged.report()).unwrap();
-    let reported = ResourceAttributeInputs::from_report(resource, &values, judged.report());
+        ResourceAttributeInputs::from_resolved_for_test(resource, &values, judged.report())
+            .unwrap();
+    let reported =
+        ResourceAttributeInputs::from_report_for_test(resource, &values, judged.report());
     assert!(resolved.authored_evidence().is_ok());
     assert!(reported.authored_evidence().is_err());
     for inputs in [&resolved, &reported] {
@@ -228,7 +230,7 @@ fn materialized_subsets_keep_owner_order_and_unchanged_projections() {
     let tree = AnalysisTree::try_from_file(loaded.judged().file()).unwrap();
     let resource = tree.resources().next().unwrap();
     let mut inputs =
-        ResourceAttributeInputs::for_resource(resource, loaded.judged().report()).unwrap();
+        ResourceAttributeInputs::for_resource_for_test(resource, loaded.judged().report()).unwrap();
     let original = inputs.fork();
     let values = ["delta_knob", "quartz_knob", "zulu_knob"]
         .into_iter()
@@ -287,25 +289,32 @@ fn materialized_subsets_keep_owner_order_and_unchanged_projections() {
 
 #[test]
 fn projected_attributes_take_resource_order_without_authored_authority() {
-    let mut parsed = custom_directory(
+    let parsed = custom_directory(
         "mock.test.resource { name_prefix = 'prefix-' zulu_knob = 'z' alpha_knob = 'a' }",
     );
     let schemas = schemas();
-    carina_core::identifier::resolve_attr_prefixes(&mut parsed.resources, &schemas).unwrap();
+    let parsed = carina_core::identifier::canonicalize_file_prefixes(
+        parsed,
+        &schemas,
+        carina_core::identifier::SuffixSource::Preview,
+    );
     let config = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let loaded = load_buffer_configuration(&parsed, &schemas, &config);
-    let tree = AnalysisTree::try_from_file(loaded.judged().file()).unwrap();
+    let loaded = parsed.judge(&config);
+    let tree = loaded.analysis_tree().unwrap();
     let resource = tree.resources().next().unwrap();
     assert!(resource.authored_slot("name").is_err());
-    let values = resource
+    let values: indexmap::IndexMap<_, _> = resource
         .attributes()
         .iter()
         .rev()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
-    let inputs =
-        ResourceAttributeInputs::from_resolved(resource, &values, loaded.judged().report())
-            .unwrap();
+    let inputs = ResourceAttributeInputs::from_resolved(
+        resource,
+        &resource.with_values(&values).unwrap(),
+        loaded.judged().report(),
+    )
+    .unwrap();
     assert_eq!(
         inputs
             .values()

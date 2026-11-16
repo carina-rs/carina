@@ -218,11 +218,21 @@ impl<B: BindingAddress> std::fmt::Display for ValidatedEntry<'_, B> {
 /// at their own boundary, so a deferred placeholder is structurally
 /// distinct from a resolved id rather than a string that happens to
 /// contain `[?]`.
-fn validated_entries<E>(
-    parsed: &carina_core::parser::ModuleResolvedFile<E>,
-) -> Vec<ValidatedEntry<'_, carina_core::resource::AbsoluteBindingAddress>> {
-    parsed
-        .iter_all_resources()
+fn validated_entries<'a>(
+    resources: impl Iterator<
+        Item = ResourceRef<
+            'a,
+            carina_core::resource::ModuleSource,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::parser::ResolvedDeferredForPhase<
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::ParserPlaceholder,
+            >,
+        >,
+    >,
+) -> Vec<ValidatedEntry<'a, carina_core::resource::AbsoluteBindingAddress>> {
+    resources
         // Every call now has a composition so its typed boundary survives
         // expansion, but an unbound call has no address the user can write.
         // Keep those internal nodes available to validation while excluding
@@ -886,7 +896,7 @@ let observed_names = roles.names
         // validate display path in `deferred_for_expressions`.
         assert_eq!(parsed.deferred_for_expressions().len(), 1);
 
-        let entries = validated_entries(&parsed);
+        let entries = validated_entries(parsed.iter_all_resources());
         let output = ValidateOutput {
             status: "ok",
             resource_count: entries.len(),
@@ -928,7 +938,7 @@ let observed_names = roles.names
         let parsed = crate::test_support::parsed_fixture("aws.s3.Bucket {}\n");
         let parsed = resolve_file_for_test(parsed);
 
-        let entries = validated_entries(&parsed);
+        let entries = validated_entries(parsed.iter_all_resources());
         assert_eq!(entries.len(), 1);
         assert!(
             matches!(entries[0], ValidatedEntry::PendingDirect(_)),
@@ -979,7 +989,7 @@ let observed_names = roles.names
             .push(composition("example_deadbeefdeadbeef", None));
         let parsed = resolve_file_for_test(parsed);
 
-        let rendered: Vec<_> = validated_entries(&parsed)
+        let rendered: Vec<_> = validated_entries(parsed.iter_all_resources())
             .into_iter()
             .map(|entry| entry.to_string())
             .collect();

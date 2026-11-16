@@ -447,7 +447,8 @@ fn analysis_tree_rejects_unlocated_data_wait_and_nested_declarations() {
             }
             error @ (AnalysisTreeErrorKind::InsideSecret
             | AnalysisTreeErrorKind::MissingElementProvenance { .. }
-            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }) => {
+            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }
+            | AnalysisTreeErrorKind::UncanonicalizedResource { .. }) => {
                 panic!("unexpected element invariant: {error}")
             }
         }
@@ -8643,7 +8644,7 @@ fn parse_if_non_bool_condition_errors() {
 }
 
 #[test]
-fn parse_if_env_condition_reports_only_the_string_type() {
+fn parse_if_env_condition_includes_the_string_value() {
     let variable = "CARINA_3849_IF_CONDITION";
     let plaintext = "hunter2SECRET";
     let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
@@ -8663,9 +8664,12 @@ fn parse_if_env_condition_reports_only_the_string_type() {
     let error = parse(&input, &config).expect_err("non-bool condition");
     let message = error.to_string();
 
-    assert!(!message.contains(plaintext), "message leaked: {message}");
+    assert!(message.contains(plaintext), "message={message}");
     assert!(message.contains("got: string"), "message={message}");
-    assert!(!message.contains("value from env"), "message={message}");
+    assert!(
+        !message.contains(crate::schema::SECRET_VALUE_MASK),
+        "message={message}"
+    );
 }
 
 #[test]
@@ -12572,7 +12576,10 @@ fn parse_env_resource_keeps_runtime_plan_and_state_plaintext() {
     resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
 
     let value = parsed.resources[0].get_attr("name").unwrap();
-    assert_eq!(crate::ValueDescription::of(value).to_string(), "string");
+    assert_eq!(
+        crate::ValueDescription::of(value).to_string(),
+        "string 'hunter2SECRET'"
+    );
     assert_eq!(crate::value::format_value(value), "'hunter2SECRET'");
     assert_eq!(
         crate::value::value_to_json(&expanded_value(value)).unwrap(),
@@ -12581,7 +12588,7 @@ fn parse_env_resource_keeps_runtime_plan_and_state_plaintext() {
 }
 
 #[test]
-fn env_derived_provider_version_error_does_not_echo_plaintext() {
+fn env_derived_provider_version_error_shows_plaintext() {
     let variable = "CARINA_3849_PROVIDER_VERSION";
     let plaintext = "hunter2SECRET";
     let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
@@ -12600,12 +12607,15 @@ fn env_derived_provider_version_error_does_not_echo_plaintext() {
     let error = parse(&input, &config).expect_err("invalid version");
     let message = error.to_string();
 
-    assert!(!message.contains(plaintext), "message leaked: {message}");
-    assert!(message.contains("value from env()"), "message={message}");
+    assert!(message.contains(plaintext), "message={message}");
+    assert!(
+        !message.contains(crate::schema::SECRET_VALUE_MASK),
+        "message={message}"
+    );
 }
 
 #[test]
-fn env_derived_subscript_is_redacted_in_unresolved_reference_diagnostic() {
+fn env_derived_subscript_is_shown_in_unresolved_reference_diagnostic() {
     let variable = "CARINA_3849_SUBSCRIPT_KEY";
     let plaintext = "hunter2SECRET";
     let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
@@ -12628,12 +12638,15 @@ fn env_derived_subscript_is_redacted_in_unresolved_reference_diagnostic() {
         .expect_err("reference remains unresolved")
         .to_string();
 
-    assert!(!message.contains(plaintext), "message leaked: {message}");
-    assert!(message.contains("value from env()"), "message={message}");
+    assert!(message.contains(plaintext), "message={message}");
+    assert!(
+        !message.contains(crate::schema::SECRET_VALUE_MASK),
+        "message={message}"
+    );
 }
 
 #[test]
-fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnostic() {
+fn env_derived_pre_field_subscript_is_shown_in_unresolved_reference_diagnostic() {
     let variable = "CARINA_3849_PRE_FIELD_SUBSCRIPT_KEY";
     let plaintext = "hunter2SECRET";
     let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
@@ -12656,8 +12669,11 @@ fn env_derived_pre_field_subscript_is_redacted_in_unresolved_reference_diagnosti
         .expect_err("reference remains unresolved")
         .to_string();
 
-    assert!(!message.contains(plaintext), "message leaked: {message}");
-    assert!(message.contains("value from env()"), "message={message}");
+    assert!(message.contains(plaintext), "message={message}");
+    assert!(
+        !message.contains(crate::schema::SECRET_VALUE_MASK),
+        "message={message}"
+    );
 }
 
 #[test]
@@ -12853,13 +12869,10 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
         .expect("typed-error fixture schema must be registered");
     let error = crate::test_utils::admit_resource_attributes(
         schema,
-        &crate::schema::classified_attributes(
-            &std::collections::HashMap::<String, ExpandedValue>::from([(
-                "value".to_string(),
-                ExpandedValue::Concrete(ExpandedConcreteValue::String("value".into())),
-            )]),
-        )
-        .unwrap(),
+        &indexmap::IndexMap::<String, ExpandedValue>::from([(
+            "value".to_string(),
+            ExpandedValue::Concrete(ExpandedConcreteValue::String("value".into())),
+        )]),
         &|_| false,
         &config.custom_types,
     )
@@ -21219,6 +21232,55 @@ fn invalid_secret_subscript_diagnostic_never_exposes_plaintext() {
         !message.contains("hunter2"),
         "secret subscript plaintext leaked: {message}",
     );
+}
+
+#[test]
+fn secret_provider_version_rejects_secret_expressions() {
+    for expression in [
+        "secret('private-token')",
+        "join('', [secret('private-token')])",
+        "\"${secret('private-token')}\"",
+    ] {
+        let error = parse(
+            &format!("fn version() {{ {expression} }}\nprovider mock {{ version = version() }}"),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("'version' must be a string literal"),
+            "{message}"
+        );
+        assert!(!message.contains("Invalid version constraint"), "{message}");
+        assert!(!message.contains("private-token"), "{message}");
+        assert!(!message.to_ascii_lowercase().contains("env"), "{message}");
+    }
+}
+
+#[test]
+fn secret_subscript_rejects_secret_expressions() {
+    for expression in [
+        "secret('private-token')",
+        "join('', [secret('private-token')])",
+        "\"${secret('private-token')}\"",
+    ] {
+        let error = parse(
+            &format!("fn key() {{ {expression} }}\nlet value = missing[key()]"),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("index access key must be an integer or string"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("unresolved binding containing"),
+            "{message}"
+        );
+        assert!(!message.contains("private-token"), "{message}");
+        assert!(!message.to_ascii_lowercase().contains("env"), "{message}");
+    }
 }
 
 // carina#3136: field access on a struct/map-valued for-loop variable.

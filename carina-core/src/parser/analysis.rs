@@ -730,6 +730,11 @@ pub enum AnalysisTreeErrorKind {
         kind: AnalysisItemKind,
         id: ResourceId,
     },
+    #[error("resource {id} has a schema but was not visited by prefix canonicalization")]
+    UncanonicalizedResource {
+        id: Box<ResourceId>,
+        declaration: Option<DeclarationLocation>,
+    },
     #[error("missing declaration provenance for wait {binding}")]
     MissingWaitProvenance { binding: String },
     #[error("missing {element} provenance in {}", declaration.file().path().display())]
@@ -746,8 +751,19 @@ impl crate::resource::InsideSecret for AnalysisTreeError {
 }
 
 pub enum AnalysisTreeDiagnostic<'a> {
+    Located(Located<&'a AnalysisTreeError>),
     File(FileScoped<&'a AnalysisTreeError>),
     Directory(DirectoryScoped<&'a AnalysisTreeError>),
+}
+
+impl std::fmt::Display for AnalysisTreeDiagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Located(finding) => std::fmt::Display::fmt(finding, f),
+            Self::File(finding) => std::fmt::Display::fmt(finding.detail(), f),
+            Self::Directory(finding) => std::fmt::Display::fmt(finding.detail(), f),
+        }
+    }
 }
 
 impl AnalysisTreeError {
@@ -761,10 +777,22 @@ impl AnalysisTreeError {
 
     pub fn diagnostic(&self) -> AnalysisTreeDiagnostic<'_> {
         match &self.kind {
+            AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: Some(declaration),
+                ..
+            } => AnalysisTreeDiagnostic::Located(Located::new(declaration.clone(), self)),
             AnalysisTreeErrorKind::MissingElementProvenance { declaration, .. } => {
                 AnalysisTreeDiagnostic::File(FileScoped::new(declaration.file().path(), self))
             }
-            _ => AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self }),
+            AnalysisTreeErrorKind::InsideSecret
+            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }
+            | AnalysisTreeErrorKind::MissingResourceProvenance { .. }
+            | AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: None, ..
+            }
+            | AnalysisTreeErrorKind::MissingWaitProvenance { .. } => {
+                AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self })
+            }
         }
     }
 }
@@ -1404,6 +1432,24 @@ pub struct AuthoredResourceInstanceKey<'a, B: BindingAddress = RelativeBindingNa
     module_scope: Option<&'a str>,
 }
 
+impl<B: BindingAddress> AuthoredResourceInstanceKey<'_, B> {
+    /// Match the same source instance across relative/absolute binding phases.
+    /// This is an address comparison, not admission authority.
+    pub fn same_source_instance<C: BindingAddress>(
+        &self,
+        other: &AuthoredResourceInstanceKey<'_, C>,
+    ) -> bool {
+        self.same_source_declaration(other) && self.element == other.element
+    }
+
+    pub(crate) fn same_source_declaration<C: BindingAddress>(
+        &self,
+        other: &AuthoredResourceInstanceKey<'_, C>,
+    ) -> bool {
+        self.declaration == other.declaration && self.module_scope == other.module_scope
+    }
+}
+
 impl<'a, P, T, D, B> AnalysisResourceRef<'a, P, T, D, B>
 where
     P: ValueKind,
@@ -1686,6 +1732,10 @@ where
     B: BindingAddress,
     D: DeferredForPhaseTraversal<P, P, B>,
 {
+    pub(crate) fn is_project_resource(&self) -> bool {
+        self.in_project_walk
+    }
+
     pub fn attributes(&self) -> std::borrow::Cow<'a, indexmap::IndexMap<String, Value<P, B>>> {
         self.resource.attributes()
     }
@@ -1823,7 +1873,6 @@ pub struct AnalysisTree<
     value_references: Vec<AnalysisValueReference<B>>,
     validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
     iterables: Vec<AnalysisForRef<'a, P, B>>,
-    arguments: &'a [super::ArgumentParameter<super::TypeExpr, P, B>],
     functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
@@ -2678,7 +2727,6 @@ where
             value_references,
             validation_values,
             iterables,
-            arguments: &file.arguments,
             functions: &file.user_functions,
             module_calls: &file.module_calls,
             module_definition: !file.arguments.is_empty() || !file.attribute_params.is_empty(),
@@ -2882,12 +2930,8 @@ where
         &self.iterables
     }
 
-    pub(crate) fn admission_report(&self) -> &super::retained::ExpressionReport<B> {
-        self.file
-            .parser_binding_metadata
-            .syntax()
-            .expressions()
-            .admission_report()
+    pub(crate) fn into_resources(self) -> Vec<AnalysisResourceRef<'a, P, T, D, B>> {
+        self.resources
     }
 
     pub fn resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {
@@ -3016,56 +3060,6 @@ where
                 },
             ));
         }
-    }
-
-    pub fn inference_bindings(
-        &self,
-    ) -> crate::validation::inference::InferenceBindings<ParserPlaceholder, B> {
-        use crate::validation::inference::InferenceBinding;
-        let mut bindings = std::collections::HashMap::new();
-        for upstream in self.upstream_states() {
-            bindings.insert(
-                upstream.binding.to_string(),
-                InferenceBinding::UpstreamState,
-            );
-        }
-        for resource in self.resources() {
-            if let Some(binding) = resource.binding_address() {
-                let kind = if resource.kind() == AnalysisItemKind::Composition {
-                    InferenceBinding::Virtual {
-                        attributes: resource.attributes().into_owned(),
-                    }
-                } else {
-                    InferenceBinding::Resource {
-                        provider: resource.id().provider.clone(),
-                        resource_type: resource.id().resource_type.clone(),
-                    }
-                };
-                bindings.insert(binding.to_string(), kind);
-            }
-        }
-        for call in self.module_calls {
-            if let Some(binding) = &call.binding_name {
-                bindings
-                    .entry(binding.to_string())
-                    .or_insert(InferenceBinding::ModuleCall);
-            }
-        }
-        for argument in self.arguments {
-            bindings
-                .entry(argument.name.clone())
-                .or_insert_with(|| InferenceBinding::Argument {
-                    type_expr: argument.static_type.clone(),
-                });
-        }
-        for function in self.functions.values() {
-            bindings.entry(function.name.clone()).or_insert_with(|| {
-                InferenceBinding::UserFunction {
-                    return_type: function.return_type.clone(),
-                }
-            });
-        }
-        bindings
     }
 }
 

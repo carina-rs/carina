@@ -130,8 +130,7 @@ pub struct S3Backend {
     client: Client,
     /// AWS region
     region: String,
-    /// Admitted storage settings, including the auto-create policy and
-    /// diagnostic provenance of the bucket name.
+    /// Admitted storage settings, including the auto-create policy.
     settings: S3BackendSettings,
     /// Tracks the first in-memory state-schema migration observed by
     /// `read_state` on this backend instance (carina#3283). See the
@@ -210,10 +209,7 @@ pub struct S3AutoCreateDisabled {
 
 impl S3AutoCreateDisabled {
     fn new(settings: &S3BackendSettings) -> Self {
-        let bucket = match settings.bucket_diagnostic_literal() {
-            Some(bucket) => format!("'{bucket}'"),
-            None => "value from env()".to_owned(),
-        };
+        let bucket = carina_core::parser::display_string_literal(settings.bucket());
         Self { bucket }
     }
 }
@@ -1214,6 +1210,39 @@ mod tests {
     use crate::state::ResourceState;
     use aws_sdk_s3::error::{ErrorMetadata, SdkError};
     use std::time::Duration;
+
+    #[test]
+    fn env_backend_diagnostics_show_public_bucket_without_network() {
+        let config =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+                "CARINA_4409_BUCKET".to_string(),
+                "bucket-from-env".into(),
+            )]));
+        let mut parsed = carina_core::parser::parse_file(
+            "backend s3 { bucket = env('CARINA_4409_BUCKET') key = 'state.json' auto_create = false }",
+            std::path::Path::new("backend.crn"),
+            &config,
+        )
+        .unwrap();
+        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
+        let resolved = crate::BackendConfig::try_from(parsed.backend.as_ref().unwrap()).unwrap();
+        let settings = resolved.as_s3().unwrap();
+        let actual = [
+            S3AutoCreateDisabled::new(settings).to_string(),
+            crate::BackendSelection::for_bucket_delete(settings, "requested-bucket")
+                .unwrap_err()
+                .to_string(),
+            format!("{settings:?}"),
+        ];
+        assert_eq!(
+            actual,
+            [
+                "Backend bucket 'bucket-from-env' not found and auto_create is disabled",
+                "Bucket name 'requested-bucket' does not match backend configuration bucket 'bucket-from-env'.",
+                "S3BackendSettings { bucket: \"bucket-from-env\", key: \"state.json\", region: None, encrypt: None, auto_create: Some(false) }",
+            ]
+        );
+    }
 
     #[test]
     fn test_resolve_region_prefers_explicit_over_sdk_chain() {

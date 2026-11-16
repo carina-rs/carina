@@ -154,19 +154,15 @@ fn value_depends_on_module_output<'a>(
 /// if that parse or the current file identity is unavailable, only values
 /// proven independent of sibling names may fall back to the buffer parse.
 pub(super) enum SemanticView<'a> {
-    Standalone(&'a ParsedFile),
+    Standalone,
     DirectoryParsed { merged: &'a ParsedFile },
     DirectoryUnavailable,
 }
 
 impl<'a> SemanticView<'a> {
-    pub(super) fn for_analysis(
-        authored: &'a ParsedFile,
-        merged: Option<&'a ParsedFile>,
-        directory_backed: bool,
-    ) -> Self {
+    pub(super) fn for_analysis(merged: Option<&'a ParsedFile>, directory_backed: bool) -> Self {
         if !directory_backed {
-            return Self::Standalone(authored);
+            return Self::Standalone;
         }
         match merged {
             Some(merged) => Self::DirectoryParsed { merged },
@@ -179,7 +175,7 @@ impl<'a> SemanticView<'a> {
         T: SemanticLookup,
     {
         match self {
-            Self::Standalone(_) => Some(authored),
+            Self::Standalone => Some(authored),
             Self::DirectoryParsed { merged } => authored.lookup_in(merged),
             Self::DirectoryUnavailable => None,
         }
@@ -195,7 +191,7 @@ impl<'a> SemanticView<'a> {
         T: SemanticLookup,
     {
         match self {
-            Self::Standalone(_parsed) => authored.value(),
+            Self::Standalone => authored.value(),
             Self::DirectoryParsed { merged } => {
                 authored.lookup_in(merged).and_then(SemanticLookup::value)
             }
@@ -1198,7 +1194,6 @@ impl DiagnosticRun<'_> {
         diagnostics.extend(
             carina_core::validation::validate_deferred_for_iterable_types(
                 tree,
-                &self.schemas,
                 self.provider_context.catalog(),
             )
             .iter()
@@ -1724,11 +1719,14 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_inferred_export_types<D, B: BindingAddress>(
         &self,
         doc: &Document,
-        configuration: &carina_core::parser::retained::JudgedFile<
+        configuration: &carina_core::identifier::PrefixCanonicalized<
             '_,
-            ParsedExportParam<ParserPlaceholder, B>,
-            D,
-            B,
+            carina_core::parser::retained::JudgedFile<
+                '_,
+                ParsedExportParam<ParserPlaceholder, B>,
+                D,
+                B,
+            >,
         >,
         tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     ) -> Vec<Diagnostic>
@@ -1736,7 +1734,7 @@ impl DiagnosticRun<'_> {
         D: Clone
             + carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        let inference_input = configuration.file();
+        let inference_input = configuration.parsed();
         let mut diagnostics = Vec::new();
         let inferred_export_params = if let Some(loaded_providers) = &self.loaded_providers {
             let provider_inferred = carina_core::validation::inference::
@@ -1768,12 +1766,11 @@ impl DiagnosticRun<'_> {
             }
             provider_inferred.into_inferred_export_params()
         } else {
-            carina_core::validation::inference::infer_export_params(configuration)
+            configuration.inferred_export_params()
         };
         let signatures = carina_core::module_resolver::ResolvedModuleSignatures::default();
-        let export_bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-            inference_input, &self.schemas, None, &signatures, self.provider_context,
-        );
+        let export_bindings =
+            inference_input.binding_index_in_session(None, &signatures, self.provider_context);
         let mut boundary_export_params = inferred_export_params.parameters().to_vec();
         for parameter in &mut boundary_export_params {
             let Some(type_expr) = parameter.type_expr_opt_mut() else {

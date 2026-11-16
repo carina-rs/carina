@@ -6,7 +6,22 @@ use carina_core::validation::admission::attributes::ClassificationDiagnostics;
 #[test]
 fn resolved_input_fallback_counter_only_records_swallowed_errors() {
     let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let schemas = SchemaRegistry::new();
+    let mut schemas = SchemaRegistry::new();
+    for kind in ["Test", "Previous"] {
+        schemas.insert(
+            "mock",
+            carina_core::schema::ResourceSchema::new(kind)
+                .attribute(
+                    carina_core::schema::AttributeSchema::optional(
+                        "input",
+                        carina_core::schema::AttributeType::int(),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+    }
     let previous = carina_core::parser::parse_file(
         "mock.Previous { input = 1 }",
         Path::new("buffer.crn"),
@@ -14,21 +29,21 @@ fn resolved_input_fallback_counter_only_records_swallowed_errors() {
     )
     .unwrap();
     let sealed =
-        carina_core::config_loader::load_buffer_configuration(&previous, &schemas, &catalog);
+        carina_core::test_utils::load_canonical_buffer_configuration(&previous, &schemas, &catalog);
     let current = carina_core::parser::parse_file(
         "mock.Test { input = 'bad' }",
         Path::new("buffer.crn"),
         &catalog,
     )
     .unwrap();
-    let tree = carina_core::parser::AnalysisTree::try_from_file(&current).unwrap();
+    let configuration =
+        carina_core::test_utils::load_canonical_buffer_configuration(&current, &schemas, &catalog);
+    let tree = configuration.analysis_tree().unwrap();
     let resource = tree.resources().next().unwrap();
-    let map = authored_validation_resources(&tree);
-    let values = resource.attributes().into_owned();
+    let values = resource.values();
     let (_, coverage) = crate::admission_coverage::with_admission_coverage(|| {
         select_admission_inputs(
             resource,
-            Some(&map),
             &values,
             sealed.judged().report(),
             carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
@@ -38,9 +53,8 @@ fn resolved_input_fallback_counter_only_records_swallowed_errors() {
     let (_, coverage) = crate::admission_coverage::with_admission_coverage(|| {
         select_admission_inputs(
             resource,
-            None,
             &values,
-            sealed.judged().report(),
+            configuration.report(),
             carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
         )
     });

@@ -70,9 +70,6 @@ pub(crate) fn parse_resource_for_target(
 
     // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
-    if parts.len() < 2 {
-        return Err(ParseError::InvalidResourceType(namespaced_type));
-    }
 
     let provider = parts[0];
     let resource_type = parts[1..].join(".");
@@ -462,9 +459,6 @@ pub(crate) fn parse_read_resource_expr(
 
     // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
-    if parts.len() < 2 {
-        return Err(ParseError::InvalidResourceType(namespaced_type));
-    }
 
     // First part is provider name, the rest is resource type
     let provider = parts[0];

@@ -729,3 +729,76 @@ fn replay_verifies_the_copied_corpus_independently_of_the_source_worktree() {
     std::fs::write(copied, "# changed replay input\n").unwrap();
     assert!(std::panic::catch_unwind(|| manifest.verify()).is_err());
 }
+
+/// The cc33cf977 observations were recorded before #4429's production edits.
+/// Use #4433's full-field serializer; preserve unrelated diagnostics and anchors.
+#[tokio::test(flavor = "multi_thread")]
+async fn prefix_companion_replay_pins_only_expected_diagnostic_changes() {
+    use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+    fn error(message: &str, start: (u32, u32), end: (u32, u32)) -> Diagnostic {
+        Diagnostic {
+            range: Range::new(Position::new(start.0, start.1), Position::new(end.0, end.1)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("carina".into()),
+            message: message.into(),
+            ..Default::default()
+        }
+    }
+    let missing = || error("Required attribute 'name' is missing", (0, 0), (0, 18));
+    let unknown_prefix = || error("Unknown attribute 'name_prefix'", (1, 2), (1, 20));
+    let bogus = || error("Unknown attribute 'bogus'", (2, 2), (2, 15));
+    let cases = [
+        (
+            "accepted",
+            "mock.test.resource { name_prefix = 'ok' }\n",
+            vec![
+                missing(),
+                error("Unknown attribute 'name_prefix'", (0, 21), (0, 39)),
+            ],
+            vec![],
+        ),
+        (
+            "unknown-sibling",
+            "mock.test.resource {\n  name_prefix = 'ok'\n  bogus = 'bad'\n}\n",
+            vec![missing(), unknown_prefix(), bogus()],
+            vec![bogus()],
+        ),
+        (
+            "conflict",
+            "mock.test.resource {\n  name_prefix = 'ok'\n  name = 'explicit'\n}\n",
+            vec![unknown_prefix()],
+            vec![error(
+                "mock.test.resource.<pending>: cannot specify both 'name_prefix' and 'name'",
+                (0, 0),
+                (3, 1),
+            )],
+        ),
+        (
+            "non-string",
+            "mock.test.resource {\n  name = 'explicit'\n  name_prefix = 7\n}\n",
+            vec![error("Unknown attribute 'name_prefix'", (2, 2), (2, 17))],
+            vec![error("Unknown attribute 'name_prefix'", (2, 2), (2, 17))],
+        ),
+    ];
+    for (label, source, before, expected) in cases {
+        let fixture = control();
+        std::fs::write(fixture.path().join("main.crn"), source).unwrap();
+        let states = states(fixture.path()).await;
+        let (actual, coverage) = analyze(&states, &fixture.path().join("main.crn"));
+        assert_eq!(actual, expected, "{label}: {actual:#?}");
+        let before: serde_json::Value = serde_json::from_slice(&replay::document_json(
+            "main.crn",
+            &before,
+            &AdmissionCoverage::default(),
+            &[],
+        ))
+        .unwrap();
+        let after: serde_json::Value =
+            serde_json::from_slice(&replay::document_json("main.crn", &actual, &coverage, &[]))
+                .unwrap();
+        println!(
+            "PREFIX_REPLAY_DIFF {}",
+            serde_json::json!({"case":label,"baseline_revision":"cc33cf977","before":before["diagnostics"],"after":after["diagnostics"],"coverage_after":after["coverage"]})
+        );
+    }
+}
