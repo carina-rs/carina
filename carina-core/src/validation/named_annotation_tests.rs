@@ -1726,7 +1726,6 @@ fn function_reads_ignore_slot_members_and_coalesce_keeps_destination_checks() {
         report
             .binding(&crate::resource::RelativeBindingName::new("result"))
             .unwrap(),
-        snapshot.schema_registry(),
         &bindings,
     )
     .expect("the coalesce can select the fitting branch; the selected value remains checked at its destination");
