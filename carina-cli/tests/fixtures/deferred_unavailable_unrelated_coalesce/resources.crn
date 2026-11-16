@@ -4,5 +4,6 @@ let o = mock.test.resource {
 
 let dependent = mock.test.resource {
   name    = "unrelated-coalesce-dependent"
-  comment = "${o.identifier}-${secret("k")}" ?? env("CARINA_MISSING_Y")
+  comment = "${o.identifier}-${secret("k")}"
+  parent = o.identifier ?? env("CARINA_MISSING_Y")
 }

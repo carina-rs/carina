@@ -62,7 +62,11 @@ fn rejects_invalid_product_value(projected: bool) {
         assert!(
             findings
                 .errors()
-                .chain(findings.symbolic_errors().map(|(_, _, e)| e))
+                .chain(
+                    findings
+                        .symbolic_errors()
+                        .map(|(_, _, diagnostic)| diagnostic.error())
+                )
                 .any(|e| e.to_string().contains("expected String, got Int")),
             "admission must judge its product's invalid value: {findings:?}"
         );

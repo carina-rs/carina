@@ -853,6 +853,7 @@ impl std::error::Error for BindingUseReport {}
 #[derive(Debug)]
 pub struct ResolvedFile<E> {
     inner: crate::parser::ExpandedFile<E>,
+    secrecy: Option<crate::secrecy::ValidatedSecrecyGraph>,
 }
 
 impl<E> ResolvedFile<E> {
@@ -864,7 +865,16 @@ impl<E> ResolvedFile<E> {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn for_test(inner: crate::parser::ExpandedFile<E>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            secrecy: None,
+        }
+    }
+
+    pub fn validated_secrecy(
+        &self,
+    ) -> Result<&crate::secrecy::ValidatedSecrecyGraph, crate::secrecy::PendingSecrecy> {
+        self.secrecy.as_ref().ok_or(crate::secrecy::PendingSecrecy)
     }
 
     pub fn as_file(&self) -> &crate::parser::ExpandedFile<E> {
@@ -890,6 +900,8 @@ pub enum ResolveFileError {
     Unjudged(#[from] crate::parser::retained::UnjudgedConfiguration),
     #[error(transparent)]
     Expression(Box<crate::parser::Located<inference::InferenceError>>),
+    #[error(transparent)]
+    Secrecy(Box<crate::secrecy::Finding>),
     #[error(transparent)]
     ResourceDirective(Box<crate::parser::Located<ResourceDirectiveFinding>>),
     #[error(transparent)]
@@ -2378,8 +2390,7 @@ pub fn resolve_bare_binding_uses<
         let context = ValidationTypeContext::new(&judged, provider_context, module_signatures);
         check_expanded_bare_binding_uses(&context)
     };
-    let file = judged.into_file();
-    finish_binding_resolution(file, report, schemas, provider_context)
+    finish_binding_resolution(judged, report, provider_context)
 }
 
 /// Consume a bootstrap/recovery file using the same incomplete catalog that
@@ -2403,16 +2414,24 @@ pub fn resolve_bare_binding_uses_in_session<
             ValidationTypeContext::in_session(&judged, provider_context, module_signatures);
         check_expanded_bare_binding_uses(&context)
     };
-    let file = judged.into_file();
-    finish_binding_resolution(file, report, schemas, provider_context.catalog())
+    finish_binding_resolution(judged, report, provider_context.catalog())
 }
 
 fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteBindingAddress>>(
-    file: crate::parser::ModuleResolvedFile<E>,
+    judged: crate::parser::retained::JudgedFile<
+        '_,
+        E,
+        crate::parser::ResolvedDeferredForPhase<
+            ParserPlaceholder,
+            ParserPlaceholder,
+            AbsoluteBindingAddress,
+        >,
+        AbsoluteBindingAddress,
+    >,
     report: BindingUseReport,
-    schemas: &SchemaRegistry,
     provider_context: &ProviderContext,
 ) -> Result<ResolvedFile<E::Expanded>, ResolveFileError> {
+    let file = judged.file();
     if let Some(finding) = resource_directive_findings(&file.parser_binding_metadata).first() {
         return Err(ResolveFileError::ResourceDirective(Box::new(
             finding.clone(),
@@ -2425,9 +2444,19 @@ fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteB
         return Err(report.into());
     }
 
-    Ok(ResolvedFile {
-        inner: file.into_expanded(schemas, provider_context)?,
-    })
+    if let Some(finding) = judged.secrecy().findings().first() {
+        return Err(ResolveFileError::Secrecy(Box::new(finding.clone())));
+    }
+    let secrecy = judged.secrecy().admitted();
+    let schemas = judged.schemas();
+    let file = judged.into_file();
+    let mut inner = file.into_expanded(schemas, provider_context)?;
+    if let Some(graph) = &secrecy
+        && let Some(inputs) = &inner.authored_inputs
+    {
+        inner.attach_authored_inputs(inputs.with_validated_secrecy(graph.clone()));
+    }
+    Ok(ResolvedFile { inner, secrecy })
 }
 
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
@@ -5333,8 +5362,7 @@ pub struct ResourceAdmissionFinding {
 enum ResourceAdmissionDetail {
     Schema {
         resource: crate::resource::ResourceId,
-        attribute: Option<String>,
-        error: TypeError,
+        diagnostic: Box<crate::schema::SchemaDiagnostic>,
         mismatch: Option<Box<ReferenceMismatch>>,
     },
     Arithmetic(Box<crate::parser::Located<IntegerArithmeticTypeFinding>>),
@@ -5359,14 +5387,15 @@ impl ResourceAdmissionFinding {
     fn prefix(error: &crate::identifier::AttributePrefixError) -> Self {
         let mut finding = Self::schema(
             error.resource_id(),
-            None,
-            &TypeError::AttributePrefix(Box::new(error.clone())),
+            &crate::schema::SchemaDiagnostic::unlocated(TypeError::AttributePrefix(Box::new(
+                error.clone(),
+            ))),
+            error.location().cloned(),
         );
         finding.human = error.to_string();
-        finding.location = error.location().cloned();
         finding
     }
-    fn analysis(error: crate::parser::AnalysisTreeError) -> Self {
+    pub(crate) fn analysis(error: crate::parser::AnalysisTreeError) -> Self {
         let location = match error.diagnostic() {
             crate::parser::AnalysisTreeDiagnostic::Located(finding) => {
                 Some(finding.location().clone())
@@ -5382,23 +5411,22 @@ impl ResourceAdmissionFinding {
     }
     fn schema(
         resource: &crate::resource::ResourceId,
-        attribute: Option<&str>,
-        error: &TypeError,
+        diagnostic: &crate::schema::SchemaDiagnostic,
+        location: Option<crate::parser::DeclarationLocation>,
     ) -> Self {
         Self {
-            human: format!("{resource}: {error}"),
+            human: format!("{resource}: {}", diagnostic.error()),
             detail: ResourceAdmissionDetail::Schema {
                 resource: resource.clone(),
-                attribute: attribute.map(str::to_owned),
-                error: error.clone(),
+                diagnostic: Box::new(diagnostic.clone()),
                 mismatch: None,
             },
-            location: None,
+            location,
         }
     }
     pub fn type_error(&self) -> Option<&TypeError> {
         match &self.detail {
-            ResourceAdmissionDetail::Schema { error, .. } => Some(error),
+            ResourceAdmissionDetail::Schema { diagnostic, .. } => Some(diagnostic.error()),
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
@@ -5435,16 +5463,15 @@ impl ResourceAdmissionFinding {
                 mismatch: Some(mismatch),
                 ..
             } => mismatch.message(),
-            ResourceAdmissionDetail::Schema {
-                error: TypeError::Reference { error, .. },
-                ..
-            } => match error.as_ref() {
-                SecretDiagnosticError::Public(admission::AdmissionReferenceError::Arithmetic(
-                    finding,
-                )) => finding.detail().to_string(),
-                _ => error.to_string(),
+            ResourceAdmissionDetail::Schema { diagnostic, .. } => match diagnostic.error() {
+                TypeError::Reference { error, .. } => match error.as_ref() {
+                    SecretDiagnosticError::Public(
+                        admission::AdmissionReferenceError::Arithmetic(finding),
+                    ) => finding.detail().to_string(),
+                    _ => error.to_string(),
+                },
+                error => error.to_string(),
             },
-            ResourceAdmissionDetail::Schema { error, .. } => error.to_string(),
             ResourceAdmissionDetail::Arithmetic(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::Iterable(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::UnavailableSchema(error) => error.to_string(),
@@ -5520,6 +5547,14 @@ struct ValueAdmission<'a, B: BindingAddress> {
     coverage: &'a mut crate::schema::value_validation::WalkCoverage,
 }
 
+type ResourceAdmissionValues = HashMap<
+    (
+        crate::resource::ResourceId,
+        crate::parser::DeclarationLocation,
+    ),
+    crate::schema::ResourceValueValidation,
+>;
+
 struct ResourceValidationContext<'a, B: BindingAddress> {
     report: &'a crate::parser::retained::ExpressionReport<B>,
     registry: &'a SchemaRegistry,
@@ -5527,13 +5562,13 @@ struct ResourceValidationContext<'a, B: BindingAddress> {
     provider_context: &'a ProviderContext,
     all_errors: &'a mut ResourceAdmissionFindings,
     diagnostics: &'a mut dyn deferred_types::ProviderTypeCheckSink,
-    admissions:
-        Option<&'a HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>>,
+    admissions: Option<&'a ResourceAdmissionValues>,
     coverage: &'a mut crate::schema::value_validation::WalkCoverage,
 }
 
 fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
     id: &crate::resource::ResourceId,
+    provenance: &crate::parser::DeclarationProvenance,
     slots: &crate::parser::retained::AuthoredSlots<B>,
     quoted_string_attrs: &HashSet<String>,
     input: Option<(
@@ -5547,9 +5582,11 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
         Some((schema, attributes)) => {
             let mut classification_errors = Vec::new();
             let checked;
-            let values = if let Some(values) =
-                context.admissions.and_then(|reports| reports.get(id))
-            {
+            let values = if let Some(values) = context.admissions.and_then(|reports| {
+                provenance
+                    .location()
+                    .and_then(|location| reports.get(&(id.clone(), location.clone())))
+            }) {
                 let _ = crate::resource::knowledge::collect_classified_attributes(
                     attributes.iter().map(|(name, value)| (name.clone(), value)),
                     &crate::resource::knowledge::KnowledgeContext::validation(),
@@ -5606,17 +5643,33 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                 checked = outcome.values;
                 &checked
             };
-            for (error, path, symbolic) in values.diagnostic_errors() {
-                if path.is_some_and(|(name, _)| values.is_retained_failure(name)) {
+            for (diagnostic, symbolic) in values.diagnostic_errors() {
+                if diagnostic
+                    .coverage_path()
+                    .is_some_and(|(root, _)| values.is_retained_failure(root))
+                {
                     continue;
                 }
                 let rendered_symbolically = context.admissions.is_some() && symbolic.owns_path();
                 if !rendered_symbolically {
-                    context.all_errors.push(ResourceAdmissionFinding::schema(
-                        id,
-                        path.map(|(name, _)| name),
-                        error,
-                    ));
+                    // The value-only validate_resources API keeps its existing
+                    // unlocated projection. Full admission has the authored view.
+                    let location = if context.admissions.is_some() {
+                        match provenance.schema_diagnostic_location(diagnostic) {
+                            Ok(location) => location,
+                            Err(error) => {
+                                context
+                                    .all_errors
+                                    .push(ResourceAdmissionFinding::analysis(error));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    context
+                        .all_errors
+                        .push(ResourceAdmissionFinding::schema(id, diagnostic, location));
                 }
             }
             context.all_errors.extend(
@@ -5731,9 +5784,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
-    admissions: Option<
-        &HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
-    >,
+    admissions: Option<&ResourceAdmissionValues>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     admission: ValueAdmission<'_, B>,
 ) -> Vec<ResourceAdmissionFinding> {
@@ -5783,6 +5834,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
             match resource {
                 CanonicalSchemaResource::DataSource(resource, input) => validate_resource_values(
                     &resource.id,
+                    &resource.declaration,
                     &resource.authored_slots,
                     &resource.quoted_string_attrs,
                     input.as_ref().map(|(schema, values)| (*schema, values)),
@@ -5792,6 +5844,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
                 CanonicalSchemaResource::Resource(resource, input) => {
                     validate_resource_values(
                         &resource.id,
+                        &resource.declaration,
                         &resource.authored_slots,
                         &resource.quoted_string_attrs,
                         input.as_ref().map(|(schema, values)| (*schema, values)),
@@ -5812,6 +5865,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
                 CanonicalSchemaResource::Deferred(resource, input) => {
                     validate_resource_values(
                         &resource.id,
+                        &resource.declaration,
                         &resource.authored_slots,
                         &resource.quoted_string_attrs,
                         input.as_ref().map(|(schema, values)| (*schema, values)),
@@ -6019,30 +6073,6 @@ fn complete_resource_admission_report<
             },
         )
     });
-    let tree = judged.parsed().analysis_tree()?;
-    let mut resources = HashMap::new();
-    for resource in tree.project_resources() {
-        // Preserve the former find() policy if an earlier validation phase
-        // has retained multiple declarations with the same identity.
-        resources.entry(resource.id()).or_insert(resource);
-    }
-    for finding in &mut findings {
-        if let ResourceAdmissionDetail::Schema {
-            resource: id,
-            attribute,
-            ..
-        } = &finding.detail
-            && let Some(resource) = resources.get(id)
-        {
-            finding.location = Some(
-                attribute
-                    .as_deref()
-                    .map(|name| resource.attribute_key_location(name))
-                    .unwrap_or_else(|| resource.type_location())
-                    .clone(),
-            );
-        }
-    }
     findings.extend(report.findings.0);
     report.findings = ResourceAdmissionFindings(findings);
     Ok(report)
@@ -6056,14 +6086,14 @@ fn publish_admission_diagnostics<T>(
 }
 
 struct ResourceAdmissionReport {
-    attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
+    attributes: ResourceAdmissionValues,
     // Required prefix rejections and reference findings have one consuming exit.
     findings: ResourceAdmissionFindings,
 }
 impl ResourceAdmissionReport {
     fn new<F>(
         file: &crate::identifier::PrefixCanonicalized<'_, F>,
-        attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
+        attributes: ResourceAdmissionValues,
         mut references: ResourceAdmissionFindings,
     ) -> Self {
         let mut findings = file
@@ -6186,7 +6216,18 @@ fn resource_admission_report<
                     };
                     let attrs = resource.attributes();
                     let location = resource.diagnostic_label();
-                    for (attribute, path, error) in values.symbolic_errors() {
+                    for (attribute, path, diagnostic) in values.symbolic_errors() {
+                        let located = match resource
+                            .locate_schema_diagnostic(diagnostic, |_ordinary| {
+                                resource.attribute_key_location(attribute).clone()
+                            }) {
+                            Ok(located) => located,
+                            Err(error) => {
+                                all_errors.push(ResourceAdmissionFinding::analysis(error));
+                                continue;
+                            }
+                        };
+                        let error = diagnostic.error();
                         let start = all_errors.0.len();
                         match error {
                             TypeError::Reference { error, .. } => match error.as_ref() {
@@ -6243,8 +6284,7 @@ fn resource_admission_report<
                         for finding in &mut all_errors.0[start..] {
                             finding.detail = ResourceAdmissionDetail::Schema {
                                 resource: resource.id().clone(),
-                                attribute: Some(attribute.to_string()),
-                                error: error.clone(),
+                                diagnostic: Box::new(diagnostic.clone()),
                                 mismatch: match error {
                                     TypeError::TypeMismatch { types } => {
                                         Some(Box::new(ReferenceMismatch::for_attribute(
@@ -6257,11 +6297,10 @@ fn resource_admission_report<
                                     _ => None,
                                 },
                             };
-                            finding.location =
-                                Some(resource.attribute_key_location(attribute).clone());
+                            finding.location = Some(located.location().clone());
                         }
                     }
-                    attributes.insert(resource.id().clone(), values);
+                    attributes.insert((resource.id().clone(), resource.location().clone()), values);
                 }
                 Ok(())
             },
@@ -9190,7 +9229,20 @@ pub enum ExpandedModuleCallCheckInput<'a, 'bindings, P: PlaceholderKind = Parser
     },
 }
 
+/// A local check records its publication points before the driver visits
+/// children. Replaying these actions preserves recursive diagnostic ordering
+/// without retaining a Rust call frame or a self-referential binding index.
+enum ModuleCheckAction {
+    Finding(Box<ModuleCallFinding>),
+    Import {
+        directory: crate::paths::ResolvedPath,
+        root_owner: Box<ModuleCallFindingOwnerSource>,
+    },
+    Exit(crate::paths::CanonicalPath),
+}
+
 struct ModuleCallChecker<'a> {
+    module_actions: Option<Vec<ModuleCheckAction>>,
     source_overrides: crate::config_loader::SourceOverrides,
     provider_context: typecheck::TypecheckProviderContext<'a>,
     schemas: &'a SchemaRegistry,
@@ -9229,6 +9281,10 @@ struct ModuleReferenceCheckContext<'a, 'bindings, E> {
 
 impl ModuleCallChecker<'_> {
     fn push_finding(&mut self, finding: ModuleCallFinding) {
+        if let Some(actions) = &mut self.module_actions {
+            actions.push(ModuleCheckAction::Finding(Box::new(finding)));
+            return;
+        }
         if let Some(existing) = self
             .findings
             .iter_mut()
@@ -9609,7 +9665,12 @@ impl ModuleCallChecker<'_> {
                 },
                 Err(error) => Err(error),
             };
-            let reports_here = !self.findings.iter().any(|finding| finding.anchor.location() == location && finding.owners.contains(&owner))
+            let reports_here = !self.findings.iter().chain(
+                self.module_actions.iter().flatten().filter_map(|action| match action {
+                    ModuleCheckAction::Finding(finding) => Some(finding.as_ref()),
+                    ModuleCheckAction::Import { .. } | ModuleCheckAction::Exit(_) => None,
+                })
+            ).any(|finding| finding.anchor.location() == location && finding.owners.contains(&owner))
                 && !inference.as_ref().is_ok_and(|expression| {
                     matches!(expression.static_type(), Err(crate::static_type::InferenceIssue::Failed(error))
                         if authority_file.expression_report().findings().iter().any(|finding| finding.detail() == &error))
@@ -9770,14 +9831,60 @@ impl ModuleCallChecker<'_> {
         let Some(base_dir) = base_dir else {
             return Ok(());
         };
-        let Ok(module_dir) = base_dir.join(&import.path) else {
+        let Ok(directory) = base_dir.join(&import.path) else {
             return Ok(());
         };
-        let guard = module_dir.identity();
-        if !self.active_modules.insert(guard.clone()) {
+        let action = ModuleCheckAction::Import {
+            directory,
+            root_owner: Box::new(root_owner.clone()),
+        };
+        if let Some(actions) = &mut self.module_actions {
+            actions.push(action);
             return Ok(());
         }
+        let mut work = vec![action];
+        while let Some(action) = work.pop() {
+            match action {
+                ModuleCheckAction::Finding(finding) => self.push_finding(*finding),
+                ModuleCheckAction::Exit(guard) => {
+                    self.active_modules.remove(&guard);
+                }
+                ModuleCheckAction::Import {
+                    directory,
+                    root_owner,
+                } => {
+                    let guard = directory.identity();
+                    if !self.active_modules.insert(guard.clone()) {
+                        continue;
+                    }
+                    // Local checks record findings and child-import suspension
+                    // points; they never enter another module themselves.
+                    self.module_actions = Some(Vec::new());
+                    let checked = self.check_loaded_module(&directory, &root_owner);
+                    let actions = self.module_actions.take().expect("recorded module actions");
+                    if let Err(error) = checked {
+                        self.active_modules.remove(&guard);
+                        for action in work {
+                            if let ModuleCheckAction::Exit(guard) = action {
+                                self.active_modules.remove(&guard);
+                            }
+                        }
+                        return Err(error);
+                    }
+                    work.push(ModuleCheckAction::Exit(guard));
+                    work.extend(actions.into_iter().rev());
+                }
+            }
+        }
+        Ok(())
+    }
 
+    fn check_loaded_module(
+        &mut self,
+        module_dir: &crate::paths::ResolvedPath,
+        root_owner: &ModuleCallFindingOwnerSource,
+    ) -> Result<(), crate::parser::AnalysisTreeError> {
+        let guard = module_dir.identity();
         // An enriched parse intentionally rejects an unknown bare type before
         // this checker can turn it into a contextual declaration diagnostic.
         // Retain the providerless syntax snapshot in that case, then let the
@@ -9786,13 +9893,13 @@ impl ModuleCallChecker<'_> {
         // against this source-anchored finding.
         if let Some(mut module) = self.module_cache.get(&guard).cloned().or_else(|| {
             crate::module_resolver::loader::load_module_with_overrides(
-                &module_dir,
+                module_dir,
                 self.provider_context.as_provider_context(),
                 &self.source_overrides,
             )
             .or_else(|| {
                 crate::module_resolver::loader::load_module_with_overrides(
-                    &module_dir,
+                    module_dir,
                     &ProviderContext::new(
                         self.provider_context
                             .as_provider_context()
@@ -9811,7 +9918,7 @@ impl ModuleCallChecker<'_> {
             )?;
             let signatures = crate::module_resolver::load_resolved_module_signatures_with_overrides(
                 &module,
-                &module_dir,
+                module_dir,
                 self.provider_context.as_provider_context(),
                 &self.source_overrides,
             );
@@ -9862,7 +9969,7 @@ impl ModuleCallChecker<'_> {
                 &module,
                 ModuleFileCheckContext {
                     semantic: Some(&module),
-                    base_dir: Some(&module_dir),
+                    base_dir: Some(module_dir),
                     signatures: &signatures,
                     binding_use_report: &binding_use_report,
                     bindings: &bindings,
@@ -9872,7 +9979,6 @@ impl ModuleCallChecker<'_> {
             )?;
         }
 
-        self.active_modules.remove(&guard);
         Ok(())
     }
 
@@ -10324,6 +10430,7 @@ fn check_module_calls_with_provider_context<'a, 'bindings, E, C: ?Sized>(
         reference_checks,
     } = input;
     let mut checker = ModuleCallChecker {
+        module_actions: None,
         source_overrides: overrides.clone(),
         provider_context,
         schemas,
@@ -10354,6 +10461,7 @@ pub fn check_expanded_module_calls<P: PlaceholderKind>(
     let schemas = SchemaRegistry::new();
     let overrides = Default::default();
     let mut checker = ModuleCallChecker {
+        module_actions: None,
         source_overrides: overrides,
         provider_context: typecheck::TypecheckProviderContext::providerless(provider_context),
         schemas: &schemas,

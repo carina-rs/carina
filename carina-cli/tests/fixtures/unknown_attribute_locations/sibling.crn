@@ -1,0 +1,8 @@
+let decoy = '😀 typo multiline'
+let emoji = '😀' mock.test.resource { name = 'sibling' typo = true
+  multiline = [
+    'value'
+  ]
+  lifecycle_configuration = { struct_typo = true }
+  rule { block_typo = true }
+}

@@ -744,6 +744,9 @@ where
     pub fn report(&self) -> &crate::parser::retained::ExpressionReport<B> {
         self.file.report()
     }
+    pub fn secrecy(&self) -> &crate::secrecy::SecrecyReport {
+        self.file.secrecy()
+    }
     pub fn validation_context_in_session<'f>(
         &'f self,
         session: &'f dyn crate::validation::deferred_types::ProviderTypeCheckContext,

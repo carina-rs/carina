@@ -16,23 +16,30 @@ python3 - "$@" <<'PY'
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import tomllib
 import uuid
 
-limit = int(os.environ.get("CARINA_ISOLATION_TIMEOUT", "1200"))
+with Path(".config/nextest.toml").open("rb") as config_file:
+    slow_timeout = tomllib.load(config_file)["profile"]["default"]["slow-timeout"]
+period = re.fullmatch(r"(\d+(?:\.\d+)?)s", slow_timeout["period"])
+if period is None:
+    raise SystemExit("default nextest slow-timeout period must be in seconds (e.g. 60s)")
+limit = float(period[1]) * slow_timeout["terminate-after"]
 
-def run(args, fail_fast=True, **kwargs):
+def run(args, fail_fast=True, timeout=None, **kwargs):
     child = subprocess.Popen(args, start_new_session=True, **kwargs)
     try:
-        stdout, stderr = child.communicate(timeout=limit)
+        stdout, stderr = child.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         os.killpg(child.pid, signal.SIGKILL)
         child.communicate()
-        message = f"in-process isolation check timed out after {limit}s: {args[0]}"
+        message = f"in-process isolation check timed out after {timeout:g}s: {args[0]}"
         if fail_fast:
             raise SystemExit(message)
         print(message, flush=True)
@@ -92,7 +99,8 @@ with tempfile.TemporaryDirectory(prefix="carina-in-process-env-") as temporary:
             package = "carina-provider-mock" if key[0] == "carina_provider_mock" else "carina-cli"
             binary_env = dict(child_env, CARGO_MANIFEST_DIR=str(workspace / package))
             args = [executable, "--test-threads=8"]
-            status = run(args, env=binary_env, cwd=workspace / package, fail_fast=False)
+            status = run(args, env=binary_env, cwd=workspace / package,
+                         fail_fast=False, timeout=limit)
             if status:
                 failures.append((key, status))
     finally:

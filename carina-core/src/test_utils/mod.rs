@@ -9,6 +9,13 @@ pub mod loopback;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod provider_text;
 
+/// Adapt a real parser invariant for downstream terminal-rendering tests.
+pub fn resource_analysis_finding_for_test(
+    error: crate::parser::AnalysisTreeError,
+) -> crate::validation::ResourceAdmissionFinding {
+    crate::validation::ResourceAdmissionFinding::analysis(error)
+}
+
 pub fn load_canonical_buffer_configuration<'a, E, D, B: crate::resource::BindingAddress>(
     parsed: &crate::parser::File<
         E,
@@ -210,9 +217,6 @@ pub fn fixture_value_type<P: crate::resource::ValueKind, B: crate::resource::Bin
             else {
                 return usize::MAX;
             };
-            if key.is_diagnostic_sensitive() {
-                return usize::MAX;
-            }
             let key = key.expose_plaintext();
             self.keys
                 .iter()

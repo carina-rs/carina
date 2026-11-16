@@ -1,0 +1,6 @@
+let seed = mock.test.resource { name = "seed" }
+let other = mock.test.resource {
+  name = "other"
+  comment = secret("${seed.identifier}-STRUCTURAL_SECRECY_4470_CANARY")
+}
+let up = upstream_state { source = "./up" }

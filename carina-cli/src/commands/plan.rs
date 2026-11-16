@@ -5827,7 +5827,7 @@ mod storage_readiness_tests {
         assert!(matches!(&policy_error, AppError::Config(_)));
         assert_eq!(
             policy_error.to_string(),
-            "Backend bucket value from env() not found and auto_create is disabled"
+            "Backend bucket 'private-bucket-name' not found and auto_create is disabled"
         );
         assert!(
             plan_s3_storage_bootstrap(storage.clone(), true, false)

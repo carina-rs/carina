@@ -293,21 +293,6 @@ impl ResolvedReferences {
         b: &ValueString,
         operands: &[ReferenceOperand; 2],
     ) -> Result<bool, Box<ReferencePlanError>> {
-        for (raw, operand) in [a, b].into_iter().zip(operands) {
-            if raw.is_diagnostic_sensitive() {
-                return Err(Box::new(ReferencePlanError {
-                    instance: ProviderInstanceKey::from(resource),
-                    resource: resource.clone(),
-                    path: operand.path.clone(),
-                    raw: raw.clone(),
-                    source: ReferenceError::InvalidReference(
-                        HostError::invalid_input("secret values cannot be used as references")
-                            .into(),
-                    )
-                    .into(),
-                }));
-            }
-        }
         if a == b {
             return Ok(true);
         }
@@ -1217,10 +1202,7 @@ fn collect_leaf<P: crate::resource::ValueKind>(
 ) -> Result<(), Box<ReferencePlanError>> {
     // Secrets are never sent to a guest. Only a comparison that uses one
     // returns its typed error.
-    if !secret
-        && let Value::Concrete(ConcreteValue::String(raw)) = value
-        && !raw.is_diagnostic_sensitive()
-    {
+    if !secret && let Value::Concrete(ConcreteValue::String(raw)) = value {
         values.push(Occurrence {
             resource: resource.clone(),
             path: path.into(),
@@ -1299,9 +1281,7 @@ impl ReferenceValidation<'_> {
                 ty.map_value(),
                 format!(
                     "{path}[{}]",
-                    name.diagnostic_literal()
-                        .map(crate::parser::display_string_literal)
-                        .unwrap_or_else(|| "<sensitive string>".to_owned())
+                    crate::parser::display_string_literal(name.expose_plaintext())
                 ),
             ),
             LeafPathSegment::ListIndex(index) => (ty.list_element(), format!("{path}[{index}]")),
@@ -1346,22 +1326,29 @@ impl ReferenceValidation<'_> {
         secret: bool,
         depth: usize,
     ) -> Result<(), Box<ReferencePlanError>> {
-        self.walk(value, ty, path, secret, depth, &mut |value, _, path, secret| {
-            if secret || crate::value::contains_secret(value)
-                || matches!(value, Value::Concrete(ConcreteValue::String(raw)) if raw.is_diagnostic_sensitive())
-            {
-                return Err(Box::new(ReferencePlanError {
-                    instance: ProviderInstanceKey::from(self.resource),
-                    resource: self.resource.clone(),
-                    path: path.into(),
-                    raw: ValueString::diagnostic_sensitive("<redacted>"),
-                    source: ReferenceError::InvalidReference(HostError::invalid_input(
-                        "secret values cannot be used as references",
-                    ).into()).into(),
-                }));
-            }
-            Ok(())
-        })
+        self.walk(
+            value,
+            ty,
+            path,
+            secret,
+            depth,
+            &mut |value, _, path, secret| {
+                if secret || crate::value::contains_secret(value) {
+                    return Err(Box::new(ReferencePlanError {
+                        instance: ProviderInstanceKey::from(self.resource),
+                        resource: self.resource.clone(),
+                        path: path.into(),
+                        raw: ValueString::diagnostic_sensitive("<redacted>"),
+                        source: ReferenceError::InvalidReference(
+                            HostError::invalid_input("secret values cannot be used as references")
+                                .into(),
+                        )
+                        .into(),
+                    }));
+                }
+                Ok(())
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

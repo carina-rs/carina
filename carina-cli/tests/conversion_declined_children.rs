@@ -3,7 +3,7 @@ mod base;
 
 use carina_core::{paths::ResolvedPath, provider::*, schema::*};
 use std::{collections::HashMap, sync::Arc};
-use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
+use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString, Position, Range};
 
 struct ChildFactory {
     inner: Box<dyn ProviderFactory>,
@@ -301,6 +301,12 @@ async fn r7_no_as_scalar_reference_keeps_mains_ordinary_field_error() {
     assert_eq!(errors.len(), 1, "{}", cli.json);
     assert_eq!(errors[0]["message"], "Unknown field 'unknown' in B");
     assert!(errors[0]["code"].is_null(), "{}", cli.json);
+    let column = source.lines().nth(2).unwrap().find("unknown").unwrap() as u32;
+    let json_range = serde_json::json!({
+        "start": {"line": 3, "column": column + 1},
+        "end": {"line": 3, "column": column + 8},
+    });
+    let cli_range = errors[0]["location"]["range"].clone();
     let lsp = lsp(directory.path(), source);
     let errors = lsp
         .iter()
@@ -308,6 +314,17 @@ async fn r7_no_as_scalar_reference_keeps_mains_ordinary_field_error() {
         .collect::<Vec<_>>();
     assert_eq!(errors.len(), 1, "{lsp:?}");
     assert_eq!(errors[0].severity, Some(DiagnosticSeverity::WARNING));
+    eprintln!(
+        "symbolic unknown: CLI JSON {cli_range}; LSP {:?}",
+        errors[0].range
+    );
+    assert_eq!(
+        (cli_range, errors[0].range),
+        (
+            json_range,
+            Range::new(Position::new(2, column), Position::new(2, column + 7))
+        )
+    );
     assert!(lsp.iter().all(|diagnostic| !matches!(&diagnostic.code, Some(NumberOrString::String(code)) if code.starts_with("conversion_"))), "{lsp:?}");
     let runtime = carina_cli::test_support::TestCommandRuntime::new();
     carina_cli::commands::init::run_init(&runtime, directory.path(), false, false, false, false)
@@ -323,4 +340,37 @@ async fn r7_no_as_scalar_reference_keeps_mains_ordinary_field_error() {
     let output = carina_cli::error::format_error_with_source_chain(&error);
     assert!(output.contains("Unknown field 'unknown' in B"), "{output}");
     assert!(!output.contains("conversion"), "{output}");
+}
+
+#[test]
+fn symbolic_unknown_field_uses_authored_key_in_cli_json_and_lsp() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = source("direct = { unknown = p.output }").replace("output = 'ok'", "");
+    write(directory.path(), &source);
+    let cli = validate(directory.path());
+    let errors = cli.json["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{}", cli.json);
+    assert_eq!(errors[0]["message"], "Unknown field 'unknown' in B");
+    assert!(errors[0]["code"].is_null());
+    let column = source.lines().nth(2).unwrap().find("unknown").unwrap() as u32;
+    let expected_json = serde_json::json!({
+        "start": {"line": 3, "column": column + 1},
+        "end": {"line": 3, "column": column + 8},
+    });
+    let cli_range = errors[0]["location"]["range"].clone();
+    let lsp = lsp(directory.path(), source);
+    assert_eq!(lsp.len(), 1, "{lsp:#?}");
+    assert_eq!(lsp[0].message, "Unknown field 'unknown' in B");
+    assert_eq!(lsp[0].severity, Some(DiagnosticSeverity::WARNING));
+    eprintln!(
+        "unresolved symbolic unknown: CLI JSON {cli_range}; LSP {:?}",
+        lsp[0].range
+    );
+    assert_eq!(
+        (cli_range, lsp[0].range),
+        (
+            expected_json,
+            Range::new(Position::new(2, column), Position::new(2, column + 7))
+        )
+    );
 }

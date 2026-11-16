@@ -125,10 +125,10 @@ fn extract<B: BindingAddress>(
     }
 }
 fn missing_field(accessor: &ValueString, location: &str) -> String {
-    match accessor.diagnostic_literal() {
-        Some(accessor) => format!("map(): field '{}' not found {location}", &accessor[1..]),
-        None => format!("map(): field named by a sensitive value not found {location}"),
-    }
+    format!(
+        "map(): field '{}' not found {location}",
+        &accessor.expose_plaintext()[1..]
+    )
 }
 
 #[cfg(test)]

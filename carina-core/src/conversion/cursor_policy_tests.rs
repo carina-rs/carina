@@ -131,13 +131,7 @@ fn conversion_channel_is_disjoint_from_ordinary_findings_across_resource_slots()
                 0,
                 "conversion leaked into diagnostic errors"
             );
-            assert!(
-                report
-                    .take_attribute("target")
-                    .unwrap()
-                    .symbolic_findings()
-                    .is_empty()
-            );
+            assert!(report.take_attribute("target").unwrap().1.is_empty());
             resources += 1;
         }
     });

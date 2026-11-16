@@ -19,6 +19,7 @@ impl From<AuthoredInputUnavailable> for crate::provider::HostError {
 #[derive(Clone)]
 pub struct AuthoredInputs {
     selection: super::union_fits::InputSelectionAuthority,
+    secrecy: Option<crate::secrecy::ValidatedSecrecyGraph>,
     parser_source: Option<Arc<crate::parser::ParsedFile>>,
     resources: Vec<crate::resource::Resource<ModuleSource, ParserPlaceholder>>,
     defaults: Vec<type_context::DefaultTagEvidence>,
@@ -81,6 +82,7 @@ impl AuthoredInputs {
             defaults,
             parser_source: None,
             selection: Default::default(),
+            secrecy: None,
         }
     }
 
@@ -159,6 +161,23 @@ impl AuthoredInputs {
         inputs
     }
 
+    /// Structural evidence is granted by successful binding admission, never
+    /// reconstructed from this snapshot's provisional or provider values.
+    pub fn validated_secrecy(
+        &self,
+    ) -> Result<&crate::secrecy::ValidatedSecrecyGraph, crate::secrecy::PendingSecrecy> {
+        self.secrecy.as_ref().ok_or(crate::secrecy::PendingSecrecy)
+    }
+
+    pub(crate) fn with_validated_secrecy(
+        &self,
+        graph: crate::secrecy::ValidatedSecrecyGraph,
+    ) -> Self {
+        let mut inputs = self.clone();
+        inputs.secrecy = Some(graph);
+        inputs
+    }
+
     pub(super) fn resources(&self) -> impl Iterator<Item = AuthoredResource<'_>> {
         self.resources.iter().map(AuthoredResource)
     }
@@ -197,6 +216,7 @@ impl AuthoredInputs {
             defaults: Vec::new(),
             parser_source: None,
             selection: Default::default(),
+            secrecy: None,
         }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -291,6 +291,7 @@ pub struct Backend {
     client: Client,
     documents: Arc<DashMap<Url, Document>>,
     providers: Arc<tokio::sync::RwLock<ProviderStates>>,
+    published_documents: Arc<DiagnosticPublisher>,
     provider_context: Arc<ProviderContext>,
     workspace_root: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
     factory_builder: Option<FactoryBuilder>,
@@ -323,6 +324,7 @@ impl Backend {
         Self {
             client,
             documents: Arc::new(DashMap::new()),
+            published_documents: Arc::default(),
             providers: Arc::new(tokio::sync::RwLock::new(ProviderStates::new(
                 provider_context.environment.clone(),
             ))),
@@ -340,7 +342,14 @@ impl Backend {
     }
 
     async fn update_diagnostics(&self, uri: Url) {
-        publish_diagnostics_for(&self.client, &self.documents, &self.providers, uri).await;
+        publish_diagnostics_for(
+            &self.client,
+            &self.documents,
+            &self.providers,
+            &self.published_documents,
+            Some(&uri),
+        )
+        .await;
     }
 
     /// Spawn a background task that polls the on-disk install state for
@@ -359,6 +368,7 @@ impl Backend {
         }
         let providers = Arc::clone(&self.providers);
         let documents = Arc::clone(&self.documents);
+        let published_documents = Arc::clone(&self.published_documents);
         let workspace_root = Arc::clone(&self.workspace_root);
         let factory_builder = self.factory_builder.as_ref().map(Arc::clone);
         let install_prober = self.install_prober.as_ref().map(Arc::clone);
@@ -382,6 +392,7 @@ impl Backend {
                         install_prober.as_ref(),
                         providers.as_ref(),
                         documents.as_ref(),
+                        published_documents.as_ref(),
                     )
                     .await;
                 }
@@ -398,6 +409,7 @@ impl Backend {
             self.install_prober.as_ref(),
             self.providers.as_ref(),
             self.documents.as_ref(),
+            self.published_documents.as_ref(),
         )
         .await;
     }
@@ -421,8 +433,13 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                        ..Default::default()
+                    },
                 )),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![
@@ -559,6 +576,11 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents.remove(&params.text_document.uri);
+        self.update_diagnostics(params.text_document.uri).await;
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        self.update_diagnostics(params.text_document.uri).await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -722,24 +744,151 @@ impl LanguageServer for Backend {
     }
 }
 
-/// Publish diagnostics for a single document. Free function so both the
-/// `Backend` methods and the provider-drift poller can call it without going
-/// through `&self`.
+/// Cached contributions are owned by the document analysis that produced them.
+/// The update gate orders notifications; the state lock never covers analysis
+/// or client I/O.
+#[derive(Default)]
+struct DiagnosticPublisher {
+    update: tokio::sync::Mutex<()>,
+    state: std::sync::Mutex<BTreeMap<Url, crate::diagnostics::DocumentDiagnostics>>,
+}
+
 async fn publish_diagnostics_for(
     client: &Client,
     documents: &DashMap<Url, Document>,
     providers: &tokio::sync::RwLock<ProviderStates>,
-    uri: Url,
+    published_documents: &DiagnosticPublisher,
+    changed: Option<&Url>,
 ) {
-    let Some(doc) = documents.get(&uri) else {
-        return;
+    let _update = published_documents.update.lock().await;
+    let open_uris = documents
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect::<BTreeSet<_>>();
+    let targets = {
+        let state = published_documents.state.lock().unwrap();
+        match changed
+            .and_then(|uri| uri.to_file_path().ok())
+            .and_then(|path| path.parent().map(PathIdentity::new))
+        {
+            Some(directory) => {
+                let mut affected = BTreeSet::from([directory.clone()]);
+                for (uri, result) in state.iter() {
+                    if result.imported_directories.contains(&directory)
+                        && let Some(root) = uri
+                            .to_file_path()
+                            .ok()
+                            .and_then(|path| path.parent().map(PathIdentity::new))
+                    {
+                        affected.insert(root);
+                    }
+                }
+                open_uris
+                    .iter()
+                    .filter(|uri| {
+                        uri.to_file_path()
+                            .ok()
+                            .and_then(|path| path.parent().map(PathIdentity::new))
+                            .is_some_and(|directory| affected.contains(&directory))
+                    })
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            }
+            // Provider/schema reloads explicitly invalidate every analysis.
+            None if changed.is_none() => open_uris.clone(),
+            None => BTreeSet::new(),
+        }
     };
-    let current_file_path = uri.to_file_path().ok();
+    let open_sources = open_uris
+        .iter()
+        .filter_map(|uri| documents.get(uri))
+        .map(|entry| (entry.source_file().to_path_buf(), entry.source_snapshot()))
+        .collect::<Vec<_>>();
     let guard = providers.read().await;
-    let diagnostics = analyze_document(&guard, &doc, current_file_path.as_deref());
+    let mut results = Vec::new();
+    for uri in &targets {
+        let Some(entry) = documents.get(uri) else {
+            continue;
+        };
+        let path = uri.to_file_path().ok();
+        let state = path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|path| guard.state_for_path(path))
+            .unwrap_or(&guard.empty);
+        results.push((
+            uri.clone(),
+            state.diagnostic_engine.analyze_document_snapshot(
+                &entry,
+                path.as_deref(),
+                &open_sources,
+            ),
+        ));
+    }
     drop(guard);
-
-    client.publish_diagnostics(uri, diagnostics, None).await;
+    let report = {
+        let mut state = published_documents.state.lock().unwrap();
+        let mut touched = BTreeSet::new();
+        let paths = |result: &crate::diagnostics::DocumentDiagnostics| {
+            result
+                .documents
+                .keys()
+                .filter_map(|path| Url::from_file_path(path).ok())
+                .collect::<Vec<_>>()
+        };
+        state.retain(|uri, result| {
+            if open_uris.contains(uri) {
+                true
+            } else {
+                touched.extend(paths(result));
+                touched.insert(uri.clone());
+                false
+            }
+        });
+        for (uri, result) in results {
+            touched.extend(paths(&result));
+            if let Some(previous) = state.insert(uri, result) {
+                touched.extend(paths(&previous));
+            }
+        }
+        if let Some(uri) = changed {
+            touched.insert(uri.clone());
+        }
+        let mut report = touched
+            .iter()
+            .map(|uri| (uri.clone(), Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        for result in state.values() {
+            for (file, diagnostics) in &result.documents {
+                let Ok(uri) = Url::from_file_path(file) else {
+                    continue;
+                };
+                let Some(combined) = report.get_mut(&uri) else {
+                    continue;
+                };
+                for diagnostic in diagnostics {
+                    if !combined.iter().any(|existing| {
+                        crate::diagnostics::AnalyzedDiagnostic::same(existing, diagnostic)
+                    }) {
+                        combined.push(diagnostic.clone());
+                    }
+                }
+            }
+        }
+        report
+    };
+    for (uri, diagnostics) in report {
+        client
+            .publish_diagnostics(
+                uri,
+                diagnostics
+                    .into_iter()
+                    .map(|finding| finding.diagnostic)
+                    .collect(),
+                None,
+            )
+            .await;
+    }
 }
 
 /// Workspace-wide schema load/reload. Free function so the drift poller can
@@ -751,6 +900,7 @@ async fn load_schemas_impl(
     install_prober: Option<&ProviderInstallProber>,
     providers: &tokio::sync::RwLock<ProviderStates>,
     documents: &DashMap<Url, Document>,
+    published_documents: &DiagnosticPublisher,
 ) {
     let Some(Some(root)) = workspace_root.get() else {
         return;
@@ -789,10 +939,7 @@ async fn load_schemas_impl(
             .await;
     }
     if result.reloaded || result.import_map_changed {
-        let uris: Vec<Url> = documents.iter().map(|r| r.key().clone()).collect();
-        for uri in uris {
-            publish_diagnostics_for(client, documents, providers, uri).await;
-        }
+        publish_diagnostics_for(client, documents, providers, published_documents, None).await;
     }
 }
 
@@ -803,11 +950,22 @@ pub fn analyze_document(
     document: &Document,
     current_file_path: Option<&Path>,
 ) -> Vec<Diagnostic> {
+    analyze_document_with_open_sources(states, document, current_file_path, &[])
+}
+
+fn analyze_document_with_open_sources(
+    states: &ProviderStates,
+    document: &Document,
+    current_file_path: Option<&Path>,
+    open_sources: &[(PathBuf, Arc<str>)],
+) -> Vec<Diagnostic> {
     let state = current_file_path
         .and_then(Path::parent)
         .map(|path| states.state_for_path(path))
         .unwrap_or(&states.empty);
-    state.diagnostic_engine.analyze(document, current_file_path)
+    state
+        .diagnostic_engine
+        .analyze_with_open_sources(document, current_file_path, open_sources)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -996,6 +1154,127 @@ mod tests {
     use super::*;
     use carina_core::provider::{BoxFuture, ProviderResult};
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    #[tokio::test]
+    async fn changes_reanalyse_only_the_directory_and_its_last_module_importers_including_close() {
+        let fixture = tempfile::tempdir().unwrap();
+        for directory in ["caller", "module", "unrelated"] {
+            std::fs::create_dir(fixture.path().join(directory)).unwrap();
+        }
+        let files = [
+            (
+                "caller/main.crn",
+                "let child = use { source = '../module' }\nlet instance = child {}\n",
+            ),
+            ("caller/providers.crn", "provider mock {}\n"),
+            (
+                "module/main.crn",
+                "arguments { value: String = 'public' }\nattributes { result: String = value }\n",
+            ),
+            ("unrelated/main.crn", "provider mock {}\n"),
+        ];
+        for (file, text) in files {
+            std::fs::write(fixture.path().join(file), text).unwrap();
+        }
+        let (service, socket) = tower_lsp::LspService::new(|client| {
+            Backend::new(
+                client,
+                ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+                None,
+            )
+        });
+        drop(socket);
+        let backend = service.inner();
+        for (file, text) in files {
+            backend
+                .did_open(DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem::new(
+                        Url::from_file_path(fixture.path().join(file)).unwrap(),
+                        "carina".into(),
+                        0,
+                        text.into(),
+                    ),
+                })
+                .await;
+        }
+        let take = || {
+            crate::diagnostics::ANALYZED_DOCUMENTS.with(|paths| {
+                std::mem::take(&mut *paths.borrow_mut())
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            })
+        };
+        take();
+        let module_uri = Url::from_file_path(fixture.path().join("module/main.crn")).unwrap();
+        backend.update_diagnostics(module_uri.clone()).await;
+        let expected = files[..3]
+            .iter()
+            .map(|(file, _)| fixture.path().join(file))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            take(),
+            expected,
+            "unrelated open directories must not be analyzed"
+        );
+        backend
+            .did_save(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier::new(module_uri.clone()),
+                text: None,
+            })
+            .await;
+        assert_eq!(
+            take(),
+            expected,
+            "saving uses the same cached import dependencies"
+        );
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier::new(module_uri.clone()),
+            })
+            .await;
+        assert_eq!(
+            take(),
+            files[..2]
+                .iter()
+                .map(|(file, _)| fixture.path().join(file))
+                .collect()
+        );
+        let caller_uri = Url::from_file_path(fixture.path().join("caller/main.crn")).unwrap();
+        std::fs::write(
+            fixture.path().join("caller/main.crn"),
+            "let local = 'public'\n",
+        )
+        .unwrap();
+        backend
+            .did_change(DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier::new(caller_uri, 1),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "let local = 'public'\n".into(),
+                }],
+            })
+            .await;
+        assert_eq!(
+            take(),
+            files[..2]
+                .iter()
+                .map(|(file, _)| fixture.path().join(file))
+                .collect()
+        );
+        backend.update_diagnostics(module_uri).await;
+        assert!(
+            take().is_empty(),
+            "removing an import must remove the cached dependency"
+        );
+        backend
+            .update_diagnostics(Url::parse("untitled:closed").unwrap())
+            .await;
+        assert!(
+            take().is_empty(),
+            "a non-file notification must not trigger a full sweep"
+        );
+    }
 
     struct BlockSchemaFactory {
         block_name: &'static str,

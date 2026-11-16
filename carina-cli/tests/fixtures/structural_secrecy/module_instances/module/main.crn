@@ -1,0 +1,4 @@
+let item = mock.test.resource {
+  name = name
+  comment = value ?? "default"
+}

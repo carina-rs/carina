@@ -204,10 +204,7 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
 /// Format a Value for hover display
 fn format_value_for_hover(value: &Value) -> String {
     match value {
-        Value::Concrete(ConcreteValue::String(s)) => s
-            .diagnostic_literal()
-            .map(display_string_literal)
-            .unwrap_or_else(|| "string".to_string()),
+        Value::Concrete(ConcreteValue::String(s)) => display_string_literal(s.expose_plaintext()),
         Value::Concrete(ConcreteValue::Int(n)) => n.to_string(),
         Value::Concrete(ConcreteValue::Float(f)) => f.to_string(),
         Value::Concrete(ConcreteValue::Bool(b)) => b.to_string(),
@@ -2693,6 +2690,65 @@ EOT
         );
         let hover = provider.hover(&doc, Position::new(0, 3));
         assert!(hover.is_none(), "Unknown function should not show hover");
+    }
+
+    #[test]
+    fn env_hover_values_are_public_and_secret_values_stay_masked() {
+        let config = ProviderContext::new(carina_core::EnvironmentSnapshot::new([(
+            "CARINA_4409_HOVER".to_string(),
+            "hover-env-value".into(),
+        )]));
+        let mut parsed = carina_core::parser::parse_file(
+            "let value = env('CARINA_4409_HOVER')\nlet hidden = secret(env('CARINA_4409_HOVER'))",
+            std::path::Path::new("hover.crn"),
+            &config,
+        )
+        .unwrap();
+        carina_core::parser::resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
+        let value = parsed.variables["value"].clone();
+        let ordinary = format_value_for_hover(&value);
+        let hidden = format_value_for_hover(&parsed.variables["hidden"]);
+        let provider = HoverProvider::new(Arc::new(SchemaRegistry::new()), vec![]);
+        let hover = provider.builtin_function_hover("env").unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("builtin hover must use markup");
+        };
+        assert_eq!(hidden, "Deferred(Secret((secret)))");
+        assert_eq!(ordinary, "'hover-env-value'");
+        assert!(content.value.contains("ordinary string"));
+        assert!(content.value.contains("secret(env('NAME'))"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let module = directory.path().join("module");
+        std::fs::create_dir(&module).unwrap();
+        std::fs::write(module.join("main.crn"),
+            "arguments { value: String = env('CARINA_4409_HOVER') hidden: String = secret(env('CARINA_4409_HOVER')) }\n").unwrap();
+        let source = "let service = use { source = './module' }\nservice { value = 'public' hidden = 'public' }\n";
+        let document = Document::new_with_path(
+            source.into(),
+            directory.path().join("main.crn"),
+            Arc::new(config),
+        );
+        for (name, expected) in [
+            (
+                "value",
+                "## service.value\n\n- **Type**: String\n- **Default**: Deferred(FunctionCall { name: env, args: [Concrete(String(\"CARINA_4409_HOVER\"))], source_line: DiagnosticSourceLine(Some(1)) })\n",
+            ),
+            (
+                "hidden",
+                "## service.hidden\n\n- **Type**: String\n- **Default**: Deferred(Secret((secret)))\n",
+            ),
+        ] {
+            let content = hover_markdown(
+                &provider,
+                &document,
+                hover_position(source, name, 0),
+                Some(directory.path()),
+            )
+            .unwrap();
+            assert_eq!(content, expected);
+            assert!(!content.contains("hover-env-value"), "{content}");
+        }
     }
 
     #[test]

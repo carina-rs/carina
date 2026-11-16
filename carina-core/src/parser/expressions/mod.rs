@@ -41,6 +41,8 @@ pub(super) fn evaluation_form(rule: super::Rule) -> EvaluationForm {
         Rule::if_expr => EvaluationForm::If,
         Rule::expression => EvaluationForm::Expression,
         Rule::EOI
+        | Rule::coalesce_separator
+        | Rule::coalesce_token
         | Rule::file
         | Rule::statement
         | Rule::require_head

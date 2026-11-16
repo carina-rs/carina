@@ -97,9 +97,16 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `env` | `env(name) -> String` | Reads an environment variable; diagnostics never display its contents |
+| `env` | `env(name) -> String` | Reads an environment variable as an ordinary string |
 | `secret` | `secret(value) -> Secret` | Marks a value as secret (stored as hash in state) |
 | `decrypt` | `decrypt(ciphertext, key?) -> Secret` | Decrypts base64 ciphertext with host-side AWS KMS; returns a masked secret stored as a hash in state |
+
+`env()` returns an ordinary string that can appear in diagnostics and plan output.
+An environment variable that must stay hidden is written `secret(env('NAME'))`:
+
+```crn
+let password = secret(env('DB_PASSWORD'))
+```
 
 ## User-defined functions
 

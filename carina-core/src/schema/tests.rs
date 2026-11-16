@@ -1563,23 +1563,11 @@ fn unique_lists_compare_nested_canonical_values_and_skip_partial_objects() {
 }
 
 #[test]
-fn unique_list_skips_whole_secrets_and_diagnostic_sensitive_elements() {
+fn unique_list_skips_whole_parsed_secrets() {
     let list = unique_list_from_protocol(AttributeType::string(), true);
-    let duplicate = Value::Concrete(ConcreteValue::List(vec![
-        Value::Concrete(ConcreteValue::String("private-claim".into())),
-        Value::Concrete(ConcreteValue::String("private-claim".into())),
-    ]));
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(duplicate).into()));
+    let secret = schema_source_value("secret(['private-claim', 'private-claim'])");
     assert!(list.validate(&secret).is_ok());
     assert!(Schema::flat(list).validate_collect(&secret).is_empty());
-
-    let sensitive = Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-        "env-private-claim",
-    )));
-    let duplicate = Value::Concrete(ConcreteValue::List(vec![sensitive.clone(), sensitive]));
-    let list = unique_list_from_protocol(AttributeType::string(), true);
-    assert!(list.validate(&duplicate).is_ok());
-    assert!(Schema::flat(list).validate_collect(&duplicate).is_empty());
 }
 
 #[test]
@@ -1748,48 +1736,55 @@ fn unique_list_constraints_collect_length_and_element_errors_together() {
     }
 }
 
-fn assert_mixed_sensitive_list_is_not_comparable(secret: bool, sensitive_first: bool) {
-    let plain = Value::Concrete(ConcreteValue::String("private-mixed-claim".into()));
-    let sensitive = if secret {
-        Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()).into()))
+fn assert_mixed_secret_list_is_not_comparable(secret_first: bool) {
+    let value = schema_source_value(if secret_first {
+        "[secret('private-mixed-claim'), 'private-mixed-claim']"
     } else {
-        Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-            "private-mixed-claim",
-        )))
-    };
-    let items = if sensitive_first {
-        vec![sensitive, plain]
-    } else {
-        vec![plain, sensitive]
-    };
+        "['private-mixed-claim', secret('private-mixed-claim')]"
+    });
     let list = unique_list_from_protocol(AttributeType::string(), true);
-    let value = Value::Concrete(ConcreteValue::List(items));
     assert!(
         list.validate(&value).is_ok(),
-        "sensitive equality must stay private"
+        "secret equality must stay private"
     );
     let errors = Schema::flat(list).validate_collect(&value);
     assert!(errors.is_empty(), "{errors:?}");
 }
 
 #[test]
+fn unique_list_compares_env_values_but_keeps_secrets_private() {
+    let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        "CARINA_4409_UNIQUE".to_string(),
+        "duplicate-env-value".into(),
+    )]));
+    let value = crate::builtins::evaluate_builtin_with_config_to_value(
+        "env",
+        &[string_value("CARINA_4409_UNIQUE")],
+        &config,
+    )
+    .unwrap();
+    let list = unique_list_from_protocol(AttributeType::string(), true);
+    let plain = Value::Concrete(ConcreteValue::List(vec![value.clone(), value.clone()]));
+    let hidden =
+        schema_source_value("[secret('duplicate-env-value'), secret('duplicate-env-value')]");
+    let errors = Schema::flat(list.clone()).validate_collect(&plain);
+    assert!(
+        list.validate(&hidden).is_ok(),
+        "secret equality must stay private"
+    );
+    assert_eq!(errors.len(), 1, "ordinary env duplicates must be rejected");
+    assert!(errors[0].1.to_string().contains("Duplicate list element"));
+    assert!(errors[0].1.to_string().contains("duplicate-env-value"));
+}
+
+#[test]
 fn unique_list_skips_secret_before_plain() {
-    assert_mixed_sensitive_list_is_not_comparable(true, true);
+    assert_mixed_secret_list_is_not_comparable(true);
 }
 
 #[test]
 fn unique_list_skips_plain_before_secret() {
-    assert_mixed_sensitive_list_is_not_comparable(true, false);
-}
-
-#[test]
-fn unique_list_skips_diagnostic_sensitive_before_plain() {
-    assert_mixed_sensitive_list_is_not_comparable(false, true);
-}
-
-#[test]
-fn unique_list_skips_plain_before_diagnostic_sensitive() {
-    assert_mixed_sensitive_list_is_not_comparable(false, false);
+    assert_mixed_secret_list_is_not_comparable(false);
 }
 
 #[test]
@@ -5292,6 +5287,20 @@ fn validate_enum_rejects_quoted_string_literal() {
         matches!(err, TypeError::StringLiteralExpectedEnum { ref user_typed, .. } if user_typed.as_plain() == Some("IPv4")),
         "expected StringLiteralExpectedEnum, got: {err:?}"
     );
+}
+
+fn schema_source_value(expression: &str) -> Value {
+    crate::parser::parse(
+        &format!("let value = {expression}"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .variables
+    .shift_remove("value")
+    .unwrap()
+    .resolve_root(&crate::resource::RootScope::new())
+    .into_expanded()
+    .unwrap()
 }
 
 #[test]

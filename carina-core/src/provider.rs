@@ -16657,13 +16657,23 @@ mod provider_text_route_tests {
     async fn review_round4_normalization_routes_by_binding_before_provider_ingress() {
         let mut desired = Vec::<Resource>::new();
         for (binding, password) in [("first", "first-private"), ("second", "second-private")] {
+            let mut parsed = crate::parser::parse(
+                &format!(
+                    "let value = secret({})",
+                    crate::parser::display_string_literal(password)
+                ),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            let value = parsed
+                .variables
+                .shift_remove("value")
+                .unwrap()
+                .resolve_root(&crate::resource::RootScope::new())
+                .into_expanded()
+                .unwrap();
             let mut resource = Resource::with_provider("route-probe", "thing", binding, None)
-                .with_attribute(
-                    "password",
-                    Value::Concrete(ConcreteValue::String(
-                        crate::resource::ValueString::diagnostic_sensitive(password),
-                    )),
-                );
+                .with_attribute("password", value);
             resource.id.provider_instance = Some(binding.into());
             desired.push(resource);
         }
@@ -16680,6 +16690,7 @@ mod provider_text_route_tests {
             .cloned()
             .map(Resource::into_provider_resource)
             .collect::<Vec<_>>();
+        crate::executor::normalized::unwrap_dispatch_desired(&mut resources);
         let error = router
             .normalize_desired(&mut resources)
             .await

@@ -109,7 +109,7 @@ fn final_provider_input_keeps_substituted_values_out_of_reference_judgement() {
             &mut Vec::new(),
         );
         assert!(checked.accepts());
-        assert!(checked.into_findings().symbolic_findings().is_empty());
+        assert!(checked.into_findings().symbolic.is_empty());
         assert!(validator.reference_checked.0.borrow().is_empty());
     });
 }
@@ -430,9 +430,9 @@ fn recovered_stream_survives_merges_without_changing_primary() {
         parent.findings.authored.extend(checked.findings.authored);
         assert!(parent.accepts());
         let findings = parent.into_findings();
-        assert_eq!(findings.symbolic_findings().len(), 1);
+        assert_eq!(findings.symbolic.len(), 1);
         assert_eq!(
-            findings.symbolic_findings()[0].origin(),
+            findings.symbolic[0].origin,
             SymbolicFindingOrigin::RecoveredReference
         );
         assert_eq!(findings.into_located().len(), 1);
@@ -586,7 +586,7 @@ fn equal_ordinary_and_recovered_errors_keep_distinct_transformation_origins() {
         ordinary
             .findings
             .additional_local_errors
-            .push(error.clone());
+            .push(PrimaryValueFinding::new(path.clone(), error.clone()));
         ordinary
             .findings
             .authored
@@ -599,16 +599,16 @@ fn equal_ordinary_and_recovered_errors_keep_distinct_transformation_origins() {
             Some(TypeError::StructFieldError { .. })
         ));
         assert!(matches!(
-            wrapped.findings.additional_local_errors[0],
+            wrapped.findings.additional_local_errors[0].error(),
             TypeError::StructFieldError { .. }
         ));
         let protected = ordinary.inside_secret().into_findings();
         use crate::resource::SecretDiagnosticError;
         for error in [
             protected.local_error().unwrap(),
-            &protected.local[0].1,
+            protected.local[0].error(),
             &protected.located[0].1,
-            &protected.additional_local_errors[0],
+            protected.additional_local_errors[0].error(),
         ] {
             assert!(
                 matches!(error, TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
@@ -636,7 +636,7 @@ fn recovered_stream_deduplicates_authored_uses_after_ordinary_selection() {
             .extend(checked.findings.authored.clone());
         assert!(checked.accepts());
         let findings = checked.into_findings();
-        assert_eq!(findings.symbolic_findings().len(), 1);
+        assert_eq!(findings.symbolic.len(), 1);
         assert_eq!(findings.clone().into_located().len(), 1);
         assert_eq!(findings.local_errors().count(), 1);
     });

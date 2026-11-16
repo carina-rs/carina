@@ -21,6 +21,12 @@ mod private {
 
         fn module_argument_placeholder(name: String, authority: Derivation) -> Option<Self>;
 
+        fn binding_in_scope(
+            name: super::RelativeBindingName,
+            scope: Option<&str>,
+            authority: Derivation,
+        ) -> Self;
+
         fn knowledge_diagnostic(
             error: super::super::knowledge::KnowledgeError<Self>,
         ) -> super::super::knowledge::KnowledgeDiagnostic
@@ -259,8 +265,6 @@ pub trait BindingAddress:
     /// # }
     /// ```
     fn as_str(&self) -> &str;
-
-    fn diagnostic_literal(&self) -> Option<&str>;
 }
 
 impl private::Sealed for RelativeBindingName {
@@ -313,15 +317,19 @@ impl private::Sealed for RelativeBindingName {
     fn module_argument_placeholder(name: String, _authority: private::Derivation) -> Option<Self> {
         Some(Self::new(name))
     }
+
+    fn binding_in_scope(
+        name: RelativeBindingName,
+        _scope: Option<&str>,
+        _authority: private::Derivation,
+    ) -> Self {
+        name
+    }
 }
 
 impl BindingAddress for RelativeBindingName {
     fn as_str(&self) -> &str {
         self.as_str()
-    }
-
-    fn diagnostic_literal(&self) -> Option<&str> {
-        self.0.diagnostic_literal()
     }
 }
 
@@ -366,15 +374,25 @@ impl private::Sealed for AbsoluteBindingAddress {
     fn module_argument_placeholder(_name: String, _authority: private::Derivation) -> Option<Self> {
         None
     }
+
+    fn binding_in_scope(
+        name: RelativeBindingName,
+        scope: Option<&str>,
+        _authority: private::Derivation,
+    ) -> Self {
+        let root = super::RootScope::new();
+        match scope {
+            Some(scope) => root
+                .resolve(RelativeBindingName::new(scope))
+                .with_attribute(name.as_str()),
+            None => root.resolve(name),
+        }
+    }
 }
 
 impl BindingAddress for AbsoluteBindingAddress {
     fn as_str(&self) -> &str {
         self.as_str()
-    }
-
-    fn diagnostic_literal(&self) -> Option<&str> {
-        self.0.diagnostic_literal()
     }
 }
 
@@ -404,6 +422,13 @@ pub(crate) fn binding_with_map_key<B: BindingAddress>(binding: &B, key: &ValueSt
 
 pub(crate) fn module_argument_placeholder<B: BindingAddress>(name: String) -> Option<B> {
     <B as private::Sealed>::module_argument_placeholder(name, private::Derivation)
+}
+
+pub(crate) fn binding_in_scope<B: BindingAddress>(
+    name: RelativeBindingName,
+    scope: Option<&str>,
+) -> B {
+    <B as private::Sealed>::binding_in_scope(name, scope, private::Derivation)
 }
 
 impl PartialEq<str> for RelativeBindingName {

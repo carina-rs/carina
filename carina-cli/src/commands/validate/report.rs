@@ -77,6 +77,8 @@ pub(super) struct Diagnostic {
     pub warning_type: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<Location>,
 }
 
 #[derive(Serialize)]
@@ -141,6 +143,7 @@ impl Diagnostic {
             location: None,
             warning_type: None,
             file: None,
+            related: Vec::new(),
         }
     }
     fn located(message: String, location: &DeclarationLocation) -> Self {
@@ -309,6 +312,14 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
                 })
                 .collect();
         }
+        AppError::Secrecy(finding) => Diagnostic {
+            related: finding
+                .call_site()
+                .map(|call| Location::authored(&call.location))
+                .into_iter()
+                .collect(),
+            ..Diagnostic::located(finding.message(), finding.location())
+        },
         AppError::ExpressionType(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
