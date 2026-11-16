@@ -133,7 +133,7 @@ struct RecoveredReference {
 pub(super) struct RecoveredReferences(Vec<RecoveredReference>);
 
 impl RecoveredReferences {
-    pub(super) fn attach(self, root: &str, findings: &mut ValueValidationFindings) {
+    pub(super) fn attach(self, findings: &mut ValueValidationFindings) {
         let mut seen = std::collections::HashSet::new();
         for RecoveredReference {
             identity,
@@ -153,7 +153,7 @@ impl RecoveredReferences {
             findings.located.push((path.clone(), error.clone()));
             findings
                 .symbolic
-                .push(SymbolicFinding::recovered_reference(root, path, error));
+                .push(SymbolicFinding::recovered_reference(path, error));
         }
     }
 }

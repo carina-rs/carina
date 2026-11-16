@@ -27,7 +27,7 @@ pub(crate) enum SchemaDiagnosticKey {
         name: String,
     },
     Value {
-        root: String,
+        root: Option<String>,
         relative: SchemaKeyPath,
         coverage: Option<LeafPath>,
     },
@@ -81,7 +81,7 @@ fn secret_parent(path: &FieldPath) -> FieldPath {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OtherSchemaFinding {
     error: TypeError,
-    path: Option<(String, LeafPath)>,
+    path: Option<(Option<String>, LeafPath)>,
 }
 
 impl OtherSchemaFinding {
@@ -90,7 +90,9 @@ impl OtherSchemaFinding {
     }
 
     pub fn path(&self) -> Option<(&str, &LeafPath)> {
-        self.path.as_ref().map(|(root, path)| (root.as_str(), path))
+        self.path
+            .as_ref()
+            .and_then(|(root, path)| root.as_deref().map(|root| (root, path)))
     }
 }
 
@@ -117,9 +119,6 @@ impl SchemaDiagnostic {
 
     pub(crate) fn unlocated(error: TypeError) -> Self {
         if is_unknown_key(&error) {
-            if let TypeError::UnknownAttribute { name, .. } = &error {
-                return Self::from_value(name.clone(), LeafPath::from_segments([]), error);
-            }
             return Self::UnknownKey(KeyedSchemaFinding {
                 key: SchemaDiagnosticKey::Unlocated,
                 error,
@@ -133,45 +132,58 @@ impl SchemaDiagnostic {
         relative: LeafPath,
         error: TypeError,
     ) -> Self {
+        let root = root.into();
+        if matches!(error, TypeError::UnknownAttribute { .. }) {
+            return Self::UnknownKey(KeyedSchemaFinding {
+                key: SchemaDiagnosticKey::Attribute { name: root },
+                error,
+            });
+        }
         Self::relative(
             &FieldPath::from_canonical_segments(relative.segments().iter().cloned()),
             error,
         )
-        .at_attribute(&root.into())
+        .at_attribute(&root)
     }
 
-    fn relative(path: &FieldPath, error: TypeError) -> Self {
+    /// Walk findings have a relative target until their attribute is known.
+    pub(super) fn relative(path: &FieldPath, error: TypeError) -> Self {
         if is_unknown_key(&error) {
-            let key = if matches!(error, TypeError::UnknownAttribute { .. }) {
-                SchemaDiagnosticKey::Attribute {
-                    name: String::new(),
-                }
-            } else {
-                SchemaDiagnosticKey::Value {
-                    root: String::new(),
+            Self::UnknownKey(KeyedSchemaFinding {
+                key: SchemaDiagnosticKey::Value {
+                    root: None,
                     relative: SchemaKeyPath::new(path),
                     coverage: Some(path.canonical()),
-                }
-            };
-            Self::UnknownKey(KeyedSchemaFinding { key, error })
+                },
+                error,
+            })
         } else {
             Self::Other(OtherSchemaFinding {
                 error,
-                path: Some((String::new(), path.canonical())),
+                path: Some((None, path.canonical())),
             })
         }
     }
 
     pub(super) fn at_attribute(mut self, root: &str) -> Self {
+        if matches!(
+            &self,
+            Self::UnknownKey(KeyedSchemaFinding {
+                key: SchemaDiagnosticKey::Value { .. },
+                error: TypeError::UnknownAttribute { .. },
+            })
+        ) {
+            return Self::from_value(root, LeafPath::from_segments([]), self.into_error());
+        }
         match &mut self {
             Self::UnknownKey(finding) => match &mut finding.key {
                 SchemaDiagnosticKey::Unlocated => {}
                 SchemaDiagnosticKey::Attribute { name } => *name = root.into(),
-                SchemaDiagnosticKey::Value { root: name, .. } => *name = root.into(),
+                SchemaDiagnosticKey::Value { root: name, .. } => *name = Some(root.into()),
             },
             Self::Other(finding) => {
                 if let Some((name, _)) = &mut finding.path {
-                    *name = root.into();
+                    *name = Some(root.into());
                 }
             }
         }
@@ -192,16 +204,24 @@ impl SchemaDiagnostic {
             Self::Other(_) => !is_unknown_key(&error),
         };
         if !same_contract {
-            let root = match &self {
+            let (root, coverage) = match &self {
                 Self::UnknownKey(finding) => match &finding.key {
-                    SchemaDiagnosticKey::Unlocated => "",
-                    SchemaDiagnosticKey::Attribute { name } => name.as_str(),
-                    SchemaDiagnosticKey::Value { root, .. } => root.as_str(),
+                    SchemaDiagnosticKey::Unlocated => (None, None),
+                    SchemaDiagnosticKey::Attribute { name } => (Some(name.clone()), None),
+                    SchemaDiagnosticKey::Value { root, coverage, .. } => {
+                        (root.clone(), coverage.clone())
+                    }
                 },
-                Self::Other(finding) => finding.path().map_or("", |(root, _)| root),
+                Self::Other(finding) => (
+                    finding.path.as_ref().and_then(|(root, _)| root.clone()),
+                    finding.path.as_ref().map(|(_, path)| path.clone()),
+                ),
             };
-            let coverage = self.coverage_path().map(|(_, path)| path.clone());
-            let replacement = Self::relative(source, error).at_attribute(root);
+            let replacement = Self::relative(source, error);
+            let replacement = match root {
+                Some(root) => replacement.at_attribute(&root),
+                None => replacement,
+            };
             return if matches!(replacement, Self::Other(_)) {
                 replacement.with_coverage(coverage.as_ref())
             } else {
@@ -228,7 +248,7 @@ impl SchemaDiagnostic {
             Self::UnknownKey(finding) => match &finding.key {
                 SchemaDiagnosticKey::Unlocated | SchemaDiagnosticKey::Attribute { .. } => None,
                 SchemaDiagnosticKey::Value { root, coverage, .. } => {
-                    coverage.as_ref().map(|path| (root.as_str(), path))
+                    root.as_deref().zip(coverage.as_ref())
                 }
             },
             Self::Other(finding) => finding.path(),

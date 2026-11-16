@@ -16721,10 +16721,10 @@ impl PatternResourceSchema<Compiled> {
                         error.clone().with_attribute(name),
                     ));
                 }
-                report.attributes.insert(name.clone(), findings);
+                report.insert_attribute(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
                 if let Some(admit) = admission.unknown {
-                    report.attributes.insert(name.clone(), admit(name, value));
+                    report.insert_attribute(name.clone(), admit(name, value));
                 }
                 report.errors.push(SchemaDiagnostic::from_value(
                     name,

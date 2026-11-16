@@ -424,26 +424,24 @@ pub struct SymbolicFinding {
     diagnostic: SchemaDiagnostic,
 }
 impl SymbolicFinding {
-    fn ordinary(root: &str, path: LeafPath, error: TypeError) -> Self {
+    fn new(origin: SymbolicFindingOrigin, path: LeafPath, error: TypeError) -> Self {
         Self {
-            origin: SymbolicFindingOrigin::Ordinary,
-            diagnostic: SchemaDiagnostic::from_value(root, path.clone(), error),
+            origin,
+            diagnostic: SchemaDiagnostic::relative(
+                &FieldPath::from_canonical_segments(path.segments().iter().cloned()),
+                error,
+            ),
             path,
         }
     }
-    fn authored_hook(root: &str, path: LeafPath, error: TypeError) -> Self {
-        Self {
-            origin: SymbolicFindingOrigin::AuthoredHook,
-            diagnostic: SchemaDiagnostic::from_value(root, path.clone(), error),
-            path,
-        }
+    fn ordinary(path: LeafPath, error: TypeError) -> Self {
+        Self::new(SymbolicFindingOrigin::Ordinary, path, error)
     }
-    fn recovered_reference(root: &str, path: LeafPath, error: TypeError) -> Self {
-        Self {
-            origin: SymbolicFindingOrigin::RecoveredReference,
-            diagnostic: SchemaDiagnostic::from_value(root, path.clone(), error),
-            path,
-        }
+    fn authored_hook(path: LeafPath, error: TypeError) -> Self {
+        Self::new(SymbolicFindingOrigin::AuthoredHook, path, error)
+    }
+    fn recovered_reference(path: LeafPath, error: TypeError) -> Self {
+        Self::new(SymbolicFindingOrigin::RecoveredReference, path, error)
     }
     pub fn origin(&self) -> SymbolicFindingOrigin {
         self.origin
@@ -654,7 +652,7 @@ impl InsideSecret for ValueValidationFindings {
 #[derive(Debug, Default)]
 pub struct ResourceValueValidation {
     pub(super) errors: Vec<SchemaDiagnostic>,
-    pub(super) attributes: indexmap::IndexMap<String, ValueValidationFindings>,
+    attributes: indexmap::IndexMap<String, ValueValidationFindings>,
 }
 
 /// CLI preserves main's path ownership. Exact finding ownership is reserved
@@ -675,6 +673,19 @@ impl SymbolicDiagnosticCoverage {
 }
 
 impl ResourceValueValidation {
+    /// Bind every symbolic finding using the one name that owns this entry.
+    pub(super) fn insert_attribute(&mut self, name: String, mut findings: ValueValidationFindings) {
+        findings.symbolic = findings
+            .symbolic
+            .into_iter()
+            .map(|mut finding| {
+                finding.diagnostic = finding.diagnostic.at_attribute(&name);
+                finding
+            })
+            .collect();
+        self.attributes.insert(name, findings);
+    }
+
     pub(crate) fn from_errors(errors: Vec<TypeError>) -> Self {
         Self {
             errors: errors
@@ -1278,22 +1289,22 @@ impl<'a, M: WalkMode> WalkCheckedValue<'a, M> {
             .or_else(|| self.findings.provider.first().map(|(_, error)| error))
     }
 
-    fn into_parts(mut self, root: &str) -> (ValueValidationFindings, M::Channel) {
+    fn into_parts(mut self) -> (ValueValidationFindings, M::Channel) {
         self.retain_primary_finding();
         let SupplementalData {
             authored,
             references,
         } = std::mem::take(&mut self.findings.authored).into_parts();
-        let symbolic = self
-            .findings
-            .assignment
-            .errors
-            .iter()
-            .map(|(path, error)| SymbolicFinding::ordinary(root, path.clone(), error.clone()))
-            .chain(authored.errors.iter().map(|(path, error)| {
-                SymbolicFinding::authored_hook(root, path.clone(), error.clone())
-            }))
-            .collect();
+        let symbolic =
+            self.findings
+                .assignment
+                .errors
+                .iter()
+                .map(|(path, error)| SymbolicFinding::ordinary(path.clone(), error.clone()))
+                .chain(authored.errors.iter().map(|(path, error)| {
+                    SymbolicFinding::authored_hook(path.clone(), error.clone())
+                }))
+                .collect();
         for (path, error) in authored.errors.clone() {
             let path = FieldPath::from_canonical_segments(path.segments().iter().cloned());
             if self.local.error().is_some() {
@@ -1334,7 +1345,7 @@ impl<'a, M: WalkMode> WalkCheckedValue<'a, M> {
             additional_local_errors: self.findings.additional_local_errors,
             provider: self.findings.provider,
         };
-        references.attach(root, &mut findings);
+        references.attach(&mut findings);
         (findings, conversions)
     }
 }
@@ -1344,18 +1355,13 @@ type CheckedValue<'a> = OrdinaryCheckedValue<'a>;
 type AuthoredCheckedValue<'a> = WalkCheckedValue<'a, WithAuthored>;
 impl OrdinaryCheckedValue<'_> {
     fn into_findings(self) -> ValueValidationFindings {
-        // A value-only walk has no resource attribute or assignment callbacks.
-        let (findings, NoConversions) = self.into_parts("");
+        let (findings, NoConversions) = self.into_parts();
         findings
     }
 }
 impl AuthoredCheckedValue<'_> {
-    fn into_findings_with_coverage(
-        self,
-        root: &str,
-        coverage: &mut WalkCoverage,
-    ) -> ValueValidationFindings {
-        let (findings, conversions) = self.into_parts(root);
+    fn into_findings_with_coverage(self, coverage: &mut WalkCoverage) -> ValueValidationFindings {
+        let (findings, conversions) = self.into_parts();
         coverage.record_conversions(conversions);
         findings
     }
@@ -1461,14 +1467,10 @@ impl<'a, 'lookup, M: WalkMode> ValueValidator<'a, 'lookup, M> {
     }
 }
 
-pub(crate) fn untyped_symbolic_errors(
-    root: &str,
-    errors: Vec<TypeError>,
-) -> ValueValidationFindings {
+pub(crate) fn untyped_symbolic_errors(errors: Vec<TypeError>) -> ValueValidationFindings {
     let mut findings = ValueValidationFindings::default();
     for error in errors {
         findings.symbolic.push(SymbolicFinding::ordinary(
-            root,
             LeafPath::from_segments([]),
             error.clone(),
         ));
@@ -2611,7 +2613,6 @@ pub(crate) fn validate_authored_value_for_admission<
     B: BindingAddress,
     T: StructuralPending<'v, P, B>,
 >(
-    root: &str,
     attr: &CompiledAttributeType,
     value: &Classification<'v, P, B, T>,
     defs: &BTreeMap<String, CompiledAttributeType>,
@@ -2622,7 +2623,7 @@ pub(crate) fn validate_authored_value_for_admission<
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
     validate_authored_value_with_callbacks(
-        root, attr, value, defs, ancestry, lookup, cursor, callbacks, None, coverage,
+        attr, value, defs, ancestry, lookup, cursor, callbacks, None, coverage,
     )
 }
 
@@ -2635,7 +2636,6 @@ pub(crate) fn validate_authored_value_for_admission_with_references<
     B: BindingAddress,
     T: StructuralPending<'v, P, B>,
 >(
-    root: &str,
     attr: &CompiledAttributeType,
     value: &Classification<'v, P, B, T>,
     defs: &BTreeMap<String, CompiledAttributeType>,
@@ -2647,7 +2647,6 @@ pub(crate) fn validate_authored_value_for_admission_with_references<
     coverage: &mut WalkCoverage,
 ) -> ValueValidationFindings {
     validate_authored_value_with_callbacks(
-        root,
         attr,
         value,
         defs,
@@ -2669,7 +2668,6 @@ fn validate_authored_value_with_callbacks<
     B: BindingAddress,
     T: StructuralPending<'v, P, B>,
 >(
-    root: &str,
     attr: &CompiledAttributeType,
     value: &Classification<'v, P, B, T>,
     defs: &BTreeMap<String, CompiledAttributeType>,
@@ -2709,7 +2707,7 @@ fn validate_authored_value_with_callbacks<
         checked
     };
     *coverage = visits.into_inner();
-    let mut findings = checked.into_findings_with_coverage(root, coverage);
+    let mut findings = checked.into_findings_with_coverage(coverage);
     findings.structure = value_structure(value);
     findings
 }
@@ -4993,6 +4991,112 @@ mod tests {
     use super::super::CompiledAttributeType as AT;
     use super::*;
 
+    fn ordinary_walk_report(
+        error: TypeError,
+        known: bool,
+        supplemental: bool,
+    ) -> ResourceValueValidation {
+        let mut schema = ResourceSchema::new("Thing");
+        if known {
+            schema = schema.attribute(
+                AttributeSchema::optional("config", AttributeType::struct_("Entry", vec![]))
+                    .build(),
+            );
+        }
+        let schema = schema.validate().unwrap();
+        let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "typo".into(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )])));
+        let classified = indexmap::IndexMap::from([(
+            "config".to_owned(),
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .unwrap()
+                .into_classification(),
+        )]);
+        let findings = || {
+            let path = FieldPath::new().push_field("typo");
+            let mut checked = CheckedValue::rejected(&path, error.clone());
+            if supplemental {
+                checked
+                    .findings
+                    .authored
+                    .extend(AssignmentFindings::<NoConversions> {
+                        errors: vec![(path.canonical(), error.clone())],
+                        ..Default::default()
+                    });
+            } else {
+                checked
+                    .findings
+                    .assignment
+                    .errors
+                    .push((path.canonical(), error.clone()));
+            }
+            checked.into_findings()
+        };
+        schema.as_schema().validate_admission_report(
+            &classified,
+            classified.iter(),
+            &|_| false,
+            &AttributeAdmission {
+                known: &|_, _, _| findings(),
+                unknown: Some(&|_, _| findings()),
+            },
+        )
+    }
+
+    #[test]
+    fn ordinary_walk_symbolic_uses_attribute_root_on_insertion() {
+        for known in [true, false] {
+            for supplemental in [false, true] {
+                let report = ordinary_walk_report(
+                    seam_error(crate::parser::retained::MissingEvidence::new(
+                        "ordinary syntax descent",
+                    )),
+                    known,
+                    supplemental,
+                );
+                let (attribute, _, diagnostic) = report.symbolic_errors().next().unwrap();
+                assert_eq!(attribute, "config");
+                assert_eq!(diagnostic.path().map(|(root, _)| root), Some(attribute));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_walk_unknown_key_uses_bound_parser_location() {
+        let source = "mock.test.Thing { config = { typo = true } }";
+        let parsed = crate::parser::parse_file(
+            source,
+            std::path::Path::new("sibling.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        for known in [true, false] {
+            for supplemental in [false, true] {
+                let mut report = ordinary_walk_report(
+                    TypeError::UnknownStructField {
+                        struct_name: "Entry".into(),
+                        field: "typo".into(),
+                        suggestion: None,
+                    },
+                    known,
+                    supplemental,
+                );
+                let diagnostic = report.symbolic_errors().next().unwrap().2.clone();
+                let finding = resource.locate_schema_diagnostic(&diagnostic, |_| panic!("unknown key used ordinary adapter"))
+                    .expect("attribute insertion must bind an ordinary finding before either client sees it");
+                let span = finding.location().span();
+                assert_eq!(&source[span.start_byte()..span.end_byte()], "typo");
+                let editor = report.take_attribute("config").unwrap();
+                assert_eq!(editor.symbolic_findings()[0].diagnostic().1, &diagnostic);
+            }
+        }
+    }
+
     #[test]
     fn unknown_key_target_is_not_an_ordinary_diagnostic_path() {
         for error in [
@@ -5070,7 +5174,6 @@ mod tests {
             .unwrap()
             .symbolic
             .push(SymbolicFinding::ordinary(
-                "variant",
                 LeafPath::from_segments([]),
                 TypeError::MissingRequired {
                     name: "other".into(),
@@ -5084,11 +5187,16 @@ mod tests {
 
     #[test]
     fn unknown_key_target_survives_report_consumption() {
-        let unknown = |name: &str| {
-            ResourceValueValidation::from_errors(vec![TypeError::UnknownAttribute {
-                name: name.into(),
-                suggestion: None,
-            }])
+        let unknown = |name: &str| ResourceValueValidation {
+            errors: vec![SchemaDiagnostic::from_value(
+                name,
+                LeafPath::from_segments([]),
+                TypeError::UnknownAttribute {
+                    name: name.into(),
+                    suggestion: None,
+                },
+            )],
+            ..Default::default()
         };
         let mut report = unknown("first");
         assert_eq!(report.errors().count(), 1);
@@ -5121,7 +5229,6 @@ mod tests {
             "typo".into(),
             ValueValidationFindings {
                 symbolic: vec![SymbolicFinding::authored_hook(
-                    "typo",
                     LeafPath::from_segments([]),
                     TypeError::MissingRequired {
                         name: "other".into(),
@@ -5151,7 +5258,6 @@ mod tests {
                 "config".into(),
                 ValueValidationFindings {
                     symbolic: vec![SymbolicFinding::ordinary(
-                        "config",
                         path,
                         TypeError::MissingRequired {
                             name: "other".into(),
@@ -5175,7 +5281,6 @@ mod tests {
                         name.to_owned(),
                         ValueValidationFindings {
                             symbolic: vec![SymbolicFinding::authored_hook(
-                                name,
                                 LeafPath::from_segments([]),
                                 TypeError::UnknownAttribute {
                                     name: name.into(),
@@ -5216,7 +5321,7 @@ mod tests {
             attributes: indexmap::IndexMap::from([(
                 "input".into(),
                 ValueValidationFindings {
-                    symbolic: vec![SymbolicFinding::authored_hook("input", path, hook)],
+                    symbolic: vec![SymbolicFinding::authored_hook(path, hook)],
                     ..Default::default()
                 },
             )]),
@@ -5250,11 +5355,11 @@ mod tests {
         };
         for (finding, expected) in [
             (
-                SymbolicFinding::ordinary("input", path.clone(), error.clone()),
+                SymbolicFinding::ordinary(path.clone(), error.clone()),
                 SymbolicDiagnosticCoverage::Path,
             ),
             (
-                SymbolicFinding::authored_hook("input", path.clone(), error.clone()),
+                SymbolicFinding::authored_hook(path.clone(), error.clone()),
                 SymbolicDiagnosticCoverage::Finding,
             ),
         ] {
@@ -5293,8 +5398,8 @@ mod tests {
             name: "field".into(),
         };
         for finding in [
-            SymbolicFinding::ordinary("input", path.clone(), error.clone()),
-            SymbolicFinding::authored_hook("input", path, error),
+            SymbolicFinding::ordinary(path.clone(), error.clone()),
+            SymbolicFinding::authored_hook(path, error),
         ] {
             let origin = finding.origin();
             let protected = finding.inside_secret();
@@ -6542,11 +6647,8 @@ mod round3_ordinary_walk_tests {
     fn round3_plain_and_authored_walks_have_distinct_consuming_types() {
         let _: fn(OrdinaryCheckedValue<'static>) -> ValueValidationFindings =
             OrdinaryCheckedValue::into_findings;
-        let _: fn(
-            AuthoredCheckedValue<'static>,
-            &str,
-            &mut WalkCoverage,
-        ) -> ValueValidationFindings = AuthoredCheckedValue::into_findings_with_coverage;
+        let _: fn(AuthoredCheckedValue<'static>, &mut WalkCoverage) -> ValueValidationFindings =
+            AuthoredCheckedValue::into_findings_with_coverage;
         assert_eq!(std::mem::size_of::<NoConversions>(), 0);
     }
 }

@@ -190,10 +190,8 @@ fn missing_authored_root_keeps_the_resource_invariant_and_other_findings() {
     let parsed =
         crate::parser::parse_file(source, std::path::Path::new("sibling.crn"), config).unwrap();
     let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "mock",
-        PatternResourceSchema::new("test.Thing").validate().unwrap(),
-    );
+    let schema = PatternResourceSchema::new("test.Thing").validate().unwrap();
+    schemas.insert("mock", schema.clone());
     let loaded = crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, config);
     let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
     let mut admissions = ResourceAdmissionValues::new();
@@ -203,18 +201,37 @@ fn missing_authored_root_keeps_the_resource_invariant_and_other_findings() {
         } else {
             vec!["typo"]
         };
-        admissions.insert(
-            (resource.id().clone(), resource.location().clone()),
-            crate::schema::ResourceValueValidation::from_errors(
-                names
-                    .into_iter()
-                    .map(|name| TypeError::UnknownAttribute {
-                        name: name.into(),
-                        suggestion: None,
-                    })
-                    .collect(),
-            ),
+        let values: indexmap::IndexMap<_, RuntimeValue> = names
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    RuntimeValue::Concrete(RuntimeConcreteValue::Bool(true)),
+                )
+            })
+            .collect();
+        let classified: indexmap::IndexMap<_, _> = values
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                )
+            })
+            .collect();
+        let report = schema.as_schema().validate_admission_report(
+            &classified,
+            classified.iter(),
+            &|_| false,
+            &crate::schema::value_validation::AttributeAdmission {
+                known: &|_, _, _| Default::default(),
+                unknown: None,
+            },
         );
+        admissions.insert((resource.id().clone(), resource.location().clone()), report);
     }
     let judged = loaded.judged();
     let inputs = judged.schema_validation_resources().unwrap();

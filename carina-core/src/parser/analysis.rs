@@ -453,7 +453,7 @@ fn locate_unknown_key(
             }
         }
         SchemaDiagnosticKey::Value {
-            root: name,
+            root: Some(name),
             relative,
             ..
         } => AttributeDiagnosticLocations {
@@ -461,6 +461,14 @@ fn locate_unknown_key(
             root: authored_root(name)?.location(),
         }
         .attribute_path_location(name, relative.path()),
+        SchemaDiagnosticKey::Value { root: None, .. } => {
+            return Err(AnalysisTreeError::new(
+                AnalysisTreeErrorKind::MissingElementProvenance {
+                    declaration: declaration.clone(),
+                    element: "schema diagnostic attribute binding".into(),
+                },
+            ));
+        }
     };
     Ok(Located::new(location.clone(), finding.error().clone()))
 }
@@ -3289,6 +3297,41 @@ mod location_tests {
     }
 
     #[test]
+    fn unlocated_top_level_unknown_uses_type_projection() {
+        use crate::schema::{ResourceValueValidation, TypeError};
+        let parsed = super::super::parse_file(
+            "mock.test.Thing { typo = true }",
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let mut failures = Vec::new();
+        for name in ["typo", "missing"] {
+            let report = ResourceValueValidation::from_errors(vec![TypeError::UnknownAttribute {
+                name: name.into(),
+                suggestion: None,
+            }]);
+            let (diagnostic, _) = report.diagnostic_errors().next().unwrap();
+            match resource.locate_schema_diagnostic(diagnostic, |_| {
+                panic!("unknown key used ordinary adapter")
+            }) {
+                Ok(finding) if finding.location() == resource.type_location() => {}
+                Ok(finding) => failures.push(format!(
+                    "{name}: authored key {:?}",
+                    finding.location().span()
+                )),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "unlocated top-level unknowns claimed authored keys: {failures:?}"
+        );
+    }
+
+    #[test]
     fn unknown_key_lookup_miss_is_an_analysis_invariant() {
         use crate::schema::{SchemaDiagnostic, TypeError};
         let source = "mock.test.Thing { config = {} }";
@@ -3300,10 +3343,14 @@ mod location_tests {
         .unwrap();
         let tree = AnalysisTree::try_from_file(&parsed).unwrap();
         let resource = tree.resources().next().unwrap();
-        let diagnostic = SchemaDiagnostic::unlocated(TypeError::UnknownAttribute {
-            name: "missing".into(),
-            suggestion: None,
-        });
+        let diagnostic = SchemaDiagnostic::from_value(
+            "missing",
+            crate::schema::LeafPath::from_segments([]),
+            TypeError::UnknownAttribute {
+                name: "missing".into(),
+                suggestion: None,
+            },
+        );
         {
             let SchemaDiagnostic::UnknownKey(key) = diagnostic else {
                 panic!("keyed diagnostic")
