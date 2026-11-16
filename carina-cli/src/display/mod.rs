@@ -27,7 +27,7 @@ use carina_core::provider::{HostResult, ProviderRouter};
 use carina_core::resource::Value;
 use carina_core::resource::{ModuleSource, ResourceId};
 use carina_core::schema::SchemaRegistry;
-use carina_core::value::{RenderedValue, ValueSpanKind, render_export_json_value, render_value};
+use carina_core::value::{RenderedValue, ValueSpanKind, render_export_json_value};
 
 use crate::DetailLevel;
 use crate::plan_summary::PlanChangeSummary;
@@ -50,21 +50,25 @@ impl<S> HistoricalDisplaySource<S> for HistoricalDisplayAttributes {
 #[cfg(test)]
 impl HistoricalDisplaySource for HashMap<DeletedInstanceKey, HashMap<String, Value>> {
     fn historical_display<'a>(&'a self, plan: &Plan) -> Cow<'a, HistoricalDisplayAttributes> {
-        let mut display = HistoricalDisplayAttributes::for_plan(plan);
-        let empty_nested_write_only = carina_core::provider::NestedWriteOnlyRecord::new();
+        let mut display = HistoricalDisplayAttributes::for_test_plan(plan);
         #[allow(clippy::iter_over_hash_type)]
         // keyed rebuild: test display attributes are installed by distinct delete-instance keys
         for (key, attributes) in self {
-            let attributes = attributes
+            let attributes: HashMap<_, _> = attributes
                 .iter()
                 .map(|(key, value)| (key.clone(), value.to_snapshot()))
                 .collect();
-            display.set_delete_from_provider_and_persisted(
-                key.clone(),
-                &attributes,
-                None,
-                &empty_nested_write_only,
-            );
+            display
+                .set_delete_from_observation(
+                    key.clone(),
+                    &crate::test_support::protected_observation(
+                        &carina_core::resource::SnapshotState::existing(
+                            key.id().clone(),
+                            attributes,
+                        ),
+                    ),
+                )
+                .expect("fixture observation uses its delete key");
         }
         Cow::Owned(display)
     }
@@ -285,7 +289,7 @@ fn format_export_change(
                 top_level_sigil_prefix(&Sigil::export_added(color_mode,)),
                 name,
                 type_str.dimmed(color_mode),
-                colored_value(color_mode, &render_value(new_value))
+                colored_value(color_mode, new_value)
             )
             .unwrap();
         }
@@ -307,7 +311,7 @@ fn format_export_change(
                 type_str.dimmed(color_mode),
                 colored_value(color_mode, &render_export_json_value(old_json)),
                 "→".dimmed(color_mode),
-                colored_value(color_mode, &render_value(new_value))
+                colored_value(color_mode, new_value)
             )
             .unwrap();
         }
@@ -369,7 +373,7 @@ pub(crate) fn format_persisted_directive_changes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
+pub fn print_plan<S: Clone, D: HistoricalDisplaySource<S> + ?Sized>(
     color_mode: crate::output_style::ColorMode,
     plan: &carina_core::plan::AdmittedPlan<S>,
     summary: &PlanChangeSummary,
@@ -426,10 +430,10 @@ pub(crate) fn print_planned_plan(
         ),
         crate::wiring::PlannedPlan::Unrendered { plan, .. } => print_plan(
             color_mode,
-            plan,
+            plan.checked(),
             summary,
             DetailLevel::None,
-            &HistoricalDisplayAttributes::for_plan(plan),
+            &HistoricalDisplayAttributes::empty(),
             schemas,
             moved_origins,
             prev_explicit,
@@ -507,7 +511,7 @@ pub fn format_prepared_plan(
 /// unchanged-attribute counting (refs awscc#206), so server-side default
 /// fields the user never wrote do not inflate the plan output.
 #[allow(clippy::too_many_arguments)]
-pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Sized>(
+pub fn format_plan_with_delete_instances<S: Clone, D: HistoricalDisplaySource<S> + ?Sized>(
     color_mode: crate::output_style::ColorMode,
     plan: &carina_core::plan::AdmittedPlan<S>,
     summary: &PlanChangeSummary,
@@ -571,7 +575,7 @@ fn format_plan_display<S>(
 
         out.push_str(&format_plan_tree(
             color_mode,
-            display,
+            &display,
             detail,
             schemas,
             moved_origins,
@@ -769,7 +773,7 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
     let historical_display = historical_display.historical_display(plan);
     out.push_str(&format_plan_tree(
         color_mode,
-        PlanDisplay::unprepared(
+        &PlanDisplay::unprepared(
             plan,
             &historical_display,
             carina_core::detail_rows::DetailComparisons::RecordedEffects,
@@ -820,7 +824,7 @@ fn append_destroy_ordering_warnings<S>(
 struct TreeRenderContext<'a, S> {
     out: String,
     printed: HashSet<usize>,
-    display: PlanDisplay<'a, S>,
+    display: &'a PlanDisplay<'a, S>,
     dependents: HashMap<usize, Vec<usize>>,
     replacement_create_info: HashMap<usize, ReplaceDisplayInfo<'a>>,
     replacement_delete_indices: HashSet<usize>,
@@ -1473,7 +1477,7 @@ fn child_prefix_for_parent(
 #[allow(clippy::too_many_arguments)]
 fn format_plan_tree<'a, S>(
     color_mode: crate::output_style::ColorMode,
-    display: PlanDisplay<'a, S>,
+    display: &'a PlanDisplay<'a, S>,
     detail: DetailLevel,
     schemas: Option<&'a SchemaRegistry>,
     moved_origins: &'a HashMap<ResourceId, ResourceId>,
@@ -2714,3 +2718,6 @@ pub fn format_effect<S>(effect: &Effect<S>) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+use crate::test_support::render_value;

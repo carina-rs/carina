@@ -1167,6 +1167,11 @@ fn create_plan_parts(
     let mut plan = Plan::new();
     let mut pending_replaces = HashMap::new();
     let authored_managed = managed.authored();
+    plan.retain_observation_desired(
+        authored_managed
+            .iter()
+            .map(|resource| (&resource.id, &resource.attributes)),
+    );
     let known_bindings = known_binding_names(authored_managed, data_sources);
     let comparison_saved = PlanInputSavedAttributes::new(saved_attrs, registry);
 

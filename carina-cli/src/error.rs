@@ -632,10 +632,7 @@ impl StateBucketSeedError {
     }
 
     pub fn identifier_literal(&self) -> carina_core::value::RenderedValue {
-        let value: carina_core::resource::Value = carina_core::resource::Value::Concrete(
-            carina_core::resource::ConcreteValue::String(self.identifier.as_str().into()),
-        );
-        carina_core::value::render_value(&value)
+        carina_core::value::render_identifier_literal(self.identifier.as_str())
     }
 
     pub fn resource_address(&self) -> &str {

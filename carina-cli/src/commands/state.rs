@@ -30,14 +30,14 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     AbsoluteBindingAddress, Current, DataSource, ResolvedDataSource, ResolvedResource,
-    ResolvedResourceId, ResourceId, ResourceIdentity, SnapshotState, SnapshotValue,
+    ResolvedResourceId, ResourceId, ResourceIdentity, SnapshotState,
 };
 #[cfg(test)]
 use carina_core::resource::{State, Value};
 use carina_core::shutdown::{
     CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownPhase, ShutdownToken,
 };
-use carina_core::value::{RenderedKey, render_value};
+use carina_core::value::RenderedKey;
 use carina_state::lock::format_lock_expiry;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, BackendSelection, DeposedKey, LoadedOrphans,
@@ -733,6 +733,7 @@ where
     let state =
         crate::commands::apply::load_state_persist_if_migrated(backend, StateLockRef::Held(lock))
             .await?
+            .into_file()
             .unwrap_or_default();
     let mut state = StateForgetWriteState::from_loaded(state, project_dir)?;
     let row = state
@@ -1379,8 +1380,7 @@ fn format_state_show(state: &StateFile) -> String {
             } => format_attributes_for_show(
                 &mut output,
                 rs.persisted_attributes()
-                    .map(PersistedAttributes::to_values)
-                    .unwrap_or_default(),
+                    .unwrap_or(&PersistedAttributes::default()),
                 "  ",
             ),
             StateCommandCurrent::CreateInFlight(pending) => {
@@ -1395,30 +1395,23 @@ fn format_state_show(state: &StateFile) -> String {
                 "  {}\n",
                 deposed_state_marker(&deposed.key, &deposed.identifier)
             ));
-            format_attributes_for_show(
-                &mut output,
-                deposed.persisted_attributes().to_values(),
-                "    ",
-            );
+            format_attributes_for_show(&mut output, deposed.persisted_attributes(), "    ");
         }
     }
     output
 }
 
-fn format_attributes_for_show(
-    output: &mut String,
-    attributes: HashMap<String, SnapshotValue>,
-    indent: &str,
-) {
+fn format_attributes_for_show(output: &mut String, attributes: &PersistedAttributes, indent: &str) {
     let mut keys: Vec<&String> = attributes.keys().collect();
     keys.sort();
     for key in keys {
-        let value = &attributes[key];
         output.push_str(&format!(
             "{}{} = {}\n",
             indent,
             RenderedKey::from_raw(key),
-            render_value(value)
+            attributes
+                .rendered_attribute(key)
+                .expect("key belongs to loaded attributes")
         ));
     }
 }
@@ -1475,8 +1468,7 @@ async fn run_state_show(
         }
         let plan =
             build_plan_from_state(&state).admit(&carina_core::schema::SchemaRegistry::new())?;
-        let historical_display =
-            carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+        let historical_display = carina_core::detail_rows::HistoricalDisplayAttributes::empty();
         let prev_explicit = state.build_explicit();
         carina_tui::run(
             carina_core::detail_rows::PlanDisplay::unprepared(
@@ -2153,7 +2145,7 @@ pub(crate) async fn run_state_refresh_locked(
     let (ctx, expanded_graph) = validated.config.context_and_resources();
     let parsed = expanded_graph.configuration();
     if let Some(migrated) = validated.migrated_state {
-        state_file = Some(migrated);
+        *state_file = Some(migrated);
         if let Some(state) = state_file.as_ref() {
             #[allow(clippy::iter_over_hash_type)]
             // keyed rebuild: dependency metadata is assigned independently by resource ID
@@ -2971,6 +2963,19 @@ fn diff_display_update_resource_with_provider(
                     owner_schema.schema().as_schema(),
                 );
 
+            let old_display = existing_rs
+                .persisted_attributes()
+                .map(|attributes| {
+                    attributes.rendered_comparison_attributes(owner_schema.schema().as_schema())
+                })
+                .unwrap_or_default();
+            let new_display = refreshed_resource_state
+                .as_ref()
+                .and_then(ResourceState::persisted_attributes)
+                .map(|attributes| {
+                    attributes.rendered_comparison_attributes(owner_schema.schema().as_schema())
+                })
+                .unwrap_or_default();
             let mut has_changes = false;
             let mut changes: Vec<String> = Vec::new();
 
@@ -3008,27 +3013,27 @@ fn diff_display_update_resource_with_provider(
                                 "    {} {}: {} {} {}",
                                 "~".yellow(color_mode),
                                 RenderedKey::from_raw(key),
-                                render_value(old).to_string().red(color_mode),
+                                old_display[*key].to_string().red(color_mode),
                                 "\u{2192}".dimmed(color_mode),
-                                render_value(new).to_string().green(color_mode),
+                                new_display[*key].to_string().green(color_mode),
                             ));
                         }
-                        (Some(old), None) => {
+                        (Some(_old), None) => {
                             has_changes = true;
                             changes.push(format!(
                                 "    {} {}: {}",
                                 "-".red(color_mode),
                                 RenderedKey::from_raw(key),
-                                render_value(old).to_string().red(color_mode),
+                                old_display[*key].to_string().red(color_mode),
                             ));
                         }
-                        (None, Some(new)) => {
+                        (None, Some(_new)) => {
                             has_changes = true;
                             changes.push(format!(
                                 "    {} {}: {}",
                                 "+".green(color_mode),
                                 RenderedKey::from_raw(key),
-                                render_value(new).to_string().green(color_mode),
+                                new_display[*key].to_string().green(color_mode),
                             ));
                         }
                         _ => {}
@@ -3095,18 +3100,22 @@ fn diff_display_update_resource(
 #[cfg(test)]
 mod tests {
     use carina_core::provider::{Provider, ProviderNormalizer};
+    use carina_core::resource::SnapshotValue;
     #[test]
     fn provider_text_state_attribute_display_sanitizes_keys_and_enum_values() {
         let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
         let mut output = String::new();
         super::format_attributes_for_show(
             &mut output,
-            std::collections::HashMap::from([(
-                raw.clone(),
-                carina_core::resource::Value::Concrete(
-                    carina_core::resource::ConcreteValue::enum_identifier(&raw),
-                ),
-            )]),
+            &PersistedAttributes::from_typed_persisted_wire_values(
+                std::collections::HashMap::from([(
+                    raw.clone(),
+                    carina_core::resource::Value::Concrete(
+                        carina_core::resource::ConcreteValue::enum_identifier(&raw),
+                    ),
+                )]),
+            )
+            .unwrap(),
             "",
         );
         assert!(!output.contains(['\x1b', '\u{9b}']));

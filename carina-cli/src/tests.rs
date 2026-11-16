@@ -2209,6 +2209,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     let result = crate::commands::apply::detect_drift(
         color_mode,
         &[resolved_inner(resource)],
+        &Plan::new(),
         &[ReloadedCurrentStateEntry::managed(
             id.clone(),
             planned.clone(),
@@ -2222,6 +2223,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
         &provider,
         &provider,
         None,
+        &crate::test_support::observation_authority_for_test(None),
         &schemas,
         ApplyTarget::Project(std::path::Path::new(".")),
     )
@@ -3932,9 +3934,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
 #[test]
 fn plan_file_serialization_redacts_secrets() {
-    use carina_core::value::{
-        redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
-    };
+    use carina_core::value::redact_secrets_in_resource;
 
     // Build a plan with secrets in resources, states, and effects
     let secret_password = Value::Deferred(DeferredValue::Secret(
@@ -3992,7 +3992,7 @@ fn plan_file_serialization_redacts_secrets() {
                 "awscc",
             )]),
             backend_config: crate::commands::plan::SavedBackendConfig::default(),
-            plan: redact_secrets_in_plan(&plan).unwrap(),
+            plan: crate::test_support::creation_fixture::recorded_snapshot(&plan),
             sorted_resources: vec![
                 redact_secrets_in_resource(&resolved_inner(resource_with_secret.clone())).unwrap(),
             ],
@@ -4009,7 +4009,9 @@ fn plan_file_serialization_redacts_secrets() {
             data_source_values: vec![],
             current_states: vec![CurrentStateEntry::managed(
                 ResourceId::with_provider_identity("awscc", "rds.db_instance", "my-db", None),
-                redact_secrets_in_state(&state_with_secret).unwrap(),
+                crate::test_support::protected_observation(&state_with_secret.to_snapshot())
+                    .snapshot()
+                    .unwrap(),
             )],
             upstream_snapshot: HashMap::new(),
             upstream_sources: Vec::new(),

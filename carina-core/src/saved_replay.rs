@@ -44,15 +44,21 @@ impl SavedPlanReplay<SnapshotLeaf> {
         import_identifiers: &HashMap<ResourceId, Value>,
         templates: &crate::parser::ResolvedDeferredForExpressions,
     ) -> Result<SavedPlanReplay, SecretRehydrationSiteError> {
-        Ok(SavedPlanReplay {
-            plan: crate::value::rehydrate_plan_desired_secrets(
-                &self.plan,
-                resources,
-                data_sources,
-                import_identifiers,
-                templates,
-            )?,
-        })
+        let mut plan = crate::value::rehydrate_plan_desired_secrets(
+            &self.plan,
+            resources,
+            data_sources,
+            import_identifiers,
+            templates,
+        )?;
+        #[allow(clippy::iter_over_hash_type)]
+        // Keyed runtime metadata; iteration order never reaches output.
+        plan.retain_observation_desired(
+            resources
+                .values()
+                .map(|resource| (&resource.id, &resource.attributes)),
+        );
+        Ok(SavedPlanReplay { plan })
     }
 }
 impl<V: PlanValueKind> SavedPlanReplay<V> {
@@ -128,6 +134,25 @@ impl RecordedPlanSnapshot {
     }
 }
 impl InputCheckedPlan {
+    /// Raw historical maps cannot enter saved-plan output.
+    /// Previously: the raw-map call compiled successfully.
+    ///
+    /// ```compile_fail,E0308
+    /// use std::collections::HashMap;
+    /// use carina_core::{input_rules::InputCheckedPlan, resource::{ResourceId, Resource, SnapshotLeaf, SnapshotState}};
+    /// fn bypass(checked: &InputCheckedPlan, desired: &HashMap<ResourceId, Resource<carina_core::resource::ModuleSource, SnapshotLeaf>>, raw: &HashMap<ResourceId, SnapshotState>) {
+    ///     let _ = checked.record_snapshot(desired, raw);
+    /// }
+    /// ```
+    /// Detached subsets cannot replace the complete observation batch.
+    ///
+    /// ```compile_fail,E0308
+    /// use std::collections::HashMap;
+    /// use carina_core::{input_rules::InputCheckedPlan, resource::{ResourceId, Resource, SnapshotLeaf, ModuleSource}, value::ProtectedObservation};
+    /// fn omit(checked: &InputCheckedPlan, desired: &HashMap<ResourceId, Resource<ModuleSource, SnapshotLeaf>>) {
+    ///     let _ = checked.record_snapshot(desired, std::iter::empty::<&ProtectedObservation>());
+    /// }
+    /// ```
     pub fn record_snapshot<D>(
         &self,
         desired: &HashMap<
@@ -139,14 +164,34 @@ impl InputCheckedPlan {
                 D,
             >,
         >,
-        historical: &HashMap<ResourceId, SnapshotState>,
+        observations: &crate::value::ProtectedObservations,
     ) -> Result<RecordedPlanSnapshot, crate::value::SerializationError> {
+        let plan = observations.protect_plan_history(self.plan())?;
+        let historical = observations.recorded_history()?;
         Ok(RecordedPlanSnapshot {
             plan: crate::value::redact_secrets_in_plan_with_desired_and_historical(
-                self.plan(),
+                &plan,
                 desired,
-                historical,
+                &historical,
             )?,
         })
+    }
+}
+
+impl
+    crate::provider_text::SavedProviderConfiguration<
+        NoPlaceholder,
+        crate::provider_text::SavedInputsResolved,
+    >
+{
+    /// The loaded configuration owns all saved desired resources, including
+    /// unchanged resources that have no effect. Bind that owner during replay.
+    pub fn bind_observation_plan(&self, mut plan: SavedPlanReplay) -> SavedPlanReplay {
+        plan.plan.retain_observation_desired(
+            self.resources()
+                .iter()
+                .map(|resource| (&resource.id, &resource.attributes)),
+        );
+        plan
     }
 }

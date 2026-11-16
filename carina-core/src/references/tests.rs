@@ -470,7 +470,7 @@ async fn round5_ordered_list_detail_rows_record_the_pairs_the_renderer_compares(
         &plan.effects()[0],
         Some(&fixture.registry),
         crate::detail_rows::DetailLevel::Full,
-        &crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+        &crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan),
         None,
         &fixture.router,
         crate::detail_rows::DetailComparisons::Planning(&references),
@@ -610,7 +610,7 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
         .unwrap();
     preparation
         .display(
-            plan.clone(),
+            &plan,
             &prepared.references,
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, &fixture.saved),
             crate::detail_rows::DetailLevel::Full,
@@ -647,7 +647,7 @@ async fn successive_preparations_and_detail_rendering_share_a_router_without_glo
             .effects()
             .first()
             .expect("reference repoint produces an Update");
-        let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+        let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
         let rows = crate::detail_rows::build_detail_rows_by_instance(
             effect,
             Some(&fixture.registry),
@@ -949,7 +949,7 @@ async fn round9_scalar_to_list_union_enumerates_planning_and_display_operands() 
     fixture.calls.lock().unwrap().clear();
     ReferencePreparation::default()
         .display(
-            crate::input_rules::FinalizedPlan::new(plan.clone())
+            &crate::input_rules::FinalizedPlan::new(plan.clone())
                 .check_inputs(&fixture.registry, &HashMap::new())
                 .unwrap(),
             &prepare_empty_for_tests(),
@@ -2155,7 +2155,7 @@ async fn unordered_list_index_ignore_precedes_projection_pairing_and_saved_merge
     let Current::Present(current) = fixture.current[&fixture.desired[0].id].current() else {
         unreachable!()
     };
-    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     historical.set_update_from_provider_and_persisted(
         fixture.desired[0].id.clone(),
         &current.state().attributes,
@@ -3083,7 +3083,7 @@ async fn round4_saved_deleted_alias_does_not_annotate_a_tag_update() {
         ResolvedResource::collect_resolved_with_schemas([target], &fixture.registry).unwrap();
     let references = fixture.prepare().await.unwrap();
     let plan = fixture.plan(&references).unwrap();
-    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     let rows = crate::detail_rows::build_detail_rows_by_instance(
         &plan.effects()[0],
         Some(&fixture.registry),
@@ -3191,7 +3191,7 @@ async fn round4_historical_list_pairing_uses_only_unmatched_reference_values() {
     let Current::Present(current) = fixture.current[&fixture.desired[0].id].current() else {
         unreachable!()
     };
-    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     historical.set_update_from_provider_and_persisted(
         fixture.desired[0].id.clone(),
         &current.state().attributes,
@@ -3304,7 +3304,7 @@ async fn round4_dangling_note_requires_a_rendered_reference_field() {
             .is_some()
     );
     let plan = fixture.plan(&references).unwrap();
-    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     let rows = crate::detail_rows::build_detail_rows_by_instance(
         &plan.effects()[0],
         Some(&fixture.registry),
@@ -3371,7 +3371,7 @@ async fn round4_dangling_saved_value_is_labeled_saved_in_its_diff_row() {
     );
     let references = fixture.prepare().await.unwrap();
     let plan = fixture.plan(&references).unwrap();
-    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     let rows = crate::detail_rows::build_detail_rows_by_instance(
         &plan.effects()[0],
         Some(&fixture.registry),
@@ -3437,7 +3437,7 @@ async fn round4_historical_pairing_does_not_compare_unmanaged_reference_peers() 
     let references = fixture.prepare().await.unwrap();
     let plan = fixture.plan(&references).unwrap();
     assert!(fixture.calls.lock().unwrap().is_empty());
-    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     crate::detail_rows::build_detail_rows_by_instance(
         &plan.effects()[0],
         Some(&fixture.registry),
@@ -3636,7 +3636,7 @@ async fn round5_dangling_saved_leaf_does_not_annotate_a_different_list_element()
         &plan.effects()[0],
         Some(&fixture.registry),
         crate::detail_rows::DetailLevel::Full,
-        &crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+        &crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan),
         None,
         &fixture.router,
         crate::detail_rows::DetailComparisons::Planning(&references),
@@ -3695,7 +3695,7 @@ async fn round5_current_dangling_notes_keep_the_original_string_list_index() {
             &plan.effects()[0],
             Some(&fixture.registry),
             crate::detail_rows::DetailLevel::Full,
-            &crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+            &crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan),
             None,
             &fixture.router,
             crate::detail_rows::DetailComparisons::Planning(&references),
@@ -3850,7 +3850,7 @@ async fn round5_saved_map_union_grafts_retain_the_saved_side() {
         &plan.effects()[0],
         Some(&fixture.registry),
         crate::detail_rows::DetailLevel::Full,
-        &crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+        &crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan),
         None,
         &fixture.router,
         crate::detail_rows::DetailComparisons::Planning(&references),

@@ -37,3 +37,30 @@ pub fn checked_with_derived_schemas(
     }
     checked(plan, &schemas)
 }
+
+/// Synthetic fixtures still record through the production observation owner.
+#[allow(dead_code)]
+pub fn recorded_snapshot(plan: &carina_core::plan::Plan) -> carina_core::plan::SnapshotPlan {
+    let checked = checked_with_derived_schemas(plan.clone());
+    let observations = carina_core::value::ObservationState::empty_for_test()
+        .protect(carina_core::value::ObservationInputs::Display {
+            deleted: &std::collections::HashMap::new(),
+            plan: checked.plan(),
+            current: &std::collections::HashMap::new(),
+        })
+        .unwrap();
+    checked
+        .record_snapshot(
+            &std::collections::HashMap::<
+                _,
+                carina_core::resource::Resource<
+                    carina_core::resource::ModuleSource,
+                    carina_core::resource::SnapshotLeaf,
+                >,
+            >::new(),
+            &observations,
+        )
+        .unwrap()
+        .plan()
+        .clone()
+}

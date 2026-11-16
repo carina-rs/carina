@@ -1135,7 +1135,7 @@ pub(crate) struct ProtectedUpdateInput {
     id: ResourceId,
     attributes: IndexMap<String, Value>,
     ignored: crate::resource::ResolvedIgnoreChanges,
-    patch: UpdatePatch,
+    patch: RuleUpdatePatch,
     selection: crate::input_rules::InputSelectionAuthority,
 }
 
@@ -1159,9 +1159,16 @@ impl ProtectedUpdateInput {
         &self.ignored
     }
     pub(crate) fn patch(&self) -> &UpdatePatch {
-        &self.patch
+        &self.patch.0
     }
 }
+
+/// Binding/positional annotation consumed only by dispatch rules.
+#[derive(Clone)]
+struct RuleUpdatePatch(UpdatePatch);
+/// Output annotation consumed only by diagnostics and free-text enrollment.
+#[derive(Debug, Clone)]
+struct DiagnosticUpdatePatch(UpdatePatch);
 
 /// Per-operation request record for [`Provider::update`].
 ///
@@ -1217,6 +1224,7 @@ pub struct UpdateRequest {
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
     input: Arc<ProtectedUpdateInput>,
+    diagnostics: DiagnosticUpdatePatch,
     #[cfg(any(test, feature = "test-utils"))]
     desired_for_fixture: ProviderReadyResource,
 }
@@ -1230,36 +1238,39 @@ impl UpdateRequest {
     ) -> Result<Self, crate::executor::ProviderPreparationError> {
         let patch = context.prepare_update_patch(changed_attributes, resource, &from)?;
         let protected = resource.protected_desired_tree();
-        let annotated_patch = UpdatePatch {
-            ops: patch
-                .payload()
-                .as_inner()
-                .ops
-                .iter()
-                .map(|op| match op {
-                    PatchOp::Add { key, value } => PatchOp::Add {
-                        key: key.clone(),
-                        value: resource.diagnostic_value(key, value),
-                    },
-                    PatchOp::Replace { key, value } => PatchOp::Replace {
-                        key: key.clone(),
-                        value: resource.diagnostic_value(key, value),
-                    },
-                    PatchOp::Reassert { key, value } => PatchOp::Reassert {
-                        key: key.clone(),
-                        value: resource.diagnostic_value(key, value),
-                    },
-                    PatchOp::Remove { key } => PatchOp::Remove { key: key.clone() },
-                })
-                .collect(),
-        };
+        let annotate_patch =
+            |annotate: fn(&ProviderReadyResource, &str, &Value) -> Value| UpdatePatch {
+                ops: patch
+                    .payload()
+                    .as_inner()
+                    .ops
+                    .iter()
+                    .map(|op| match op {
+                        PatchOp::Add { key, value } => PatchOp::Add {
+                            key: key.clone(),
+                            value: annotate(resource, key, value),
+                        },
+                        PatchOp::Replace { key, value } => PatchOp::Replace {
+                            key: key.clone(),
+                            value: annotate(resource, key, value),
+                        },
+                        PatchOp::Reassert { key, value } => PatchOp::Reassert {
+                            key: key.clone(),
+                            value: annotate(resource, key, value),
+                        },
+                        PatchOp::Remove { key } => PatchOp::Remove { key: key.clone() },
+                    })
+                    .collect(),
+            };
         let input = Arc::new(ProtectedUpdateInput {
             id: protected.id().clone(),
             attributes: protected.attributes().clone(),
             ignored: protected.ignored().clone(),
-            patch: annotated_patch,
+            patch: RuleUpdatePatch(annotate_patch(ProviderReadyResource::rule_input_value)),
             selection: protected.selection_authority().clone(),
         });
+        let diagnostics =
+            DiagnosticUpdatePatch(annotate_patch(ProviderReadyResource::diagnostic_value));
         Ok(Self {
             #[cfg(any(test, feature = "test-utils"))]
             desired_for_fixture: resource.clone(),
@@ -1267,6 +1278,7 @@ impl UpdateRequest {
             patch,
             directives: *resource.directives(),
             input,
+            diagnostics,
         })
     }
 
@@ -1286,7 +1298,13 @@ impl UpdateRequest {
     }
 
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
-        self.input.patch.ops.iter().filter_map(PatchOp::sent_value)
+        // The owner classified this exact sent patch before transport removed
+        // annotations. Enroll every string in its secret leaves and Whole units.
+        self.diagnostics
+            .0
+            .ops
+            .iter()
+            .filter_map(PatchOp::sent_value)
     }
 
     pub(crate) fn protected_input(&self) -> &ProtectedUpdateInput {
@@ -1974,6 +1992,24 @@ impl PersistedAttributes {
         Ok(Self { encoded })
     }
 
+    /// Render one loaded persisted attribute with its structural secret tags.
+    pub fn rendered_attribute(&self, key: &str) -> Option<crate::value::RenderedValue> {
+        self.get(key).as_ref().map(crate::value::render_value)
+    }
+
+    /// Render the same canonical persisted values used for state comparison.
+    pub fn rendered_comparison_attributes(
+        &self,
+        schema: &ResourceSchema,
+    ) -> HashMap<String, crate::value::RenderedValue> {
+        let values =
+            crate::resource::CanonicalComparisonAttributes::canonicalize(self.to_values(), schema);
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), crate::value::render_value(value)))
+            .collect()
+    }
+
     /// Decode one stored attribute with structural persisted-secret semantics.
     pub fn get(&self, key: &str) -> Option<crate::resource::SnapshotValue> {
         self.encoded.get(key)?.decode()
@@ -2042,6 +2078,7 @@ impl PersistedAttributes {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn encoded(&self) -> &HashMap<String, PersistedValue> {
         &self.encoded
     }
@@ -6943,6 +6980,11 @@ pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::Pla
             }
             Err(
                 source @ (SerializationError::NullProviderSecret
+                | SerializationError::ObservationIdentityMismatch { .. }
+                | SerializationError::MissingObservationResource { .. }
+                | SerializationError::MissingObservationAttribute { .. }
+                | SerializationError::MissingObservationComparisons
+                | SerializationError::ObservationPlanMismatch
                 | SerializationError::UnresolvedEnumIdentifier { .. }
                 | SerializationError::UnexpandedModuleIf { .. }
                 | SerializationError::UnavailableSecret(_)

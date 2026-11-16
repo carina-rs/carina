@@ -10546,6 +10546,16 @@ impl<P> ExportsCheckedPreApply<P> {
     }
 }
 
+impl ExportsCheckedPreApply<crate::parser::ExpandedInferredExportParam> {
+    pub fn rendered_display_values(
+        &self,
+    ) -> impl Iterator<Item = Option<crate::value::RenderedValue>> + '_ {
+        self.display_params
+            .iter()
+            .map(|param| param.value.as_ref().map(crate::value::render_value))
+    }
+}
+
 /// Export parameters resolved against the post-apply binding view and proven
 /// not to contain a secret.
 ///

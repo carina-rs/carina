@@ -53,6 +53,24 @@ used by planning. Applying it replays that classification against locked state
 before writing state v21. Older saved plans are rejected; regenerate them with
 `carina plan --out`.
 
+Managed-resource observations inherit the configuration's secret paths in text
+plans, JSON and saved plans, destroy and orphan rows, saved-apply drift text,
+apply diagnostics and provider free text, even when an external system changes
+their contents or structure. This output protection does not apply to data-source read values
+or reference bindings; those retain their existing annotation rules. Provider free-text substitution
+enrolls strings classified secret in the actual sent patch. A change of value kind
+on a path to a configured secret, or a change in the length of a secret-bearing
+list, hides the observed subtree at the first divergence. `StringList` and `List`
+are treated as the same kind. Maps match keys one to one: missing keys (including
+write-only secrets) and extra observed keys never widen protection. Matching
+keys retain their secret leaf or descendant protection; unmatched observed keys
+remain ordinary values. Public siblings outside a hidden subtree remain visible.
+
+`plan --json` and `plan --out` store a hash of the hidden observed subtree.
+A newly hidden container has no stored digest to reuse, so its hash receives a
+fresh random salt on every plan. This protection also applies to values selected
+by `ignore_changes`; their normal text change rows remain omitted.
+
 Saved plans never contain secret plaintext. Carina stores each secret as a
 typed placeholder containing only an Argon2id hash, including secrets nested
 inside lists or maps and values derived from `decrypt()` or other expressions.
@@ -62,10 +80,11 @@ unchanged secret already exists in state, the plan reuses that exact digest
 and therefore keeps its salt. A pre-v12 digest may instead appear in the
 self-contained `argon2-legacy` form until the next write that has the
 plaintext available. Equal newly written secrets receive unrelated hashes,
-and a resource move does not change how a stored digest is verified. State
-writeback stores the same digest carried by the plan placeholder. The
-placeholder is not a provider value and cannot be applied directly. Backend
-attributes cannot be secret-derived because backend implementations accept only
+and a resource move does not change how a stored digest is verified. For authored
+secrets selected for state writeback, state stores the digest carried by the
+corresponding desired-input placeholder. Protecting a provider observation in a
+plan does not replace the stored authored digest. A placeholder is not a provider
+value and cannot be applied directly. Backend attributes cannot be secret-derived because backend implementations accept only
 ordinary configuration values; validation rejects `secret()` and `decrypt()`
 results there.
 

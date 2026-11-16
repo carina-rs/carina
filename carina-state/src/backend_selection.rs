@@ -177,6 +177,11 @@ pub struct ResolvedReadBackend {
 }
 
 impl ResolvedReadBackend {
+    pub async fn read_state_with_observations(
+        &self,
+    ) -> BackendResult<(Option<crate::LoadedState>, crate::ObservationStateAuthority)> {
+        crate::ObservationStateAuthority::load(self.backend.as_ref()).await
+    }
     pub async fn read_state(&self) -> BackendResult<Option<crate::LoadedState>> {
         self.backend.read_state().await
     }

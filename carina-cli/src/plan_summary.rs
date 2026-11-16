@@ -220,7 +220,11 @@ mod tests {
         let export_change = ExportChange::Added {
             name: "region".to_string(),
             type_expr: None,
-            new_value: Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+            new_value: crate::test_support::render_value(&Value::<
+                carina_core::resource::NoPlaceholder,
+            >::Concrete(
+                ConcreteValue::String("ap-northeast-1".into()),
+            )),
         };
         let no_deferred = resolved_deferred_for_for_test([]);
         let deferred = resolved_deferred_for_for_test([residual_deferred_for()]);
