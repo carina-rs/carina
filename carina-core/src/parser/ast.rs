@@ -1092,6 +1092,8 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                     DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
                 }
                 Value::Deferred(_) => DeferredForIterableResolution::StillDeferred,
+                crate::resource::Value::Reference(never)
+                | crate::resource::Value::Conversion(never) => match *never {},
             }
         };
         let phase_detail = iterable
@@ -9100,6 +9102,9 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::Secret(_)) => "secret",
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -9495,6 +9500,9 @@ fn normalize_substituted_value<B: BindingAddress>(
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unknown(_),
         ) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
     Ok(())
 }
@@ -9600,6 +9608,9 @@ fn normalize_substituted_lazily<B: BindingAddress>(
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unknown(_),
         ) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
     Ok(())
 }

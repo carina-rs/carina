@@ -191,6 +191,8 @@ fn value_depends_on_module_output(
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::Placeholder(_)) => false,
+        carina_core::resource::Value::Reference(never)
+        | carina_core::resource::Value::Conversion(never) => match *never {},
     }
 }
 
@@ -296,7 +298,8 @@ impl<'a> ContextFreeValue<'a> {
                 }
                 Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
                     is_context_free(expression.lhs()) && is_context_free(expression.rhs())
-                }
+                },
+        carina_core::resource::Value::Reference(never) | carina_core::resource::Value::Conversion(never) => match *never {},
             }
         }
 

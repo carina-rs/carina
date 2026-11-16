@@ -1383,6 +1383,8 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
                     | ParserPlaceholder::EmptyInterpolation { source: _ },
                 ),
             ) => None,
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         })?;
     argument_values
         .contains_key(&candidate)
@@ -1741,6 +1743,9 @@ fn authored_value_reference_path(value: &Value) -> Option<crate::resource::Autho
                 | ParserPlaceholder::EmptyInterpolation { source: _ },
             ),
         ) => crate::resource::module_argument_reference_path(value),
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -1882,6 +1887,8 @@ pub(crate) fn module_parameter_postfix<B: BindingAddress>(
                     | ParserPlaceholder::EmptyInterpolation { source: _ },
                 ),
             ) => None,
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         }
     }
 
@@ -3405,6 +3412,8 @@ fn expand_module_composition(
                                 | ParserPlaceholder::EmptyInterpolation { source: _ },
                             ),
                         ) => None,
+                        crate::resource::Value::Reference(never)
+                        | crate::resource::Value::Conversion(never) => match *never {},
                     };
                     let forwarded_handle = parameter
                         .and_then(|parameter| {

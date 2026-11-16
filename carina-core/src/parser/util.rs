@@ -75,6 +75,9 @@ pub(crate) fn value_type_name(value: &Value) -> &'static str {
 
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
         Value::Deferred(DeferredValue::Placeholder(_)) => "placeholder",
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 

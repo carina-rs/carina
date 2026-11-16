@@ -3,6 +3,7 @@
 pub mod configuration;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod loopback;
+pub mod resolver_kind;
 
 // Host boundary fixtures must not become guest display authority through
 // Cargo feature unification in a provider's wasm build.

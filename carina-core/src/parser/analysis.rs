@@ -1021,6 +1021,12 @@ fn require_integer_operator_provenance<P: ValueKind, B: BindingAddress>(
             | DeferredValue::Placeholder(_)
             | DeferredValue::Unknown(_),
         ) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
     Ok(())
 }
@@ -1073,6 +1079,12 @@ where
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
     Ok(())
 }

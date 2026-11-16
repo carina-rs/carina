@@ -1085,6 +1085,9 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
             target.ancestry,
         )
         .map_err(BindingResolutionError::Type),
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -1399,6 +1402,9 @@ fn deferred_value_mismatch<B: BindingAddress>(
             | crate::resource::ConcreteValue::StringList(_)
             | crate::resource::ConcreteValue::Map(_),
         ) => None,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -2608,6 +2614,12 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
         | GenericValue::Concrete(crate::resource::ConcreteValue::Duration(_))
         | GenericValue::Concrete(crate::resource::ConcreteValue::StringList(_))
         | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_)) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -2997,6 +3009,9 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress, E: InsideSecret>(
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
     findings
 }
@@ -3368,6 +3383,9 @@ fn prove_integer_operand<B: BindingAddress>(
             | crate::resource::DeferredValue::Access(_)
             | crate::resource::DeferredValue::Unknown(_),
         ) => None,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     };
 
     if let Some(RefType::Typed(source)) = reference_type {
@@ -4846,6 +4864,8 @@ mod user_function_refs {
             })
             | crate::resource::Value::Deferred(crate::resource::DeferredValue::Unknown(_))
             | crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(_)) => {}
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         }
     }
 }
@@ -10225,6 +10245,9 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
             module_call_value_is_context_free(expression.lhs())
                 && module_call_value_is_context_free(expression.rhs())
         }
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -10806,6 +10829,16 @@ fn attribute_value_findings_from<S: ExportSource, P: PlaceholderKind, B: Binding
                                 None,
                             ));
                             continue;
+                        }
+                        crate::resource::Value::Reference(never) => {
+                            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(
+                                never,
+                            ) {}
+                        }
+                        crate::resource::Value::Conversion(never) => {
+                            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(
+                                never,
+                            ) {}
                         }
                     }
                 }

@@ -1039,6 +1039,12 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
             Self::Value(Value::Deferred(DeferredValue::Access(_))) => "access expression",
             Self::Value(Value::Deferred(DeferredValue::Unknown(_))) => "unknown",
             Self::Value(Value::Deferred(DeferredValue::Placeholder(_))) => "placeholder",
+            Self::Value(crate::resource::Value::Reference(never)) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            Self::Value(crate::resource::Value::Conversion(never)) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 

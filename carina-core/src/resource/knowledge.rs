@@ -3279,6 +3279,12 @@ fn classify_value<
             }
             Ok(expression(value, EvaluationKind::ModuleIf, inputs))
         }
+        crate::resource::Value::Reference(never) => {
+            match *<Q as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<Q as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 /// Definitive absence of an eligible selection. Only the existing resolution

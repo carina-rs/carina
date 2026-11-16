@@ -194,6 +194,12 @@ impl<B: BindingAddress> CandidateOrigin<B> {
                 | DeferredValue::Secret(_)
                 | DeferredValue::Unknown(_),
             ) => Self::Expression,
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 }

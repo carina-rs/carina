@@ -8476,6 +8476,8 @@ pub(crate) fn canonicalize_custom_type_value(
             | RawShape::Ref(_),
             _,
         ) => unreachable!("identified scalar guard excludes non-scalar declarations"),
+        (_, crate::resource::Value::Reference(never)) => match *never {},
+        (_, crate::resource::Value::Conversion(never)) => match *never {},
     }
 }
 
