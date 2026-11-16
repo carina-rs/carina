@@ -1,4 +1,4 @@
 let ordinary = use { source = '../ordinary.crn' }
-let service = use { source = '../target' }
+let service = use { source = '../module' }
 ordinary {}
 let result = service {}

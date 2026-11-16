@@ -5,13 +5,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: duplicate binding 'x': declared in main.crn and sibling.crn\nError: main.crn at line 2\nError: Unknown argument 'n' for module 'service'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'\n",
+          "stderr": "Error: ../module: duplicate binding 'x': declared in main.crn and sibling.crn\nError: main.crn at line 2\nError: Unknown argument 'n' for module 'service'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"Unknown argument 'n' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 24\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"Unknown argument 'n' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 24\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -734,7 +734,7 @@
       "value": {
         "contents": {
           "kind": "markdown",
-          "value": "## service\n\n`../target`\n"
+          "value": "## service\n\n`../module`\n"
         }
       }
     },
@@ -742,7 +742,7 @@
       "classification": "changed:4398-importability",
       "value": {
         "exit": 1,
-        "stderr": "warning: ./../target/main.crn:1  ../target: duplicate binding 'x': declared in main.crn and sibling.crn\nError: Found 1 lint warning(s).\n",
+        "stderr": "warning: ./../module/main.crn:1  ../module: duplicate binding 'x': declared in main.crn and sibling.crn\nError: Found 1 lint warning(s).\n",
         "stdout": ""
       }
     },
@@ -763,8 +763,8 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target/interface.crn": [],
-          "target/main.crn": [
+          "module/interface.crn": [],
+          "module/main.crn": [
             {
               "message": "duplicate binding 'x': declared in main.crn and sibling.crn",
               "range": {
@@ -781,7 +781,7 @@
               "source": "carina"
             }
           ],
-          "target/sibling.crn": [
+          "module/sibling.crn": [
             {
               "message": "duplicate binding 'x': declared in main.crn and sibling.crn",
               "range": {
@@ -800,8 +800,8 @@
           ]
         },
         "faithful_disk_error": {
-          "target/interface.crn": [],
-          "target/main.crn": [
+          "module/interface.crn": [],
+          "module/main.crn": [
             {
               "message": "duplicate binding 'x': declared in main.crn and sibling.crn",
               "range": {
@@ -818,7 +818,7 @@
               "source": "carina"
             }
           ],
-          "target/sibling.crn": [
+          "module/sibling.crn": [
             {
               "message": "duplicate binding 'x': declared in main.crn and sibling.crn",
               "range": {
@@ -843,13 +843,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: duplicate binding 'x': declared in main.crn and sibling.crn\nError: main.crn at line 3\nError: Unknown argument 'n' for module 'service'\n",
+          "stderr": "Error: ../module: duplicate binding 'x': declared in main.crn and sibling.crn\nError: main.crn at line 3\nError: Unknown argument 'n' for module 'service'\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"Unknown argument 'n' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 24\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"Unknown argument 'n' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 24\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -892,7 +892,7 @@
       "classification": "changed:4398-importability",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target: duplicate binding 'x': declared in main.crn and sibling.crn\n",
+        "stderr": "Error: ../module: duplicate binding 'x': declared in main.crn and sibling.crn\n",
         "stdout": "Validating...\n"
       }
     },
@@ -901,10 +901,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -913,16 +914,16 @@
     "files": {},
     "id": "no_interface_duplicate--direct--called",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "no_interface_duplicate",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
     "supplemental": true,
     "target_paths": [
-      "target/interface.crn",
-      "target/main.crn",
-      "target/sibling.crn"
+      "module/interface.crn",
+      "module/main.crn",
+      "module/sibling.crn"
     ],
     "unreadable_paths": [],
     "usage": "called"

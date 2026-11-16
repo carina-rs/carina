@@ -1,0 +1,5 @@
+arguments { outer_n: Int = 1 }
+let service = use { source = '../module' }
+let result = service {}
+let second = use { source = '../module' }
+let other = second {}

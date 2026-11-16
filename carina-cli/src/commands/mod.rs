@@ -787,12 +787,8 @@ fn validate_and_resolve_configuration<'s>(
     // resource-validation preference. Keep the recursive module snapshots
     // available even on destroy/state recovery paths; the later optional
     // policy checks remain gated by `skip_resource_validation`.
-    let module_walk = ModuleWalk::load(
-        parsed.parsed(),
-        base_dir,
-        &enriched_context.catalog().environment,
-        ctx.schemas(),
-    );
+    let mut module_walk =
+        ModuleWalk::load(&parsed, base_dir, enriched_context.catalog(), ctx.schemas());
     for metadata in std::iter::once(&parsed.parser_binding_metadata).chain(
         module_walk
             .iter()
@@ -1002,16 +998,8 @@ fn validate_and_resolve_configuration<'s>(
         }
     };
 
-    // User-facing checks for root-owned blocks inside modules run on the
-    // recursive module walk so validate/plan/apply can collect path-prefixed
-    // findings alongside other validation errors. As with the duplicate
-    // checks established in #3711, the directory unit includes every imported
-    // nested module, even when that import is never called. The `errors`
-    // return immediately below happens before
-    // module resolver, so the same run cannot also emit the
-    // resolver's expansion-phase backstops. Destroy and state refresh set
-    // `skip_resource_validation = true`, bypass this walk, and rely on those
-    // backstops while still expanding modules.
+    // Core's issued traversal owns every reachable prohibition, including
+    // children of failed or unusable bridges. Static checks only present it.
     if !skip_resource_validation {
         errors.extend(validate_module_boundaries(&module_walk));
     }
@@ -1050,10 +1038,11 @@ fn validate_and_resolve_configuration<'s>(
         return Err(ValidationStopped::existing(errors));
     }
 
-    let module_resolution = module_resolver::resolve_modules_with_diagnostics(
+    let module_resolution = module_resolver::resolve_modules_with_collected_imports(
         parsed.clone().admit(ctx.schemas(), enriched_context),
         base_dir,
         &authored_module_call_findings,
+        &mut module_walk,
     );
     let mut parsed = match module_resolution.into_validation(errors) {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {

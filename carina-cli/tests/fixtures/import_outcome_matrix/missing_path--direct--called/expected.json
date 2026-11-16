@@ -830,6 +830,7 @@
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -838,7 +839,7 @@
     "files": {},
     "id": "missing_path--direct--called",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "missing_path",
     "runtime_unreadable": {},

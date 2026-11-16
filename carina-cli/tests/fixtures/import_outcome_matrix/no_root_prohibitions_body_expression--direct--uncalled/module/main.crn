@@ -1,0 +1,3 @@
+arguments { n: Int = 1 }
+let a = 'present'
+let broken = a ?? 1

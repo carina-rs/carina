@@ -5348,14 +5348,25 @@ pub(crate) fn validate_module_internal_ref_types(
     }
 }
 
-/// Present the loader's typed sets in main's category-first order, retaining
-/// depth-first directory order within each category. No body is reclassified.
+/// Present the resolver's complete collection in its issued order. Adapters
+/// retain each finding's typed prohibition or ordinary-read presentation.
 pub(crate) fn validate_module_boundaries(module_walk: &ModuleWalk) -> Vec<AppError> {
-    let mut rejections = module_walk.rejections().iter().collect::<Vec<_>>();
-    rejections.sort_by_key(|rejection| rejection.category);
-    rejections
-        .into_iter()
-        .map(crate::module_walk::RejectedModuleAtPath::diagnostic)
+    module_walk
+        .prohibitions()
+        .boundary_findings()
+        .map(|finding| {
+            let error = std::sync::Arc::new(finding.error());
+            match finding.prohibition_path() {
+                Some(path) => AppError::ModuleImport {
+                    path: path.clone(),
+                    error,
+                },
+                None => AppError::ModuleImportResolution {
+                    error,
+                    base: Box::new(module_walk.base_dir().clone()),
+                },
+            }
+        })
         .collect()
 }
 

@@ -1623,7 +1623,7 @@ fn empty_import_directory_has_a_specific_error() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "Error: checked: No .crn files found in checked\n"
+        "Error: Module resolution error: Module not found: ./checked\n"
     );
 }
 

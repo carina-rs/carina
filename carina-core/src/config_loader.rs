@@ -2068,6 +2068,33 @@ impl DirectoryFiles {
             .collect::<Result<Vec<_>, _>>()
             .map(|sources| DirectoryInputs { sources })
     }
+
+    /// Read every sibling exactly once. An incomplete import keeps both its
+    /// readable source and the first failure, without issuing completeness.
+    pub(crate) fn read_import(self, overrides: &SourceOverrides) -> ImportDirectoryInputs {
+        let mut sources = Vec::new();
+        let mut failure = None;
+        for file in self.paths {
+            match read_source_with_overrides(&file, overrides) {
+                Ok(source) => sources.push((file, source)),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        match failure {
+            None => ImportDirectoryInputs::Complete(DirectoryInputs { sources }),
+            Some(error) => ImportDirectoryInputs::Partial { sources, error },
+        }
+    }
+}
+
+pub(crate) enum ImportDirectoryInputs {
+    Complete(DirectoryInputs),
+    Partial {
+        sources: Vec<(ResolvedPath, String)>,
+        error: std::io::Error,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2083,12 +2110,6 @@ pub(crate) struct DirectorySourceReadFailure {
 /// these inputs. Successful parsing of all of them can mint completeness.
 pub(crate) struct DirectoryInputs {
     sources: Vec<(ResolvedPath, String)>,
-}
-
-impl DirectorySourceReadFailure {
-    pub(crate) fn into_error(self) -> std::io::Error {
-        self.error
-    }
 }
 
 impl DirectoryInputs {

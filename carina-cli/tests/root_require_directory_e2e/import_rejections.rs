@@ -137,7 +137,145 @@ fn readable_exports_precede_unreadable_sibling() {
     let output = directory.run(&["validate", "."]);
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "Error: ../rooted: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n"
+        "Error: ../rooted: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Module resolution error: IO error: stream did not contain valid UTF-8\n"
+    );
+}
+
+#[test]
+fn full_reach_keeps_each_use_children_and_failing_bridges_on_every_transport() {
+    for shape in [
+        "two_uses",
+        "two_called_uses",
+        "two_calls",
+        "two_children",
+        "body_error",
+        "unreadable",
+        "prohibited_parent",
+    ] {
+        let directory = fixture();
+        let bridge = directory._temp.path().join("bridge");
+        fs::create_dir_all(bridge.join("child")).unwrap();
+        fs::write(bridge.join("child/main.crn"), "arguments {}\nexports {}\n").unwrap();
+        let mut body =
+            "arguments { n: Int = 1 }\nlet child = use { source = './child' }\n".to_string();
+        let expected = match shape {
+            "two_uses" | "two_called_uses" => 2,
+            "two_calls" => 1,
+            "two_children" => {
+                fs::create_dir(bridge.join("other")).unwrap();
+                fs::write(bridge.join("other/main.crn"), "arguments {}\nexports {}\n").unwrap();
+                body.push_str("let other = use { source = './other' }\n");
+                2
+            }
+            "body_error" => {
+                body.push_str("let a = 'present'\nlet broken = a ?? 1\n");
+                1
+            }
+            "unreadable" => {
+                fs::write(bridge.join("unreadable.crn"), [0xff]).unwrap();
+                1
+            }
+            "prohibited_parent" => {
+                body.push_str("exports {}\n");
+                2
+            }
+            _ => unreachable!(),
+        };
+        fs::write(bridge.join("main.crn"), body).unwrap();
+        let caller = if shape == "two_calls" {
+            "let one = use { source = '../bridge/child' }\none {}\none {}\n"
+        } else if shape == "two_called_uses" {
+            "let one = use { source = '../bridge/child' }\none {}\nlet two = use { source = '../bridge/child' }\ntwo {}\n"
+        } else if shape == "two_uses" {
+            "let one = use { source = '../bridge/child' }\nlet two = use { source = '../bridge/child' }\n"
+        } else {
+            "let one = use { source = '../bridge' }\n"
+        };
+        fs::write(directory.project.join("main.crn"), caller).unwrap();
+        let output = directory.run(&["validate", "--json", "."]);
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let errors = report["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|error| {
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not allowed inside modules")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(errors.len(), expected, "{shape}: {report}");
+        for command in ["validate", "lint"] {
+            let output = directory.run(&[command, "."]);
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr.matches("not allowed inside modules").count(),
+                expected,
+                "{shape}, {command}: {stderr}"
+            );
+            if shape == "body_error" && command == "lint" {
+                assert!(
+                    stderr.contains("Error: Module resolution error: Parse error: ../bridge/main.crn:4:19: Invalid expression at line 4: coalesce default type `Int` does not match left type `String`"),
+                    "{stderr}"
+                );
+            }
+        }
+        let snapshot = Arc::new(loaded_provider_snapshot_from_factories(
+            Arc::new(vec![Box::new(ConfiguredBuiltinMock::new(
+                MockBehavior::default(),
+                MockScope::memory(),
+            ))]),
+            SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
+        ));
+        let engine = DiagnosticEngine::new(snapshot.clone(), vec!["mock".into()]);
+        let path = directory.project.join("main.crn");
+        let document = Document::new_with_path(
+            caller.into(),
+            path.clone(),
+            Arc::new(snapshot.provider_context().as_provider_context().clone()),
+        );
+        let diagnostics = engine.analyze(&document, Some(&path));
+        let prohibitions = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("not allowed inside modules"))
+            .collect::<Vec<_>>();
+        assert_eq!(prohibitions.len(), expected, "{shape}: {diagnostics:?}");
+        for (index, (error, diagnostic)) in errors.iter().zip(prohibitions).enumerate() {
+            let line = if shape == "two_called_uses" {
+                index * 2 + 1
+            } else if shape == "two_uses" {
+                index + 1
+            } else if shape == "two_calls" {
+                2
+            } else {
+                1
+            };
+            assert_eq!(error["location"]["file"], "main.crn", "{shape}");
+            assert_eq!(error["location"]["range"]["start"]["line"], line, "{shape}");
+            assert_eq!(
+                diagnostic.range.start,
+                Position::new((line - 1) as u32, 0),
+                "{shape}"
+            );
+        }
+    }
+}
+
+#[test]
+fn empty_import_human_matches_genuine_main_without_repeated_path() {
+    let directory = fixture();
+    fs::create_dir(directory._temp.path().join("empty")).unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let m = use { source = '../empty' }\nm {}\n",
+    )
+    .unwrap();
+    let output = directory.run(&["validate", "."]);
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Error: Module resolution error: Module not found: ../empty\n"
     );
 }
 
@@ -342,11 +480,11 @@ fn ordinary_uncalled_imports_match_main_on_every_transport() {
         (
             "uncalled-syntax",
             &[(
-                r###"target/broken.crn"###,
+                r###"module/broken.crn"###,
                 r###"let =
 "###,
             )],
-            r###"Error: Module resolution error: Parse error in ../target/broken.crn: Syntax error:  --> 1:5
+            r###"Error: Module resolution error: Parse error in ../module/broken.crn: Syntax error:  --> 1:5
 Error:   |
 Error: 1 | let =
 Error:   |     ^---
@@ -363,7 +501,7 @@ Error:   = expected discard_pattern or identifier
       "severity": "error",
       "code": null,
       "location": {
-        "file": "../target/broken.crn",
+        "file": "../module/broken.crn",
         "range": {
           "start": {
             "line": 1,
@@ -383,7 +521,7 @@ Error:   = expected discard_pattern or identifier
         (
             "uncalled-empty",
             &[],
-            r###"Error: ../target: No .crn files found in ../target
+            r###"Error: Module resolution error: Module not found: ../module
 "###,
             r###"{
   "status": "error",
@@ -391,7 +529,7 @@ Error:   = expected discard_pattern or identifier
   "resources": [],
   "errors": [
     {
-      "message": "No .crn files found in ../target",
+      "message": "No .crn files found in ../module",
       "severity": "error",
       "code": null,
       "location": null
@@ -403,11 +541,11 @@ Error:   = expected discard_pattern or identifier
         (
             "uncalled-file",
             &[(
-                r###"target"###,
+                r###"module"###,
                 r###"arguments {}
 "###,
             )],
-            r###"Error: Module resolution error: Module path '../target' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.
+            r###"Error: Module resolution error: Module path '../module' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.
 "###,
             r###"{
   "status": "error",
@@ -415,7 +553,7 @@ Error:   = expected discard_pattern or identifier
   "resources": [],
   "errors": [
     {
-      "message": "Module path '../target' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+      "message": "Module path '../module' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
       "severity": "error",
       "code": null,
       "location": null
@@ -428,22 +566,22 @@ Error:   = expected discard_pattern or identifier
             "uncalled-cycle",
             &[
                 (
-                    r###"target/main.crn"###,
+                    r###"module/main.crn"###,
                     r###"let again = use { source = './nested' }
 "###,
                 ),
                 (
-                    r###"target/nested/main.crn"###,
+                    r###"module/nested/main.crn"###,
                     r###"let again = use { source = '..' }
 "###,
                 ),
                 (
-                    r###"target/arguments.crn"###,
+                    r###"module/arguments.crn"###,
                     r###"arguments { n: Int = 1 }
 "###,
                 ),
                 (
-                    r###"target/nested/arguments.crn"###,
+                    r###"module/nested/arguments.crn"###,
                     r###"arguments { n: Int = 1 }
 "###,
                 ),
@@ -478,11 +616,11 @@ Error:   = expected discard_pattern or identifier
             fs::write(path, source).unwrap();
         }
         if *shape == "uncalled-empty" {
-            fs::create_dir(temp.path().join("target")).unwrap();
+            fs::create_dir(temp.path().join("module")).unwrap();
         }
         fs::write(
             project.join("main.crn"),
-            "let m = use { source = '../target' }\n",
+            "let m = use { source = '../module' }\n",
         )
         .unwrap();
         fs::write(project.join("providers.crn"), "provider mock {}\n").unwrap();
@@ -585,7 +723,11 @@ fn readable_prohibitions_beside_unreadable_siblings_keep_call_locations() {
     let output = directory.run(&["validate", "--json", "."]);
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     let errors = report["errors"].as_array().unwrap();
-    assert_eq!(errors.len(), 5, "{report}");
+    assert_eq!(errors.len(), 6, "{report}");
+    assert_eq!(
+        errors.last().unwrap()["message"],
+        "IO error: stream did not contain valid UTF-8"
+    );
     for error in errors {
         assert_eq!(error["location"]["range"]["start"]["line"], 2, "{report}");
     }
@@ -615,13 +757,13 @@ fn empty_interfaces_keep_duplicate_type_and_nested_call_checks() {
             ),
         ] {
             let directory = fixture();
-            let target = directory._temp.path().join("rooted");
-            fs::remove_dir_all(&target).unwrap();
-            fs::create_dir_all(target.join("child")).unwrap();
-            fs::write(target.join("arguments.crn"), interface).unwrap();
-            fs::write(target.join("main.crn"), body).unwrap();
+            let module = directory._temp.path().join("rooted");
+            fs::remove_dir_all(&module).unwrap();
+            fs::create_dir_all(module.join("child")).unwrap();
+            fs::write(module.join("arguments.crn"), interface).unwrap();
+            fs::write(module.join("main.crn"), body).unwrap();
             fs::write(
-                target.join("sibling.crn"),
+                module.join("sibling.crn"),
                 if kind == "duplicate" {
                     "let x = 2\n"
                 } else {
@@ -629,7 +771,7 @@ fn empty_interfaces_keep_duplicate_type_and_nested_call_checks() {
                 },
             )
             .unwrap();
-            fs::write(target.join("child/main.crn"), "arguments { n: Int }\n").unwrap();
+            fs::write(module.join("child/main.crn"), "arguments { n: Int }\n").unwrap();
             fs::write(
                 directory.project.join("main.crn"),
                 "let service = use { source = '../rooted' }\nlet result = service {}\n",
@@ -648,27 +790,32 @@ fn empty_interfaces_keep_duplicate_type_and_nested_call_checks() {
 }
 
 #[test]
-fn rejected_parents_stop_before_child_prohibitions_and_body_findings() {
-    for (root_evidence, child) in [
-        (true, "arguments { n: Int = 1 }\nexports { value = 1 }\n"),
+fn rejected_parents_keep_child_prohibitions_and_suppress_child_body_findings() {
+    for (root_evidence, child, expected_prohibitions) in [
+        (true, "arguments { n: Int = 1 }\nexports { value = 1 }\n", 2),
         (
             true,
             "arguments { n: Int = 1 }\nattributes { bad: ChildType = 1 }\n",
+            1,
         ),
-        (false, "arguments { n: Int = 1 }\nexports { value = 1 }\n"),
+        (
+            false,
+            "arguments { n: Int = 1 }\nexports { value = 1 }\n",
+            2,
+        ),
     ] {
         let directory = fixture();
-        let target = directory._temp.path().join("rooted");
-        fs::remove_dir_all(&target).unwrap();
-        fs::create_dir_all(target.join("child")).unwrap();
-        fs::write(target.join("arguments.crn"), "arguments { n: Int = 1 }\n").unwrap();
+        let module = directory._temp.path().join("rooted");
+        fs::remove_dir_all(&module).unwrap();
+        fs::create_dir_all(module.join("child")).unwrap();
+        fs::write(module.join("arguments.crn"), "arguments { n: Int = 1 }\n").unwrap();
         fs::write(
-            target.join("main.crn"),
+            module.join("main.crn"),
             "let inner = use { source = './child' }\nattributes { bad: ParentType = 1 }\n",
         )
         .unwrap();
         fs::write(
-            target.join("boundary.crn"),
+            module.join("boundary.crn"),
             if root_evidence {
                 "provider mock {}\n"
             } else {
@@ -676,18 +823,22 @@ fn rejected_parents_stop_before_child_prohibitions_and_body_findings() {
             },
         )
         .unwrap();
-        fs::write(target.join("child/main.crn"), child).unwrap();
+        fs::write(module.join("child/main.crn"), child).unwrap();
         let output = directory.run(&["validate", "--json", "."]);
         let report: Value = serde_json::from_slice(&output.stdout).unwrap();
         let errors = report["errors"].as_array().unwrap();
-        assert_eq!(errors.len(), if root_evidence { 1 } else { 2 }, "{report}");
+        assert_eq!(
+            errors.len(),
+            expected_prohibitions + usize::from(!root_evidence),
+            "{report}"
+        );
         assert!(!report.to_string().contains("ChildType"), "{report}");
         assert_eq!(
             report
                 .to_string()
                 .matches("not allowed inside modules")
                 .count(),
-            1,
+            expected_prohibitions,
             "{report}"
         );
         assert_eq!(

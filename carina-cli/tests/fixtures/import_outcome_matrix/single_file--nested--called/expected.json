@@ -5,18 +5,18 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: Module resolution error: Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\n",
+          "stderr": "Error: Module resolution error: Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
             {
-              "message": "Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+              "message": "Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
               "range": {
                 "end": {
                   "character": 20,
@@ -33,7 +33,7 @@
           ],
           "caller/main.crn": [
             {
-              "message": "Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+              "message": "Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
               "range": {
                 "end": {
                   "character": 24,
@@ -739,7 +739,7 @@
       "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "Error: Module resolution error: Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\n",
+        "stderr": "Error: Module resolution error: Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\n",
         "stdout": ""
       }
     },
@@ -749,7 +749,7 @@
         "all_siblings_open": {
           "bridge/main.crn": [
             {
-              "message": "Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+              "message": "Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
               "range": {
                 "end": {
                   "character": 20,
@@ -766,7 +766,7 @@
           ],
           "caller/main.crn": [
             {
-              "message": "Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+              "message": "Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
               "range": {
                 "end": {
                   "character": 24,
@@ -786,7 +786,7 @@
         "faithful_disk_error": {
           "bridge/main.crn": [
             {
-              "message": "Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+              "message": "Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
               "range": {
                 "end": {
                   "character": 20,
@@ -803,7 +803,7 @@
           ],
           "caller/main.crn": [
             {
-              "message": "Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+              "message": "Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
               "range": {
                 "end": {
                   "character": 24,
@@ -826,10 +826,10 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target.crn": []
+          "module.crn": []
         },
         "faithful_disk_error": {
-          "target.crn": []
+          "module.crn": []
         }
       }
     },
@@ -838,18 +838,18 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: Module resolution error: Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\n",
+          "stderr": "Error: Module resolution error: Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
             {
-              "message": "Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+              "message": "Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
               "range": {
                 "end": {
                   "character": 20,
@@ -866,7 +866,7 @@
           ],
           "caller/main.crn": [
             {
-              "message": "Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
+              "message": "Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.",
               "range": {
                 "end": {
                   "character": 24,
@@ -889,7 +889,7 @@
       "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "Error: Module resolution error: Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\n",
+        "stderr": "Error: Module resolution error: Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\n",
         "stdout": "Validating...\n"
       }
     },
@@ -898,10 +898,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module path '../target.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module path '../module.crn' must be a directory. Single-file modules are not supported; put the module's .crn files in a directory and import the directory.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -910,14 +911,14 @@
     "files": {},
     "id": "single_file--nested--called",
     "immediate_importer": "bridge/main.crn",
-    "import_path": "../target.crn",
+    "import_path": "../module.crn",
     "route": "nested",
     "row": "single_file",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
     "supplemental": false,
     "target_paths": [
-      "target.crn"
+      "module.crn"
     ],
     "unreadable_paths": [],
     "usage": "called"

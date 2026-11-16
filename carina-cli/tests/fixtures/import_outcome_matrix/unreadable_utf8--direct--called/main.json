@@ -731,7 +731,7 @@
     "hover_module": {
       "contents": {
         "kind": "markdown",
-        "value": "## service\n\n`../target`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `value`: `String`\n"
+        "value": "## service\n\n`../module`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `value`: `String`\n"
       }
     },
     "lint": {
@@ -783,8 +783,8 @@
     },
     "lsp_target": {
       "all_siblings_open": {
-        "target/main.crn": [],
-        "target/z-unreadable.crn": [
+        "module/main.crn": [],
+        "module/z-unreadable.crn": [
           {
             "message": " --> 1:1\n  |\n1 | �\n  | ^---\n  |\n  = expected file",
             "range": {
@@ -803,7 +803,7 @@
         ]
       },
       "faithful_disk_error": {
-        "target/main.crn": []
+        "module/main.crn": []
       }
     },
     "module_reference_checks": {
@@ -879,5 +879,5 @@
       "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"IO error: stream did not contain valid UTF-8\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
     }
   },
-  "revision": "980dd4e9dea5cce43552b3d1802175f924c83d12"
+  "revision": "66063dd7f96561c274807d6943b5441783ee3d71"
 }

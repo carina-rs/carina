@@ -5,13 +5,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/providers.crn:1.\nError: main.crn at line 2\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
+          "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/providers.crn:1.\nError: Module resolution error: IO error: stream did not contain valid UTF-8\nError: main.crn at line 2\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"IO error: stream did not contain valid UTF-8\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -70,11 +70,26 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
               ],
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "IO error: stream did not contain valid UTF-8",
+              "range": {
+                "end": {
+                  "character": 20,
+                  "line": 1
+                },
+                "start": {
+                  "character": 13,
+                  "line": 1
+                }
+              },
               "severity": 1,
               "source": "carina"
             }
@@ -772,7 +787,7 @@
       "value": {
         "contents": {
           "kind": "markdown",
-          "value": "## service\n\n`../target`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `value`: `String`\n"
+          "value": "## service\n\n`../module`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `value`: `String`\n"
         }
       }
     },
@@ -780,7 +795,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "warning: .:1  ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/providers.crn:1.\nError: Found 1 lint warning(s).\n",
+        "stderr": "warning: .:1  ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/providers.crn:1.\nError: Module resolution error: IO error: stream did not contain valid UTF-8\n",
         "stdout": ""
       }
     },
@@ -814,11 +829,26 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
               ],
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "IO error: stream did not contain valid UTF-8",
+              "range": {
+                "end": {
+                  "character": 20,
+                  "line": 1
+                },
+                "start": {
+                  "character": 13,
+                  "line": 1
+                }
+              },
               "severity": 1,
               "source": "carina"
             }
@@ -852,11 +882,26 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
               ],
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "IO error: stream did not contain valid UTF-8",
+              "range": {
+                "end": {
+                  "character": 20,
+                  "line": 1
+                },
+                "start": {
+                  "character": 13,
+                  "line": 1
+                }
+              },
               "severity": 1,
               "source": "carina"
             }
@@ -869,7 +914,7 @@
       "classification": "changed:4398-placement",
       "value": {
         "all_siblings_open": {
-          "target/main.crn": [
+          "module/main.crn": [
             {
               "message": "arguments blocks are only valid inside module definitions, not in root configurations.",
               "range": {
@@ -895,7 +940,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -928,7 +973,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -937,8 +982,8 @@
               "source": "carina"
             }
           ],
-          "target/providers.crn": [],
-          "target/z-unreadable.crn": [
+          "module/providers.crn": [],
+          "module/z-unreadable.crn": [
             {
               "message": " --> 1:1\n  |\n1 | �\n  | ^---\n  |\n  = expected file",
               "range": {
@@ -957,7 +1002,7 @@
           ]
         },
         "faithful_disk_error": {
-          "target/main.crn": [
+          "module/main.crn": [
             {
               "message": "arguments blocks are only valid inside module definitions, not in root configurations.",
               "range": {
@@ -983,7 +1028,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1016,7 +1061,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1025,7 +1070,7 @@
               "source": "carina"
             }
           ],
-          "target/providers.crn": []
+          "module/providers.crn": []
         }
       }
     },
@@ -1034,13 +1079,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/providers.crn:1.\nError: main.crn at line 3\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
+          "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/providers.crn:1.\nError: Module resolution error: IO error: stream did not contain valid UTF-8\nError: main.crn at line 3\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"IO error: stream did not contain valid UTF-8\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -1084,11 +1129,26 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
               ],
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "IO error: stream did not contain valid UTF-8",
+              "range": {
+                "end": {
+                  "character": 20,
+                  "line": 2
+                },
+                "start": {
+                  "character": 13,
+                  "line": 2
+                }
+              },
               "severity": 1,
               "source": "carina"
             },
@@ -1116,7 +1176,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/providers.crn:1.\n",
+        "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/providers.crn:1.\nError: Module resolution error: IO error: stream did not contain valid UTF-8\n",
         "stdout": "Validating...\n"
       }
     },
@@ -1125,35 +1185,36 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"IO error: stream did not contain valid UTF-8\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
       "caller"
     ],
     "files": {
-      "target/z-unreadable.crn": "�"
+      "module/z-unreadable.crn": "�"
     },
     "id": "unreadable_utf8_root_arguments--direct--called",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "unreadable_utf8_root_arguments",
     "runtime_unreadable": {
-      "target/z-unreadable.crn": "invalid_utf8"
+      "module/z-unreadable.crn": "invalid_utf8"
     },
     "schema_readiness": "Loaded providers for 2 directory(s), 48 resource type schema(s) total",
     "supplemental": true,
     "target_paths": [
-      "target/main.crn",
-      "target/providers.crn",
-      "target/z-unreadable.crn"
+      "module/main.crn",
+      "module/providers.crn",
+      "module/z-unreadable.crn"
     ],
     "unreadable_paths": [
-      "target/z-unreadable.crn"
+      "module/z-unreadable.crn"
     ],
     "usage": "called"
   },

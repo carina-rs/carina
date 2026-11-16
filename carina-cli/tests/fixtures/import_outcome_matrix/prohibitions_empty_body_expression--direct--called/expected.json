@@ -5,18 +5,18 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ./../target/errors.crn at line 2\nError: coalesce default type `Map<Map<Int>>` does not match left type `String`\nError: ../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+          "stderr": "Error: ./../module/errors.crn at line 2\nError: coalesce default type `Map<Map<Int>>` does not match left type `String`\nError: ../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
             {
-              "message": "Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
+              "message": "Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
               "range": {
                 "end": {
                   "character": 20,
@@ -767,7 +767,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "warning: .:1  ../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nwarning: .:1  ../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nwarning: .:1  ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 3 lint warning(s).\n",
+        "stderr": "warning: .:1  ../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nwarning: .:1  ../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nwarning: .:1  ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Module resolution error: Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`\n",
         "stdout": ""
       }
     },
@@ -777,7 +777,7 @@
         "all_siblings_open": {
           "caller/main.crn": [
             {
-              "message": "Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
+              "message": "Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
               "range": {
                 "end": {
                   "character": 20,
@@ -842,7 +842,7 @@
         "faithful_disk_error": {
           "caller/main.crn": [
             {
-              "message": "Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
+              "message": "Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
               "range": {
                 "end": {
                   "character": 20,
@@ -910,7 +910,7 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target/errors.crn": [
+          "module/errors.crn": [
             {
               "message": "coalesce default type `Map<Map<Int>>` does not match left type `String`",
               "range": {
@@ -927,9 +927,9 @@
               "source": "carina"
             }
           ],
-          "target/exports.crn": [],
-          "target/state.crn": [],
-          "target/upstream.crn": [
+          "module/exports.crn": [],
+          "module/state.crn": [],
+          "module/upstream.crn": [
             {
               "message": "upstream_state 'prior': source '../prior' does not exist",
               "range": {
@@ -948,7 +948,7 @@
           ]
         },
         "faithful_disk_error": {
-          "target/errors.crn": [
+          "module/errors.crn": [
             {
               "message": "coalesce default type `Map<Map<Int>>` does not match left type `String`",
               "range": {
@@ -965,9 +965,9 @@
               "source": "carina"
             }
           ],
-          "target/exports.crn": [],
-          "target/state.crn": [],
-          "target/upstream.crn": [
+          "module/exports.crn": [],
+          "module/state.crn": [],
+          "module/upstream.crn": [
             {
               "message": "upstream_state 'prior': source '../prior' does not exist",
               "range": {
@@ -992,18 +992,18 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ./../target/errors.crn at line 2\nError: coalesce default type `Map<Map<Int>>` does not match left type `String`\nError: ../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+          "stderr": "Error: ./../module/errors.crn at line 2\nError: coalesce default type `Map<Map<Int>>` does not match left type `String`\nError: ../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
             {
-              "message": "Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
+              "message": "Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
               "range": {
                 "end": {
                   "character": 20,
@@ -1071,7 +1071,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "Error: ./../target/errors.crn at line 2\nError: coalesce default type `Map<Map<Int>>` does not match left type `String`\nError: ../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+        "stderr": "Error: ./../module/errors.crn at line 2\nError: coalesce default type `Map<Map<Int>>` does not match left type `String`\nError: ../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
         "stdout": "Validating...\n"
       }
     },
@@ -1080,10 +1080,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -1092,17 +1093,17 @@
     "files": {},
     "id": "prohibitions_empty_body_expression--direct--called",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "prohibitions_empty_body_expression",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
     "supplemental": true,
     "target_paths": [
-      "target/errors.crn",
-      "target/exports.crn",
-      "target/state.crn",
-      "target/upstream.crn"
+      "module/errors.crn",
+      "module/exports.crn",
+      "module/state.crn",
+      "module/upstream.crn"
     ],
     "unreadable_paths": [],
     "usage": "called"

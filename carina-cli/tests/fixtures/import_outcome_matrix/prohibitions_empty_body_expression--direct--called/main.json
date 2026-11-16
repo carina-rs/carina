@@ -3,18 +3,18 @@
     "callsite_argument_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: Module resolution error: Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`\n",
+        "stderr": "Error: Module resolution error: Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "caller/main.crn": [
           {
-            "message": "Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
+            "message": "Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
             "range": {
               "end": {
                 "character": 20,
@@ -696,14 +696,14 @@
     "hover_module": null,
     "lint": {
       "exit": 1,
-      "stderr": "Error: Module resolution error: Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`\n",
+      "stderr": "Error: Module resolution error: Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`\n",
       "stdout": ""
     },
     "lsp_caller": {
       "all_siblings_open": {
         "caller/main.crn": [
           {
-            "message": "Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
+            "message": "Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
             "range": {
               "end": {
                 "character": 20,
@@ -723,7 +723,7 @@
       "faithful_disk_error": {
         "caller/main.crn": [
           {
-            "message": "Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
+            "message": "Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
             "range": {
               "end": {
                 "character": 20,
@@ -743,7 +743,7 @@
     },
     "lsp_target": {
       "all_siblings_open": {
-        "target/errors.crn": [
+        "module/errors.crn": [
           {
             "message": "coalesce default type `Map<Map<Int>>` does not match left type `String`",
             "range": {
@@ -760,9 +760,9 @@
             "source": "carina"
           }
         ],
-        "target/exports.crn": [],
-        "target/state.crn": [],
-        "target/upstream.crn": [
+        "module/exports.crn": [],
+        "module/state.crn": [],
+        "module/upstream.crn": [
           {
             "message": "upstream_state 'prior': source '../prior' does not exist",
             "range": {
@@ -781,7 +781,7 @@
         ]
       },
       "faithful_disk_error": {
-        "target/errors.crn": [
+        "module/errors.crn": [
           {
             "message": "coalesce default type `Map<Map<Int>>` does not match left type `String`",
             "range": {
@@ -798,9 +798,9 @@
             "source": "carina"
           }
         ],
-        "target/exports.crn": [],
-        "target/state.crn": [],
-        "target/upstream.crn": [
+        "module/exports.crn": [],
+        "module/state.crn": [],
+        "module/upstream.crn": [
           {
             "message": "upstream_state 'prior': source '../prior' does not exist",
             "range": {
@@ -822,18 +822,18 @@
     "module_reference_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: Module resolution error: Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`\n",
+        "stderr": "Error: Module resolution error: Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "caller/main.crn": [
           {
-            "message": "Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
+            "message": "Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`",
             "range": {
               "end": {
                 "character": 20,
@@ -853,14 +853,14 @@
     },
     "validate_human": {
       "exit": 1,
-      "stderr": "Error: Module resolution error: Parse error: ../target/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`\n",
+      "stderr": "Error: Module resolution error: Parse error: ../module/errors.crn:2:19: Invalid expression at line 2: coalesce default type `Map<Map<Int>>` does not match left type `String`\n",
       "stdout": "Validating...\n"
     },
     "validate_json": {
       "exit": 1,
       "stderr": "",
-      "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    }\n  ]\n}\n"
+      "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"coalesce default type `Map<Map<Int>>` does not match left type `String`\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/errors.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 43\n          }\n        }\n      }\n    }\n  ]\n}\n"
     }
   },
-  "revision": "980dd4e9dea5cce43552b3d1802175f924c83d12"
+  "revision": "66063dd7f96561c274807d6943b5441783ee3d71"
 }

@@ -483,6 +483,36 @@ def normalize(value, root):
     return value
 
 
+def refresh_main_baselines(output, expectations, revision):
+    baselines = []
+    for directory, expected in expectations:
+        path = directory / "main.json"
+        before = path.read_bytes()
+        stored = json.loads(before)
+        if not revision or stored["revision"] != revision:
+            raise RuntimeError(f"{directory.name}: genuine main revision mismatch")
+        raw = output / "raw" / directory.name / "main"
+        root = output / "fixtures" / "main" / directory.name
+        columns = {
+            column: normalize(json.loads((raw / (column + ".cell.json")).read_text()), root)
+            for column in expected["columns"]
+            if column != "resolved_signature"
+        }
+        if columns.keys() != stored["columns"].keys():
+            raise RuntimeError(f"{directory.name}: genuine main column mismatch")
+        baselines.append((path, before, {"revision": revision, "columns": columns}))
+    receipts = []
+    for path, before, baseline in baselines:
+        dump(path, baseline)
+        receipts.append({
+            "id": path.parent.name,
+            "before_sha256": hashlib.sha256(before).hexdigest(),
+            "after_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "columns": len(baseline["columns"]),
+        })
+    dump(output / "main-baseline-refresh.json", {"revision": revision, "fixtures": receipts})
+
+
 def compare(output, expectations):
     records = []
     counts = {}
@@ -541,7 +571,13 @@ def main():
     )
     parser.add_argument("--phase", choices=["main", "head", "both"], default="both")
     parser.add_argument("--fixtures", type=Path, default=FIXTURES)
+    parser.add_argument(
+        "--refresh-main-baselines", action="store_true",
+        help="replace main.json from measured main cells, retaining its verified revision",
+    )
     args = parser.parse_args()
+    if args.refresh_main_baselines and args.phase == "head":
+        parser.error("--refresh-main-baselines requires a main measurement")
     output = args.output.resolve()
     fixture_root = args.fixtures.resolve()
     binary_root = args.evidence.resolve() / "bin"
@@ -575,9 +611,11 @@ def main():
                 parser.error(f"{directory.name}:{column}: unknown classification")
     phases = ["main", "head"] if args.phase == "both" else [args.phase]
     # Validate saved provenance before writing anything or launching a binary.
+    provenance = {}
     for phase in phases:
         binaries = binary_root / phase
-        artifacts = json.loads((binaries / "artifacts.json").read_text())["bins"]
+        provenance[phase] = json.loads((binaries / "artifacts.json").read_text())
+        artifacts = provenance[phase]["bins"]
         if set(artifacts) != {"carina", "carina-lsp"}:
             parser.error(
                 f"{phase}: expected saved carina and carina-lsp binary receipts"
@@ -608,6 +646,8 @@ def main():
             finally:
                 restore_permissions(root, fixture)
         dump(output / ("measure-" + phase + "-summary.json"), results)
+    if args.refresh_main_baselines:
+        refresh_main_baselines(output, expectations, provenance["main"].get("revision"))
     if args.phase == "both" and compare(output, expectations):
         raise SystemExit(1)
 

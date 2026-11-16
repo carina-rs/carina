@@ -1,0 +1,3 @@
+arguments { n: Int = 1 }
+let child = use { source = './child' }
+exports {}

@@ -5,13 +5,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: main.crn at line 2\nError: Unknown argument 'n' for module 'service'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'\nError: ../target/main.crn at line 2\nError: module call 'child_call': argument 'n': expected Int, got string 'wrong'\n",
+          "stderr": "Error: main.crn at line 2\nError: Unknown argument 'n' for module 'service'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'\nError: ../module/main.crn at line 2\nError: module call 'child_call': argument 'n': expected Int, got string 'wrong'\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Unknown argument 'n' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 24\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'child_call': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 30\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 37\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Unknown argument 'n' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 24\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'child_call': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 30\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 37\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -749,7 +749,7 @@
       "value": {
         "contents": {
           "kind": "markdown",
-          "value": "## service\n\n`../target`\n"
+          "value": "## service\n\n`../module`\n"
         }
       }
     },
@@ -810,9 +810,9 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target/child/main.crn": [],
-          "target/interface.crn": [],
-          "target/main.crn": [
+          "module/child/main.crn": [],
+          "module/interface.crn": [],
+          "module/main.crn": [
             {
               "message": "module call 'child_call': argument 'n': expected Int, got string 'wrong'",
               "range": {
@@ -829,12 +829,12 @@
               "source": "carina"
             }
           ],
-          "target/sibling.crn": []
+          "module/sibling.crn": []
         },
         "faithful_disk_error": {
-          "target/child/main.crn": [],
-          "target/interface.crn": [],
-          "target/main.crn": [
+          "module/child/main.crn": [],
+          "module/interface.crn": [],
+          "module/main.crn": [
             {
               "message": "module call 'child_call': argument 'n': expected Int, got string 'wrong'",
               "range": {
@@ -851,7 +851,7 @@
               "source": "carina"
             }
           ],
-          "target/sibling.crn": []
+          "module/sibling.crn": []
         }
       }
     },
@@ -860,13 +860,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: main.crn at line 3\nError: Unknown argument 'n' for module 'service'\nError: ../target/main.crn at line 2\nError: module call 'child_call': argument 'n': expected Int, got string 'wrong'\n",
+          "stderr": "Error: main.crn at line 3\nError: Unknown argument 'n' for module 'service'\nError: ../module/main.crn at line 2\nError: module call 'child_call': argument 'n': expected Int, got string 'wrong'\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Unknown argument 'n' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 24\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'child_call': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 30\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 37\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Unknown argument 'n' for module 'service'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 24\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'child_call': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 30\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 37\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -924,7 +924,7 @@
       "classification": "changed:4398-importability",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target/main.crn at line 2\nError: module call 'child_call': argument 'n': expected Int, got string 'wrong'\n",
+        "stderr": "Error: ../module/main.crn at line 2\nError: module call 'child_call': argument 'n': expected Int, got string 'wrong'\n",
         "stdout": "Validating...\n"
       }
     },
@@ -933,10 +933,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"module call 'child_call': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 30\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 37\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"module call 'child_call': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 30\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 37\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -945,17 +946,17 @@
     "files": {},
     "id": "empty_arguments_nested_call--direct--called",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "empty_arguments_nested_call",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
     "supplemental": true,
     "target_paths": [
-      "target/child/main.crn",
-      "target/interface.crn",
-      "target/main.crn",
-      "target/sibling.crn"
+      "module/child/main.crn",
+      "module/interface.crn",
+      "module/main.crn",
+      "module/sibling.crn"
     ],
     "unreadable_paths": [],
     "usage": "called"

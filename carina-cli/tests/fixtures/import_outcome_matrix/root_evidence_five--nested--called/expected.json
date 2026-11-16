@@ -5,13 +5,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/providers.crn:1.\nError: ../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../target: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n  Note: directory is a root configuration because of the backend block at ../target/backend.crn:1.\nError: ../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+          "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/providers.crn:1.\nError: ../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../module: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n  Note: directory is a root configuration because of the backend block at ../module/backend.crn:1.\nError: ../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\\nNote: directory is a root configuration because of the backend block at ../target/backend.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\\nNote: directory is a root configuration because of the backend block at ../module/backend.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
@@ -40,7 +40,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -88,7 +88,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/backend.crn"
+                    "uri": "file://$ROOT/module/backend.crn"
                   },
                   "message": "This backend block makes the directory a root configuration."
                 }
@@ -153,7 +153,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -201,7 +201,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/backend.crn"
+                    "uri": "file://$ROOT/module/backend.crn"
                   },
                   "message": "This backend block makes the directory a root configuration."
                 }
@@ -931,7 +931,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "warning: .:1  ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/providers.crn:1.\nwarning: .:1  ../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nwarning: .:1  ../target: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n  Note: directory is a root configuration because of the backend block at ../target/backend.crn:1.\nwarning: .:1  ../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nwarning: .:1  ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 5 lint warning(s).\n",
+        "stderr": "warning: .:1  ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/providers.crn:1.\nwarning: .:1  ../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nwarning: .:1  ../module: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n  Note: directory is a root configuration because of the backend block at ../module/backend.crn:1.\nwarning: .:1  ../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nwarning: .:1  ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 5 lint warning(s).\n",
         "stdout": ""
       }
     },
@@ -965,7 +965,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1013,7 +1013,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/backend.crn"
+                    "uri": "file://$ROOT/module/backend.crn"
                   },
                   "message": "This backend block makes the directory a root configuration."
                 }
@@ -1078,7 +1078,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1126,7 +1126,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/backend.crn"
+                    "uri": "file://$ROOT/module/backend.crn"
                   },
                   "message": "This backend block makes the directory a root configuration."
                 }
@@ -1194,7 +1194,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1242,7 +1242,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/backend.crn"
+                    "uri": "file://$ROOT/module/backend.crn"
                   },
                   "message": "This backend block makes the directory a root configuration."
                 }
@@ -1307,7 +1307,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1355,7 +1355,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/backend.crn"
+                    "uri": "file://$ROOT/module/backend.crn"
                   },
                   "message": "This backend block makes the directory a root configuration."
                 }
@@ -1402,11 +1402,11 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target/backend.crn": [],
-          "target/exports.crn": [],
-          "target/providers.crn": [],
-          "target/state.crn": [],
-          "target/upstream.crn": [
+          "module/backend.crn": [],
+          "module/exports.crn": [],
+          "module/providers.crn": [],
+          "module/state.crn": [],
+          "module/upstream.crn": [
             {
               "message": "upstream_state 'prior': source '../prior' does not exist",
               "range": {
@@ -1425,11 +1425,11 @@
           ]
         },
         "faithful_disk_error": {
-          "target/backend.crn": [],
-          "target/exports.crn": [],
-          "target/providers.crn": [],
-          "target/state.crn": [],
-          "target/upstream.crn": [
+          "module/backend.crn": [],
+          "module/exports.crn": [],
+          "module/providers.crn": [],
+          "module/state.crn": [],
+          "module/upstream.crn": [
             {
               "message": "upstream_state 'prior': source '../prior' does not exist",
               "range": {
@@ -1454,13 +1454,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/providers.crn:1.\nError: ../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../target: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n  Note: directory is a root configuration because of the backend block at ../target/backend.crn:1.\nError: ../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+          "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/providers.crn:1.\nError: ../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../module: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n  Note: directory is a root configuration because of the backend block at ../module/backend.crn:1.\nError: ../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\\nNote: directory is a root configuration because of the backend block at ../target/backend.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\\nNote: directory is a root configuration because of the backend block at ../module/backend.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
@@ -1489,7 +1489,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1537,7 +1537,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/backend.crn"
+                    "uri": "file://$ROOT/module/backend.crn"
                   },
                   "message": "This backend block makes the directory a root configuration."
                 }
@@ -1602,7 +1602,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/providers.crn"
+                    "uri": "file://$ROOT/module/providers.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1650,7 +1650,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/backend.crn"
+                    "uri": "file://$ROOT/module/backend.crn"
                   },
                   "message": "This backend block makes the directory a root configuration."
                 }
@@ -1697,7 +1697,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/providers.crn:1.\nError: ../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../target: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n  Note: directory is a root configuration because of the backend block at ../target/backend.crn:1.\nError: ../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+        "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/providers.crn:1.\nError: ../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\nError: ../module: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\n  Note: directory is a root configuration because of the backend block at ../module/backend.crn:1.\nError: ../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
         "stdout": "Validating...\n"
       }
     },
@@ -1706,10 +1706,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\\nNote: directory is a root configuration because of the backend block at ../target/backend.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/providers.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: backend blocks are not allowed inside modules. Define the backend at the root configuration level.\\nNote: directory is a root configuration because of the backend block at ../module/backend.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -1718,18 +1719,18 @@
     "files": {},
     "id": "root_evidence_five--nested--called",
     "immediate_importer": "bridge/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "nested",
     "row": "root_evidence_five",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 2 directory(s), 48 resource type schema(s) total",
     "supplemental": false,
     "target_paths": [
-      "target/state.crn",
-      "target/upstream.crn",
-      "target/exports.crn",
-      "target/providers.crn",
-      "target/backend.crn"
+      "module/state.crn",
+      "module/upstream.crn",
+      "module/exports.crn",
+      "module/providers.crn",
+      "module/backend.crn"
     ],
     "unreadable_paths": [],
     "usage": "called"

@@ -1,230 +1,10 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+// Reachability and the complete prohibition collection are resolver-owned.
+pub(crate) use carina_core::module_resolver::ModuleImportTraversal as ModuleWalk;
 
-use carina_core::module_resolver::{
-    self, ModuleAnalysisOutcome, ModuleBodyAnalysis, ModuleError, ModuleLoadError,
-    ModuleProhibitionCategory, ModuleProhibitions, ModuleRejection, PartialModule,
-    PartialModuleAnalysis,
-};
-use carina_core::paths::{CanonicalPath, DisplayPath, ResolvedPath};
-
-/// One successfully loaded module in the shared depth-first module walk.
-pub(crate) struct LoadedModuleAtPath {
-    // Retain the import chain for provenance; render diagnostic_label() for users.
-    diagnostic_path: PathBuf,
-    diagnostic_base: ResolvedPath,
-    module_path: ResolvedPath,
-    loaded: PartialModule,
-}
-
-impl LoadedModuleAtPath {
-    pub(crate) fn diagnostic_path(&self) -> &Path {
-        &self.diagnostic_path
-    }
-
-    pub(crate) fn diagnostic_label(&self) -> DisplayPath {
-        DisplayPath::for_diagnostics_from(self.diagnostic_path(), &self.diagnostic_base)
-    }
-
-    pub(crate) fn module_path(&self) -> &ResolvedPath {
-        &self.module_path
-    }
-
-    pub(crate) fn loaded(&self) -> &PartialModule {
-        &self.loaded
-    }
-}
-
-pub(crate) struct RejectedModuleAtPath {
-    pub(crate) label: DisplayPath,
-    pub(crate) error: std::sync::Arc<ModuleError>,
-    pub(crate) category: ModuleProhibitionCategory,
-}
-
-impl RejectedModuleAtPath {
-    pub(crate) fn diagnostic(&self) -> crate::error::AppError {
-        crate::error::AppError::ModuleImport {
-            path: self.label.clone(),
-            error: self.error.clone(),
-        }
-    }
-}
-
-/// Modules reachable from a root parse, in depth-first pre-order.
-///
-/// This is the single recursive module-loading seam for static validation.
-/// Duplicate-declaration reporting and module attribute type validation both
-/// consume the same loaded snapshots, so their traversal order, cycle guard,
-/// and path prefixes cannot drift apart.
-#[derive(Default)]
-pub(crate) struct ModuleWalk {
-    modules: Vec<LoadedModuleAtPath>,
-    rejections: Vec<RejectedModuleAtPath>,
-}
-
-impl ModuleWalk {
-    pub(crate) fn load<E>(
-        parsed: &carina_core::parser::File<E>,
-        base_dir: &ResolvedPath,
-        environment: &carina_core::EnvironmentSnapshot,
-        schemas: &carina_core::schema::SchemaRegistry,
-    ) -> Self {
-        let context = carina_core::parser::ProviderContext::new(environment.clone());
-        let mut walk = Self::default();
-        let base_dir = base_dir.clone();
-        let mut visited = HashSet::new();
-        for import in &parsed.uses {
-            let Ok(module_path) = base_dir.join(&import.path) else {
-                continue;
-            };
-            let owners = parsed
-                .module_calls
-                .iter()
-                .filter(|call| call.module_name == import.alias)
-                .map(|call| call.id().clone())
-                .collect::<Vec<_>>();
-            visit_module(
-                ModuleVisit {
-                    module_path: &module_path,
-                    diagnostic_path: Path::new(&import.path),
-                    diagnostic_base: &base_dir,
-                    owners: &owners,
-                    import_location: import.declaration_location(),
-                },
-                &mut visited,
-                &mut walk,
-                &context,
-                schemas,
-            );
-        }
-        walk
-    }
-
-    pub(crate) fn rejections(&self) -> &[RejectedModuleAtPath] {
-        &self.rejections
-    }
-
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &LoadedModuleAtPath> {
-        self.modules.iter()
-    }
-
-    fn reject(&mut self, prohibitions: ModuleProhibitions, visit: &ModuleVisit<'_>) {
-        self.rejections.extend(
-            prohibitions
-                .into_owned_errors(visit.import_location.clone(), visit.owners.to_vec())
-                .into_iter()
-                .map(|(category, error)| RejectedModuleAtPath {
-                    label: DisplayPath::for_diagnostics_from(
-                        visit.diagnostic_path,
-                        visit.diagnostic_base,
-                    ),
-                    error: std::sync::Arc::new(error),
-                    category,
-                }),
-        );
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ModuleVisit<'a> {
-    module_path: &'a ResolvedPath,
-    diagnostic_path: &'a Path,
-    diagnostic_base: &'a ResolvedPath,
-    owners: &'a [carina_core::parser::ModuleCallId],
-    import_location: &'a carina_core::parser::DeclarationLocation,
-}
-
-fn visit_module(
-    visit: ModuleVisit<'_>,
-    visited: &mut HashSet<CanonicalPath>,
-    walk: &mut ModuleWalk,
-    context: &carina_core::parser::ProviderContext,
-    schemas: &carina_core::schema::SchemaRegistry,
-) {
-    let ModuleVisit {
-        module_path,
-        diagnostic_path,
-        diagnostic_base,
-        owners,
-        import_location,
-    } = visit;
-    if !visited.insert(module_path.identity()) {
-        return;
-    }
-
-    let loaded = match module_resolver::load_partial_module_analysis_with_schemas(
-        module_path,
-        context,
-        schemas,
-        &diagnostic_base.source_label(),
-    ) {
-        Ok(PartialModuleAnalysis {
-            outcome: ModuleAnalysisOutcome::Importable(loaded),
-            signature: _,
-        }) => loaded,
-        Ok(PartialModuleAnalysis {
-            outcome: ModuleAnalysisOutcome::Prohibited { prohibitions, body },
-            signature: _,
-        }) => {
-            walk.reject(prohibitions, &visit);
-            if let ModuleBodyAnalysis::Available(loaded) = body {
-                walk.modules.push(LoadedModuleAtPath {
-                    diagnostic_path: diagnostic_path.to_path_buf(),
-                    diagnostic_base: diagnostic_base.clone(),
-                    module_path: module_path.clone(),
-                    loaded,
-                });
-            }
-            return;
-        }
-        Err(ModuleLoadError::Partial {
-            prohibitions,
-            signature: _,
-        }) => {
-            walk.reject(*prohibitions, &visit);
-            return;
-        }
-        Err(ModuleLoadError::NotModule {
-            error,
-            signature: _,
-            body: _,
-        }) => {
-            match *error {
-                ModuleRejection::Prohibited(prohibitions) => walk.reject(prohibitions, &visit),
-                ModuleRejection::NotADirectory { path: _ }
-                | ModuleRejection::NoConfigurationFiles { path: _ } => {}
-            }
-            return;
-        }
-        Err(ModuleLoadError::Unavailable(_)) => return,
-    };
-    let imports = loaded.parsed().uses.clone();
-    walk.modules.push(LoadedModuleAtPath {
-        diagnostic_path: diagnostic_path.to_path_buf(),
-        diagnostic_base: diagnostic_base.clone(),
-        module_path: module_path.clone(),
-        loaded,
-    });
-    for import in imports {
-        let Ok(child_module_path) = module_path.join(&import.path) else {
-            continue;
-        };
-        let child_diagnostic_path = diagnostic_path.join(&import.path);
-        visit_module(
-            ModuleVisit {
-                module_path: &child_module_path,
-                diagnostic_path: &child_diagnostic_path,
-                diagnostic_base,
-                owners,
-                import_location,
-            },
-            visited,
-            walk,
-            context,
-            schemas,
-        );
-    }
-}
+#[cfg(test)]
+use carina_core::{module_resolver, paths::ResolvedPath};
+#[cfg(test)]
+use std::path::Path;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -257,10 +37,12 @@ mod tests {
             &context,
         )
         .unwrap();
+        let directory_parse =
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed.clone());
         let walk = ModuleWalk::load(
-            &parsed,
+            &directory_parse,
             &ResolvedPath::new(&project).unwrap(),
-            &carina_core::EnvironmentSnapshot::empty(),
+            &context,
             &carina_core::schema::SchemaRegistry::new(),
         );
         assert_eq!(
@@ -301,14 +83,18 @@ mod unavailable_tests {
         let path = ResolvedPath::new(directory.path()).unwrap();
         for (source, expected_modules) in [(b"let broken =\n".as_slice(), 0), (&[0xff], 1)] {
             std::fs::write(child.join("broken.crn"), source).unwrap();
+            let directory_parse =
+                carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(
+                    parsed.clone(),
+                );
             let walk = ModuleWalk::load(
-                &parsed,
+                &directory_parse,
                 &path,
-                &environment,
+                &context,
                 &carina_core::schema::SchemaRegistry::new(),
             );
             assert_eq!(walk.iter().count(), expected_modules);
-            assert!(walk.rejections().is_empty());
+            assert!(walk.prohibitions().boundary_findings().next().is_none());
             assert!(
                 module_resolver::load_resolved_module_signatures(&parsed, &path, &context)
                     .is_empty()
@@ -331,18 +117,20 @@ mod rejected_import_tests {
             "let file = use { source = './not-a-directory.crn' }\nlet empty = use { source = './empty' }\n",
             &directory.path().join("main.crn"), &context,
         ).unwrap();
+        let directory_parse =
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed.clone());
         let walk = ModuleWalk::load(
-            &parsed,
+            &directory_parse,
             &ResolvedPath::new(directory.path()).unwrap(),
-            &environment,
+            &context,
             &carina_core::schema::SchemaRegistry::new(),
         );
-        assert!(walk.rejections().is_empty());
+        assert!(walk.prohibitions().boundary_findings().next().is_none());
         assert!(crate::wiring::validate_module_boundaries(&walk).is_empty());
     }
 
     #[test]
-    fn rejected_import_has_no_children_for_the_static_walk() {
+    fn rejected_import_still_reports_child_prohibitions() {
         let directory = tempfile::tempdir().unwrap();
         let child = directory.path().join("child");
         std::fs::create_dir_all(child.join("nested")).unwrap();
@@ -366,17 +154,20 @@ mod rejected_import_tests {
             &context,
         )
         .unwrap();
+        let directory_parse =
+            carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed.clone());
         let walk = ModuleWalk::load(
-            &parsed,
+            &directory_parse,
             &ResolvedPath::new(directory.path()).unwrap(),
-            &environment,
+            &context,
             &carina_core::schema::SchemaRegistry::new(),
         );
         assert_eq!(walk.iter().count(), 0);
-        assert_eq!(walk.rejections().len(), 1);
-        assert!(matches!(
-            walk.rejections()[0].error.root_cause(),
-            ModuleError::ProviderInModule { evidence: _ }
-        ));
+        assert_eq!(walk.prohibitions().boundary_findings().count(), 2);
+        assert!(
+            walk.prohibitions()
+                .boundary_findings()
+                .all(|finding| finding.prohibition_path().is_some())
+        );
     }
 }

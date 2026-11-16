@@ -5,18 +5,18 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: Module resolution error: Parse error in ../bridge/../target/main.crn: Syntax error:  --> 3:1\nError:   |\nError: 3 | \nError:   | ^---\nError:   |\nError:   = expected primary\n",
+          "stderr": "Error: Module resolution error: Parse error in ../bridge/../module/main.crn: Syntax error:  --> 3:1\nError:   |\nError: 3 | \nError:   | ^---\nError:   |\nError:   = expected primary\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Syntax error: expected primary\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 1\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Syntax error: expected primary\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 1\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
             {
-              "message": "Parse error in ../target/main.crn: Syntax error:  --> 3:1\n  |\n3 | \n  | ^---\n  |\n  = expected primary",
+              "message": "Parse error in ../module/main.crn: Syntax error:  --> 3:1\n  |\n3 | \n  | ^---\n  |\n  = expected primary",
               "range": {
                 "end": {
                   "character": 20,
@@ -723,7 +723,7 @@
       "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "Error: Module resolution error: Parse error in ../bridge/../target/main.crn: Syntax error:  --> 3:1\nError:   |\nError: 3 | \nError:   | ^---\nError:   |\nError:   = expected primary\n",
+        "stderr": "Error: Module resolution error: Parse error in ../bridge/../module/main.crn: Syntax error:  --> 3:1\nError:   |\nError: 3 | \nError:   | ^---\nError:   |\nError:   = expected primary\n",
         "stdout": ""
       }
     },
@@ -746,7 +746,7 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target/main.crn": [
+          "module/main.crn": [
             {
               "message": " --> 3:1\n  |\n3 | \n  | ^---\n  |\n  = expected primary",
               "range": {
@@ -765,7 +765,7 @@
           ]
         },
         "faithful_disk_error": {
-          "target/main.crn": [
+          "module/main.crn": [
             {
               "message": " --> 3:1\n  |\n3 | \n  | ^---\n  |\n  = expected primary",
               "range": {
@@ -790,18 +790,18 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: Module resolution error: Parse error in ../bridge/../target/main.crn: Syntax error:  --> 3:1\nError:   |\nError: 3 | \nError:   | ^---\nError:   |\nError:   = expected primary\n",
+          "stderr": "Error: Module resolution error: Parse error in ../bridge/../module/main.crn: Syntax error:  --> 3:1\nError:   |\nError: 3 | \nError:   | ^---\nError:   |\nError:   = expected primary\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Syntax error: expected primary\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 1\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Syntax error: expected primary\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 1\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
             {
-              "message": "Parse error in ../target/main.crn: Syntax error:  --> 3:1\n  |\n3 | \n  | ^---\n  |\n  = expected primary",
+              "message": "Parse error in ../module/main.crn: Syntax error:  --> 3:1\n  |\n3 | \n  | ^---\n  |\n  = expected primary",
               "range": {
                 "end": {
                   "character": 20,
@@ -825,7 +825,7 @@
       "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "Error: Module resolution error: Parse error in ../bridge/../target/main.crn: Syntax error:  --> 3:1\nError:   |\nError: 3 | \nError:   | ^---\nError:   |\nError:   = expected primary\n",
+        "stderr": "Error: Module resolution error: Parse error in ../bridge/../module/main.crn: Syntax error:  --> 3:1\nError:   |\nError: 3 | \nError:   | ^---\nError:   |\nError:   = expected primary\n",
         "stdout": "Validating...\n"
       }
     },
@@ -834,10 +834,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Syntax error: expected primary\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 1\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Syntax error: expected primary\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 1\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -846,14 +847,14 @@
     "files": {},
     "id": "syntax_error--nested--uncalled",
     "immediate_importer": "bridge/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "nested",
     "row": "syntax_error",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
     "supplemental": false,
     "target_paths": [
-      "target/main.crn"
+      "module/main.crn"
     ],
     "unreadable_paths": [],
     "usage": "uncalled"

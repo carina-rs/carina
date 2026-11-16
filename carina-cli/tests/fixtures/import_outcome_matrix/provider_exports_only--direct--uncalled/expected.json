@@ -5,13 +5,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/main.crn:1.\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+          "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/main.crn:1.\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/main.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/main.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -40,7 +40,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/main.crn"
+                    "uri": "file://$ROOT/module/main.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -755,7 +755,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "warning: .:1  ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/main.crn:1.\nwarning: .:1  ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 2 lint warning(s).\n",
+        "stderr": "warning: .:1  ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/main.crn:1.\nwarning: .:1  ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 2 lint warning(s).\n",
         "stdout": ""
       }
     },
@@ -789,7 +789,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/main.crn"
+                    "uri": "file://$ROOT/module/main.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -842,7 +842,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/main.crn"
+                    "uri": "file://$ROOT/module/main.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -874,10 +874,10 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target/main.crn": []
+          "module/main.crn": []
         },
         "faithful_disk_error": {
-          "target/main.crn": []
+          "module/main.crn": []
         }
       }
     },
@@ -886,13 +886,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/main.crn:1.\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+          "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/main.crn:1.\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/main.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/main.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -921,7 +921,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/main.crn"
+                    "uri": "file://$ROOT/module/main.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -953,7 +953,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/main.crn:1.\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+        "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/main.crn:1.\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
         "stdout": "Validating...\n"
       }
     },
@@ -962,10 +962,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/main.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 1,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 1,\n            \"column\": 43\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 1,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 1,\n            \"column\": 43\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/main.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 1,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 1,\n            \"column\": 43\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 1,\n            \"column\": 1\n          },\n          \"end\": {\n            \"line\": 1,\n            \"column\": 43\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -974,14 +975,14 @@
     "files": {},
     "id": "provider_exports_only--direct--uncalled",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "provider_exports_only",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 2 directory(s), 48 resource type schema(s) total",
     "supplemental": true,
     "target_paths": [
-      "target/main.crn"
+      "module/main.crn"
     ],
     "unreadable_paths": [],
     "usage": "uncalled"

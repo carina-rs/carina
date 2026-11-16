@@ -1,4 +1,4 @@
 arguments { n: Int = 1 }
 attributes { value: String = 'one' }
-let again = use { source = '../target' }
+let again = use { source = '../module' }
 again {}

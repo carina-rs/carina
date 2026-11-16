@@ -492,7 +492,6 @@ fn static_validation_walks_multifile_modules_using_environment_snapshot() {
     let Err(carina_core::module_resolver::ModuleLoadError::NotModule {
         error,
         signature: _,
-        body: _,
     }) = result
     else {
         panic!("supplied env must allow parsing through to the provider prohibition");

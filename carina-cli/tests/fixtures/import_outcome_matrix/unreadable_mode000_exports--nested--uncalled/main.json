@@ -3,13 +3,13 @@
     "callsite_argument_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: ../bridge/main.crn at line 3\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: ../bridge/main.crn at line 3\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
+        "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: ../bridge/main.crn at line 3\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: ../bridge/main.crn at line 3\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "bridge/main.crn": [
@@ -763,12 +763,12 @@
     "hover_module": {
       "contents": {
         "kind": "markdown",
-        "value": "## service\n\n`../target`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `value`: `String`\n"
+        "value": "## service\n\n`../module`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `value`: `String`\n"
       }
     },
     "lint": {
       "exit": 1,
-      "stderr": "warning: .:1  ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 1 lint warning(s).\n",
+      "stderr": "warning: .:1  ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 1 lint warning(s).\n",
       "stdout": ""
     },
     "lsp_caller": {
@@ -785,25 +785,25 @@
     },
     "lsp_target": {
       "all_siblings_open": {
-        "target/exports.crn": [],
-        "target/main.crn": [],
-        "target/z-unreadable.crn": []
+        "module/exports.crn": [],
+        "module/main.crn": [],
+        "module/z-unreadable.crn": []
       },
       "faithful_disk_error": {
-        "target/exports.crn": [],
-        "target/main.crn": []
+        "module/exports.crn": [],
+        "module/main.crn": []
       }
     },
     "module_reference_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: ../bridge: mock.test.resource.<pending>: unknown attribute 'absent' on 'result' in reference result.absent\nError: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: ../bridge/main.crn at line 4\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
+        "stderr": "Error: ../bridge: mock.test.resource.<pending>: unknown attribute 'absent' on 'result' in reference result.absent\nError: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: ../bridge/main.crn at line 4\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"unknown attribute 'absent' on 'result' in reference result.absent\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 22\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 26\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"unknown attribute 'absent' on 'result' in reference result.absent\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 22\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 26\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "bridge/main.crn": [
@@ -875,14 +875,14 @@
     },
     "validate_human": {
       "exit": 1,
-      "stderr": "Error: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+      "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
       "stdout": "Validating...\n"
     },
     "validate_json": {
       "exit": 1,
       "stderr": "",
-      "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
+      "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
     }
   },
-  "revision": "980dd4e9dea5cce43552b3d1802175f924c83d12"
+  "revision": "66063dd7f96561c274807d6943b5441783ee3d71"
 }

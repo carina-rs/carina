@@ -323,15 +323,23 @@ fn assert_prohibition_parity(cli: &Value, diagnostics: &Value, fixture: &Fixture
         .unwrap_or(&[]);
     let cli = errors
         .iter()
-        .map(|error| error["message"].as_str().unwrap())
-        .filter(|message| message.contains("not allowed inside modules"))
+        .filter(|error| {
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("not allowed inside modules")
+        })
         .collect::<Vec<_>>();
     let lsp = diagnostics["caller/main.crn"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|diagnostic| diagnostic["message"].as_str().unwrap())
-        .filter(|message| message.contains("not allowed inside modules"))
+        .filter(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .unwrap()
+                .contains("not allowed inside modules")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         cli.len(),
@@ -341,10 +349,32 @@ fn assert_prohibition_parity(cli: &Value, diagnostics: &Value, fixture: &Fixture
     );
     for (cli, lsp) in cli.into_iter().zip(lsp) {
         assert!(
-            cli.contains(lsp),
+            cli["message"]
+                .as_str()
+                .unwrap()
+                .contains(lsp["message"].as_str().unwrap()),
             "{}: prohibition order/text: {cli:?} / {lsp:?}",
             fixture.id
         );
+        assert_eq!(
+            cli["location"]["file"], "main.crn",
+            "{}: prohibition owner",
+            fixture.id
+        );
+        for side in ["start", "end"] {
+            assert_eq!(
+                cli["location"]["range"][side]["line"].as_u64().unwrap(),
+                lsp["range"][side]["line"].as_u64().unwrap() + 1,
+                "{}: prohibition line",
+                fixture.id
+            );
+            assert_eq!(
+                cli["location"]["range"][side]["column"].as_u64().unwrap(),
+                lsp["range"][side]["character"].as_u64().unwrap() + 1,
+                "{}: prohibition column",
+                fixture.id
+            );
+        }
     }
 }
 
@@ -354,6 +384,86 @@ fn assert_decisions(fixture: &Fixture, cells: &BTreeMap<String, Value>) {
         &cells["lsp_caller"]["faithful_disk_error"],
         fixture,
     );
+    assert_prohibition_parity(
+        &cells["validate_json"],
+        &cells["lsp_caller"]["all_siblings_open"],
+        fixture,
+    );
+    let report: Value =
+        serde_json::from_str(cells["validate_json"]["stdout"].as_str().unwrap()).unwrap();
+    if !fixture.runtime_unreadable.is_empty()
+        && let Some(errors) = report["errors"].as_array()
+        && errors.iter().any(|error| {
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("not allowed inside modules")
+        })
+    {
+        let read_errors = errors
+            .iter()
+            .filter(|error| error["message"].as_str().unwrap().starts_with("IO error:"))
+            .collect::<Vec<_>>();
+        let lsp_errors = cells["lsp_caller"]["faithful_disk_error"]["caller/main.crn"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("IO error:")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read_errors.len(),
+            lsp_errors.len(),
+            "{}: IO count",
+            fixture.id
+        );
+        assert_eq!(
+            cells["validate_human"]["stderr"]
+                .as_str()
+                .unwrap()
+                .matches("IO error:")
+                .count(),
+            read_errors.len(),
+            "{}: human IO count",
+            fixture.id
+        );
+        assert_eq!(
+            cells["lint"]["stderr"]
+                .as_str()
+                .unwrap()
+                .matches("IO error:")
+                .count(),
+            read_errors.len(),
+            "{}: lint IO count",
+            fixture.id
+        );
+        for (error, diagnostic) in read_errors.into_iter().zip(lsp_errors) {
+            assert_eq!(
+                error["message"], diagnostic["message"],
+                "{}: IO text",
+                fixture.id
+            );
+            assert_eq!(error["location"]["file"], "main.crn");
+            for side in ["start", "end"] {
+                assert_eq!(
+                    error["location"]["range"][side]["line"].as_u64().unwrap(),
+                    diagnostic["range"][side]["line"].as_u64().unwrap() + 1,
+                    "{}: IO line",
+                    fixture.id
+                );
+                assert_eq!(
+                    error["location"]["range"][side]["column"].as_u64().unwrap(),
+                    diagnostic["range"][side]["character"].as_u64().unwrap() + 1,
+                    "{}: IO column",
+                    fixture.id
+                );
+            }
+        }
+    }
     for column in ["callsite_argument_checks", "module_reference_checks"] {
         assert_prohibition_parity(
             &cells[column]["json"],
@@ -366,7 +476,7 @@ fn assert_decisions(fixture: &Fixture, cells: &BTreeMap<String, Value>) {
             serde_json::from_str(cells["validate_json"]["stdout"].as_str().unwrap()).unwrap();
         assert_eq!(
             report["errors"][0]["message"],
-            "No .crn files found in ../target"
+            "No .crn files found in ../module"
         );
         if fixture.usage == "uncalled" {
             assert!(
@@ -566,7 +676,7 @@ async fn import_outcome_matrix() {
         let fixture = &expected.fixture;
         let main: MainFixture =
             serde_json::from_slice(&fs::read(directory.join("main.json")).unwrap()).unwrap();
-        assert_eq!(main.revision, "980dd4e9dea5cce43552b3d1802175f924c83d12");
+        assert_eq!(main.revision, "66063dd7f96561c274807d6943b5441783ee3d71");
         assert_eq!(
             main.columns.keys().cloned().collect::<BTreeSet<_>>(),
             columns

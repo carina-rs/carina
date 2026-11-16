@@ -459,12 +459,12 @@ impl CompletionProvider {
             Err(carina_core::module_resolver::ModuleLoadError::Partial {
                 prohibitions: _,
                 signature: _,
+                read_failure: _,
             })
             | Err(carina_core::module_resolver::ModuleLoadError::Unavailable(_))
             | Err(carina_core::module_resolver::ModuleLoadError::NotModule {
                 error: _,
                 signature: _,
-                body: _,
             }) => None,
         }
     }

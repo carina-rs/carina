@@ -5,13 +5,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 4\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 4\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
+          "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 4\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 4\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -798,7 +798,7 @@
       "value": {
         "contents": {
           "kind": "markdown",
-          "value": "## service\n\n`../target`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `value`: `String`\n"
+          "value": "## service\n\n`../module`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `value`: `String`\n"
         }
       }
     },
@@ -806,7 +806,7 @@
       "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "warning: .:1  ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 1 lint warning(s).\n",
+        "stderr": "warning: .:1  ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: Found 1 lint warning(s).\n",
         "stdout": ""
       }
     },
@@ -889,7 +889,7 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target/exports.crn": [
+          "module/exports.crn": [
             {
               "message": "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
               "range": {
@@ -906,10 +906,10 @@
               "source": "carina"
             }
           ],
-          "target/main.crn": []
+          "module/main.crn": []
         },
         "faithful_disk_error": {
-          "target/exports.crn": [
+          "module/exports.crn": [
             {
               "message": "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
               "range": {
@@ -926,7 +926,7 @@
               "source": "carina"
             }
           ],
-          "target/main.crn": []
+          "module/main.crn": []
         }
       }
     },
@@ -935,13 +935,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 5\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
+          "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 5\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -1014,7 +1014,7 @@
       "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
+        "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n",
         "stdout": "Validating...\n"
       }
     },
@@ -1023,10 +1023,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -1035,15 +1036,15 @@
     "files": {},
     "id": "file_plus_prohibited--direct--called",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "file_plus_prohibited",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
     "supplemental": true,
     "target_paths": [
-      "target/exports.crn",
-      "target/main.crn"
+      "module/exports.crn",
+      "module/main.crn"
     ],
     "unreadable_paths": [],
     "usage": "called"

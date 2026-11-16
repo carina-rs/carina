@@ -5,13 +5,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/boundary.crn:1.\nError: main.crn at line 2\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
+          "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/boundary.crn:1.\nError: main.crn at line 2\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/boundary.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/boundary.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -70,7 +70,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/boundary.crn"
+                    "uri": "file://$ROOT/module/boundary.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -794,7 +794,7 @@
       "value": {
         "contents": {
           "kind": "markdown",
-          "value": "## service\n\n`../target`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `bad`: `ParentType`\n"
+          "value": "## service\n\n`../module`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `bad`: `ParentType`\n"
         }
       }
     },
@@ -802,7 +802,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "warning: .:1  ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/boundary.crn:1.\nError: Found 1 lint warning(s).\n",
+        "stderr": "warning: .:1  ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/boundary.crn:1.\nError: Found 1 lint warning(s).\n",
         "stdout": ""
       }
     },
@@ -836,7 +836,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/boundary.crn"
+                    "uri": "file://$ROOT/module/boundary.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -874,7 +874,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/boundary.crn"
+                    "uri": "file://$ROOT/module/boundary.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -891,8 +891,8 @@
       "classification": "changed:4398-placement",
       "value": {
         "all_siblings_open": {
-          "target/boundary.crn": [],
-          "target/child/main.crn": [
+          "module/boundary.crn": [],
+          "module/child/main.crn": [
             {
               "message": "attribute 'bad': unknown custom type 'ChildType'",
               "range": {
@@ -909,7 +909,7 @@
               "source": "carina"
             }
           ],
-          "target/main.crn": [
+          "module/main.crn": [
             {
               "message": "attribute 'bad': unknown custom type 'ParentType'",
               "range": {
@@ -950,7 +950,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/boundary.crn"
+                    "uri": "file://$ROOT/module/boundary.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -983,7 +983,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/boundary.crn"
+                    "uri": "file://$ROOT/module/boundary.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1009,8 +1009,8 @@
           ]
         },
         "faithful_disk_error": {
-          "target/boundary.crn": [],
-          "target/child/main.crn": [
+          "module/boundary.crn": [],
+          "module/child/main.crn": [
             {
               "message": "attribute 'bad': unknown custom type 'ChildType'",
               "range": {
@@ -1027,7 +1027,7 @@
               "source": "carina"
             }
           ],
-          "target/main.crn": [
+          "module/main.crn": [
             {
               "message": "attribute 'bad': unknown custom type 'ParentType'",
               "range": {
@@ -1068,7 +1068,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/boundary.crn"
+                    "uri": "file://$ROOT/module/boundary.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1101,7 +1101,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/boundary.crn"
+                    "uri": "file://$ROOT/module/boundary.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1133,13 +1133,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/boundary.crn:1.\nError: main.crn at line 3\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
+          "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/boundary.crn:1.\nError: main.crn at line 3\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/boundary.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/boundary.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -1183,7 +1183,7 @@
                         "line": 0
                       }
                     },
-                    "uri": "file://$ROOT/target/boundary.crn"
+                    "uri": "file://$ROOT/module/boundary.crn"
                   },
                   "message": "This provider block makes the directory a root configuration."
                 }
@@ -1215,7 +1215,7 @@
       "classification": "changed:user-prohibitions",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../target/boundary.crn:1.\n",
+        "stderr": "Error: ../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\n  Note: directory is a root configuration because of the provider block at ../module/boundary.crn:1.\n",
         "stdout": "Validating...\n"
       }
     },
@@ -1224,10 +1224,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../target/boundary.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: provider blocks are not allowed inside modules. Define providers at the root configuration level.\\nNote: directory is a root configuration because of the provider block at ../module/boundary.crn:1.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -1236,16 +1237,16 @@
     "files": {},
     "id": "root_parent_body_child--direct--called",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "root_parent_body_child",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 2 directory(s), 48 resource type schema(s) total",
     "supplemental": true,
     "target_paths": [
-      "target/boundary.crn",
-      "target/child/main.crn",
-      "target/main.crn"
+      "module/boundary.crn",
+      "module/child/main.crn",
+      "module/main.crn"
     ],
     "unreadable_paths": [],
     "usage": "called"

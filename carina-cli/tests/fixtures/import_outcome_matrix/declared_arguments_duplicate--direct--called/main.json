@@ -3,13 +3,13 @@
     "callsite_argument_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: ../target: duplicate binding 'x': declared in main.crn and sibling.crn\nError: main.crn at line 2\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
+        "stderr": "Error: ../module: duplicate binding 'x': declared in main.crn and sibling.crn\nError: main.crn at line 2\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "caller/main.crn": [
@@ -738,12 +738,12 @@
     "hover_module": {
       "contents": {
         "kind": "markdown",
-        "value": "## service\n\n`../target`\n\n### Arguments\n\n- `n`: `Int`\n"
+        "value": "## service\n\n`../module`\n\n### Arguments\n\n- `n`: `Int`\n"
       }
     },
     "lint": {
       "exit": 1,
-      "stderr": "warning: ./../target/main.crn:1  ../target: duplicate binding 'x': declared in main.crn and sibling.crn\nError: Found 1 lint warning(s).\n",
+      "stderr": "warning: ./../module/main.crn:1  ../module: duplicate binding 'x': declared in main.crn and sibling.crn\nError: Found 1 lint warning(s).\n",
       "stdout": ""
     },
     "lsp_caller": {
@@ -758,8 +758,8 @@
     },
     "lsp_target": {
       "all_siblings_open": {
-        "target/interface.crn": [],
-        "target/main.crn": [
+        "module/interface.crn": [],
+        "module/main.crn": [
           {
             "message": "duplicate binding 'x': declared in main.crn and sibling.crn",
             "range": {
@@ -776,7 +776,7 @@
             "source": "carina"
           }
         ],
-        "target/sibling.crn": [
+        "module/sibling.crn": [
           {
             "message": "duplicate binding 'x': declared in main.crn and sibling.crn",
             "range": {
@@ -795,8 +795,8 @@
         ]
       },
       "faithful_disk_error": {
-        "target/interface.crn": [],
-        "target/main.crn": [
+        "module/interface.crn": [],
+        "module/main.crn": [
           {
             "message": "duplicate binding 'x': declared in main.crn and sibling.crn",
             "range": {
@@ -813,7 +813,7 @@
             "source": "carina"
           }
         ],
-        "target/sibling.crn": [
+        "module/sibling.crn": [
           {
             "message": "duplicate binding 'x': declared in main.crn and sibling.crn",
             "range": {
@@ -835,13 +835,13 @@
     "module_reference_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: ../target: duplicate binding 'x': declared in main.crn and sibling.crn\nError: main.crn at line 3\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
+        "stderr": "Error: ../module: duplicate binding 'x': declared in main.crn and sibling.crn\nError: main.crn at line 3\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 41\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "caller/main.crn": [
@@ -881,14 +881,14 @@
     },
     "validate_human": {
       "exit": 1,
-      "stderr": "Error: ../target: duplicate binding 'x': declared in main.crn and sibling.crn\n",
+      "stderr": "Error: ../module: duplicate binding 'x': declared in main.crn and sibling.crn\n",
       "stdout": "Validating...\n"
     },
     "validate_json": {
       "exit": 1,
       "stderr": "",
-      "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
+      "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: duplicate binding 'x': declared in main.crn and sibling.crn\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
     }
   },
-  "revision": "980dd4e9dea5cce43552b3d1802175f924c83d12"
+  "revision": "66063dd7f96561c274807d6943b5441783ee3d71"
 }

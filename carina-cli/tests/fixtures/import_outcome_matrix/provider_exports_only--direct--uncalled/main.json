@@ -3,18 +3,18 @@
     "callsite_argument_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: Module resolution error: Module not found: ../target\n",
+        "stderr": "Error: Module resolution error: Module not found: ../module\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module not found: ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module not found: ../module\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "caller/main.crn": [
           {
-            "message": "Module not found: ../target",
+            "message": "Module not found: ../module",
             "range": {
               "end": {
                 "character": 20,
@@ -696,7 +696,7 @@
     "hover_module": null,
     "lint": {
       "exit": 1,
-      "stderr": "Error: Module resolution error: Module not found: ../target\n",
+      "stderr": "Error: Module resolution error: Module not found: ../module\n",
       "stdout": ""
     },
     "lsp_caller": {
@@ -711,27 +711,27 @@
     },
     "lsp_target": {
       "all_siblings_open": {
-        "target/main.crn": []
+        "module/main.crn": []
       },
       "faithful_disk_error": {
-        "target/main.crn": []
+        "module/main.crn": []
       }
     },
     "module_reference_checks": {
       "human": {
         "exit": 1,
-        "stderr": "Error: Module resolution error: Module not found: ../target\n",
+        "stderr": "Error: Module resolution error: Module not found: ../module\n",
         "stdout": "Validating...\n"
       },
       "json": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module not found: ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module not found: ../module\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    }\n  ]\n}\n"
       },
       "lsp_caller": {
         "caller/main.crn": [
           {
-            "message": "Module not found: ../target",
+            "message": "Module not found: ../module",
             "range": {
               "end": {
                 "character": 20,
@@ -751,14 +751,14 @@
     },
     "validate_human": {
       "exit": 1,
-      "stderr": "Error: Module resolution error: Module not found: ../target\n",
+      "stderr": "Error: Module resolution error: Module not found: ../module\n",
       "stdout": "Validating...\n"
     },
     "validate_json": {
       "exit": 1,
       "stderr": "",
-      "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module not found: ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
+      "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"Module not found: ../module\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": null\n    }\n  ]\n}\n"
     }
   },
-  "revision": "980dd4e9dea5cce43552b3d1802175f924c83d12"
+  "revision": "66063dd7f96561c274807d6943b5441783ee3d71"
 }

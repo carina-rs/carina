@@ -734,7 +734,7 @@
       "value": {
         "contents": {
           "kind": "markdown",
-          "value": "## service\n\n`../target`\n"
+          "value": "## service\n\n`../module`\n"
         }
       }
     },
@@ -763,10 +763,10 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target/main.crn": []
+          "module/main.crn": []
         },
         "faithful_disk_error": {
-          "target/main.crn": []
+          "module/main.crn": []
         }
       }
     },
@@ -837,6 +837,7 @@
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -845,14 +846,14 @@
     "files": {},
     "id": "normal_empty_arguments--direct--uncalled",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "normal_empty_arguments",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
     "supplemental": true,
     "target_paths": [
-      "target/main.crn"
+      "module/main.crn"
     ],
     "unreadable_paths": [],
     "usage": "uncalled"

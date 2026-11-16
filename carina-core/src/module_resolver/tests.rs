@@ -45,6 +45,154 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
 }
 
 #[test]
+fn collected_imports_reuse_the_partial_read_and_its_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("child")).unwrap();
+    fs::write(
+        directory.path().join("main.crn"),
+        "let m = use { source = './child' }\nm {}\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("child/main.crn"),
+        "arguments {}\nexports {}\n",
+    )
+    .unwrap();
+    fs::write(directory.path().join("child/unreadable.crn"), [0xff]).unwrap();
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
+    let mut imports = ModuleImportTraversal::load(&parsed, &root, &context, &schemas);
+    // A consumer re-read would replace the captured IO failure with this new
+    // expression failure. Only the original reader's two findings may survive.
+    fs::write(
+        directory.path().join("child/unreadable.crn"),
+        "let a = 'present'\nlet broken = a ?? 1\n",
+    )
+    .unwrap();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        let report = resolve_modules_with_collected_imports(
+            parsed.admit(&schemas, session),
+            &root,
+            &[],
+            &mut imports,
+        );
+        let mut run = crate::test_utils::conversion_validation::<std::convert::Infallible>();
+        let ModuleResolutionDiagnosticResult::Unowned { errors } = report.into_validation(&mut run)
+        else {
+            panic!("captured incomplete input cannot be expanded");
+        };
+        let messages = errors
+            .iter()
+            .map(|error| error.lsp_message_relative_to(directory.path()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec![
+                "exports blocks are not allowed inside modules. Define exports at the root configuration level.",
+                "IO error: stream did not contain valid UTF-8",
+            ]
+        );
+    });
+}
+
+#[test]
+fn ordinary_unreadable_bridges_keep_main_fail_fast() {
+    let directory = tempfile::tempdir().unwrap();
+    for child in ["first", "second"] {
+        fs::create_dir_all(directory.path().join("bridge").join(child)).unwrap();
+        fs::write(
+            directory.path().join("bridge").join(child).join("main.crn"),
+            [0xff],
+        )
+        .unwrap();
+    }
+    fs::write(
+        directory.path().join("main.crn"),
+        "let m = use { source = './bridge' }\nm {}\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("bridge/main.crn"),
+        "arguments { n: Int = 1 }\nlet first = use { source = './first' }\nlet second = use { source = './second' }\n",
+    )
+    .unwrap();
+    let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let schemas = crate::schema::SchemaRegistry::new();
+    let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
+    let mut imports = ModuleImportTraversal::load(&parsed, &root, &context, &schemas);
+    assert_eq!(imports.prohibitions().boundary_findings().count(), 0);
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        let report = resolve_modules_with_collected_imports(
+            parsed.admit(&schemas, session),
+            &root,
+            &[],
+            &mut imports,
+        );
+        let mut run = crate::test_utils::conversion_validation::<std::convert::Infallible>();
+        let ModuleResolutionDiagnosticResult::Unowned { errors } = report.into_validation(&mut run)
+        else {
+            panic!("the first unreadable child blocks the ordinary bridge");
+        };
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].lsp_message_relative_to(directory.path()),
+            "IO error: stream did not contain valid UTF-8"
+        );
+    });
+}
+
+#[test]
+fn collected_lint_body_failures_keep_main_unrelated_rejection_gate() {
+    for failing_bridge in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("bridge/child")).unwrap();
+        fs::write(
+            directory.path().join("bridge/child/main.crn"),
+            "arguments {}\nexports {}\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("bridge/main.crn"),
+            "arguments { n: Int = 1 }\nlet child = use { source = './child' }\nlet a = 'present'\nlet broken = a ?? 1\n",
+        )
+        .unwrap();
+        let caller = if failing_bridge {
+            "let m = use { source = './bridge' }\n"
+        } else {
+            "let missing = use { source = './missing' }\nlet m = use { source = './bridge/child' }\n"
+        };
+        fs::write(directory.path().join("main.crn"), caller).unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let schemas = crate::schema::SchemaRegistry::new();
+        let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
+        let mut imports = ModuleImportTraversal::load(&parsed, &root, &context, &schemas);
+        assert_eq!(imports.prohibitions().boundary_findings().count(), 1);
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let error = resolve_module_template_with_imports(
+                parsed.admit(&schemas, session),
+                &root,
+                &mut imports,
+            )
+            .unwrap_err();
+            let ordinary = imports.ordinary_resolution_error(error);
+            assert_eq!(ordinary.is_some(), failing_bridge);
+            if let Some(error) = ordinary {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("coalesce default type `Int` does not match left type `String`"),
+                    "{error}"
+                );
+            }
+        });
+    }
+}
+
+#[test]
 fn imported_prohibitions_remain_complete_on_every_resolver_load_and_retry() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../carina-cli/tests/fixtures/import_root_boundary");

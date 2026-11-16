@@ -42,10 +42,10 @@ pub use error::{
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
 pub use loader::{
     LoadedModule, ModuleAnalysisOutcome, ModuleBodyAnalysis, ModuleLoadError, ModuleProhibition,
-    ModuleProhibitionCategory, ModuleProhibitions, ModuleRejection, ModuleSignatureSource,
-    ModuleSignatureView, ModuleTemplate, ModuleTemplatePreflight, PartialModule,
-    PartialModuleAnalysis, PartialModuleSignatureSource, derive_module_name, get_parsed_file,
-    load_directory_module, load_module, load_module_from_directory,
+    ModuleProhibitionCategory, ModuleProhibitions, ModuleReadFailure, ModuleRejection,
+    ModuleSignatureSource, ModuleSignatureView, ModuleTemplate, ModuleTemplatePreflight,
+    PartialModule, PartialModuleAnalysis, PartialModuleSignatureSource, derive_module_name,
+    get_parsed_file, load_directory_module, load_module, load_module_from_directory,
     load_module_signature_with_schemas, load_module_with_diagnostics,
     load_module_with_diagnostics_and_schemas, load_partial_module_analysis_with_schemas,
     load_partial_module_signature_with_schemas,
@@ -55,13 +55,15 @@ pub(crate) use resolver::{
     resolve_upstream_modules_with_providerless_config,
 };
 pub use resolver::{
-    ModuleCallConstraintReport, ModuleCallConstraintReports, ModuleResolutionDiagnosticResult,
+    CollectedImportFinding, CollectedImportProhibitions, ModuleAtPath, ModuleCallConstraintReport,
+    ModuleCallConstraintReports, ModuleImportTraversal, ModuleResolutionDiagnosticResult,
     ModuleResolutionReport, ProviderMetadataResolution, ResidualModuleResolutionDiagnostic,
     ResidualModuleResolutionError, ResolvedModuleConstraintOrigin, ResolvedModuleConstraintOutcome,
     ResolvedModuleConstraintStatus, ensure_expanded_root_graph,
     finalize_provider_metadata_with_module_overrides, prepare_root_export_validation,
-    resolve_module_template_with_config, resolve_module_template_with_providerless_config,
-    resolve_modules_providerless, resolve_modules_with_config,
+    resolve_module_template_with_config, resolve_module_template_with_imports,
+    resolve_module_template_with_providerless_config, resolve_modules_providerless,
+    resolve_modules_with_collected_imports, resolve_modules_with_config,
     resolve_modules_with_config_and_overrides, resolve_modules_with_diagnostics,
     resolve_modules_with_diagnostics_and_overrides, resolve_modules_with_providerless_config,
     resolve_modules_with_providerless_diagnostics,

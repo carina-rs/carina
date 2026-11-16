@@ -5,13 +5,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 2\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\nError: ../target/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
+          "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 2\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: main.crn at line 2\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\nError: ../module/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 46\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -791,7 +791,7 @@
       "value": {
         "contents": {
           "kind": "markdown",
-          "value": "## service\n\n`../target`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `bad`: `TotallyMadeUpType`\n"
+          "value": "## service\n\n`../module`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `bad`: `TotallyMadeUpType`\n"
         }
       }
     },
@@ -799,7 +799,7 @@
       "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "warning: .:1  ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nwarning: .:1  ./../target/main.crn:2:19: attribute 'bad': unknown custom type 'TotallyMadeUpType'\nError: Found 2 lint warning(s).\n",
+        "stderr": "warning: .:1  ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nwarning: .:1  ./../module/main.crn:2:19: attribute 'bad': unknown custom type 'TotallyMadeUpType'\nError: Found 2 lint warning(s).\n",
         "stdout": ""
       }
     },
@@ -882,7 +882,7 @@
       "classification": "main",
       "value": {
         "all_siblings_open": {
-          "target/main.crn": [
+          "module/main.crn": [
             {
               "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
               "range": {
@@ -916,7 +916,7 @@
           ]
         },
         "faithful_disk_error": {
-          "target/main.crn": [
+          "module/main.crn": [
             {
               "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
               "range": {
@@ -956,13 +956,13 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 3\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\nError: ../target/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
+          "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: main.crn at line 3\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\nError: ../module/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 41\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 41\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "caller/main.crn": [
@@ -1035,7 +1035,7 @@
       "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: ../target/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
+        "stderr": "Error: ../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\nError: ../module/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
         "stdout": "Validating...\n"
       }
     },
@@ -1044,10 +1044,11 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../target: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"../module: exports blocks are not allowed inside modules. Define exports at the root configuration level.\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 14\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 21\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../module/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
@@ -1056,14 +1057,14 @@
     "files": {},
     "id": "type_error_body_exports--direct--called",
     "immediate_importer": "caller/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "direct",
     "row": "type_error_body_exports",
     "runtime_unreadable": {},
     "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
     "supplemental": true,
     "target_paths": [
-      "target/main.crn"
+      "module/main.crn"
     ],
     "unreadable_paths": [],
     "usage": "called"

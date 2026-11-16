@@ -155,6 +155,7 @@ fn collect_list_struct_attrs_for_population<E, D, B: carina_core::resource::Bind
 }
 
 struct LintResult {
+    import_errors: Vec<AppError>,
     checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<
         Result<Vec<LintWarning>, AppError>,
     >,
@@ -192,7 +193,10 @@ impl LintResult {
             Result<Vec<LintWarning>, AppError>,
         >,
     ) -> Self {
-        Self { checks }
+        Self {
+            checks,
+            import_errors: Vec::new(),
+        }
     }
 
     fn publish(
@@ -256,6 +260,9 @@ impl LintResult {
             );
         }
         result?;
+        if !self.import_errors.is_empty() {
+            return Err(crate::commands::collapse_errors(self.import_errors));
+        }
         Err(AppError::Validation(format!(
             "Found {} lint warning(s).",
             warning_count
@@ -299,13 +306,16 @@ fn lint_result(
     let duplicate_declarations = loaded.duplicate_declarations;
     let mut parsed = loaded.parsed;
 
-    let module_walk = ModuleWalk::load(
+    let mut module_walk = ModuleWalk::load(
         &parsed,
         base_dir,
-        &provider_context.environment,
+        provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     );
-    let module_boundary_findings = validate_module_boundaries(&module_walk);
+    let (module_boundary_findings, mut import_errors): (Vec<_>, Vec<_>) =
+        validate_module_boundaries(&module_walk)
+            .into_iter()
+            .partition(|finding| matches!(finding, AppError::ModuleImport { .. }));
 
     let (providers, provider_factory_error) = ProviderLoad::load_reporting(
         runtime,
@@ -364,25 +374,35 @@ fn lint_result(
                 );
             }
 
-            // Report invalid root-owned module blocks through lint's collected,
-            // path-prefixed output. The resolver enforces the same invariants as
-            // expansion backstops, so do not expand after this gate fails or lint
-            // would abort before rendering the findings below. This deliberately
-            // degrades schema-dependent checks: `iter_top_level_resources` then sees
-            // only root-declared resources, so List<Struct> block-syntax suggestions
-            // can disappear even from root files. The configuration is already
-            // blocked; retaining these findings and the schema-independent text scans
-            // is more useful than aborting lint entirely. Full schema-backed
-            // suggestions return once the blocking finding is fixed.
-            let mut parsed = if module_boundary_findings.is_empty() && type_findings.is_empty() {
-                let resolution = module_resolver::resolve_module_template_with_config(
-                    parsed.admit(schemas, catalog),
+            // Preserve main's operational bridge failure while presenting the
+            // resolver's full prohibition collection. A blocked import cannot
+            // supply an expanded graph, so schema-dependent lint suggestions keep
+            // the existing root-only policy; fatal import errors publish after
+            // the prohibition warnings instead of discarding them.
+            let mut parsed = if type_findings.is_empty() {
+                let resolution = module_resolver::resolve_module_template_with_imports(
+                    parsed.clone().admit(schemas, catalog),
                     base_dir,
+                    &mut module_walk,
                 );
-                LintFile::Resolved(resolution.map_err(|error| AppError::LintModuleResolution {
-                    error: Box::new(error),
-                    base: base_dir.source_label(),
-                })?)
+                match resolution {
+                    Ok(resolved) => LintFile::Resolved(resolved),
+                    Err(error) if !module_boundary_findings.is_empty() => {
+                        if let Some(error) = module_walk.ordinary_resolution_error(error) {
+                            import_errors.push(AppError::LintModuleResolution {
+                                error: Box::new(error),
+                                base: base_dir.source_label(),
+                            });
+                        }
+                        LintFile::Blocked(parsed)
+                    }
+                    Err(error) => {
+                        return Err(AppError::LintModuleResolution {
+                            error: Box::new(error),
+                            base: base_dir.source_label(),
+                        });
+                    }
+                }
             } else {
                 LintFile::Blocked(parsed)
             };
@@ -540,7 +560,9 @@ fn lint_result(
             Ok(warnings)
         },
     );
-    Ok(LintResult::settle(checks))
+    let mut result = LintResult::settle(checks);
+    result.import_errors = import_errors;
+    Ok(result)
 }
 
 #[cfg(test)]

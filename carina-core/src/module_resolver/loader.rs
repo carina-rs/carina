@@ -21,7 +21,7 @@ pub struct LoadedModule {
 
 /// Declaration source for hover, completion and call signatures. This is not
 /// evidence that the directory may be imported or its body expanded.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModuleSignatureSource {
     pub arguments: Vec<crate::parser::ArgumentParameter>,
     pub attribute_params: Vec<crate::parser::AttributeParameter>,
@@ -188,16 +188,25 @@ pub fn get_parsed_file(
 /// A failed module load distinguishes unavailable source from a directory that
 /// was read successfully but cannot be imported. Static consumers may skip
 /// unavailable sources; they must not interpret that as proof of importability.
+///
+/// Ordinary rejections cannot carry body authority:
+/// ```compile_fail,E0026
+/// use carina_core::module_resolver::ModuleLoadError;
+/// fn bypass(error: ModuleLoadError) {
+///     if let ModuleLoadError::NotModule { body, .. } = error { let _ = body; }
+/// }
+/// ```
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleLoadError {
     #[error("{0}")]
     Unavailable(ModuleError),
     /// A readable prohibition is conclusive even when sibling IO prevents a
     /// complete parse. Only main-skipping consumers may use this signature.
-    #[error("{}", .prohibitions.clone().into_error())]
+    #[error("{}", .read_failure.with_prohibitions(.prohibitions.as_deref()))]
     Partial {
-        prohibitions: Box<ModuleProhibitions>,
+        prohibitions: Option<Box<ModuleProhibitions>>,
         signature: Option<Box<PartialModuleSignatureSource>>,
+        read_failure: ModuleReadFailure,
     },
     #[error("{error}")]
     NotModule {
@@ -205,19 +214,63 @@ pub enum ModuleLoadError {
         /// A declaration-only consumer may recover this view explicitly. It
         /// cannot be admitted as a successfully loaded module.
         signature: ModuleSignatureView,
-        /// Complete rejected inputs retain only the body authority issued by
-        /// the prohibition scope. They can never become a LoadedModule.
-        body: ModuleBodyAnalysis,
     },
 }
 
 /// Successfully inspected inputs that cannot be imported. The payload cannot
 /// contain an unrelated resolver error or grow a silently ignored cause.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ModuleRejection {
-    NotADirectory { path: String },
-    NoConfigurationFiles { path: crate::paths::DisplayPath },
-    Prohibited(ModuleProhibitions),
+    NotADirectory {
+        path: String,
+    },
+    NoConfigurationFiles {
+        path: crate::paths::DisplayPath,
+    },
+    Prohibited {
+        prohibitions: ModuleProhibitions,
+        body: ModuleBodyAnalysis,
+    },
+}
+
+/// A read failure retained beside readable declarations and prohibitions.
+/// Its constructor is private to the directory reader; consumers never retry IO.
+#[derive(Debug, Clone)]
+pub struct ModuleReadFailure(std::sync::Arc<std::io::Error>);
+impl std::fmt::Display for ModuleReadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "IO error: {}", self.0)
+    }
+}
+impl ModuleReadFailure {
+    pub(super) fn same_read(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+    fn with_prohibitions<'a>(
+        &'a self,
+        prohibitions: Option<&'a ModuleProhibitions>,
+    ) -> PartialReadDiagnostic<'a> {
+        PartialReadDiagnostic {
+            failure: self,
+            prohibitions,
+        }
+    }
+    pub(super) fn into_error(self) -> ModuleError {
+        ModuleError::from_import_read_failure(self)
+    }
+}
+
+struct PartialReadDiagnostic<'a> {
+    failure: &'a ModuleReadFailure,
+    prohibitions: Option<&'a ModuleProhibitions>,
+}
+impl std::fmt::Display for PartialReadDiagnostic<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(prohibitions) = self.prohibitions {
+            writeln!(formatter, "{}", prohibitions.clone().into_error())?;
+        }
+        self.failure.fmt(formatter)
+    }
 }
 
 /// One category in an imported directory's complete prohibition set.
@@ -245,7 +298,7 @@ pub enum ModuleProhibitionCategory {
 }
 
 impl ModuleProhibition {
-    fn category(&self) -> ModuleProhibitionCategory {
+    pub(super) fn category(&self) -> ModuleProhibitionCategory {
         match self {
             Self::Provider { evidence: _ } => ModuleProhibitionCategory::Provider,
             Self::State => ModuleProhibitionCategory::State,
@@ -273,7 +326,6 @@ pub struct ModuleProhibitions {
     first: ModuleProhibition,
     rest: Vec<ModuleProhibition>,
     scope: ProhibitionScope,
-    source: ProhibitionSource,
 }
 
 #[derive(Debug, Clone)]
@@ -282,19 +334,12 @@ enum ProhibitionScope {
     NoRootEvidence,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ProhibitionSource {
-    CompleteImport,
-    ReadableSubset,
-}
-
 impl ModuleProhibitions {
     /// Collect authored block presence once, before any body resolution. Root
     /// evidence supplies a guaranteed first prohibition; empty blocks count.
     fn collect(
         parsed: &ParsedFile,
         root: Option<&crate::config_loader::RootDirectoryVerdict>,
-        source: ProhibitionSource,
     ) -> Option<Self> {
         use crate::parser::ConfigurationBlock;
         let mut body = [
@@ -332,7 +377,6 @@ impl ModuleProhibitions {
             first,
             rest: members,
             scope,
-            source,
         })
     }
 
@@ -347,7 +391,6 @@ impl ModuleProhibitions {
                 first,
                 rest: Vec::new(),
                 scope: self.scope.clone(),
-                source: self.source,
             })
             .collect()
     }
@@ -363,60 +406,68 @@ impl ModuleProhibitions {
             .collect()
     }
 
-    /// Publish the loader's typed members with ownership, retaining their
-    /// categories so consumers can preserve main's category-first ordering.
-    pub fn into_owned_errors(
-        self,
-        location: crate::parser::DeclarationLocation,
-        calls: Vec<crate::parser::ModuleCallId>,
-    ) -> Vec<(ModuleProhibitionCategory, ModuleError)> {
-        let categories = self
-            .iter()
-            .map(ModuleProhibition::category)
-            .collect::<Vec<_>>();
-        let errors = self
-            .into_error()
-            .with_import_owners(location, calls)
-            .into_import_prohibition_errors();
-        categories.into_iter().zip(errors).collect()
-    }
-
     pub(crate) fn into_error(self) -> ModuleError {
         ModuleError::from_import_prohibitions(self)
     }
 }
-impl ModuleRejection {
-    pub(crate) fn with_body_error(self, body: ModuleError) -> ModuleError {
-        match self {
-            Self::Prohibited(prohibitions) => {
-                ModuleError::from_import_body_error(body, prohibitions)
-            }
-            ordinary @ (Self::NotADirectory { path: _ }
-            | Self::NoConfigurationFiles { path: _ }) => {
-                ModuleError::from_nonempty_errors(body, vec![ordinary.into_error()])
-            }
-        }
+impl ModuleProhibitions {
+    pub(super) fn with_body_error(self, body: ModuleError) -> ModuleError {
+        ModuleError::from_import_body_error(body, self)
     }
+}
+impl ModuleRejection {
     pub fn into_errors(self) -> Vec<ModuleError> {
         match self {
             Self::NotADirectory { path } => vec![ModuleError::NotADirectory { path }],
             Self::NoConfigurationFiles { path } => {
-                vec![ModuleError::NoConfigurationFiles { path }]
+                vec![ModuleError::NoConfigurationFiles {
+                    path,
+                    import_path: None,
+                }]
             }
-            Self::Prohibited(prohibitions) => prohibitions.into_errors(),
+            Self::Prohibited { prohibitions, body } => {
+                let mut errors = prohibitions.into_errors();
+                if let ModuleBodyAnalysis::Failed(error) = body {
+                    errors.insert(0, *error);
+                }
+                errors
+            }
         }
     }
     pub(crate) fn into_error(self) -> ModuleError {
         match self {
             Self::NotADirectory { path } => ModuleError::NotADirectory { path },
-            Self::NoConfigurationFiles { path } => ModuleError::NoConfigurationFiles { path },
-            Self::Prohibited(prohibitions) => prohibitions.into_error(),
+            Self::NoConfigurationFiles { path } => ModuleError::NoConfigurationFiles {
+                path,
+                import_path: None,
+            },
+            Self::Prohibited { prohibitions, body } => match body {
+                ModuleBodyAnalysis::Failed(error) => prohibitions.with_body_error(*error),
+                ModuleBodyAnalysis::Available(_) | ModuleBodyAnalysis::ProhibitionsOnly => {
+                    prohibitions.into_error()
+                }
+            },
         }
     }
 }
 impl std::fmt::Display for ModuleRejection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.clone().into_error().fmt(formatter)
+        match self {
+            Self::NotADirectory { path } => {
+                ModuleError::NotADirectory { path: path.clone() }.fmt(formatter)
+            }
+            Self::NoConfigurationFiles { path } => ModuleError::NoConfigurationFiles {
+                path: path.clone(),
+                import_path: None,
+            }
+            .fmt(formatter),
+            Self::Prohibited { prohibitions, body } => {
+                if let ModuleBodyAnalysis::Failed(error) = body {
+                    writeln!(formatter, "{error}")?;
+                }
+                prohibitions.clone().into_error().fmt(formatter)
+            }
+        }
     }
 }
 impl std::error::Error for ModuleRejection {}
@@ -427,11 +478,14 @@ impl ModuleLoadError {
             Self::Partial {
                 prohibitions,
                 signature: _,
-            } => prohibitions.into_error(),
+                read_failure,
+            } => match prohibitions {
+                Some(prohibitions) => prohibitions.with_body_error(read_failure.into_error()),
+                None => read_failure.into_error(),
+            },
             Self::NotModule {
                 error,
                 signature: _,
-                body: _,
             } => error.into_error(),
         }
     }
@@ -442,11 +496,15 @@ impl ModuleLoadError {
             Self::Partial {
                 prohibitions,
                 signature: _,
-            } => prohibitions.into_errors(),
+                read_failure,
+            } => {
+                let mut errors = prohibitions.map(|p| p.into_errors()).unwrap_or_default();
+                errors.push(read_failure.into_error());
+                errors
+            }
             Self::NotModule {
                 error,
                 signature: _,
-                body: _,
             } => error.into_errors(),
         }
     }
@@ -454,7 +512,6 @@ impl ModuleLoadError {
         Self::NotModule {
             error: Box::new(error),
             signature: ModuleSignatureView::Unavailable,
-            body: ModuleBodyAnalysis::Unavailable,
         }
     }
 }
@@ -524,7 +581,7 @@ fn load_signature_source(
 
 /// An interface recovered by a reader that may omit unreadable siblings.
 /// Only consumers with main's readable-sibling policy use this type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PartialModuleSignatureSource {
     declarations: ModuleSignatureSource,
 }
@@ -567,13 +624,14 @@ fn load_partial_signature(
         Err(ModuleLoadError::Partial {
             signature: Some(source),
             prohibitions: _,
+            read_failure: _,
         }) => return Ok(*source),
         Err(ModuleLoadError::Unavailable(error @ ModuleError::Io(_))) => {
             let analysis =
                 load_partial_module_analysis(path, config, overrides, schemas, display_root)?;
             match analysis.signature {
-                ModuleSignatureView::Declarations(source) => *source,
-                ModuleSignatureView::EmptyInterface | ModuleSignatureView::Unavailable => {
+                Some(source) => return Ok(*source),
+                None => {
                     return Err(ModuleLoadError::Unavailable(error));
                 }
             }
@@ -603,6 +661,7 @@ pub(crate) fn load_resolved_signature_source_with_overrides(
 }
 
 /// Readable source for static checks. It cannot be expanded as a LoadedModule.
+#[derive(Clone)]
 pub struct PartialModule {
     parsed: Box<ParsedFile>,
     pub duplicate_declarations: Vec<crate::config_loader::DuplicateDeclaration>,
@@ -629,17 +688,27 @@ impl PartialModule {
 #[derive(Debug)]
 pub enum ModuleBodyAnalysis {
     ProhibitionsOnly,
-    Unavailable,
     Available(PartialModule),
+    Failed(Box<ModuleError>),
 }
 
+/// Readable-subset declarations cannot enter a complete-only signature API.
+/// ```compile_fail,E0308
+/// use carina_core::module_resolver::{PartialModuleAnalysis, ModuleSignatureSource};
+/// fn complete_only(_: &ModuleSignatureSource) {}
+/// fn bypass(analysis: PartialModuleAnalysis) {
+///     if let Some(source) = analysis.signature { complete_only(&source); }
+/// }
+/// ```
 pub struct PartialModuleAnalysis {
-    pub signature: ModuleSignatureView,
+    pub signature: Option<Box<PartialModuleSignatureSource>>,
     pub outcome: ModuleAnalysisOutcome,
+    pub read_failure: Option<ModuleReadFailure>,
+    imports: Vec<crate::parser::UseStatement>,
 }
 
-/// Only an importable directory supplies children to the static walk. A
-/// rejected directory may retain main's body checks without authorizing descent.
+/// Body checks and declarations from readable inputs never grant admission.
+/// The resolver traverses imports independently of body authority.
 pub enum ModuleAnalysisOutcome {
     Importable(PartialModule),
     Prohibited {
@@ -702,13 +771,26 @@ fn load_partial_module_analysis(
     // This reader deliberately has no CompleteDirectoryVerdict or admission
     // result: readable siblings are useful without proving completeness.
     let mut files = Vec::new();
-    let mut source = ProhibitionSource::CompleteImport;
+    let mut read_failure = None;
     for path in paths.into_paths() {
         match crate::config_loader::read_source_with_overrides(&path, overrides) {
             Ok(text) => files.push((path, text)),
-            Err(_read_error) => source = ProhibitionSource::ReadableSubset,
+            Err(error) => {
+                read_failure.get_or_insert_with(|| ModuleReadFailure(std::sync::Arc::new(error)));
+            }
         }
     }
+    analyze_partial_sources(files, read_failure, config, schemas, display_root, path)
+}
+
+fn analyze_partial_sources(
+    files: Vec<(ResolvedPath, String)>,
+    read_failure: Option<ModuleReadFailure>,
+    config: &ProviderContext,
+    schemas: &crate::schema::SchemaRegistry,
+    display_root: &std::path::Path,
+    path: &ResolvedPath,
+) -> Result<PartialModuleAnalysis, ModuleLoadError> {
     let parsed_files =
         crate::config_loader::parse_directory_files_located_from_root(&files, config, display_root)
             .map_err(|located| {
@@ -732,15 +814,15 @@ fn load_partial_module_analysis(
         merged
             .directory_verdict()
             .and_then(|verdict| verdict.root()),
-        source,
     );
     let signature = if crate::validation::is_module_definition(&merged) {
-        ModuleSignatureView::Declarations(Box::new(ModuleSignatureSource::from_parsed(
-            merged.clone(),
-        )))
+        Some(Box::new(PartialModuleSignatureSource {
+            declarations: ModuleSignatureSource::from_parsed(merged.clone()),
+        }))
     } else {
-        ModuleSignatureView::EmptyInterface
+        None
     };
+    let imports = merged.uses.clone();
     crate::parser::retained::judge_configuration(&mut merged, schemas, config);
     let module = PartialModule {
         parsed: Box::new(merged),
@@ -753,7 +835,12 @@ fn load_partial_module_analysis(
         },
         None => ModuleAnalysisOutcome::Importable(module),
     };
-    Ok(PartialModuleAnalysis { outcome, signature })
+    Ok(PartialModuleAnalysis {
+        outcome,
+        signature,
+        read_failure,
+        imports,
+    })
 }
 
 pub(crate) fn load_module_body_for_checks_with_overrides(
@@ -782,7 +869,7 @@ pub(crate) fn load_module_body_for_checks_with_overrides(
         } => Some(module),
         ModuleAnalysisOutcome::Prohibited {
             prohibitions: _,
-            body: ModuleBodyAnalysis::ProhibitionsOnly | ModuleBodyAnalysis::Unavailable,
+            body: ModuleBodyAnalysis::ProhibitionsOnly | ModuleBodyAnalysis::Failed(_),
         } => None,
     }
 }
@@ -795,22 +882,17 @@ fn signature_source(
         Err(ModuleLoadError::NotModule {
             error: _,
             signature: ModuleSignatureView::Declarations(source),
-            body: _,
         }) => Ok(*source),
         Err(ModuleLoadError::NotModule {
             error,
             signature:
                 signature @ (ModuleSignatureView::EmptyInterface | ModuleSignatureView::Unavailable),
-            body,
-        }) => Err(ModuleLoadError::NotModule {
-            error,
-            signature,
-            body,
-        }),
+        }) => Err(ModuleLoadError::NotModule { error, signature }),
         Err(
             error @ ModuleLoadError::Partial {
                 prohibitions: _,
                 signature: _,
+                read_failure: _,
             },
         ) => Err(error),
         Err(ModuleLoadError::Unavailable(error)) => Err(ModuleLoadError::Unavailable(error)),
@@ -828,113 +910,175 @@ pub(crate) fn load_imported_directory(
     schemas: &crate::schema::SchemaRegistry,
     display_root: &std::path::Path,
 ) -> Result<LoadedModule, ModuleLoadError> {
+    inspect_imported_directory(dir_path, config, overrides, schemas, display_root).outcome
+}
+
+/// The reader retains imports even when body admission or a sibling fails.
+/// Only the resolver traversal consumes this snapshot; public loaders expose
+/// the outcome's separate declaration and body authorities.
+pub(super) struct ModuleInspection {
+    pub outcome: Result<LoadedModule, ModuleLoadError>,
+    pub imports: Vec<crate::parser::UseStatement>,
+    pub static_body: Option<PartialModule>,
+}
+
+pub(super) fn inspect_imported_directory(
+    dir_path: &ResolvedPath,
+    config: &ProviderContext,
+    overrides: &crate::config_loader::SourceOverrides,
+    schemas: &crate::schema::SchemaRegistry,
+    display_root: &std::path::Path,
+) -> ModuleInspection {
     use ModuleLoadError::Unavailable;
-    let metadata = dir_path
-        .metadata()
-        .map_err(|e| Unavailable(ModuleError::Io(e)))?;
-    if !metadata.is_dir() {
-        return Err(ModuleLoadError::rejected(ModuleRejection::NotADirectory {
-            path: dir_path.source_label().to_string_lossy().into_owned(),
-        }));
-    }
-    let inputs = crate::config_loader::DirectoryFiles::discover(dir_path, overrides)
-        .map_err(|error| Unavailable(ModuleError::Io(error)))?;
-    let inputs = match inputs.read_all(overrides) {
-        Ok(inputs) => inputs,
-        Err(failure) => {
-            // A failed read cannot admit a module. A readable prohibition is
-            // nevertheless decisive, just as monotone readable root evidence.
-            if let Ok(PartialModuleAnalysis {
-                outcome:
-                    ModuleAnalysisOutcome::Prohibited {
-                        prohibitions,
-                        body: _,
-                    },
-                signature,
-            }) = load_partial_module_analysis(dir_path, config, overrides, schemas, display_root)
-            {
-                let signature = match signature {
-                    ModuleSignatureView::Declarations(source) => {
-                        Some(Box::new(PartialModuleSignatureSource {
-                            declarations: *source,
-                        }))
+    let mut imports = Vec::new();
+    let mut static_body = None;
+    let outcome = (|| {
+        if !dir_path
+            .metadata()
+            .map_err(|error| Unavailable(ModuleError::Io(error)))?
+            .is_dir()
+        {
+            return Err(ModuleLoadError::rejected(ModuleRejection::NotADirectory {
+                path: dir_path.source_label().to_string_lossy().into_owned(),
+            }));
+        }
+        let inputs = crate::config_loader::DirectoryFiles::discover(dir_path, overrides)
+            .map_err(|error| Unavailable(ModuleError::Io(error)))?;
+        let inputs = match inputs.read_import(overrides) {
+            crate::config_loader::ImportDirectoryInputs::Complete(inputs) => inputs,
+            crate::config_loader::ImportDirectoryInputs::Partial { sources, error } => {
+                let read_failure = ModuleReadFailure(std::sync::Arc::new(error));
+                // Retry parsing captured text, never the directory's IO. Main's
+                // readable-sibling UI policy retains its explicit neutral retry.
+                let neutral = ProviderContext::new(config.environment.clone());
+                let analysis = analyze_partial_sources(
+                    sources.clone(),
+                    Some(read_failure.clone()),
+                    config,
+                    schemas,
+                    display_root,
+                    dir_path,
+                )
+                .or_else(|_| {
+                    analyze_partial_sources(
+                        sources,
+                        Some(read_failure.clone()),
+                        &neutral,
+                        schemas,
+                        display_root,
+                        dir_path,
+                    )
+                });
+                let (prohibitions, signature) = match analysis {
+                    Ok(analysis) => {
+                        imports = analysis.imports;
+                        match analysis.outcome {
+                            ModuleAnalysisOutcome::Importable(module) => {
+                                static_body = Some(module);
+                                (None, analysis.signature)
+                            }
+                            ModuleAnalysisOutcome::Prohibited { prohibitions, body } => {
+                                if let ModuleBodyAnalysis::Available(module) = body {
+                                    static_body = Some(module);
+                                }
+                                (Some(Box::new(prohibitions)), analysis.signature)
+                            }
+                        }
                     }
-                    ModuleSignatureView::EmptyInterface | ModuleSignatureView::Unavailable => None,
+                    Err(_) => (None, None),
                 };
                 return Err(ModuleLoadError::Partial {
-                    prohibitions: Box::new(prohibitions),
+                    prohibitions,
                     signature,
+                    read_failure,
                 });
             }
-            return Err(Unavailable(ModuleError::Io(failure.into_error())));
-        }
-    };
-    let unavailable = |located: crate::config_loader::LocatedParseError| {
-        Unavailable(match located.source_file {
-            Some(path) => ModuleError::ParseInFile {
-                path,
-                error: Box::new(*located.error),
-            },
-            None => ModuleError::Parse(*located.error),
-        })
-    };
-    let (parsed_files, body_error) = match inputs.parse_from_root(config, display_root) {
-        Ok(files) => (files, None),
-        Err(error) => {
-            let neutral = ProviderContext::new(config.environment.clone());
-            match inputs.parse_from_root(&neutral, display_root) {
-                Ok(files) => (files, Some(unavailable(error))),
-                Err(_) => return Err(unavailable(error)),
-            }
-        }
-    };
-    if parsed_files.is_empty() {
-        return Err(no_configuration_files(dir_path, display_root));
-    }
-    let duplicate_declarations =
-        crate::config_loader::find_duplicate_declarations(&dir_path.source_label(), &parsed_files);
-    let mut merged = parsed_files.empty_assembly();
-    let (verdict, parsed_files) = parsed_files.into_parts();
-    for (_, parsed) in parsed_files {
-        crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
-    }
-    if let Some(prohibitions) =
-        ModuleProhibitions::collect(&merged, verdict.root(), ProhibitionSource::CompleteImport)
-    {
-        let body = prohibitions.body_analysis(PartialModule {
-            parsed: Box::new(merged.clone()),
-            duplicate_declarations: duplicate_declarations.clone(),
-        });
-        // Expansion never receives prohibited directories. No-root bodies
-        // retain main's strict checks through their separate typed authority.
-        // Static UI consumers request their declaration source explicitly.
-        // Match main's declaration availability, including argumented roots,
-        // without granting expansion authority.
-        let signature = if body_error.is_some() {
-            // The neutral parse classifies prohibition only. Main's UI did
-            // not expose declarations after an enriched parse failure.
-            ModuleSignatureView::Unavailable
-        } else if crate::validation::is_module_definition(&merged) {
-            ModuleSignatureView::Declarations(Box::new(ModuleSignatureSource::from_parsed(merged)))
-        } else {
-            ModuleSignatureView::EmptyInterface
         };
-        return Err(ModuleLoadError::NotModule {
-            error: Box::new(ModuleRejection::Prohibited(prohibitions)),
-            signature,
-            body,
-        });
+        let unavailable =
+            |located: crate::config_loader::LocatedParseError| match located.source_file {
+                Some(path) => ModuleError::ParseInFile {
+                    path,
+                    error: located.error,
+                },
+                None => ModuleError::Parse(*located.error),
+            };
+        let (parsed_files, body_error) = match inputs.parse_from_root(config, display_root) {
+            Ok(files) => (files, None),
+            Err(error) => {
+                let neutral = ProviderContext::new(config.environment.clone());
+                match inputs.parse_from_root(&neutral, display_root) {
+                    Ok(files) => (files, Some(unavailable(error))),
+                    Err(_) => return Err(Unavailable(unavailable(error))),
+                }
+            }
+        };
+        if parsed_files.is_empty() {
+            return Err(no_configuration_files(dir_path, display_root));
+        }
+        let duplicate_declarations = crate::config_loader::find_duplicate_declarations(
+            &dir_path.source_label(),
+            &parsed_files,
+        );
+        let mut merged = parsed_files.empty_assembly();
+        let (verdict, parsed_files) = parsed_files.into_parts();
+        for (_, parsed) in parsed_files {
+            crate::config_loader::merge_parsed_file(&mut merged, parsed.into_inner());
+        }
+        imports = merged.uses.clone();
+        let prohibitions = ModuleProhibitions::collect(&merged, verdict.root());
+        let mut static_parsed = merged.clone();
+        crate::parser::retained::judge_configuration(&mut static_parsed, schemas, config);
+        let snapshot = PartialModule {
+            parsed: Box::new(static_parsed),
+            duplicate_declarations: duplicate_declarations.clone(),
+        };
+        if let Some(prohibitions) = prohibitions {
+            let enriched_failed = body_error.is_some();
+            let body = match (&prohibitions.scope, body_error) {
+                (ProhibitionScope::RootEvidence, _) => ModuleBodyAnalysis::ProhibitionsOnly,
+                (ProhibitionScope::NoRootEvidence, Some(error)) => {
+                    ModuleBodyAnalysis::Failed(Box::new(error))
+                }
+                (ProhibitionScope::NoRootEvidence, None) => {
+                    ModuleBodyAnalysis::Available(snapshot.clone())
+                }
+            };
+            let signature = if enriched_failed {
+                ModuleSignatureView::Unavailable
+            } else if crate::validation::is_module_definition(&merged) {
+                ModuleSignatureView::Declarations(Box::new(ModuleSignatureSource::from_parsed(
+                    merged,
+                )))
+            } else {
+                ModuleSignatureView::EmptyInterface
+            };
+            // Static checks keep main's readable-source policy. This partial
+            // snapshot cannot enter body resolution: that reader must consume
+            // the rejection's Available/Failed authority below.
+            if matches!(prohibitions.scope, ProhibitionScope::NoRootEvidence) {
+                static_body = Some(snapshot);
+            }
+            return Err(ModuleLoadError::NotModule {
+                error: Box::new(ModuleRejection::Prohibited { prohibitions, body }),
+                signature,
+            });
+        }
+        static_body = Some(snapshot);
+        if let Some(error) = body_error {
+            return Err(Unavailable(error));
+        }
+        crate::parser::retained::judge_configuration(&mut merged, schemas, config);
+        Ok(LoadedModule {
+            directory: dir_path.clone(),
+            parsed: merged,
+            duplicate_declarations,
+        })
+    })();
+    ModuleInspection {
+        outcome,
+        imports,
+        static_body,
     }
-    if let Some(error) = body_error {
-        return Err(error);
-    }
-    crate::parser::retained::judge_configuration(&mut merged, schemas, config);
-    let module = LoadedModule {
-        directory: dir_path.clone(),
-        parsed: merged,
-        duplicate_declarations,
-    };
-    Ok(module)
 }
 
 /// Derive the module name from a file or directory path.
@@ -1124,10 +1268,16 @@ mod tests {
         let ModuleLoadError::NotModule {
             error: rejection,
             signature: _,
-            body: _,
         } = &error
         else {
             panic!("root must have a typed rejection");
+        };
+        let ModuleRejection::Prohibited {
+            prohibitions: rejection,
+            ..
+        } = rejection.as_ref()
+        else {
+            panic!("root prohibition");
         };
         let errors = rejection.clone().into_errors();
         assert!(matches!(
@@ -1211,7 +1361,6 @@ mod tests {
             ModuleLoadError::NotModule {
                 error: _,
                 signature: _,
-                body: _,
             }
         ));
         assert_eq!(
@@ -1239,7 +1388,6 @@ mod tests {
                 ModuleLoadError::NotModule {
                     error: _,
                     signature: _,
-                    body: _,
                 }
             ),
             "{error}"
@@ -1268,7 +1416,6 @@ mod tests {
         let ModuleLoadError::NotModule {
             error,
             signature: _,
-            body: _,
         } = error
         else {
             panic!("empty directory must be a typed rejection");
@@ -1414,14 +1561,16 @@ mod importability_tests {
         let Err(ModuleLoadError::NotModule {
             error,
             signature: _,
-            body: _,
         }) = load_module(&path, &context)
         else {
             panic!("empty directory must have a typed rejection");
         };
         assert!(matches!(
             error.into_error().root_cause(),
-            ModuleError::NoConfigurationFiles { path: _ }
+            ModuleError::NoConfigurationFiles {
+                path: _,
+                import_path: _
+            }
         ));
         fs::write(directory.path().join("arguments.crn"), "arguments {}\n").unwrap();
         fs::write(directory.path().join("broken.crn"), "let broken =\n").unwrap();
@@ -1435,14 +1584,17 @@ mod importability_tests {
         fs::write(directory.path().join("broken.crn"), [0xff]).unwrap();
         assert!(matches!(
             load_module(&path, &context),
-            Err(ModuleLoadError::Unavailable(ModuleError::Io(_)))
+            Err(ModuleLoadError::Partial {
+                prohibitions: _,
+                signature: _,
+                read_failure: _,
+            })
         ));
         fs::remove_file(directory.path().join("broken.crn")).unwrap();
         fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
         let Err(ModuleLoadError::NotModule {
             error,
             signature: _,
-            body: _,
         }) = load_module(&path, &context)
         else {
             panic!("root evidence must prohibit import");
@@ -1579,6 +1731,8 @@ mod signature_view_tests {
         let PartialModuleAnalysis {
             outcome: ModuleAnalysisOutcome::Prohibited { body, prohibitions },
             signature: _,
+            read_failure,
+            imports: _,
         } = inspect()
         else {
             panic!("exports prohibit this directory");
@@ -1588,32 +1742,35 @@ mod signature_view_tests {
             prohibitions.scope,
             ProhibitionScope::NoRootEvidence
         ));
-        assert!(matches!(
-            prohibitions.source,
-            ProhibitionSource::CompleteImport
-        ));
+        assert!(read_failure.is_none());
         fs::write(directory.path().join("z-unreadable.crn"), [0xff]).unwrap();
         let PartialModuleAnalysis {
             outcome: ModuleAnalysisOutcome::Prohibited { body, prohibitions },
             signature: _,
+            read_failure,
+            imports: _,
         } = inspect()
         else {
             panic!("exports prohibit this directory");
         };
         assert!(matches!(body, ModuleBodyAnalysis::Available(_)));
+        assert!(read_failure.is_some());
         assert!(matches!(
-            prohibitions.source,
-            ProhibitionSource::ReadableSubset
+            prohibitions.scope,
+            ProhibitionScope::NoRootEvidence
         ));
         fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
         let PartialModuleAnalysis {
             outcome: ModuleAnalysisOutcome::Prohibited { body, prohibitions },
             signature: _,
+            read_failure,
+            imports: _,
         } = inspect()
         else {
             panic!("exports prohibit this directory");
         };
         assert!(matches!(body, ModuleBodyAnalysis::ProhibitionsOnly));
+        assert!(read_failure.is_some());
         assert!(matches!(prohibitions.scope, ProhibitionScope::RootEvidence));
     }
 
@@ -1623,30 +1780,22 @@ mod signature_view_tests {
         let path = ResolvedPath::new(directory.path()).unwrap();
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         fs::write(directory.path().join("exports.crn"), "exports {}\n").unwrap();
-        let Err(ModuleLoadError::NotModule {
-            error,
-            signature,
-            body: _,
-        }) = load_module(&path, &context)
+        let Err(ModuleLoadError::NotModule { error, signature }) = load_module(&path, &context)
         else {
             panic!("prohibited parsed directory");
         };
-        assert!(matches!(*error, ModuleRejection::Prohibited(_)));
+        assert!(matches!(*error, ModuleRejection::Prohibited { .. }));
         assert!(matches!(signature, ModuleSignatureView::EmptyInterface));
         fs::write(
             directory.path().join("arguments.crn"),
             "arguments { n: Int = 1 }\n",
         )
         .unwrap();
-        let Err(ModuleLoadError::NotModule {
-            error,
-            signature,
-            body: _,
-        }) = load_module(&path, &context)
+        let Err(ModuleLoadError::NotModule { error, signature }) = load_module(&path, &context)
         else {
             panic!("prohibited parsed directory");
         };
-        assert!(matches!(*error, ModuleRejection::Prohibited(_)));
+        assert!(matches!(*error, ModuleRejection::Prohibited { .. }));
         let ModuleSignatureView::Declarations(interface) = signature else {
             panic!("nonempty interface remains available");
         };
@@ -1682,16 +1831,25 @@ mod signature_view_tests {
                 ),
                 ..ProviderContext::new(crate::EnvironmentSnapshot::empty())
             };
-            let Err(ModuleLoadError::NotModule {
-                error,
-                signature,
-                body: _,
-            }) = load_module(&ResolvedPath::new(directory.path()).unwrap(), &context)
+            let Err(ModuleLoadError::NotModule { error, signature }) =
+                load_module(&ResolvedPath::new(directory.path()).unwrap(), &context)
             else {
                 panic!("fallback classifies prohibition");
             };
-            assert!(matches!(*error, ModuleRejection::Prohibited(_)));
+            assert!(matches!(*error, ModuleRejection::Prohibited { .. }));
             assert!(matches!(signature, ModuleSignatureView::Unavailable));
+            if !root_evidence {
+                assert!(
+                    matches!(
+                        *error,
+                        ModuleRejection::Prohibited {
+                            body: ModuleBodyAnalysis::Failed(_),
+                            ..
+                        }
+                    ),
+                    "an enriched parse failure cannot authorize the neutral body"
+                );
+            }
             let path = ResolvedPath::new(directory.path()).unwrap();
             assert!(
                 crate::config_loader::parse_directory_files(
@@ -1723,6 +1881,57 @@ mod signature_view_tests {
                 .is_err(),
                 "fallback syntax classifies prohibition but grants no static source"
             );
+        }
+    }
+
+    #[test]
+    fn enriched_attribute_failures_retain_the_original_body_error() {
+        let context = ProviderContext {
+            custom_types: crate::parser::ProviderCustomTypes::loaded(
+                Default::default(),
+                Box::new(|_, _| Ok(())),
+            ),
+            ..ProviderContext::new(crate::EnvironmentSnapshot::empty())
+        };
+        let neutral = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for annotation in ["TotallyMadeUpType", "mock.test.Resource.Name"] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = format!(
+                "arguments {{ n: Int = 1 }}\nattributes {{ bad: {annotation} = 'one' }}\nexports {{}}\n"
+            );
+            let file = directory.path().join("main.crn");
+            fs::write(&file, &source).unwrap();
+            let enriched = crate::parser::parse_file(&source, &file, &context);
+            let mut rederived = crate::parser::parse_file(&source, &file, &neutral).unwrap();
+            let findings =
+                crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                    crate::validation::resolve_file_type_exprs(&mut rederived, session).unwrap()
+                });
+            println!(
+                "{annotation}: enriched={:?}; rederived={:?}",
+                enriched.as_ref().err().map(ToString::to_string),
+                findings.iter().map(ToString::to_string).collect::<Vec<_>>()
+            );
+            let Err(ModuleLoadError::NotModule { error, .. }) =
+                load_module(&ResolvedPath::new(directory.path()).unwrap(), &context)
+            else {
+                panic!("prohibited input");
+            };
+            let ModuleRejection::Prohibited { body, .. } = *error else {
+                panic!("prohibition");
+            };
+            match enriched {
+                Err(original) => {
+                    let ModuleBodyAnalysis::Failed(error) = body else {
+                        panic!("failed enriched parse cannot issue a body");
+                    };
+                    assert!(error.to_string().contains(&original.to_string()));
+                }
+                Ok(_) => assert!(
+                    matches!(body, ModuleBodyAnalysis::Available(_)),
+                    "dotted types defer to schema resolution"
+                ),
+            }
         }
     }
 }

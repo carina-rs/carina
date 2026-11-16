@@ -1,0 +1,4 @@
+let service = use { source = '../module' }
+let result = service {}
+let second = use { source = '../module' }
+let other = second {}

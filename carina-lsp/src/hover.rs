@@ -487,11 +487,11 @@ impl HoverProvider {
                     carina_core::module_resolver::ModuleLoadError::NotModule {
                         error: _,
                         signature: _,
-                        body: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Partial {
                         prohibitions: _,
                         signature: _,
+                        read_failure: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
                 ) => return None,
@@ -566,11 +566,11 @@ impl HoverProvider {
                     carina_core::module_resolver::ModuleLoadError::NotModule {
                         error: _,
                         signature: _,
-                        body: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Partial {
                         prohibitions: _,
                         signature: _,
+                        read_failure: _,
                     }
                     | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
                 ) => return None,

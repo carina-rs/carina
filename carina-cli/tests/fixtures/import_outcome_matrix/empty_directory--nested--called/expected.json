@@ -5,18 +5,18 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: No .crn files found in ../target\n",
+          "stderr": "Error: Module resolution error: Module not found: ../module\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"No .crn files found in ../module\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
             {
-              "message": "No .crn files found in ../target",
+              "message": "No .crn files found in ../module",
               "range": {
                 "end": {
                   "character": 20,
@@ -33,7 +33,7 @@
           ],
           "caller/main.crn": [
             {
-              "message": "No .crn files found in ../target",
+              "message": "No .crn files found in ../module",
               "range": {
                 "end": {
                   "character": 24,
@@ -736,10 +736,10 @@
       "value": null
     },
     "lint": {
-      "classification": "changed:C",
+      "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target: No .crn files found in ../target\n",
+        "stderr": "Error: Module resolution error: Module not found: ../module\n",
         "stdout": ""
       }
     },
@@ -749,7 +749,7 @@
         "all_siblings_open": {
           "bridge/main.crn": [
             {
-              "message": "No .crn files found in ../target",
+              "message": "No .crn files found in ../module",
               "range": {
                 "end": {
                   "character": 20,
@@ -766,7 +766,7 @@
           ],
           "caller/main.crn": [
             {
-              "message": "No .crn files found in ../target",
+              "message": "No .crn files found in ../module",
               "range": {
                 "end": {
                   "character": 24,
@@ -786,7 +786,7 @@
         "faithful_disk_error": {
           "bridge/main.crn": [
             {
-              "message": "No .crn files found in ../target",
+              "message": "No .crn files found in ../module",
               "range": {
                 "end": {
                   "character": 20,
@@ -803,7 +803,7 @@
           ],
           "caller/main.crn": [
             {
-              "message": "No .crn files found in ../target",
+              "message": "No .crn files found in ../module",
               "range": {
                 "end": {
                   "character": 24,
@@ -834,18 +834,18 @@
       "value": {
         "human": {
           "exit": 1,
-          "stderr": "Error: ../target: No .crn files found in ../target\n",
+          "stderr": "Error: Module resolution error: Module not found: ../module\n",
           "stdout": "Validating...\n"
         },
         "json": {
           "exit": 1,
           "stderr": "",
-          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"No .crn files found in ../module\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
         },
         "lsp_caller": {
           "bridge/main.crn": [
             {
-              "message": "No .crn files found in ../target",
+              "message": "No .crn files found in ../module",
               "range": {
                 "end": {
                   "character": 20,
@@ -862,7 +862,7 @@
           ],
           "caller/main.crn": [
             {
-              "message": "No .crn files found in ../target",
+              "message": "No .crn files found in ../module",
               "range": {
                 "end": {
                   "character": 24,
@@ -882,10 +882,10 @@
       }
     },
     "validate_human": {
-      "classification": "changed:C",
+      "classification": "main",
       "value": {
         "exit": 1,
-        "stderr": "Error: ../target: No .crn files found in ../target\n",
+        "stderr": "Error: Module resolution error: Module not found: ../module\n",
         "stdout": "Validating...\n"
       }
     },
@@ -894,20 +894,21 @@
       "value": {
         "exit": 1,
         "stderr": "",
-        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"No .crn files found in ../target\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"No .crn files found in ../module\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 20\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 25\n          }\n        }\n      }\n    }\n  ]\n}\n"
       }
     }
   },
+  "derivation": "Genuine main 66063dd7f plus committed reviewed expectations and recorded user decisions. Candidate output is not an expectation authority.",
   "fixture": {
     "caller": "caller/main.crn",
     "directories": [
       "caller",
-      "target"
+      "module"
     ],
     "files": {},
     "id": "empty_directory--nested--called",
     "immediate_importer": "bridge/main.crn",
-    "import_path": "../target",
+    "import_path": "../module",
     "route": "nested",
     "row": "empty_directory",
     "runtime_unreadable": {},

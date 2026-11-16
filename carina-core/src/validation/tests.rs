@@ -4225,12 +4225,15 @@ fn assert_imported_prohibition(
     let Err(ModuleLoadError::NotModule {
         error,
         signature: _,
-        body: _,
     }) = result
     else {
         panic!("expected a typed import prohibition, not success or an unrelated load failure");
     };
-    let ModuleRejection::Prohibited(prohibitions) = *error else {
+    let ModuleRejection::Prohibited {
+        prohibitions,
+        body: _,
+    } = *error
+    else {
         panic!("expected a prohibited parsed module");
     };
     let members = prohibitions.iter().collect::<Vec<_>>();
@@ -4260,7 +4263,6 @@ fn imported_root_block_error(
     let Err(ModuleLoadError::NotModule {
         error,
         signature: _,
-        body: _,
     }) = crate::module_resolver::load_module_with_diagnostics(
         &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
         &context,
@@ -4268,7 +4270,11 @@ fn imported_root_block_error(
     else {
         panic!("root block must yield a typed prohibition");
     };
-    let ModuleRejection::Prohibited(prohibitions) = *error else {
+    let ModuleRejection::Prohibited {
+        prohibitions,
+        body: _,
+    } = *error
+    else {
         panic!("expected a parsed prohibited directory");
     };
     let members = prohibitions.iter().collect::<Vec<_>>();
