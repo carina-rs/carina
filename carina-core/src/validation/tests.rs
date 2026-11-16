@@ -34,6 +34,10 @@ type RuntimeInferredExportParam =
     crate::parser::InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>;
 
 fn unknown_key_locations(body: &str) -> Vec<String> {
+    unknown_key_locations_with_duplicate_id(body, false)
+}
+
+fn unknown_key_locations_with_duplicate_id(body: &str, duplicate: bool) -> Vec<String> {
     let catalog = LoadedProviderContext::empty_for_test();
     let config = catalog.as_provider_context();
     let entry = || {
@@ -95,6 +99,9 @@ fn unknown_key_locations(body: &str) -> Vec<String> {
     let source = format!("provider mock {{}}\n{body}\n");
     let mut parsed =
         crate::parser::parse_file(&source, std::path::Path::new("sibling.crn"), config).unwrap();
+    if duplicate {
+        parsed.resources[1].id = parsed.resources[0].id.clone();
+    }
     crate::schema::resolve_file_block_names_with_schemas(&mut parsed, &schemas).unwrap();
     let bindings = BindingIndex::from_parsed(&parsed, &schemas, config);
     let loaded = crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, config);
@@ -110,6 +117,14 @@ fn unknown_key_locations(body: &str) -> Vec<String> {
         .map(|finding| {
             let location = finding.location().expect("authored diagnostic");
             assert_eq!(location.file().path(), std::path::Path::new("sibling.crn"));
+            eprintln!(
+                "{body}: {}:{}-{}:{} {}",
+                location.span().start_line(),
+                location.span().start_column(),
+                location.span().end_line(),
+                location.span().end_column(),
+                finding.message()
+            );
             source[location.span().start_byte()..location.span().end_byte()].to_owned()
         })
         .collect()
@@ -152,6 +167,17 @@ fn unknown_key_keeps_its_selected_union_arm_location() {
     assert_eq!(
         unknown_key_locations("mock.test.Thing { variant = { enabled = true typo = true } }"),
         ["typo"],
+    );
+}
+
+#[test]
+fn duplicate_resource_id_keeps_the_second_unknown_key_owner() {
+    assert_eq!(
+        unknown_key_locations_with_duplicate_id(
+            "mock.test.Thing {}\nmock.test.Thing { typo = true }",
+            true
+        ),
+        ["typo = true"],
     );
 }
 

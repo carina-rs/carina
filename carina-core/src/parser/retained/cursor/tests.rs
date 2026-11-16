@@ -338,7 +338,8 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
         assert!(
             actual
                 .local_findings()
-                .starts_with(expected.local_findings())
+                .take(expected.local_findings().len())
+                .eq(expected.local_findings())
         );
         assert_eq!(actual.take_assignment().errors.len(), 1);
     }

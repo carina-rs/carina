@@ -1127,7 +1127,6 @@ impl DiagnosticRun<'_> {
 
                 let container_findings = attr_findings
                     .local_findings()
-                    .iter()
                     .any(|(path, _)| !path.is_empty())
                     || matches!(
                         attr_findings.structure(),

@@ -599,16 +599,16 @@ fn equal_ordinary_and_recovered_errors_keep_distinct_transformation_origins() {
             Some(TypeError::StructFieldError { .. })
         ));
         assert!(matches!(
-            wrapped.findings.additional_local_errors[0].error,
+            wrapped.findings.additional_local_errors[0].error(),
             TypeError::StructFieldError { .. }
         ));
         let protected = ordinary.inside_secret().into_findings();
         use crate::resource::SecretDiagnosticError;
         for error in [
             protected.local_error().unwrap(),
-            &protected.local[0].1,
+            protected.local[0].error(),
             &protected.located[0].1,
-            &protected.additional_local_errors[0].error,
+            protected.additional_local_errors[0].error(),
         ] {
             assert!(
                 matches!(error, TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))

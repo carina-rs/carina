@@ -299,6 +299,15 @@ impl AttributeLocationIndex {
 }
 
 impl AttributeLocationNode {
+    fn root_key<'a>(
+        &self,
+        elements: &'a super::elements::ElementLocations,
+    ) -> Option<&'a super::AttributeKeyLocation> {
+        self.first_block
+            .map(|index| &elements.keys()[index])
+            .or_else(|| self.key(elements))
+    }
+
     fn child(&self, step: &crate::schema::FieldPathStep) -> Option<&Self> {
         #[cfg(test)]
         record_attribute_location_work(1);
@@ -410,7 +419,75 @@ impl<'a> AttributeDiagnosticLocations<'a> {
     }
 }
 
+fn locate_unknown_key(
+    elements: &super::elements::ElementLocations,
+    declaration: &DeclarationLocation,
+    finding: &crate::schema::KeyedSchemaFinding,
+) -> Result<Located<crate::schema::TypeError>, AnalysisTreeError> {
+    use crate::schema::diagnostic::SchemaDiagnosticKey;
+    let name = match &finding.key {
+        SchemaDiagnosticKey::Attribute { name } => name,
+        SchemaDiagnosticKey::Value { root, .. } => root,
+    };
+    let root = elements
+        .diagnostic_index()
+        .attribute(name)
+        .and_then(|node| node.root_key(elements))
+        .ok_or_else(|| {
+            AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
+                declaration: declaration.clone(),
+                element: "unknown attribute key".into(),
+            })
+        })?;
+    let location = match &finding.key {
+        SchemaDiagnosticKey::Attribute { .. } => {
+            let assignment = root.assignment_location();
+            if assignment.span().start_line() == assignment.span().end_line() {
+                assignment
+            } else {
+                root.location()
+            }
+        }
+        SchemaDiagnosticKey::Value { relative, .. } => AttributeDiagnosticLocations {
+            elements,
+            root: root.location(),
+        }
+        .attribute_path_location(name, relative.path()),
+    };
+    Ok(Located::new(location.clone(), finding.error().clone()))
+}
+
 impl DeclarationProvenance {
+    /// Locate a schema finding while its declaration is still in hand. Unauthored
+    /// programmatic resources have no source span; an authored missing root is an invariant.
+    pub(crate) fn schema_diagnostic_location(
+        &self,
+        diagnostic: &crate::schema::SchemaDiagnostic,
+    ) -> Result<Option<DeclarationLocation>, AnalysisTreeError> {
+        let Some(declaration) = self.location() else {
+            return Ok(None);
+        };
+        match diagnostic {
+            crate::schema::SchemaDiagnostic::UnknownKey(key) => {
+                locate_unknown_key(self.elements(), declaration, key)
+                    .map(|finding| Some(finding.into_parts().0))
+            }
+            crate::schema::SchemaDiagnostic::Other(_) => Ok(Some(
+                diagnostic
+                    .path()
+                    .and_then(|(name, _)| self.elements().diagnostic_index().attribute(name))
+                    .and_then(|node| node.root_key(self.elements()))
+                    .map(|key| key.location())
+                    .or_else(|| {
+                        self.elements()
+                            .get(super::elements::ElementKind::ResourceType)
+                    })
+                    .unwrap_or(declaration)
+                    .clone(),
+            )),
+        }
+    }
+
     /// Canonical lookup paths retain their original parser-owned spans after
     /// schema block aliases are resolved. Programmatic resources have no span.
     pub(crate) fn attribute_diagnostic_location(
@@ -1255,11 +1332,7 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
         // Blocks are collected after assignments; otherwise the parser keeps
         // the final authored assignment. Both facts are indexed once.
         let key_location = node
-            .and_then(|node| {
-                node.first_block
-                    .map(|index| &provenance.elements().keys()[index])
-                    .or_else(|| node.key(provenance.elements()))
-            })
+            .and_then(|node| node.root_key(provenance.elements()))
             .ok_or_else(|| {
                 AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
                     declaration: location.clone(),
@@ -1606,47 +1679,7 @@ where
         &self,
         finding: &crate::schema::KeyedSchemaFinding,
     ) -> Result<Located<crate::schema::TypeError>, AnalysisTreeError> {
-        let missing = || {
-            AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
-                declaration: self.location.clone(),
-                element: "unknown attribute key".into(),
-            })
-        };
-        let name = finding.key.root.as_str();
-        let root = self.attribute_locations.get(name).ok_or_else(missing)?;
-        let path = crate::schema::FieldPath::from_canonical_segments(
-            finding.key.relative.segments().iter().cloned(),
-        );
-        let location = if path.is_empty() {
-            let assignment = root.assignment_location();
-            if assignment.span().start_line() == assignment.span().end_line() {
-                assignment
-            } else {
-                root.location()
-            }
-        } else {
-            let mut node = self
-                .elements
-                .diagnostic_index()
-                .attribute(name)
-                .ok_or_else(missing)?;
-            for (depth, step) in path.steps().iter().enumerate() {
-                if let Some(parent) = node.value(self.elements)
-                    && !parent.literal_container
-                {
-                    // Computed values retain the existing nearest-authored-parent policy.
-                    let location = if depth == 0 {
-                        root.location()
-                    } else {
-                        &parent.anchor
-                    };
-                    return Ok(Located::new(location.clone(), finding.error().clone()));
-                }
-                node = node.child(step).ok_or_else(missing)?;
-            }
-            node.key(self.elements).ok_or_else(missing)?.location()
-        };
-        Ok(Located::new(location.clone(), finding.error().clone()))
+        locate_unknown_key(self.elements, self.location, finding)
     }
 
     pub fn attribute_assignment_location(&self, name: &str) -> &'a DeclarationLocation {
@@ -3108,8 +3141,66 @@ mod location_tests {
     use super::*;
 
     #[test]
+    fn inaccessible_unknown_child_uses_the_shared_parent_walk() {
+        use crate::schema::{FieldPath, LeafPath, LeafPathSegment, SchemaDiagnostic, TypeError};
+        let source = "mock.test.Thing { config = { inner = {} allow = { typo = true } } }";
+        let parsed = super::super::parse_file(
+            source,
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let mut misses = Vec::new();
+        for (case, segments) in [
+            vec![
+                LeafPathSegment::StructField("inner".into()),
+                LeafPathSegment::StructField("missing".into()),
+            ],
+            vec![
+                LeafPathSegment::MapKey(crate::resource::ValueString::diagnostic_sensitive(
+                    "PRIVATE_KEY",
+                )),
+                LeafPathSegment::StructField("missing".into()),
+            ],
+            vec![
+                LeafPathSegment::MapKey("Allow".into()),
+                LeafPathSegment::StructField("typo".into()),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = FieldPath::from_canonical_segments(segments.clone());
+            let SchemaDiagnostic::UnknownKey(key) = SchemaDiagnostic::from_value(
+                "config",
+                LeafPath::from_segments(segments),
+                TypeError::UnknownStructField {
+                    struct_name: "Config".into(),
+                    field: "missing".into(),
+                    suggestion: None,
+                },
+            ) else {
+                panic!("keyed finding")
+            };
+            match resource.locate_unknown_key(&key) {
+                Ok(finding) => assert_eq!(
+                    finding.location(),
+                    resource.attribute_path_location("config", &path)
+                ),
+                Err(_) => misses.push(case),
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "missing-child, protected-key, enum-alias lookup aborted in cases {misses:?}"
+        );
+    }
+
+    #[test]
     fn unknown_key_lookup_miss_is_an_analysis_invariant() {
-        use crate::schema::{LeafPath, LeafPathSegment, SchemaDiagnostic, TypeError};
+        use crate::schema::{SchemaDiagnostic, TypeError};
         let source = "mock.test.Thing { config = {} }";
         let parsed = super::super::parse_file(
             source,
@@ -3119,21 +3210,11 @@ mod location_tests {
         .unwrap();
         let tree = AnalysisTree::try_from_file(&parsed).unwrap();
         let resource = tree.resources().next().unwrap();
-        for diagnostic in [
-            SchemaDiagnostic::unlocated(TypeError::UnknownAttribute {
-                name: "missing".into(),
-                suggestion: None,
-            }),
-            SchemaDiagnostic::from_value(
-                "config",
-                LeafPath::from_segments([LeafPathSegment::StructField("missing".into())]),
-                TypeError::UnknownStructField {
-                    struct_name: "Config".into(),
-                    field: "missing".into(),
-                    suggestion: None,
-                },
-            ),
-        ] {
+        let diagnostic = SchemaDiagnostic::unlocated(TypeError::UnknownAttribute {
+            name: "missing".into(),
+            suggestion: None,
+        });
+        {
             let SchemaDiagnostic::UnknownKey(key) = diagnostic else {
                 panic!("keyed diagnostic")
             };

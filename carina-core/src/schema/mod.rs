@@ -256,7 +256,7 @@ use crate::value::{
 
 pub(crate) mod assignability;
 mod assignability_edges;
-mod diagnostic;
+pub(crate) mod diagnostic;
 mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
@@ -6648,7 +6648,7 @@ fn union_member_judgement_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
 }
 
 struct UnionMemberFailure {
-    error: TypeError,
+    primary: diagnostic::PrimaryValueFinding,
     diagnostic_identity: UnionDiagnosticIdentity,
 }
 
@@ -6673,12 +6673,13 @@ impl BestUnionMemberFailures {
         }
     }
 
-    fn into_error<P: PlaceholderKind, B: BindingAddress>(
+    fn into_finding<P: PlaceholderKind, B: BindingAddress>(
         self,
+        path: &FieldPath,
         value: ConcreteValueRef<'_, P, B>,
         members: UnionMembers<'_, Compiled>,
         ancestry: FieldAncestry,
-    ) -> TypeError {
+    ) -> diagnostic::PrimaryValueFinding {
         let BestUnionMemberFailures {
             failure_rank: _,
             first,
@@ -6700,7 +6701,8 @@ impl BestUnionMemberFailures {
         };
 
         let Some((map, alternatives)) = struct_context else {
-            return TypeError::from_union_member_failures(first, tied);
+            let primary = first.primary.clone();
+            return primary.union_error(path, TypeError::from_union_member_failures(first, tied));
         };
         let mut failures = Vec::with_capacity(tied.len() + 1);
         failures.push(first);
@@ -6716,15 +6718,21 @@ impl BestUnionMemberFailures {
             .iter()
             .enumerate()
             .filter_map(|(index, failure)| {
-                matches!(failure.error, TypeError::FieldGroupViolation { .. }).then_some(index)
+                matches!(
+                    failure.primary.error(),
+                    TypeError::FieldGroupViolation { .. }
+                )
+                .then_some(index)
             })
             .collect::<Vec<_>>();
         if let [index] = group_failure_indices.as_slice() {
-            return failures.swap_remove(*index).error;
+            return failures.swap_remove(*index).primary.in_container(path);
         }
         if !group_failure_indices.is_empty() {
             let first = failures.remove(0);
-            return TypeError::from_union_member_failures(first, failures);
+            let primary = first.primary.clone();
+            return primary
+                .union_error(path, TypeError::from_union_member_failures(first, failures));
         }
 
         // One non-empty recognized-field identity is a unique relevant arm,
@@ -6746,7 +6754,8 @@ impl BestUnionMemberFailures {
         if non_empty_count == 1 {
             return failures
                 .swap_remove(sole_non_empty.expect("one non-empty identity has an index"))
-                .error;
+                .primary
+                .in_container(path);
         }
 
         let recognizable_fields = RecognizedStructFields::union(failures.iter().map(|failure| {
@@ -6776,11 +6785,14 @@ impl BestUnionMemberFailures {
             }
         };
 
-        TypeError::UnionStructMismatch {
-            reason,
-            supplied_fields: map.keys().cloned().collect(),
-            alternatives,
-        }
+        diagnostic::PrimaryValueFinding::new(
+            path.clone(),
+            TypeError::UnionStructMismatch {
+                reason,
+                supplied_fields: map.keys().cloned().collect(),
+                alternatives,
+            },
+        )
     }
 }
 
@@ -8250,7 +8262,10 @@ impl TypeError {
         first: UnionMemberFailure,
         rest: impl IntoIterator<Item = UnionMemberFailure>,
     ) -> Self {
-        Self::from_union_arm_errors(first.error, rest.into_iter().map(|failure| failure.error))
+        Self::from_union_arm_errors(
+            first.primary.into_error(),
+            rest.into_iter().map(|failure| failure.primary.into_error()),
+        )
     }
 
     fn from_union_arm_errors(first: TypeError, rest: impl IntoIterator<Item = TypeError>) -> Self {
@@ -16685,7 +16700,7 @@ impl PatternResourceSchema<Compiled> {
                     value,
                 );
                 for (index, primary) in findings.primary_findings().enumerate() {
-                    let error = &primary.error;
+                    let error = primary.error();
                     let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
                         && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
@@ -16694,14 +16709,9 @@ impl PatternResourceSchema<Compiled> {
                     } else {
                         tagged
                     };
-                    let diagnostic = if diagnostic::is_unknown_key(error) {
-                        primary.diagnostic(name, reshaped)
-                    } else if let Some((path, _)) = findings.located.get(index) {
-                        // Preserve ordinary symbolic coverage's established path policy.
-                        SchemaDiagnostic::from_value(name, path.clone(), reshaped)
-                    } else {
-                        SchemaDiagnostic::unlocated(reshaped)
-                    };
+                    let diagnostic = primary
+                        .diagnostic(name, reshaped)
+                        .with_coverage(findings.located.get(index).map(|(path, _)| path));
                     report.errors.push(diagnostic);
                 }
                 for (path, error) in &findings.provider {

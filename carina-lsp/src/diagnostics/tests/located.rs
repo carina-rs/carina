@@ -452,7 +452,7 @@ fn unknown_key_keeps_its_selected_union_arm_location_in_the_lsp() {
 }
 
 #[test]
-fn missing_unknown_key_is_an_analysis_invariant_in_the_lsp() {
+fn missing_unknown_child_keeps_the_nearest_authored_parent_in_the_lsp() {
     use carina_core::schema::{AttributeType, ValidatedConfigSchema};
     let source = create_document_at(
         "mock.test.Thing { config = {} }",
@@ -481,11 +481,14 @@ fn missing_unknown_key_is_an_analysis_invariant_in_the_lsp() {
         findings,
     );
     assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
     assert!(
-        diagnostics[0]
-            .message
-            .contains("missing unknown attribute key provenance")
+        diagnostics[0].message.contains("Unknown field"),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 18), Position::new(0, 24))
     );
 }
 

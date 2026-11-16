@@ -1,36 +1,83 @@
 //! Schema findings retain the target that the parser, rather than a client, locates.
 
-use super::{FieldPath, LeafPath, TypeError};
+use super::{
+    FieldPath, FieldPathDirection, FieldPathStep, LeafPath, LeafPathSegment, RedactedPathField,
+    SECRET_VALUE_MASK, TypeError,
+};
+use crate::resource::InsideSecret;
 
 /// A schema diagnostic with an explicit location contract for unknown keys.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SchemaDiagnostic {
     UnknownKey(KeyedSchemaFinding),
     Other(OtherSchemaFinding),
 }
 
 /// An unknown input key. Only the parser resolves its opaque target.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KeyedSchemaFinding {
     pub(crate) key: SchemaDiagnosticKey,
     error: TypeError,
 }
 
-#[derive(Clone)]
-pub(crate) struct SchemaDiagnosticKey {
-    pub(crate) root: String,
-    pub(crate) relative: LeafPath,
+#[derive(Clone, PartialEq)]
+pub(crate) enum SchemaDiagnosticKey {
+    Attribute {
+        name: String,
+    },
+    Value {
+        root: String,
+        relative: SchemaKeyPath,
+        coverage: Option<LeafPath>,
+    },
 }
 
 impl std::fmt::Debug for SchemaDiagnosticKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Location provenance can retain a key whose diagnostic text is redacted.
         formatter.write_str("SchemaDiagnosticKey(..)")
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub(crate) enum SchemaKeyPath {
+    Key(FieldPath),
+    SecretParent(FieldPath),
+}
+
+impl SchemaKeyPath {
+    fn new(path: &FieldPath) -> Self {
+        // A protected map key cannot be entered by the location index. Retain
+        // only its public prefix and a marker, never its runtime bytes/suffix.
+        let canonical = path.canonical();
+        let mut prefix = FieldPath::new();
+        for (step, segment) in path.steps().iter().zip(canonical.segments()) {
+            if matches!(step, FieldPathStep::Redacted(_)) {
+                return Self::Key(secret_parent(&prefix));
+            }
+            prefix = prefix.pushed(step.clone(), segment.clone(), FieldPathDirection::After);
+        }
+        Self::Key(path.clone())
+    }
+
+    pub(crate) fn path(&self) -> &FieldPath {
+        match self {
+            Self::Key(path) | Self::SecretParent(path) => path,
+        }
+    }
+}
+
+fn secret_parent(path: &FieldPath) -> FieldPath {
+    // An unenterable step lets the existing parser walk select the authored
+    // parent, including the anchor of a nested secret() expression.
+    path.pushed(
+        FieldPathStep::Redacted(RedactedPathField::SecretValue),
+        LeafPathSegment::StructField(SECRET_VALUE_MASK.into()),
+        FieldPathDirection::After,
+    )
+}
+
 /// A diagnostic whose established location policy remains with its adapter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OtherSchemaFinding {
     error: TypeError,
     path: Option<(String, LeafPath)>,
@@ -56,6 +103,13 @@ impl SchemaDiagnostic {
         }
     }
 
+    fn into_error(self) -> TypeError {
+        match self {
+            Self::UnknownKey(finding) => finding.error,
+            Self::Other(finding) => finding.error,
+        }
+    }
+
     pub(crate) fn unlocated(error: TypeError) -> Self {
         if let TypeError::UnknownAttribute { name, .. } = &error {
             return Self::from_value(name.clone(), LeafPath::from_segments([]), error);
@@ -68,54 +122,141 @@ impl SchemaDiagnostic {
         relative: LeafPath,
         error: TypeError,
     ) -> Self {
-        let root = root.into();
+        Self::relative(
+            &FieldPath::from_canonical_segments(relative.segments().iter().cloned()),
+            error,
+        )
+        .at_attribute(&root.into())
+    }
+
+    fn relative(path: &FieldPath, error: TypeError) -> Self {
         if is_unknown_key(&error) {
-            Self::UnknownKey(KeyedSchemaFinding {
-                key: SchemaDiagnosticKey { root, relative },
-                error,
-            })
+            let key = if matches!(error, TypeError::UnknownAttribute { .. }) {
+                SchemaDiagnosticKey::Attribute {
+                    name: String::new(),
+                }
+            } else {
+                SchemaDiagnosticKey::Value {
+                    root: String::new(),
+                    relative: SchemaKeyPath::new(path),
+                    coverage: Some(path.canonical()),
+                }
+            };
+            Self::UnknownKey(KeyedSchemaFinding { key, error })
         } else {
             Self::Other(OtherSchemaFinding {
                 error,
-                path: Some((root, relative)),
+                path: Some((String::new(), path.canonical())),
             })
         }
     }
 
+    fn at_attribute(mut self, root: &str) -> Self {
+        match &mut self {
+            Self::UnknownKey(finding) => match &mut finding.key {
+                SchemaDiagnosticKey::Attribute { name } => *name = root.into(),
+                SchemaDiagnosticKey::Value { root: name, .. } => *name = root.into(),
+            },
+            Self::Other(finding) => {
+                if let Some((name, _)) = &mut finding.path {
+                    *name = root.into();
+                }
+            }
+        }
+        self
+    }
+
+    fn with_error(mut self, error: TypeError) -> Self {
+        match &mut self {
+            Self::UnknownKey(finding) => finding.error = error,
+            Self::Other(finding) => finding.error = error,
+        }
+        self
+    }
+
+    /// Ordinary paths never expose an unknown key's location target.
     pub(crate) fn path(&self) -> Option<(&str, &LeafPath)> {
         match self {
-            Self::UnknownKey(finding) => Some((&finding.key.root, &finding.key.relative)),
+            Self::UnknownKey(_) => None,
             Self::Other(finding) => finding.path(),
         }
     }
 
-    pub(super) fn from_container(root: &str, path: &FieldPath, error: TypeError) -> Self {
-        // Map summaries retain a container display path. Their structured error
-        // carries the selected value's suffix, independently of that presentation.
-        let target = if matches!(error, TypeError::MapValueError { .. }) && is_unknown_key(&error) {
-            unknown_key_path(path.clone(), &error)
-        } else {
-            path.clone()
-        };
-        Self::from_value(root, target.canonical(), error)
+    pub(super) fn coverage_path(&self) -> Option<(&str, &LeafPath)> {
+        match self {
+            Self::UnknownKey(finding) => match &finding.key {
+                SchemaDiagnosticKey::Attribute { .. } => None,
+                SchemaDiagnosticKey::Value { root, coverage, .. } => {
+                    coverage.as_ref().map(|path| (root.as_str(), path))
+                }
+            },
+            Self::Other(finding) => finding.path(),
+        }
+    }
+
+    pub(crate) fn retained_failure(&self, values: &super::ResourceValueValidation) -> bool {
+        self.coverage_path()
+            .is_some_and(|(root, _)| values.is_retained_failure(root))
+    }
+
+    pub(super) fn with_coverage(mut self, path: Option<&LeafPath>) -> Self {
+        match &mut self {
+            Self::UnknownKey(finding) => {
+                if let SchemaDiagnosticKey::Value { coverage, .. } = &mut finding.key {
+                    *coverage = path.cloned();
+                }
+            }
+            Self::Other(finding) => {
+                finding.path = finding
+                    .path
+                    .take()
+                    .and_then(|(root, _)| path.cloned().map(|path| (root, path)));
+            }
+        }
+        self
+    }
+
+    fn at_secret_boundary(&mut self, boundary: &FieldPath) {
+        if let Self::UnknownKey(finding) = self
+            && let SchemaDiagnosticKey::Value { relative, .. } = &mut finding.key
+        {
+            *relative = SchemaKeyPath::SecretParent(secret_parent(boundary));
+        }
     }
 }
 
-fn unknown_key_path(path: FieldPath, error: &TypeError) -> FieldPath {
-    match error {
-        TypeError::UnknownStructField { field, .. } => path.push_field(field),
-        TypeError::StructFieldError { field, inner } => {
-            unknown_key_path(path.push_field(field), inner)
+impl InsideSecret for SchemaDiagnostic {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::UnknownKey(mut finding) => {
+                finding.error = finding.error.inside_secret();
+                if let SchemaDiagnosticKey::Value {
+                    relative, coverage, ..
+                } = &mut finding.key
+                {
+                    *relative = match relative {
+                        SchemaKeyPath::Key(_) => {
+                            SchemaKeyPath::SecretParent(secret_parent(&FieldPath::new()))
+                        }
+                        SchemaKeyPath::SecretParent(path) => {
+                            SchemaKeyPath::SecretParent(path.clone())
+                        }
+                    };
+                    *coverage = coverage.take().map(InsideSecret::inside_secret);
+                }
+                Self::UnknownKey(finding)
+            }
+            Self::Other(finding) => Self::Other(OtherSchemaFinding {
+                error: finding.error.inside_secret(),
+                path: finding
+                    .path
+                    .map(|(root, path)| (root, path.inside_secret())),
+            }),
         }
-        TypeError::ListItemError { index, inner } => {
-            unknown_key_path(path.push_index(*index), inner)
-        }
-        TypeError::MapValueError { key, inner } => unknown_key_path(path.push_map_key(key), inner),
-        _ => path,
     }
 }
 
-pub(super) fn is_unknown_key(error: &TypeError) -> bool {
+fn is_unknown_key(error: &TypeError) -> bool {
     match error {
         TypeError::UnknownAttribute { .. } | TypeError::UnknownStructField { .. } => true,
         TypeError::StructFieldError { inner, .. }
@@ -125,64 +266,134 @@ pub(super) fn is_unknown_key(error: &TypeError) -> bool {
     }
 }
 
-/// Keep the selected error attached to its leaf as container messages wrap it.
+/// One walk-produced record, with a separate container/display path. Wrapping
+/// a message or selecting a union arm moves its record, never rebuilds a key.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PrimaryValueFinding {
     pub(super) path: FieldPath,
-    pub(super) error: TypeError,
-    key_path: Option<SchemaKeyPath>,
-}
-
-#[derive(Clone, PartialEq)]
-struct SchemaKeyPath(FieldPath);
-
-impl std::fmt::Debug for SchemaKeyPath {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SchemaKeyPath(..)")
-    }
+    diagnostic: SchemaDiagnostic,
 }
 
 impl PrimaryValueFinding {
     pub(super) fn new(path: FieldPath, error: TypeError) -> Self {
-        let key_path = is_unknown_key(&error).then(|| SchemaKeyPath(path.clone()));
         Self {
+            diagnostic: SchemaDiagnostic::relative(&path, error),
             path,
-            error,
-            key_path,
         }
     }
-
-    pub(super) fn from_container(path: FieldPath, error: TypeError) -> Self {
-        let key_path =
-            is_unknown_key(&error).then(|| SchemaKeyPath(unknown_key_path(path.clone(), &error)));
-        Self {
-            path,
+    pub(super) fn error(&self) -> &TypeError {
+        self.diagnostic.error()
+    }
+    pub(super) fn into_error(self) -> TypeError {
+        self.diagnostic.into_error()
+    }
+    pub(super) fn map_error(mut self, wrap: impl FnOnce(TypeError) -> TypeError) -> Self {
+        let error = wrap(self.error().clone());
+        self.diagnostic = self.diagnostic.with_error(error);
+        self
+    }
+    pub(super) fn in_container(mut self, path: &FieldPath) -> Self {
+        self.path = path.clone();
+        self.diagnostic = self.diagnostic.with_coverage(Some(&path.canonical()));
+        self
+    }
+    pub(super) fn union_error(self, path: &FieldPath, error: TypeError) -> Self {
+        if matches!(
             error,
-            key_path,
+            TypeError::UnionAlternativesMismatch { .. } | TypeError::UnionStructMismatch { .. }
+        ) {
+            Self::new(path.clone(), error)
+        } else {
+            self.map_error(|_| error).in_container(path)
         }
     }
-
-    pub(super) fn key_path(&self) -> &FieldPath {
-        self.key_path.as_ref().map_or(&self.path, |key| &key.0)
-    }
-
     pub(super) fn diagnostic(&self, root: &str, error: TypeError) -> SchemaDiagnostic {
-        SchemaDiagnostic::from_value(root, self.key_path().canonical(), error)
+        self.diagnostic.clone().with_error(error).at_attribute(root)
+    }
+    pub(super) fn into_diagnostic(self, root: &str) -> (FieldPath, SchemaDiagnostic) {
+        (self.path, self.diagnostic.at_attribute(root))
+    }
+    pub(super) fn at_secret_boundary(&mut self, boundary: &FieldPath) {
+        self.diagnostic.at_secret_boundary(boundary);
     }
 }
 
-impl crate::resource::InsideSecret for PrimaryValueFinding {
+impl InsideSecret for PrimaryValueFinding {
     fn inside_secret(self) -> Self {
         Self {
             path: self.path.inside_secret(),
-            error: self.error.inside_secret(),
-            key_path: self.key_path,
+            diagnostic: self.diagnostic.inside_secret(),
         }
     }
 }
 
 impl std::fmt::Display for PrimaryValueFinding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(formatter)
+        self.error().fmt(formatter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::InsideSecret;
+
+    fn target(finding: &PrimaryValueFinding) -> &FieldPath {
+        let SchemaDiagnostic::UnknownKey(KeyedSchemaFinding {
+            key: SchemaDiagnosticKey::Value { relative, .. },
+            ..
+        }) = &finding.diagnostic
+        else {
+            panic!("nested unknown key")
+        };
+        relative.path()
+    }
+
+    #[test]
+    fn protected_map_key_target_drops_runtime_key_and_suffix() {
+        use super::super::LeafPathSegment;
+        let finding = PrimaryValueFinding::new(
+            FieldPath::from_canonical_segments([
+                LeafPathSegment::MapKey(crate::resource::ValueString::diagnostic_sensitive(
+                    "PRIVATE_KEY",
+                )),
+                LeafPathSegment::StructField("PRIVATE_FIELD".into()),
+            ]),
+            TypeError::UnknownStructField {
+                struct_name: "Entry".into(),
+                field: "PRIVATE_FIELD".into(),
+                suggestion: None,
+            },
+        );
+        let path = target(&finding).canonical();
+        assert!(
+            path.segments().iter().all(|segment| match segment {
+                LeafPathSegment::MapKey(key) => !key.expose_plaintext().contains("PRIVATE"),
+                LeafPathSegment::StructField(field) => !field.contains("PRIVATE"),
+                LeafPathSegment::ListIndex(_) => true,
+            }),
+            "target retains protected runtime bytes"
+        );
+        assert!(target(&finding).steps().len() <= 1);
+    }
+
+    #[test]
+    fn secret_unknown_key_target_does_not_retain_plaintext() {
+        let finding = PrimaryValueFinding::new(
+            FieldPath::new()
+                .push_map_key("PRIVATE_KEY")
+                .push_field("PRIVATE_FIELD"),
+            TypeError::UnknownStructField {
+                struct_name: "Entry".into(),
+                field: "PRIVATE_FIELD".into(),
+                suggestion: None,
+            },
+        )
+        .inside_secret();
+        assert!(!target(&finding).to_string().contains("PRIVATE"));
+        assert!(
+            target(&finding).steps().len() <= 1,
+            "truncate at the protected boundary"
+        );
     }
 }

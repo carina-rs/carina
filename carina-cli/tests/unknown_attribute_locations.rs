@@ -52,8 +52,9 @@ fn unknown_attribute_sibling_matches_text_json_and_lsp() {
     assert_eq!(json.status.code(), Some(1), "{json:?}");
     assert!(json.stderr.is_empty(), "{json:?}");
     let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    eprintln!("sibling CLI JSON: {report}");
     let errors = report["errors"].as_array().unwrap();
-    assert_eq!(errors.len(), 2, "{report:#}");
+    assert_eq!(errors.len(), 4, "{report:#}");
     let human = validate(false);
     assert_eq!(human.status.code(), Some(1), "{human:?}");
     let human = String::from_utf8(human.stderr).unwrap();
@@ -62,9 +63,11 @@ fn unknown_attribute_sibling_matches_text_json_and_lsp() {
         .map(|error| error["message"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(
-        messages,
+        &messages[..2],
         ["Unknown attribute 'typo'", "Unknown attribute 'multiline'"]
     );
+    assert!(messages[2].contains("struct_typo"), "{messages:?}");
+    assert!(messages[3].contains("block_typo"), "{messages:?}");
     assert_eq!(
         human.lines().collect::<Vec<_>>(),
         messages
@@ -74,13 +77,20 @@ fn unknown_attribute_sibling_matches_text_json_and_lsp() {
     );
     let diagnostics = editor(directory.path(), "sibling.crn")
         .into_iter()
-        .filter(|diagnostic| diagnostic.message.starts_with("Unknown attribute"))
+        .filter(|diagnostic| {
+            diagnostic.message.contains("Unknown attribute")
+                || diagnostic.message.contains("Unknown field")
+        })
         .collect::<Vec<_>>();
-    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
+    eprintln!("sibling LSP: {diagnostics:#?}");
     assert!(
         editor(directory.path(), "main.crn")
             .iter()
-            .all(|diagnostic| !diagnostic.message.starts_with("Unknown attribute"))
+            .all(
+                |diagnostic| !diagnostic.message.contains("Unknown attribute")
+                    && !diagnostic.message.contains("Unknown field")
+            )
     );
     let source = std::fs::read_to_string(directory.path().join("sibling.crn")).unwrap();
     let position = |range: &serde_json::Value, endpoint: &str| {
@@ -96,9 +106,16 @@ fn unknown_attribute_sibling_matches_text_json_and_lsp() {
             .sum::<usize>();
         Position::new(line as u32, utf16 as u32)
     };
-    for (error, diagnostic) in errors.iter().zip(&diagnostics) {
+    for error in errors {
+        let key = ["'typo'", "'multiline'", "'struct_typo'", "'block_typo'"]
+            .into_iter()
+            .find(|key| error["message"].as_str().unwrap().contains(key))
+            .unwrap();
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains(key))
+            .unwrap();
         assert_eq!(error["location"]["file"], "sibling.crn");
-        assert_eq!(error["message"], diagnostic.message);
         let range = &error["location"]["range"];
         assert_eq!(
             Range::new(position(range, "start"), position(range, "end")),

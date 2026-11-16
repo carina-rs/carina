@@ -728,7 +728,7 @@ fn typed_ref_int_apply_rejects_unknown_out_of_range_output_before_consumer_creat
         };
         assert!(
             matches!(
-                errors.errors(),
+                errors.errors().as_slice(),
                 [TypeError::ValueOutOfRange {
                     value: DiagnosticNumber::Int(actual),
                     bounds: NumericRangeBounds::Int { min: Some(1), max: Some(1024) },
