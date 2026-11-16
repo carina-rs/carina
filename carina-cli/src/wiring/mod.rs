@@ -5351,14 +5351,10 @@ pub(crate) fn validate_module_internal_ref_types(
 /// Present the loader's typed sets in main's category-first order, retaining
 /// depth-first directory order within each category. No body is reclassified.
 pub(crate) fn validate_module_boundaries(module_walk: &ModuleWalk) -> Vec<AppError> {
-    carina_core::module_resolver::ModuleProhibitionCategory::ALL
+    let mut rejections = module_walk.rejections().iter().collect::<Vec<_>>();
+    rejections.sort_by_key(|rejection| rejection.category);
+    rejections
         .into_iter()
-        .flat_map(|category| {
-            module_walk
-                .rejections()
-                .iter()
-                .filter(move |rejection| rejection.category == category)
-        })
         .map(crate::module_walk::RejectedModuleAtPath::diagnostic)
         .collect()
 }

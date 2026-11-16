@@ -1,0 +1,3 @@
+arguments { n: Int = 1 }
+attributes { value: String = 'one' }
+let looped = use { source = '../cycle-child' }

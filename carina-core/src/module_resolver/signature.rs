@@ -119,31 +119,10 @@ pub fn load_resolved_module_signatures_with_overrides<E, B: crate::resource::Bin
             // retain the providerless declaration snapshot: call-site
             // arguments still need the signature so their independent
             // boundary errors are reported alongside the body diagnostic.
-            let loaded =
-                match super::loader::load_signature_source_with_overrides(&path, config, overrides)
-                {
-                    Ok(module) => Some(module),
-                    Err(super::loader::ModuleLoadError::NotModule {
-                        error: _,
-                        imports: _,
-                        signature: _,
-                    }) => None,
-                    Err(super::loader::ModuleLoadError::Unavailable(_)) => {
-                        match super::loader::load_signature_source_with_overrides(
-                            &path,
-                            &ProviderContext::new(config.environment.clone()),
-                            overrides,
-                        ) {
-                            Ok(module) => Some(module),
-                            Err(super::loader::ModuleLoadError::NotModule {
-                                error: _,
-                                imports: _,
-                                signature: _,
-                            }) => None,
-                            Err(super::loader::ModuleLoadError::Unavailable(_)) => None,
-                        }
-                    }
-                };
+            let loaded = super::loader::load_resolved_signature_source_with_overrides(
+                &path, config, overrides,
+            )
+            .ok();
             loaded.map(|source| {
                 (
                     import.alias.clone(),

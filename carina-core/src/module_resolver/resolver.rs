@@ -291,6 +291,7 @@ impl ResidualModuleResolutionError {
                 error: _,
                 warnings: _,
             }
+            | ModuleError::ImportProhibitions(_)
             | ModuleError::AtImport {
                 location: _,
                 error: _,
@@ -431,7 +432,8 @@ impl ResidualModuleResolutionError {
             ModuleError::NotADirectory { path: _path } => {
                 Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
-            ModuleError::AtImport {
+            ModuleError::ImportProhibitions(_)
+            | ModuleError::AtImport {
                 location: _,
                 error: _,
             }
@@ -514,7 +516,8 @@ impl ResidualModuleResolutionError {
                 self.finding_owns_error(finding)
                     && finding.message().covers_unknown_argument(module, argument)
             }),
-            ModuleError::AtImport {
+            ModuleError::ImportProhibitions(_)
+            | ModuleError::AtImport {
                 location: _,
                 error: _,
             }
@@ -699,14 +702,11 @@ fn without_covered_reference_type_members(
                 .filter_map(|error| without_covered_reference_type_members(error, findings))
                 .collect(),
         ),
-        ModuleError::AtImport { location, error } => {
-            without_covered_reference_type_members(*error, findings).map(|error| {
-                ModuleError::AtImport {
-                    location,
-                    error: Box::new(error),
-                }
-            })
-        }
+        error @ (ModuleError::ImportProhibitions(_)
+        | ModuleError::AtImport {
+            location: _,
+            error: _,
+        }) => Some(error),
         ModuleError::OwnedByCalls { calls, error } => {
             without_covered_reference_type_members(*error, findings).map(|error| {
                 ModuleError::OwnedByCalls {
@@ -1388,10 +1388,6 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let loaded = self.load_directory_module(&full_path);
         let mut parsed = match loaded {
             Ok(parsed) => parsed,
-            Err(ModuleError::NoConfigurationFiles { path: _ }) => {
-                self.resolving.remove(&canonical);
-                return Err(ModuleError::NotFound(path.to_string()));
-            }
             Err(error) => {
                 self.resolving.remove(&canonical);
                 return Err(error);

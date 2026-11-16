@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use carina_core::module_resolver::{
-    self, LoadedModule, ModuleError, ModuleLoadError, ModuleProhibitionCategory, ModuleRejection,
+    self, ModuleBodyAnalysis, ModuleError, ModuleLoadError, ModuleProhibitionCategory,
+    ModuleRejection, PartialModule, PartialModuleAnalysis,
 };
 use carina_core::paths::{CanonicalPath, DisplayPath, ResolvedPath};
 
@@ -12,7 +13,7 @@ pub(crate) struct LoadedModuleAtPath {
     diagnostic_path: PathBuf,
     diagnostic_base: ResolvedPath,
     module_path: ResolvedPath,
-    loaded: LoadedModule,
+    loaded: PartialModule,
 }
 
 impl LoadedModuleAtPath {
@@ -28,7 +29,7 @@ impl LoadedModuleAtPath {
         &self.module_path
     }
 
-    pub(crate) fn loaded(&self) -> &LoadedModule {
+    pub(crate) fn loaded(&self) -> &PartialModule {
         &self.loaded
     }
 }
@@ -36,7 +37,7 @@ impl LoadedModuleAtPath {
 pub(crate) struct RejectedModuleAtPath {
     pub(crate) label: DisplayPath,
     pub(crate) error: std::sync::Arc<ModuleError>,
-    pub(crate) category: ModuleProhibitionCategory,
+    pub(crate) category: Option<ModuleProhibitionCategory>,
 }
 
 impl RejectedModuleAtPath {
@@ -87,6 +88,7 @@ impl ModuleWalk {
                     diagnostic_path: Path::new(&import.path),
                     diagnostic_base: &base_dir,
                     owners: &owners,
+                    ordinary_owners: &owners,
                     import_location: import.declaration_location(),
                 },
                 &mut visited,
@@ -112,6 +114,7 @@ struct ModuleVisit<'a> {
     diagnostic_path: &'a Path,
     diagnostic_base: &'a ResolvedPath,
     owners: &'a [carina_core::parser::ModuleCallId],
+    ordinary_owners: &'a [carina_core::parser::ModuleCallId],
     import_location: &'a carina_core::parser::DeclarationLocation,
 }
 
@@ -121,6 +124,7 @@ fn visit_module(
         diagnostic_path,
         diagnostic_base,
         owners,
+        ordinary_owners,
         import_location,
     }: ModuleVisit<'_>,
     visited: &mut HashSet<CanonicalPath>,
@@ -132,24 +136,71 @@ fn visit_module(
         return;
     }
 
-    let imports = match module_resolver::load_module_with_diagnostics_and_schemas(
+    let mut child_calls =
+        std::collections::HashMap::<String, Vec<carina_core::parser::ModuleCallId>>::new();
+    let imports = match module_resolver::load_partial_module_analysis_with_schemas(
         module_path,
         context,
         schemas,
         &diagnostic_base.source_label(),
     ) {
-        Ok(loaded) => {
-            let imports = loaded.parsed().uses.clone();
-            walk.modules.push(LoadedModuleAtPath {
-                diagnostic_path: diagnostic_path.to_path_buf(),
-                diagnostic_base: diagnostic_base.clone(),
-                module_path: module_path.clone(),
-                loaded,
-            });
+        Ok(PartialModuleAnalysis {
+            imports,
+            prohibitions,
+            body,
+            signature: _,
+        }) => {
+            if let Some(prohibitions) = prohibitions {
+                walk.rejections.extend(
+                    prohibitions
+                        .into_owned_errors(import_location.clone(), owners.to_vec())
+                        .into_iter()
+                        .map(|(category, error)| RejectedModuleAtPath {
+                            label: DisplayPath::for_diagnostics_from(
+                                diagnostic_path,
+                                diagnostic_base,
+                            ),
+                            error: std::sync::Arc::new(error),
+                            category: Some(category),
+                        }),
+                );
+            }
+            match body {
+                ModuleBodyAnalysis::Available(loaded) => {
+                    for call in &loaded.parsed().module_calls {
+                        child_calls
+                            .entry(call.module_name.clone())
+                            .or_default()
+                            .push(call.id().clone());
+                    }
+                    walk.modules.push(LoadedModuleAtPath {
+                        diagnostic_path: diagnostic_path.to_path_buf(),
+                        diagnostic_base: diagnostic_base.clone(),
+                        module_path: module_path.clone(),
+                        loaded,
+                    });
+                }
+                ModuleBodyAnalysis::ProhibitionsOnly | ModuleBodyAnalysis::Unavailable => {}
+            }
             imports
         }
-        // Preserve the existing static walk policy for unreadable/broken
-        // modules. The strict resolver still reports these typed failures.
+        Err(ModuleLoadError::Partial {
+            prohibitions,
+            imports,
+            signature: _,
+        }) => {
+            walk.rejections.extend(
+                prohibitions
+                    .into_owned_errors(import_location.clone(), owners.to_vec())
+                    .into_iter()
+                    .map(|(category, error)| RejectedModuleAtPath {
+                        label: DisplayPath::for_diagnostics_from(diagnostic_path, diagnostic_base),
+                        error: std::sync::Arc::new(error),
+                        category: Some(category),
+                    }),
+            );
+            imports
+        }
         Err(ModuleLoadError::Unavailable(_)) => return,
         Err(ModuleLoadError::NotModule {
             error,
@@ -157,10 +208,23 @@ fn visit_module(
             signature: _,
         }) => {
             match *error {
-                // Main's static walk skips ordinary load failures; the
-                // resolver owns their messages and call/file locations.
-                ModuleRejection::NotADirectory { path: _ }
-                | ModuleRejection::NoConfigurationFiles { path: _ } => return,
+                ModuleRejection::NotADirectory { path: _ } => return,
+                rejection @ ModuleRejection::NoConfigurationFiles { path: _ } => {
+                    walk.rejections
+                        .extend(rejection.into_errors().into_iter().map(|error| {
+                            RejectedModuleAtPath {
+                                label: DisplayPath::for_diagnostics_from(
+                                    diagnostic_path,
+                                    diagnostic_base,
+                                ),
+                                error: std::sync::Arc::new(error.with_import_owners(
+                                    import_location.clone(),
+                                    ordinary_owners.to_vec(),
+                                )),
+                                category: None,
+                            }
+                        }));
+                }
                 ModuleRejection::Prohibited(prohibitions) => {
                     walk.rejections.extend(
                         prohibitions
@@ -172,7 +236,7 @@ fn visit_module(
                                     diagnostic_base,
                                 ),
                                 error: std::sync::Arc::new(error),
-                                category,
+                                category: Some(category),
                             }),
                     );
                 }
@@ -186,17 +250,23 @@ fn visit_module(
             Some((
                 module_path.join(&import.path).ok()?,
                 diagnostic_path.join(&import.path),
+                if ordinary_owners.is_empty() {
+                    child_calls.remove(&import.alias).unwrap_or_default()
+                } else {
+                    ordinary_owners.to_vec()
+                },
             ))
         })
         .collect();
 
-    for (child_module_path, child_diagnostic_path) in child_paths {
+    for (child_module_path, child_diagnostic_path, child_ordinary_owners) in child_paths {
         visit_module(
             ModuleVisit {
                 module_path: &child_module_path,
                 diagnostic_path: &child_diagnostic_path,
                 diagnostic_base,
                 owners,
+                ordinary_owners: &child_ordinary_owners,
                 import_location,
             },
             visited,
@@ -302,7 +372,7 @@ mod unavailable_tests {
 mod rejected_import_tests {
     use super::*;
     #[test]
-    fn ordinary_rejected_imports_are_left_to_the_resolver() {
+    fn empty_import_is_a_typed_static_rejection_without_a_use_anchor() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("not-a-directory.crn"), "// file\n").unwrap();
         std::fs::create_dir(directory.path().join("empty")).unwrap();
@@ -318,8 +388,17 @@ mod rejected_import_tests {
             &environment,
             &carina_core::schema::SchemaRegistry::new(),
         );
-        assert!(walk.rejections().is_empty());
-        assert!(crate::wiring::validate_module_boundaries(&walk).is_empty());
+        assert_eq!(walk.rejections().len(), 1);
+        let rejection = &walk.rejections()[0];
+        assert!(matches!(
+            rejection.error.root_cause(),
+            module_resolver::ModuleError::NoConfigurationFiles { path: _ }
+        ));
+        assert!(matches!(
+            rejection.error.call_source(),
+            module_resolver::ModuleErrorCallSource::Unavailable
+        ));
+        assert_eq!(crate::wiring::validate_module_boundaries(&walk).len(), 1);
     }
 
     #[test]

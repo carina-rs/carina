@@ -456,7 +456,12 @@ impl CompletionProvider {
             &module_path.source_label(),
         ) {
             Ok(module) => Some(module),
-            Err(carina_core::module_resolver::ModuleLoadError::Unavailable(_))
+            Err(carina_core::module_resolver::ModuleLoadError::Partial {
+                prohibitions: _,
+                imports: _,
+                signature: _,
+            })
+            | Err(carina_core::module_resolver::ModuleLoadError::Unavailable(_))
             | Err(carina_core::module_resolver::ModuleLoadError::NotModule {
                 error: _,
                 imports: _,
@@ -669,12 +674,13 @@ impl CompletionProvider {
         if let Some(path) = import_path.as_deref()
             && let Some(base) = base_path
             && let Ok(module_path) = base.join(path)
-            && let Ok(parsed) = carina_core::module_resolver::load_module_signature_with_schemas(
-                &module_path,
-                provider_ctx,
-                &carina_core::schema::SchemaRegistry::new(),
-                &module_path.source_label(),
-            )
+            && let Ok(parsed) =
+                carina_core::module_resolver::load_partial_module_signature_with_schemas(
+                    &module_path,
+                    provider_ctx,
+                    &carina_core::schema::SchemaRegistry::new(),
+                    &module_path.source_label(),
+                )
             && !parsed.arguments.is_empty()
         {
             let mut snippet = format!("{} {{\n", binding);

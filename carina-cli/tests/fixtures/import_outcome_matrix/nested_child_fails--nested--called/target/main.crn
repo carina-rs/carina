@@ -1,0 +1,4 @@
+arguments { n: Int = 1 }
+attributes { value: String = 'one' }
+let child = use { source = '../missing-child' }
+child {}

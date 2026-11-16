@@ -1,0 +1,5 @@
+Error: ../rooted: state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.
+Error: ../rooted: upstream_state declarations are not allowed inside modules. Define upstream_state declarations at the root configuration level.
+Error: ../rooted: exports blocks are not allowed inside modules. Define exports at the root configuration level.
+Error: ../rooted/errors.crn at line 1
+Error: attribute 'bad': unknown custom type 'TotallyMadeUpType'

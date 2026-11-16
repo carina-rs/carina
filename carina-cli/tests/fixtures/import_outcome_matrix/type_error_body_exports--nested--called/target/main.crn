@@ -1,0 +1,3 @@
+arguments { n: Int = 1 }
+attributes { bad: TotallyMadeUpType = 'one' }
+exports { value = 'one' }

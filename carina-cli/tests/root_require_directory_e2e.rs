@@ -2128,7 +2128,16 @@ fn template_blocks_state_command(args: &[&str]) {
         ("require false, 'PRIVATE_GUARD'", "require statement"),
         ("arguments {}", "arguments block"),
     ] {
-        for state in ["absent", "present", "corrupt"] {
+        enum FixtureState {
+            Absent,
+            Present,
+            Corrupt,
+        }
+        for state in [
+            FixtureState::Absent,
+            FixtureState::Present,
+            FixtureState::Corrupt,
+        ] {
             let (directory, upstream) = upstream_provider_fixture();
             fs::write(
                 upstream.join("declarations.crn"),
@@ -2136,12 +2145,11 @@ fn template_blocks_state_command(args: &[&str]) {
             )
             .unwrap();
             match state {
-                "present" => write_upstream_state(&upstream),
-                "corrupt" => {
+                FixtureState::Present => write_upstream_state(&upstream),
+                FixtureState::Corrupt => {
                     fs::write(upstream.join("carina.state.json"), "invalid state sentinel").unwrap()
                 }
-                "absent" => {}
-                _ => unreachable!(),
+                FixtureState::Absent => {}
             }
             let paths = [
                 directory.project.join("carina.state.json"),

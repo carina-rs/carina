@@ -9850,39 +9850,12 @@ impl ModuleCallChecker<'_> {
         // rejects the same declaration; its parser backstop is deduplicated
         // against this source-anchored finding.
         if let Some(mut module) = self.module_cache.get(&guard).cloned().or_else(|| {
-            use crate::module_resolver::ModuleLoadError;
-            match crate::module_resolver::loader::load_module_with_overrides(
+            crate::module_resolver::loader::load_module_body_for_checks_with_overrides(
                 &module_dir,
                 self.provider_context.as_provider_context(),
                 &self.source_overrides,
-            ) {
-                Ok(module) => Some(module),
-                Err(ModuleLoadError::NotModule {
-                    error: _,
-                    imports: _,
-                    signature: _,
-                }) => None,
-                Err(ModuleLoadError::Unavailable(_)) => {
-                    match crate::module_resolver::loader::load_module_with_overrides(
-                        &module_dir,
-                        &ProviderContext::new(
-                            self.provider_context
-                                .as_provider_context()
-                                .environment
-                                .clone(),
-                        ),
-                        &self.source_overrides,
-                    ) {
-                        Ok(module) => Some(module),
-                        Err(ModuleLoadError::NotModule {
-                            error: _,
-                            imports: _,
-                            signature: _,
-                        }) => None,
-                        Err(ModuleLoadError::Unavailable(_)) => None,
-                    }
-                }
-            }
+            )
+            .map(crate::module_resolver::loader::PartialModule::into_parsed)
         }) {
             let resolution_errors = resolve_file_type_exprs(
                 &mut module,

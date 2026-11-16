@@ -478,22 +478,28 @@ impl HoverProvider {
 
         // Load the module to get its definition
         let module_path = base_path.join(&import_path).ok()?;
-        let module_parsed = match carina_core::module_resolver::load_module_signature_with_schemas(
-            &module_path,
-            doc.provider_context(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &module_path.source_label(),
-        ) {
-            Ok(module) => module,
-            Err(
-                carina_core::module_resolver::ModuleLoadError::NotModule {
-                    error: _,
-                    imports: _,
-                    signature: _,
-                }
-                | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
-            ) => return None,
-        };
+        let module_parsed =
+            match carina_core::module_resolver::load_partial_module_signature_with_schemas(
+                &module_path,
+                doc.provider_context(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &module_path.source_label(),
+            ) {
+                Ok(module) => module,
+                Err(
+                    carina_core::module_resolver::ModuleLoadError::NotModule {
+                        error: _,
+                        imports: _,
+                        signature: _,
+                    }
+                    | carina_core::module_resolver::ModuleLoadError::Partial {
+                        prohibitions: _,
+                        imports: _,
+                        signature: _,
+                    }
+                    | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
+                ) => return None,
+            };
 
         let mut content = format!("## {}\n\n`{}`\n", word, import_path);
 
@@ -552,22 +558,28 @@ impl HoverProvider {
 
         // Load the module to get argument definitions
         let module_path = base_path.join(&import_path).ok()?;
-        let module_parsed = match carina_core::module_resolver::load_module_signature_with_schemas(
-            &module_path,
-            doc.provider_context(),
-            &carina_core::schema::SchemaRegistry::new(),
-            &module_path.source_label(),
-        ) {
-            Ok(module) => module,
-            Err(
-                carina_core::module_resolver::ModuleLoadError::NotModule {
-                    error: _,
-                    imports: _,
-                    signature: _,
-                }
-                | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
-            ) => return None,
-        };
+        let module_parsed =
+            match carina_core::module_resolver::load_partial_module_signature_with_schemas(
+                &module_path,
+                doc.provider_context(),
+                &carina_core::schema::SchemaRegistry::new(),
+                &module_path.source_label(),
+            ) {
+                Ok(module) => module,
+                Err(
+                    carina_core::module_resolver::ModuleLoadError::NotModule {
+                        error: _,
+                        imports: _,
+                        signature: _,
+                    }
+                    | carina_core::module_resolver::ModuleLoadError::Partial {
+                        prohibitions: _,
+                        imports: _,
+                        signature: _,
+                    }
+                    | carina_core::module_resolver::ModuleLoadError::Unavailable(_),
+                ) => return None,
+            };
 
         // Find the argument matching the word
         let arg = module_parsed.arguments.iter().find(|a| a.name == word)?;

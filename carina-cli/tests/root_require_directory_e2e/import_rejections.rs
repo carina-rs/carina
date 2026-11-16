@@ -92,6 +92,98 @@ fn imported_root_pins_all_five_errors_and_call_site_on_every_transport() {
 }
 
 #[test]
+fn round31_nonroot_prohibition_keeps_body_and_call_findings() {
+    let directory = fixture();
+    fs::remove_dir_all(directory._temp.path().join("rooted")).unwrap();
+    fs::create_dir(directory._temp.path().join("rooted")).unwrap();
+    fs::write(directory._temp.path().join("rooted/main.crn"),
+        "arguments { n: Int = 1 }\nattributes { bad: TotallyMadeUpType = 'one' }\nexports { value = 'one' }\n").unwrap();
+    fs::write(directory.project.join("main.crn"),
+        "let service = use { source = '../rooted' }\nlet result = service { n = 'wrong' unexpected = 1 }\n").unwrap();
+    let output = directory.run(&["validate", "."]);
+    let text = output_text(&output);
+    assert!(text.contains("exports blocks are not allowed"), "{text}");
+    assert!(
+        text.contains("attribute 'bad': unknown custom type 'TotallyMadeUpType'"),
+        "{text}"
+    );
+    assert!(
+        text.contains("module call 'result': argument 'n': expected Int, got string 'wrong'"),
+        "{text}"
+    );
+    assert!(text.contains("Unknown argument 'unexpected'"), "{text}");
+}
+
+#[test]
+fn round31_readable_exports_precede_unreadable_sibling() {
+    let directory = fixture();
+    fs::remove_dir_all(directory._temp.path().join("rooted")).unwrap();
+    fs::create_dir(directory._temp.path().join("rooted")).unwrap();
+    fs::write(
+        directory._temp.path().join("rooted/main.crn"),
+        "arguments { n: Int = 1 }\nattributes { value: String = 'one' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory._temp.path().join("rooted/exports.crn"),
+        "exports { value: String = 'one' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory._temp.path().join("rooted/z-unreadable.crn"),
+        [0xff],
+    )
+    .unwrap();
+    let output = directory.run(&["validate", "."]);
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Error: ../rooted: exports blocks are not allowed inside modules. Define exports at the root configuration level.\n"
+    );
+}
+
+#[test]
+fn round31_nested_uncalled_prohibitions_belong_to_root_use() {
+    let directory = fixture();
+    fs::create_dir(directory.project.join("bridge")).unwrap();
+    fs::write(
+        directory.project.join("bridge/main.crn"),
+        "arguments { n: Int = 1 }\nlet inner = use { source = '../../rooted' }\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.project.join("main.crn"),
+        "let outer = use { source = './bridge' }\n",
+    )
+    .unwrap();
+    let output = directory.run(&["validate", "--json", "."]);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["errors"].as_array().unwrap().len(), 5, "{report}");
+    let snapshot = Arc::new(loaded_provider_snapshot_from_factories(
+        Arc::new(vec![Box::new(ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::memory(),
+        ))]),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    ));
+    let engine = DiagnosticEngine::new(snapshot.clone(), vec!["mock".into()]);
+    let path = directory.project.join("main.crn");
+    let document = Document::new_with_path(
+        fs::read_to_string(&path).unwrap(),
+        path.clone(),
+        Arc::new(snapshot.provider_context().as_provider_context().clone()),
+    );
+    let diagnostics = engine.analyze(&document, Some(&path));
+    assert_eq!(diagnostics.len(), 5, "{diagnostics:?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.range.start == Position::new(0, 0)),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
 fn removing_root_evidence_keeps_three_errors_on_every_transport() {
     let directory = fixture();
     for name in ["providers.crn", "backend.crn"] {
@@ -187,9 +279,15 @@ fn uncalled_prohibited_imports_pin_use_locations_on_every_transport() {
 #[test]
 fn prohibited_imports_precede_body_expression_and_type_errors_on_every_transport() {
     for root_evidence in [true, false] {
-        for body_error in [
-            "let a = 'present'\nlet broken = a ?? { inner = { leaf = 1 } }\n",
-            "attributes { bad: TotallyMadeUpType = 'one' }\n",
+        for (body_error, nonroot_prefix) in [
+            (
+                "let a = 'present'\nlet broken = a ?? { inner = { leaf = 1 } }\n",
+                "three",
+            ),
+            (
+                "attributes { bad: TotallyMadeUpType = 'one' }\n",
+                "three-body-type",
+            ),
         ] {
             let directory = fixture();
             if !root_evidence {
@@ -198,7 +296,11 @@ fn prohibited_imports_precede_body_expression_and_type_errors_on_every_transport
                 }
             }
             fs::write(directory._temp.path().join("rooted/errors.crn"), body_error).unwrap();
-            let prefix = if root_evidence { "five" } else { "three" };
+            let prefix = if root_evidence {
+                "five"
+            } else {
+                nonroot_prefix
+            };
             let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/import_root_boundary");
             assert_transports(
@@ -211,7 +313,8 @@ fn prohibited_imports_precede_body_expression_and_type_errors_on_every_transport
     }
 }
 
-// Golden results measured on cc33cf977, including child syntax routing.
+// Ordinary values remain main. The empty-directory case uses decision C's
+// typed error while preserving main's null location and absent use anchor.
 #[test]
 fn ordinary_uncalled_imports_match_main_on_every_transport() {
     type MainImportCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
@@ -280,7 +383,7 @@ Error:   = expected discard_pattern or identifier
         (
             "uncalled-empty",
             &[],
-            r###"Error: Module resolution error: Module not found: ../target
+            r###"Error: ../target: No .crn files found in ../target
 "###,
             r###"{
   "status": "error",
@@ -288,7 +391,7 @@ Error:   = expected discard_pattern or identifier
   "resources": [],
   "errors": [
     {
-      "message": "Module not found: ../target",
+      "message": "../target: No .crn files found in ../target",
       "severity": "error",
       "code": null,
       "location": null

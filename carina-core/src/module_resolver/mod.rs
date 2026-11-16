@@ -39,12 +39,14 @@ mod validation;
 pub use error::{DiagnosticLine, ModuleError, ModuleErrorCallSource, ModuleErrorDiagnostic};
 pub use expander::{instance_prefix_for_call, reconcile_anonymous_module_instances};
 pub use loader::{
-    LoadedModule, ModuleLoadError, ModuleProhibition, ModuleProhibitionCategory,
-    ModuleProhibitions, ModuleRejection, ModuleSignatureSource, ModuleSignatureView,
-    ModuleTemplate, ModuleTemplatePreflight, derive_module_name, get_parsed_file,
+    LoadedModule, ModuleBodyAnalysis, ModuleLoadError, ModuleProhibition,
+    ModuleProhibitionCategory, ModuleProhibitions, ModuleRejection, ModuleSignatureSource,
+    ModuleSignatureView, ModuleTemplate, ModuleTemplatePreflight, PartialModule,
+    PartialModuleAnalysis, PartialModuleSignatureSource, derive_module_name, get_parsed_file,
     load_directory_module, load_module, load_module_from_directory,
     load_module_signature_with_schemas, load_module_with_diagnostics,
-    load_module_with_diagnostics_and_schemas,
+    load_module_with_diagnostics_and_schemas, load_partial_module_analysis_with_schemas,
+    load_partial_module_signature_with_schemas,
 };
 pub(crate) use resolver::{
     AuthoredModuleGraph, expand_root_directory_file, resolve_upstream_modules_with_config,

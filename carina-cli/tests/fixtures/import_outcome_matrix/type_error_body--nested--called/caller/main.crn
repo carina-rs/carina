@@ -1,0 +1,3 @@
+let outer = use { source = '../bridge' }
+let outer_result = outer {}
+

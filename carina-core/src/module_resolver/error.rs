@@ -15,13 +15,73 @@ use super::validation::ModuleConstraintDiagnostic;
 #[derive(Debug)]
 pub struct MultipleModuleErrors {
     errors: Vec<ModuleError>,
-    group: ModuleErrorGroup,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ModuleErrorGroup {
-    Resolution,
-    ImportProhibitions,
+/// Proof that every member came from the loader's one prohibition producer.
+/// Consumers cannot turn arbitrary resolver errors into import anchors.
+#[derive(Debug)]
+pub struct ImportProhibitionGroup {
+    source: super::loader::ModuleProhibitions,
+    error: Box<ModuleError>,
+}
+impl std::ops::Deref for ImportProhibitionGroup {
+    type Target = ModuleError;
+    fn deref(&self) -> &Self::Target {
+        &self.error
+    }
+}
+impl std::fmt::Display for ImportProhibitionGroup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+impl ImportProhibitionGroup {
+    fn new(source: super::loader::ModuleProhibitions) -> Self {
+        let (first, rest) = source.clone().into_parts();
+        let error = ModuleError::from_nonempty_errors(
+            first.into_error(),
+            rest.into_iter()
+                .map(super::loader::ModuleProhibition::into_error)
+                .collect(),
+        );
+        Self {
+            source,
+            error: Box::new(error),
+        }
+    }
+    fn with_warnings(self, warnings: Vec<crate::parser::ParseWarning>) -> Self {
+        Self {
+            source: self.source,
+            error: Box::new(self.error.with_provider_type_warnings(warnings)),
+        }
+    }
+    fn into_members(self) -> Vec<Self> {
+        let warnings = self
+            .error
+            .provider_type_warnings()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.source
+            .into_singletons()
+            .into_iter()
+            .map(|source| Self::new(source).with_warnings(warnings.clone()))
+            .collect()
+    }
+    fn with_owners(
+        self: Box<Self>,
+        location: crate::parser::DeclarationLocation,
+        calls: Vec<ModuleCallId>,
+    ) -> ModuleError {
+        if calls.is_empty() {
+            ModuleError::AtImport {
+                location,
+                error: self,
+            }
+        } else {
+            ModuleError::ImportProhibitions(self).with_owning_calls(calls)
+        }
+    }
 }
 
 impl MultipleModuleErrors {
@@ -114,11 +174,14 @@ pub enum ModuleError {
         error: Box<ModuleError>,
     },
 
+    #[error("{0}")]
+    ImportProhibitions(Box<ImportProhibitionGroup>),
+
     /// A rejected import with no call site retains its authored use location.
     #[error("{error}")]
     AtImport {
         location: crate::parser::DeclarationLocation,
-        error: Box<ModuleError>,
+        error: Box<ImportProhibitionGroup>,
     },
 
     /// Failure raised while expanding one concrete call site.
@@ -279,19 +342,14 @@ impl ModuleError {
 
     fn decompose_import_prohibition_errors(self) -> Vec<Self> {
         match self {
-            Self::Multiple(errors) => {
-                let separate = matches!(errors.group, ModuleErrorGroup::ImportProhibitions);
-                if !separate {
-                    return vec![Self::Multiple(errors)];
-                }
-                errors
-                    .into_vec()
-                    .into_iter()
-                    .flat_map(|error| error.decompose_import_prohibition_errors())
-                    .collect()
-            }
+            Self::Multiple(errors) => vec![Self::Multiple(errors)],
+            Self::ImportProhibitions(group) => group
+                .into_members()
+                .into_iter()
+                .map(|group| *group.error)
+                .collect(),
             Self::AtImport { location, error } => error
-                .decompose_import_prohibition_errors()
+                .into_members()
                 .into_iter()
                 .map(|error| Self::AtImport {
                     location: location.clone(),
@@ -375,8 +433,10 @@ impl ModuleError {
             Self::ProviderInModule { evidence } | Self::BackendInModule { evidence } => {
                 Some(evidence)
             }
-            Self::AtImport { location: _, error }
-            | Self::OwnedByCalls { calls: _, error }
+            Self::ImportProhibitions(error) | Self::AtImport { location: _, error } => {
+                error.root_evidence()
+            }
+            Self::OwnedByCalls { calls: _, error }
             | Self::AtCall { call: _, error }
             | Self::WithProviderTypeWarnings { error, warnings: _ } => error.root_evidence(),
             Self::Multiple(errors) => errors.iter().find_map(Self::root_evidence),
@@ -441,9 +501,12 @@ impl ModuleError {
         match self {
             Self::ProviderInModule { evidence: _ } => Self::PROVIDER_IN_MODULE.to_string(),
             Self::BackendInModule { evidence: _ } => Self::BACKEND_IN_MODULE.to_string(),
-            Self::AtImport { location: _, error }
-            | Self::OwnedByCalls { calls: _, error }
-            | Self::AtCall { call: _, error } => error.lsp_message_relative_to(root),
+            Self::ImportProhibitions(error) | Self::AtImport { location: _, error } => {
+                error.lsp_message_relative_to(root)
+            }
+            Self::OwnedByCalls { calls: _, error } | Self::AtCall { call: _, error } => {
+                error.lsp_message_relative_to(root)
+            }
             Self::Multiple(errors) => errors
                 .iter()
                 .map(|error| error.lsp_message_relative_to(root))
@@ -539,9 +602,12 @@ impl ModuleError {
                 .iter()
                 .flat_map(|error| error.diagnostic_lines_relative_to(root))
                 .collect(),
-            Self::AtImport { location: _, error }
-            | Self::OwnedByCalls { calls: _, error }
-            | Self::AtCall { call: _, error } => error.diagnostic_lines_relative_to(root),
+            Self::ImportProhibitions(error) | Self::AtImport { location: _, error } => {
+                error.diagnostic_lines_relative_to(root)
+            }
+            Self::OwnedByCalls { calls: _, error } | Self::AtCall { call: _, error } => {
+                error.diagnostic_lines_relative_to(root)
+            }
             Self::WithProviderTypeWarnings { error, warnings } => {
                 let mut lines = error.diagnostic_lines_relative_to(root);
                 lines.push(DiagnosticLine::Message(render_provider_type_warnings(
@@ -611,6 +677,7 @@ impl ModuleError {
                 error: _,
                 warnings: _,
             }
+            | Self::ImportProhibitions(_)
             | Self::AtImport {
                 location: _,
                 error: _,
@@ -704,9 +771,12 @@ impl ModuleError {
                 .iter()
                 .chain(error.provider_type_warnings())
                 .collect(),
-            Self::AtImport { location: _, error }
-            | Self::OwnedByCalls { calls: _, error }
-            | Self::AtCall { call: _, error } => error.provider_type_warnings(),
+            Self::ImportProhibitions(error) | Self::AtImport { location: _, error } => {
+                error.provider_type_warnings()
+            }
+            Self::OwnedByCalls { calls: _, error } | Self::AtCall { call: _, error } => {
+                error.provider_type_warnings()
+            }
             Self::Multiple(errors) => errors
                 .iter()
                 .flat_map(Self::provider_type_warnings)
@@ -771,49 +841,110 @@ impl ModuleError {
         Some(Self::from_nonempty_errors(first, rest))
     }
     pub(crate) fn from_nonempty_errors(first: Self, rest: Vec<Self>) -> Self {
-        Self::from_nonempty_errors_grouped(first, rest, ModuleErrorGroup::Resolution)
+        if rest.is_empty() {
+            first
+        } else {
+            Self::Multiple(MultipleModuleErrors {
+                errors: std::iter::once(first).chain(rest).collect(),
+            })
+        }
     }
 
     pub(super) fn from_import_prohibitions(
         prohibitions: super::loader::ModuleProhibitions,
     ) -> Self {
-        let (first, rest) = prohibitions.into_parts();
-        Self::from_nonempty_errors_grouped(
-            first.into_error(),
-            rest.into_iter()
-                .map(super::loader::ModuleProhibition::into_error)
-                .collect(),
-            ModuleErrorGroup::ImportProhibitions,
-        )
+        Self::ImportProhibitions(Box::new(ImportProhibitionGroup::new(prohibitions)))
     }
 
-    fn from_nonempty_errors_grouped(first: Self, rest: Vec<Self>, group: ModuleErrorGroup) -> Self {
-        if rest.is_empty() && matches!(group, ModuleErrorGroup::Resolution) {
-            first
-        } else {
-            Self::Multiple(MultipleModuleErrors {
-                errors: std::iter::once(first).chain(rest).collect(),
-                group,
-            })
-        }
-    }
-
-    /// Keep existing call anchors. Only a loader-issued prohibition group
-    /// may use the import declaration when there is no owning call.
+    /// Only the loader's typed group can acquire an import anchor. Peel old
+    /// ownership from that group before assigning the outer caller's use/call.
     pub fn with_import_owners(
         self,
         location: crate::parser::DeclarationLocation,
         calls: Vec<ModuleCallId>,
     ) -> Self {
-        if calls.is_empty()
-            && matches!(&self, Self::Multiple(errors) if matches!(errors.group, ModuleErrorGroup::ImportProhibitions))
-        {
-            Self::AtImport {
-                location,
-                error: Box::new(self),
+        fn detach(error: ModuleError) -> Result<Box<ImportProhibitionGroup>, ModuleError> {
+            match error {
+                ModuleError::ImportProhibitions(group)
+                | ModuleError::AtImport {
+                    location: _,
+                    error: group,
+                } => Ok(group),
+                ModuleError::OwnedByCalls { calls, error } => {
+                    detach(*error).map_err(|error| error.with_owning_calls(calls))
+                }
+                ModuleError::WithProviderTypeWarnings { error, warnings } => match detach(*error) {
+                    Ok(group) => Ok(Box::new(group.with_warnings(warnings))),
+                    Err(error) => Err(error.with_provider_type_warnings(warnings)),
+                },
+                error @ (ModuleError::AtCall { call: _, error: _ }
+                | ModuleError::Multiple(_)
+                | ModuleError::AnalysisInvariant(_)
+                | ModuleError::NoConfigurationFiles { path: _ }
+                | ModuleError::NotFound(_)
+                | ModuleError::CircularImport(_)
+                | ModuleError::MissingArgument {
+                    module: _,
+                    argument: _,
+                }
+                | ModuleError::InvalidArgumentType {
+                    module: _,
+                    argument: _,
+                    mismatch: _,
+                }
+                | ModuleError::BareStructuralHandleArgument {
+                    module: _,
+                    argument: _,
+                    source_path: _,
+                    line: _,
+                    message: _,
+                }
+                | ModuleError::ArgumentValueAccess {
+                    module: _,
+                    source_path: _,
+                    line: _,
+                    diagnostic: _,
+                }
+                | ModuleError::DroppedConditionalBinding {
+                    binding: _,
+                    condition: _,
+                    source_path: _,
+                    line: _,
+                }
+                | ModuleError::UnexpandedModuleTemplate { context: _ }
+                | ModuleError::ReferenceType(_)
+                | ModuleError::Io(_)
+                | ModuleError::Parse(_)
+                | ModuleError::ParseInFile { path: _, error: _ }
+                | ModuleError::TypeResolution(_)
+                | ModuleError::UnknownArgument {
+                    module: _,
+                    argument: _,
+                }
+                | ModuleError::UnknownModule(_)
+                | ModuleError::ProviderInModule { evidence: _ }
+                | ModuleError::StateBlockInModule
+                | ModuleError::BackendInModule { evidence: _ }
+                | ModuleError::UpstreamStateInModule
+                | ModuleError::ExportsInModule
+                | ModuleError::Constraint(_)
+                | ModuleError::RequireOutsideModule(_)
+                | ModuleError::NotADirectory { path: _ }) => Err(error),
             }
-        } else {
-            self.with_owning_calls(calls)
+        }
+        if let Self::Multiple(errors) = self {
+            let mut errors = errors.into_vec().into_iter();
+            let first = errors.next().expect("multiple errors are nonempty");
+            return Self::from_nonempty_errors(
+                first.with_import_owners(location.clone(), calls.clone()),
+                errors
+                    .map(|error| error.with_import_owners(location.clone(), calls.clone()))
+                    .collect(),
+            );
+        }
+        match detach(self) {
+            Ok(group) => group.with_owners(location, calls),
+            Err(error) => error.with_owning_calls(calls),
         }
     }
 
@@ -839,7 +970,7 @@ impl ModuleError {
     pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
         match self {
             Self::WithProviderTypeWarnings { error, warnings: _ } => error.call_source(),
-            Self::Multiple(_errors) => ModuleErrorCallSource::Unavailable,
+            Self::Multiple(_) | Self::ImportProhibitions(_) => ModuleErrorCallSource::Unavailable,
             Self::OwnedByCalls { calls, error: _ } => ModuleErrorCallSource::Owners(calls),
             Self::AtImport { location, error: _ } => ModuleErrorCallSource::Import(location),
             Self::AtCall { call, error: _ } => ModuleErrorCallSource::Failing(call),
@@ -901,9 +1032,10 @@ impl ModuleError {
         match self {
             Self::WithProviderTypeWarnings { error, warnings: _ } => error.failing_call(),
             Self::Multiple(_errors) => None,
-            Self::AtImport { location: _, error } | Self::OwnedByCalls { calls: _, error } => {
+            Self::ImportProhibitions(error) | Self::AtImport { location: _, error } => {
                 error.failing_call()
             }
+            Self::OwnedByCalls { calls: _, error } => error.failing_call(),
             Self::AtCall { call, error } => error.failing_call().or(Some(call)),
             Self::NoConfigurationFiles { path: _ }
             | Self::NotFound(_)
@@ -977,8 +1109,9 @@ impl ModuleError {
                         collect(error, owners, findings);
                     }
                 }
-                ModuleError::AtImport { location: _, error }
-                | ModuleError::OwnedByCalls { error, calls: _ }
+                ModuleError::ImportProhibitions(error)
+                | ModuleError::AtImport { location: _, error } => collect(error, owners, findings),
+                ModuleError::OwnedByCalls { error, calls: _ }
                 | ModuleError::AtCall { error, call: _ }
                 | ModuleError::WithProviderTypeWarnings { error, warnings: _ } => {
                     collect(error, owners, findings)
@@ -997,9 +1130,10 @@ impl ModuleError {
     /// Semantic leaf after removing typed import ownership wrappers.
     pub fn root_cause(&self) -> &Self {
         match self {
-            Self::Multiple(errors) if errors.errors.len() == 1 => errors.errors[0].root_cause(),
-            Self::AtImport { location: _, error }
-            | Self::OwnedByCalls { error, calls: _ }
+            Self::ImportProhibitions(error) | Self::AtImport { location: _, error } => {
+                error.root_cause()
+            }
+            Self::OwnedByCalls { error, calls: _ }
             | Self::AtCall { error, call: _ }
             | Self::WithProviderTypeWarnings { error, warnings: _ } => error.root_cause(),
             error @ (Self::Multiple(_)
@@ -1098,9 +1232,12 @@ impl ModuleError {
                     error.display_relative_to(root)
                 )
             }
-            Self::AtImport { location: _, error }
-            | Self::OwnedByCalls { calls: _, error }
-            | Self::AtCall { call: _, error } => error.display_relative_to(root),
+            Self::ImportProhibitions(error) | Self::AtImport { location: _, error } => {
+                error.display_relative_to(root)
+            }
+            Self::OwnedByCalls { calls: _, error } | Self::AtCall { call: _, error } => {
+                error.display_relative_to(root)
+            }
             Self::BareStructuralHandleArgument {
                 module,
                 argument,
@@ -1197,7 +1334,8 @@ impl ModuleError {
             Self::ParseInFile { path: _, error } => {
                 parse_error_is_deferred_for_body_rejection(error)
             }
-            Self::AtImport {
+            Self::ImportProhibitions(_)
+            | Self::AtImport {
                 location: _,
                 error: _,
             }

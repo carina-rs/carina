@@ -1,0 +1,2 @@
+// valid module with no interface declarations
+mock.test.resource { name = 'ordinary' }

@@ -5826,3 +5826,37 @@ fn called_module_completion_distinguishes_empty_directories_from_root_signatures
         "root declarations remain available without admitting their body"
     );
 }
+
+#[test]
+fn called_module_completion_requires_every_sibling_to_be_readable() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("module");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("main.crn"),
+        "arguments { n: Int = 1 }\nattributes { value: String = 'one' }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("exports.crn"),
+        "exports { value: String = 'one' }\n",
+    )
+    .unwrap();
+    let text = "let service = use { source = './module' }\nlet result = service {}\n";
+    let provider = test_provider();
+    let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let base = carina_core::paths::ResolvedPath::new(directory.path()).unwrap();
+    carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+        assert!(
+            provider
+                .load_called_module("service", text, Some(&base), session)
+                .is_some()
+        );
+        std::fs::write(module.join("z-unreadable.crn"), [0xff]).unwrap();
+        assert!(
+            provider
+                .load_called_module("service", text, Some(&base), session)
+                .is_none()
+        );
+    });
+}

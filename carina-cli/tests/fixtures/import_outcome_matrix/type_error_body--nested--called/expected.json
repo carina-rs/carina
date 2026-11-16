@@ -1,0 +1,1270 @@
+{
+  "columns": {
+    "callsite_argument_checks": {
+      "classification": "main",
+      "value": {
+        "human": {
+          "exit": 1,
+          "stderr": "Error: ../bridge/main.crn at line 3\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: ../bridge/main.crn at line 3\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\nError: ../target/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
+          "stdout": "Validating...\n"
+        },
+        "json": {
+          "exit": 1,
+          "stderr": "",
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 46\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        },
+        "lsp_caller": {
+          "bridge/main.crn": [
+            {
+              "message": "module call 'result': argument 'n': expected Int, got string 'wrong'",
+              "range": {
+                "end": {
+                  "character": 34,
+                  "line": 2
+                },
+                "start": {
+                  "character": 27,
+                  "line": 2
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?",
+              "range": {
+                "end": {
+                  "character": 45,
+                  "line": 2
+                },
+                "start": {
+                  "character": 35,
+                  "line": 2
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 51,
+                  "line": 2
+                },
+                "start": {
+                  "character": 13,
+                  "line": 2
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/main.crn": [
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 27,
+                  "line": 1
+                },
+                "start": {
+                  "character": 19,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/providers.crn": []
+        }
+      }
+    },
+    "completion_export_reference": {
+      "classification": "main",
+      "value": [
+        {
+          "detail": "cidr_subnet(prefix: String, newbits: Int, netnum: Int) -> String",
+          "insertText": "cidr_subnet($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "cidr_subnet"
+        },
+        {
+          "detail": "env(name: String) -> String",
+          "insertText": "env($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "env"
+        },
+        {
+          "detail": "join(separator: String, list: list) -> String",
+          "insertText": "join($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "join"
+        },
+        {
+          "detail": "lookup(map: map, key: String, default: Any) -> Any",
+          "insertText": "lookup($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "lookup"
+        },
+        {
+          "detail": "lower(string: String) -> String",
+          "insertText": "lower($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "lower"
+        },
+        {
+          "detail": "map(accessor: String, collection: list | map) -> list | map",
+          "insertText": "map($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "map"
+        },
+        {
+          "detail": "max(a: Number, b: Number) -> Number",
+          "insertText": "max($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "max"
+        },
+        {
+          "detail": "min(a: Number, b: Number) -> Number",
+          "insertText": "min($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "min"
+        },
+        {
+          "detail": "replace(search: String, replacement: String, string: String) -> String",
+          "insertText": "replace($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "replace"
+        },
+        {
+          "detail": "trim(string: String) -> String",
+          "insertText": "trim($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "trim"
+        },
+        {
+          "detail": "upper(string: String) -> String",
+          "insertText": "upper($0)",
+          "insertTextFormat": 2,
+          "kind": 3,
+          "label": "upper"
+        }
+      ]
+    },
+    "completion_parameter": {
+      "classification": "main",
+      "value": [
+        {
+          "command": {
+            "command": "editor.action.triggerSuggest",
+            "title": "Trigger Suggest"
+          },
+          "detail": "int",
+          "insertText": "n = ",
+          "kind": 10,
+          "label": "n"
+        }
+      ]
+    },
+    "completion_parameter_empty": {
+      "classification": "main",
+      "value": [
+        {
+          "command": {
+            "command": "editor.action.triggerSuggest",
+            "title": "Trigger Suggest"
+          },
+          "detail": "int",
+          "insertText": "n = ",
+          "kind": 10,
+          "label": "n"
+        }
+      ]
+    },
+    "completion_snippet": {
+      "classification": "main",
+      "value": [
+        {
+          "detail": "Module call",
+          "insertText": "service {\n  ${1}\n}",
+          "insertTextFormat": 2,
+          "kind": 9,
+          "label": "service"
+        }
+      ]
+    },
+    "completion_top_level": {
+      "classification": "main",
+      "value": [
+        {
+          "detail": "Define a provider block",
+          "insertText": "provider ${1:aws} {\n    region = aws.Region.${2:ap_northeast_1}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "provider"
+        },
+        {
+          "detail": "Define a named resource or variable",
+          "insertText": "let ${1:name} = ",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "let"
+        },
+        {
+          "detail": "Read existing resource (data source)",
+          "insertText": "let ${1:name} = read ${2:aws.s3.Bucket} {\n    name = \"${3:existing-resource}\"\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "read"
+        },
+        {
+          "detail": "Define module argument parameters",
+          "insertText": "arguments {\n    ${1:param}: ${2:type}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "arguments"
+        },
+        {
+          "detail": "Define module attribute values",
+          "insertText": "attributes {\n    ${1:name}: ${2:type} = ${3:value}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "attributes"
+        },
+        {
+          "detail": "Publish values for upstream_state consumers",
+          "insertText": "exports {\n    ${1:name}: ${2:type} = ${3:value}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "exports"
+        },
+        {
+          "detail": "Define a pure function",
+          "insertText": "fn ${1:name}(${2:params}) {\n    ${3:body}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "fn"
+        },
+        {
+          "detail": "Load a module from a directory",
+          "insertText": "let ${1:module_name} = use {\n    source = '${2:./modules/name}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "let use"
+        },
+        {
+          "detail": "Import existing resource into state",
+          "insertText": "import {\n    to = ${1:awscc.ec2.Vpc} '${2:name}'\n    id = '${3:resource-id}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "import"
+        },
+        {
+          "detail": "Remove resource from state without destroying",
+          "insertText": "removed {\n    from = ${1:awscc.ec2.Vpc} '${2:name}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "removed"
+        },
+        {
+          "detail": "Move/rename resource in state",
+          "insertText": "moved {\n    from = ${1:awscc.ec2.Vpc} '${2:old-name}'\n    to   = ${3:awscc.ec2.Vpc} '${4:new-name}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "moved"
+        },
+        {
+          "detail": "Configure state backend",
+          "insertText": "backend ${1|s3,local,github|} {\n    $0\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "backend"
+        },
+        {
+          "detail": "Reference another project's exported state",
+          "insertText": "let ${1:binding} = upstream_state {\n    source = '${2:../other-project}'\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "upstream_state"
+        },
+        {
+          "detail": "Cross-argument constraint",
+          "insertText": "require ${1:condition}, \"${2:error message}\"",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "require"
+        },
+        {
+          "detail": "Block downstream resources until target reaches a condition",
+          "insertText": "let ${1:waited} = wait ${2:target} {\n    until = ${2:target}.${3:status} == ${4:value}\n}",
+          "insertTextFormat": 2,
+          "kind": 14,
+          "label": "wait"
+        },
+        {
+          "detail": "Module call",
+          "insertText": "service {\n  ${1}\n}",
+          "insertTextFormat": 2,
+          "kind": 9,
+          "label": "service"
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.budgets.Budget",
+          "textEdit": {
+            "newText": "mock.budgets.Budget {\n    budget = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.compute.Instance",
+          "textEdit": {
+            "newText": "mock.compute.Instance {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.example.consumer",
+          "textEdit": {
+            "newText": "mock.example.consumer {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.example.thing",
+          "textEdit": {
+            "newText": "mock.example.thing {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.iam.Role",
+          "textEdit": {
+            "newText": "mock.iam.Role {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.iam.Roles",
+          "textEdit": {
+            "newText": "mock.iam.Roles {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.logs.LogGroup",
+          "textEdit": {
+            "newText": "mock.logs.LogGroup {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.route53.HostedZone",
+          "textEdit": {
+            "newText": "mock.route53.HostedZone {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.route53.RecordSet",
+          "textEdit": {
+            "newText": "mock.route53.RecordSet {\n    hosted_zone_id = ${1}\n    name = ${2}\n    type = ${3}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.Thing",
+          "textEdit": {
+            "newText": "mock.test.Thing {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.creation_conflicting",
+          "textEdit": {
+            "newText": "mock.test.creation_conflicting {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.creation_constrained",
+          "textEdit": {
+            "newText": "mock.test.creation_constrained {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.default_prevent_destroy",
+          "textEdit": {
+            "newText": "mock.test.default_prevent_destroy {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.deferred_source",
+          "textEdit": {
+            "newText": "mock.test.deferred_source {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.estimated_input",
+          "textEdit": {
+            "newText": "mock.test.estimated_input {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.input_constrained",
+          "textEdit": {
+            "newText": "mock.test.input_constrained {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.keyed_partial_update_list",
+          "textEdit": {
+            "newText": "mock.test.keyed_partial_update_list {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.nested_identity",
+          "textEdit": {
+            "newText": "mock.test.nested_identity {\n    identity = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.pattern_modes",
+          "textEdit": {
+            "newText": "mock.test.pattern_modes {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.reference",
+          "textEdit": {
+            "newText": "mock.test.reference {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.resource",
+          "textEdit": {
+            "newText": "mock.test.resource {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.server_added_list",
+          "textEdit": {
+            "newText": "mock.test.server_added_list {\n    name = ${1}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "mock.test.unique_identity",
+          "textEdit": {
+            "newText": "mock.test.unique_identity {\n    name = ${1}\n    replacement_key = ${2}\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        },
+        {
+          "detail": "Resource",
+          "insertTextFormat": 2,
+          "kind": 7,
+          "label": "read mock.iam.Roles",
+          "textEdit": {
+            "newText": "let ${1:name} = read mock.iam.Roles {\n}",
+            "range": {
+              "end": {
+                "character": 0,
+                "line": 5
+              },
+              "start": {
+                "character": 0,
+                "line": 5
+              }
+            }
+          }
+        }
+      ]
+    },
+    "hover_argument": {
+      "classification": "main",
+      "value": {
+        "contents": {
+          "kind": "markdown",
+          "value": "## service.n\n\n- **Type**: Int\n- **Default**: 1\n"
+        }
+      }
+    },
+    "hover_module": {
+      "classification": "main",
+      "value": {
+        "contents": {
+          "kind": "markdown",
+          "value": "## service\n\n`../target`\n\n### Arguments\n\n- `n`: `Int`\n\n### Attributes\n\n- `bad`: `TotallyMadeUpType`\n"
+        }
+      }
+    },
+    "lint": {
+      "classification": "main",
+      "value": {
+        "exit": 1,
+        "stderr": "warning: .:1  ./../bridge/../target/main.crn:2:19: attribute 'bad': unknown custom type 'TotallyMadeUpType'\nError: Found 1 lint warning(s).\n",
+        "stdout": ""
+      }
+    },
+    "lsp_caller": {
+      "classification": "main",
+      "value": {
+        "all_siblings_open": {
+          "bridge/main.crn": [
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 23,
+                  "line": 2
+                },
+                "start": {
+                  "character": 13,
+                  "line": 2
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/main.crn": [
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 27,
+                  "line": 1
+                },
+                "start": {
+                  "character": 19,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/providers.crn": []
+        },
+        "faithful_disk_error": {
+          "bridge/main.crn": [
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 23,
+                  "line": 2
+                },
+                "start": {
+                  "character": 13,
+                  "line": 2
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/main.crn": [
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 27,
+                  "line": 1
+                },
+                "start": {
+                  "character": 19,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/providers.crn": []
+        }
+      }
+    },
+    "lsp_target": {
+      "classification": "main",
+      "value": {
+        "all_siblings_open": {
+          "target/main.crn": [
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 35,
+                  "line": 1
+                },
+                "start": {
+                  "character": 18,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ]
+        },
+        "faithful_disk_error": {
+          "target/main.crn": [
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 35,
+                  "line": 1
+                },
+                "start": {
+                  "character": 18,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ]
+        }
+      }
+    },
+    "module_reference_checks": {
+      "classification": "main-4485",
+      "value": {
+        "human": {
+          "exit": 1,
+          "stderr": "Error: ../bridge: mock.test.resource.<pending>: unknown attribute 'absent' on 'result' in reference result.absent\nError: ../bridge/main.crn at line 4\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\nError: ../target/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
+          "stdout": "Validating...\n"
+        },
+        "json": {
+          "exit": 1,
+          "stderr": "",
+          "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"unknown attribute 'absent' on 'result' in reference result.absent\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 22\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 26\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 41\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
+        },
+        "lsp_caller": {
+          "bridge/main.crn": [
+            {
+              "message": "module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)",
+              "range": {
+                "end": {
+                  "character": 40,
+                  "line": 3
+                },
+                "start": {
+                  "character": 27,
+                  "line": 3
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 42,
+                  "line": 3
+                },
+                "start": {
+                  "character": 13,
+                  "line": 3
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            },
+            {
+              "message": "Unknown attribute 'absent' on 'result'.",
+              "range": {
+                "end": {
+                  "character": 41,
+                  "line": 4
+                },
+                "start": {
+                  "character": 35,
+                  "line": 4
+                }
+              },
+              "severity": 2,
+              "source": "carina"
+            }
+          ],
+          "caller/main.crn": [
+            {
+              "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+              "range": {
+                "end": {
+                  "character": 27,
+                  "line": 1
+                },
+                "start": {
+                  "character": 19,
+                  "line": 1
+                }
+              },
+              "severity": 1,
+              "source": "carina"
+            }
+          ],
+          "caller/providers.crn": []
+        }
+      }
+    },
+    "resolved_signature": {
+      "classification": "main-4485",
+      "value": {
+        "argument_checks": {
+          "human": {
+            "exit": 1,
+            "stderr": "Error: ../bridge/main.crn at line 3\nError: module call 'result': argument 'n': expected Int, got string 'wrong'\nError: ../bridge/main.crn at line 3\nError: Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\nError: ../target/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
+            "stdout": "Validating...\n"
+          },
+          "json": {
+            "exit": 1,
+            "stderr": "",
+            "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"module call 'result': argument 'n': expected Int, got string 'wrong'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 35\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 3,\n            \"column\": 36\n          },\n          \"end\": {\n            \"line\": 3,\n            \"column\": 46\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          },
+          "lsp_caller": {
+            "bridge/main.crn": [
+              {
+                "message": "module call 'result': argument 'n': expected Int, got string 'wrong'",
+                "range": {
+                  "end": {
+                    "character": 34,
+                    "line": 2
+                  },
+                  "start": {
+                    "character": 27,
+                    "line": 2
+                  }
+                },
+                "severity": 1,
+                "source": "carina"
+              },
+              {
+                "message": "Unknown argument 'unexpected' for module 'service'. Did you mean 'n'?",
+                "range": {
+                  "end": {
+                    "character": 45,
+                    "line": 2
+                  },
+                  "start": {
+                    "character": 35,
+                    "line": 2
+                  }
+                },
+                "severity": 1,
+                "source": "carina"
+              },
+              {
+                "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+                "range": {
+                  "end": {
+                    "character": 51,
+                    "line": 2
+                  },
+                  "start": {
+                    "character": 13,
+                    "line": 2
+                  }
+                },
+                "severity": 1,
+                "source": "carina"
+              }
+            ],
+            "caller/main.crn": [
+              {
+                "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+                "range": {
+                  "end": {
+                    "character": 27,
+                    "line": 1
+                  },
+                  "start": {
+                    "character": 19,
+                    "line": 1
+                  }
+                },
+                "severity": 1,
+                "source": "carina"
+              }
+            ],
+            "caller/providers.crn": []
+          }
+        },
+        "module_reference_checks": {
+          "human": {
+            "exit": 1,
+            "stderr": "Error: ../bridge: mock.test.resource.<pending>: unknown attribute 'absent' on 'result' in reference result.absent\nError: ../bridge/main.crn at line 4\nError: module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\nError: ../target/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
+            "stdout": "Validating...\n"
+          },
+          "json": {
+            "exit": 1,
+            "stderr": "",
+            "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"unknown attribute 'absent' on 'result' in reference result.absent\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 5,\n            \"column\": 22\n          },\n          \"end\": {\n            \"line\": 5,\n            \"column\": 26\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../bridge/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 4,\n            \"column\": 28\n          },\n          \"end\": {\n            \"line\": 4,\n            \"column\": 41\n          }\n        }\n      }\n    },\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
+          },
+          "lsp_caller": {
+            "bridge/main.crn": [
+              {
+                "message": "module call 'result': argument 'n': cannot assign String to 'n': expected Int, got String (from supplied.name)",
+                "range": {
+                  "end": {
+                    "character": 40,
+                    "line": 3
+                  },
+                  "start": {
+                    "character": 27,
+                    "line": 3
+                  }
+                },
+                "severity": 1,
+                "source": "carina"
+              },
+              {
+                "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+                "range": {
+                  "end": {
+                    "character": 42,
+                    "line": 3
+                  },
+                  "start": {
+                    "character": 13,
+                    "line": 3
+                  }
+                },
+                "severity": 1,
+                "source": "carina"
+              },
+              {
+                "message": "Unknown attribute 'absent' on 'result'.",
+                "range": {
+                  "end": {
+                    "character": 41,
+                    "line": 4
+                  },
+                  "start": {
+                    "character": 35,
+                    "line": 4
+                  }
+                },
+                "severity": 2,
+                "source": "carina"
+              }
+            ],
+            "caller/main.crn": [
+              {
+                "message": "attribute 'bad': unknown custom type 'TotallyMadeUpType'",
+                "range": {
+                  "end": {
+                    "character": 27,
+                    "line": 1
+                  },
+                  "start": {
+                    "character": 19,
+                    "line": 1
+                  }
+                },
+                "severity": 1,
+                "source": "carina"
+              }
+            ],
+            "caller/providers.crn": []
+          }
+        }
+      }
+    },
+    "validate_human": {
+      "classification": "main",
+      "value": {
+        "exit": 1,
+        "stderr": "Error: ../target/main.crn at line 2\nError: attribute 'bad': unknown custom type 'TotallyMadeUpType'\n",
+        "stdout": "Validating...\n"
+      }
+    },
+    "validate_json": {
+      "classification": "main",
+      "value": {
+        "exit": 1,
+        "stderr": "",
+        "stdout": "{\n  \"status\": \"error\",\n  \"resource_count\": 0,\n  \"resources\": [],\n  \"errors\": [\n    {\n      \"message\": \"attribute 'bad': unknown custom type 'TotallyMadeUpType'\",\n      \"severity\": \"error\",\n      \"code\": null,\n      \"location\": {\n        \"file\": \"../target/main.crn\",\n        \"range\": {\n          \"start\": {\n            \"line\": 2,\n            \"column\": 19\n          },\n          \"end\": {\n            \"line\": 2,\n            \"column\": 36\n          }\n        }\n      }\n    }\n  ]\n}\n"
+      }
+    }
+  },
+  "fixture": {
+    "caller": "caller/main.crn",
+    "directories": [
+      "caller"
+    ],
+    "files": {},
+    "id": "type_error_body--nested--called",
+    "immediate_importer": "bridge/main.crn",
+    "import_path": "../target",
+    "route": "nested",
+    "row": "type_error_body",
+    "runtime_unreadable": {},
+    "schema_readiness": "Loaded providers for 1 directory(s), 24 resource type schema(s) total",
+    "supplemental": false,
+    "target_paths": [
+      "target/main.crn"
+    ],
+    "unreadable_paths": [],
+    "usage": "called"
+  },
+  "signatures": {
+    "bootstrap:bridge/main.crn": {
+      "service": {
+        "arguments": [
+          {
+            "default": true,
+            "name": "n",
+            "type": "Int"
+          }
+        ],
+        "attributes": {
+          "bad": "TotallyMadeUpType"
+        },
+        "requires": 0
+      }
+    },
+    "bootstrap:caller/main.crn": {
+      "outer": {
+        "arguments": [
+          {
+            "default": true,
+            "name": "outer_n",
+            "type": "Int"
+          }
+        ],
+        "attributes": {},
+        "requires": 0
+      }
+    },
+    "loaded-mock:bridge/main.crn": {
+      "service": {
+        "arguments": [
+          {
+            "default": true,
+            "name": "n",
+            "type": "Int"
+          }
+        ],
+        "attributes": {
+          "bad": null
+        },
+        "requires": 0
+      }
+    },
+    "loaded-mock:caller/main.crn": {
+      "outer": {
+        "arguments": [
+          {
+            "default": true,
+            "name": "outer_n",
+            "type": "Int"
+          }
+        ],
+        "attributes": {},
+        "requires": 0
+      }
+    }
+  }
+}
