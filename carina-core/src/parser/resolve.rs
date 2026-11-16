@@ -73,7 +73,7 @@ enum RootKind {
 }
 
 #[derive(Clone, Copy)]
-enum Event {
+pub(crate) enum Event {
     Lookup,
     IntegerArithmetic,
     Interpolation,
@@ -82,9 +82,24 @@ enum Event {
     BuiltinSuccess,
     Access,
     TakePresent,
+    LookupHit,
+    Upper,
+    KernelVisit,
+    CallsOnlyVisit,
+    Canonicalize,
+    #[cfg(feature = "test-utils")]
+    ReferenceEnvelope,
+    #[cfg(feature = "test-utils")]
+    ConversionEnvelope,
+    #[cfg(feature = "test-utils")]
+    ProjectionVisit,
+    #[cfg(feature = "test-utils")]
+    CopyValue,
+    #[cfg(feature = "test-utils")]
+    CopyContainer,
 }
 
-fn count(event: Event) {
+pub(crate) fn count(event: Event) {
     #[cfg(feature = "test-utils")]
     crate::test_utils::resolver_kind::count(event as usize);
     #[cfg(not(feature = "test-utils"))]
@@ -93,6 +108,8 @@ fn count(event: Event) {
 
 #[cfg(all(test, feature = "test-utils"))]
 mod kind_tests;
+#[cfg(feature = "test-utils")]
+mod oracle;
 #[cfg(feature = "test-utils")]
 mod output_kind;
 
@@ -1547,42 +1564,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
 ) -> Result<(), RootInputFailure> {
     #[cfg(feature = "test-utils")]
     if crate::test_utils::resolver_kind::is_observing() {
-        use output_kind::EnrichedAuthored;
-        // Strict per-file snapshots lower demand; the diagnostics per-file
-        // facade supplies its own scoped tag. No P enters the loader.
-        let _invocation = crate::test_utils::resolver_kind::InvocationGuard::enter(
-            resolution.requires_available(),
-        );
-        return resolve_resource_refs_output::<EnrichedAuthored, E>(
-            parsed,
-            config,
-            session,
-            resolution,
-            &mut |original, kind, bindings, lowered| {
-                let projected = EnrichedAuthored::project(&lowered).into_owned();
-                let oracle = {
-                    let _oracle = crate::test_utils::resolver_kind::OracleGuard::enter();
-                    match kind {
-                        RootKind::Full => resolve_value_with_config::<ParserPlaceholder, _>(
-                            original, bindings, config, session, resolution,
-                        ),
-                        RootKind::CallsOnly => resolve_function_calls_only::<ParserPlaceholder, _>(
-                            original, bindings, config, session, resolution,
-                        ),
-                    }
-                };
-                let matches = oracle.as_ref().is_ok_and(|oracle| {
-                    crate::resource::same_plain_representation(&projected, oracle)
-                });
-                crate::test_utils::resolver_kind::publish(
-                    matches,
-                    matches!(kind, RootKind::Full),
-                    output_kind::observe_paths(&lowered),
-                    output_kind::input_observation(original),
-                );
-                projected
-            },
-        );
+        return oracle::compare_invocation(parsed, config, session, resolution);
     }
     resolve_resource_refs_output::<ParserPlaceholder, E>(
         parsed,
@@ -2482,6 +2464,7 @@ fn resolve_value_with_binding_lookup<P: ResolveKind, B: ProviderAttributeBinding
     resolution: ResolutionContext,
     scope: DiagnosticScope,
 ) -> Result<V<P, B>, ParseError> {
+    count(Event::KernelVisit);
     match value {
         GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
             // HEAD validates known failures in both retained module-if branches.
@@ -2590,14 +2573,17 @@ fn resolve_value_with_binding_lookup<P: ResolveKind, B: ProviderAttributeBinding
             }
             count(Event::Lookup);
             let plain = match binding_lookup(path.binding_address(), path.attribute()) {
-                Some(attribute_value) => resolve_value_with_binding_lookup::<ParserPlaceholder, _>(
-                    &attribute_value,
-                    binding_lookup,
-                    config,
-                    session,
-                    resolution,
-                    scope,
-                )?,
+                Some(attribute_value) => {
+                    count(Event::LookupHit);
+                    resolve_value_with_binding_lookup::<ParserPlaceholder, _>(
+                        &attribute_value,
+                        binding_lookup,
+                        config,
+                        session,
+                        resolution,
+                        scope,
+                    )?
+                }
                 None => value.clone(),
             };
             Ok(P::read(path, plain))
@@ -2660,6 +2646,7 @@ fn resolve_value_with_binding_lookup<P: ResolveKind, B: ProviderAttributeBinding
                 .collect::<Result<Vec<_>, _>>()?;
             reject_required_interpolation_unavailable(&resolved, resolution)?;
             count(Event::Interpolation);
+            count(Event::Canonicalize);
             let plain =
                 GenericValue::Deferred(DeferredValue::Interpolation(resolved)).canonicalize();
             Ok(P::computed(operands, plain))
@@ -2758,6 +2745,9 @@ fn resolve_value_with_binding_lookup<P: ResolveKind, B: ProviderAttributeBinding
                 .map(super::functions::function_argument_as_eval)
                 .collect();
             count(Event::Builtin);
+            if name.as_str() == "upper" {
+                count(Event::Upper);
+            }
             let plain = match crate::builtins::evaluate_builtin_with_config(
                 name.as_str(),
                 &eval_args,
@@ -2928,6 +2918,7 @@ fn resolve_function_calls_only<P: ResolveKind, B: ProviderAttributeBindingPhase>
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
 ) -> Result<V<P, B>, ParseError> {
+    count(Event::CallsOnlyVisit);
     match value {
         GenericValue::Deferred(
             DeferredValue::ModuleIf(_)
@@ -2988,6 +2979,7 @@ fn resolve_function_calls_only<P: ResolveKind, B: ProviderAttributeBindingPhase>
                 .collect::<Result<Vec<_>, _>>()?;
             reject_required_interpolation_unavailable(&resolved, resolution)?;
             count(Event::Interpolation);
+            count(Event::Canonicalize);
             let plain =
                 GenericValue::Deferred(DeferredValue::Interpolation(resolved)).canonicalize();
             Ok(P::computed(operands, plain))

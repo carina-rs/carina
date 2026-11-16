@@ -3,7 +3,7 @@
 use crate::{config_loader, parser::ProviderContext, paths::ResolvedPath, schema::SchemaRegistry};
 use std::cell::RefCell;
 
-const EVENTS: [&str; 8] = [
+pub const EVENTS: [&str; 13] = [
     "lookup",
     "integer_arithmetic",
     "interpolation",
@@ -12,9 +12,23 @@ const EVENTS: [&str; 8] = [
     "builtin_success",
     "access",
     "take_present",
+    "lookup_hit",
+    "upper",
+    "kernel_visit",
+    "calls_only_visit",
+    "canonicalize",
+];
+pub const STORAGE_EVENTS: [&str; 5] = [
+    "reference_envelope",
+    "conversion_envelope",
+    "projection_visit",
+    "copy_value",
+    "copy_container",
 ];
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Counts(pub [usize; 8]);
+pub struct StorageCounts(pub [usize; 5]);
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Counts(pub [usize; 13]);
 impl Counts {
     pub fn get(&self, name: &str) -> usize {
         self.0[EVENTS
@@ -59,6 +73,12 @@ pub struct InvocationObservation {
     pub entry: &'static str,
     pub counts: Counts,
     pub oracle_counts: Counts,
+    pub storage_counts: StorageCounts,
+    pub oracle_storage_counts: StorageCounts,
+    pub same_inputs: bool,
+    pub same_roots: bool,
+    pub same_error: bool,
+    pub errored: bool,
 }
 #[derive(Default, Debug)]
 pub struct ProjectionReport {
@@ -66,12 +86,17 @@ pub struct ProjectionReport {
     pub invocations: Vec<InvocationObservation>,
     pub strict_succeeded: bool,
     pub diagnostics_succeeded: bool,
+    pub strict_error_matches: bool,
+    pub diagnostics_error_matches: bool,
+    pub strict_error: Option<String>,
+    pub diagnostics_error: Option<String>,
 }
 #[derive(Default)]
 struct State {
     active: bool,
     oracle: bool,
     per_file: bool,
+    bookkeeping: bool,
     entry: &'static str,
     ordinal: usize,
     invocation: Option<Frame>,
@@ -86,6 +111,12 @@ struct Frame {
     oracle_counts: Counts,
     root_counts: Counts,
     root_oracle_counts: Counts,
+    storage_counts: StorageCounts,
+    oracle_storage_counts: StorageCounts,
+    same_inputs: bool,
+    same_roots: bool,
+    same_error: bool,
+    errored: bool,
 }
 thread_local! {static OBSERVER:RefCell<State>=RefCell::new(State::default());}
 struct ObserverGuard(State);
@@ -119,8 +150,18 @@ pub(crate) fn count(event: usize) {
             return;
         }
         let oracle = s.oracle;
+        let bookkeeping = s.bookkeeping;
         if let Some(frame) = &mut s.invocation {
-            if oracle {
+            if event >= EVENTS.len() {
+                if !bookkeeping {
+                    let counts = if oracle {
+                        &mut frame.oracle_storage_counts
+                    } else {
+                        &mut frame.storage_counts
+                    };
+                    counts.0[event - EVENTS.len()] += 1;
+                }
+            } else if oracle {
                 frame.oracle_counts.0[event] += 1;
                 frame.root_oracle_counts.0[event] += 1;
             } else {
@@ -167,6 +208,12 @@ impl InvocationGuard {
                 oracle_counts: Counts::default(),
                 root_counts: Counts::default(),
                 root_oracle_counts: Counts::default(),
+                storage_counts: StorageCounts::default(),
+                oracle_storage_counts: StorageCounts::default(),
+                same_inputs: false,
+                same_roots: false,
+                same_error: false,
+                errored: false,
             });
             Self(previous)
         })
@@ -183,6 +230,12 @@ impl Drop for InvocationGuard {
                 entry: frame.entry,
                 counts: frame.counts,
                 oracle_counts: frame.oracle_counts,
+                storage_counts: frame.storage_counts,
+                oracle_storage_counts: frame.oracle_storage_counts,
+                same_inputs: frame.same_inputs,
+                same_roots: frame.same_roots,
+                same_error: frame.same_error,
+                errored: frame.errored,
             });
             s.invocation = self.0.take();
         });
@@ -231,25 +284,182 @@ pub(crate) fn publish(
         });
     });
 }
-/// Compare successful roots against the plain instantiation on their original inputs.
-/// The production strict and diagnostics loaders each resolve per-file inputs before merging.
+/// Compare safe, typed diagnostic identity and presentation without Debug-formatting values.
+pub(crate) fn same_parse_error(
+    a: &crate::parser::ParseError,
+    b: &crate::parser::ParseError,
+) -> bool {
+    use crate::parser::ParseError;
+    use std::error::Error;
+    fn chain(error: &dyn Error) -> Vec<String> {
+        let mut items = Vec::new();
+        let mut next = Some(error);
+        while let Some(error) = next {
+            items.push(error.to_string());
+            next = error.source();
+        }
+        items
+    }
+    if std::mem::discriminant(a) != std::mem::discriminant(b)
+        || a.diagnostic_range() != b.diagnostic_range()
+        || a.source_file() != b.source_file()
+        || a.diagnostic_message() != b.diagnostic_message()
+        || chain(a) != chain(b)
+    {
+        return false;
+    }
+    match (a, b) {
+        (
+            ParseError::Located { path: a, error: ae },
+            ParseError::Located { path: b, error: be },
+        ) => a == b && same_parse_error(ae, be),
+        (ParseError::AtElement(a), ParseError::AtElement(b)) => {
+            a.location() == b.location() && same_parse_error(a.detail(), b.detail())
+        }
+        _ => true,
+    }
+}
+pub(crate) fn take_oracle_root_counts() -> Counts {
+    OBSERVER.with(|s| {
+        std::mem::take(
+            &mut s
+                .borrow_mut()
+                .invocation
+                .as_mut()
+                .expect("invocation")
+                .root_oracle_counts,
+        )
+    })
+}
+pub(crate) fn set_oracle_root_counts(counts: Counts) {
+    OBSERVER.with(|s| {
+        s.borrow_mut()
+            .invocation
+            .as_mut()
+            .expect("invocation")
+            .root_oracle_counts = counts
+    });
+}
+pub(crate) fn finish_invocation(
+    same_inputs: bool,
+    same_roots: bool,
+    same_error: bool,
+    errored: bool,
+) {
+    OBSERVER.with(|s| {
+        let mut s = s.borrow_mut();
+        let frame = s.invocation.as_mut().expect("invocation");
+        frame.same_inputs = same_inputs;
+        frame.same_roots = same_roots;
+        frame.same_error = same_error;
+        frame.errored = errored;
+    });
+}
+pub(crate) struct BookkeepingGuard(bool);
+impl BookkeepingGuard {
+    pub(crate) fn enter() -> Self {
+        Self(OBSERVER.with(|s| {
+            let mut s = s.borrow_mut();
+            let old = s.bookkeeping;
+            s.bookkeeping = true;
+            old
+        }))
+    }
+}
+impl Drop for BookkeepingGuard {
+    fn drop(&mut self) {
+        OBSERVER.with(|s| s.borrow_mut().bookkeeping = self.0);
+    }
+}
+fn same_configuration_failure(
+    a: Option<&config_loader::ConfigurationLoadFailure>,
+    b: Option<&config_loader::ConfigurationLoadFailure>,
+) -> bool {
+    use config_loader::ConfigurationLoadDiagnostic;
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.kind() == b.kind()
+                && a.to_string() == b.to_string()
+                && a.diagnostics().len() == b.diagnostics().len()
+                && a.diagnostics()
+                    .iter()
+                    .zip(b.diagnostics())
+                    .all(|(a, b)| match (a, b) {
+                        (
+                            ConfigurationLoadDiagnostic::Parse { file: a, error: ae },
+                            ConfigurationLoadDiagnostic::Parse { file: b, error: be },
+                        ) => a == b && same_parse_error(ae, be),
+                        (
+                            ConfigurationLoadDiagnostic::Message {
+                                file: a,
+                                message: ae,
+                            },
+                            ConfigurationLoadDiagnostic::Message {
+                                file: b,
+                                message: be,
+                            },
+                        ) => a == b && ae == be,
+                        _ => false,
+                    })
+        }
+        _ => false,
+    }
+}
+fn same_directory_failure(
+    a: Option<&config_loader::DirectoryParseFailure>,
+    b: Option<&config_loader::DirectoryParseFailure>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.to_string() == b.to_string()
+                && a.source_file() == b.source_file()
+                && match (a.parse_error(), b.parse_error()) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => same_parse_error(a, b),
+                    _ => false,
+                }
+                && a.element_diagnostic().map(|error| error.location())
+                    == b.element_diagnostic().map(|error| error.location())
+                && a.io_error()
+                    .map(|error| (error.kind(), error.raw_os_error()))
+                    == b.io_error()
+                        .map(|error| (error.kind(), error.raw_os_error()))
+        }
+        _ => false,
+    }
+}
+/// Every invocation replays the original saved input, including failures and
+/// shared plain backend/directive work. These entries use None sessions only.
+/// Nested module fixture directories are loaded as roots, not expanded as modules.
 pub fn compare_directory(
     path: &ResolvedPath,
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> ProjectionReport {
-    let _guard = ObserverGuard::install();
-    OBSERVER.with(|s| s.borrow_mut().entry = "strict");
-    let strict_succeeded = config_loader::load_configuration_report(path, config, schemas).is_ok();
-    OBSERVER.with(|s| s.borrow_mut().entry = "diagnostics");
-    let diagnostics_succeeded =
+    // Independently pin errors raised before the resolver is reached as well.
+    let plain_strict = config_loader::load_configuration_report(path, config, schemas).err();
+    let plain_diagnostics =
         config_loader::parse_directory_with_overrides_and_diagnostics_with_schemas(
             path,
             config,
             &config_loader::SourceOverrides::new(),
             schemas,
         )
-        .is_ok();
+        .err();
+    let _guard = ObserverGuard::install();
+    OBSERVER.with(|s| s.borrow_mut().entry = "strict");
+    let strict_error = config_loader::load_configuration_report(path, config, schemas).err();
+    OBSERVER.with(|s| s.borrow_mut().entry = "diagnostics");
+    let diagnostics_error =
+        config_loader::parse_directory_with_overrides_and_diagnostics_with_schemas(
+            path,
+            config,
+            &config_loader::SourceOverrides::new(),
+            schemas,
+        )
+        .err();
     let (roots, invocations) = OBSERVER.with(|s| {
         let mut s = s.borrow_mut();
         (
@@ -260,7 +470,17 @@ pub fn compare_directory(
     ProjectionReport {
         roots,
         invocations,
-        strict_succeeded,
-        diagnostics_succeeded,
+        strict_succeeded: strict_error.is_none(),
+        diagnostics_succeeded: diagnostics_error.is_none(),
+        strict_error_matches: same_configuration_failure(
+            plain_strict.as_ref(),
+            strict_error.as_ref(),
+        ),
+        diagnostics_error_matches: same_directory_failure(
+            plain_diagnostics.as_ref(),
+            diagnostics_error.as_ref(),
+        ),
+        strict_error: strict_error.map(|error| error.to_string()),
+        diagnostics_error: diagnostics_error.map(|error| error.to_string()),
     }
 }

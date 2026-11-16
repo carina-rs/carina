@@ -50,6 +50,13 @@ impl<P: ValueShape, Q: ValueShape, B: BindingAddress> Copier<'_, P, Q, B> {
     }
 
     fn value(&mut self, value: &Value<P, B>) -> Value<Q, B> {
+        crate::parser::count_resolver_event(crate::parser::ResolverEvent::CopyValue);
+        if matches!(
+            value,
+            Value::Concrete(ConcreteValue::List(_) | ConcreteValue::Map(_))
+        ) {
+            crate::parser::count_resolver_event(crate::parser::ResolverEvent::CopyContainer);
+        }
         match value {
             Value::Reference(payload) => (self.reference)(payload),
             Value::Conversion(payload) => (self.conversion)(payload),

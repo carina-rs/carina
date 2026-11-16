@@ -45,34 +45,54 @@ impl ResolveKind for EnrichedAuthored {
         )
     }
     fn project<B: BindingAddress>(value: &V<Self, B>) -> Cow<'_, S<B>> {
+        count(Event::ProjectionVisit);
         match value {
             V::Reference(payload) => Cow::Borrowed(&payload.plain_result),
             V::Conversion(payload) => Cow::Borrowed(&payload.plain_result),
             _ => Cow::Owned(copy_storage(
                 value,
                 &mut |p| p.0.clone(),
-                &mut |payload| (*payload.plain_result).clone(),
-                &mut |payload| (*payload.plain_result).clone(),
+                &mut |payload| clone_plain(&payload.plain_result),
+                &mut |payload| clone_plain(&payload.plain_result),
             )),
         }
     }
     fn split_operand<B: BindingAddress>(value: V<Self, B>) -> (S<B>, V<Self, B>) {
-        (Self::project(&value).into_owned(), value)
+        (project_owned(&value), value)
     }
     fn protect_operand<B: BindingAddress>(operand: V<Self, B>) -> V<Self, B> {
         V::Deferred(DeferredValue::Secret(SecretPayload::wrap_storage(operand)))
     }
     fn read<B: BindingAddress>(path: &AccessPath<B>, plain_result: S<B>) -> V<Self, B> {
+        count(Event::ReferenceEnvelope);
         V::Reference(Arc::new(EnrichedReference {
             path: path.clone(),
             plain_result: Box::new(plain_result),
         }))
     }
     fn computed<B: BindingAddress>(operands: Vec<V<Self, B>>, plain_result: S<B>) -> V<Self, B> {
+        count(Event::ConversionEnvelope);
         V::Conversion(Arc::new(EnrichedConversion {
             operands,
             plain_result: Box::new(plain_result),
         }))
+    }
+}
+
+// Keep owned projection copies in the counted, exhaustive storage copier as
+// well. Cow::into_owned would hide stored-result tree copies in derived Clone.
+fn clone_plain<B: BindingAddress>(value: &S<B>) -> S<B> {
+    copy_storage(
+        value,
+        &mut Clone::clone,
+        &mut |never: &NoReferencePayload| match *never {},
+        &mut |never: &NoReferencePayload| match *never {},
+    )
+}
+pub(super) fn project_owned<B: BindingAddress>(value: &V<EnrichedAuthored, B>) -> S<B> {
+    match EnrichedAuthored::project(value) {
+        Cow::Borrowed(value) => clone_plain(value),
+        Cow::Owned(value) => value,
     }
 }
 
