@@ -3,7 +3,9 @@
 use super::*;
 use crate::resource::ParserPlaceholder;
 use crate::resource::ResourceId;
-use crate::schema::{LeafPathSegment, SchemaRegistry};
+use crate::schema::LeafPathSegment;
+#[cfg(test)]
+use crate::schema::SchemaRegistry;
 
 mod inputs;
 use inputs::{AttributeInput, with_classified_inputs};
@@ -682,7 +684,6 @@ where
     evaluation: ValidationEvaluation<B>,
     bindings: &'a BindingIndex<'a, B>,
     session: &'a dyn ProviderTypeCheckContext,
-    schemas: &'a SchemaRegistry,
 }
 
 impl<'a, 'file, E, D, B: BindingAddress> ResourceAdmissionRequest<'a, 'file, E, D, B>
@@ -724,7 +725,6 @@ where
             evaluation,
             bindings,
             session,
-            schemas,
         }
     }
 
@@ -751,7 +751,6 @@ where
             evaluation,
             bindings,
             session,
-            schemas: owner.schemas(),
         })
     }
 }
@@ -828,7 +827,6 @@ where
         evaluation,
         bindings,
         session,
-        schemas,
     } = request;
     let (values, classification_diagnostics) =
         with_classified_inputs(&inputs, evaluation, session, |inputs, attributes| {
@@ -840,12 +838,12 @@ where
             let findings = if uses_resource_attribute_admission(resource.kind()) {
                 typed_resource_attribute_admissions::<Pass, kind::ResourceAttribute, _, _, _>(
                     resource, parsed, schema, attributes, quoted, inputs, bindings, session,
-                    schemas, &visits,
+                    &visits,
                 )
             } else {
                 typed_resource_attribute_admissions::<Pass, kind::DataSourceAttribute, _, _, _>(
                     resource, parsed, schema, attributes, quoted, inputs, bindings, session,
-                    schemas, &visits,
+                    &visits,
                 )
             };
             *coverage = visits.into_inner();
@@ -913,7 +911,6 @@ pub(crate) fn resource_attribute_admissions_for_test<
             evaluation,
             bindings,
             session,
-            schemas,
         },
         coverage,
     )
@@ -949,7 +946,6 @@ fn typed_resource_attribute_admissions<
     inputs: &ResourceAttributeInputs<B>,
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
-    schemas: &SchemaRegistry,
     coverage: &std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
 ) -> crate::schema::ResourceValueValidation {
     use crate::resource::{DeferredValue, ParserPlaceholder};
@@ -1148,7 +1144,6 @@ fn typed_resource_attribute_admissions<
                         access,
                         interpolation_sink.assignment_sink(&session.catalog().custom_types),
                         expression,
-                        schemas,
                         bindings,
                     )
                     .err()
@@ -1190,12 +1185,10 @@ fn typed_resource_attribute_admissions<
         }
         match value {
             Value::Deferred(DeferredValue::Access(_) | DeferredValue::Coalesce { .. }) => {
-                crate::validation::check_deferred_access_type(
-                    value, sink, expression, schemas, bindings,
-                )
-                .map_err(|error| {
-                    assignment::reference_error(AdmissionReferenceError::Computed(error))
-                })?;
+                crate::validation::check_deferred_access_type(value, sink, expression, bindings)
+                    .map_err(|error| {
+                        assignment::reference_error(AdmissionReferenceError::Computed(error))
+                    })?;
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
                 let operands: &dyn crate::validation::IntegerOperandEvidence<B> = match &evidence {

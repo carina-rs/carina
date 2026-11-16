@@ -74,7 +74,6 @@ fn secret_origin_4275_directory_mismatch_is_redacted() {
             crate::schema::SinkAuthority::Owner(&owner),
         ),
         expression,
-        &schemas,
         &index,
     )
     .unwrap_err();

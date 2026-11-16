@@ -1309,7 +1309,6 @@ fn loaded_catalog_rejects_undeclared_bare_integer_operand_type() {
             crate::schema::SinkAuthority::Owner(&TEST_OWNER),
         ),
         expression,
-        &schemas,
         &index,
     )
     .expect_err("a loaded catalog must reject an unknown operand type");
@@ -10692,7 +10691,6 @@ fn deferred_loop_placeholder_access_checks_after_materialization() {
                 crate::schema::SinkAuthority::Owner(&TEST_OWNER)
             ),
             &inference,
-            &schemas,
             &index
         ),
         Ok(())
