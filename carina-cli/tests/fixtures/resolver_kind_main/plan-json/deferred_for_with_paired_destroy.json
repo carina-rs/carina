@@ -1,0 +1,411 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/deferred_for_with_paired_destroy",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/deferred_for_with_paired_destroy",
+  "state_lineage": "test-lineage-deferred-for-with-paired-destroy",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "aws",
+      "attributes": {
+        "region": {
+          "String": "us-east-1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Create": {
+          "id": {
+            "provider": "aws",
+            "resource_type": "acm.Certificate",
+            "identity": "cert"
+          },
+          "attributes": {
+            "domain_name": {
+              "String": "registry.example.com"
+            },
+            "validation_method": {
+              "String": "DNS"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": "cert",
+          "dependencies": null,
+          "module_source": null
+        }
+      },
+      {
+        "DeferredReplace": {
+          "deletes": [
+            {
+              "previous_attributes": {
+                "hosted_zone_id": {
+                  "String": "Z123"
+                },
+                "resource_records": {
+                  "List": [
+                    {
+                      "String": "_old-validation.example.com"
+                    }
+                  ]
+                },
+                "type": {
+                  "String": "CNAME"
+                },
+                "ttl": {
+                  "Int": 60
+                },
+                "name": {
+                  "String": "_acme.registry.example.com"
+                }
+              },
+              "id": {
+                "provider": "aws",
+                "resource_type": "route53.RecordSet",
+                "identity": "validation_records[0]"
+              },
+              "identifier": "Z123:_acme.registry.example.com:CNAME",
+              "directives": {
+                "force_delete": false,
+                "create_before_destroy": false,
+                "prevent_destroy": {
+                  "kind": "unspecified"
+                }
+              },
+              "binding": "validation_records[0]",
+              "dependencies": [
+                {
+                  "provider": "aws",
+                  "resource_type": "acm.Certificate",
+                  "identity": "cert"
+                }
+              ],
+              "explicit_dependencies": []
+            }
+          ],
+          "id": {
+            "provider": "aws",
+            "resource_type": "route53.RecordSet",
+            "identity": "validation_records"
+          },
+          "template": {
+            "file": "main.crn",
+            "line": 15,
+            "header": "for opt in cert.domain_validation_options",
+            "resource_type": "aws.route53.RecordSet",
+            "target": {
+              "kind": "bound",
+              "binding": "validation_records"
+            },
+            "iterable": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "cert",
+                  "attribute": "domain_validation_options"
+                }
+              }
+            },
+            "binding": {
+              "Simple": "opt"
+            },
+            "template_resource": {
+              "id": {
+                "provider": "aws",
+                "resource_type": "route53.RecordSet",
+                "identity": "validation_records[?]"
+              },
+              "attributes": {
+                "hosted_zone_id": {
+                  "String": "Z123"
+                },
+                "name": {
+                  "Access": {
+                    "base": {
+                      "Access": {
+                        "base": {
+                          "Unknown": "ForValue"
+                        },
+                        "step": {
+                          "kind": "field",
+                          "name": "resource_record"
+                        }
+                      }
+                    },
+                    "step": {
+                      "kind": "field",
+                      "name": "name"
+                    }
+                  }
+                },
+                "type": {
+                  "Access": {
+                    "base": {
+                      "Access": {
+                        "base": {
+                          "Unknown": "ForValue"
+                        },
+                        "step": {
+                          "kind": "field",
+                          "name": "resource_record"
+                        }
+                      }
+                    },
+                    "step": {
+                      "kind": "field",
+                      "name": "type"
+                    }
+                  }
+                },
+                "ttl": {
+                  "Int": 60
+                },
+                "resource_records": {
+                  "List": [
+                    {
+                      "Access": {
+                        "base": {
+                          "Access": {
+                            "base": {
+                              "Unknown": "ForValue"
+                            },
+                            "step": {
+                              "kind": "field",
+                              "name": "resource_record"
+                            }
+                          }
+                        },
+                        "step": {
+                          "kind": "field",
+                          "name": "value"
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "directives": {
+                "force_delete": false,
+                "create_before_destroy": false,
+                "prevent_destroy": {
+                  "kind": "unspecified"
+                }
+              },
+              "prefixes": {},
+              "binding": "validation_records[?]",
+              "dependencies": null,
+              "module_source": null
+            }
+          },
+          "dependency_template": {
+            "value": [
+              {
+                "provider": "aws",
+                "resource_type": "acm.Certificate",
+                "identity": "cert"
+              }
+            ],
+            "explicit": [],
+            "persisted_value": [
+              {
+                "provider": "aws",
+                "resource_type": "acm.Certificate",
+                "identity": "cert"
+              }
+            ],
+            "persisted_explicit": [],
+            "reads": [
+              {
+                "id": {
+                  "provider": "aws",
+                  "resource_type": "acm.Certificate",
+                  "identity": "cert"
+                },
+                "read": "Unknown"
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "aws",
+        "resource_type": "acm.Certificate",
+        "identity": "cert"
+      },
+      "attributes": {
+        "domain_name": {
+          "String": "registry.example.com"
+        },
+        "validation_method": {
+          "String": "DNS"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "cert",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "aws",
+        "resource_type": "acm.Certificate",
+        "identity": "cert"
+      },
+      "attributes": {
+        "domain_name": {
+          "String": "registry.example.com"
+        },
+        "validation_method": {
+          "String": "DNS"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "cert",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "aws",
+        "resource_type": "acm.Certificate",
+        "identity": "cert"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "aws",
+            "resource_type": "acm.Certificate",
+            "identity": "cert"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "aws",
+        "resource_type": "route53.RecordSet",
+        "identity": "validation_records[0]"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "aws",
+            "resource_type": "route53.RecordSet",
+            "identity": "validation_records[0]"
+          },
+          "identifier": "Z123:_acme.registry.example.com:CNAME",
+          "attributes": {
+            "ttl": {
+              "Int": 60
+            },
+            "resource_records": {
+              "List": [
+                {
+                  "String": "_old-validation.example.com"
+                }
+              ]
+            },
+            "type": {
+              "String": "CNAME"
+            },
+            "hosted_zone_id": {
+              "String": "Z123"
+            },
+            "name": {
+              "String": "_acme.registry.example.com"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            {
+              "provider": "aws",
+              "resource_type": "acm.Certificate",
+              "identity": "cert"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "aws": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "acm.Certificate",
+            "fingerprint": {
+              "present": "e3559c1448f19ad247e9a8594de76e6edb6d2308670acaabc599a219d65b9d09"
+            }
+          },
+          {
+            "kind": "resource",
+            "resource_type": "route53.RecordSet",
+            "fingerprint": {
+              "present": "1e093ec6666c91b72d9c834b2669ba255471452cbac43e9752cae0b7020dc80a"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

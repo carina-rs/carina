@@ -1,0 +1,379 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/list_diff_removed_struct",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/list_diff_removed_struct",
+  "state_lineage": "test-lineage-list-diff-removed-struct",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "iam.RolePolicy",
+              "identity": "policy"
+            },
+            "identifier": "test-role|test-inline",
+            "attributes": {
+              "role_name": {
+                "String": "test-role"
+              },
+              "statement": {
+                "List": [
+                  {
+                    "Map": {
+                      "action": {
+                        "String": "s3:GetObject"
+                      },
+                      "effect": {
+                        "String": "Allow"
+                      },
+                      "resource": {
+                        "String": "arn:aws:s3:::example/*"
+                      },
+                      "sid": {
+                        "String": "AllowS3Read"
+                      }
+                    }
+                  },
+                  {
+                    "Map": {
+                      "action": {
+                        "List": [
+                          {
+                            "String": "cloudformation:CancelResourceRequest"
+                          },
+                          {
+                            "String": "cloudformation:CreateResource"
+                          },
+                          {
+                            "String": "cloudformation:DeleteResource"
+                          },
+                          {
+                            "String": "cloudformation:GetResource"
+                          },
+                          {
+                            "String": "cloudformation:GetResourceRequestStatus"
+                          },
+                          {
+                            "String": "cloudformation:ListResources"
+                          },
+                          {
+                            "String": "cloudformation:UpdateResource"
+                          }
+                        ]
+                      },
+                      "effect": {
+                        "String": "Allow"
+                      },
+                      "resource": {
+                        "List": [
+                          {
+                            "String": "*"
+                          }
+                        ]
+                      },
+                      "sid": {
+                        "String": "CloudControl"
+                      }
+                    }
+                  }
+                ]
+              },
+              "policy_name": {
+                "String": "test-inline"
+              }
+            },
+            "exists": true,
+            "dependency_bindings": []
+          },
+          "identifier": "test-role|test-inline",
+          "to": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "iam.RolePolicy",
+              "identity": "policy"
+            },
+            "attributes": {
+              "policy_name": {
+                "String": "test-inline"
+              },
+              "role_name": {
+                "String": "test-role"
+              },
+              "statement": {
+                "List": [
+                  {
+                    "Map": {
+                      "sid": {
+                        "String": "AllowS3Read"
+                      },
+                      "effect": {
+                        "String": "Allow"
+                      },
+                      "action": {
+                        "String": "s3:GetObject"
+                      },
+                      "resource": {
+                        "String": "arn:aws:s3:::example/*"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "prefixes": {},
+            "binding": "policy",
+            "dependencies": null,
+            "module_source": null
+          },
+          "changed_attributes": [
+            "statement"
+          ]
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "iam.RolePolicy",
+        "identity": "policy"
+      },
+      "attributes": {
+        "policy_name": {
+          "String": "test-inline"
+        },
+        "role_name": {
+          "String": "test-role"
+        },
+        "statement": {
+          "List": [
+            {
+              "Map": {
+                "sid": {
+                  "String": "AllowS3Read"
+                },
+                "effect": {
+                  "String": "Allow"
+                },
+                "action": {
+                  "String": "s3:GetObject"
+                },
+                "resource": {
+                  "String": "arn:aws:s3:::example/*"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "policy",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "iam.RolePolicy",
+        "identity": "policy"
+      },
+      "attributes": {
+        "policy_name": {
+          "String": "test-inline"
+        },
+        "role_name": {
+          "String": "test-role"
+        },
+        "statement": {
+          "List": [
+            {
+              "Map": {
+                "sid": {
+                  "String": "AllowS3Read"
+                },
+                "effect": {
+                  "String": "Allow"
+                },
+                "action": {
+                  "String": "s3:GetObject"
+                },
+                "resource": {
+                  "String": "arn:aws:s3:::example/*"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "policy",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "iam.RolePolicy",
+        "identity": "policy"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "iam.RolePolicy",
+            "identity": "policy"
+          },
+          "identifier": "test-role|test-inline",
+          "attributes": {
+            "policy_name": {
+              "String": "test-inline"
+            },
+            "role_name": {
+              "String": "test-role"
+            },
+            "statement": {
+              "List": [
+                {
+                  "Map": {
+                    "action": {
+                      "String": "s3:GetObject"
+                    },
+                    "effect": {
+                      "String": "Allow"
+                    },
+                    "resource": {
+                      "String": "arn:aws:s3:::example/*"
+                    },
+                    "sid": {
+                      "String": "AllowS3Read"
+                    }
+                  }
+                },
+                {
+                  "Map": {
+                    "action": {
+                      "List": [
+                        {
+                          "String": "cloudformation:CancelResourceRequest"
+                        },
+                        {
+                          "String": "cloudformation:CreateResource"
+                        },
+                        {
+                          "String": "cloudformation:DeleteResource"
+                        },
+                        {
+                          "String": "cloudformation:GetResource"
+                        },
+                        {
+                          "String": "cloudformation:GetResourceRequestStatus"
+                        },
+                        {
+                          "String": "cloudformation:ListResources"
+                        },
+                        {
+                          "String": "cloudformation:UpdateResource"
+                        }
+                      ]
+                    },
+                    "effect": {
+                      "String": "Allow"
+                    },
+                    "resource": {
+                      "List": [
+                        {
+                          "String": "*"
+                        }
+                      ]
+                    },
+                    "sid": {
+                      "String": "CloudControl"
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "iam.RolePolicy",
+            "fingerprint": {
+              "present": "f8bef9b6afaade2fbbea5045cd3184b036cf126c2b9e392c45a800276278630e"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

@@ -1,0 +1,1033 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/nested_write_only",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/nested_write_only",
+  "state_lineage": "test-nested-write-only-plan-display",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "elasticloadbalancingv2.Listener",
+              "identity": "unrelated"
+            },
+            "identifier": "listener-unrelated",
+            "attributes": {
+              "ssl_policy": {
+                "String": "ELBSecurityPolicy-2016-08"
+              },
+              "default_actions": {
+                "List": [
+                  {
+                    "Map": {
+                      "authenticate_oidc_config": {
+                        "Map": {
+                          "issuer": {
+                            "String": "https://issuer.example.com"
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "exists": true,
+            "dependency_bindings": []
+          },
+          "identifier": "listener-unrelated",
+          "to": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "elasticloadbalancingv2.Listener",
+              "identity": "unrelated"
+            },
+            "attributes": {
+              "default_actions": {
+                "List": [
+                  {
+                    "Map": {
+                      "authenticate_oidc_config": {
+                        "Map": {
+                          "issuer": {
+                            "String": "https://issuer.example.com"
+                          },
+                          "client_secret": {
+                            "RedactedSecret": {
+                              "hash": "$argon2id$v=19$m=19456,t=2,p=1$QFYsM5haP9jZ2PMxad/Kmw$zUbld/b1kCoEiFMKa/DOJNf45v5CHbi9DfswR/vGF2k"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "ssl_policy": {
+                "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "prefixes": {},
+            "binding": "unrelated",
+            "dependencies": null,
+            "module_source": null
+          },
+          "changed_attributes": [
+            "ssl_policy"
+          ]
+        }
+      },
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "elasticloadbalancingv2.Listener",
+              "identity": "rotated"
+            },
+            "identifier": "listener-rotated",
+            "attributes": {
+              "ssl_policy": {
+                "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+              },
+              "default_actions": {
+                "List": [
+                  {
+                    "Map": {
+                      "authenticate_oidc_config": {
+                        "Map": {
+                          "issuer": {
+                            "String": "https://issuer.example.com"
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "exists": true,
+            "dependency_bindings": []
+          },
+          "identifier": "listener-rotated",
+          "to": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "elasticloadbalancingv2.Listener",
+              "identity": "rotated"
+            },
+            "attributes": {
+              "default_actions": {
+                "List": [
+                  {
+                    "Map": {
+                      "authenticate_oidc_config": {
+                        "Map": {
+                          "issuer": {
+                            "String": "https://issuer.example.com"
+                          },
+                          "client_secret": {
+                            "RedactedSecret": {
+                              "hash": "$argon2id$v=19$m=19456,t=2,p=1$NbAPS9Krgs51iFN+Tr+CGg$Ev4LjDV4KhENjMNMWu7x1TmoU0tQJJjMTdYUnKTjRgA"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "ssl_policy": {
+                "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "prefixes": {},
+            "binding": "rotated",
+            "dependencies": null,
+            "module_source": null
+          },
+          "changed_attributes": [
+            "default_actions"
+          ]
+        }
+      },
+      {
+        "Delete": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "elasticloadbalancingv2.Listener",
+            "identity": "replacement"
+          },
+          "identifier": "listener-replacement",
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "binding": "replacement",
+          "dependencies": [],
+          "explicit_dependencies": []
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "elasticloadbalancingv2.Listener",
+            "identity": "replacement"
+          },
+          "attributes": {
+            "default_actions": {
+              "List": [
+                {
+                  "Map": {
+                    "authenticate_oidc_config": {
+                      "Map": {
+                        "issuer": {
+                          "String": "https://issuer.example.com"
+                        },
+                        "client_secret": {
+                          "RedactedSecret": {
+                            "hash": "$argon2id$v=19$m=19456,t=2,p=1$mv36rlZ2xU3M+lxcw47CBg$XktpG7h5mXeuXi+vRZBiaoQlqeZwEoQfNrpF9P6P0dU"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "ssl_policy": {
+              "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+            },
+            "port": {
+              "Int": 8443
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": "replacement",
+          "dependencies": null,
+          "module_source": null
+        }
+      },
+      {
+        "Delete": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "elasticloadbalancingv2.Listener",
+            "identity": "replacement_same_secret"
+          },
+          "identifier": "listener-replacement-same-secret",
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "binding": "replacement_same_secret",
+          "dependencies": [],
+          "explicit_dependencies": []
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "elasticloadbalancingv2.Listener",
+            "identity": "replacement_same_secret"
+          },
+          "attributes": {
+            "default_actions": {
+              "List": [
+                {
+                  "Map": {
+                    "authenticate_oidc_config": {
+                      "Map": {
+                        "issuer": {
+                          "String": "https://issuer.example.com"
+                        },
+                        "client_secret": {
+                          "RedactedSecret": {
+                            "hash": "$argon2id$v=19$m=19456,t=2,p=1$pCNjxE8AFBjEI+sg59N7Rg$8f9Lkio1HoOLlJdWT8Uu3IoBR/F0a/sPIcLBfbme950"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "ssl_policy": {
+              "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+            },
+            "port": {
+              "Int": 8443
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": "replacement_same_secret",
+          "dependencies": null,
+          "module_source": null
+        }
+      }
+    ],
+    "replacement_inputs": {
+      "old_instances": [
+        {
+          "instance": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "elasticloadbalancingv2.Listener",
+              "identity": "replacement"
+            },
+            "generation": "Current",
+            "identifier": "listener-replacement"
+          },
+          "attributes": {
+            "default_actions": {
+              "List": [
+                {
+                  "Map": {
+                    "authenticate_oidc_config": {
+                      "Map": {
+                        "issuer": {
+                          "String": "https://issuer.example.com"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "port": {
+              "Int": 443
+            },
+            "ssl_policy": {
+              "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+            }
+          }
+        },
+        {
+          "instance": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "elasticloadbalancingv2.Listener",
+              "identity": "replacement_same_secret"
+            },
+            "generation": "Current",
+            "identifier": "listener-replacement-same-secret"
+          },
+          "attributes": {
+            "port": {
+              "Int": 443
+            },
+            "ssl_policy": {
+              "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+            },
+            "default_actions": {
+              "List": [
+                {
+                  "Map": {
+                    "authenticate_oidc_config": {
+                      "Map": {
+                        "issuer": {
+                          "String": "https://issuer.example.com"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "prepared_names": []
+    },
+    "replace_display": [
+      {
+        "create_idx": 3,
+        "delete_idx": 2,
+        "create_before_destroy": false,
+        "changed_create_only": [
+          "port"
+        ],
+        "cascade_ref_hints": [],
+        "temporary_name": null,
+        "previous_attributes": {
+          "port": {
+            "Int": 443
+          },
+          "default_actions": {
+            "List": [
+              {
+                "Map": {
+                  "authenticate_oidc_config": {
+                    "Map": {
+                      "issuer": {
+                        "String": "https://issuer.example.com"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "ssl_policy": {
+            "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+          }
+        }
+      },
+      {
+        "create_idx": 5,
+        "delete_idx": 4,
+        "create_before_destroy": false,
+        "changed_create_only": [
+          "port"
+        ],
+        "cascade_ref_hints": [],
+        "temporary_name": null,
+        "previous_attributes": {
+          "port": {
+            "Int": 443
+          },
+          "default_actions": {
+            "List": [
+              {
+                "Map": {
+                  "authenticate_oidc_config": {
+                    "Map": {
+                      "issuer": {
+                        "String": "https://issuer.example.com"
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "ssl_policy": {
+            "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "unrelated"
+      },
+      "attributes": {
+        "default_actions": {
+          "List": [
+            {
+              "Map": {
+                "authenticate_oidc_config": {
+                  "Map": {
+                    "issuer": {
+                      "String": "https://issuer.example.com"
+                    },
+                    "client_secret": {
+                      "RedactedSecret": {
+                        "hash": "$argon2id$v=19$m=19456,t=2,p=1$QFYsM5haP9jZ2PMxad/Kmw$zUbld/b1kCoEiFMKa/DOJNf45v5CHbi9DfswR/vGF2k"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ssl_policy": {
+          "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "unrelated",
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "rotated"
+      },
+      "attributes": {
+        "default_actions": {
+          "List": [
+            {
+              "Map": {
+                "authenticate_oidc_config": {
+                  "Map": {
+                    "issuer": {
+                      "String": "https://issuer.example.com"
+                    },
+                    "client_secret": {
+                      "RedactedSecret": {
+                        "hash": "$argon2id$v=19$m=19456,t=2,p=1$NbAPS9Krgs51iFN+Tr+CGg$Ev4LjDV4KhENjMNMWu7x1TmoU0tQJJjMTdYUnKTjRgA"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ssl_policy": {
+          "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "rotated",
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "replacement"
+      },
+      "attributes": {
+        "default_actions": {
+          "List": [
+            {
+              "Map": {
+                "authenticate_oidc_config": {
+                  "Map": {
+                    "issuer": {
+                      "String": "https://issuer.example.com"
+                    },
+                    "client_secret": {
+                      "RedactedSecret": {
+                        "hash": "$argon2id$v=19$m=19456,t=2,p=1$mv36rlZ2xU3M+lxcw47CBg$XktpG7h5mXeuXi+vRZBiaoQlqeZwEoQfNrpF9P6P0dU"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ssl_policy": {
+          "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        },
+        "port": {
+          "Int": 8443
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "replacement",
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "replacement_same_secret"
+      },
+      "attributes": {
+        "default_actions": {
+          "List": [
+            {
+              "Map": {
+                "authenticate_oidc_config": {
+                  "Map": {
+                    "issuer": {
+                      "String": "https://issuer.example.com"
+                    },
+                    "client_secret": {
+                      "RedactedSecret": {
+                        "hash": "$argon2id$v=19$m=19456,t=2,p=1$pCNjxE8AFBjEI+sg59N7Rg$8f9Lkio1HoOLlJdWT8Uu3IoBR/F0a/sPIcLBfbme950"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ssl_policy": {
+          "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        },
+        "port": {
+          "Int": 8443
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "replacement_same_secret",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    [],
+    [],
+    [],
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    [],
+    [],
+    [],
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "unrelated"
+      },
+      "attributes": {
+        "default_actions": {
+          "List": [
+            {
+              "Map": {
+                "authenticate_oidc_config": {
+                  "Map": {
+                    "issuer": {
+                      "String": "https://issuer.example.com"
+                    },
+                    "client_secret": {
+                      "RedactedSecret": {
+                        "hash": "$argon2id$v=19$m=19456,t=2,p=1$oQEJxCjEq9LkUz9R9mw8yw$TI5Tedoa19seEPFmobS/XzpbU7bNpJMqtC2gJFIfSmU"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ssl_policy": {
+          "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "unrelated",
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "rotated"
+      },
+      "attributes": {
+        "default_actions": {
+          "List": [
+            {
+              "Map": {
+                "authenticate_oidc_config": {
+                  "Map": {
+                    "issuer": {
+                      "String": "https://issuer.example.com"
+                    },
+                    "client_secret": {
+                      "RedactedSecret": {
+                        "hash": "$argon2id$v=19$m=19456,t=2,p=1$KoymEKSOvTMKnF/+1bVyRg$5Vgm7LnCcBZKUqYJqisXsjHx4IbdcqwX1FzZimRPi3s"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ssl_policy": {
+          "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "rotated",
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "replacement"
+      },
+      "attributes": {
+        "default_actions": {
+          "List": [
+            {
+              "Map": {
+                "authenticate_oidc_config": {
+                  "Map": {
+                    "issuer": {
+                      "String": "https://issuer.example.com"
+                    },
+                    "client_secret": {
+                      "RedactedSecret": {
+                        "hash": "$argon2id$v=19$m=19456,t=2,p=1$m6e7udNKTaHy7+3LTcFMkw$prZW+E7HRQzJNAbVyKqQohhvMMFgCKT/mQ5Y3c0oB04"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ssl_policy": {
+          "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        },
+        "port": {
+          "Int": 8443
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "replacement",
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "replacement_same_secret"
+      },
+      "attributes": {
+        "default_actions": {
+          "List": [
+            {
+              "Map": {
+                "authenticate_oidc_config": {
+                  "Map": {
+                    "issuer": {
+                      "String": "https://issuer.example.com"
+                    },
+                    "client_secret": {
+                      "RedactedSecret": {
+                        "hash": "$argon2id$v=19$m=19456,t=2,p=1$BKu/x88r3lRFB0Ro+Ot+lg$ZZjvG+ckIUMrRB0Um6/zcM+pKO58UwPDyImtOPEOdso"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "ssl_policy": {
+          "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+        },
+        "port": {
+          "Int": 8443
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "replacement_same_secret",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "replacement"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "elasticloadbalancingv2.Listener",
+            "identity": "replacement"
+          },
+          "identifier": "listener-replacement",
+          "attributes": {
+            "port": {
+              "Int": 443
+            },
+            "ssl_policy": {
+              "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+            },
+            "default_actions": {
+              "List": [
+                {
+                  "Map": {
+                    "authenticate_oidc_config": {
+                      "Map": {
+                        "issuer": {
+                          "String": "https://issuer.example.com"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "replacement_same_secret"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "elasticloadbalancingv2.Listener",
+            "identity": "replacement_same_secret"
+          },
+          "identifier": "listener-replacement-same-secret",
+          "attributes": {
+            "ssl_policy": {
+              "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+            },
+            "default_actions": {
+              "List": [
+                {
+                  "Map": {
+                    "authenticate_oidc_config": {
+                      "Map": {
+                        "issuer": {
+                          "String": "https://issuer.example.com"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "port": {
+              "Int": 443
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "rotated"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "elasticloadbalancingv2.Listener",
+            "identity": "rotated"
+          },
+          "identifier": "listener-rotated",
+          "attributes": {
+            "default_actions": {
+              "List": [
+                {
+                  "Map": {
+                    "authenticate_oidc_config": {
+                      "Map": {
+                        "issuer": {
+                          "String": "https://issuer.example.com"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "ssl_policy": {
+              "String": "ELBSecurityPolicy-TLS13-1-2-2021-06"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "elasticloadbalancingv2.Listener",
+        "identity": "unrelated"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "elasticloadbalancingv2.Listener",
+            "identity": "unrelated"
+          },
+          "identifier": "listener-unrelated",
+          "attributes": {
+            "ssl_policy": {
+              "String": "ELBSecurityPolicy-2016-08"
+            },
+            "default_actions": {
+              "List": [
+                {
+                  "Map": {
+                    "authenticate_oidc_config": {
+                      "Map": {
+                        "issuer": {
+                          "String": "https://issuer.example.com"
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "elasticloadbalancingv2.Listener",
+            "fingerprint": {
+              "present": "8950a2290c30120eae679dc4edf9f27c2640ed0ae14ec09ec3c712556c9d3576"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

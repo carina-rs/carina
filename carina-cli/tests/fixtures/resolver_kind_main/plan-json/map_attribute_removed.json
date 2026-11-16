@@ -1,0 +1,224 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/map_attribute_removed",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/map_attribute_removed",
+  "state_lineage": "test-lineage-map-attribute-removed",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "ec2.Vpc",
+              "identity": "vpc"
+            },
+            "identifier": "vpc-0123456789abcdef0",
+            "attributes": {
+              "cidr_block": {
+                "String": "10.0.0.0/16"
+              },
+              "tags": {
+                "Map": {
+                  "Component": {
+                    "String": "registry"
+                  },
+                  "Environment": {
+                    "String": "dev"
+                  },
+                  "ManagedBy": {
+                    "String": "carina"
+                  },
+                  "Project": {
+                    "String": "carina-rs"
+                  },
+                  "Repository": {
+                    "String": "carina-rs/infra"
+                  }
+                }
+              },
+              "vpc_id": {
+                "String": "vpc-0123456789abcdef0"
+              }
+            },
+            "exists": true,
+            "dependency_bindings": []
+          },
+          "identifier": "vpc-0123456789abcdef0",
+          "to": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "ec2.Vpc",
+              "identity": "vpc"
+            },
+            "attributes": {
+              "cidr_block": {
+                "String": "10.0.0.0/16"
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "prefixes": {},
+            "binding": "vpc",
+            "dependencies": null,
+            "module_source": null
+          },
+          "changed_attributes": [
+            "tags"
+          ]
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "vpc"
+      },
+      "attributes": {
+        "cidr_block": {
+          "String": "10.0.0.0/16"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "vpc",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "vpc"
+      },
+      "attributes": {
+        "cidr_block": {
+          "String": "10.0.0.0/16"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "vpc",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "vpc"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "vpc"
+          },
+          "identifier": "vpc-0123456789abcdef0",
+          "attributes": {
+            "tags": {
+              "Map": {
+                "Component": {
+                  "String": "registry"
+                },
+                "Environment": {
+                  "String": "dev"
+                },
+                "ManagedBy": {
+                  "String": "carina"
+                },
+                "Project": {
+                  "String": "carina-rs"
+                },
+                "Repository": {
+                  "String": "carina-rs/infra"
+                }
+              }
+            },
+            "vpc_id": {
+              "String": "vpc-0123456789abcdef0"
+            },
+            "cidr_block": {
+              "String": "10.0.0.0/16"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "ec2.Vpc",
+            "fingerprint": {
+              "present": "b80bbb46ef8ef2e668a216d5bf751b549de872d7669c6453be3255481b6fc548"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

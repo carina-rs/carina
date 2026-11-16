@@ -1,0 +1,242 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/keyed_partial_update_release",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/keyed_partial_update_release",
+  "state_lineage": "keyed-partial-update-release",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "mock",
+      "attributes": {}
+    }
+  ],
+  "backend_config": {
+    "backend_type": "local",
+    "attributes": {
+      "path": {
+        "String": "carina.state.json"
+      }
+    }
+  },
+  "plan": {
+    "effects": [
+      {
+        "ReleaseListKeys": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.keyed_partial_update_list",
+            "identity": "mock_test_keyed_partial_update_list_e646b73c"
+          },
+          "attribute": "target_group_attributes",
+          "key_field": "key",
+          "keys": [
+            {
+              "key": "b",
+              "retained_value": {
+                "String": "2"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.keyed_partial_update_list",
+        "identity": "mock_test_keyed_partial_update_list_e646b73c"
+      },
+      "attributes": {
+        "name": {
+          "String": "target"
+        },
+        "target_group_attributes": {
+          "List": [
+            {
+              "Map": {
+                "key": {
+                  "String": "a"
+                },
+                "value": {
+                  "String": "1"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.keyed_partial_update_list",
+        "identity": "mock_test_keyed_partial_update_list_e646b73c"
+      },
+      "attributes": {
+        "name": {
+          "String": "target"
+        },
+        "target_group_attributes": {
+          "List": [
+            {
+              "Map": {
+                "key": {
+                  "String": "a"
+                },
+                "value": {
+                  "String": "1"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "mock",
+        "resource_type": "test.keyed_partial_update_list",
+        "identity": "mock_test_keyed_partial_update_list_e646b73c"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.keyed_partial_update_list",
+            "identity": "mock_test_keyed_partial_update_list_e646b73c"
+          },
+          "identifier": "mock-id",
+          "attributes": {
+            "name": {
+              "String": "target"
+            },
+            "target_group_attributes": {
+              "List": [
+                {
+                  "Map": {
+                    "key": {
+                      "String": "a"
+                    },
+                    "value": {
+                      "String": "1"
+                    }
+                  }
+                },
+                {
+                  "Map": {
+                    "key": {
+                      "String": "b"
+                    },
+                    "value": {
+                      "String": "2"
+                    }
+                  }
+                },
+                {
+                  "Map": {
+                    "key": {
+                      "String": "stickiness.type"
+                    },
+                    "value": {
+                      "String": "lb_cookie"
+                    }
+                  }
+                },
+                {
+                  "Map": {
+                    "key": {
+                      "String": "load_balancing.algorithm.type"
+                    },
+                    "value": {
+                      "String": "round_robin"
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "mock": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "test.keyed_partial_update_list",
+            "fingerprint": {
+              "present": "928746f64cadb73fdb4585490885d362a9fa72cbb436da0a8810db42da522c00"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {
+    "mock": {
+      "kind": "built_in"
+    }
+  },
+  "provider_scopes": [
+    {
+      "instance": {
+        "provider": "mock",
+        "provider_instance": null
+      },
+      "scope": {
+        "kind": "unavailable"
+      }
+    }
+  ]
+}

@@ -1,0 +1,1052 @@
+{
+  "directories": 135,
+  "documents": 82,
+  "entries": [
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "all_create"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "anonymous_create_only_rekey"
+    },
+    {
+      "file": "anonymous_if_legacy.json",
+      "fixture": "anonymous_if_legacy",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_loop_claimed_legacy.json",
+      "fixture": "anonymous_loop_claimed_legacy",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_loop_deferred_map.json",
+      "fixture": "anonymous_loop_deferred_map",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_loop_deferred_map__orgs.json",
+      "fixture": "anonymous_loop_deferred_map/orgs",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_loop_delete_earlier.json",
+      "fixture": "anonymous_loop_delete_earlier",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_loop_insert_before.json",
+      "fixture": "anonymous_loop_insert_before",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_loop_module_call.json",
+      "fixture": "anonymous_loop_module_call",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/anonymous_loop_module_call/network/main.crn:6:16: awscc.ec2.Vpc.vpc: attribute `cidr_block`: unresolved module argument: vpc_cidr",
+        "stage": "root-validation"
+      },
+      "fixture": "anonymous_loop_module_call/network"
+    },
+    {
+      "file": "anonymous_loop_new_id_exists.json",
+      "fixture": "anonymous_loop_new_id_exists",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_loop_reorder.json",
+      "fixture": "anonymous_loop_reorder",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_loop_same_tail.json",
+      "fixture": "anonymous_loop_same_tail",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_loop_sibling_files.json",
+      "fixture": "anonymous_loop_sibling_files",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_old_identity_name_override.json",
+      "fixture": "anonymous_old_identity_name_override",
+      "verified_phcs": {}
+    },
+    {
+      "file": "anonymous_old_identity_update.json",
+      "fixture": "anonymous_old_identity_update",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "compact"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "default_tags"
+    },
+    {
+      "file": "default_tags_update_replace.json",
+      "fixture": "default_tags_update_replace",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "default_values"
+    },
+    {
+      "file": "deferred_for.json",
+      "fixture": "deferred_for",
+      "verified_phcs": {}
+    },
+    {
+      "file": "deferred_for_anonymous.json",
+      "fixture": "deferred_for_anonymous",
+      "verified_phcs": {}
+    },
+    {
+      "file": "deferred_for_create_solo.json",
+      "fixture": "deferred_for_create_solo",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "deferred_for_with_dependent_wait"
+    },
+    {
+      "file": "deferred_for_with_paired_destroy.json",
+      "fixture": "deferred_for_with_paired_destroy",
+      "verified_phcs": {}
+    },
+    {
+      "file": "deferred_for_with_unrelated_delete.json",
+      "fixture": "deferred_for_with_unrelated_delete",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "delete_orphan"
+    },
+    {
+      "file": "delete_orphan_list_of_maps.json",
+      "fixture": "delete_orphan_list_of_maps",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "depends_on"
+    },
+    {
+      "file": "deposed_delete.json",
+      "fixture": "deposed_delete",
+      "verified_phcs": {}
+    },
+    {
+      "file": "deposed_delete_update_dependency.json",
+      "fixture": "deposed_delete_update_dependency",
+      "verified_phcs": {}
+    },
+    {
+      "file": "destroy_full.json",
+      "fixture": "destroy_full",
+      "verified_phcs": {}
+    },
+    {
+      "file": "destroy_list_struct_child_gutter.json",
+      "fixture": "destroy_list_struct_child_gutter",
+      "verified_phcs": {}
+    },
+    {
+      "file": "destroy_orphans.json",
+      "fixture": "destroy_orphans",
+      "verified_phcs": {}
+    },
+    {
+      "file": "dynamic_enum_az_no_diff.json",
+      "fixture": "dynamic_enum_az_no_diff",
+      "verified_phcs": {}
+    },
+    {
+      "file": "empty_explicit_children_no_changes.json",
+      "fixture": "empty_explicit_children_no_changes",
+      "verified_phcs": {}
+    },
+    {
+      "file": "enum_display.json",
+      "fixture": "enum_display",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "explicit"
+    },
+    {
+      "file": "exports.json",
+      "fixture": "exports",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile.json",
+      "fixture": "exports_multifile",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_let_chain.json",
+      "fixture": "exports_multifile_let_chain",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_let_chain__usecase.json",
+      "fixture": "exports_multifile_let_chain/usecase",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_let_chain_5hop.json",
+      "fixture": "exports_multifile_let_chain_5hop",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_let_chain_5hop__usecase.json",
+      "fixture": "exports_multifile_let_chain_5hop/usecase",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_let_literal.json",
+      "fixture": "exports_multifile_let_literal",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_let_literal__usecase.json",
+      "fixture": "exports_multifile_let_literal/usecase",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_module_output.json",
+      "fixture": "exports_multifile_module_output",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_module_output__usecase.json",
+      "fixture": "exports_multifile_module_output/usecase",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_resource_attribute_ref.json",
+      "fixture": "exports_multifile_resource_attribute_ref",
+      "verified_phcs": {}
+    },
+    {
+      "file": "exports_multifile_resource_attribute_ref__usecase.json",
+      "fixture": "exports_multifile_resource_attribute_ref/usecase",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "Module resolution error: Parse error in usecase/main.crn: Invalid expression at line 2: cannot apply access .foo to string",
+        "stage": "root-validation"
+      },
+      "fixture": "exports_multifile_string_let_attr_access_rejected"
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/exports_multifile_string_let_attr_access_rejected/usecase/main.crn: Invalid expression at line 2: cannot apply access .foo to string",
+        "stage": "root-load"
+      },
+      "fixture": "exports_multifile_string_let_attr_access_rejected/usecase"
+    },
+    {
+      "file": "ignore_changes_readable.json",
+      "fixture": "ignore_changes_readable",
+      "verified_phcs": {}
+    },
+    {
+      "file": "import_deferred_interpolation.json",
+      "fixture": "import_deferred_interpolation",
+      "verified_phcs": {}
+    },
+    {
+      "file": "import_deferred_interpolation__network.json",
+      "fixture": "import_deferred_interpolation/network",
+      "verified_phcs": {}
+    },
+    {
+      "file": "keyed_partial_update_release.json",
+      "fixture": "keyed_partial_update_release",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "legacy_orphan_unknown_destroy_ordering"
+    },
+    {
+      "file": "list_diff_added_struct.json",
+      "fixture": "list_diff_added_struct",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "list_diff_added_struct_child_gutter"
+    },
+    {
+      "file": "list_diff_best_first_mid_insert.json",
+      "fixture": "list_diff_best_first_mid_insert",
+      "verified_phcs": {}
+    },
+    {
+      "file": "list_diff_modified_with_unchanged.json",
+      "fixture": "list_diff_modified_with_unchanged",
+      "verified_phcs": {}
+    },
+    {
+      "file": "list_diff_modified_with_unchanged_nested.json",
+      "fixture": "list_diff_modified_with_unchanged_nested",
+      "verified_phcs": {}
+    },
+    {
+      "file": "list_diff_paired_all_unchanged_dropped.json",
+      "fixture": "list_diff_paired_all_unchanged_dropped",
+      "verified_phcs": {}
+    },
+    {
+      "file": "list_diff_removed_struct.json",
+      "fixture": "list_diff_removed_struct",
+      "verified_phcs": {}
+    },
+    {
+      "file": "list_diff_string_list_grew.json",
+      "fixture": "list_diff_string_list_grew",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "list_struct_child_gutter"
+    },
+    {
+      "file": "map_added_from_none.json",
+      "fixture": "map_added_from_none",
+      "verified_phcs": {}
+    },
+    {
+      "file": "map_attribute_removed.json",
+      "fixture": "map_attribute_removed",
+      "verified_phcs": {}
+    },
+    {
+      "file": "map_field_string_list_grew.json",
+      "fixture": "map_field_string_list_grew",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "map_key_diff"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "mixed_operations"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "module_anonymous_resource"
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/module_anonymous_resource/oidc-module/main.crn:7:15: awscc.iam.Role.role: attribute `role_name`: unresolved module argument: role_name\n<WORKSPACE>/carina-cli/tests/fixtures/plan_display/module_anonymous_resource/oidc-module/main.crn:7:15: awscc.iam.RolePolicy.<pending>: attribute `role_name`: unresolved module argument: role_name",
+        "stage": "root-validation"
+      },
+      "fixture": "module_anonymous_resource/oidc-module"
+    },
+    {
+      "file": "moved_claims_precede_heuristics.json",
+      "fixture": "moved_claims_precede_heuristics",
+      "verified_phcs": {}
+    },
+    {
+      "file": "moved_hint_ambiguous.json",
+      "fixture": "moved_hint_ambiguous",
+      "verified_phcs": {}
+    },
+    {
+      "file": "moved_hint_let_to_for.json",
+      "fixture": "moved_hint_let_to_for",
+      "verified_phcs": {}
+    },
+    {
+      "file": "moved_hint_read_loop.json",
+      "fixture": "moved_hint_read_loop",
+      "verified_phcs": {}
+    },
+    {
+      "file": "moved_hint_read_loop_module.json",
+      "fixture": "moved_hint_read_loop_module",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/moved_hint_read_loop_module/record-module/main.crn:6:23: aws.acm.Certificate.cert: attribute `domain_name`: unresolved module argument: domain_name",
+        "stage": "root-validation"
+      },
+      "fixture": "moved_hint_read_loop_module/record-module"
+    },
+    {
+      "file": "moved_let_to_for_bound.json",
+      "fixture": "moved_let_to_for_bound",
+      "verified_phcs": {}
+    },
+    {
+      "file": "moved_let_to_for_map.json",
+      "fixture": "moved_let_to_for_map",
+      "verified_phcs": {}
+    },
+    {
+      "file": "moved_let_to_for_read_loop.json",
+      "fixture": "moved_let_to_for_read_loop",
+      "verified_phcs": {}
+    },
+    {
+      "file": "moved_let_to_for_read_loop_module.json",
+      "fixture": "moved_let_to_for_read_loop_module",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/moved_let_to_for_read_loop_module/record-module/main.crn:6:23: aws.acm.Certificate.cert: attribute `domain_name`: unresolved module argument: domain_name",
+        "stage": "root-validation"
+      },
+      "fixture": "moved_let_to_for_read_loop_module/record-module"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "moved_let_to_for_unbound"
+    },
+    {
+      "file": "moved_let_to_for_unbound_reference.json",
+      "fixture": "moved_let_to_for_unbound_reference",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "moved_prev_keys"
+    },
+    {
+      "file": "moved_pure.json",
+      "fixture": "moved_pure",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "moved_with_changes"
+    },
+    {
+      "file": "multi_instance_create.json",
+      "fixture": "multi_instance_create",
+      "verified_phcs": {}
+    },
+    {
+      "file": "multi_instance_module.json",
+      "fixture": "multi_instance_module",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/multi_instance_module/reg-module/main.crn:9:17: awscc.s3.Bucket.cert: attribute `bucket_name`: unresolved module argument: cert_name",
+        "stage": "root-validation"
+      },
+      "fixture": "multi_instance_module/reg-module"
+    },
+    {
+      "file": "nested_list_of_maps_all_dropped.json",
+      "fixture": "nested_list_of_maps_all_dropped",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "nested_map_diff"
+    },
+    {
+      "file": "nested_write_only.json",
+      "fixture": "nested_write_only",
+      "verified_phcs": {
+        "/plan/effects/0/Update/to/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "accepted-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/plan/effects/1/Update/to/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "new-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/plan/effects/3/Create/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "new-replace-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/plan/effects/5/Create/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "accepted-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/sorted_resources/0/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "accepted-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/sorted_resources/1/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "new-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/sorted_resources/2/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "new-replace-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/sorted_resources/3/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "accepted-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/unresolved_resources/0/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "accepted-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/unresolved_resources/1/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "new-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/unresolved_resources/2/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "new-replace-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        },
+        "/unresolved_resources/3/attributes/default_actions/List/0/Map/authenticate_oidc_config/Map/client_secret/RedactedSecret/hash": {
+          "algorithm": "argon2id",
+          "digest_bytes": 32,
+          "material": "accepted-secret",
+          "params": "m=19456,t=2,p=1",
+          "salt_chars": 22,
+          "version": 19
+        }
+      }
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "no_changes"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "no_changes_enum"
+    },
+    {
+      "file": "pending_inputs.json",
+      "fixture": "pending_inputs",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "plan_image_anonymous"
+    },
+    {
+      "file": "plan_image_module_cascade.json",
+      "fixture": "plan_image_module_cascade",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/plan_image_module_cascade/review-module/main.crn:7:19: test.test.Widget.module_node: attribute `description`: unresolved module argument: description",
+        "stage": "root-validation"
+      },
+      "fixture": "plan_image_module_cascade/review-module"
+    },
+    {
+      "file": "plan_image_reference_layout.json",
+      "fixture": "plan_image_reference_layout",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/plan_image_reference_layout/app-module/main.crn:7:19: test.test.Widget.server: attribute `description`: unresolved module argument: subnet_output",
+        "stage": "root-validation"
+      },
+      "fixture": "plan_image_reference_layout/app-module"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "policy_pretty"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "policy_pretty_dynamic_key_list"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "policy_pretty_nested"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "postfix_access"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "pretty_long_string_list"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "pretty_short_string_list"
+    },
+    {
+      "file": "provider_prefix.json",
+      "fixture": "provider_prefix",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "read_only_attrs"
+    },
+    {
+      "file": "removed_missing_identifier.json",
+      "fixture": "removed_missing_identifier",
+      "verified_phcs": {}
+    },
+    {
+      "file": "replace_create_only.json",
+      "fixture": "replace_create_only",
+      "verified_phcs": {}
+    },
+    {
+      "file": "replace_with_non_forcing_diffs.json",
+      "fixture": "replace_with_non_forcing_diffs",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "errors": [
+          "aws.acm.Certificate.cert: resource type 'aws.acm.Certificate' does not support create_before_destroy: the replacement cannot coexist with the original; create_before_destroy required by dependent `aws.route53.RecordSet.records[?]`"
+        ],
+        "stage": "plan-diagnostics"
+      },
+      "fixture": "required_by_deferred"
+    },
+    {
+      "expected_error": {
+        "errors": [
+          "aws.acm.Certificate.cert: resource type 'aws.acm.Certificate' does not support create_before_destroy: the replacement cannot coexist with the original; create_before_destroy required by dependents `aws.acm.CertificateValidation.alpha`, `aws.acm.CertificateValidation.zeta`"
+        ],
+        "stage": "plan-diagnostics"
+      },
+      "fixture": "required_by_resources"
+    },
+    {
+      "expected_error": {
+        "errors": [
+          "fixture.test.Consumer.consumer: resolved value constraint failed for attribute(s) `target` from reference(s) `producer.value`: Invalid value 'bad-value' for 'target': does not match required pattern /^good-/ (Substring: Plan fixture deliberately validates only the prefix)"
+        ],
+        "stage": "plan-diagnostics"
+      },
+      "fixture": "resolved_value_constraint_multifile"
+    },
+    {
+      "file": "route53_hosted_zone_name_strip_suffix_no_diff.json",
+      "fixture": "route53_hosted_zone_name_strip_suffix_no_diff",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "secret_values"
+    },
+    {
+      "file": "server_added_list_elements_changed.json",
+      "fixture": "server_added_list_elements_changed",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "server_default_struct_leaf"
+    },
+    {
+      "file": "state_blocks.json",
+      "fixture": "state_blocks",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "state_only_directive_change"
+    },
+    {
+      "file": "string_dot_suffix.json",
+      "fixture": "string_dot_suffix",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "upstream_state"
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/upstream_state/network/main.crn: Invalid expression at line 4: unknown type 'struct'; custom types must use a registered type name",
+        "stage": "root-load"
+      },
+      "fixture": "upstream_state/network"
+    },
+    {
+      "expected_error": {
+        "rendered": "cannot serialize at secret redaction: value is not yet known (upstream value network.vpc.vpc_id)",
+        "stage": "plan-save"
+      },
+      "fixture": "upstream_state_empty_exports"
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/upstream_state_empty_exports/network/main.crn: Invalid expression at line 4: unknown type 'struct'; custom types must use a registered type name",
+        "stage": "root-load"
+      },
+      "fixture": "upstream_state_empty_exports/network"
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "upstream_state_map_dot_notation"
+    },
+    {
+      "file": "upstream_state_map_dot_notation__orgs.json",
+      "fixture": "upstream_state_map_dot_notation/orgs",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "pending resource identity cannot be serialized",
+        "stage": "plan-serialize"
+      },
+      "fixture": "upstream_state_map_subscript"
+    },
+    {
+      "file": "upstream_state_map_subscript__orgs.json",
+      "fixture": "upstream_state_map_subscript/orgs",
+      "verified_phcs": {}
+    },
+    {
+      "expected_error": {
+        "rendered": "cannot serialize at secret redaction: value is not yet known (upstream value network.vpc.vpc_id)",
+        "stage": "plan-save"
+      },
+      "fixture": "upstream_state_unresolved"
+    },
+    {
+      "expected_error": {
+        "rendered": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/upstream_state_unresolved/network/main.crn: Invalid expression at line 4: unknown type 'struct'; custom types must use a registered type name",
+        "stage": "root-load"
+      },
+      "fixture": "upstream_state_unresolved/network"
+    },
+    {
+      "expected_error": {
+        "errors": [
+          "aws.acm.Certificate.cert: wait `cert_issued`: `until` references unknown attribute `cert.status` on `acm.Certificate`"
+        ],
+        "stage": "plan-diagnostics"
+      },
+      "fixture": "wait_cert"
+    }
+  ],
+  "expected_errors": 53,
+  "header": {
+    "allowed_files": [
+      "carina-cli/tests/spike_4400_directory.rs",
+      "carina-cli/tests/support/resolver_kind_main.rs",
+      "carina-cli/src/commands/plan/pr1_tests.rs",
+      "carina-cli/src/commands/plan.rs",
+      "carina-cli/tests/fixtures/resolver_kind_main/4400-cells.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/manifest.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/all_create.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_create_only_rekey.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_if_legacy.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_claimed_legacy.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_deferred_map.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_deferred_map__orgs.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_delete_earlier.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_insert_before.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_module_call.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_module_call__network.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_new_id_exists.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_reorder.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_same_tail.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_loop_sibling_files.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_old_identity_name_override.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/anonymous_old_identity_update.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/compact.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/default_tags.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/default_tags_update_replace.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/default_values.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/deferred_for.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/deferred_for_anonymous.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/deferred_for_create_solo.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/deferred_for_with_dependent_wait.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/deferred_for_with_paired_destroy.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/deferred_for_with_unrelated_delete.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/delete_orphan.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/delete_orphan_list_of_maps.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/depends_on.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/deposed_delete.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/deposed_delete_update_dependency.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/destroy_full.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/destroy_list_struct_child_gutter.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/destroy_orphans.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/dynamic_enum_az_no_diff.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/empty_explicit_children_no_changes.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/enum_display.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/explicit.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_let_chain.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_let_chain__usecase.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_let_chain_5hop.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_let_chain_5hop__usecase.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_let_literal.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_let_literal__usecase.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_module_output.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_module_output__usecase.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_resource_attribute_ref.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_resource_attribute_ref__usecase.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_string_let_attr_access_rejected.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/exports_multifile_string_let_attr_access_rejected__usecase.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/ignore_changes_readable.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/import_deferred_interpolation.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/import_deferred_interpolation__network.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/keyed_partial_update_release.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/legacy_orphan_unknown_destroy_ordering.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/list_diff_added_struct.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/list_diff_added_struct_child_gutter.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/list_diff_best_first_mid_insert.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/list_diff_modified_with_unchanged.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/list_diff_modified_with_unchanged_nested.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/list_diff_paired_all_unchanged_dropped.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/list_diff_removed_struct.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/list_diff_string_list_grew.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/list_struct_child_gutter.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/map_added_from_none.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/map_attribute_removed.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/map_field_string_list_grew.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/map_key_diff.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/mixed_operations.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/module_anonymous_resource.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/module_anonymous_resource__oidc-module.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_claims_precede_heuristics.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_hint_ambiguous.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_hint_let_to_for.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_hint_read_loop.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_hint_read_loop_module.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_hint_read_loop_module__record-module.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_let_to_for_bound.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_let_to_for_map.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_let_to_for_read_loop.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_let_to_for_read_loop_module.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_let_to_for_read_loop_module__record-module.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_let_to_for_unbound.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_let_to_for_unbound_reference.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_prev_keys.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_pure.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/moved_with_changes.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/multi_instance_create.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/multi_instance_module.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/multi_instance_module__reg-module.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/nested_list_of_maps_all_dropped.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/nested_map_diff.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/nested_write_only.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/no_changes.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/no_changes_enum.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/pending_inputs.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/plan_image_anonymous.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/plan_image_module_cascade.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/plan_image_module_cascade__review-module.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/plan_image_reference_layout.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/plan_image_reference_layout__app-module.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/policy_pretty.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/policy_pretty_dynamic_key_list.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/policy_pretty_nested.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/postfix_access.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/pretty_long_string_list.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/pretty_short_string_list.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/provider_prefix.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/read_only_attrs.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/removed_missing_identifier.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/replace_create_only.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/replace_with_non_forcing_diffs.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/required_by_deferred.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/required_by_resources.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/resolved_value_constraint_multifile.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/route53_hosted_zone_name_strip_suffix_no_diff.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/secret_values.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/server_added_list_elements_changed.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/server_default_struct_leaf.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/state_blocks.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/state_only_directive_change.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/string_dot_suffix.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state__network.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state_empty_exports.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state_empty_exports__network.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state_map_dot_notation.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state_map_dot_notation__orgs.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state_map_subscript.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state_map_subscript__orgs.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state_unresolved.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/upstream_state_unresolved__network.json",
+      "carina-cli/tests/fixtures/resolver_kind_main/plan-json/wait_cert.json"
+    ],
+    "hash_scope": "test source files including the plan.rs module declaration; generated goldens excluded to avoid self hashes",
+    "main_commit": "dedb7bcebd10f6b9a6b2d4a7cd6c8b318f8b2ccd",
+    "test_only_files_sha256": {
+      "carina-cli/src/commands/plan.rs": "3ca1ed17c88747f3bff6bc02d564d448ebdf95e858de937f9275330b791f9c8b",
+      "carina-cli/src/commands/plan/pr1_tests.rs": "c044b0620905802eca51ddecb7a885e48ccb0a5d44f5abd40dc70fc045851932",
+      "carina-cli/tests/spike_4400_directory.rs": "7e123061f725dcd186317c6260ad85995cede97261d630ebe5ee4035fc7ebf6c",
+      "carina-cli/tests/support/resolver_kind_main.rs": "5751240b0e077b2a019edb71a25bb355bfc013fc304f5116c0d387027417c9db"
+    }
+  },
+  "nested_directories": "attempted as roots, not as module-loader coverage",
+  "normalization": {
+    "root": "<WORKSPACE>",
+    "secrets": "verify candidate and golden PHCs at every path against fixture material; pin PHC metadata, replace full PHC strings with <VERIFIED-PHC> for comparison",
+    "timestamp": "2000-01-01T00:00:00+00:00"
+  }
+}

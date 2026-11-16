@@ -1,0 +1,90 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/import_deferred_interpolation",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/import_deferred_interpolation",
+  "state_lineage": null,
+  "state_serial": null,
+  "provider_configs": [
+    {
+      "name": "aws",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "aws.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Import": {
+          "id": {
+            "provider": "aws",
+            "resource_type": "route53.RecordSet",
+            "identity": "r.delegation_ns"
+          },
+          "identifier": {
+            "Interpolation": [
+              {
+                "Expr": {
+                  "Unknown": {
+                    "UpstreamRef": {
+                      "path": {
+                        "binding": "management_route53",
+                        "attribute": "apex_zone_id"
+                      }
+                    }
+                  }
+                }
+              },
+              {
+                "Literal": "|registry-dev.carina-rs.dev|NS"
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [],
+  "sorted_value_destroy_dependencies": [],
+  "sorted_explicit_destroy_dependencies": [],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [],
+  "upstream_snapshot": {
+    "management_route53": {}
+  },
+  "upstream_sources": [
+    {
+      "binding": "management_route53",
+      "source": "./network"
+    }
+  ],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "aws": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "route53.RecordSet",
+            "fingerprint": {
+              "present": "59b914ca7844d42c86cecd98c97aeb759aa4dc629703a754b14d6b7cc5dbcf5f"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

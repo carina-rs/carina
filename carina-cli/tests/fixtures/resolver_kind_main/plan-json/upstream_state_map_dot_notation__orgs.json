@@ -1,0 +1,54 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/upstream_state_map_dot_notation/orgs",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/upstream_state_map_dot_notation/orgs",
+  "state_lineage": "remote-orgs-lineage",
+  "state_serial": 1,
+  "provider_configs": [],
+  "backend_config": {
+    "backend_type": "local",
+    "attributes": {
+      "path": {
+        "String": "carina.state.json"
+      }
+    }
+  },
+  "plan": {
+    "effects": []
+  },
+  "sorted_resources": [],
+  "sorted_value_destroy_dependencies": [],
+  "sorted_explicit_destroy_dependencies": [],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {}
+  },
+  "provider_artifacts": {
+    "mock": {
+      "kind": "built_in"
+    }
+  },
+  "provider_scopes": [
+    {
+      "instance": {
+        "provider": "mock",
+        "provider_instance": null
+      },
+      "scope": {
+        "kind": "unavailable"
+      }
+    }
+  ]
+}

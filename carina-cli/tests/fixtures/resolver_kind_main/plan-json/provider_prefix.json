@@ -1,0 +1,155 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/provider_prefix",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/provider_prefix",
+  "state_lineage": "test-lineage-provider-prefix",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Delete": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "awscc_ec2_vpc_fb75c929"
+          },
+          "identifier": "vpc-0123456789abcdef0",
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "binding": "awscc_ec2_vpc_fb75c929",
+          "dependencies": [],
+          "explicit_dependencies": []
+        }
+      }
+    ],
+    "replacement_inputs": {
+      "old_instances": [
+        {
+          "instance": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "ec2.Vpc",
+              "identity": "awscc_ec2_vpc_fb75c929"
+            },
+            "generation": "Current",
+            "identifier": "vpc-0123456789abcdef0"
+          },
+          "attributes": {
+            "cidr_block": {
+              "String": "10.0.0.0/16"
+            },
+            "enable_dns_hostnames": {
+              "Bool": true
+            },
+            "enable_dns_support": {
+              "Bool": true
+            },
+            "tags": {
+              "Map": {
+                "Name": {
+                  "String": "provider-prefix-fixture"
+                }
+              }
+            },
+            "vpc_id": {
+              "String": "vpc-0123456789abcdef0"
+            }
+          }
+        }
+      ],
+      "prepared_names": []
+    }
+  },
+  "sorted_resources": [],
+  "sorted_value_destroy_dependencies": [],
+  "sorted_explicit_destroy_dependencies": [],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "awscc_ec2_vpc_fb75c929"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "awscc_ec2_vpc_fb75c929"
+          },
+          "identifier": "vpc-0123456789abcdef0",
+          "attributes": {
+            "cidr_block": {
+              "String": "10.0.0.0/16"
+            },
+            "tags": {
+              "Map": {
+                "Name": {
+                  "String": "provider-prefix-fixture"
+                }
+              }
+            },
+            "enable_dns_support": {
+              "Bool": true
+            },
+            "vpc_id": {
+              "String": "vpc-0123456789abcdef0"
+            },
+            "enable_dns_hostnames": {
+              "Bool": true
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "ec2.Vpc",
+            "fingerprint": {
+              "present": "b80bbb46ef8ef2e668a216d5bf751b549de872d7669c6453be3255481b6fc548"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

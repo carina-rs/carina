@@ -1,0 +1,267 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/replace_with_non_forcing_diffs",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/replace_with_non_forcing_diffs",
+  "state_lineage": "test-replace-with-non-forcing-diffs",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "test",
+      "attributes": {}
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Delete": {
+          "id": {
+            "provider": "test",
+            "resource_type": "test.Widget",
+            "identity": "web_acl"
+          },
+          "identifier": "widget-web-acl-live",
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "binding": "web_acl",
+          "dependencies": [],
+          "explicit_dependencies": []
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "test",
+            "resource_type": "test.Widget",
+            "identity": "web_acl"
+          },
+          "attributes": {
+            "external_name": {
+              "String": "edge-new"
+            },
+            "description": {
+              "String": "new description"
+            },
+            "metric_name": {
+              "String": "edge-new-metric"
+            },
+            "scope": {
+              "String": "CLOUDFRONT"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": "web_acl",
+          "dependencies": null,
+          "module_source": null
+        }
+      }
+    ],
+    "replacement_inputs": {
+      "old_instances": [
+        {
+          "instance": {
+            "id": {
+              "provider": "test",
+              "resource_type": "test.Widget",
+              "identity": "web_acl"
+            },
+            "generation": "Current",
+            "identifier": "widget-web-acl-live"
+          },
+          "attributes": {
+            "description": {
+              "String": "old description"
+            },
+            "external_name": {
+              "String": "edge-old"
+            },
+            "metric_name": {
+              "String": "edge-old-metric"
+            },
+            "scope": {
+              "String": "CLOUDFRONT"
+            }
+          }
+        }
+      ],
+      "prepared_names": []
+    },
+    "replace_display": [
+      {
+        "create_idx": 1,
+        "delete_idx": 0,
+        "create_before_destroy": false,
+        "changed_create_only": [
+          "external_name"
+        ],
+        "cascade_ref_hints": [],
+        "temporary_name": null,
+        "previous_attributes": {
+          "scope": {
+            "String": "CLOUDFRONT"
+          },
+          "description": {
+            "String": "old description"
+          },
+          "metric_name": {
+            "String": "edge-old-metric"
+          },
+          "external_name": {
+            "String": "edge-old"
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "test",
+        "resource_type": "test.Widget",
+        "identity": "web_acl"
+      },
+      "attributes": {
+        "external_name": {
+          "String": "edge-new"
+        },
+        "description": {
+          "String": "new description"
+        },
+        "metric_name": {
+          "String": "edge-new-metric"
+        },
+        "scope": {
+          "String": "CLOUDFRONT"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "web_acl",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "test",
+        "resource_type": "test.Widget",
+        "identity": "web_acl"
+      },
+      "attributes": {
+        "external_name": {
+          "String": "edge-new"
+        },
+        "description": {
+          "String": "new description"
+        },
+        "metric_name": {
+          "String": "edge-new-metric"
+        },
+        "scope": {
+          "String": "CLOUDFRONT"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "web_acl",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "test",
+        "resource_type": "test.Widget",
+        "identity": "web_acl"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "test",
+            "resource_type": "test.Widget",
+            "identity": "web_acl"
+          },
+          "identifier": "widget-web-acl-live",
+          "attributes": {
+            "scope": {
+              "String": "CLOUDFRONT"
+            },
+            "metric_name": {
+              "String": "edge-old-metric"
+            },
+            "external_name": {
+              "String": "edge-old"
+            },
+            "description": {
+              "String": "old description"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "test": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "test.Widget",
+            "fingerprint": {
+              "present": "81dc1452b10bf313ea825ce897326690a5fb7c1a008dffb207a80307547f9d18"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

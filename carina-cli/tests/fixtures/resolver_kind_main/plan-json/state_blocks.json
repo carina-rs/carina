@@ -1,0 +1,134 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/state_blocks",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/state_blocks",
+  "state_lineage": "test-state-blocks",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Import": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "imported-vpc"
+          },
+          "identifier": {
+            "String": "vpc-0abc123def456"
+          }
+        }
+      },
+      {
+        "Remove": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Subnet",
+            "identity": "legacy-subnet"
+          }
+        }
+      },
+      {
+        "Move": {
+          "from": {
+            "provider": "awscc",
+            "resource_type": "ec2.SecurityGroup",
+            "identity": "old-sg"
+          },
+          "to": {
+            "provider": "awscc",
+            "resource_type": "ec2.SecurityGroup",
+            "identity": "renamed-sg"
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [],
+  "sorted_value_destroy_dependencies": [],
+  "sorted_explicit_destroy_dependencies": [],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.SecurityGroup",
+        "identity": "renamed-sg"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.SecurityGroup",
+            "identity": "renamed-sg"
+          },
+          "identifier": "sg-0abc123",
+          "attributes": {
+            "group_id": {
+              "String": "sg-0abc123"
+            },
+            "group_description": {
+              "String": "Old security group"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "ec2.SecurityGroup",
+            "fingerprint": {
+              "present": "a2990148f5b010ec7a2333dc65221d844addf668cde7cca063c5fd727457a3d0"
+            }
+          },
+          {
+            "kind": "resource",
+            "resource_type": "ec2.Subnet",
+            "fingerprint": {
+              "present": "f45fedc0ffb79f6c8f15c2e91e2d41002278603cdef32fcc9741258a7c55ec35"
+            }
+          },
+          {
+            "kind": "resource",
+            "resource_type": "ec2.Vpc",
+            "fingerprint": {
+              "present": "b80bbb46ef8ef2e668a216d5bf751b549de872d7669c6453be3255481b6fc548"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

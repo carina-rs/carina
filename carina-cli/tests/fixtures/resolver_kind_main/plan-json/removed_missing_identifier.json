@@ -1,0 +1,84 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/removed_missing_identifier",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/removed_missing_identifier",
+  "state_lineage": "removed-missing-identifier-ordering",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "mock",
+      "attributes": {}
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Remove": {
+          "id": {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "legacy"
+          }
+        }
+      }
+    ],
+    "abandoned_deposed": [
+      {
+        "id": {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "legacy"
+        },
+        "key": "broken-generation"
+      }
+    ]
+  },
+  "sorted_resources": [],
+  "sorted_value_destroy_dependencies": [],
+  "sorted_explicit_destroy_dependencies": [],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "mock": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "test.resource",
+            "fingerprint": {
+              "present": "d307859469bcbb06fdb09027a481c71507aef2fa609389875f04b914e1e27a77"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {
+    "mock": {
+      "kind": "built_in"
+    }
+  },
+  "provider_scopes": [
+    {
+      "instance": {
+        "provider": "mock",
+        "provider_instance": null
+      },
+      "scope": {
+        "kind": "unavailable"
+      }
+    }
+  ]
+}

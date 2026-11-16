@@ -1,0 +1,248 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/anonymous_loop_new_id_exists",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/anonymous_loop_new_id_exists",
+  "state_lineage": "anonymous-loop-new-id-exists",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Delete": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "_for0[0]"
+          },
+          "identifier": "vpc-legacy",
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "binding": "_for0[0]",
+          "dependencies": [],
+          "explicit_dependencies": []
+        }
+      }
+    ],
+    "replacement_inputs": {
+      "old_instances": [
+        {
+          "instance": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "ec2.Vpc",
+              "identity": "_for0[0]"
+            },
+            "generation": "Current",
+            "identifier": "vpc-legacy"
+          },
+          "attributes": {
+            "cidr_block": {
+              "String": "10.0.0.0/16"
+            },
+            "vpc_id": {
+              "String": "vpc-legacy"
+            }
+          }
+        }
+      ],
+      "prepared_names": []
+    }
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "awscc_ec2_vpc_0bc2a2bb"
+      },
+      "attributes": {
+        "cidr_block": {
+          "String": "10.0.0.0/16"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null,
+      "loop_provenance": {
+        "direct": {
+          "kind": {
+            "kind": "for",
+            "element": {
+              "kind": "index",
+              "value": 0
+            }
+          },
+          "source": {
+            "display_file": "main.crn",
+            "line": 5,
+            "column": 1,
+            "kind": "for",
+            "system_identity": "_loop_eb65f4445e8f0576"
+          },
+          "legacy": "_for0[0]"
+        }
+      }
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "awscc_ec2_vpc_0bc2a2bb"
+      },
+      "attributes": {
+        "cidr_block": {
+          "String": "10.0.0.0/16"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null,
+      "loop_provenance": {
+        "direct": {
+          "kind": {
+            "kind": "for",
+            "element": {
+              "kind": "index",
+              "value": 0
+            }
+          },
+          "source": {
+            "display_file": "main.crn",
+            "line": 5,
+            "column": 1,
+            "kind": "for",
+            "system_identity": "_loop_eb65f4445e8f0576"
+          },
+          "legacy": "_for0[0]"
+        }
+      }
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "_for0[0]"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "_for0[0]"
+          },
+          "identifier": "vpc-legacy",
+          "attributes": {
+            "vpc_id": {
+              "String": "vpc-legacy"
+            },
+            "cidr_block": {
+              "String": "10.0.0.0/16"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "awscc_ec2_vpc_0bc2a2bb"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "awscc_ec2_vpc_0bc2a2bb"
+          },
+          "identifier": "vpc-current",
+          "attributes": {
+            "vpc_id": {
+              "String": "vpc-current"
+            },
+            "cidr_block": {
+              "String": "10.0.0.0/16"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "ec2.Vpc",
+            "fingerprint": {
+              "present": "b80bbb46ef8ef2e668a216d5bf751b549de872d7669c6453be3255481b6fc548"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

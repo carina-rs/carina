@@ -1,0 +1,359 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/map_field_string_list_grew",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/map_field_string_list_grew",
+  "state_lineage": "test-lineage-map-field-string-list-grew",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "iam.RolePolicy",
+              "identity": "policy"
+            },
+            "identifier": "delegation-writer|trust-policy",
+            "attributes": {
+              "policy_name": {
+                "String": "trust-policy"
+              },
+              "statement": {
+                "List": [
+                  {
+                    "Map": {
+                      "action": {
+                        "String": "sts:AssumeRole"
+                      },
+                      "effect": {
+                        "String": "Allow"
+                      },
+                      "principal": {
+                        "Map": {
+                          "aws": {
+                            "List": [
+                              {
+                                "String": "arn:aws:iam::151116838382:role/carina-registry-infra-deploy"
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "resource": {
+                        "String": "*"
+                      },
+                      "sid": {
+                        "String": "AllowAssumeRole"
+                      }
+                    }
+                  }
+                ]
+              },
+              "role_name": {
+                "String": "delegation-writer"
+              }
+            },
+            "exists": true,
+            "dependency_bindings": []
+          },
+          "identifier": "delegation-writer|trust-policy",
+          "to": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "iam.RolePolicy",
+              "identity": "policy"
+            },
+            "attributes": {
+              "policy_name": {
+                "String": "trust-policy"
+              },
+              "role_name": {
+                "String": "delegation-writer"
+              },
+              "statement": {
+                "List": [
+                  {
+                    "Map": {
+                      "sid": {
+                        "String": "AllowAssumeRole"
+                      },
+                      "effect": {
+                        "String": "Allow"
+                      },
+                      "principal": {
+                        "Map": {
+                          "aws": {
+                            "List": [
+                              {
+                                "String": "arn:aws:iam::151116838382:role/carina-registry-infra-deploy"
+                              },
+                              {
+                                "String": "arn:aws:iam::412038850359:role/aws-reserved/sso.amazonaws.com/ap-northeast-1/AWSReservedSSO_AdministratorAccess_1ade6440f2d3bcdd"
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      "action": {
+                        "String": "sts:AssumeRole"
+                      },
+                      "resource": {
+                        "String": "*"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "prefixes": {},
+            "binding": "policy",
+            "dependencies": null,
+            "module_source": null
+          },
+          "changed_attributes": [
+            "statement"
+          ]
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "iam.RolePolicy",
+        "identity": "policy"
+      },
+      "attributes": {
+        "policy_name": {
+          "String": "trust-policy"
+        },
+        "role_name": {
+          "String": "delegation-writer"
+        },
+        "statement": {
+          "List": [
+            {
+              "Map": {
+                "sid": {
+                  "String": "AllowAssumeRole"
+                },
+                "effect": {
+                  "String": "Allow"
+                },
+                "principal": {
+                  "Map": {
+                    "aws": {
+                      "List": [
+                        {
+                          "String": "arn:aws:iam::151116838382:role/carina-registry-infra-deploy"
+                        },
+                        {
+                          "String": "arn:aws:iam::412038850359:role/aws-reserved/sso.amazonaws.com/ap-northeast-1/AWSReservedSSO_AdministratorAccess_1ade6440f2d3bcdd"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "action": {
+                  "String": "sts:AssumeRole"
+                },
+                "resource": {
+                  "String": "*"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "policy",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "iam.RolePolicy",
+        "identity": "policy"
+      },
+      "attributes": {
+        "policy_name": {
+          "String": "trust-policy"
+        },
+        "role_name": {
+          "String": "delegation-writer"
+        },
+        "statement": {
+          "List": [
+            {
+              "Map": {
+                "sid": {
+                  "String": "AllowAssumeRole"
+                },
+                "effect": {
+                  "String": "Allow"
+                },
+                "principal": {
+                  "Map": {
+                    "aws": {
+                      "List": [
+                        {
+                          "String": "arn:aws:iam::151116838382:role/carina-registry-infra-deploy"
+                        },
+                        {
+                          "String": "arn:aws:iam::412038850359:role/aws-reserved/sso.amazonaws.com/ap-northeast-1/AWSReservedSSO_AdministratorAccess_1ade6440f2d3bcdd"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "action": {
+                  "String": "sts:AssumeRole"
+                },
+                "resource": {
+                  "String": "*"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "policy",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "iam.RolePolicy",
+        "identity": "policy"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "iam.RolePolicy",
+            "identity": "policy"
+          },
+          "identifier": "delegation-writer|trust-policy",
+          "attributes": {
+            "role_name": {
+              "String": "delegation-writer"
+            },
+            "statement": {
+              "List": [
+                {
+                  "Map": {
+                    "action": {
+                      "String": "sts:AssumeRole"
+                    },
+                    "effect": {
+                      "String": "Allow"
+                    },
+                    "principal": {
+                      "Map": {
+                        "aws": {
+                          "List": [
+                            {
+                              "String": "arn:aws:iam::151116838382:role/carina-registry-infra-deploy"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "resource": {
+                      "String": "*"
+                    },
+                    "sid": {
+                      "String": "AllowAssumeRole"
+                    }
+                  }
+                }
+              ]
+            },
+            "policy_name": {
+              "String": "trust-policy"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "iam.RolePolicy",
+            "fingerprint": {
+              "present": "0e893949aaad6c4275769bf37a81ab49a7e8a41032e667b41083ad766fa102a3"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

@@ -1,0 +1,151 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/moved_pure",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/moved_pure",
+  "state_lineage": "test-moved-pure",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Move": {
+          "from": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "old_vpc"
+          },
+          "to": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "new_vpc"
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "new_vpc"
+      },
+      "attributes": {
+        "cidr_block": {
+          "String": "10.0.0.0/16"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "new_vpc",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "new_vpc"
+      },
+      "attributes": {
+        "cidr_block": {
+          "String": "10.0.0.0/16"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "new_vpc",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "new_vpc"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "new_vpc"
+          },
+          "identifier": "vpc-old123",
+          "attributes": {
+            "vpc_id": {
+              "String": "vpc-old123"
+            },
+            "cidr_block": {
+              "String": "10.0.0.0/16"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "ec2.Vpc",
+            "fingerprint": {
+              "present": "b80bbb46ef8ef2e668a216d5bf751b549de872d7669c6453be3255481b6fc548"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

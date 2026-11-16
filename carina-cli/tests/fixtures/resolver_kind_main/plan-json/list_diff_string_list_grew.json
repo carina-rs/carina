@@ -1,0 +1,483 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/list_diff_string_list_grew",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/list_diff_string_list_grew",
+  "state_lineage": "test-lineage-list-diff-string-list-grew",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "iam.RolePolicy",
+              "identity": "policy"
+            },
+            "identifier": "test-role|test-inline",
+            "attributes": {
+              "statement": {
+                "List": [
+                  {
+                    "Map": {
+                      "action": {
+                        "List": [
+                          {
+                            "String": "route53:CreateHostedZone"
+                          },
+                          {
+                            "String": "route53:DeleteHostedZone"
+                          },
+                          {
+                            "String": "route53:GetHostedZone"
+                          },
+                          {
+                            "String": "route53:ListHostedZones"
+                          },
+                          {
+                            "String": "route53:ListHostedZonesByName"
+                          },
+                          {
+                            "String": "route53:UpdateHostedZoneComment"
+                          },
+                          {
+                            "String": "route53:ChangeTagsForResource"
+                          },
+                          {
+                            "String": "route53:ListTagsForResource"
+                          },
+                          {
+                            "String": "route53:ChangeResourceRecordSets"
+                          },
+                          {
+                            "String": "route53:ListResourceRecordSets"
+                          },
+                          {
+                            "String": "route53:GetChange"
+                          }
+                        ]
+                      },
+                      "effect": {
+                        "String": "Allow"
+                      },
+                      "resource": {
+                        "String": "*"
+                      },
+                      "sid": {
+                        "String": "AllowRoute53Read"
+                      }
+                    }
+                  }
+                ]
+              },
+              "policy_name": {
+                "String": "test-inline"
+              },
+              "role_name": {
+                "String": "test-role"
+              }
+            },
+            "exists": true,
+            "dependency_bindings": []
+          },
+          "identifier": "test-role|test-inline",
+          "to": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "iam.RolePolicy",
+              "identity": "policy"
+            },
+            "attributes": {
+              "policy_name": {
+                "String": "test-inline"
+              },
+              "role_name": {
+                "String": "test-role"
+              },
+              "statement": {
+                "List": [
+                  {
+                    "Map": {
+                      "sid": {
+                        "String": "AllowRoute53Read"
+                      },
+                      "effect": {
+                        "String": "Allow"
+                      },
+                      "action": {
+                        "List": [
+                          {
+                            "String": "route53:CreateHostedZone"
+                          },
+                          {
+                            "String": "route53:DeleteHostedZone"
+                          },
+                          {
+                            "String": "route53:GetHostedZone"
+                          },
+                          {
+                            "String": "route53:ListHostedZones"
+                          },
+                          {
+                            "String": "route53:ListHostedZonesByName"
+                          },
+                          {
+                            "String": "route53:UpdateHostedZoneComment"
+                          },
+                          {
+                            "String": "route53:ChangeTagsForResource"
+                          },
+                          {
+                            "String": "route53:ListTagsForResource"
+                          },
+                          {
+                            "String": "route53:ChangeResourceRecordSets"
+                          },
+                          {
+                            "String": "route53:ListResourceRecordSets"
+                          },
+                          {
+                            "String": "route53:GetChange"
+                          },
+                          {
+                            "String": "route53:ListQueryLoggingConfigs"
+                          },
+                          {
+                            "String": "route53:GetQueryLoggingConfig"
+                          }
+                        ]
+                      },
+                      "resource": {
+                        "String": "*"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "prefixes": {},
+            "binding": "policy",
+            "dependencies": null,
+            "module_source": null
+          },
+          "changed_attributes": [
+            "statement"
+          ]
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "iam.RolePolicy",
+        "identity": "policy"
+      },
+      "attributes": {
+        "policy_name": {
+          "String": "test-inline"
+        },
+        "role_name": {
+          "String": "test-role"
+        },
+        "statement": {
+          "List": [
+            {
+              "Map": {
+                "sid": {
+                  "String": "AllowRoute53Read"
+                },
+                "effect": {
+                  "String": "Allow"
+                },
+                "action": {
+                  "List": [
+                    {
+                      "String": "route53:CreateHostedZone"
+                    },
+                    {
+                      "String": "route53:DeleteHostedZone"
+                    },
+                    {
+                      "String": "route53:GetHostedZone"
+                    },
+                    {
+                      "String": "route53:ListHostedZones"
+                    },
+                    {
+                      "String": "route53:ListHostedZonesByName"
+                    },
+                    {
+                      "String": "route53:UpdateHostedZoneComment"
+                    },
+                    {
+                      "String": "route53:ChangeTagsForResource"
+                    },
+                    {
+                      "String": "route53:ListTagsForResource"
+                    },
+                    {
+                      "String": "route53:ChangeResourceRecordSets"
+                    },
+                    {
+                      "String": "route53:ListResourceRecordSets"
+                    },
+                    {
+                      "String": "route53:GetChange"
+                    },
+                    {
+                      "String": "route53:ListQueryLoggingConfigs"
+                    },
+                    {
+                      "String": "route53:GetQueryLoggingConfig"
+                    }
+                  ]
+                },
+                "resource": {
+                  "String": "*"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "policy",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "iam.RolePolicy",
+        "identity": "policy"
+      },
+      "attributes": {
+        "policy_name": {
+          "String": "test-inline"
+        },
+        "role_name": {
+          "String": "test-role"
+        },
+        "statement": {
+          "List": [
+            {
+              "Map": {
+                "sid": {
+                  "String": "AllowRoute53Read"
+                },
+                "effect": {
+                  "String": "Allow"
+                },
+                "action": {
+                  "List": [
+                    {
+                      "String": "route53:CreateHostedZone"
+                    },
+                    {
+                      "String": "route53:DeleteHostedZone"
+                    },
+                    {
+                      "String": "route53:GetHostedZone"
+                    },
+                    {
+                      "String": "route53:ListHostedZones"
+                    },
+                    {
+                      "String": "route53:ListHostedZonesByName"
+                    },
+                    {
+                      "String": "route53:UpdateHostedZoneComment"
+                    },
+                    {
+                      "String": "route53:ChangeTagsForResource"
+                    },
+                    {
+                      "String": "route53:ListTagsForResource"
+                    },
+                    {
+                      "String": "route53:ChangeResourceRecordSets"
+                    },
+                    {
+                      "String": "route53:ListResourceRecordSets"
+                    },
+                    {
+                      "String": "route53:GetChange"
+                    },
+                    {
+                      "String": "route53:ListQueryLoggingConfigs"
+                    },
+                    {
+                      "String": "route53:GetQueryLoggingConfig"
+                    }
+                  ]
+                },
+                "resource": {
+                  "String": "*"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "policy",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "iam.RolePolicy",
+        "identity": "policy"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "iam.RolePolicy",
+            "identity": "policy"
+          },
+          "identifier": "test-role|test-inline",
+          "attributes": {
+            "role_name": {
+              "String": "test-role"
+            },
+            "statement": {
+              "List": [
+                {
+                  "Map": {
+                    "action": {
+                      "List": [
+                        {
+                          "String": "route53:CreateHostedZone"
+                        },
+                        {
+                          "String": "route53:DeleteHostedZone"
+                        },
+                        {
+                          "String": "route53:GetHostedZone"
+                        },
+                        {
+                          "String": "route53:ListHostedZones"
+                        },
+                        {
+                          "String": "route53:ListHostedZonesByName"
+                        },
+                        {
+                          "String": "route53:UpdateHostedZoneComment"
+                        },
+                        {
+                          "String": "route53:ChangeTagsForResource"
+                        },
+                        {
+                          "String": "route53:ListTagsForResource"
+                        },
+                        {
+                          "String": "route53:ChangeResourceRecordSets"
+                        },
+                        {
+                          "String": "route53:ListResourceRecordSets"
+                        },
+                        {
+                          "String": "route53:GetChange"
+                        }
+                      ]
+                    },
+                    "effect": {
+                      "String": "Allow"
+                    },
+                    "resource": {
+                      "String": "*"
+                    },
+                    "sid": {
+                      "String": "AllowRoute53Read"
+                    }
+                  }
+                }
+              ]
+            },
+            "policy_name": {
+              "String": "test-inline"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "iam.RolePolicy",
+            "fingerprint": {
+              "present": "3820d709dbb13c93c4d42963cebe57b45a43df0ee6c9f424ccf915baf39c254a"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

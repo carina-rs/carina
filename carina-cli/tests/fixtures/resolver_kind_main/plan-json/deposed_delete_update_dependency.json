@@ -1,0 +1,559 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/deposed_delete_update_dependency",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/deposed_delete_update_dependency",
+  "state_lineage": "test-lineage-deposed-delete-update-dependency",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "EnumIdentifier": "awscc.Region.ap_northeast_1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "ec2.Vpc",
+              "identity": "main"
+            },
+            "identifier": "vpc-new",
+            "attributes": {
+              "tags": {
+                "Map": {
+                  "Environment": {
+                    "String": "old"
+                  },
+                  "Name": {
+                    "String": "main"
+                  }
+                }
+              },
+              "vpc_id": {
+                "String": "vpc-new"
+              },
+              "cidr_block": {
+                "String": "10.221.0.0/16"
+              }
+            },
+            "exists": true,
+            "dependency_bindings": []
+          },
+          "identifier": "vpc-new",
+          "to": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "ec2.Vpc",
+              "identity": "main"
+            },
+            "attributes": {
+              "cidr_block": {
+                "String": "10.221.0.0/16"
+              },
+              "tags": {
+                "Map": {
+                  "Name": {
+                    "String": "main"
+                  },
+                  "Environment": {
+                    "String": "new"
+                  }
+                }
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "prefixes": {},
+            "binding": "main",
+            "dependencies": null,
+            "module_source": null
+          },
+          "changed_attributes": [
+            "tags"
+          ]
+        }
+      },
+      {
+        "Update": {
+          "from": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "ec2.Subnet",
+              "identity": "subnet"
+            },
+            "identifier": "subnet-new",
+            "attributes": {
+              "cidr_block": {
+                "String": "10.221.1.0/24"
+              },
+              "availability_zone": {
+                "String": "ap-northeast-1a"
+              },
+              "subnet_id": {
+                "String": "subnet-new"
+              },
+              "vpc_id": {
+                "String": "vpc-new"
+              },
+              "tags": {
+                "Map": {
+                  "Environment": {
+                    "String": "old"
+                  },
+                  "Name": {
+                    "String": "subnet"
+                  }
+                }
+              }
+            },
+            "exists": true,
+            "dependency_bindings": [
+              {
+                "provider": "awscc",
+                "resource_type": "ec2.Vpc",
+                "identity": "main"
+              }
+            ]
+          },
+          "identifier": "subnet-new",
+          "to": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "ec2.Subnet",
+              "identity": "subnet"
+            },
+            "attributes": {
+              "vpc_id": {
+                "String": "vpc-new"
+              },
+              "cidr_block": {
+                "String": "10.221.1.0/24"
+              },
+              "availability_zone": {
+                "String": "ap-northeast-1a"
+              },
+              "tags": {
+                "Map": {
+                  "Name": {
+                    "String": "subnet"
+                  },
+                  "Environment": {
+                    "String": "new"
+                  }
+                }
+              }
+            },
+            "directives": {
+              "force_delete": false,
+              "create_before_destroy": false,
+              "prevent_destroy": {
+                "kind": "unspecified"
+              }
+            },
+            "prefixes": {},
+            "binding": "subnet",
+            "dependencies": null,
+            "module_source": null,
+            "value_dependencies": [
+              {
+                "provider": "awscc",
+                "resource_type": "ec2.Vpc",
+                "identity": "main"
+              }
+            ],
+            "persisted_value_destroy_dependencies": [
+              {
+                "provider": "awscc",
+                "resource_type": "ec2.Vpc",
+                "identity": "main"
+              }
+            ],
+            "value_dependency_reads": [
+              {
+                "id": {
+                  "provider": "awscc",
+                  "resource_type": "ec2.Vpc",
+                  "identity": "main"
+                },
+                "read": {
+                  "Known": [
+                    "vpc_id"
+                  ]
+                }
+              }
+            ]
+          },
+          "changed_attributes": [
+            "tags"
+          ]
+        }
+      },
+      {
+        "Delete": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "main"
+          },
+          "identifier": "vpc-old",
+          "generation": {
+            "Deposed": "deposed001"
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "binding": "main",
+          "dependencies": [],
+          "explicit_dependencies": []
+        }
+      }
+    ],
+    "replacement_inputs": {
+      "old_instances": [
+        {
+          "instance": {
+            "id": {
+              "provider": "awscc",
+              "resource_type": "ec2.Vpc",
+              "identity": "main"
+            },
+            "generation": {
+              "Deposed": "deposed001"
+            },
+            "identifier": "vpc-old"
+          },
+          "attributes": {
+            "vpc_id": {
+              "String": "vpc-old"
+            },
+            "tags": {
+              "Map": {
+                "Environment": {
+                  "String": "old"
+                },
+                "Name": {
+                  "String": "main-old"
+                }
+              }
+            },
+            "cidr_block": {
+              "String": "10.220.0.0/16"
+            }
+          }
+        }
+      ],
+      "prepared_names": []
+    }
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "main"
+      },
+      "attributes": {
+        "cidr_block": {
+          "String": "10.221.0.0/16"
+        },
+        "tags": {
+          "Map": {
+            "Name": {
+              "String": "main"
+            },
+            "Environment": {
+              "String": "new"
+            }
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "main",
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Subnet",
+        "identity": "subnet"
+      },
+      "attributes": {
+        "vpc_id": {
+          "String": "vpc-new"
+        },
+        "cidr_block": {
+          "String": "10.221.1.0/24"
+        },
+        "availability_zone": {
+          "String": "ap-northeast-1a"
+        },
+        "tags": {
+          "Map": {
+            "Name": {
+              "String": "subnet"
+            },
+            "Environment": {
+              "String": "new"
+            }
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "subnet",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    [],
+    [
+      {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "main"
+      }
+    ]
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    [],
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "main"
+      },
+      "attributes": {
+        "cidr_block": {
+          "String": "10.221.0.0/16"
+        },
+        "tags": {
+          "Map": {
+            "Name": {
+              "String": "main"
+            },
+            "Environment": {
+              "String": "new"
+            }
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "main",
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Subnet",
+        "identity": "subnet"
+      },
+      "attributes": {
+        "vpc_id": {
+          "ResourceRef": {
+            "path": {
+              "binding": "main",
+              "attribute": "vpc_id"
+            }
+          }
+        },
+        "cidr_block": {
+          "String": "10.221.1.0/24"
+        },
+        "availability_zone": {
+          "String": "ap-northeast-1a"
+        },
+        "tags": {
+          "Map": {
+            "Name": {
+              "String": "subnet"
+            },
+            "Environment": {
+              "String": "new"
+            }
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "subnet",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Subnet",
+        "identity": "subnet"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Subnet",
+            "identity": "subnet"
+          },
+          "identifier": "subnet-new",
+          "attributes": {
+            "availability_zone": {
+              "String": "ap-northeast-1a"
+            },
+            "tags": {
+              "Map": {
+                "Environment": {
+                  "String": "old"
+                },
+                "Name": {
+                  "String": "subnet"
+                }
+              }
+            },
+            "cidr_block": {
+              "String": "10.221.1.0/24"
+            },
+            "subnet_id": {
+              "String": "subnet-new"
+            },
+            "vpc_id": {
+              "String": "vpc-new"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": [
+            {
+              "provider": "awscc",
+              "resource_type": "ec2.Vpc",
+              "identity": "main"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "ec2.Vpc",
+        "identity": "main"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "ec2.Vpc",
+            "identity": "main"
+          },
+          "identifier": "vpc-new",
+          "attributes": {
+            "tags": {
+              "Map": {
+                "Environment": {
+                  "String": "old"
+                },
+                "Name": {
+                  "String": "main"
+                }
+              }
+            },
+            "cidr_block": {
+              "String": "10.221.0.0/16"
+            },
+            "vpc_id": {
+              "String": "vpc-new"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "ec2.Subnet",
+            "fingerprint": {
+              "present": "a839d8cacbc28fbedb6cffec66097035de4041539610ed49e14a5bf4b0867e31"
+            }
+          },
+          {
+            "kind": "resource",
+            "resource_type": "ec2.Vpc",
+            "fingerprint": {
+              "present": "b80bbb46ef8ef2e668a216d5bf751b549de872d7669c6453be3255481b6fc548"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

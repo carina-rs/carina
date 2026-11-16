@@ -1,0 +1,149 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/dynamic_enum_az_no_diff",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/dynamic_enum_az_no_diff",
+  "state_lineage": "test-lineage-dynamic-enum-az-no-diff",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "fixture",
+      "attributes": {}
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": []
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "fixture",
+        "resource_type": "network.Subnet",
+        "identity": "subnet"
+      },
+      "attributes": {
+        "availability_zone": {
+          "CanonicalEnum": {
+            "identity": {
+              "provider": "fixture",
+              "segments": [
+                "network",
+                "Subnet"
+              ],
+              "kind": "ZoneName"
+            },
+            "api_value": "ap-northeast-1a"
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "subnet",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "fixture",
+        "resource_type": "network.Subnet",
+        "identity": "subnet"
+      },
+      "attributes": {
+        "availability_zone": {
+          "EnumIdentifier": "fixture.network.Subnet.ZoneName.ap_northeast_1a"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "subnet",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "fixture",
+        "resource_type": "network.Subnet",
+        "identity": "subnet"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "fixture",
+            "resource_type": "network.Subnet",
+            "identity": "subnet"
+          },
+          "identifier": "subnet-fixture",
+          "attributes": {
+            "availability_zone": {
+              "CanonicalEnum": {
+                "identity": {
+                  "provider": "fixture",
+                  "segments": [
+                    "network",
+                    "Subnet"
+                  ],
+                  "kind": "ZoneName"
+                },
+                "api_value": "ap-northeast-1a"
+              }
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "fixture": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "network.Subnet",
+            "fingerprint": {
+              "present": "c9cbeb6092074ecdd7871680d11dc7e67efc590fb72d9201a0c9ff66b6e873f0"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

@@ -1,0 +1,153 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/anonymous_old_identity_name_override",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/anonymous_old_identity_name_override",
+  "state_lineage": "test-anonymous-old-identity-name-override",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "test",
+      "attributes": {}
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Move": {
+          "from": {
+            "provider": "test",
+            "resource_type": "test.Widget",
+            "identity": "test_widget_11111111"
+          },
+          "to": {
+            "provider": "test",
+            "resource_type": "test.Widget",
+            "identity": "test_test_widget_bd472f05"
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "test",
+        "resource_type": "test.Widget",
+        "identity": "test_test_widget_bd472f05"
+      },
+      "attributes": {
+        "external_name": {
+          "String": "stable-replacement"
+        },
+        "legacy_token": {
+          "String": "shared"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "test",
+        "resource_type": "test.Widget",
+        "identity": "test_test_widget_bd472f05"
+      },
+      "attributes": {
+        "external_name": {
+          "String": "stable-replacement"
+        },
+        "legacy_token": {
+          "String": "shared"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "test",
+        "resource_type": "test.Widget",
+        "identity": "test_test_widget_bd472f05"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "test",
+            "resource_type": "test.Widget",
+            "identity": "test_test_widget_bd472f05"
+          },
+          "identifier": "widget-live",
+          "attributes": {
+            "external_name": {
+              "String": "stable-replacement"
+            },
+            "legacy_token": {
+              "String": "shared"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "test": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "test.Widget",
+            "fingerprint": {
+              "present": "81dc1452b10bf313ea825ce897326690a5fb7c1a008dffb207a80307547f9d18"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

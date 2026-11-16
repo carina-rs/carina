@@ -1,0 +1,151 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/moved_claims_precede_heuristics",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/moved_claims_precede_heuristics",
+  "state_lineage": "test-moved-claims-precede-heuristics",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "awscc",
+      "attributes": {
+        "region": {
+          "String": "ap-northeast-1"
+        }
+      }
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": [
+      {
+        "Move": {
+          "from": {
+            "provider": "awscc",
+            "resource_type": "test.Widget",
+            "identity": "test_widget_11111111"
+          },
+          "to": {
+            "provider": "awscc",
+            "resource_type": "test.Widget",
+            "identity": "awscc_test_widget_58cf4fed"
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "test.Widget",
+        "identity": "awscc_test_widget_58cf4fed"
+      },
+      "attributes": {
+        "external_name": {
+          "String": "claimed-widget"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "awscc",
+        "resource_type": "test.Widget",
+        "identity": "awscc_test_widget_58cf4fed"
+      },
+      "attributes": {
+        "external_name": {
+          "String": "claimed-widget"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "awscc",
+        "resource_type": "test.Widget",
+        "identity": "awscc_test_widget_58cf4fed"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "awscc",
+            "resource_type": "test.Widget",
+            "identity": "awscc_test_widget_58cf4fed"
+          },
+          "identifier": "widget-live-1",
+          "attributes": {
+            "id": {
+              "String": "widget-live-1"
+            },
+            "external_name": {
+              "String": "claimed-widget"
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "awscc": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "test.Widget",
+            "fingerprint": {
+              "present": "262699d95bce5a9f2a1ff91f5365be863e2182f24cacbbb096ae7994c52d97d7"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}

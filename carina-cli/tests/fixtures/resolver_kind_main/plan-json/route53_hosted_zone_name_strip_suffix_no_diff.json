@@ -1,0 +1,129 @@
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "2000-01-01T00:00:00+00:00",
+  "source_path": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/route53_hosted_zone_name_strip_suffix_no_diff",
+  "source_identity": "<WORKSPACE>/carina-cli/tests/fixtures/plan_display/route53_hosted_zone_name_strip_suffix_no_diff",
+  "state_lineage": "test-lineage-route53-hosted-zone-name-strip-suffix-no-diff",
+  "state_serial": 1,
+  "provider_configs": [
+    {
+      "name": "fixture",
+      "attributes": {}
+    }
+  ],
+  "backend_config": null,
+  "plan": {
+    "effects": []
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "fixture",
+        "resource_type": "route53.HostedZone",
+        "identity": "zone"
+      },
+      "attributes": {
+        "name": {
+          "String": "registry-dev.carina-rs.dev"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "zone",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "fixture",
+        "resource_type": "route53.HostedZone",
+        "identity": "zone"
+      },
+      "attributes": {
+        "name": {
+          "String": "registry-dev.carina-rs.dev"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "zone",
+      "dependencies": null,
+      "module_source": null
+    }
+  ],
+  "compositions": [],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "fixture",
+        "resource_type": "route53.HostedZone",
+        "identity": "zone"
+      },
+      "current": {
+        "status": "present",
+        "state": {
+          "id": {
+            "provider": "fixture",
+            "resource_type": "route53.HostedZone",
+            "identity": "zone"
+          },
+          "identifier": "hosted-zone-fixture",
+          "attributes": {
+            "name": {
+              "String": "registry-dev.carina-rs.dev."
+            }
+          },
+          "exists": true,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "fixture": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "route53.HostedZone",
+            "fingerprint": {
+              "present": "3fd78355cf211e528f7720f0fed1a424960b6bc255af1617ff9e4eba7bb08922"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {},
+  "provider_scopes": []
+}
