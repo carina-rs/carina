@@ -7,16 +7,23 @@ use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
-pub(crate) struct EnrichedAuthored(ParserPlaceholder);
+pub(super) struct EnrichedAuthored(ParserPlaceholder);
 #[derive(Clone)]
-pub(crate) struct EnrichedReference<B: BindingAddress> {
+pub(super) struct EnrichedReference<B: BindingAddress> {
     path: AccessPath<B>,
     plain_result: Box<S<B>>,
 }
 #[derive(Clone)]
-pub(crate) struct EnrichedConversion<B: BindingAddress> {
+pub(super) struct EnrichedConversion<B: BindingAddress> {
     operands: Vec<V<EnrichedAuthored, B>>,
     plain_result: Box<S<B>>,
+}
+// Only this module can mint an operand for the unmarked storage constructor.
+pub(crate) struct SecretStorageOperand<P: ValueShape, B: BindingAddress>(V<P, B>);
+impl<P: ValueShape, B: BindingAddress> SecretStorageOperand<P, B> {
+    pub(crate) fn into_value(self) -> V<P, B> {
+        self.0
+    }
 }
 // Do not format retained plaintext, even if someone accidentally formats a payload.
 impl<B: BindingAddress> fmt::Debug for EnrichedReference<B> {
@@ -46,22 +53,15 @@ impl ResolveKind for EnrichedAuthored {
     }
     fn project<B: BindingAddress>(value: &V<Self, B>) -> Cow<'_, S<B>> {
         count(Event::ProjectionVisit);
-        match value {
-            V::Reference(payload) => Cow::Borrowed(&payload.plain_result),
-            V::Conversion(payload) => Cow::Borrowed(&payload.plain_result),
-            _ => Cow::Owned(copy_storage(
-                value,
-                &mut |p| p.0.clone(),
-                &mut |payload| (*payload.plain_result).clone(),
-                &mut |payload| (*payload.plain_result).clone(),
-            )),
-        }
+        project_storage(value)
     }
     fn split_operand<B: BindingAddress>(value: V<Self, B>) -> (S<B>, V<Self, B>) {
-        (project_owned(&value), value)
+        (Self::project(&value).into_owned(), value)
     }
     fn protect_operand<B: BindingAddress>(operand: V<Self, B>) -> V<Self, B> {
-        V::Deferred(DeferredValue::Secret(SecretPayload::wrap_storage(operand)))
+        V::Deferred(DeferredValue::Secret(SecretPayload::wrap_storage(
+            SecretStorageOperand(operand),
+        )))
     }
     fn read<B: BindingAddress>(path: &AccessPath<B>, plain_result: S<B>) -> V<Self, B> {
         count(Event::ReferenceEnvelope);
@@ -79,8 +79,21 @@ impl ResolveKind for EnrichedAuthored {
     }
 }
 
-pub(super) fn project_owned<B: BindingAddress>(value: &V<EnrichedAuthored, B>) -> S<B> {
-    EnrichedAuthored::project(value).into_owned()
+fn project_storage<B: BindingAddress>(value: &V<EnrichedAuthored, B>) -> Cow<'_, S<B>> {
+    match value {
+        V::Reference(payload) => Cow::Borrowed(&payload.plain_result),
+        V::Conversion(payload) => Cow::Borrowed(&payload.plain_result),
+        _ => Cow::Owned(copy_storage(
+            value,
+            &mut |p| p.0.clone(),
+            &mut |payload| (*payload.plain_result).clone(),
+            &mut |payload| (*payload.plain_result).clone(),
+        )),
+    }
+}
+
+pub(super) fn project_for_comparison<B: BindingAddress>(value: &V<EnrichedAuthored, B>) -> S<B> {
+    project_storage(value).into_owned()
 }
 
 pub(super) fn observe_paths(

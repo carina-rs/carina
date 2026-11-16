@@ -122,7 +122,7 @@ mod oracle;
 #[cfg(feature = "test-utils")]
 mod output_kind;
 #[cfg(feature = "test-utils")]
-pub(crate) use output_kind::EnrichedAuthored;
+pub(crate) use output_kind::SecretStorageOperand;
 
 /// Authored provider attribute holding defaults for desired resource tags.
 pub const DEFAULT_TAGS_ATTRIBUTE: &str = "default_tags";

@@ -153,7 +153,7 @@ pub(super) fn compare_invocation<E: ExportParamLike>(
         session,
         resolution,
         &mut |original, kind, bindings, lowered| {
-            let projected = output_kind::project_owned(&lowered);
+            let projected = output_kind::project_for_comparison(&lowered);
             let matches = if let Some(expected) = roots.pop_front() {
                 same_inputs &= std::mem::discriminant(&kind)
                     == std::mem::discriminant(&expected.kind)

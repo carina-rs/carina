@@ -336,7 +336,7 @@ impl<P: ValueKind, B: BindingAddress> PartialEq for SecretPayload<P, B> {
 
 #[cfg(feature = "test-utils")]
 impl<P: ValueShape, B: BindingAddress> SecretPayload<P, B> {
-    pub(crate) fn copy_storage<Q: ValueShape>(
+    pub(super) fn copy_storage<Q: ValueShape>(
         &self,
         map: &mut impl FnMut(&Value<P, B>) -> Value<Q, B>,
     ) -> SecretPayload<Q, B> {
@@ -358,11 +358,11 @@ impl<P: ValueShape, B: BindingAddress> SecretPayload<P, B> {
 }
 
 #[cfg(feature = "test-utils")]
-impl<B: BindingAddress> SecretPayload<crate::parser::EnrichedAuthored, B> {
-    // Retained operands may contain unmarked plaintext; readers cannot call this.
-    pub(crate) fn wrap_storage(value: Value<crate::parser::EnrichedAuthored, B>) -> Self {
+impl<P: ValueShape, B: BindingAddress> SecretPayload<P, B> {
+    // The operand's constructor is private to the resolver's enriched output module.
+    pub(crate) fn wrap_storage(value: crate::parser::SecretStorageOperand<P, B>) -> Self {
         Self {
-            value: Box::new(value),
+            value: Box::new(value.into_value()),
         }
     }
 }

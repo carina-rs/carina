@@ -321,6 +321,12 @@ pub(crate) fn same_parse_error(
     {
         return false;
     }
+    macro_rules! same_fields {
+        ($variant:ident { $($field:ident),* $(,)? }) => {{
+            let fields = ($($field,)*);
+            matches!(b, ParseError::$variant { $($field,)* } if fields == ($($field,)*))
+        }};
+    }
     match a {
         ParseError::Located { path, error } => {
             if let ParseError::Located {
@@ -341,19 +347,103 @@ pub(crate) fn same_parse_error(
                 false
             }
         }
+        ParseError::DeferredForBodyTemplate {
+            line,
+            header,
+            span,
+            error,
+        } => {
+            if let ParseError::DeferredForBodyTemplate {
+                line: other_line,
+                header: other_header,
+                span: other_span,
+                error: other_error,
+            } = b
+            {
+                (line, header, span) == (other_line, other_header, other_span)
+                    && same_parse_error(error, other_error)
+            } else {
+                false
+            }
+        }
+        ParseError::Evaluation { line, error } => same_fields!(Evaluation { line, error }),
+        ParseError::UnavailableSecret(error) => {
+            matches!(b, ParseError::UnavailableSecret(other) if error == other)
+        }
+        ParseError::Syntax(error) => {
+            matches!(b, ParseError::Syntax(other) if std::ops::Deref::deref(error) == std::ops::Deref::deref(other))
+        }
+        ParseError::DeferredForBodyUnsupported(error) => {
+            matches!(b, ParseError::DeferredForBodyUnsupported(other) if error == other)
+        }
+        ParseError::InterpolationInConstraintString {
+            kind,
+            line,
+            column,
+            span,
+        } => same_fields!(InterpolationInConstraintString {
+            kind,
+            line,
+            column,
+            span
+        }),
+        ParseError::UnboundLoopRead { kind, line, span } => {
+            same_fields!(UnboundLoopRead { kind, line, span })
+        }
+        ParseError::UnresolvedDeclarationType {
+            token,
+            line,
+            message,
+        } => same_fields!(UnresolvedDeclarationType {
+            token,
+            line,
+            message
+        }),
+        ParseError::SecretDerivedBackendAttribute {
+            backend_type,
+            attribute,
+            line,
+            start_column,
+            end_column,
+        } => same_fields!(SecretDerivedBackendAttribute {
+            backend_type,
+            attribute,
+            line,
+            start_column,
+            end_column
+        }),
+        ParseError::UndefinedIdentifier {
+            name,
+            line,
+            span,
+            suggestion,
+            in_scope,
+        } => same_fields!(UndefinedIdentifier {
+            name,
+            line,
+            span,
+            suggestion,
+            in_scope
+        }),
+        ParseError::UndefinedDeferredIterable {
+            name,
+            line,
+            span,
+            suggestion,
+            in_scope,
+        } => same_fields!(UndefinedDeferredIterable {
+            name,
+            line,
+            span,
+            suggestion,
+            in_scope
+        }),
+        ParseError::CyclicLetBinding { chain } => same_fields!(CyclicLetBinding { chain }),
         ParseError::RetainedEvidence(_)
         | ParseError::InsideSecret { line: _ }
         | ParseError::SecretInConstraint { line: _ }
-        | ParseError::InterpolationInConstraintString {
-            kind: _,
-            line: _,
-            column: _,
-            span: _,
-        }
-        | ParseError::UnavailableSecret(_)
         | ParseError::ValueWalk(_)
         | ParseError::ProtectedFile(_)
-        | ParseError::Syntax(_)
         | ParseError::InvalidExpression {
             line: _,
             message: _,
@@ -362,29 +452,11 @@ pub(crate) fn same_parse_error(
             line: _,
             diagnostic: _,
         }
-        | ParseError::Evaluation { line: _, error: _ }
         | ParseError::InvalidFloatLiteral { line: _, source: _ }
         | ParseError::IntegerArithmetic {
             line: _,
             column: _,
             end_column: _,
-            message: _,
-        }
-        | ParseError::UnboundLoopRead {
-            kind: _,
-            line: _,
-            span: _,
-        }
-        | ParseError::DeferredForBodyUnsupported(_)
-        | ParseError::DeferredForBodyTemplate {
-            line: _,
-            header: _,
-            span: _,
-            error: _,
-        }
-        | ParseError::UnresolvedDeclarationType {
-            token: _,
-            line: _,
             message: _,
         }
         | ParseError::UnknownFunction {
@@ -399,37 +471,15 @@ pub(crate) fn same_parse_error(
             end_line: _,
             end_column: _,
         }
-        | ParseError::SecretDerivedBackendAttribute {
-            backend_type: _,
-            attribute: _,
-            line: _,
-            start_column: _,
-            end_column: _,
-        }
         | ParseError::InterpolationNotAllowedInLiteralString { line: _ }
         | ParseError::InvalidResourceIdentity { line: _, error: _ }
         | ParseError::InvalidResourceType(_)
         | ParseError::DuplicateBinding { name: _, line: _ }
-        | ParseError::UndefinedIdentifier {
-            name: _,
-            line: _,
-            span: _,
-            suggestion: _,
-            in_scope: _,
-        }
-        | ParseError::UndefinedDeferredIterable {
-            name: _,
-            line: _,
-            span: _,
-            suggestion: _,
-            in_scope: _,
-        }
         | ParseError::InternalError {
             expected: _,
             context: _,
         }
         | ParseError::RecursiveFunction(_)
-        | ParseError::CyclicLetBinding { chain: _ }
         | ParseError::UserFunctionError(_) => true,
     }
 }

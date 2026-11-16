@@ -7,7 +7,9 @@ Example (run separately from the Rust tests):
 
 Only validate is measured: plan can open state backends and contact providers.
 The closure follows literal local source/import paths, preserving their relative
-layout. Only .crn files and provider/backend lock files are copied. Absolute local sources and interpolated
+layout. Each directory entry includes every .crn beneath it, excluding artifact
+and build directories. Only .crn files and provider/backend lock files are copied.
+Absolute local sources and interpolated
 local paths are refused rather than letting a subprocess use the original tree.
 Installed trust/plugin directories are shared through explicit directory overrides;
 no .carina or state files are copied. Credentials are removed from the inherited
@@ -31,6 +33,7 @@ import statistics
 import subprocess
 import tempfile
 import time
+import traceback
 
 
 WARMUPS = 5
@@ -347,4 +350,9 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    except Exception:
+        traceback.print_exc()
+        exit_code = 4
+    raise SystemExit(exit_code)

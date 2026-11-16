@@ -5,7 +5,7 @@
 //! A PR that correctly changes diagnostic wording refreshes and reviews this file's golden.
 //! The golden pins the original typed error vector, including Debug field names,
 //! and rendered errors. Facade/replay equality is asserted without recording a
-//! duplicate. JSON is stored once and its compact serialized bytes are compared.
+//! duplicate. JSON is stored once and compared as a structured value.
 //! Refresh and read the diff when an error field or diagnostic changes.
 //! The 16 erased-reference rows and their same-file twins record main's
 //! known-accept / unknown-reject behaviour where observed. The node-judge PR
@@ -679,27 +679,6 @@ fn authored_reference_cells_match_recorded() {
     assert_eq!(golden["skipped_probes"], json!(SKIPPED_PROBES));
     assert_eq!(golden["rows"].as_array().unwrap().len(), 108);
     let actual = cells();
-    for (recorded_row, actual_row) in golden["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .zip(actual.as_array().unwrap())
-    {
-        for (recorded, actual) in recorded_row["cells"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .zip(actual_row["cells"].as_array().unwrap())
-        {
-            assert!(
-                serde_json::to_vec(&recorded["observation"]["json"]).unwrap()
-                    == serde_json::to_vec(&actual["observation"]["json"]).unwrap(),
-                "{} known={}: compact validate JSON bytes differ",
-                recorded_row["row"],
-                recorded["known"]
-            );
-        }
-    }
     if golden["rows"] != actual {
         eprintln!(
             "actual cells: {}",
