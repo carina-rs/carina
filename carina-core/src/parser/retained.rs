@@ -14,7 +14,7 @@ use crate::resource::{
 use indexmap::IndexMap;
 use pest::iterators::{Pair, Pairs};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::Path,
     sync::{Arc, OnceLock},
 };
@@ -1072,6 +1072,60 @@ impl<B: BindingAddress> Default for Expressions<B> {
             captures: Arc::default(),
             projections: Arc::default(),
             template_placements: Default::default(),
+        }
+    }
+}
+
+/// Resolve a let-bound builtin closure from authored definitions. Captures
+/// stay in application order, and no evaluated value can supply this identity.
+fn builtin_closure<B: BindingAddress>(
+    definitions: &IndexMap<B, ExprValue<ParserPlaceholder, B>>,
+    instance: &ExpressionInstance,
+    name: &str,
+) -> Option<(
+    crate::builtins::Builtin,
+    Vec<ExprValue<ParserPlaceholder, B>>,
+)> {
+    let named = |instance: &ExpressionInstance, name: &str| {
+        let scope = match instance {
+            ExpressionInstance::Root => None,
+            ExpressionInstance::Module(environment) => Some(environment.scope.as_ref()),
+        };
+        let binding: B = crate::resource::binding_address::binding_in_scope(
+            RelativeBindingName::new(name),
+            scope,
+        );
+        definitions
+            .get(&binding)
+            .filter(|definition| definition.secrecy_instance() == instance)
+    };
+    let mut definition = named(instance, name)?;
+    let mut seen = HashSet::new();
+    let mut captures = Vec::new();
+    loop {
+        if !seen.insert((definition.secrecy_instance().clone(), definition.node_id())) {
+            return None;
+        }
+        match definition.secrecy_kind() {
+            ExprKind::Alias | ExprKind::Parens | ExprKind::Definition => {
+                definition = definition.secrecy_children().last()?;
+            }
+            ExprKind::Binding(binding) => definition = definitions.get(binding)?,
+            ExprKind::Call(name) => {
+                captures.push(definition.secrecy_children());
+                if let Some(builtin) = crate::builtins::Builtin::from_name(name) {
+                    let captures = captures
+                        .into_iter()
+                        .rev()
+                        .flatten()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    return (!captures.is_empty() && captures.len() < builtin.arity())
+                        .then_some((builtin, captures));
+                }
+                definition = named(definition.secrecy_instance(), name)?;
+            }
+            _ => return None,
         }
     }
 }
@@ -4772,6 +4826,7 @@ mod judgement {
     #[derive(Default)]
     struct SecrecyIndex {
         locations: HashMap<ExpressionLocation, NodeId>,
+        authored_locations: HashMap<DeclarationLocation, Vec<(ExpressionInstance, NodeId)>>,
         attributes: HashMap<(ExpressionInstance, NodeId), DeclarationLocation>,
         functions: HashMap<(ExpressionInstance, String), NodeId>,
         modules: HashMap<String, ExpressionInstance>,
@@ -4783,7 +4838,16 @@ mod judgement {
             SECRECY_INDEX_BUILDS.update(|builds| builds + 1);
             let mut index = Self::default();
             for ((instance, id), node) in nodes {
-                index.locations.entry(node.location.clone()).or_insert(*id);
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    index.locations.entry(node.location.clone())
+                {
+                    entry.insert(*id);
+                    index
+                        .authored_locations
+                        .entry(node.location.authored.clone())
+                        .or_default()
+                        .push((instance.clone(), *id));
+                }
                 if let Some(value) = node.sink_value() {
                     index
                         .attributes
@@ -5084,6 +5148,16 @@ mod judgement {
         ) -> Option<&ExprValue<ParserPlaceholder, B>> {
             self.definitions.get(binding)
         }
+        pub(crate) fn secrecy_builtin_closure(
+            &self,
+            instance: &ExpressionInstance,
+            name: &str,
+        ) -> Option<(
+            crate::builtins::Builtin,
+            Vec<ExprValue<ParserPlaceholder, B>>,
+        )> {
+            builtin_closure(&self.definitions, instance, name)
+        }
         pub(crate) fn secrecy_argument(&self, binding: &B) -> Option<&Value<ParserPlaceholder, B>> {
             self.secrecy_arguments.get(binding)
         }
@@ -5113,6 +5187,17 @@ mod judgement {
         ) -> Option<ExprValue<ParserPlaceholder, B>> {
             self.secrecy_at_in(&ExpressionLocation::new(self.instance.clone(), location))
         }
+        pub(crate) fn secrecy_at_instances<'a>(
+            &'a self,
+            location: &'a DeclarationLocation,
+        ) -> impl Iterator<Item = ExprValue<ParserPlaceholder, B>> + 'a {
+            self.secrecy_index()
+                .authored_locations
+                .get(location)
+                .into_iter()
+                .flatten()
+                .filter_map(move |(instance, id)| self.secrecy_node(instance, *id))
+        }
         pub(crate) fn secrecy_literal(&self, expression: &ExprValue<ParserPlaceholder, B>) -> bool {
             self.node(expression.secrecy_instance(), expression.node_id())
                 .is_some_and(|judged| {
@@ -5125,9 +5210,12 @@ mod judgement {
                     )
                 })
         }
-        pub(crate) fn secrecy_is_structural(&self, location: &DeclarationLocation) -> bool {
-            self.expression(location)
-                .is_ok_and(|expression| expression.structural_source)
+        pub(crate) fn secrecy_is_structural(
+            &self,
+            source: &ExprValue<ParserPlaceholder, B>,
+        ) -> bool {
+            self.node(source.secrecy_instance(), source.node_id())
+                .is_some_and(|expression| expression.structural_source)
         }
         pub(crate) fn secrecy_node(
             &self,

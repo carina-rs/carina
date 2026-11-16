@@ -51,7 +51,7 @@ fn secrecy_related_position_rejects_zero_coordinates() {
 }
 
 #[test]
-fn unavailable_related_source_keeps_the_call_diagnostic() {
+fn unavailable_related_source_keeps_the_authored_operator_diagnostic() {
     let directory = tempfile::tempdir().unwrap();
     let module = directory.path().join("child/main.crn");
     std::fs::create_dir(module.parent().unwrap()).unwrap();
@@ -90,23 +90,27 @@ fn unavailable_related_source_keeps_the_call_diagnostic() {
     let configuration =
         carina_core::config_loader::load_buffer_configuration(&expanded, &schemas, &context);
     let finding = configuration.judged().secrecy().findings().first().unwrap();
-    let document = create_document_at(text, root);
+    let document = create_document_at(&std::fs::read_to_string(&module).unwrap(), module.clone());
     let doc = document.for_diagnostics().unwrap();
-    let original = render_secrecy(&doc, finding, &[]).unwrap();
+    let original = render_secrecy(&doc, finding, &[]).unwrap().1;
     assert!(original.related_information.is_some());
-    let open = render_secrecy(&doc, finding, &[(module.clone(), String::new())]).unwrap();
+    let open = render_secrecy(&doc, finding, &[(root.clone(), String::new())])
+        .unwrap()
+        .1;
     assert!(
         open.related_information.is_none(),
         "an open unmappable buffer must not fall back to its disk text"
     );
-    std::fs::remove_file(&module).unwrap();
-    let missing =
-        render_secrecy(&doc, finding, &[]).expect("a missing related file must not hide the error");
+    std::fs::remove_file(&root).unwrap();
+    let missing = render_secrecy(&doc, finding, &[])
+        .expect("a missing related file must not hide the error")
+        .1;
     assert_eq!(missing.range, original.range);
     assert_eq!(missing.message, original.message);
     assert!(missing.related_information.is_none());
-    std::fs::write(&module, "").unwrap();
-    let unmappable =
-        render_secrecy(&doc, finding, &[]).expect("a missing related line must not hide the error");
+    std::fs::write(&root, "").unwrap();
+    let unmappable = render_secrecy(&doc, finding, &[])
+        .expect("a missing related line must not hide the error")
+        .1;
     assert!(unmappable.related_information.is_none());
 }

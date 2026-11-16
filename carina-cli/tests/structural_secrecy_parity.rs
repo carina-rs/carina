@@ -4,7 +4,7 @@
 #[path = "support/structural_secrecy.rs"]
 mod fixtures;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -103,10 +103,10 @@ fn assert_validation(root: &Path, expected: &[Finding]) -> (Value, String) {
     let expected_files = expected
         .iter()
         .map(|finding| finding.site.file)
-        .collect::<HashSet<_>>()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|file| (file, source_file(root, file)))
-        .collect::<HashMap<_, _>>();
+        .collect::<BTreeMap<_, _>>();
     let human_sites = human_text
         .lines()
         .flat_map(|line| {
@@ -233,6 +233,75 @@ fn assert_module_validation(root: &Path, finding: Finding) {
 fn module_instances_blame_authored_operator_and_identify_only_secret_call() {
     let fixture = fixtures::fixture("module_instances");
     assert_module_validation(fixture.path(), fixtures::MODULE_FINDING);
+}
+
+#[test]
+fn root_failure_does_not_hide_the_module_instance_finding() {
+    let fixture = fixtures::root_and_module_fixture();
+    assert_validation(fixture.path(), fixtures::ROOT_AND_MODULE_FINDINGS);
+}
+
+#[test]
+fn impossible_expansion_keeps_the_same_root_secrecy_subset_as_lsp() {
+    let fixture = fixtures::unexpandable_root_and_module_fixture();
+    let output = validate(fixture.path(), true);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    let findings = report["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|error| {
+            error["message"]
+                .as_str()
+                .is_some_and(fixtures::is_secrecy_message)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(findings.len(), 1, "{report}");
+    assert!(at_site(
+        fixture.path(),
+        &findings[0]["location"],
+        fixtures::ROOT_AND_MODULE_FINDINGS[1].site
+    ));
+}
+
+#[test]
+fn ordinary_root_errors_still_collect_expanded_secrecy_findings() {
+    let fixture = fixtures::root_and_module_with_backend_error_fixture();
+    let output = validate(fixture.path(), true);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{report}");
+    let findings = report["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|error| {
+            error["message"]
+                .as_str()
+                .is_some_and(fixtures::is_secrecy_message)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(findings.len(), 2, "{report}");
+    assert!(
+        report["errors"].as_array().unwrap().len() > findings.len(),
+        "{report}"
+    );
+    for expected in fixtures::ROOT_AND_MODULE_FINDINGS {
+        assert!(
+            findings.iter().any(|finding| at_site(
+                fixture.path(),
+                &finding["location"],
+                expected.site
+            )),
+            "{report}"
+        );
+    }
+}
+
+#[test]
+fn non_attribute_declarations_use_their_authored_kind_and_name() {
+    let (fixture, findings) = fixtures::declaration_kinds_fixture();
+    assert_validation(fixture.path(), &findings);
 }
 
 #[test]

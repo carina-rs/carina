@@ -2533,7 +2533,15 @@ where
                     .declarations()
                     .iter()
                     .find(|record| record.kind() == kind && record.name() == name)
-                    .map(|record| record.value_location().unwrap_or(record.location()))
+                    .map(|record| {
+                        // Let evaluation/type backstops keep their declaration
+                        // anchor even when secrecy retains a separate RHS span.
+                        if kind == DeclarationKind::Binding {
+                            record.location()
+                        } else {
+                            record.value_location().unwrap_or(record.location())
+                        }
+                    })
                     .ok_or_else(|| {
                         AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
                             element: format!("{kind:?} {name} value"),

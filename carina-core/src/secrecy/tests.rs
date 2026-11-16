@@ -318,7 +318,7 @@ fn attribute_less_module_resources_keep_distinct_expansion_rows() {
 }
 
 #[test]
-fn direct_and_referenced_attribute_walks_share_the_slot_environment() {
+fn direct_and_referenced_attribute_walks_keep_independent_memos() {
     let report = report(
         "let token = secret('canary')\nlet seed = mock.test.Resource { name = 'seed' comment = token }\nlet sink = mock.test.Resource { name = 'sink' comment = seed.comment }\n",
     );
@@ -330,8 +330,8 @@ fn direct_and_referenced_attribute_walks_share_the_slot_environment() {
         .find(|stats| stats.attribute == "comment" && stats.reference_visits == 2)
         .expect("the sink encounters seed.comment and token");
     assert_eq!(
-        stats.memo_hits, 1,
-        "the direct token walk must populate the same memo key"
+        stats.memo_hits, 0,
+        "earlier attribute walks must not prepopulate the sink memo"
     );
     assert_eq!(stats.maximum_depth, 2);
 }
@@ -347,8 +347,8 @@ fn repeated_errors_block_memo_admission_and_deduplicate_only_in_the_report() {
         syntax: &syntax,
         schemas: &schemas,
         resources: IndexMap::new(),
+        declarations: Vec::new(),
         upstream: HashSet::new(),
-        memo: RefCell::default(),
         empty_environment: Arc::default(),
     };
     let resource = &file.resources[0];
@@ -356,7 +356,8 @@ fn repeated_errors_block_memo_admission_and_deduplicate_only_in_the_report() {
     let source = syntax
         .secrecy_root(&resource.id, slot.secrecy_node())
         .unwrap();
-    let mut walk = Walk::new(&owner, "comment".into(), source.location().clone());
+    let mut walk =
+        Walk::new(&owner, "comment".into(), source.location().clone()).in_source(&source);
     assert_eq!(
         walk.run(Thunk {
             source: Source::Syntax(source),
@@ -370,7 +371,7 @@ fn repeated_errors_block_memo_admission_and_deduplicate_only_in_the_report() {
         "no traversal with a repeated error may enter the memo"
     );
     assert_eq!(walk.findings.len(), 3);
-    assert!(owner.memo.borrow().is_empty());
+    assert!(walk.memo.is_empty());
     let mut report = SecrecyReport::default();
     report.add_findings(walk.findings);
     assert_eq!(report.findings().len(), 1);
@@ -429,8 +430,8 @@ fn unavailable_builtin_keeps_argument_secrecy_separate_from_failure() {
         syntax: &syntax,
         schemas: &schemas,
         resources: IndexMap::new(),
+        declarations: Vec::new(),
         upstream: HashSet::new(),
-        memo: RefCell::default(),
         empty_environment: Arc::default(),
     };
     let value = Value::Deferred(DeferredValue::Unavailable {
@@ -714,6 +715,293 @@ let sink = mock.test.Resource { name = "sink" comment = join("", [seed.comment, 
     assert!(stats.maximum_depth > 0);
     assert_eq!(stats.memo_hits, 1);
     assert!(stats.limit.is_none());
+}
+
+#[test]
+fn reference_visits_reject_4202_reference_sink_in_both_orders_and_file_layouts() {
+    use std::fmt::Write as _;
+    for shape in CHAIN_SHAPES {
+        for sink_first in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut leaves = String::new();
+            let mut hubs = String::new();
+            for prefix in ["a", "b"] {
+                for index in 1..=2100 {
+                    writeln!(
+                        leaves,
+                        "let {prefix}{index} = mock.test.Resource {{ comment = 'x' }}"
+                    )
+                    .unwrap();
+                }
+                let references = (1..=2100)
+                    .map(|index| format!("{prefix}{index}.comment"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    hubs,
+                    "let hub_{prefix} = mock.test.Resource {{ comment = join('', [{references}]) }}"
+                )
+                .unwrap();
+            }
+            let sink = "let sink = mock.test.Resource { comment = join('', [hub_a.comment, hub_b.comment]) }\n";
+            let path = directory.path().join("main.crn");
+            let file = match shape {
+                ChainShape::SingleFile => {
+                    let body = if sink_first {
+                        sink.to_string() + &hubs
+                    } else {
+                        hubs.clone() + sink
+                    };
+                    crate::parser::parse_file(&(leaves.clone() + &body), &path, &context()).unwrap()
+                }
+                ChainShape::SiblingFiles => {
+                    std::fs::write(&path, &leaves).unwrap();
+                    let (sink_file, hubs_file) = if sink_first {
+                        ("00-sink.crn", "01-hubs.crn")
+                    } else {
+                        ("01-sink.crn", "00-hubs.crn")
+                    };
+                    std::fs::write(directory.path().join(sink_file), sink).unwrap();
+                    std::fs::write(directory.path().join(hubs_file), &hubs).unwrap();
+                    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+                    crate::config_loader::parse_directory(&base, &context())
+                        .unwrap()
+                        .parsed()
+                        .clone()
+                }
+            };
+            let report = secrecy_report(&file, &schemas());
+            assert_eq!(
+                report.findings().len(),
+                1,
+                "{shape:?}, sink_first={sink_first}: {report:?}"
+            );
+            assert_eq!(
+                report.findings()[0].message(),
+                "Attribute 'comment': deciding whether the value is a secret needs more than 4096 reference lookups from this attribute."
+            );
+            let finding = &report.findings()[0];
+            let (sink_file, sink_line) = match shape {
+                ChainShape::SingleFile => (
+                    path,
+                    leaves.lines().count()
+                        + if sink_first {
+                            1
+                        } else {
+                            hubs.lines().count() + 1
+                        },
+                ),
+                ChainShape::SiblingFiles => (
+                    directory.path().join(if sink_first {
+                        "00-sink.crn"
+                    } else {
+                        "01-sink.crn"
+                    }),
+                    1,
+                ),
+            };
+            assert_eq!(finding.location().file().path(), sink_file);
+            assert_eq!(finding.location().span().start_line(), sink_line);
+            assert_eq!(
+                finding.location().span().start_column(),
+                sink.find("comment").unwrap() + 1
+            );
+            for hub in ["hub_a", "hub_b"] {
+                assert_eq!(
+                    attribute(&report, hub, "comment"),
+                    Evidence::Leaf(Secrecy::Public)
+                );
+            }
+            assert!(
+                report
+                    .traversals()
+                    .iter()
+                    .filter(|stats| stats.reference_visits == 2100 && stats.limit.is_none())
+                    .count()
+                    >= 2
+            );
+            // The sink needs 2 + 2100 + 2100 = 4202 encounters. Stop at the
+            // first over-budget encounter, irrespective of earlier walks.
+            assert!(
+                report
+                    .traversals()
+                    .iter()
+                    .any(|stats| stats.reference_visits == 4097
+                        && stats.limit == Some(LimitKind::ReferenceVisits))
+            );
+        }
+    }
+}
+
+#[test]
+fn thirteen_level_fan_out_dag_counts_27_encounters_per_consumer() {
+    use std::fmt::Write as _;
+    let mut source = "let r0 = mock.test.Resource { comment = 'x' }\n".to_string();
+    for index in 1..=13 {
+        writeln!(source, "let r{index} = mock.test.Resource {{ comment = join('', [r{previous}.comment, r{previous}.comment]) }}", previous = index - 1).unwrap();
+    }
+    source.push_str("let first = mock.test.Resource { comment = r13.comment }\nlet second = mock.test.Resource { comment = r13.comment }\n");
+    let report = report(&source);
+    assert!(report.findings().is_empty(), "{report:?}");
+    assert!(report.admitted().is_some());
+    assert!(
+        report
+            .traversals()
+            .iter()
+            .filter(|stats| stats.reference_visits == 27
+                && stats.memo_hits == 13
+                && stats.limit.is_none())
+            .count()
+            >= 2
+    );
+}
+
+#[test]
+fn partially_applied_lookup_checks_call_and_pipe_at_the_authored_use() {
+    for expression in ["pick(secret('d'))", "secret('d') |> pick()"] {
+        let source = format!(
+            "let pick = lookup({{ a = 'public' }}, 'k')\nmock.test.Resource {{ comment = {expression} }}\n"
+        );
+        let report = report(&source);
+        assert_eq!(report.findings().len(), 1, "{expression}: {report:?}");
+        let finding = &report.findings()[0];
+        assert_eq!(
+            finding.message(),
+            "Attribute 'comment': lookup() alternatives mix secret and public values; all alternatives must be secret or all public."
+        );
+        assert_eq!(finding.location().span().start_line(), 2);
+        assert_eq!(finding.location().span().end_line(), 2);
+        let column = source.lines().nth(1).unwrap().find("pick").unwrap() + 1;
+        assert_eq!(finding.location().span().start_column(), column);
+        assert_eq!(
+            finding.location().span().end_column(),
+            column
+                + if expression.starts_with("pick(") {
+                    expression.len()
+                } else {
+                    "pick()".len()
+                }
+        );
+    }
+}
+
+#[test]
+fn partially_applied_builtins_keep_secret_evidence_for_calls_and_pipes() {
+    for (binding, call, pipe) in [
+        (
+            "lookup({ a = secret('a') })",
+            "pick('k', secret('d'))",
+            "secret('d') |> pick('k')",
+        ),
+        (
+            "lookup({ a = secret('a') }, 'k')",
+            "pick(secret('d'))",
+            "secret('d') |> pick()",
+        ),
+        ("join(secret('-'))", "pick(['d'])", "['d'] |> pick()"),
+    ] {
+        for expression in [call, pipe] {
+            for name in ["pick", "alias"] {
+                let expression = expression.replace("pick", name);
+                let file = parsed(&format!(
+                    "let pick = {binding}\nlet alias = pick\nlet sink = mock.test.Resource {{ name = 'sink' comment = {expression} }}\n"
+                ));
+                let schemas = schemas();
+                let configuration =
+                    crate::config_loader::load_buffer_configuration(&file, &schemas, &context());
+                let report = configuration.judged().secrecy();
+                assert!(
+                    report.findings().is_empty(),
+                    "{binding}, {expression}: {report:?}"
+                );
+                // Partial builtin calls have incomplete type judgement, so the
+                // report stays pending even when its recorded evidence is secret.
+                assert_eq!(
+                    attribute(report, "sink", "comment"),
+                    Evidence::Leaf(Secrecy::Secret)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn findings_name_the_authored_declaration_independently_of_reference_walk_order() {
+    let binding = "let t = 'public' ?? secret('canary')\n";
+    let sink = "mock.test.Resource { comment = t }\n";
+    for source in [binding.to_string() + sink, sink.to_string() + binding] {
+        let report = report(&source);
+        assert_eq!(report.findings().len(), 1, "{report:?}");
+        assert_eq!(
+            report.findings()[0].message(),
+            "Let binding 't': ?? alternatives mix secret and public values; all alternatives must be secret or all public."
+        );
+    }
+    for (source, expected) in [
+        (
+            "exports { x: String = 'public' ?? secret('canary') }",
+            "Export 'x'",
+        ),
+        (
+            "let template = use { source = './unused' }\nlet instance = template { x = 'public' ?? secret('canary') }",
+            "Module argument 'x'",
+        ),
+    ] {
+        let report = report(source);
+        assert_eq!(report.findings().len(), 1, "{source}: {report:?}");
+        assert_eq!(
+            report.findings()[0].message(),
+            format!(
+                "{expected}: ?? alternatives mix secret and public values; all alternatives must be secret or all public."
+            )
+        );
+    }
+}
+
+#[test]
+fn instantiated_output_and_default_argument_findings_keep_their_declaration_kinds() {
+    for (body, expected) in [
+        (
+            "attributes { x: String = 'public' ?? secret('canary') }\n",
+            "Output 'x'",
+        ),
+        (
+            "arguments { x: String = 'public' ?? secret('canary') }\nmock.test.Resource { comment = x }\n",
+            "Module argument 'x'",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        std::fs::write(directory.path().join("child/main.crn"), body).unwrap();
+        std::fs::write(
+            directory.path().join("main.crn"),
+            "provider mock {}\nlet child = use { source = './child' }\nlet instance = child {}\n",
+        )
+        .unwrap();
+        let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let context = context();
+        let schemas = schemas();
+        let root = crate::config_loader::parse_directory(&base, &context).unwrap();
+        let expanded =
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    root, &base, session, &schemas,
+                )
+                .unwrap()
+            });
+        let report = crate::config_loader::load_buffer_configuration(&expanded, &schemas, &context)
+            .judged()
+            .secrecy()
+            .clone();
+        assert_eq!(report.findings().len(), 1, "{body}: {report:?}");
+        assert_eq!(
+            report.findings()[0].message(),
+            format!(
+                "{expected}: ?? alternatives mix secret and public values; all alternatives must be secret or all public."
+            )
+        );
+        assert!(report.findings()[0].call_site().is_some());
+    }
 }
 
 #[test]

@@ -11,7 +11,8 @@ mod validation;
 mod tests;
 
 use indexmap::IndexMap;
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -356,55 +357,98 @@ fn secrecy_related_message(cause: &carina_core::secrecy::DerivationError, name: 
     format!("{description} in module instance '{name}'")
 }
 
+fn secrecy_range(
+    location: &carina_core::parser::DeclarationLocation,
+    open_sources: &[(PathBuf, String)],
+) -> Option<Range> {
+    let identity = PathIdentity::new(location.file().path());
+    let source = match open_sources
+        .iter()
+        .find(|(path, _)| PathIdentity::new(path) == identity)
+    {
+        Some((_, source)) => std::borrow::Cow::Borrowed(source.as_str()),
+        None => std::borrow::Cow::Owned(std::fs::read_to_string(location.file().path()).ok()?),
+    };
+    let span = location.span();
+    Some(Range::new(
+        secrecy_related_position(&source, span.start_line(), span.start_column())?,
+        secrecy_related_position(&source, span.end_line(), span.end_column())?,
+    ))
+}
+
 fn render_secrecy(
     doc: &Document,
     finding: &carina_core::secrecy::Finding,
     open_sources: &[(PathBuf, String)],
-) -> Option<Diagnostic> {
+) -> Option<(PathBuf, Diagnostic)> {
     let authored = finding.location();
-    if authored.file().path() == doc.source_file() {
-        return render_merged(
+    let mut message = finding.message();
+    if let Some(call) = finding.call_site() {
+        let span = call.location.span();
+        message.push_str(&format!(
+            " (module instance '{}' at {}:{}:{})",
+            call.name,
+            call.location.file().path().display(),
+            span.start_line(),
+            span.start_column()
+        ));
+    }
+    let mut diagnostic = if authored.file().path() == doc.source_file() {
+        render_merged(
             doc,
             &carina_core::parser::Located::new(authored.clone(), ()),
             DiagnosticSeverity::ERROR,
-            finding.message(),
-        );
-    }
-    let call = finding.call_site()?;
-    if call.location.file().path() != doc.source_file() {
-        return None;
-    }
-    let mut diagnostic = render_merged(
-        doc,
-        &carina_core::parser::Located::new(call.location.clone(), ()),
-        DiagnosticSeverity::ERROR,
-        finding.message(),
-    )?;
-    // A related location is optional. Failure to read or map it must never
-    // suppress the diagnostic at the caller's valid location.
-    let related = || {
-        let identity = PathIdentity::new(authored.file().path());
-        let source = match open_sources
-            .iter()
-            .find(|(path, _)| PathIdentity::new(path) == identity)
-        {
-            Some((_, source)) => std::borrow::Cow::Borrowed(source.as_str()),
-            None => std::borrow::Cow::Owned(std::fs::read_to_string(authored.file().path()).ok()?),
-        };
+            message,
+        )?
+    } else {
+        // The expanded finding belongs to the module URI. Open sources are
+        // consulted only here, for rendering its authored source range.
         let span = authored.span();
-        Some(tower_lsp::lsp_types::DiagnosticRelatedInformation {
-            location: tower_lsp::lsp_types::Location {
-                uri: tower_lsp::lsp_types::Url::from_file_path(authored.file().path()).ok()?,
-                range: Range::new(
-                    secrecy_related_position(&source, span.start_line(), span.start_column())?,
-                    secrecy_related_position(&source, span.end_line(), span.end_column())?,
+        let fallback = || {
+            Some(Range::new(
+                Position::new(
+                    u32::try_from(span.start_line().checked_sub(1)?).ok()?,
+                    u32::try_from(span.start_column().checked_sub(1)?).ok()?,
                 ),
-            },
-            message: secrecy_related_message(finding.cause(), &call.name),
-        })
+                Position::new(
+                    u32::try_from(span.end_line().checked_sub(1)?).ok()?,
+                    u32::try_from(span.end_column().checked_sub(1)?).ok()?,
+                ),
+            ))
+        };
+        Diagnostic {
+            range: secrecy_range(authored, open_sources).or_else(fallback)?,
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("carina".into()),
+            message,
+            ..Default::default()
+        }
     };
-    diagnostic.related_information = related().map(|related| vec![related]);
-    Some(diagnostic)
+    if let Some(call) = finding.call_site() {
+        let range = if call.location.file().path() == doc.source_file() {
+            render_merged(
+                doc,
+                &carina_core::parser::Located::new(call.location.clone(), ()),
+                DiagnosticSeverity::ERROR,
+                String::new(),
+            )
+            .map(|diagnostic| diagnostic.range)
+        } else {
+            secrecy_range(&call.location, open_sources)
+        };
+        // Missing or unmappable related text never suppresses the operator.
+        diagnostic.related_information = range.and_then(|range| {
+            Some(vec![tower_lsp::lsp_types::DiagnosticRelatedInformation {
+                location: tower_lsp::lsp_types::Location {
+                    uri: tower_lsp::lsp_types::Url::from_file_path(call.location.file().path())
+                        .ok()?,
+                    range,
+                },
+                message: secrecy_related_message(finding.cause(), &call.name),
+            }])
+        });
+    }
+    Some((authored.file().path().to_path_buf(), diagnostic))
 }
 
 /// Syntax errors can use coordinates only from this buffer's own parser.
@@ -759,6 +803,7 @@ pub(super) struct DiagnosticRun<'a> {
     engine: &'a DiagnosticEngine,
     provider_context: &'a dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     open_sources: &'a [(PathBuf, String)],
+    routed_secrecy: &'a RefCell<BTreeMap<PathBuf, Vec<Diagnostic>>>,
 }
 
 impl std::ops::Deref for DiagnosticRun<'_> {
@@ -959,19 +1004,9 @@ impl DiagnosticRun<'_> {
         } else {
             None
         };
-        // Parsing and related ranges share the same snapshot of every open
-        // file. The current document's parsed text takes precedence.
-        let current_identity = PathIdentity::new(doc.source_file());
-        let entries = self
-            .open_sources
-            .iter()
-            .filter(|(path, _)| PathIdentity::new(path) != current_identity)
-            .filter_map(|(path, text)| {
-                carina_core::paths::ResolvedPath::new(path)
-                    .ok()
-                    .map(|path| (path, text.clone()))
-            })
-            .chain(current_override);
+        // Only the analyzed document overrides parsing. Other open buffers
+        // are available solely to secrecy source-range rendering.
+        let entries = current_override;
         let overrides = match carina_core::config_loader::SourceOverrides::try_from_entries(entries)
         {
             Ok(overrides) => overrides,
@@ -1608,10 +1643,18 @@ impl DiagnosticRun<'_> {
                 |configuration| configuration.judged().secrecy(),
             );
             for finding in secrecy_report.findings() {
-                if let Some(diagnostic) = render_secrecy(doc, finding, self.open_sources)
-                    && !diagnostics.contains(&diagnostic)
-                {
-                    diagnostics.push(diagnostic);
+                if let Some((path, diagnostic)) = render_secrecy(doc, finding, self.open_sources) {
+                    if path == doc.source_file() {
+                        if !diagnostics.contains(&diagnostic) {
+                            diagnostics.push(diagnostic);
+                        }
+                    } else {
+                        let mut routed = self.routed_secrecy.borrow_mut();
+                        let findings = routed.entry(path).or_default();
+                        if !findings.contains(&diagnostic) {
+                            findings.push(diagnostic);
+                        }
+                    }
                 }
             }
             let expanded_validation_tree = match &expanded_configuration {
@@ -2947,6 +2990,7 @@ impl DiagnosticEngine {
                     engine: self,
                     provider_context: session,
                     open_sources: &[],
+                    routed_secrecy: &RefCell::default(),
                 })
             },
         )
@@ -2980,15 +3024,43 @@ impl DiagnosticEngine {
         self.analyze_with_open_sources(raw, current_file_path, &open_sources)
     }
 
+    /// Analyze the current document and route instantiated secrecy findings to
+    /// their authored files. Other buffers affect only secrecy range rendering.
+    /// Results iterate in file-path order.
+    pub fn analyze_document_set(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_documents: &[&crate::document::Document],
+    ) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+        let open_sources = open_documents
+            .iter()
+            .map(|doc| (doc.source_file().to_path_buf(), doc.text()))
+            .collect::<Vec<_>>();
+        self.analyze_document_set_with_open_sources(raw, current_file_path, &open_sources)
+    }
+
     pub(crate) fn analyze_with_open_sources(
         &self,
         raw: &crate::document::Document,
         current_file_path: Option<&Path>,
         open_sources: &[(PathBuf, String)],
     ) -> Vec<Diagnostic> {
+        self.analyze_document_set_with_open_sources(raw, current_file_path, open_sources)
+            .remove(raw.source_file())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn analyze_document_set_with_open_sources(
+        &self,
+        raw: &crate::document::Document,
+        current_file_path: Option<&Path>,
+        open_sources: &[(PathBuf, String)],
+    ) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
+        let single = |diagnostics| BTreeMap::from([(raw.source_file().to_path_buf(), diagnostics)]);
         let doc = match raw.for_diagnostics() {
             Ok(doc) => doc,
-            Err(protected) => return vec![buffer::protected_parse_error(protected)],
+            Err(protected) => return single(vec![buffer::protected_parse_error(protected)]),
         };
         let context = self.catalog_for_public_document(&doc, current_file_path);
         let reparsed;
@@ -3001,21 +3073,28 @@ impl DiagnosticEngine {
             );
             match reparsed.for_diagnostics() {
                 Ok(doc) => doc,
-                Err(protected) => return vec![buffer::protected_parse_error(protected)],
+                Err(protected) => return single(vec![buffer::protected_parse_error(protected)]),
             }
         } else {
             doc
         };
+        let routed_secrecy = RefCell::default();
         let terminal =
             carina_core::validation::deferred_types::TypeCheckSession::run(&context, |session| {
                 DiagnosticRun {
                     engine: self,
                     provider_context: session,
                     open_sources,
+                    routed_secrecy: &routed_secrecy,
                 }
                 .collect_diagnostics(&doc, current_file_path)
             });
-        Self::publish_type_diagnostics(terminal, &doc)
+        let mut report = routed_secrecy.into_inner();
+        report.insert(
+            raw.source_file().to_path_buf(),
+            Self::publish_type_diagnostics(terminal, &doc),
+        );
+        report
     }
 
     pub(crate) fn catalog_for_document(

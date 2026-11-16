@@ -1,7 +1,6 @@
 //! Structural secrecy of authored configuration. Values obtained from providers
 //! and state never enter this owner. Availability and secrecy are separate facts.
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -128,9 +127,51 @@ pub struct CallSite {
     pub location: DeclarationLocation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DeclarationKind {
+    Attribute,
+    LetBinding,
+    ModuleArgument,
+    Output,
+    Export,
+}
+impl DeclarationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Attribute => "Attribute",
+            Self::LetBinding => "Let binding",
+            Self::ModuleArgument => "Module argument",
+            Self::Output => "Output",
+            Self::Export => "Export",
+        }
+    }
+    fn from_syntax(kind: crate::config_loader::DeclarationKind) -> Option<Self> {
+        use crate::config_loader::DeclarationKind as Syntax;
+        match kind {
+            Syntax::Binding => Some(Self::LetBinding),
+            Syntax::Argument => Some(Self::ModuleArgument),
+            Syntax::ModuleAttribute => Some(Self::Output),
+            Syntax::Export => Some(Self::Export),
+            Syntax::UserFunction | Syntax::ProviderKind => None,
+        }
+    }
+}
+
+type DeclarationIdentity = (ExpressionInstance, NodeId);
+
+#[derive(Clone)]
+struct Declaration {
+    identity: DeclarationIdentity,
+    kind: DeclarationKind,
+    name: String,
+    location: DeclarationLocation,
+}
+
 /// The core owns message text and both authored and instantiated locations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Finding {
+    declaration: DeclarationIdentity,
+    kind: DeclarationKind,
     attribute: String,
     location: DeclarationLocation,
     call_site: Option<CallSite>,
@@ -151,6 +192,7 @@ impl Finding {
         &self.cause
     }
     pub fn message(&self) -> String {
+        let kind = self.kind.label();
         match &self.cause {
             DerivationError::MixedAlternatives(MixedAlternatives { operator }) => {
                 let operator = match operator {
@@ -158,21 +200,23 @@ impl Finding {
                     Alternatives::Lookup => "lookup()",
                 };
                 format!(
-                    "Attribute '{}': {operator} alternatives mix secret and public values; all alternatives must be secret or all public.",
+                    "{kind} '{}': {operator} alternatives mix secret and public values; all alternatives must be secret or all public.",
                     self.attribute
                 )
             }
             DerivationError::LimitReached(LimitReached {
                 kind: LimitKind::Depth,
             }) => format!(
-                "Attribute '{}': the value follows a chain of {MAX_REFERENCE_DEPTH} or more reference or expression steps from this attribute; Carina cannot decide whether it is a secret.",
-                self.attribute
+                "{kind} '{}': the value follows a chain of {MAX_REFERENCE_DEPTH} or more reference or expression steps from this {}; Carina cannot decide whether it is a secret.",
+                self.attribute,
+                kind.to_lowercase()
             ),
             DerivationError::LimitReached(LimitReached {
                 kind: LimitKind::ReferenceVisits,
             }) => format!(
-                "Attribute '{}': deciding whether the value is a secret needs more than {MAX_REFERENCE_VISITS} reference lookups from this attribute.",
-                self.attribute
+                "{kind} '{}': deciding whether the value is a secret needs more than {MAX_REFERENCE_VISITS} reference lookups from this {}.",
+                self.attribute,
+                kind.to_lowercase()
             ),
             DerivationError::RecursiveFunction(name) => {
                 crate::parser::ParseError::RecursiveFunction(name.clone()).to_string()
@@ -227,7 +271,12 @@ struct TraversalStats {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SecrecyReport {
     findings: Vec<Finding>,
-    finding_keys: HashSet<(DeclarationLocation, Option<CallSite>, DerivationError)>,
+    finding_keys: HashSet<(
+        DeclarationIdentity,
+        DeclarationLocation,
+        Option<CallSite>,
+        DerivationError,
+    )>,
     pending: bool,
     rows: Arc<IndexMap<ResourceId, Row>>,
     #[cfg(test)]
@@ -275,6 +324,7 @@ impl SecrecyReport {
     fn add_findings(&mut self, findings: impl IntoIterator<Item = Finding>) {
         for finding in findings {
             if self.finding_keys.insert((
+                finding.declaration.clone(),
                 finding.location.clone(),
                 finding.call_site.clone(),
                 finding.cause.clone(),
@@ -414,8 +464,28 @@ struct Owner<'a, B: BindingAddress> {
     schemas: &'a SchemaRegistry,
     resources: IndexMap<B, ResourceSource<B>>,
     upstream: HashSet<B>,
-    memo: RefCell<HashMap<ReferenceKey<B>, Memo>>,
+    declarations: Vec<Declaration>,
     empty_environment: Arc<Environment<B>>,
+}
+
+impl<B: BindingAddress> Owner<'_, B> {
+    fn declaration(
+        &self,
+        location: &DeclarationLocation,
+        call: Option<&CallSite>,
+    ) -> Option<&Declaration> {
+        self.declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.location.file() == location.file()
+                    && declaration.location.span().start_byte() <= location.span().start_byte()
+                    && declaration.location.span().end_byte() >= location.span().end_byte()
+                    && self.syntax.secrecy_call(&declaration.identity.0) == call
+            })
+            .min_by_key(|declaration| {
+                declaration.location.span().end_byte() - declaration.location.span().start_byte()
+            })
+    }
 }
 
 pub(crate) fn derive<E, P, T, D, B>(
@@ -433,7 +503,7 @@ where
         syntax,
         schemas,
         resources: IndexMap::new(),
-        memo: RefCell::default(),
+        declarations: Vec::new(),
         empty_environment: Arc::default(),
         upstream: file
             .upstream_states
@@ -448,6 +518,56 @@ where
     {
         report.pending = true;
         return report;
+    }
+    // Register authored owners before any dependency walk. A finding reached
+    // through another declaration retains its own kind, name and parser ID.
+    for resource in syntax.secrecy_resources() {
+        for sink in resource.secrecy_children() {
+            if let ExprKind::Sink { name } = sink.secrecy_kind() {
+                owner.declarations.push(Declaration {
+                    identity: (sink.secrecy_instance().clone(), sink.node_id()),
+                    kind: DeclarationKind::Attribute,
+                    name: name.to_string(),
+                    location: sink.location().clone(),
+                });
+            }
+        }
+    }
+    for (name, source) in syntax.secrecy_arguments_authored() {
+        owner.declarations.push(Declaration {
+            identity: (source.secrecy_instance().clone(), source.node_id()),
+            kind: DeclarationKind::ModuleArgument,
+            name,
+            location: source.location().clone(),
+        });
+    }
+    for call in &file.module_calls {
+        for (name, _) in call.arguments() {
+            if let Some(location) = call.id().argument_value_location(name)
+                && let Some(source) = syntax.secrecy_at(location)
+            {
+                owner.declarations.push(Declaration {
+                    identity: (source.secrecy_instance().clone(), source.node_id()),
+                    kind: DeclarationKind::ModuleArgument,
+                    name: name.to_string(),
+                    location: location.clone(),
+                });
+            }
+        }
+    }
+    for declaration in file.parser_binding_metadata.syntax().declarations() {
+        if let Some(kind) = DeclarationKind::from_syntax(declaration.detail().kind())
+            && let Some(location) = declaration.detail().value_location()
+        {
+            for source in syntax.secrecy_at_instances(location) {
+                owner.declarations.push(Declaration {
+                    identity: (source.secrecy_instance().clone(), source.node_id()),
+                    kind,
+                    name: declaration.detail().name().to_string(),
+                    location: location.clone(),
+                });
+            }
+        }
     }
     for resource in file
         .iter_all_resources()
@@ -682,16 +802,19 @@ where
                 | crate::config_loader::DeclarationKind::ModuleAttribute
                 | crate::config_loader::DeclarationKind::Export
         ) && let Some(location) = declaration.detail().value_location()
-            && !syntax.secrecy_is_structural(location)
-            && let Some(source) = syntax.secrecy_at(location)
         {
-            report.inspect_source(
-                &owner,
-                declaration.detail().name().to_string(),
-                location.clone(),
-                source,
-                owner.empty_environment.clone(),
-            );
+            for source in syntax.secrecy_at_instances(location) {
+                if syntax.secrecy_is_structural(&source) {
+                    continue;
+                }
+                report.inspect_source(
+                    &owner,
+                    declaration.detail().name().to_string(),
+                    location.clone(),
+                    source,
+                    owner.empty_environment.clone(),
+                );
+            }
         }
     }
     if syntax.has_failed_expressions() {
@@ -765,6 +888,20 @@ enum Operation {
     Pending,
 }
 
+fn builtin_operation(
+    name: &str,
+    origin: Option<(DeclarationLocation, Option<CallSite>)>,
+) -> Operation {
+    match name {
+        "secret" | "decrypt" => Operation::Secret,
+        "lookup" => Operation::Alternatives {
+            operator: Alternatives::Lookup,
+            origin,
+        },
+        _ => Operation::Propagate,
+    }
+}
+
 struct FunctionContext<'a, B: BindingAddress> {
     environment: Arc<Environment<B>>,
     path: Vec<PathSegment>,
@@ -778,11 +915,14 @@ struct Walk<'a, B: BindingAddress> {
     attribute: String,
     attribute_location: DeclarationLocation,
     call_site: Option<CallSite>,
+    declaration: Option<Declaration>,
     findings: Vec<Finding>,
     visits: usize,
     #[cfg(test)]
     memo_hits: usize,
     max_depth: usize,
+    // Visit/depth accounting is private to this declaration walk.
+    memo: HashMap<ReferenceKey<B>, Memo>,
     active_references: HashSet<ReferenceKey<B>>,
     active_functions: HashSet<(ExpressionInstance, NodeId)>,
     active_value_functions: HashSet<DeclarationLocation>,
@@ -796,11 +936,13 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             attribute,
             attribute_location: location,
             call_site: None,
+            declaration: None,
             findings: Vec::new(),
             visits: 0,
             #[cfg(test)]
             memo_hits: 0,
             max_depth: 0,
+            memo: HashMap::new(),
             active_references: HashSet::new(),
             active_functions: HashSet::new(),
             active_value_functions: HashSet::new(),
@@ -814,6 +956,17 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             .syntax
             .secrecy_call(source.secrecy_instance())
             .cloned();
+        self.declaration = Some(
+            self.owner
+                .declaration(&self.attribute_location, self.call_site.as_ref())
+                .cloned()
+                .unwrap_or_else(|| Declaration {
+                    identity: (source.secrecy_instance().clone(), source.node_id()),
+                    kind: DeclarationKind::Attribute,
+                    name: self.attribute.clone(),
+                    location: self.attribute_location.clone(),
+                }),
+        );
         self
     }
     fn finding(
@@ -824,8 +977,15 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
     ) {
         // Count every occurrence so the reference memo gate also sees errors
         // already reported elsewhere in this walk. The report deduplicates.
+        let declaration = self
+            .owner
+            .declaration(&location, call.as_ref())
+            .or(self.declaration.as_ref())
+            .expect("finding has an authored declaration");
         self.findings.push(Finding {
-            attribute: self.attribute.clone(),
+            declaration: declaration.identity.clone(),
+            kind: declaration.kind,
+            attribute: declaration.name.clone(),
             location,
             call_site: call,
             cause,
@@ -886,7 +1046,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         && !self.pending_validation
                         && let Some(Some(evidence)) = values.last()
                     {
-                        self.owner.memo.borrow_mut().insert(
+                        self.memo.insert(
                             key,
                             Memo {
                                 evidence: evidence.clone(),
@@ -1047,7 +1207,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             binding: binding.clone(),
             path: path.clone(),
         };
-        let memo = self.owner.memo.borrow().get(&key).cloned();
+        let memo = self.memo.get(&key).cloned();
         let reached_depth = next_depth + memo.as_ref().map_or(0, |memo| memo.relative_depth);
         self.max_depth = self.max_depth.max(reached_depth.min(MAX_REFERENCE_DEPTH));
         if let Some(memo) = memo {
@@ -1253,27 +1413,24 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                                     values,
                                 },
                             );
-                        } else if name == "decrypt" {
-                            self.schedule(Operation::Secret, children(), path, depth, work);
-                        } else if name == "lookup" {
-                            self.schedule(
-                                Operation::Alternatives {
-                                    operator: Alternatives::Lookup,
-                                    origin: Some((
-                                        expression.location().clone(),
-                                        self.owner
-                                            .syntax
-                                            .secrecy_call(expression.secrecy_instance())
-                                            .cloned(),
-                                    )),
-                                },
-                                children(),
-                                path,
-                                depth,
-                                work,
-                            );
                         } else {
-                            self.schedule(Operation::Propagate, children(), path, depth, work);
+                            let (builtin, arguments) = self.builtin_arguments(
+                                &expression,
+                                name,
+                                children().collect(),
+                                &environment,
+                            );
+                            let operation = builtin_operation(
+                                &builtin,
+                                Some((
+                                    expression.location().clone(),
+                                    self.owner
+                                        .syntax
+                                        .secrecy_call(expression.secrecy_instance())
+                                        .cloned(),
+                                )),
+                            );
+                            self.schedule(operation, arguments, path, depth, work);
                         }
                     }
                     ExprKind::Sequence => {
@@ -1402,6 +1559,41 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
             && self.owner.syntax.secrecy_argument(binding).is_none()
             && !self.owner.upstream.contains(binding)
             && self.owner.syntax.secrecy_literal(expression)
+    }
+
+    /// Retained call and pipe syntax names the closure's let binding. Follow
+    /// its authored definition and prepend captures before applying builtin
+    /// secrecy rules. This also preserves intrinsic secret/decrypt behavior.
+    fn builtin_arguments(
+        &self,
+        expression: &ExprValue<ParserPlaceholder, B>,
+        name: &str,
+        arguments: Vec<Thunk<B>>,
+        environment: &Arc<Environment<B>>,
+    ) -> (String, Vec<Thunk<B>>) {
+        if crate::builtins::Builtin::from_name(name).is_some() {
+            return (name.to_string(), arguments);
+        }
+        let Some((builtin, captures)) = self
+            .owner
+            .syntax
+            .secrecy_builtin_closure(expression.secrecy_instance(), name)
+        else {
+            return (name.to_string(), arguments);
+        };
+        let name = match builtin {
+            crate::builtins::Builtin::Secret => "secret",
+            crate::builtins::Builtin::Function(function) => function.as_str(),
+        };
+        let arguments = captures
+            .into_iter()
+            .map(|source| Thunk {
+                source: Source::Syntax(source),
+                environment: environment.clone(),
+            })
+            .chain(arguments)
+            .collect();
+        (name.to_string(), arguments)
     }
 
     fn known_boolean(&self, input: &Thunk<B>) -> Option<bool> {
@@ -1733,16 +1925,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         .filter_map(|argument| argument.value())
                         .map(thunk)
                         .collect::<Vec<_>>();
-                    let operation = if name.as_str() == "decrypt" {
-                        Operation::Secret
-                    } else if name.as_str() == "lookup" {
-                        Operation::Alternatives {
-                            operator: Alternatives::Lookup,
-                            origin: None,
-                        }
-                    } else {
-                        Operation::Propagate
-                    };
+                    let operation = builtin_operation(name.as_str(), None);
                     self.schedule(operation, children, path, depth, work);
                 }
                 DeferredValue::ResolvedFunctionCall {

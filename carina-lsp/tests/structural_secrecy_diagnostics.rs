@@ -5,7 +5,7 @@ mod support;
 #[path = "../../carina-cli/tests/support/structural_secrecy.rs"]
 mod fixtures;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -65,10 +65,10 @@ fn assert_findings(root: &Path, diagnostics: &[Diagnostic], expected: &[Finding]
     let sources = expected
         .iter()
         .map(|finding| finding.site.file)
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|file| (file, std::fs::read_to_string(root.join(file)).unwrap()))
-        .collect::<HashMap<_, _>>();
+        .collect::<BTreeMap<_, _>>();
     let lines = sources
         .iter()
         .map(|(file, source)| (*file, source.lines().collect::<Vec<_>>()))
@@ -143,53 +143,237 @@ fn homogeneous_alternatives_and_if_remain_valid_in_directory_diagnostics() {
 }
 
 fn assert_module_findings(fixture: &tempfile::TempDir, expected: Finding) {
-    let diagnostics = analyze(&engine(), fixture, "main.crn");
-    assert_no_payload(&diagnostics);
-    let findings = diagnostics
-        .iter()
-        .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
-        .collect::<Vec<_>>();
-    assert_eq!(findings.len(), 1, "{diagnostics:#?}");
-    let finding = findings[0];
-    assert_eq!(finding.message, expected.message);
-    assert_eq!(finding.severity, Some(DiagnosticSeverity::ERROR));
-    assert_eq!(finding.source.as_deref(), Some("carina"));
-    // A root buffer's primary range identifies its instantiated call. Its
-    // related location carries the exact module operator used by CLI JSON,
-    // without pretending a module coordinate belongs to the root document.
+    let root_path = fixture.path().join("main.crn");
+    let root = Document::new_with_path(
+        std::fs::read_to_string(&root_path).unwrap(),
+        root_path.clone(),
+        Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+    );
+    let report = engine().analyze_document_set(&root, Some(&root_path), &[]);
+    assert_findings(fixture.path(), &report[&root_path], &[]);
+    let module_path = fixture.path().join(expected.site.file);
+    let diagnostics = &report[&module_path];
+    assert_no_payload(diagnostics);
+    assert_eq!(diagnostics.len(), 1, "{report:#?}");
+    let finding = &diagnostics[0];
+    assert!(finding.message.starts_with(expected.message));
+    assert!(finding.message.contains("secret_instance"));
+    assert_eq!(finding.range, lsp_range(fixture.path(), expected.site));
+    let related = finding.related_information.as_ref().unwrap();
+    assert_eq!(related.len(), 1);
     assert_eq!(
-        finding.range,
+        CanonicalPath::new(related[0].location.uri.to_file_path().unwrap()).unwrap(),
+        CanonicalPath::new(&root_path).unwrap()
+    );
+    assert_eq!(
+        related[0].location.range,
         lsp_range(fixture.path(), fixtures::SECRET_CALL)
     );
-    let authored = expected.site;
-    let related = finding.related_information.as_deref().unwrap_or_default();
-    let matching = related
-        .iter()
-        .filter(|information| {
-            information
-                .location
-                .uri
-                .to_file_path()
-                .ok()
-                .is_some_and(|file| {
-                    CanonicalPath::new(file).unwrap()
-                        == CanonicalPath::new(fixture.path().join(authored.file)).unwrap()
-                })
-                && information.location.range == lsp_range(fixture.path(), authored)
-        })
-        .count();
-    assert_eq!(
-        matching, 1,
-        "missing authored module location: {finding:#?}"
+}
+
+#[test]
+fn root_and_module_findings_match_cli_at_both_authored_sites() {
+    let fixture = fixtures::root_and_module_fixture();
+    let root_path = fixture.path().join("main.crn");
+    let root = Document::new_with_path(
+        std::fs::read_to_string(&root_path).unwrap(),
+        root_path.clone(),
+        Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
     );
+    let report = engine().analyze_document_set(&root, Some(&root_path), &[]);
     assert_eq!(
-        diagnostics
+        report
+            .values()
+            .flat_map(|diagnostics| diagnostics.iter())
+            .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
+            .count(),
+        2,
+        "{report:#?}"
+    );
+    for expected in fixtures::ROOT_AND_MODULE_FINDINGS {
+        let path = fixture.path().join(expected.site.file);
+        let findings = report[&path]
+            .iter()
+            .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1, "{report:#?}");
+        assert!(findings[0].message.starts_with(expected.message));
+        assert_eq!(findings[0].range, lsp_range(fixture.path(), expected.site));
+    }
+}
+
+#[test]
+fn impossible_expansion_keeps_the_same_root_secrecy_subset_as_cli() {
+    let fixture = fixtures::unexpandable_root_and_module_fixture();
+    let root_path = fixture.path().join("main.crn");
+    let root = Document::new_with_path(
+        std::fs::read_to_string(&root_path).unwrap(),
+        root_path.clone(),
+        Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+    );
+    let report = engine().analyze_document_set(&root, Some(&root_path), &[]);
+    let findings = report
+        .values()
+        .flat_map(|diagnostics| diagnostics.iter())
+        .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
+        .collect::<Vec<_>>();
+    assert_eq!(findings.len(), 1, "{report:#?}");
+    assert_eq!(
+        findings[0].range,
+        lsp_range(fixture.path(), fixtures::ROOT_AND_MODULE_FINDINGS[1].site)
+    );
+    assert!(!report.contains_key(&fixture.path().join("module/main.crn")));
+}
+
+#[test]
+fn ordinary_root_errors_still_collect_the_same_expanded_secrecy_findings() {
+    let fixture = fixtures::root_and_module_with_backend_error_fixture();
+    let engine = engine();
+    let root_path = fixture.path().join("main.crn");
+    let root = Document::new_with_path(
+        std::fs::read_to_string(&root_path).unwrap(),
+        root_path.clone(),
+        Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+    );
+    let report = engine.analyze_document_set(&root, Some(&root_path), &[]);
+    let findings = report
+        .values()
+        .flat_map(|diagnostics| diagnostics.iter())
+        .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
+        .collect::<Vec<_>>();
+    assert_eq!(findings.len(), 2, "{report:#?}");
+    // Ordinary backend diagnostics belong to backend.crn. Analyzing main.crn
+    // still has to collect both secrecy findings despite that sibling error.
+    let backend_path = fixture.path().join("backend.crn");
+    let backend = Document::new_with_path(
+        std::fs::read_to_string(&backend_path).unwrap(),
+        backend_path.clone(),
+        Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+    );
+    let backend_report = engine.analyze_document_set(&backend, Some(&backend_path), &[]);
+    let backend_errors = backend_report[&backend_path]
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+        .collect::<Vec<_>>();
+    assert_eq!(backend_errors.len(), 1, "{backend_report:#?}");
+    assert_eq!(
+        backend_errors[0].message, "Unknown attribute 'typo' for backend type 'local'",
+        "{backend_report:#?}"
+    );
+    assert_eq!(backend_errors[0].source.as_deref(), Some("carina"));
+    let typo_column = backend.text().find("typo").unwrap() as u32;
+    assert_eq!(
+        backend_errors[0].range,
+        Range::new(
+            Position::new(0, typo_column),
+            Position::new(0, typo_column + 4),
+        )
+    );
+    assert!(
+        report[&root_path]
             .iter()
             .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+            .all(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message)),
+        "a sibling backend error must not be attached to main.crn: {report:#?}"
+    );
+    for expected in fixtures::ROOT_AND_MODULE_FINDINGS {
+        assert!(
+            report[&fixture.path().join(expected.site.file)]
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.message.starts_with(expected.message)
+                        && diagnostic.range == lsp_range(fixture.path(), expected.site)
+                ),
+            "{report:#?}"
+        );
+    }
+}
+
+#[test]
+fn non_attribute_declaration_messages_match_cli() {
+    let (fixture, findings) = fixtures::declaration_kinds_fixture();
+    let diagnostics = analyze(&engine(), &fixture, "main.crn");
+    assert_findings(fixture.path(), &diagnostics, &findings);
+}
+
+#[tokio::test]
+async fn publication_routes_module_findings_without_duplicating_the_root() {
+    use tower_lsp::lsp_types::{PublishDiagnosticsParams, Url};
+    let fixture = fixtures::root_and_module_fixture();
+    let root_path = fixture.path().join("main.crn");
+    let module_path = fixture.path().join("module/main.crn");
+    let root_uri = Url::from_file_path(&root_path).unwrap();
+    let module_uri = Url::from_file_path(&module_path).unwrap();
+    let mut schemas = SchemaRegistry::new();
+    for schema in carina_provider_mock::builtin_schemas() {
+        schemas.insert("mock", schema);
+    }
+    let mut client = support::TestClient::with_schemas(fixture.path(), schemas).await;
+    client
+        .open_document(
+            root_uri.as_str(),
+            &std::fs::read_to_string(&root_path).unwrap(),
+        )
+        .await;
+    let mut publications = HashMap::new();
+    let mut published_uris = Vec::new();
+    for _ in 0..2 {
+        let notification = client
+            ._read_notification(
+                "textDocument/publishDiagnostics",
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let params: PublishDiagnosticsParams =
+            serde_json::from_value(notification["params"].clone()).unwrap();
+        published_uris.push(params.uri.clone());
+        publications.insert(params.uri, params.diagnostics);
+    }
+    assert_eq!(published_uris, [root_uri.clone(), module_uri.clone()]);
+    for (uri, expected) in [
+        (root_uri.clone(), fixtures::ROOT_AND_MODULE_FINDINGS[1]),
+        (module_uri.clone(), fixtures::MODULE_FINDING),
+    ] {
+        let findings = publications[&uri]
+            .iter()
+            .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1, "{publications:#?}");
+        assert_eq!(findings[0].range, lsp_range(fixture.path(), expected.site));
+    }
+    // Opening the module must preserve the caller's instance diagnostic.
+    client
+        .open_document(
+            module_uri.as_str(),
+            &std::fs::read_to_string(&module_path).unwrap(),
+        )
+        .await;
+    let notification = client.wait_for_diagnostics(module_uri.as_str()).await;
+    let params: PublishDiagnosticsParams =
+        serde_json::from_value(notification["params"].clone()).unwrap();
+    assert_eq!(
+        params
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
             .count(),
         1,
-        "the public instance must remain valid: {diagnostics:#?}"
+        "{params:#?}"
     );
+    // Removing the last caller must clear the externally published finding.
+    client.close_document(root_uri.as_str()).await;
+    let notification = client.wait_for_diagnostics(module_uri.as_str()).await;
+    let params: PublishDiagnosticsParams =
+        serde_json::from_value(notification["params"].clone()).unwrap();
+    assert!(
+        params
+            .diagnostics
+            .iter()
+            .all(|diagnostic| !fixtures::is_secrecy_message(&diagnostic.message)),
+        "{params:#?}"
+    );
+    client.shutdown().await;
 }
 
 #[test]
@@ -199,13 +383,15 @@ fn module_instances_report_authored_operator_with_secret_call_context() {
 }
 
 #[test]
-fn unsaved_module_lines_supply_the_related_range() {
+fn open_module_buffer_supplies_utf16_ranges_without_overriding_semantic_inputs() {
     let fixture = fixtures::fixture("module_instances");
     let root_path = fixture.path().join("main.crn");
     let module_path = fixture.path().join("module/main.crn");
-    let disk = std::fs::read_to_string(&module_path).unwrap();
-    // Shift the authored operator and put a non-BMP character before it.
-    let edited = format!("// unsaved header\n\n{}", disk.replace("??", "/* 😀 */ ??"));
+    let disk = std::fs::read_to_string(&module_path)
+        .unwrap()
+        .replace("??", "/* x */ ??");
+    std::fs::write(&module_path, &disk).unwrap();
+    let edited = disk.replace("/* x */", "/* 😀 */");
     let document = |path: &Path, text: String| {
         Document::new_with_path(
             text,
@@ -215,34 +401,41 @@ fn unsaved_module_lines_supply_the_related_range() {
     };
     let root = document(&root_path, std::fs::read_to_string(&root_path).unwrap());
     let module = document(&module_path, edited.clone());
-    let diagnostics = engine().analyze_with_open_documents(&root, Some(&root_path), &[&module]);
-    let findings = diagnostics
-        .iter()
-        .filter(|diagnostic| fixtures::is_secrecy_message(&diagnostic.message))
-        .collect::<Vec<_>>();
-    assert_eq!(findings.len(), 1, "{diagnostics:#?}");
-    assert_eq!(
-        findings[0].range,
-        lsp_range(fixture.path(), fixtures::SECRET_CALL)
-    );
-    let operator = edited.find("??").unwrap();
-    let prefix = &edited[..operator];
+    let report = engine().analyze_document_set(&root, Some(&root_path), &[&module]);
+    assert_findings(fixture.path(), &report[&root_path], &[]);
+    let findings = &report[&module_path];
+    assert_eq!(findings.len(), 1, "{report:#?}");
+    let prefix = &edited[..edited.find("??").unwrap()];
     let start = Position::new(
         prefix.bytes().filter(|byte| *byte == b'\n').count() as u32,
         prefix.rsplit('\n').next().unwrap().encode_utf16().count() as u32,
     );
-    let related = findings[0].related_information.as_ref().unwrap();
-    assert_eq!(related.len(), 1);
     assert_eq!(
-        related[0].location.range,
+        findings[0].range,
         Range::new(start, Position::new(start.line, start.character + 2))
     );
-    assert_eq!(
-        CanonicalPath::new(related[0].location.uri.to_file_path().unwrap()).unwrap(),
-        CanonicalPath::new(&module_path).unwrap()
-    );
     assert_eq!(std::fs::read_to_string(&module_path).unwrap(), disk);
-    assert_no_payload(&diagnostics);
+    assert_no_payload(findings);
+}
+
+#[test]
+fn unrelated_open_buffers_do_not_override_directory_checks() {
+    let fixture = fixtures::fixture("homogeneous");
+    let root_path = fixture.path().join("main.crn");
+    let root = Document::new_with_path(
+        std::fs::read_to_string(&root_path).unwrap(),
+        root_path.clone(),
+        Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+    );
+    let sibling = Document::new_with_path(
+        "this is invalid syntax {".to_string(),
+        fixture.path().join("resources.crn"),
+        Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
+    );
+    let engine = engine();
+    let baseline = engine.analyze(&root, Some(&root_path));
+    let with_open = engine.analyze_with_open_documents(&root, Some(&root_path), &[&sibling]);
+    assert_eq!(with_open, baseline);
 }
 
 #[test]

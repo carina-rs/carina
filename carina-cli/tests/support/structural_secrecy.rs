@@ -10,6 +10,9 @@ pub const COALESCE_MESSAGE: &str = "Attribute 'comment': ?? alternatives mix sec
 pub const LOOKUP_MESSAGE: &str = "Attribute 'comment': lookup() alternatives mix secret and public values; all alternatives must be secret or all public.";
 pub const DEPTH_LIMIT_MESSAGE: &str = "Attribute 'comment': the value follows a chain of 128 or more reference or expression steps from this attribute; Carina cannot decide whether it is a secret.";
 pub const VISITS_LIMIT_MESSAGE: &str = "Attribute 'comment': deciding whether the value is a secret needs more than 4096 reference lookups from this attribute.";
+pub const LET_COALESCE_MESSAGE: &str = "Let binding 't': ?? alternatives mix secret and public values; all alternatives must be secret or all public.";
+pub const ARGUMENT_COALESCE_MESSAGE: &str = "Module argument 'value': ?? alternatives mix secret and public values; all alternatives must be secret or all public.";
+pub const EXPORT_COALESCE_MESSAGE: &str = "Export 'x': ?? alternatives mix secret and public values; all alternatives must be secret or all public.";
 
 /// One-based Unicode scalar coordinates, matching CLI source metadata.
 /// LSP converts these to zero-based UTF-16 only when rendering.
@@ -149,6 +152,71 @@ pub fn public_module_fixture() -> tempfile::TempDir {
     )
     .unwrap();
     fixture
+}
+
+pub const ROOT_AND_MODULE_FINDINGS: &[Finding] = &[MODULE_FINDING, Finding::coalesce(13, 27)];
+
+pub fn root_and_module_fixture() -> tempfile::TempDir {
+    let fixture = fixture("module_instances");
+    let path = fixture.path().join("main.crn");
+    let mut root = std::fs::read_to_string(&path).unwrap();
+    root.push_str("let other = mock.test.resource { name = 'other' comment = secret('canary') }\nlet sink = mock.test.resource {\n  name = 'sink'\n  comment = other.comment ?? \"default\"\n}\n");
+    std::fs::write(path, root).unwrap();
+    fixture
+}
+
+pub fn unexpandable_root_and_module_fixture() -> tempfile::TempDir {
+    let fixture = root_and_module_fixture();
+    std::fs::write(
+        fixture.path().join("module/arguments.crn"),
+        "arguments { name: String value: String required: String }\n",
+    )
+    .unwrap();
+    fixture
+}
+
+pub fn root_and_module_with_backend_error_fixture() -> tempfile::TempDir {
+    let fixture = root_and_module_fixture();
+    std::fs::write(
+        fixture.path().join("backend.crn"),
+        "backend local { path = 'carina.state.json' typo = true }\n",
+    )
+    .unwrap();
+    fixture
+}
+
+pub fn declaration_kinds_fixture() -> (tempfile::TempDir, Vec<Finding>) {
+    let fixture = fixture("module_instances");
+    let source = "let t = 'public' ?? secret('canary')\nexports { x: String = 'public' ?? secret('canary') }\nlet template = use { source = './module' }\nlet instance = template {\n  name = 'instance'\n  value = 'public' ?? secret('canary')\n}\n";
+    std::fs::write(fixture.path().join("main.crn"), source).unwrap();
+    std::fs::write(
+        fixture.path().join("module/main.crn"),
+        "mock.test.resource { name = name comment = value }\n",
+    )
+    .unwrap();
+    let findings = [
+        (1, LET_COALESCE_MESSAGE),
+        (2, EXPORT_COALESCE_MESSAGE),
+        (6, ARGUMENT_COALESCE_MESSAGE),
+    ]
+    .into_iter()
+    .map(|(line, message)| Finding {
+        site: Site::token(
+            "main.crn",
+            line,
+            source
+                .lines()
+                .nth((line - 1) as usize)
+                .unwrap()
+                .find("??")
+                .unwrap() as u32
+                + 1,
+            2,
+        ),
+        message,
+    })
+    .collect();
+    (fixture, findings)
 }
 
 pub fn module_if_fixture() -> tempfile::TempDir {
@@ -324,6 +392,10 @@ pub fn is_secrecy_message(message: &str) -> bool {
         LOOKUP_MESSAGE,
         DEPTH_LIMIT_MESSAGE,
         VISITS_LIMIT_MESSAGE,
+        LET_COALESCE_MESSAGE,
+        ARGUMENT_COALESCE_MESSAGE,
+        EXPORT_COALESCE_MESSAGE,
     ]
-    .contains(&message)
+    .iter()
+    .any(|expected| message.starts_with(expected))
 }

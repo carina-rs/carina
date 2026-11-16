@@ -1475,6 +1475,12 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
         .rev()
         .find(|record| record.kind() == kind && record.name() == name)
     {
+        // Retaining a let's RHS for structural secrecy must not move ordinary
+        // evaluation errors off the binding name. In the LSP that would also
+        // make this backstop suppress the authored call's type diagnostic.
+        Some(record) if kind == crate::config_loader::DeclarationKind::Binding => {
+            error.at(record.location())
+        }
         Some(record) => error.at(record.value_location().unwrap_or(record.location())),
         None => error,
     };

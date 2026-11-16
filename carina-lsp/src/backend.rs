@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -291,6 +291,7 @@ pub struct Backend {
     client: Client,
     documents: Arc<DashMap<Url, Document>>,
     providers: Arc<tokio::sync::RwLock<ProviderStates>>,
+    published_documents: Arc<tokio::sync::Mutex<BTreeSet<Url>>>,
     provider_context: Arc<ProviderContext>,
     workspace_root: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
     factory_builder: Option<FactoryBuilder>,
@@ -323,6 +324,7 @@ impl Backend {
         Self {
             client,
             documents: Arc::new(DashMap::new()),
+            published_documents: Arc::default(),
             providers: Arc::new(tokio::sync::RwLock::new(ProviderStates::new(
                 provider_context.environment.clone(),
             ))),
@@ -339,8 +341,14 @@ impl Backend {
         self.workspace_root.get().and_then(|opt| opt.as_ref())
     }
 
-    async fn update_diagnostics(&self, uri: Url) {
-        publish_diagnostics_for(&self.client, &self.documents, &self.providers, uri).await;
+    async fn update_diagnostics(&self, _uri: Url) {
+        publish_diagnostics_for(
+            &self.client,
+            &self.documents,
+            &self.providers,
+            &self.published_documents,
+        )
+        .await;
     }
 
     /// Spawn a background task that polls the on-disk install state for
@@ -359,6 +367,7 @@ impl Backend {
         }
         let providers = Arc::clone(&self.providers);
         let documents = Arc::clone(&self.documents);
+        let published_documents = Arc::clone(&self.published_documents);
         let workspace_root = Arc::clone(&self.workspace_root);
         let factory_builder = self.factory_builder.as_ref().map(Arc::clone);
         let install_prober = self.install_prober.as_ref().map(Arc::clone);
@@ -382,6 +391,7 @@ impl Backend {
                         install_prober.as_ref(),
                         providers.as_ref(),
                         documents.as_ref(),
+                        published_documents.as_ref(),
                     )
                     .await;
                 }
@@ -398,6 +408,7 @@ impl Backend {
             self.install_prober.as_ref(),
             self.providers.as_ref(),
             self.documents.as_ref(),
+            self.published_documents.as_ref(),
         )
         .await;
     }
@@ -559,6 +570,7 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents.remove(&params.text_document.uri);
+        self.update_diagnostics(params.text_document.uri).await;
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
@@ -722,33 +734,65 @@ impl LanguageServer for Backend {
     }
 }
 
-/// Publish diagnostics for a single document. Free function so both the
+/// Publish diagnostics for the open documents and their module sources. Both the
 /// `Backend` methods and the provider-drift poller can call it without going
 /// through `&self`.
 async fn publish_diagnostics_for(
     client: &Client,
     documents: &DashMap<Url, Document>,
     providers: &tokio::sync::RwLock<ProviderStates>,
-    uri: Url,
+    published_documents: &tokio::sync::Mutex<BTreeSet<Url>>,
 ) {
-    let open_sources = documents
+    // Serialize snapshots and publication so an older run cannot restore a
+    // cleared module finding. Merge all open roots before publishing a module;
+    // analyzing the module itself must not erase its instance diagnostics.
+    let mut published = published_documents.lock().await;
+    // Root order also determines the order of findings merged into one URI.
+    let open_uris = documents
         .iter()
+        .map(|entry| entry.key().clone())
+        .collect::<BTreeSet<_>>();
+    let open_sources = open_uris
+        .iter()
+        .filter_map(|uri| documents.get(uri))
         .map(|entry| (entry.source_file().to_path_buf(), entry.text()))
         .collect::<Vec<_>>();
-    let Some(doc) = documents.get(&uri) else {
-        return;
-    };
-    let current_file_path = uri.to_file_path().ok();
     let guard = providers.read().await;
-    let diagnostics = analyze_document_with_open_sources(
-        &guard,
-        &doc,
-        current_file_path.as_deref(),
-        &open_sources,
-    );
+    let mut report: BTreeMap<Url, Vec<Diagnostic>> = BTreeMap::new();
+    for uri in open_uris {
+        let Some(entry) = documents.get(&uri) else {
+            continue;
+        };
+        let path = uri.to_file_path().ok();
+        let state = path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|path| guard.state_for_path(path))
+            .unwrap_or(&guard.empty);
+        for (file, diagnostics) in state
+            .diagnostic_engine
+            .analyze_document_set_with_open_sources(&entry, path.as_deref(), &open_sources)
+        {
+            let Ok(uri) = Url::from_file_path(file) else {
+                continue;
+            };
+            let combined = report.entry(uri).or_default();
+            for diagnostic in diagnostics {
+                if !combined.contains(&diagnostic) {
+                    combined.push(diagnostic);
+                }
+            }
+        }
+    }
     drop(guard);
-
-    client.publish_diagnostics(uri, diagnostics, None).await;
+    let current = report.keys().cloned().collect::<BTreeSet<_>>();
+    for stale in published.difference(&current) {
+        report.entry(stale.clone()).or_default();
+    }
+    for (uri, diagnostics) in report {
+        client.publish_diagnostics(uri, diagnostics, None).await;
+    }
+    *published = current;
 }
 
 /// Workspace-wide schema load/reload. Free function so the drift poller can
@@ -760,6 +804,7 @@ async fn load_schemas_impl(
     install_prober: Option<&ProviderInstallProber>,
     providers: &tokio::sync::RwLock<ProviderStates>,
     documents: &DashMap<Url, Document>,
+    published_documents: &tokio::sync::Mutex<BTreeSet<Url>>,
 ) {
     let Some(Some(root)) = workspace_root.get() else {
         return;
@@ -798,10 +843,7 @@ async fn load_schemas_impl(
             .await;
     }
     if result.reloaded || result.import_map_changed {
-        let uris: Vec<Url> = documents.iter().map(|r| r.key().clone()).collect();
-        for uri in uris {
-            publish_diagnostics_for(client, documents, providers, uri).await;
-        }
+        publish_diagnostics_for(client, documents, providers, published_documents).await;
     }
 }
 

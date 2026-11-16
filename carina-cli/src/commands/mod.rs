@@ -648,6 +648,7 @@ pub(crate) fn validate_and_resolve_report_inner(
 ) -> ConfigurationValidation<ResolvedConfig> {
     let mut warnings = Vec::new();
     let mut directive_errors = Vec::new();
+    let mut secrecy_errors = Vec::new();
     let mut authored_inputs = carina_core::input_rules::AuthoredInputs::for_directory_in_session(
         &parsed,
         enriched_context,
@@ -667,10 +668,12 @@ pub(crate) fn validate_and_resolve_report_inner(
         &mut warnings,
         &mut validation,
         &mut directive_errors,
+        &mut secrecy_errors,
     );
     // Directive findings are independent of value/type validation. Merge them only
     // after that pass so they cannot trigger an early return hiding findings.
     validation.extend(directive_errors);
+    validation.extend(secrecy_errors);
     let errors = validation
         .complete()
         .into_presented()
@@ -722,6 +725,7 @@ fn validate_and_resolve_configuration(
     warnings: &mut Vec<ConfigurationWarning>,
     validation: &mut carina_core::validation::ConversionValidation<AppError>,
     directive_errors: &mut Vec<AppError>,
+    secrecy_errors: &mut Vec<AppError>,
 ) -> Result<ResolvedConfig, ValidationStopped> {
     let initial_warning_count = parsed.warnings.len();
     let resolved_base = base_dir.clone();
@@ -852,7 +856,7 @@ fn validate_and_resolve_configuration(
         enriched_context.catalog(),
     );
     let expression_report = configuration.judged().report();
-    extend_secrecy_errors(errors, configuration.judged().secrecy());
+    extend_secrecy_errors(secrecy_errors, configuration.judged().secrecy());
     errors.extend(
         expression_report
             .findings()
@@ -999,6 +1003,26 @@ fn validate_and_resolve_configuration(
                 Err(error) => errors.push(AppError::AnalysisInvariant(error)),
             }
         }
+        // Other validation failures do not necessarily prevent expansion.
+        // Match the LSP's expanded secrecy report whenever it is available.
+        if let module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } =
+            module_resolver::resolve_modules_with_diagnostics(
+                &parsed,
+                base_dir,
+                enriched_context,
+                ctx.schemas(),
+                &authored_module_call_findings,
+            )
+            .into_validation(errors)
+        {
+            let configuration = carina_core::config_loader::load_buffer_configuration(
+                &graph,
+                ctx.schemas(),
+                enriched_context.catalog(),
+            );
+            secrecy_errors.clear();
+            extend_secrecy_errors(secrecy_errors, configuration.judged().secrecy());
+        }
         extend_module_call_errors(errors, authored_module_call_findings);
         return Err(ValidationStopped::existing(errors));
     }
@@ -1012,7 +1036,19 @@ fn validate_and_resolve_configuration(
     );
     let mut parsed = match module_resolution.into_validation(errors) {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+            let configuration = carina_core::config_loader::load_buffer_configuration(
+                &graph,
+                ctx.schemas(),
+                enriched_context.catalog(),
+            );
+            secrecy_errors.clear();
+            extend_secrecy_errors(secrecy_errors, configuration.judged().secrecy());
             errors.include_file(&graph);
+            if !secrecy_errors.is_empty() {
+                extend_module_call_errors(errors, authored_module_call_findings);
+                errors.extend(secrecy_errors.drain(..));
+                return Err(ValidationStopped::existing(errors));
+            }
             *authored_inputs = graph
                 .authored_inputs()
                 .map_err(|error| {
@@ -1130,7 +1166,6 @@ fn validate_and_resolve_configuration(
         ctx.schemas(),
         enriched_context.catalog(),
     );
-    extend_secrecy_errors(errors, configuration.judged().secrecy());
     let binding_use_report = carina_core::validation::check_expanded_bare_binding_uses(
         &enriched_context.type_context(configuration.judged(), &imported_module_signatures),
     );
