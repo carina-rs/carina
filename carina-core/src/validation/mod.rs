@@ -5337,8 +5337,7 @@ pub struct ResourceAdmissionFinding {
 enum ResourceAdmissionDetail {
     Schema {
         resource: crate::resource::ResourceId,
-        attribute: Option<String>,
-        error: TypeError,
+        diagnostic: crate::schema::SchemaDiagnostic,
         mismatch: Option<Box<ReferenceMismatch>>,
     },
     Arithmetic(Box<crate::parser::Located<IntegerArithmeticTypeFinding>>),
@@ -5363,8 +5362,9 @@ impl ResourceAdmissionFinding {
     fn prefix(error: &crate::identifier::AttributePrefixError) -> Self {
         let mut finding = Self::schema(
             error.resource_id(),
-            None,
-            &TypeError::AttributePrefix(Box::new(error.clone())),
+            &crate::schema::SchemaDiagnostic::unlocated(TypeError::AttributePrefix(Box::new(
+                error.clone(),
+            ))),
         );
         finding.human = error.to_string();
         finding.location = error.location().cloned();
@@ -5386,15 +5386,13 @@ impl ResourceAdmissionFinding {
     }
     fn schema(
         resource: &crate::resource::ResourceId,
-        attribute: Option<&str>,
-        error: &TypeError,
+        diagnostic: &crate::schema::SchemaDiagnostic,
     ) -> Self {
         Self {
-            human: format!("{resource}: {error}"),
+            human: format!("{resource}: {}", diagnostic.error()),
             detail: ResourceAdmissionDetail::Schema {
                 resource: resource.clone(),
-                attribute: attribute.map(str::to_owned),
-                error: error.clone(),
+                diagnostic: diagnostic.clone(),
                 mismatch: None,
             },
             location: None,
@@ -5402,7 +5400,7 @@ impl ResourceAdmissionFinding {
     }
     pub fn type_error(&self) -> Option<&TypeError> {
         match &self.detail {
-            ResourceAdmissionDetail::Schema { error, .. } => Some(error),
+            ResourceAdmissionDetail::Schema { diagnostic, .. } => Some(diagnostic.error()),
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
@@ -5439,16 +5437,15 @@ impl ResourceAdmissionFinding {
                 mismatch: Some(mismatch),
                 ..
             } => mismatch.message(),
-            ResourceAdmissionDetail::Schema {
-                error: TypeError::Reference { error, .. },
-                ..
-            } => match error.as_ref() {
-                SecretDiagnosticError::Public(admission::AdmissionReferenceError::Arithmetic(
-                    finding,
-                )) => finding.detail().to_string(),
-                _ => error.to_string(),
+            ResourceAdmissionDetail::Schema { diagnostic, .. } => match diagnostic.error() {
+                TypeError::Reference { error, .. } => match error.as_ref() {
+                    SecretDiagnosticError::Public(
+                        admission::AdmissionReferenceError::Arithmetic(finding),
+                    ) => finding.detail().to_string(),
+                    _ => error.to_string(),
+                },
+                error => error.to_string(),
             },
-            ResourceAdmissionDetail::Schema { error, .. } => error.to_string(),
             ResourceAdmissionDetail::Arithmetic(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::Iterable(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::UnavailableSchema(error) => error.to_string(),
@@ -5610,17 +5607,19 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                 checked = outcome.values;
                 &checked
             };
-            for (error, path, symbolic) in values.diagnostic_errors() {
-                if path.is_some_and(|(name, _)| values.is_retained_failure(name)) {
+            for (diagnostic, symbolic) in values.diagnostic_errors() {
+                if !matches!(diagnostic.error(), TypeError::UnknownAttribute { .. })
+                    && diagnostic
+                        .path()
+                        .is_some_and(|(name, _)| values.is_retained_failure(name))
+                {
                     continue;
                 }
                 let rendered_symbolically = context.admissions.is_some() && symbolic.owns_path();
                 if !rendered_symbolically {
-                    context.all_errors.push(ResourceAdmissionFinding::schema(
-                        id,
-                        path.map(|(name, _)| name),
-                        error,
-                    ));
+                    context
+                        .all_errors
+                        .push(ResourceAdmissionFinding::schema(id, diagnostic));
                 }
             }
             context.all_errors.extend(
@@ -6033,18 +6032,28 @@ fn complete_resource_admission_report<
     for finding in &mut findings {
         if let ResourceAdmissionDetail::Schema {
             resource: id,
-            attribute,
+            diagnostic,
             ..
         } = &finding.detail
-            && let Some(resource) = resources.get(id)
         {
-            finding.location = Some(
-                attribute
-                    .as_deref()
-                    .map(|name| resource.attribute_key_location(name))
-                    .unwrap_or_else(|| resource.type_location())
-                    .clone(),
-            );
+            if let Some(resource) = resources.get(id) {
+                finding.location = Some(match diagnostic {
+                    crate::schema::SchemaDiagnostic::UnknownKey(key) => {
+                        resource.locate_unknown_key(key)?.into_parts().0
+                    }
+                    crate::schema::SchemaDiagnostic::Other(_) => diagnostic
+                        .path()
+                        .map(|(name, _)| resource.attribute_key_location(name))
+                        .unwrap_or_else(|| resource.type_location())
+                        .clone(),
+                });
+            } else if matches!(diagnostic, crate::schema::SchemaDiagnostic::UnknownKey(_)) {
+                return Err(crate::parser::AnalysisTreeError::new(
+                    crate::parser::AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                        element: format!("unknown-key resource {id}"),
+                    },
+                ));
+            }
         }
     }
     findings.extend(report.findings.0);
@@ -6249,8 +6258,11 @@ fn resource_admission_report<
                         for finding in &mut all_errors.0[start..] {
                             finding.detail = ResourceAdmissionDetail::Schema {
                                 resource: resource.id().clone(),
-                                attribute: Some(attribute.to_string()),
-                                error: error.clone(),
+                                diagnostic: crate::schema::SchemaDiagnostic::from_value(
+                                    attribute,
+                                    path.clone(),
+                                    error.clone(),
+                                ),
                                 mismatch: match error {
                                     TypeError::TypeMismatch { types } => {
                                         Some(Box::new(ReferenceMismatch::for_attribute(

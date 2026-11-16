@@ -474,7 +474,11 @@ fn plan_admission_validates_supplied_proofs_absent_from_the_resource() {
         assert_eq!(
             report
                 .diagnostic_errors()
-                .map(|(_, path, _)| path.unwrap().0)
+                .map(|(diagnostic, _)| match diagnostic {
+                    carina_core::schema::SchemaDiagnostic::Other(finding) =>
+                        finding.path().unwrap().0,
+                    diagnostic => panic!("unexpected diagnostic: {diagnostic:?}"),
+                })
                 .collect::<Vec<_>>(),
             ["extra"]
         );
@@ -519,7 +523,11 @@ fn plan_admission_keeps_supplied_proof_order() {
         assert_eq!(
             report
                 .diagnostic_errors()
-                .map(|(error, path, _)| path.unwrap_or_else(|| panic!("missing path: {error:?}")).0)
+                .map(|(diagnostic, _)| match diagnostic {
+                    carina_core::schema::SchemaDiagnostic::Other(finding) =>
+                        finding.path().unwrap().0,
+                    diagnostic => panic!("unexpected diagnostic: {diagnostic:?}"),
+                })
                 .collect::<Vec<_>>(),
             UNKNOWN.into_iter().rev().collect::<Vec<_>>()
         );

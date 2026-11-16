@@ -4,8 +4,8 @@ use super::{DiagnosticEngine, render_merged, render_schema_diagnostic};
 use crate::document::DiagnosticDocument as Document;
 use carina_core::parser::{AnalysisResourceRef, Located};
 use carina_core::schema::{
-    FieldPath, FieldPathStep, LeafPath, LeafPathSegment, MismatchTypeNames, TypeError,
-    ValidatedResourceSchema,
+    FieldPath, FieldPathStep, LeafPath, LeafPathSegment, MismatchTypeNames, SchemaDiagnostic,
+    TypeError, ValidatedResourceSchema,
 };
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
@@ -80,7 +80,7 @@ impl DiagnosticEngine {
             B,
         >,
         attr_name: &str,
-        findings: Vec<(FieldPath, TypeError)>,
+        findings: Vec<(FieldPath, SchemaDiagnostic)>,
     ) -> (Vec<Diagnostic>, bool)
     where
         D: carina_core::parser::DeferredForPhaseTraversal<
@@ -91,7 +91,8 @@ impl DiagnosticEngine {
     {
         let mut diagnostics = Vec::new();
         let mut reported_duplicate = false;
-        for (path, error) in findings {
+        for (path, diagnostic) in findings {
+            let error = diagnostic.error().clone();
             let is_duplicate = super::is_duplicate_list_error(&error);
             let is_item_error = path
                 .steps()
@@ -121,12 +122,23 @@ impl DiagnosticEngine {
             let use_value_location = path.is_empty()
                 && (is_duplicate
                     || crate::code_action::enum_diagnostic_data_for_error(&error).is_some());
-            let location = if is_duplicate || use_value_location {
-                resource.attribute_value_location(attr_name, &path)
-            } else {
-                resource.attribute_path_location(attr_name, &path)
+            let finding = match diagnostic {
+                SchemaDiagnostic::UnknownKey(key) => match resource.locate_unknown_key(&key) {
+                    Ok(finding) => finding,
+                    Err(error) => {
+                        diagnostics.extend(super::render_analysis_invariant(doc, &error));
+                        continue;
+                    }
+                },
+                SchemaDiagnostic::Other(_) => {
+                    let location = if is_duplicate || use_value_location {
+                        resource.attribute_value_location(attr_name, &path)
+                    } else {
+                        resource.attribute_path_location(attr_name, &path)
+                    };
+                    Located::new(location.clone(), error)
+                }
             };
-            let finding = Located::new(location.clone(), error);
             let diagnostic = if use_value_location {
                 render_schema_diagnostic(
                     doc,

@@ -256,11 +256,13 @@ use crate::value::{
 
 pub(crate) mod assignability;
 mod assignability_edges;
+mod diagnostic;
 mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 pub(crate) mod value_validation;
+pub use diagnostic::{KeyedSchemaFinding, OtherSchemaFinding, SchemaDiagnostic};
 pub use value_validation::{
     LocallyValidatedCustomType, ResourceValueValidation, ValidatedCustomTypeLookup, ValueStructure,
     ValueValidationFindings,
@@ -16504,7 +16506,9 @@ impl PatternResourceSchema<Compiled> {
             if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
                 report
                     .errors
-                    .push(TypeError::MissingRequired { name: name.clone() });
+                    .push(SchemaDiagnostic::unlocated(TypeError::MissingRequired {
+                        name: name.clone(),
+                    }));
             }
         }
 
@@ -16524,10 +16528,12 @@ impl PatternResourceSchema<Compiled> {
                 .filter(|name| attributes.contains_key(name.as_str()))
                 .count();
             if !group.is_satisfied_by_count(present) {
-                report.errors.push(TypeError::FieldGroupViolation {
-                    path: FieldPath::new(),
-                    group: group.clone(),
-                });
+                report.errors.push(SchemaDiagnostic::unlocated(
+                    TypeError::FieldGroupViolation {
+                        path: FieldPath::new(),
+                        group: group.clone(),
+                    },
+                ));
             }
         }
 
@@ -16544,9 +16550,13 @@ impl PatternResourceSchema<Compiled> {
                     })
                     .collect(),
             )
-            && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
+            && let Err(validation_errors) = run_resource_validator(validator, &attributes)
         {
-            report.errors.append(&mut validation_errors);
+            report.errors.extend(
+                validation_errors
+                    .into_iter()
+                    .map(SchemaDiagnostic::unlocated),
+            );
         }
 
         report
@@ -16592,7 +16602,7 @@ impl PatternResourceSchema<Compiled> {
         );
         if selected.is_none_or(|names| !names.is_empty())
             && let Some(validator) = self.validator()
-            && let Err(mut errors) = run_resource_validator(
+            && let Err(errors) = run_resource_validator(
                 validator,
                 &attributes
                     .iter()
@@ -16605,7 +16615,9 @@ impl PatternResourceSchema<Compiled> {
                     .collect(),
             )
         {
-            report.errors.append(&mut errors);
+            report
+                .errors
+                .extend(errors.into_iter().map(SchemaDiagnostic::unlocated));
         }
         report
     }
@@ -16658,7 +16670,9 @@ impl PatternResourceSchema<Compiled> {
                 if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
                     report
                         .errors
-                        .push(TypeError::ReadOnlyAttribute { name: name.clone() });
+                        .push(SchemaDiagnostic::unlocated(TypeError::ReadOnlyAttribute {
+                            name: name.clone(),
+                        }));
                     continue;
                 }
 
@@ -16670,7 +16684,8 @@ impl PatternResourceSchema<Compiled> {
                     },
                     value,
                 );
-                for (index, error) in findings.local_errors().enumerate() {
+                for (index, primary) in findings.primary_findings().enumerate() {
+                    let error = &primary.error;
                     let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
                         && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
@@ -16679,27 +16694,33 @@ impl PatternResourceSchema<Compiled> {
                     } else {
                         tagged
                     };
-                    if let Some((path, _)) = findings.located.get(index) {
-                        report
-                            .error_paths
-                            .insert(report.errors.len(), (name.clone(), path.clone()));
-                    }
-                    report.errors.push(reshaped);
+                    let diagnostic = if diagnostic::is_unknown_key(error) {
+                        primary.diagnostic(name, reshaped)
+                    } else if let Some((path, _)) = findings.located.get(index) {
+                        // Preserve ordinary symbolic coverage's established path policy.
+                        SchemaDiagnostic::from_value(name, path.clone(), reshaped)
+                    } else {
+                        SchemaDiagnostic::unlocated(reshaped)
+                    };
+                    report.errors.push(diagnostic);
                 }
                 for (path, error) in &findings.provider {
-                    report
-                        .error_paths
-                        .insert(report.errors.len(), (name.clone(), path.canonical()));
-                    report.errors.push(error.clone().with_attribute(name));
+                    report.errors.push(SchemaDiagnostic::from_value(
+                        name,
+                        path.canonical(),
+                        error.clone().with_attribute(name),
+                    ));
                 }
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
                 if let Some(admit) = admission.unknown {
                     report.attributes.insert(name.clone(), admit(name, value));
                 }
-                report
-                    .errors
-                    .push(TypeError::unknown_attribute(name, &known, &aliases));
+                report.errors.push(SchemaDiagnostic::from_value(
+                    name,
+                    LeafPath::from_segments([]),
+                    TypeError::unknown_attribute(name, &known, &aliases),
+                ));
             }
         }
 

@@ -33,6 +33,128 @@ type RuntimeInterpolationPart =
 type RuntimeInferredExportParam =
     crate::parser::InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>;
 
+fn unknown_key_locations(body: &str) -> Vec<String> {
+    let catalog = LoadedProviderContext::empty_for_test();
+    let config = catalog.as_provider_context();
+    let entry = || {
+        PatternAttributeType::struct_(
+            "Entry",
+            vec![
+                PatternStructField::optional("enabled", PatternAttributeType::bool()).build(),
+                PatternStructField::optional(
+                    "children",
+                    PatternAttributeType::list(PatternAttributeType::struct_("Child", vec![])),
+                )
+                .with_block_name("child")
+                .build(),
+            ],
+        )
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Thing")
+            .attribute(PatternAttributeSchema::optional("config", entry()).build())
+            .attribute(
+                PatternAttributeSchema::optional("items", PatternAttributeType::list(entry()))
+                    .with_block_name("item")
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("mapping", PatternAttributeType::map(entry()))
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "variant",
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::struct_(
+                            "Enabled",
+                            vec![
+                                PatternStructField::required(
+                                    "enabled",
+                                    PatternAttributeType::bool(),
+                                )
+                                .build(),
+                            ],
+                        ),
+                        PatternAttributeType::struct_(
+                            "Other",
+                            vec![
+                                PatternStructField::required("other", PatternAttributeType::bool())
+                                    .build(),
+                            ],
+                        ),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let source = format!("provider mock {{}}\n{body}\n");
+    let mut parsed =
+        crate::parser::parse_file(&source, std::path::Path::new("sibling.crn"), config).unwrap();
+    crate::schema::resolve_file_block_names_with_schemas(&mut parsed, &schemas).unwrap();
+    let bindings = BindingIndex::from_parsed(&parsed, &schemas, config);
+    let loaded = crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, config);
+    let findings = resource_admission_findings(
+        loaded.judged(),
+        &bindings,
+        &HashSet::from(["mock".into()]),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    findings
+        .iter()
+        .map(|finding| {
+            let location = finding.location().expect("authored diagnostic");
+            assert_eq!(location.file().path(), std::path::Path::new("sibling.crn"));
+            source[location.span().start_byte()..location.span().end_byte()].to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn unknown_attribute_report_uses_authored_key() {
+    let actual = [
+        "mock.test.Thing { typo = true }",
+        "mock.test.Thing { typo = [\n  'value'\n] }",
+    ]
+    .map(unknown_key_locations);
+    assert_eq!(actual, [vec!["typo = true"], vec!["typo"]]);
+}
+
+#[test]
+fn nested_unknown_key_location_survives_containers_and_aliases() {
+    let actual = [
+        "mock.test.Thing { config = { typo = true } }",
+        "mock.test.Thing { items = [{ enabled = true }, { typo = true }] }",
+        "mock.test.Thing { mapping = { 'a.b' = { typo = true } } }",
+        "mock.test.Thing { item { enabled = true } item { typo = true } }",
+        "mock.test.Thing { item { child {} child { typo = true } } }",
+    ]
+    .map(unknown_key_locations);
+    assert_eq!(
+        actual,
+        [
+            vec!["typo"],
+            vec!["typo"],
+            vec!["typo"],
+            vec!["typo"],
+            vec!["typo"]
+        ]
+    );
+}
+
+#[test]
+fn unknown_key_keeps_its_selected_union_arm_location() {
+    assert_eq!(
+        unknown_key_locations("mock.test.Thing { variant = { enabled = true typo = true } }"),
+        ["typo"],
+    );
+}
+
 #[test]
 fn round9_admission_locations_use_linear_resource_work() {
     fn run(count: usize) -> usize {

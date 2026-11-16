@@ -834,7 +834,7 @@ impl DiagnosticRun<'_> {
         // core's diagnostic ownership before taking those entries.
         let resource_diagnostic_errors = value_validation
             .diagnostic_errors()
-            .map(|(error, _, coverage)| (error.clone(), coverage))
+            .map(|(diagnostic, coverage)| (diagnostic.clone(), coverage))
             .collect::<Vec<_>>();
         let mut reported_attribute_diagnostics = HashSet::new();
         let retained_failures = resource_attributes
@@ -1144,11 +1144,15 @@ impl DiagnosticRun<'_> {
                     );
                 if container_findings {
                     let findings = attr_findings
-                        .into_local_findings()
+                        .into_diagnostic_findings(attr_name)
                         .into_iter()
-                        .filter(|(path, error)| {
+                        .filter(|(path, diagnostic)| {
                             (!path.is_empty() || !authored_has_function_call)
-                                && !validation::covered_by_symbolic_findings(path, error, &symbolic)
+                                && !validation::covered_by_symbolic_findings(
+                                    path,
+                                    diagnostic.error(),
+                                    &symbolic,
+                                )
                         })
                         .collect();
                     let (nested, reported_duplicate) =
@@ -1217,7 +1221,8 @@ impl DiagnosticRun<'_> {
 
         // Render the report produced by the single owner-bound walk.
         {
-            for (error, symbolic_coverage) in resource_diagnostic_errors {
+            for (diagnostic, symbolic_coverage) in resource_diagnostic_errors {
+                let error = diagnostic.error().clone();
                 if error
                     .attribute_name()
                     .is_some_and(|name| retained_failures.contains(name))
@@ -1312,25 +1317,26 @@ impl DiagnosticRun<'_> {
                 {
                     continue;
                 }
-                let location = error
-                    .attribute_name()
-                    .filter(|name| resource_attributes.contains_key(*name))
-                    .map_or(rref.type_location(), |name| {
-                        let assignment = rref.attribute_assignment_location(name);
-                        let span = assignment.span();
-                        if matches!(
-                            error,
-                            carina_core::schema::TypeError::UnknownAttribute { .. }
-                        ) && span.start_line() == span.end_line()
-                        {
-                            assignment
-                        } else {
-                            // Multiline containers retain the precise key instead
-                            // of widening beyond main's single-line anchor.
-                            rref.attribute_key_location(name)
+                let finding = match diagnostic {
+                    carina_core::schema::SchemaDiagnostic::UnknownKey(key) => {
+                        match rref.locate_unknown_key(&key) {
+                            Ok(finding) => finding,
+                            Err(error) => {
+                                diagnostics.extend(render_analysis_invariant(doc, &error));
+                                continue;
+                            }
                         }
-                    });
-                let finding = carina_core::parser::Located::new(location.clone(), error);
+                    }
+                    carina_core::schema::SchemaDiagnostic::Other(_) => {
+                        let location = error
+                            .attribute_name()
+                            .filter(|name| resource_attributes.contains_key(*name))
+                            .map_or(rref.type_location(), |name| {
+                                rref.attribute_key_location(name)
+                            });
+                        carina_core::parser::Located::new(location.clone(), error)
+                    }
+                };
                 diagnostics.extend(render_merged(
                     doc,
                     &finding,

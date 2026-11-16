@@ -1600,6 +1600,55 @@ where
         self.attribute_locations[name].location()
     }
 
+    /// Resolve an unknown input key using the shared parser-owned range policy.
+    /// Root single-line assignments retain #4220's width; nested findings use keys.
+    pub fn locate_unknown_key(
+        &self,
+        finding: &crate::schema::KeyedSchemaFinding,
+    ) -> Result<Located<crate::schema::TypeError>, AnalysisTreeError> {
+        let missing = || {
+            AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
+                declaration: self.location.clone(),
+                element: "unknown attribute key".into(),
+            })
+        };
+        let name = finding.key.root.as_str();
+        let root = self.attribute_locations.get(name).ok_or_else(missing)?;
+        let path = crate::schema::FieldPath::from_canonical_segments(
+            finding.key.relative.segments().iter().cloned(),
+        );
+        let location = if path.is_empty() {
+            let assignment = root.assignment_location();
+            if assignment.span().start_line() == assignment.span().end_line() {
+                assignment
+            } else {
+                root.location()
+            }
+        } else {
+            let mut node = self
+                .elements
+                .diagnostic_index()
+                .attribute(name)
+                .ok_or_else(missing)?;
+            for (depth, step) in path.steps().iter().enumerate() {
+                if let Some(parent) = node.value(self.elements)
+                    && !parent.literal_container
+                {
+                    // Computed values retain the existing nearest-authored-parent policy.
+                    let location = if depth == 0 {
+                        root.location()
+                    } else {
+                        &parent.anchor
+                    };
+                    return Ok(Located::new(location.clone(), finding.error().clone()));
+                }
+                node = node.child(step).ok_or_else(missing)?;
+            }
+            node.key(self.elements).ok_or_else(missing)?.location()
+        };
+        Ok(Located::new(location.clone(), finding.error().clone()))
+    }
+
     pub fn attribute_assignment_location(&self, name: &str) -> &'a DeclarationLocation {
         self.attribute_locations[name].assignment_location()
     }
@@ -3111,6 +3160,77 @@ pub(super) fn record_attribute_location_work(steps: usize) {
 #[cfg(test)]
 mod location_tests {
     use super::*;
+
+    #[test]
+    fn unknown_key_lookup_miss_is_an_analysis_invariant() {
+        use crate::schema::{LeafPath, LeafPathSegment, SchemaDiagnostic, TypeError};
+        let source = "mock.test.Thing { config = {} }";
+        let parsed = super::super::parse_file(
+            source,
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        for diagnostic in [
+            SchemaDiagnostic::unlocated(TypeError::UnknownAttribute {
+                name: "missing".into(),
+                suggestion: None,
+            }),
+            SchemaDiagnostic::from_value(
+                "config",
+                LeafPath::from_segments([LeafPathSegment::StructField("missing".into())]),
+                TypeError::UnknownStructField {
+                    struct_name: "Config".into(),
+                    field: "missing".into(),
+                    suggestion: None,
+                },
+            ),
+        ] {
+            let SchemaDiagnostic::UnknownKey(key) = diagnostic else {
+                panic!("keyed diagnostic")
+            };
+            let error = resource
+                .locate_unknown_key(&key)
+                .expect_err("missing authored key");
+            assert!(matches!(
+                error.kind(),
+                AnalysisTreeErrorKind::MissingElementProvenance { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn computed_unknown_key_keeps_the_nearest_authored_parent() {
+        use crate::schema::{LeafPath, LeafPathSegment, SchemaDiagnostic, TypeError};
+        let source = "let value = { typo = true }\nmock.test.Thing { config = value }";
+        let parsed = super::super::parse_file(
+            source,
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let diagnostic = SchemaDiagnostic::from_value(
+            "config",
+            LeafPath::from_segments([LeafPathSegment::StructField("typo".into())]),
+            TypeError::UnknownStructField {
+                struct_name: "Config".into(),
+                field: "typo".into(),
+                suggestion: None,
+            },
+        );
+        let SchemaDiagnostic::UnknownKey(key) = diagnostic else {
+            panic!("keyed diagnostic")
+        };
+        let finding = resource.locate_unknown_key(&key).unwrap();
+        assert_eq!(
+            finding.location(),
+            resource.attribute_key_location("config")
+        );
+    }
 
     #[test]
     fn aliased_collection_input_construction_updates_locations_in_one_pass() {

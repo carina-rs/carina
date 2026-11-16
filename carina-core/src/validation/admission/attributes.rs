@@ -1523,7 +1523,7 @@ mod review_tests {
             assert_eq!(
                 report
                     .diagnostic_errors()
-                    .map(|(_, path, _)| path.unwrap().0)
+                    .map(|(diagnostic, _)| diagnostic.path().unwrap().0)
                     .collect::<Vec<_>>(),
                 ["extra"]
             );
@@ -1584,8 +1584,10 @@ mod review_tests {
                 );
                 let errors = match result {
                     Err(ApplyAdmissionErrors::Constraints(report)) => report
-                        .errors_with_paths()
-                        .map(|(error, key)| format!("{}: {error}", key.unwrap().0))
+                        .diagnostic_errors()
+                        .map(|(diagnostic, _)| {
+                            format!("{}: {}", diagnostic.path().unwrap().0, diagnostic.error())
+                        })
                         .collect::<Vec<_>>(),
                     Err(ApplyAdmissionErrors::Admission(error)) => {
                         vec![error.resolution_error().to_string()]

@@ -3350,7 +3350,9 @@ fn round7_hook_error_without_attribute_has_one_diagnostic_owner() {
     assert_eq!(report.symbolic_errors().count(), 1);
     let errors = report.diagnostic_errors().collect::<Vec<_>>();
     assert_eq!(errors.len(), 1);
-    let (error, path, coverage) = errors[0];
+    let (diagnostic, coverage) = errors[0];
+    let error = diagnostic.error();
+    let path = diagnostic.path();
     assert!(
         error.attribute_name().is_none(),
         "owner cannot be inferred from error text"

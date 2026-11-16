@@ -1,0 +1,6 @@
+let decoy = '😀 typo multiline'
+let emoji = '😀' mock.test.resource { name = 'sibling' typo = true
+  multiline = [
+    'value'
+  ]
+}

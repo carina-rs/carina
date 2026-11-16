@@ -586,7 +586,7 @@ fn equal_ordinary_and_recovered_errors_keep_distinct_transformation_origins() {
         ordinary
             .findings
             .additional_local_errors
-            .push(error.clone());
+            .push(PrimaryValueFinding::new(path.clone(), error.clone()));
         ordinary
             .findings
             .authored
@@ -599,7 +599,7 @@ fn equal_ordinary_and_recovered_errors_keep_distinct_transformation_origins() {
             Some(TypeError::StructFieldError { .. })
         ));
         assert!(matches!(
-            wrapped.findings.additional_local_errors[0],
+            wrapped.findings.additional_local_errors[0].error,
             TypeError::StructFieldError { .. }
         ));
         let protected = ordinary.inside_secret().into_findings();
@@ -608,7 +608,7 @@ fn equal_ordinary_and_recovered_errors_keep_distinct_transformation_origins() {
             protected.local_error().unwrap(),
             &protected.local[0].1,
             &protected.located[0].1,
-            &protected.additional_local_errors[0],
+            &protected.additional_local_errors[0].error,
         ] {
             assert!(
                 matches!(error, TypeError::Reference { error, .. } if matches!(error.as_ref(), SecretDiagnosticError::InsideSecret))
