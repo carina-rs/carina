@@ -44,6 +44,32 @@ fn observe(path: &Path) -> ProjectionReport {
     compare_directory(&ResolvedPath::new(path).unwrap(), &context, &schemas)
 }
 fn check(report: &ProjectionReport, label: &str) {
+    assert_eq!(
+        report.strict_succeeded, report.plain_strict_succeeded,
+        "{label}: strict success differs from the independent plain run"
+    );
+    assert_eq!(
+        report.diagnostics_succeeded, report.plain_diagnostics_succeeded,
+        "{label}: diagnostics success differs from the independent plain run"
+    );
+    let actual_publications = report.publications();
+    assert_eq!(
+        actual_publications.len(),
+        report.plain_publications.len(),
+        "{label}: published-root count differs"
+    );
+    assert_eq!(
+        actual_publications, report.plain_publications,
+        "{label}: published-root identities/order differ"
+    );
+    for invocation in &report.invocations {
+        assert!(
+            invocation.same_inputs && invocation.same_roots && invocation.same_error,
+            "{label}: invocation {} inputs, roots or error differ",
+            invocation.ordinal
+        );
+    }
+
     assert!(
         report.strict_error_matches,
         "{label}: strict directory error differs"
@@ -212,37 +238,69 @@ fn all_fixture_directories_project_identically() {
 }
 
 #[test]
-fn infra_enriched_work_counts() {
-    // CI must exercise real fixtures even when the optional external checkout is absent.
-    let manifest = manifest();
-    let mut sizes = manifest["directories"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|item| !item["nested"].as_bool().unwrap())
-        .map(|item| {
-            let relative = item["directory"].as_str().unwrap();
-            let path = repo().join(relative);
-            let size = std::fs::read_dir(&path)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "crn"))
-                .map(|path| std::fs::metadata(path).unwrap().len())
-                .sum::<u64>();
-            (size, relative)
-        })
-        .collect::<Vec<_>>();
-    sizes.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
-    assert!(sizes.len() >= 3);
+fn enriched_kind_does_no_extra_resolution_work() {
+    // Fixed inputs selected for actual event coverage, not file size. No new
+    // fixture directory is needed: arithmetic and present coalescing reuse the
+    // already-recorded cell sources (including erased-reference row 25l-i).
+    const WORK_FIXTURES: &[&str] = &[
+        "carina-cli/tests/fixtures/plan_display/plan_image_reference_layout",
+        "carina-cli/tests/fixtures/plan_display/upstream_state_map_subscript",
+        "carina-core/tests/fixtures/diagnostic_order/functions/duplicates",
+        "carina-cli/tests/fixtures/plan_display/string_dot_suffix",
+        "carina-cli/tests/fixtures/plan_display/deferred_for_with_unrelated_delete",
+        "carina-cli/tests/fixtures/plan_display/resolved_value_constraint_multifile",
+    ];
     let mut records = Vec::new();
-    for (_, relative) in sizes.into_iter().take(3) {
+    for relative in WORK_FIXTURES {
         let report = observe(&repo().join(relative));
         check(&report, relative);
         assert!(
-            !report.invocations.is_empty() && !report.roots.is_empty(),
-            "{relative}: no in-repo resolver coverage"
+            !report.invocations.is_empty(),
+            "{relative}: no resolver coverage"
         );
         records.push(summary(relative, &report));
+    }
+    let cells: Json =
+        serde_json::from_str(include_str!("fixtures/authored_reference_cells.json")).unwrap();
+    for id in ["10b-i", "25l-i", "5a"] {
+        let row = cells["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["row"] == id)
+            .unwrap();
+        let cell = row["cells"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cell| cell["known"] == true)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        for file in cell["files"].as_array().unwrap() {
+            let path = directory.path().join(file[0].as_str().unwrap());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, file[1].as_str().unwrap()).unwrap();
+        }
+        let label = format!("recorded cell {id} known");
+        let report = observe(directory.path());
+        check(&report, &label);
+        assert!(
+            !report.invocations.is_empty(),
+            "{label}: no resolver coverage"
+        );
+        records.push(summary(&label, &report));
+    }
+    let ci_records = records.len();
+    // Every currently counted resolution event has an existing input above.
+    // There are no asserted-zero exceptions. A new event must get a real input
+    // (or an explicit, justified zero exception) rather than silently passing.
+    for (index, event) in EVENTS.iter().enumerate() {
+        let total = records
+            .iter()
+            .flat_map(|record| record["invocations"].as_array().unwrap())
+            .map(|invocation| invocation["plain"][index].as_u64().unwrap())
+            .sum::<u64>();
+        assert!(total > 0, "CI input set never exercised {event}");
     }
     let external = if let Some(checkout) = std::env::var_os("CARINA_RESOLVER_KIND_INFRA") {
         let checkout = PathBuf::from(checkout);
@@ -310,11 +368,11 @@ fn infra_enriched_work_counts() {
         json!({"status":"exercised","roots":records.len()-start,"schema_loading":"production validate schema-only; imports also loaded as roots"})
     } else {
         eprintln!(
-            "SKIPPED external infra: CARINA_RESOLVER_KIND_INFRA is unset; largest in-repo fixtures were exercised"
+            "SKIPPED external infra: CARINA_RESOLVER_KIND_INFRA is unset; event-covering in-repo inputs were exercised"
         );
         json!({"status":"skipped","reason":"CARINA_RESOLVER_KIND_INFRA is unset"})
     };
-    let document = json!({"external":external,"events":EVENTS,"storage_events":STORAGE_EVENTS,"configurations":records});
+    let document = json!({"external":external,"events":EVENTS,"storage_events":STORAGE_EVENTS,"configurations":records,"ci_configurations":ci_records});
     let name = if std::env::var_os("CARINA_RESOLVER_KIND_INFRA").is_some() {
         "work-counts-infra.json"
     } else {

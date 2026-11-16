@@ -1,9 +1,13 @@
-//! Main-pinned #4400 directory observations. This test does not assert admission policy.
-//! The original 92 rows and schemas come from the cc33cf977 spike; their input
-//! bytes are retained. The last 16 rows combine each defect's sources and uses.
-//! Only the temporary directory prefix is normalized. Panics fail the run.
-//! Export only on the pinned main with the explicit test-file allowlist;
-//! reproduce by checking out that main and adding the listed test sources.
+//! The 216 recorded cells cover 92 reference forms and 16 same-file twins,
+//! each with known and unknown sources, through production validate entries.
+//! Refresh with this fixed command, then review the diff:
+//! ~/.local/bin/heavy-slot nice -n 19 env CARGO_BUILD_JOBS=4 NEXTEST_TEST_THREADS=4 cargo nextest run --offline -p carina-cli --test authored_reference_cells --run-ignored only -E 'test(=record_authored_reference_cells)'
+//! A PR that correctly changes diagnostic wording refreshes and reviews this file's golden.
+//! The 16 erased-reference rows and their same-file twins record main's
+//! known-accept / unknown-reject behaviour where observed. The node-judge PR
+//! of #4400 changes those outcomes ON PURPOSE. An unexplained accept/reject
+//! change is a regression, not a refresh. Only the temporary directory prefix
+//! is normalized; panics always fail. The two excluded probes remain documented.
 use carina_core::provider::{BoxFuture, ProviderFactory, ProviderInitialization, ProviderResult};
 use carina_core::schema::{
     AttributeSchema, AttributeType as T, ResourceSchema, StringIdentityLayer,
@@ -27,7 +31,7 @@ impl ProviderFactory for Factory {
         "mock"
     }
     fn display_name(&self) -> &str {
-        "SPIKE #4400 offline measurement"
+        "Authored reference cells #4400"
     }
     fn validate_config(
         &self,
@@ -41,7 +45,7 @@ impl ProviderFactory for Factory {
         _: &carina_core::provider::ProviderSession,
         _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        Box::pin(async { panic!("SPIKE must never initialize a provider") })
+        Box::pin(async { panic!("Cell measurement must never initialize a provider") })
     }
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(
@@ -475,98 +479,98 @@ const DEFECT_ROWS: [&str; 16] = [
 ];
 fn all_rows() -> Vec<Row> {
     ROWS.with(|rows| assert!(rows.borrow().is_empty()));
-    spike_4400_row1_top();
-    spike_4400_row2_list();
-    spike_4400_row3_map();
-    spike_4400_row3_struct();
-    spike_4400_row4_secret();
-    spike_4400_row4b_secret_literal();
-    spike_4400_row5_selected();
-    spike_4400_row5_live_alternative();
-    spike_4400_row6_input_without_reevaluation();
-    spike_4400_row7_literal();
-    spike_4400_row8_compatible();
-    spike_4400_row9_known_value_constraint();
-    spike_4400_row10a_interpolation_incompatible();
-    spike_4400_row10a_interpolation_compatible();
-    spike_4400_row10b_arithmetic_incompatible();
-    spike_4400_row10b_arithmetic_compatible();
-    spike_4400_row10c_upper_incompatible();
-    spike_4400_row10c_upper_compatible();
-    spike_4400_row11_if_incompatible();
-    spike_4400_row11_if_compatible();
-    spike_4400_row12_same_file_incompatible();
-    spike_4400_row12_same_file_compatible();
-    spike_4400_row13_alias_incompatible();
-    spike_4400_row13_alias_compatible();
-    spike_4400_row14_two_sinks();
-    spike_4400_row20_sole_incompatible();
-    spike_4400_row20_sole_compatible();
-    spike_4400_row21_list_incompatible();
-    spike_4400_row21_list_compatible();
-    spike_4400_row22_map_incompatible();
-    spike_4400_row22_map_compatible();
-    spike_4400_row23_map_incompatible();
-    spike_4400_row23_map_compatible();
-    spike_4400_row23_list_incompatible();
-    spike_4400_row23_list_compatible();
-    spike_4400_row24_list_incompatible();
-    spike_4400_row24_list_compatible();
-    spike_4400_row24_map_incompatible();
-    spike_4400_row24_map_compatible();
-    spike_4400_row25_list_incompatible();
-    spike_4400_row25_list_compatible();
-    spike_4400_row25_map_incompatible();
-    spike_4400_row25_map_compatible();
-    spike_4400_row26_inner_if_incompatible();
-    spike_4400_row26_inner_if_compatible();
-    spike_4400_row27_bad_first();
-    spike_4400_row27_bad_second();
-    spike_4400_row27_both_compatible();
-    spike_4400_row28_resource_map_incompatible();
-    spike_4400_row28_resource_map_compatible();
-    spike_4400_row29_public_first_incompatible();
-    spike_4400_row29_secret_first_incompatible();
-    spike_4400_row29_public_first_compatible();
-    spike_4400_row29_secret_first_compatible();
-    spike_4400_row30_sole_incompatible();
-    spike_4400_row30_sole_compatible();
-    spike_4400_row30_list_incompatible();
-    spike_4400_row30_list_compatible();
-    spike_4400_row30_map_incompatible();
-    spike_4400_row30_map_compatible();
-    spike_4400_row31lookup_i();
-    spike_4400_row31lookup_c();
-    spike_4400_row31values_i();
-    spike_4400_row31values_c();
-    spike_4400_row31concat_i();
-    spike_4400_row31concat_c();
-    spike_4400_row31flatten_i();
-    spike_4400_row31flatten_c();
-    spike_4400_row32id_i();
-    spike_4400_row32id_c();
-    spike_4400_row36union_i();
-    spike_4400_row36union_c();
-    spike_4400_row38unknownif_i();
-    spike_4400_row38unknownif_c();
-    spike_4400_row33param_si_di();
-    spike_4400_row33param_si_dc();
-    spike_4400_row33param_sc_di();
-    spike_4400_row33param_sc_dc();
-    spike_4400_row34declalias_si_di();
-    spike_4400_row34declalias_si_dc();
-    spike_4400_row34declalias_sc_di();
-    spike_4400_row34declalias_sc_dc();
-    spike_4400_row35fnparam_si_di();
-    spike_4400_row35fnparam_si_dc();
-    spike_4400_row35fnparam_sc_di();
-    spike_4400_row35fnparam_sc_dc();
-    spike_4400_row37ref_i();
-    spike_4400_row37ref_c();
-    spike_4400_row37coalesce_i();
-    spike_4400_row37coalesce_c();
-    spike_4400_row39typedlet_syntax_i();
-    spike_4400_row39typedlet_syntax_c();
+    reference_4400_row1_top();
+    reference_4400_row2_list();
+    reference_4400_row3_map();
+    reference_4400_row3_struct();
+    reference_4400_row4_secret();
+    reference_4400_row4b_secret_literal();
+    reference_4400_row5_selected();
+    reference_4400_row5_live_alternative();
+    reference_4400_row6_input_without_reevaluation();
+    reference_4400_row7_literal();
+    reference_4400_row8_compatible();
+    reference_4400_row9_known_value_constraint();
+    reference_4400_row10a_interpolation_incompatible();
+    reference_4400_row10a_interpolation_compatible();
+    reference_4400_row10b_arithmetic_incompatible();
+    reference_4400_row10b_arithmetic_compatible();
+    reference_4400_row10c_upper_incompatible();
+    reference_4400_row10c_upper_compatible();
+    reference_4400_row11_if_incompatible();
+    reference_4400_row11_if_compatible();
+    reference_4400_row12_same_file_incompatible();
+    reference_4400_row12_same_file_compatible();
+    reference_4400_row13_alias_incompatible();
+    reference_4400_row13_alias_compatible();
+    reference_4400_row14_two_sinks();
+    reference_4400_row20_sole_incompatible();
+    reference_4400_row20_sole_compatible();
+    reference_4400_row21_list_incompatible();
+    reference_4400_row21_list_compatible();
+    reference_4400_row22_map_incompatible();
+    reference_4400_row22_map_compatible();
+    reference_4400_row23_map_incompatible();
+    reference_4400_row23_map_compatible();
+    reference_4400_row23_list_incompatible();
+    reference_4400_row23_list_compatible();
+    reference_4400_row24_list_incompatible();
+    reference_4400_row24_list_compatible();
+    reference_4400_row24_map_incompatible();
+    reference_4400_row24_map_compatible();
+    reference_4400_row25_list_incompatible();
+    reference_4400_row25_list_compatible();
+    reference_4400_row25_map_incompatible();
+    reference_4400_row25_map_compatible();
+    reference_4400_row26_inner_if_incompatible();
+    reference_4400_row26_inner_if_compatible();
+    reference_4400_row27_bad_first();
+    reference_4400_row27_bad_second();
+    reference_4400_row27_both_compatible();
+    reference_4400_row28_resource_map_incompatible();
+    reference_4400_row28_resource_map_compatible();
+    reference_4400_row29_public_first_incompatible();
+    reference_4400_row29_secret_first_incompatible();
+    reference_4400_row29_public_first_compatible();
+    reference_4400_row29_secret_first_compatible();
+    reference_4400_row30_sole_incompatible();
+    reference_4400_row30_sole_compatible();
+    reference_4400_row30_list_incompatible();
+    reference_4400_row30_list_compatible();
+    reference_4400_row30_map_incompatible();
+    reference_4400_row30_map_compatible();
+    reference_4400_row31lookup_i();
+    reference_4400_row31lookup_c();
+    reference_4400_row31values_i();
+    reference_4400_row31values_c();
+    reference_4400_row31concat_i();
+    reference_4400_row31concat_c();
+    reference_4400_row31flatten_i();
+    reference_4400_row31flatten_c();
+    reference_4400_row32id_i();
+    reference_4400_row32id_c();
+    reference_4400_row36union_i();
+    reference_4400_row36union_c();
+    reference_4400_row38unknownif_i();
+    reference_4400_row38unknownif_c();
+    reference_4400_row33param_si_di();
+    reference_4400_row33param_si_dc();
+    reference_4400_row33param_sc_di();
+    reference_4400_row33param_sc_dc();
+    reference_4400_row34declalias_si_di();
+    reference_4400_row34declalias_si_dc();
+    reference_4400_row34declalias_sc_di();
+    reference_4400_row34declalias_sc_dc();
+    reference_4400_row35fnparam_si_di();
+    reference_4400_row35fnparam_si_dc();
+    reference_4400_row35fnparam_sc_di();
+    reference_4400_row35fnparam_sc_dc();
+    reference_4400_row37ref_i();
+    reference_4400_row37ref_c();
+    reference_4400_row37coalesce_i();
+    reference_4400_row37coalesce_c();
+    reference_4400_row39typedlet_syntax_i();
+    reference_4400_row39typedlet_syntax_c();
     let mut rows = ROWS.with(|rows| rows.take());
     assert_eq!(rows.len(), 92);
     for id in DEFECT_ROWS {
@@ -577,7 +581,7 @@ fn all_rows() -> Vec<Row> {
     rows
 }
 
-// Skipped probes from the spike, intentionally outside the 92 originals:
+// Excluded probes, intentionally outside the 92 originals:
 // 6-reevaluation: CLI admission uses ValidationEvaluation::None. upper('same')
 // folds before admission; whole-map reevaluation is only on LSP expanded /
 // relative_static paths, outside this collector.
@@ -621,7 +625,7 @@ fn cells() -> Json {
                 "observation": baseline::normalize_prefix(observed, dir.path(), "<DIR>")}));
         }
         records.push(json!({"row": id, "construct": row.construct, "cells": cells,
-            "historical_spike_metadata": {
+            "original_expectations": {
                 "reference_count": row.reference_count, "known_value_count": row.known_value_count,
                 "require_acceptance": row.require_acceptance, "expected_instances": row.expected_instances,
                 "check_public_origin": row.check_public_origin, "expected_error_count": row.expected_error_count
@@ -631,12 +635,13 @@ fn cells() -> Json {
 }
 
 #[test]
-fn main_4400_directory_baseline() {
-    let golden: Json = serde_json::from_slice(
-        &std::fs::read(baseline::golden_root().join("4400-cells.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(golden["header"]["main_commit"], baseline::MAIN);
+fn authored_reference_cells_match_recorded() {
+    let golden: Json =
+        serde_json::from_slice(&std::fs::read(baseline::golden_path()).unwrap()).unwrap();
+    assert_eq!(
+        golden["header"],
+        json!({"first_recorded_on": baseline::FIRST_RECORDED_ON, "original_rows": 92, "samefile_rows": 16, "rows": 108, "cells": 216})
+    );
     assert_eq!(golden["skipped_probes"], json!(SKIPPED_PROBES));
     assert_eq!(golden["rows"].as_array().unwrap().len(), 108);
     let actual = cells();
@@ -650,21 +655,20 @@ fn main_4400_directory_baseline() {
 }
 
 #[test]
-#[ignore = "main-only exporter; never called by the consumer"]
-fn record_main_4400_cells() {
-    let header = baseline::recording_header();
-    let golden = json!({"header": header, "original_rows": 92, "samefile_rows": 16,
-        "cells": 216, "normalization": "temporary directory prefix only",
+#[ignore = "refresh the recorded cells, then review the diff"]
+fn record_authored_reference_cells() {
+    let header = json!({"first_recorded_on": baseline::FIRST_RECORDED_ON, "original_rows": 92, "samefile_rows": 16, "rows": 108, "cells": 216});
+    let golden = json!({"header": header, "normalization": "temporary directory prefix only",
         "json_bytes": "compact serialization of validate_diagnostics_with_factories.json",
         "skipped_probes": SKIPPED_PROBES, "rows": cells()});
-    std::fs::create_dir_all(baseline::golden_root()).unwrap();
+
     std::fs::write(
-        baseline::golden_root().join("4400-cells.json"),
-        serde_json::to_vec_pretty(&golden).unwrap(),
+        baseline::golden_path(),
+        serde_json::to_string_pretty(&golden).unwrap() + "\n",
     )
     .unwrap();
 }
-// Original spike row constructors. R/V metadata below is historical, not asserted.
+// Original row constructors. R/V metadata below is historical, not asserted.
 macro_rules! row {
     ($test:ident, $id:literal, $construct:literal, $source:literal, $sink:literal, $expr:literal, $r:literal) => {
         fn $test() {
@@ -681,7 +685,7 @@ macro_rules! accepting_row {
 }
 // 1 R: one identical String -> mock.Expected rejection. V: none.
 row!(
-    spike_4400_row1_top,
+    reference_4400_row1_top,
     "1",
     "attribute root: x.name",
     "Source",
@@ -691,7 +695,7 @@ row!(
 );
 // 2 R: one identical rejection at the list item. V: none.
 row!(
-    spike_4400_row2_list,
+    reference_4400_row2_list,
     "2",
     "list item: [x.name]",
     "Source",
@@ -701,7 +705,7 @@ row!(
 );
 // 3 R: one identical rejection at map value a. V: none.
 row!(
-    spike_4400_row3_map,
+    reference_4400_row3_map,
     "3",
     "map value: { a = x.name }",
     "Source",
@@ -711,7 +715,7 @@ row!(
 );
 // 3b R: one identical rejection at struct field a. V: none.
 row!(
-    spike_4400_row3_struct,
+    reference_4400_row3_struct,
     "3b",
     "struct field: { a = x.name }",
     "Source",
@@ -721,7 +725,7 @@ row!(
 );
 // 4 R: one identical protected source-type rejection. V: none.
 row!(
-    spike_4400_row4_secret,
+    reference_4400_row4_secret,
     "4",
     "secret(x.name)",
     "Source",
@@ -731,7 +735,7 @@ row!(
 );
 // Keep the original secret-literal control. R: none. V: none. Accept both.
 accepting_row!(
-    spike_4400_row4b_secret_literal,
+    reference_4400_row4b_secret_literal,
     "4b",
     "secret literal: secret('same')",
     "Source",
@@ -742,7 +746,7 @@ accepting_row!(
 // 5a R: x rejected once per side, equal FULL counts/text. V: none;
 // fallback is a valid literal, and x's concrete value has no constraint.
 row!(
-    spike_4400_row5_selected,
+    reference_4400_row5_selected,
     "5a",
     "selected operand: x.name ?? 'fallback'",
     "Source",
@@ -751,7 +755,7 @@ row!(
     1
 );
 
-fn spike_4400_row5_live_alternative() {
+fn reference_4400_row5_live_alternative() {
     // R: x and y each rejected once, identical stream when y becomes pending.
     // V: none. x is pending in BOTH runs; only y switches known/unknown.
     let mut row = Row::new(
@@ -768,7 +772,7 @@ fn spike_4400_row5_live_alternative() {
 // 6 R: only a's reference rejected, identically once per side. V: none.
 // b's statically evaluable call creates a valid literal-like expression value.
 row!(
-    spike_4400_row6_input_without_reevaluation,
+    reference_4400_row6_input_without_reevaluation,
     "6",
     "map reference + static call: { a = x.name, b = upper('same') }",
     "Source",
@@ -779,7 +783,7 @@ row!(
 
 // 7 R: none; literal equals known source but has no reference. V: none. Accept.
 accepting_row!(
-    spike_4400_row7_literal,
+    reference_4400_row7_literal,
     "7",
     "literal equal to known source: 'same'",
     "Source",
@@ -789,7 +793,7 @@ accepting_row!(
 );
 // 8 R: none, mock.Expected -> mock.Expected. V: none. Accept both.
 accepting_row!(
-    spike_4400_row8_compatible,
+    reference_4400_row8_compatible,
     "8",
     "compatible reference: x.name",
     "CompatibleSource",
@@ -798,7 +802,7 @@ accepting_row!(
     0
 );
 
-fn spike_4400_row9_known_value_constraint() {
+fn reference_4400_row9_known_value_constraint() {
     // R: none; same nominal identity. V: one length error for 'same' (4 > 3),
     // none when no value is available. The source itself has no length limit.
     let mut row = Row::new(
@@ -815,7 +819,7 @@ fn spike_4400_row9_known_value_constraint() {
 // 10a-i R: none. Source String is incompatible with Sink DIRECTLY, but valid
 // for interpolation, which computes a new String. V: none. Accept both.
 accepting_row!(
-    spike_4400_row10a_interpolation_incompatible,
+    reference_4400_row10a_interpolation_incompatible,
     "10a-i",
     "interpolation, directly incompatible source: p-${x.name}",
     "Source",
@@ -825,7 +829,7 @@ accepting_row!(
 );
 // 10a-c R: none; nominal String also valid as interpolation input. V: none.
 accepting_row!(
-    spike_4400_row10a_interpolation_compatible,
+    reference_4400_row10a_interpolation_compatible,
     "10a-c",
     "interpolation, directly compatible source: p-${x.name}",
     "CompatibleSource",
@@ -839,7 +843,7 @@ accepting_row!(
 // implicitly admitted to a nominal Int destination. Any result-type findings
 // remain A (unforced) and must have identical content/count on both sides.
 row!(
-    spike_4400_row10b_arithmetic_incompatible,
+    reference_4400_row10b_arithmetic_incompatible,
     "10b-i",
     "addition, directly incompatible source: x.count + 1",
     "Source",
@@ -849,7 +853,7 @@ row!(
 );
 // 10b-c R: none; nominal Int also valid as addition input. V: none.
 row!(
-    spike_4400_row10b_arithmetic_compatible,
+    reference_4400_row10b_arithmetic_compatible,
     "10b-c",
     "addition, directly compatible source: x.count + 1",
     "CompatibleSource",
@@ -859,7 +863,7 @@ row!(
 );
 // 10c-i R: none; upper accepts String and returns a new String. V: none.
 accepting_row!(
-    spike_4400_row10c_upper_incompatible,
+    reference_4400_row10c_upper_incompatible,
     "10c-i",
     "upper(x.name), directly incompatible source",
     "Source",
@@ -869,7 +873,7 @@ accepting_row!(
 );
 // 10c-c R: none; upper also accepts the compatible nominal String. V: none.
 accepting_row!(
-    spike_4400_row10c_upper_compatible,
+    reference_4400_row10c_upper_compatible,
     "10c-c",
     "upper(x.name), directly compatible source",
     "CompatibleSource",
@@ -881,7 +885,7 @@ accepting_row!(
 // Condition must be static. The selected x.name independently changes knownness.
 // 11-i R: one identical rejection of selected source. V: none.
 row!(
-    spike_4400_row11_if_incompatible,
+    reference_4400_row11_if_incompatible,
     "11-i",
     "if true { x.name } else { 'fallback' }, incompatible",
     "Source",
@@ -891,7 +895,7 @@ row!(
 );
 // 11-c R: none for compatible selected branch. V: none. Accept both.
 accepting_row!(
-    spike_4400_row11_if_compatible,
+    reference_4400_row11_if_compatible,
     "11-c",
     "if true { x.name } else { 'fallback' }, compatible",
     "CompatibleSource",
@@ -900,7 +904,7 @@ accepting_row!(
     0
 );
 
-fn spike_4400_row12_same_file_incompatible() {
+fn reference_4400_row12_same_file_incompatible() {
     // R: one identical rejection (same-file control for 1). V: none.
     let mut row = Row::new(
         "12-i",
@@ -914,7 +918,7 @@ fn spike_4400_row12_same_file_incompatible() {
     measure(row);
 }
 
-fn spike_4400_row12_same_file_compatible() {
+fn reference_4400_row12_same_file_compatible() {
     // R: none (same-file control for 8). V: none. Accept both.
     let mut row = Row::new(
         "12-c",
@@ -928,7 +932,7 @@ fn spike_4400_row12_same_file_compatible() {
     measure(row.accepting());
 }
 
-fn spike_4400_row13_alias_incompatible() {
+fn reference_4400_row13_alias_incompatible() {
     // R: one identical rejection through let n = x.name. V: none.
     let mut row = Row::new(
         "13-i",
@@ -942,7 +946,7 @@ fn spike_4400_row13_alias_incompatible() {
     measure(row);
 }
 
-fn spike_4400_row13_alias_compatible() {
+fn reference_4400_row13_alias_compatible() {
     // R: none through compatible alias. V: none. Accept both.
     let mut row = Row::new(
         "13-c",
@@ -956,7 +960,7 @@ fn spike_4400_row13_alias_compatible() {
     measure(row.accepting());
 }
 
-fn spike_4400_row14_two_sinks() {
+fn reference_4400_row14_two_sinks() {
     // R: only OtherSink rejects mock.Expected; Sink accepts it. One identical
     // finding per side. Rejecting every reference would yield TWO and fail.
     // V: none. These are two distinct authored reference uses.
@@ -996,7 +1000,7 @@ macro_rules! issue_row {
 }
 // 20: Sole interpolation denotes the source reference, not a new String.
 issue_row!(
-    spike_4400_row20_sole_incompatible,
+    reference_4400_row20_sole_incompatible,
     "20-i",
     "sole interpolation, incompatible",
     "Source",
@@ -1006,7 +1010,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row20_sole_compatible,
+    reference_4400_row20_sole_compatible,
     "20-c",
     "sole interpolation, compatible",
     "CompatibleSource",
@@ -1017,7 +1021,7 @@ issue_row!(
 );
 // 21: The chosen element retains x.name's declared type.
 issue_row!(
-    spike_4400_row21_list_incompatible,
+    reference_4400_row21_list_incompatible,
     "21-i",
     "[x.name][0], incompatible",
     "Source",
@@ -1027,7 +1031,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row21_list_compatible,
+    reference_4400_row21_list_compatible,
     "21-c",
     "[x.name][0], compatible",
     "CompatibleSource",
@@ -1038,7 +1042,7 @@ issue_row!(
 );
 // 22: The chosen field retains x.name's declared type.
 issue_row!(
-    spike_4400_row22_map_incompatible,
+    reference_4400_row22_map_incompatible,
     "22-i",
     "{ f = x.name }.f, incompatible",
     "Source",
@@ -1048,7 +1052,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row22_map_compatible,
+    reference_4400_row22_map_compatible,
     "22-c",
     "{ f = x.name }.f, compatible",
     "CompatibleSource",
@@ -1059,7 +1063,7 @@ issue_row!(
 );
 // 23: Cross-file let container projection, for both container shapes.
 issue_row!(
-    spike_4400_row23_map_incompatible,
+    reference_4400_row23_map_incompatible,
     "23m-i",
     "let m = { f = x.name }; m.f, incompatible",
     "Source",
@@ -1069,7 +1073,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row23_map_compatible,
+    reference_4400_row23_map_compatible,
     "23m-c",
     "let m = { f = x.name }; m.f, compatible",
     "CompatibleSource",
@@ -1079,7 +1083,7 @@ issue_row!(
     0
 );
 issue_row!(
-    spike_4400_row23_list_incompatible,
+    reference_4400_row23_list_incompatible,
     "23l-i",
     "let l = [x.name]; l[0], incompatible",
     "Source",
@@ -1089,7 +1093,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row23_list_compatible,
+    reference_4400_row23_list_compatible,
     "23l-c",
     "let l = [x.name]; l[0], compatible",
     "CompatibleSource",
@@ -1100,7 +1104,7 @@ issue_row!(
 );
 // 24: Only the statically selected branch is live; expect one x finding.
 issue_row!(
-    spike_4400_row24_list_incompatible,
+    reference_4400_row24_list_incompatible,
     "24l-i",
     "let s = if true { [x.name] } else { [y.name] }; s[0], incompatible",
     "Source",
@@ -1110,7 +1114,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row24_list_compatible,
+    reference_4400_row24_list_compatible,
     "24l-c",
     "let s = if true { [x.name] } else { [y.name] }; s[0], compatible",
     "CompatibleSource",
@@ -1120,7 +1124,7 @@ issue_row!(
     0
 );
 issue_row!(
-    spike_4400_row24_map_incompatible,
+    reference_4400_row24_map_incompatible,
     "24m-i",
     "let s = if true { { f = x.name } } else { { f = y.name } }; s.f, incompatible",
     "Source",
@@ -1130,7 +1134,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row24_map_compatible,
+    reference_4400_row24_map_compatible,
     "24m-c",
     "let s = if true { { f = x.name } } else { { f = y.name } }; s.f, compatible",
     "CompatibleSource",
@@ -1142,7 +1146,7 @@ issue_row!(
 // 25: The non-null container is present even when its leaf is unknown.
 // R is the selected x reference's finding once, not both candidate sources.
 issue_row!(
-    spike_4400_row25_list_incompatible,
+    reference_4400_row25_list_incompatible,
     "25l-i",
     "let s = [x.name] ?? [y.name]; s[0], incompatible",
     "Source",
@@ -1152,7 +1156,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row25_list_compatible,
+    reference_4400_row25_list_compatible,
     "25l-c",
     "let s = [x.name] ?? [y.name]; s[0], compatible",
     "CompatibleSource",
@@ -1162,7 +1166,7 @@ issue_row!(
     0
 );
 issue_row!(
-    spike_4400_row25_map_incompatible,
+    reference_4400_row25_map_incompatible,
     "25m-i",
     "let s = { f = x.name } ?? { f = y.name }; s.f, incompatible",
     "Source",
@@ -1172,7 +1176,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row25_map_compatible,
+    reference_4400_row25_map_compatible,
     "25m-c",
     "let s = { f = x.name } ?? { f = y.name }; s.f, compatible",
     "CompatibleSource",
@@ -1183,7 +1187,7 @@ issue_row!(
 );
 // 26: Conditional INSIDE the projected list item; selected source remains x.
 issue_row!(
-    spike_4400_row26_inner_if_incompatible,
+    reference_4400_row26_inner_if_incompatible,
     "26-i",
     "[if true { x.name } else { y.name }][0], incompatible",
     "Source",
@@ -1193,7 +1197,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row26_inner_if_compatible,
+    reference_4400_row26_inner_if_compatible,
     "26-c",
     "[if true { x.name } else { y.name }][0], compatible",
     "CompatibleSource",
@@ -1224,7 +1228,7 @@ fn loop_selection(
     measure(row);
 }
 
-fn spike_4400_row27_bad_first() {
+fn reference_4400_row27_bad_first() {
     loop_selection(
         "27-xbad",
         "for i in [0,1]: [x.name,y.name][i]; only x incompatible",
@@ -1234,7 +1238,7 @@ fn spike_4400_row27_bad_first() {
     );
 }
 
-fn spike_4400_row27_bad_second() {
+fn reference_4400_row27_bad_second() {
     loop_selection(
         "27-ybad",
         "for i in [0,1]: [x.name,y.name][i]; only y incompatible",
@@ -1244,7 +1248,7 @@ fn spike_4400_row27_bad_second() {
     );
 }
 
-fn spike_4400_row27_both_compatible() {
+fn reference_4400_row27_both_compatible() {
     loop_selection(
         "27-c",
         "for i in [0,1]: [x.name,y.name][i]; both compatible",
@@ -1281,7 +1285,7 @@ fn resource_map_read(
     measure(row);
 }
 
-fn spike_4400_row28_resource_map_incompatible() {
+fn reference_4400_row28_resource_map_incompatible() {
     resource_map_read(
         "28-i",
         "for-built map of Source resources; built['first'].name, incompatible",
@@ -1290,7 +1294,7 @@ fn spike_4400_row28_resource_map_incompatible() {
     );
 }
 
-fn spike_4400_row28_resource_map_compatible() {
+fn reference_4400_row28_resource_map_compatible() {
     resource_map_read(
         "28-c",
         "for-built map of CompatibleSource resources; built['first'].name, compatible",
@@ -1327,7 +1331,7 @@ fn alias_public_secret(
 // Main emits one finding: lexical binding-use validation rejects public n
 // and stops the directory before resource admission can visit secret(n).
 
-fn spike_4400_row29_public_first_incompatible() {
+fn reference_4400_row29_public_first_incompatible() {
     alias_public_secret(
         "29-p-i",
         "let n = x.name; public n then secret(n), incompatible",
@@ -1337,7 +1341,7 @@ fn spike_4400_row29_public_first_incompatible() {
     );
 }
 
-fn spike_4400_row29_secret_first_incompatible() {
+fn reference_4400_row29_secret_first_incompatible() {
     alias_public_secret(
         "29-s-i",
         "let n = x.name; secret(n) then public n, incompatible",
@@ -1347,7 +1351,7 @@ fn spike_4400_row29_secret_first_incompatible() {
     );
 }
 
-fn spike_4400_row29_public_first_compatible() {
+fn reference_4400_row29_public_first_compatible() {
     alias_public_secret(
         "29-p-c",
         "let n = x.name; public n then secret(n), compatible",
@@ -1357,7 +1361,7 @@ fn spike_4400_row29_public_first_compatible() {
     );
 }
 
-fn spike_4400_row29_secret_first_compatible() {
+fn reference_4400_row29_secret_first_compatible() {
     alias_public_secret(
         "29-s-c",
         "let n = x.name; secret(n) then public n, compatible",
@@ -1371,7 +1375,7 @@ fn spike_4400_row29_secret_first_compatible() {
 // compatible Reference identity mock.Expected -> identified String accepts.
 // Literal known values and the omitted unknown attribute are built identically.
 issue_row!(
-    spike_4400_row30_sole_incompatible,
+    reference_4400_row30_sole_incompatible,
     "30s-i",
     "sole interpolation, incompatible Reference source",
     "ReferenceSource",
@@ -1381,7 +1385,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row30_sole_compatible,
+    reference_4400_row30_sole_compatible,
     "30s-c",
     "sole interpolation, compatible Reference source",
     "CompatibleReferenceSource",
@@ -1391,7 +1395,7 @@ issue_row!(
     0
 );
 issue_row!(
-    spike_4400_row30_list_incompatible,
+    reference_4400_row30_list_incompatible,
     "30l-i",
     "[x.name][0], incompatible Reference source",
     "ReferenceSource",
@@ -1401,7 +1405,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row30_list_compatible,
+    reference_4400_row30_list_compatible,
     "30l-c",
     "[x.name][0], compatible Reference source",
     "CompatibleReferenceSource",
@@ -1411,7 +1415,7 @@ issue_row!(
     0
 );
 issue_row!(
-    spike_4400_row30_map_incompatible,
+    reference_4400_row30_map_incompatible,
     "30m-i",
     "{ f = x.name }.f, incompatible Reference source",
     "ReferenceSource",
@@ -1421,7 +1425,7 @@ issue_row!(
     1
 );
 issue_row!(
-    spike_4400_row30_map_compatible,
+    reference_4400_row30_map_compatible,
     "30m-c",
     "{ f = x.name }.f, compatible Reference source",
     "CompatibleReferenceSource",
@@ -1517,7 +1521,7 @@ fn round3_module(
     measure(row);
 }
 
-fn spike_4400_row31lookup_i() {
+fn reference_4400_row31lookup_i() {
     round3(
         "31lookup-i",
         "lookup({ a = x.name }, 'a', 'fallback')",
@@ -1529,7 +1533,7 @@ fn spike_4400_row31lookup_i() {
     );
 }
 
-fn spike_4400_row31lookup_c() {
+fn reference_4400_row31lookup_c() {
     round3(
         "31lookup-c",
         "lookup({ a = x.name }, 'a', 'fallback')",
@@ -1541,7 +1545,7 @@ fn spike_4400_row31lookup_c() {
     );
 }
 
-fn spike_4400_row31values_i() {
+fn reference_4400_row31values_i() {
     round3(
         "31values-i",
         "values({ a = x.name })[0]",
@@ -1553,7 +1557,7 @@ fn spike_4400_row31values_i() {
     );
 }
 
-fn spike_4400_row31values_c() {
+fn reference_4400_row31values_c() {
     round3(
         "31values-c",
         "values({ a = x.name })[0]",
@@ -1565,7 +1569,7 @@ fn spike_4400_row31values_c() {
     );
 }
 
-fn spike_4400_row31concat_i() {
+fn reference_4400_row31concat_i() {
     round3(
         "31concat-i",
         "concat([x.name], [])[0]",
@@ -1577,7 +1581,7 @@ fn spike_4400_row31concat_i() {
     );
 }
 
-fn spike_4400_row31concat_c() {
+fn reference_4400_row31concat_c() {
     round3(
         "31concat-c",
         "concat([x.name], [])[0]",
@@ -1589,7 +1593,7 @@ fn spike_4400_row31concat_c() {
     );
 }
 
-fn spike_4400_row31flatten_i() {
+fn reference_4400_row31flatten_i() {
     round3(
         "31flatten-i",
         "flatten([[x.name]])[0]",
@@ -1601,7 +1605,7 @@ fn spike_4400_row31flatten_i() {
     );
 }
 
-fn spike_4400_row31flatten_c() {
+fn reference_4400_row31flatten_c() {
     round3(
         "31flatten-c",
         "flatten([[x.name]])[0]",
@@ -1613,7 +1617,7 @@ fn spike_4400_row31flatten_c() {
     );
 }
 
-fn spike_4400_row32id_i() {
+fn reference_4400_row32id_i() {
     round3(
         "32id-i",
         "id(x.name)",
@@ -1625,7 +1629,7 @@ fn spike_4400_row32id_i() {
     );
 }
 
-fn spike_4400_row32id_c() {
+fn reference_4400_row32id_c() {
     round3(
         "32id-c",
         "id(x.name)",
@@ -1637,7 +1641,7 @@ fn spike_4400_row32id_c() {
     );
 }
 
-fn spike_4400_row36union_i() {
+fn reference_4400_row36union_i() {
     round3(
         "36union-i",
         "[x.name]",
@@ -1649,7 +1653,7 @@ fn spike_4400_row36union_i() {
     );
 }
 
-fn spike_4400_row36union_c() {
+fn reference_4400_row36union_c() {
     round3(
         "36union-c",
         "[x.name]",
@@ -1661,7 +1665,7 @@ fn spike_4400_row36union_c() {
     );
 }
 
-fn spike_4400_row38unknownif_i() {
+fn reference_4400_row38unknownif_i() {
     round3(
         "38unknownif-i",
         "if x.ready { x.name } else { 'fallback' }",
@@ -1673,7 +1677,7 @@ fn spike_4400_row38unknownif_i() {
     );
 }
 
-fn spike_4400_row38unknownif_c() {
+fn reference_4400_row38unknownif_c() {
     round3(
         "38unknownif-c",
         "if x.ready { x.name } else { 'fallback' }",
@@ -1685,7 +1689,7 @@ fn spike_4400_row38unknownif_c() {
     );
 }
 
-fn spike_4400_row33param_si_di() {
+fn reference_4400_row33param_si_di() {
     round3_module(
         "33param-si-di",
         "module typed input read inside module; source=si, declaration=String",
@@ -1696,7 +1700,7 @@ fn spike_4400_row33param_si_di() {
     );
 }
 
-fn spike_4400_row33param_si_dc() {
+fn reference_4400_row33param_si_dc() {
     round3_module(
         "33param-si-dc",
         "module typed input read inside module; source=si, declaration=mock.Expected",
@@ -1707,7 +1711,7 @@ fn spike_4400_row33param_si_dc() {
     );
 }
 
-fn spike_4400_row33param_sc_di() {
+fn reference_4400_row33param_sc_di() {
     round3_module(
         "33param-sc-di",
         "module typed input read inside module; source=sc, declaration=String",
@@ -1718,7 +1722,7 @@ fn spike_4400_row33param_sc_di() {
     );
 }
 
-fn spike_4400_row33param_sc_dc() {
+fn reference_4400_row33param_sc_dc() {
     round3_module(
         "33param-sc-dc",
         "module typed input read inside module; source=sc, declaration=mock.Expected",
@@ -1729,7 +1733,7 @@ fn spike_4400_row33param_sc_dc() {
     );
 }
 
-fn spike_4400_row34declalias_si_di() {
+fn reference_4400_row34declalias_si_di() {
     round3_module(
         "34declalias-si-di",
         "typed output with let alias; source=si, declaration=String",
@@ -1740,7 +1744,7 @@ fn spike_4400_row34declalias_si_di() {
     );
 }
 
-fn spike_4400_row34declalias_si_dc() {
+fn reference_4400_row34declalias_si_dc() {
     round3_module(
         "34declalias-si-dc",
         "typed output with let alias; source=si, declaration=mock.Expected",
@@ -1751,7 +1755,7 @@ fn spike_4400_row34declalias_si_dc() {
     );
 }
 
-fn spike_4400_row34declalias_sc_di() {
+fn reference_4400_row34declalias_sc_di() {
     round3_module(
         "34declalias-sc-di",
         "typed output with let alias; source=sc, declaration=String",
@@ -1762,7 +1766,7 @@ fn spike_4400_row34declalias_sc_di() {
     );
 }
 
-fn spike_4400_row34declalias_sc_dc() {
+fn reference_4400_row34declalias_sc_dc() {
     round3_module(
         "34declalias-sc-dc",
         "typed output with let alias; source=sc, declaration=mock.Expected",
@@ -1773,7 +1777,7 @@ fn spike_4400_row34declalias_sc_dc() {
     );
 }
 
-fn spike_4400_row35fnparam_si_di() {
+fn reference_4400_row35fnparam_si_di() {
     round3(
         "35fnparam-si-di",
         "typed function parameter and return",
@@ -1785,7 +1789,7 @@ fn spike_4400_row35fnparam_si_di() {
     );
 }
 
-fn spike_4400_row35fnparam_si_dc() {
+fn reference_4400_row35fnparam_si_dc() {
     round3(
         "35fnparam-si-dc",
         "typed function parameter and return",
@@ -1797,7 +1801,7 @@ fn spike_4400_row35fnparam_si_dc() {
     );
 }
 
-fn spike_4400_row35fnparam_sc_di() {
+fn reference_4400_row35fnparam_sc_di() {
     round3(
         "35fnparam-sc-di",
         "typed function parameter and return",
@@ -1809,7 +1813,7 @@ fn spike_4400_row35fnparam_sc_di() {
     );
 }
 
-fn spike_4400_row35fnparam_sc_dc() {
+fn reference_4400_row35fnparam_sc_dc() {
     round3(
         "35fnparam-sc-dc",
         "typed function parameter and return",
@@ -1821,7 +1825,7 @@ fn spike_4400_row35fnparam_sc_dc() {
     );
 }
 
-fn spike_4400_row37ref_i() {
+fn reference_4400_row37ref_i() {
     let mut row = Row::new(
         "37ref-i",
         "x.name as mock.Cast",
@@ -1834,7 +1838,7 @@ fn spike_4400_row37ref_i() {
     measure(row.accepting());
 }
 
-fn spike_4400_row37ref_c() {
+fn reference_4400_row37ref_c() {
     let mut row = Row::new(
         "37ref-c",
         "x.name as mock.Cast",
@@ -1847,7 +1851,7 @@ fn spike_4400_row37ref_c() {
     measure(row.accepting());
 }
 
-fn spike_4400_row37coalesce_i() {
+fn reference_4400_row37coalesce_i() {
     let mut row = Row::new(
         "37coalesce-i",
         "(x.name ?? y.name) as mock.Cast",
@@ -1860,7 +1864,7 @@ fn spike_4400_row37coalesce_i() {
     measure(row.accepting());
 }
 
-fn spike_4400_row37coalesce_c() {
+fn reference_4400_row37coalesce_c() {
     let mut row = Row::new(
         "37coalesce-c",
         "(x.name ?? y.name) as mock.Cast",
@@ -1873,7 +1877,7 @@ fn spike_4400_row37coalesce_c() {
     measure(row.accepting());
 }
 
-fn spike_4400_row39typedlet_syntax_i() {
+fn reference_4400_row39typedlet_syntax_i() {
     round3(
         "39typedlet-i",
         "literal typed-let spelling (grammar probe)",
@@ -1885,7 +1889,7 @@ fn spike_4400_row39typedlet_syntax_i() {
     );
 }
 
-fn spike_4400_row39typedlet_syntax_c() {
+fn reference_4400_row39typedlet_syntax_c() {
     round3(
         "39typedlet-c",
         "literal typed-let spelling (grammar probe)",

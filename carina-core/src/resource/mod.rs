@@ -3584,11 +3584,17 @@ impl<P: ValueShape, B: BindingAddress> fmt::Debug for FunctionArgument<P, B> {
                 value,
                 access_base: _,
             } => value.fmt(f),
-            StructuralOperand::Handle { handle, .. } => f
+            StructuralOperand::Handle {
+                handle,
+                access_base: _,
+            } => f
                 .debug_tuple("StructuralHandleArgument")
                 .field(handle)
                 .finish(),
-            StructuralOperand::Parameter { name, .. } => f
+            StructuralOperand::Parameter {
+                name,
+                access_base: _,
+            } => f
                 .debug_tuple("ForwardedParameterArgument")
                 .field(&name)
                 .finish(),
@@ -4833,7 +4839,7 @@ impl<P: ValueShape, B: BindingAddress> fmt::Debug for DeferredValue<P, B> {
                 function,
                 args,
                 source_line,
-                ..
+                functions: _,
             } => f
                 .debug_struct("ResolvedFunctionCall")
                 .field("name", &function.name)
@@ -11922,38 +11928,49 @@ pub(crate) mod known_value_gate_tests {
 
 impl<P: ValueKind, B: BindingAddress> PartialEq for StructuralOperand<P, B> {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Value {
-                    value: a,
-                    access_base: ab,
-                },
-                Self::Value {
+        match self {
+            Self::Value {
+                value: a,
+                access_base: ab,
+            } => {
+                if let Self::Value {
                     value: b,
                     access_base: bb,
-                },
-            ) => a == b && ab == bb,
-            (
-                Self::Handle {
-                    handle: a,
-                    access_base: ab,
-                },
-                Self::Handle {
+                } = other
+                {
+                    a == b && ab == bb
+                } else {
+                    false
+                }
+            }
+            Self::Handle {
+                handle: a,
+                access_base: ab,
+            } => {
+                if let Self::Handle {
                     handle: b,
                     access_base: bb,
-                },
-            ) => a == b && ab == bb,
-            (
-                Self::Parameter {
-                    name: a,
-                    access_base: ab,
-                },
-                Self::Parameter {
+                } = other
+                {
+                    a == b && ab == bb
+                } else {
+                    false
+                }
+            }
+            Self::Parameter {
+                name: a,
+                access_base: ab,
+            } => {
+                if let Self::Parameter {
                     name: b,
                     access_base: bb,
-                },
-            ) => a == b && ab == bb,
-            _ => false,
+                } = other
+                {
+                    a == b && ab == bb
+                } else {
+                    false
+                }
+            }
         }
     }
 }
@@ -11966,10 +11983,21 @@ impl<P: ValueKind, B: BindingAddress> PartialEq for FunctionArgument<P, B> {
 }
 impl<P: ValueKind, B: BindingAddress> PartialEq for InterpolationPart<P, B> {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Literal(a), Self::Literal(b)) => a == b,
-            (Self::Expr(a), Self::Expr(b)) => a == b,
-            _ => false,
+        match self {
+            Self::Literal(a) => {
+                if let Self::Literal(b) = other {
+                    a == b
+                } else {
+                    false
+                }
+            }
+            Self::Expr(a) => {
+                if let Self::Expr(b) = other {
+                    a == b
+                } else {
+                    false
+                }
+            }
         }
     }
 }

@@ -1564,6 +1564,13 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
 ) -> Result<(), RootInputFailure> {
     #[cfg(feature = "test-utils")]
     if crate::test_utils::resolver_kind::is_observing() {
+        assert!(
+            session.is_none(),
+            "resolver-kind observation requires a None session; live session checks must not be replayed"
+        );
+        if crate::test_utils::resolver_kind::is_plain_capture() {
+            return oracle::collect_plain_invocation(parsed, config, resolution);
+        }
         return oracle::compare_invocation(parsed, config, session, resolution);
     }
     resolve_resource_refs_output::<ParserPlaceholder, E>(

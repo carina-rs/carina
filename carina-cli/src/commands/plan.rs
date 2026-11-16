@@ -1,6 +1,4 @@
 mod backend_config;
-#[cfg(test)]
-mod pr1_tests;
 pub use backend_config::SavedBackendConfig;
 
 use carina_core::resource::{PersistedDestroyDependencies, ResolvedResourceId};

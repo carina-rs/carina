@@ -188,3 +188,30 @@ pub(super) fn compare_invocation<E: ExportParamLike>(
     );
     enriched
 }
+
+// Identity publication only. This is the ordinary plain instantiation of the
+// same driver, with no oracle and no enriched nodes.
+pub(super) fn collect_plain_invocation<E: ExportParamLike>(
+    parsed: &mut File<E>,
+    config: &ProviderContext,
+    resolution: ResolutionContext,
+) -> Result<(), RootInputFailure> {
+    let _invocation = observation::InvocationGuard::enter(resolution.requires_available());
+    let result = resolve_resource_refs_output::<ParserPlaceholder, E>(
+        parsed,
+        config,
+        None,
+        resolution,
+        &mut |original, kind, _, value| {
+            observation::publish(
+                true,
+                matches!(kind, RootKind::Full),
+                Vec::new(),
+                output_kind::input_observation(original),
+            );
+            value
+        },
+    );
+    observation::finish_invocation(true, true, true, result.is_err());
+    result
+}

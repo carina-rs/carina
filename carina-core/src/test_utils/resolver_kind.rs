@@ -1,5 +1,6 @@
 //! Scoped observations of the production directory resolver. No raw enriched values escape.
-//! The entries below use `session = None`; replay cannot double-record session checks.
+//! Observed entries require `session = None` (asserted in the facade);
+//! replay is never permitted to record checks through a live session.
 use crate::{config_loader, parser::ProviderContext, paths::ResolvedPath, schema::SchemaRegistry};
 use std::cell::RefCell;
 
@@ -48,7 +49,7 @@ pub struct PathObservation {
     pub segmented: bool,
     pub conversion_depth: usize,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputObservation {
     pub shape: &'static str,
     pub direct_path: Option<String>,
@@ -80,10 +81,42 @@ pub struct InvocationObservation {
     pub same_error: bool,
     pub errored: bool,
 }
+/// Publication identity contains no values or parse IDs. The ordinal preserves
+/// multiplicity and source order within each invocation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootPublication {
+    pub invocation: usize,
+    pub kind: InvocationKind,
+    pub entry: &'static str,
+    pub ordinal: usize,
+    pub full: bool,
+    pub input: InputObservation,
+}
+fn publications(roots: &[RootObservation]) -> Vec<RootPublication> {
+    let mut ordinals = std::collections::BTreeMap::<usize, usize>::new();
+    roots
+        .iter()
+        .map(|root| {
+            let ordinal = ordinals.entry(root.invocation).or_default();
+            *ordinal += 1;
+            RootPublication {
+                invocation: root.invocation,
+                kind: root.invocation_kind,
+                entry: root.entry,
+                ordinal: *ordinal,
+                full: root.full,
+                input: root.input.clone(),
+            }
+        })
+        .collect()
+}
 #[derive(Default, Debug)]
 pub struct ProjectionReport {
     pub roots: Vec<RootObservation>,
     pub invocations: Vec<InvocationObservation>,
+    pub plain_strict_succeeded: bool,
+    pub plain_diagnostics_succeeded: bool,
+    pub plain_publications: Vec<RootPublication>,
     pub strict_succeeded: bool,
     pub diagnostics_succeeded: bool,
     pub strict_error_matches: bool,
@@ -91,9 +124,15 @@ pub struct ProjectionReport {
     pub strict_error: Option<String>,
     pub diagnostics_error: Option<String>,
 }
+impl ProjectionReport {
+    pub fn publications(&self) -> Vec<RootPublication> {
+        publications(&self.roots)
+    }
+}
 #[derive(Default)]
 struct State {
     active: bool,
+    plain_capture: bool,
     oracle: bool,
     per_file: bool,
     bookkeeping: bool,
@@ -121,10 +160,11 @@ struct Frame {
 thread_local! {static OBSERVER:RefCell<State>=RefCell::new(State::default());}
 struct ObserverGuard(State);
 impl ObserverGuard {
-    fn install() -> Self {
+    fn install(plain_capture: bool) -> Self {
         Self(OBSERVER.with(|s| {
             s.replace(State {
                 active: true,
+                plain_capture,
                 ..State::default()
             })
         }))
@@ -142,6 +182,9 @@ pub(crate) fn is_observing() -> bool {
         let s = s.borrow();
         s.active && !s.oracle
     })
+}
+pub(crate) fn is_plain_capture() -> bool {
+    OBSERVER.with(|state| state.borrow().plain_capture)
 }
 pub(crate) fn count(event: usize) {
     OBSERVER.with(|s| {
@@ -438,17 +481,25 @@ pub fn compare_directory(
     config: &ProviderContext,
     schemas: &SchemaRegistry,
 ) -> ProjectionReport {
-    // Independently pin errors raised before the resolver is reached as well.
-    let plain_strict = config_loader::load_configuration_report(path, config, schemas).err();
-    let plain_diagnostics =
-        config_loader::parse_directory_with_overrides_and_diagnostics_with_schemas(
-            path,
-            config,
-            &config_loader::SourceOverrides::new(),
-            schemas,
-        )
-        .err();
-    let _guard = ObserverGuard::install();
+    // A separate plain production run uses only an identity publication
+    // collector: no enriched lowering, saved-input replay or value comparisons.
+    let (plain_strict, plain_diagnostics, plain_publications) = {
+        let _plain = ObserverGuard::install(true);
+        OBSERVER.with(|s| s.borrow_mut().entry = "strict");
+        let strict = config_loader::load_configuration_report(path, config, schemas).err();
+        OBSERVER.with(|s| s.borrow_mut().entry = "diagnostics");
+        let diagnostics =
+            config_loader::parse_directory_with_overrides_and_diagnostics_with_schemas(
+                path,
+                config,
+                &config_loader::SourceOverrides::new(),
+                schemas,
+            )
+            .err();
+        let roots = OBSERVER.with(|s| publications(&s.borrow().roots));
+        (strict, diagnostics, roots)
+    };
+    let _guard = ObserverGuard::install(false);
     OBSERVER.with(|s| s.borrow_mut().entry = "strict");
     let strict_error = config_loader::load_configuration_report(path, config, schemas).err();
     OBSERVER.with(|s| s.borrow_mut().entry = "diagnostics");
@@ -470,6 +521,9 @@ pub fn compare_directory(
     ProjectionReport {
         roots,
         invocations,
+        plain_strict_succeeded: plain_strict.is_none(),
+        plain_diagnostics_succeeded: plain_diagnostics.is_none(),
+        plain_publications,
         strict_succeeded: strict_error.is_none(),
         diagnostics_succeeded: diagnostics_error.is_none(),
         strict_error_matches: same_configuration_failure(

@@ -163,6 +163,32 @@ fn observe(files: &[(String, String)]) -> ProjectionReport {
     compare_directory(&path, &config, &schemas)
 }
 fn assert_projection(report: &ProjectionReport, label: &str) {
+    assert_eq!(
+        report.strict_succeeded, report.plain_strict_succeeded,
+        "{label}: strict success differs from the independent plain run"
+    );
+    assert_eq!(
+        report.diagnostics_succeeded, report.plain_diagnostics_succeeded,
+        "{label}: diagnostics success differs from the independent plain run"
+    );
+    let actual_publications = report.publications();
+    assert_eq!(
+        actual_publications.len(),
+        report.plain_publications.len(),
+        "{label}: published-root count differs"
+    );
+    assert_eq!(
+        actual_publications, report.plain_publications,
+        "{label}: published-root identities/order differ"
+    );
+    for invocation in &report.invocations {
+        assert!(
+            invocation.same_inputs && invocation.same_roots && invocation.same_error,
+            "{label}: invocation {} inputs, roots or error differ",
+            invocation.ordinal
+        );
+    }
+
     assert!(!report.roots.is_empty(), "{label}: no published roots");
     for (index, root) in report.roots.iter().enumerate() {
         // Never format a Value: retained secret operands can contain plaintext.
@@ -328,7 +354,7 @@ const DEFECTS: [&str; 16] = [
 fn defect_forms_keep_paths() {
     // Consume the Phase 0 input bytes, including its same-file twins, unchanged.
     let golden: Json = serde_json::from_str(include_str!(
-        "../../../../carina-cli/tests/fixtures/resolver_kind_main/4400-cells.json"
+        "../../../../carina-cli/tests/fixtures/authored_reference_cells.json"
     ))
     .unwrap();
     let mut rows = 0;
