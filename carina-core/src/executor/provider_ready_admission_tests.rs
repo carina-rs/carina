@@ -102,6 +102,7 @@ async fn assert_ordinary_dispatch_duplicate(entry: UniqueListEntry) {
         .0
         .take_attribute("value")
         .unwrap()
+        .0
         .into_located()
         .into_iter()
         .map(|(path, error)| (path.to_string(), error.to_string()))
@@ -300,7 +301,7 @@ async fn dispatch_secret_schema_failures_keep_exact_boundary_messages() {
                     let ProviderPreparationError::ValueConstraint { mut errors, .. } = error else {
                         panic!("expected dispatch membership error")
                     };
-                    let findings = errors.0.take_attribute("value").unwrap().into_located();
+                    let findings = errors.0.take_attribute("value").unwrap().0.into_located();
                     assert_eq!(
                         findings
                             .into_iter()
