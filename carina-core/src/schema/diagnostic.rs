@@ -27,7 +27,7 @@ pub(crate) enum SchemaDiagnosticKey {
         name: String,
     },
     Value {
-        root: Option<String>,
+        root: String,
         relative: SchemaKeyPath,
         coverage: Option<LeafPath>,
     },
@@ -81,7 +81,7 @@ fn secret_parent(path: &FieldPath) -> FieldPath {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OtherSchemaFinding {
     error: TypeError,
-    path: Option<(Option<String>, LeafPath)>,
+    path: Option<(String, LeafPath)>,
 }
 
 impl OtherSchemaFinding {
@@ -90,9 +90,7 @@ impl OtherSchemaFinding {
     }
 
     pub fn path(&self) -> Option<(&str, &LeafPath)> {
-        self.path
-            .as_ref()
-            .and_then(|(root, path)| root.as_deref().map(|root| (root, path)))
+        self.path.as_ref().map(|(root, path)| (root.as_str(), path))
     }
 }
 
@@ -102,18 +100,138 @@ impl KeyedSchemaFinding {
     }
 }
 
+/// A diagnostic produced by the walk before its attribute is known.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RelativeSchemaDiagnostic {
+    target: RelativeDiagnosticTarget,
+    error: TypeError,
+}
+
+#[derive(Clone, PartialEq)]
+enum RelativeDiagnosticTarget {
+    Attribute,
+    Value {
+        relative: SchemaKeyPath,
+        coverage: Option<LeafPath>,
+    },
+    Other {
+        path: Option<LeafPath>,
+    },
+}
+
+impl std::fmt::Debug for RelativeDiagnosticTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RelativeDiagnosticTarget(..)")
+    }
+}
+
+impl RelativeSchemaDiagnostic {
+    pub(super) fn new(path: &FieldPath, error: TypeError) -> Self {
+        let target = if matches!(error, TypeError::UnknownAttribute { .. }) && path.is_empty() {
+            RelativeDiagnosticTarget::Attribute
+        } else if is_unknown_key(&error) {
+            RelativeDiagnosticTarget::Value {
+                relative: SchemaKeyPath::new(path),
+                coverage: Some(path.canonical()),
+            }
+        } else {
+            RelativeDiagnosticTarget::Other {
+                path: Some(path.canonical()),
+            }
+        };
+        Self { target, error }
+    }
+
+    pub(crate) fn error(&self) -> &TypeError {
+        &self.error
+    }
+    fn into_error(self) -> TypeError {
+        self.error
+    }
+
+    pub(super) fn at_attribute(self, root: impl Into<String>) -> SchemaDiagnostic {
+        let root = root.into();
+        match self.target {
+            RelativeDiagnosticTarget::Attribute => {
+                SchemaDiagnostic::UnknownKey(KeyedSchemaFinding {
+                    key: SchemaDiagnosticKey::Attribute { name: root },
+                    error: self.error,
+                })
+            }
+            RelativeDiagnosticTarget::Value { relative, coverage } => {
+                SchemaDiagnostic::UnknownKey(KeyedSchemaFinding {
+                    key: SchemaDiagnosticKey::Value {
+                        root,
+                        relative,
+                        coverage,
+                    },
+                    error: self.error,
+                })
+            }
+            RelativeDiagnosticTarget::Other { path } => {
+                SchemaDiagnostic::Other(OtherSchemaFinding {
+                    error: self.error,
+                    path: path.map(|path| (root, path)),
+                })
+            }
+        }
+    }
+
+    fn with_error(self, error: TypeError, source: &FieldPath) -> Self {
+        let target = match (self.target, is_unknown_key(&error)) {
+            (RelativeDiagnosticTarget::Attribute, true)
+                if matches!(error, TypeError::UnknownAttribute { .. }) =>
+            {
+                RelativeDiagnosticTarget::Attribute
+            }
+            (
+                RelativeDiagnosticTarget::Attribute | RelativeDiagnosticTarget::Other { .. },
+                true,
+            ) => return Self::new(source, error),
+            (RelativeDiagnosticTarget::Value { relative, coverage }, true) => {
+                if matches!(error, TypeError::UnknownAttribute { .. }) && relative.path().is_empty()
+                {
+                    RelativeDiagnosticTarget::Attribute
+                } else {
+                    RelativeDiagnosticTarget::Value { relative, coverage }
+                }
+            }
+            (RelativeDiagnosticTarget::Attribute, false) => {
+                RelativeDiagnosticTarget::Other { path: None }
+            }
+            (RelativeDiagnosticTarget::Value { coverage, .. }, false) => {
+                RelativeDiagnosticTarget::Other { path: coverage }
+            }
+            (RelativeDiagnosticTarget::Other { path }, false) => {
+                RelativeDiagnosticTarget::Other { path }
+            }
+        };
+        Self { target, error }
+    }
+
+    fn with_coverage(mut self, path: Option<&LeafPath>) -> Self {
+        match &mut self.target {
+            RelativeDiagnosticTarget::Attribute => {}
+            RelativeDiagnosticTarget::Value { coverage, .. } => *coverage = path.cloned(),
+            RelativeDiagnosticTarget::Other { path: stored } => {
+                *stored = stored.take().and_then(|_| path.cloned());
+            }
+        }
+        self
+    }
+
+    fn at_secret_boundary(&mut self, boundary: &FieldPath) {
+        if let RelativeDiagnosticTarget::Value { relative, .. } = &mut self.target {
+            *relative = SchemaKeyPath::SecretParent(secret_parent(boundary));
+        }
+    }
+}
+
 impl SchemaDiagnostic {
     pub fn error(&self) -> &TypeError {
         match self {
             Self::UnknownKey(finding) => finding.error(),
             Self::Other(finding) => &finding.error,
-        }
-    }
-
-    fn into_error(self) -> TypeError {
-        match self {
-            Self::UnknownKey(finding) => finding.error,
-            Self::Other(finding) => finding.error,
         }
     }
 
@@ -132,107 +250,11 @@ impl SchemaDiagnostic {
         relative: LeafPath,
         error: TypeError,
     ) -> Self {
-        let root = root.into();
-        if matches!(error, TypeError::UnknownAttribute { .. }) {
-            return Self::UnknownKey(KeyedSchemaFinding {
-                key: SchemaDiagnosticKey::Attribute { name: root },
-                error,
-            });
-        }
-        Self::relative(
+        RelativeSchemaDiagnostic::new(
             &FieldPath::from_canonical_segments(relative.segments().iter().cloned()),
             error,
         )
-        .at_attribute(&root)
-    }
-
-    /// Walk findings have a relative target until their attribute is known.
-    pub(super) fn relative(path: &FieldPath, error: TypeError) -> Self {
-        if is_unknown_key(&error) {
-            Self::UnknownKey(KeyedSchemaFinding {
-                key: SchemaDiagnosticKey::Value {
-                    root: None,
-                    relative: SchemaKeyPath::new(path),
-                    coverage: Some(path.canonical()),
-                },
-                error,
-            })
-        } else {
-            Self::Other(OtherSchemaFinding {
-                error,
-                path: Some((None, path.canonical())),
-            })
-        }
-    }
-
-    pub(super) fn at_attribute(mut self, root: &str) -> Self {
-        if matches!(
-            &self,
-            Self::UnknownKey(KeyedSchemaFinding {
-                key: SchemaDiagnosticKey::Value { .. },
-                error: TypeError::UnknownAttribute { .. },
-            })
-        ) {
-            return Self::from_value(root, LeafPath::from_segments([]), self.into_error());
-        }
-        match &mut self {
-            Self::UnknownKey(finding) => match &mut finding.key {
-                SchemaDiagnosticKey::Unlocated => {}
-                SchemaDiagnosticKey::Attribute { name } => *name = root.into(),
-                SchemaDiagnosticKey::Value { root: name, .. } => *name = Some(root.into()),
-            },
-            Self::Other(finding) => {
-                if let Some((name, _)) = &mut finding.path {
-                    *name = Some(root.into());
-                }
-            }
-        }
-        self
-    }
-
-    fn with_error(mut self, error: TypeError, source: &FieldPath) -> Self {
-        let same_contract = match &self {
-            Self::UnknownKey(finding) => match &finding.key {
-                SchemaDiagnosticKey::Unlocated => is_unknown_key(&error),
-                SchemaDiagnosticKey::Attribute { .. } => {
-                    matches!(error, TypeError::UnknownAttribute { .. })
-                }
-                SchemaDiagnosticKey::Value { .. } => {
-                    is_unknown_key(&error) && !matches!(error, TypeError::UnknownAttribute { .. })
-                }
-            },
-            Self::Other(_) => !is_unknown_key(&error),
-        };
-        if !same_contract {
-            let (root, coverage) = match &self {
-                Self::UnknownKey(finding) => match &finding.key {
-                    SchemaDiagnosticKey::Unlocated => (None, None),
-                    SchemaDiagnosticKey::Attribute { name } => (Some(name.clone()), None),
-                    SchemaDiagnosticKey::Value { root, coverage, .. } => {
-                        (root.clone(), coverage.clone())
-                    }
-                },
-                Self::Other(finding) => (
-                    finding.path.as_ref().and_then(|(root, _)| root.clone()),
-                    finding.path.as_ref().map(|(_, path)| path.clone()),
-                ),
-            };
-            let replacement = Self::relative(source, error);
-            let replacement = match root {
-                Some(root) => replacement.at_attribute(&root),
-                None => replacement,
-            };
-            return if matches!(replacement, Self::Other(_)) {
-                replacement.with_coverage(coverage.as_ref())
-            } else {
-                replacement
-            };
-        }
-        match &mut self {
-            Self::UnknownKey(finding) => finding.error = error,
-            Self::Other(finding) => finding.error = error,
-        }
-        self
+        .at_attribute(root)
     }
 
     /// Ordinary paths never expose an unknown key's location target.
@@ -248,7 +270,7 @@ impl SchemaDiagnostic {
             Self::UnknownKey(finding) => match &finding.key {
                 SchemaDiagnosticKey::Unlocated | SchemaDiagnosticKey::Attribute { .. } => None,
                 SchemaDiagnosticKey::Value { root, coverage, .. } => {
-                    root.as_deref().zip(coverage.as_ref())
+                    coverage.as_ref().map(|path| (root.as_str(), path))
                 }
             },
             Self::Other(finding) => finding.path(),
@@ -272,11 +294,44 @@ impl SchemaDiagnostic {
         self
     }
 
-    fn at_secret_boundary(&mut self, boundary: &FieldPath) {
-        if let Self::UnknownKey(finding) = self
-            && let SchemaDiagnosticKey::Value { relative, .. } = &mut finding.key
-        {
-            *relative = SchemaKeyPath::SecretParent(secret_parent(boundary));
+    pub(super) fn attribute_root(&self) -> Option<&str> {
+        match self {
+            Self::UnknownKey(finding) => match &finding.key {
+                SchemaDiagnosticKey::Attribute { name } => Some(name),
+                SchemaDiagnosticKey::Value { root, .. } => Some(root),
+                SchemaDiagnosticKey::Unlocated => None,
+            },
+            Self::Other(finding) => finding.path().map(|(root, _)| root),
+        }
+    }
+}
+
+impl InsideSecret for SchemaKeyPath {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::Key(_) => Self::SecretParent(secret_parent(&FieldPath::new())),
+            Self::SecretParent(path) => Self::SecretParent(path),
+        }
+    }
+}
+
+impl InsideSecret for RelativeSchemaDiagnostic {
+    fn inside_secret(self) -> Self {
+        let target = match self.target {
+            RelativeDiagnosticTarget::Attribute => RelativeDiagnosticTarget::Attribute,
+            RelativeDiagnosticTarget::Value { relative, coverage } => {
+                RelativeDiagnosticTarget::Value {
+                    relative: relative.inside_secret(),
+                    coverage: coverage.map(InsideSecret::inside_secret),
+                }
+            }
+            RelativeDiagnosticTarget::Other { path } => RelativeDiagnosticTarget::Other {
+                path: path.map(InsideSecret::inside_secret),
+            },
+        };
+        Self {
+            target,
+            error: self.error.inside_secret(),
         }
     }
 }
@@ -290,14 +345,7 @@ impl InsideSecret for SchemaDiagnostic {
                     relative, coverage, ..
                 } = &mut finding.key
                 {
-                    *relative = match relative {
-                        SchemaKeyPath::Key(_) => {
-                            SchemaKeyPath::SecretParent(secret_parent(&FieldPath::new()))
-                        }
-                        SchemaKeyPath::SecretParent(path) => {
-                            SchemaKeyPath::SecretParent(path.clone())
-                        }
-                    };
+                    *relative = relative.clone().inside_secret();
                     *coverage = coverage.take().map(InsideSecret::inside_secret);
                 }
                 Self::UnknownKey(finding)
@@ -327,13 +375,13 @@ fn is_unknown_key(error: &TypeError) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct PrimaryValueFinding {
     pub(super) path: FieldPath,
-    diagnostic: SchemaDiagnostic,
+    diagnostic: RelativeSchemaDiagnostic,
 }
 
 impl PrimaryValueFinding {
     pub(super) fn new(path: FieldPath, error: TypeError) -> Self {
         Self {
-            diagnostic: SchemaDiagnostic::relative(&path, error),
+            diagnostic: RelativeSchemaDiagnostic::new(&path, error),
             path,
         }
     }
@@ -398,11 +446,7 @@ mod tests {
     use crate::resource::InsideSecret;
 
     fn target(finding: &PrimaryValueFinding) -> &FieldPath {
-        let SchemaDiagnostic::UnknownKey(KeyedSchemaFinding {
-            key: SchemaDiagnosticKey::Value { relative, .. },
-            ..
-        }) = &finding.diagnostic
-        else {
+        let RelativeDiagnosticTarget::Value { relative, .. } = &finding.diagnostic.target else {
             panic!("nested unknown key")
         };
         relative.path()
@@ -484,14 +528,16 @@ mod tests {
             for (operation, diagnostic) in [
                 (
                     "with_error",
-                    SchemaDiagnostic::relative(&path, old.clone())
-                        .with_error(replacement.clone(), &path),
+                    RelativeSchemaDiagnostic::new(&path, old.clone())
+                        .with_error(replacement.clone(), &path)
+                        .at_attribute("direct"),
                 ),
                 (
                     "map_error",
                     PrimaryValueFinding::new(path.clone(), old.clone())
                         .map_error(|_| replacement.clone())
-                        .diagnostic,
+                        .diagnostic
+                        .at_attribute("direct"),
                 ),
                 (
                     "diagnostic",

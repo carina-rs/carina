@@ -453,7 +453,7 @@ fn locate_unknown_key(
             }
         }
         SchemaDiagnosticKey::Value {
-            root: Some(name),
+            root: name,
             relative,
             ..
         } => AttributeDiagnosticLocations {
@@ -461,14 +461,6 @@ fn locate_unknown_key(
             root: authored_root(name)?.location(),
         }
         .attribute_path_location(name, relative.path()),
-        SchemaDiagnosticKey::Value { root: None, .. } => {
-            return Err(AnalysisTreeError::new(
-                AnalysisTreeErrorKind::MissingElementProvenance {
-                    declaration: declaration.clone(),
-                    element: "schema diagnostic attribute binding".into(),
-                },
-            ));
-        }
     };
     Ok(Located::new(location.clone(), finding.error().clone()))
 }

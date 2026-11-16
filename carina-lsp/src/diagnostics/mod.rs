@@ -944,7 +944,7 @@ impl DiagnosticRun<'_> {
                     continue;
                 }
 
-                let attr_findings = value_validation
+                let (attr_findings, symbolic) = value_validation
                     .take_attribute(attr_name)
                     .unwrap_or_default();
                 // Admission owns the syntax verdict. Parser-owned
@@ -977,7 +977,6 @@ impl DiagnosticRun<'_> {
                 }
 
                 let assignment_value = judged_expression.assignment_value(typecheck_value);
-                let symbolic = attr_findings.symbolic_findings().to_vec();
                 let has_exact_findings = symbolic.iter().any(|finding| !finding.covers_path());
                 let mut handled_enum_diagnostic = false;
                 if matches!(

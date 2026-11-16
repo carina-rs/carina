@@ -404,7 +404,7 @@ where
             if attributes.keys().any(|name| {
                 admitted
                     .take_attribute(name)
-                    .is_some_and(|checked| checked.rejected_by_claim())
+                    .is_some_and(|(checked, _)| checked.rejected_by_claim())
             }) {
                 local.push(Finding {
                     conversion: None,

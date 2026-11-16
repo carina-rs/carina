@@ -28,7 +28,7 @@ fn assert_protected_constraint(error: ProviderPreparationError) {
         assert_hidden(&error.to_string());
         assert_hidden(&format!("{error:?}"));
     }
-    let findings = errors.0.take_attribute("value").expect("retained findings");
+    let (findings, _) = errors.0.take_attribute("value").expect("retained findings");
     assert_hidden(&format!("{findings:?}"));
     let located = findings.into_located();
     assert!(

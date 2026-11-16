@@ -2284,7 +2284,10 @@ impl Schema {
             FieldAncestry::WRITABLE,
             None,
         )
-        .into_local_findings()
+        .local
+        .into_iter()
+        .map(|finding| (finding.path.clone(), finding.into_error()))
+        .collect()
     }
 
     /// Validate one recursive child against this rootless schema's definitions.
@@ -10003,7 +10006,11 @@ impl<'a> EffectiveType<'a> {
         &self,
         value: &Value<P, B>,
     ) -> Vec<(FieldPath, TypeError)> {
-        self.validate_findings(value).into_local_findings()
+        self.validate_findings(value)
+            .local
+            .into_iter()
+            .map(|finding| (finding.path.clone(), finding.into_error()))
+            .collect()
     }
 
     /// Canonicalize provider or persisted state without discarding the
