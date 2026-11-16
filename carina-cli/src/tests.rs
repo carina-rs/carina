@@ -44,7 +44,7 @@ use crate::commands::apply::{
     save_state_locked,
 };
 use crate::commands::plan::{
-    CurrentStateEntry, MovedOrigins, PlanFile, PlanFileContents, RecordedProviderArtifact,
+    CurrentStateEntry, MovedOrigins, PlanFile, PlanFileTransport, RecordedProviderArtifact,
     ReloadedCurrentStateEntry, SavedDataSourceValue,
 };
 use crate::commands::shared::finalize::StatePersistence;
@@ -230,7 +230,7 @@ fn provider_config_for_evidence_test(name: &str) -> ExpandedProviderConfig {
     }
 }
 
-fn record_test_plan(contents: PlanFileContents, providers: &[&str]) -> PlanFile {
+fn record_test_plan(contents: PlanFileTransport, providers: &[&str]) -> PlanFile {
     let factories = providers
         .iter()
         .map(|provider| {
@@ -948,7 +948,7 @@ fn plan_file_serde_round_trip() {
     let data_source = DataSource::with_provider("aws", "sts.CallerIdentity", "caller", None);
 
     let plan_file = record_test_plan(
-        PlanFileContents {
+        PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "0.1.0".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
@@ -3980,7 +3980,7 @@ fn plan_file_serialization_redacts_secrets() {
 
     // Redact before building PlanFile (same as production code does)
     let plan_file = record_test_plan(
-        PlanFileContents {
+        PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "0.1.0".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
@@ -4047,7 +4047,7 @@ fn plan_file_serialization_redacts_secrets() {
 #[test]
 fn plan_file_serialization_rejects_pending_resource_identity() {
     let plan_file = record_test_plan(
-        PlanFileContents {
+        PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
@@ -4095,7 +4095,7 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
 #[test]
 fn plan_file_validation_rejects_missing_resource_identity() {
     let plan_file = record_test_plan(
-        PlanFileContents {
+        PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-01-01T00:00:00Z".to_string(),
@@ -4173,7 +4173,7 @@ fn plan_file_with_deferred_effect(effect: Effect) -> PlanFile {
     let mut plan = Plan::new();
     plan.add(effect);
     record_test_plan(
-        PlanFileContents {
+        PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-30T00:00:00Z".to_string(),
@@ -4502,7 +4502,7 @@ fn plan_file_validation_rejects_deferred_replace_id_that_disagrees_with_target()
     );
 }
 
-fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
+fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileTransport {
     use std::time::Duration;
 
     use carina_core::wait::ManagedWaitTarget;
@@ -4532,7 +4532,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileContents {
         interval: Duration::from_secs(5),
         explicit_dependencies: Default::default(),
     });
-    PlanFileContents {
+    PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
@@ -4662,7 +4662,7 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
         resource: resolved_data_source(data_source.clone()),
     });
     let plan_file = record_test_plan(
-        PlanFileContents {
+        PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-28T00:00:00Z".to_string(),

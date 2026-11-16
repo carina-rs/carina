@@ -112,36 +112,40 @@ impl AdmittedSavedPlanReplay {
 /// It cannot be constructed from a raw Plan or mutated after redaction.
 ///
 /// ```compile_fail,E0451
-/// use carina_core::{saved_replay::RecordedPlanSnapshot, plan::Plan};
-/// let forged = RecordedPlanSnapshot { plan: Plan::new().to_snapshot() };
+/// use carina_core::{saved_replay::RecordedPlanSnapshot, plan::SnapshotPlan, value::Saved};
+/// fn forge(plan: Saved<SnapshotPlan>) -> RecordedPlanSnapshot {
+///     RecordedPlanSnapshot { plan }
+/// }
 /// ```
 #[derive(Debug)]
 pub struct RecordedPlanSnapshot {
-    plan: crate::plan::SnapshotPlan,
+    plan: crate::value::Saved<crate::plan::SnapshotPlan>,
 }
 impl RecordedPlanSnapshot {
     pub fn plan(&self) -> &crate::plan::SnapshotPlan {
-        &self.plan
+        self.plan.as_inner()
     }
     pub fn into_wire(self) -> UnresolvedSavedPlan {
-        UnresolvedSavedPlan::from_recorded_snapshot(self.plan.into())
+        crate::plan::UnresolvedSavedPlan::from_recorded_snapshot(self.plan.into_inner().into())
     }
 }
 impl InputCheckedPlan {
-    pub fn record_snapshot<D>(
+    pub fn record_snapshot<D: Clone>(
         &self,
+        conversion: &crate::value::SavedDocumentConversion,
         desired: &HashMap<
             ResourceId,
-            Resource<
-                crate::resource::ModuleSource,
-                SnapshotLeaf,
-                crate::resource::AbsoluteBindingAddress,
-                D,
+            crate::value::Saved<
+                Resource<
+                    crate::resource::ModuleSource,
+                    SnapshotLeaf,
+                    crate::resource::AbsoluteBindingAddress,
+                    D,
+                >,
             >,
         >,
-        historical: &HashMap<ResourceId, SnapshotState>,
+        historical: &HashMap<ResourceId, crate::value::Saved<SnapshotState>>,
     ) -> Result<RecordedPlanSnapshot, crate::value::SerializationError> {
-        let conversion = crate::value::SavedDocumentConversion::new(std::iter::empty())?;
         Ok(RecordedPlanSnapshot {
             plan: conversion.redact_secrets_in_plan_with_desired_and_historical(
                 self.plan(),

@@ -4503,9 +4503,10 @@ where
                 }
                 .serialize(serializer)
             }
-            Self::ResolvedFunctionCall { .. } => Err(serde::ser::Error::custom(
-                crate::value::RetainedUserFunctionCallError,
-            )),
+            Self::ResolvedFunctionCall { function, .. } => Err(serde::ser::Error::custom(format!(
+                "deferred user-function call '{}' cannot be serialized before evaluation",
+                function.name,
+            ))),
             Self::Access(access) => SerializableDeferredValue::Access {
                 base: access.base(),
                 step: access.step(),

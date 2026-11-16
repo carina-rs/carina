@@ -23,7 +23,13 @@ async fn refusal_has_project_apply_hint_plan_out() {
             &result,
             Err(AppError::RetainedUserFunctionCall { .. })
         ));
-        assert_eq!(diagnostic, expected_retained_plan_refusal(directory.path()));
+        assert_eq!(
+            diagnostic,
+            expected_retained_plan_refusal(
+                directory.path(),
+                if name.starts_with("c1-") { "f" } else { "g" }
+            )
+        );
         assert!(!saved.exists());
         assert_eq!(directory.fixture.count("create", "Sink"), 0);
         directory.assert_unlocked().await;
@@ -68,7 +74,13 @@ async fn retained_and_invalid_calls_refuse_json_with_exact_diagnostics() {
                 &result,
                 Err(AppError::RetainedUserFunctionCall { .. })
             ));
-            assert_eq!(diagnostic, expected_retained_plan_refusal(directory.path()));
+            assert_eq!(
+                diagnostic,
+                expected_retained_plan_refusal(
+                    directory.path(),
+                    if name.starts_with("c1-") { "f" } else { "g" }
+                )
+            );
         }
         directory.assert_unlocked().await;
     }
@@ -76,7 +88,7 @@ async fn retained_and_invalid_calls_refuse_json_with_exact_diagnostics() {
 
 #[tokio::test]
 async fn problem_sentence_is_an_ordinary_savable_string() {
-    let value = "the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call.";
+    let value = "the plan contains an unevaluated call to the user-defined function 'checked'. A saved plan cannot carry this call.";
     let directory = Directory::new(&Case {
         name: "problem-looking-value".into(),
         main: format!(

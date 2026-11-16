@@ -18,9 +18,12 @@ fn project_with_provider_attributes(
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workspace.join("target"));
     let wasm = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
         .into_iter()
-        .map(|name| workspace.join("target/wasm32-wasip2/debug").join(name))
+        .map(|name| target.join("wasm32-wasip2/debug").join(name))
         .find(|path| path.is_file())
         .expect("build carina-provider-mock for wasm32-wasip2 before this test");
     let source = format!("file://{}", wasm.display());

@@ -1,0 +1,424 @@
+---
+source: carina-cli/src/fn_declared_checks_tests/saved_document.rs
+assertion_line: 120
+expression: normalized
+---
+{
+  "version": 46,
+  "carina_version": "0.15.0",
+  "timestamp": "<timestamp>",
+  "source_path": "<project>",
+  "source_identity": "<project>",
+  "state_lineage": null,
+  "state_serial": null,
+  "provider_configs": [
+    {
+      "name": "test",
+      "attributes": {},
+      "source": "file://./native-fixture.wasm"
+    }
+  ],
+  "backend_config": {
+    "backend_type": "local",
+    "attributes": {
+      "path": {
+        "String": "<project>/state.json"
+      }
+    }
+  },
+  "plan": {
+    "effects": [
+      {
+        "Create": {
+          "id": {
+            "provider": "test",
+            "resource_type": "Sink",
+            "identity": "test_sink_0990c8a18c040020"
+          },
+          "attributes": {
+            "name": {
+              "String": "sink"
+            },
+            "value": {
+              "FunctionCall": {
+                "name": "upper",
+                "args": [
+                  {
+                    "ResourceRef": {
+                      "path": {
+                        "binding": "instance.src",
+                        "attribute": "emitted"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": null,
+          "dependencies": null,
+          "module_source": null,
+          "value_dependencies": [
+            {
+              "provider": "test",
+              "resource_type": "Thing",
+              "identity": "instance.src"
+            }
+          ],
+          "persisted_value_destroy_dependencies": [
+            {
+              "provider": "test",
+              "resource_type": "Thing",
+              "identity": "instance.src"
+            }
+          ],
+          "value_dependency_reads": [
+            {
+              "id": {
+                "provider": "test",
+                "resource_type": "Thing",
+                "identity": "instance.src"
+              },
+              "read": "Unknown"
+            }
+          ]
+        }
+      },
+      {
+        "Create": {
+          "id": {
+            "provider": "test",
+            "resource_type": "Thing",
+            "identity": "instance.src"
+          },
+          "attributes": {
+            "name": {
+              "String": "allowed"
+            }
+          },
+          "directives": {
+            "force_delete": false,
+            "create_before_destroy": false,
+            "prevent_destroy": {
+              "kind": "unspecified"
+            }
+          },
+          "prefixes": {},
+          "binding": "instance.src",
+          "dependencies": null,
+          "module_source": {
+            "Module": {
+              "name": "child",
+              "instance": "instance"
+            }
+          }
+        }
+      }
+    ]
+  },
+  "sorted_resources": [
+    {
+      "id": {
+        "provider": "test",
+        "resource_type": "Sink",
+        "identity": "test_sink_0990c8a18c040020"
+      },
+      "attributes": {
+        "name": {
+          "String": "sink"
+        },
+        "value": {
+          "FunctionCall": {
+            "name": "upper",
+            "args": [
+              {
+                "ResourceRef": {
+                  "path": {
+                    "binding": "instance.src",
+                    "attribute": "emitted"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "test",
+        "resource_type": "Thing",
+        "identity": "instance.src"
+      },
+      "attributes": {
+        "name": {
+          "String": "allowed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "instance.src",
+      "dependencies": null,
+      "module_source": {
+        "Module": {
+          "name": "child",
+          "instance": "instance"
+        }
+      }
+    }
+  ],
+  "sorted_value_destroy_dependencies": [
+    [
+      {
+        "provider": "test",
+        "resource_type": "Thing",
+        "identity": "instance.src"
+      }
+    ],
+    []
+  ],
+  "sorted_explicit_destroy_dependencies": [
+    [],
+    []
+  ],
+  "legacy_dependency_classification": null,
+  "unresolved_resources": [
+    {
+      "id": {
+        "provider": "test",
+        "resource_type": "Sink",
+        "identity": "test_sink_0990c8a18c040020"
+      },
+      "attributes": {
+        "name": {
+          "String": "sink"
+        },
+        "value": {
+          "ResourceRef": {
+            "path": {
+              "binding": "instance",
+              "attribute": "output"
+            }
+          }
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": null,
+      "dependencies": null,
+      "module_source": null
+    },
+    {
+      "id": {
+        "provider": "test",
+        "resource_type": "Thing",
+        "identity": "instance.src"
+      },
+      "attributes": {
+        "name": {
+          "String": "allowed"
+        }
+      },
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "binding": "instance.src",
+      "dependencies": null,
+      "module_source": {
+        "Module": {
+          "name": "child",
+          "instance": "instance"
+        }
+      }
+    }
+  ],
+  "compositions": [
+    {
+      "id": {
+        "provider": "",
+        "resource_type": "_virtual",
+        "identity": "instance"
+      },
+      "arguments": {
+        "input": {
+          "String": "allowed"
+        }
+      },
+      "attributes": {
+        "output": {
+          "Derived": {
+            "FunctionCall": {
+              "name": "upper",
+              "args": [
+                {
+                  "ResourceRef": {
+                    "path": {
+                      "binding": "instance.src",
+                      "attribute": "emitted"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "pending_constraints": [],
+      "binding": "instance",
+      "dependency_bindings": [],
+      "module_name": "child",
+      "instance": "instance",
+      "origin_id": {
+        "root": {
+          "source_file": {
+            "location": "source_root_relative",
+            "path": "main.crn"
+          },
+          "call_span": {
+            "start_byte": 54,
+            "end_byte": 81,
+            "start_line": 2,
+            "start_column": 16,
+            "end_line": 2,
+            "end_column": 43
+          },
+          "expansion": {
+            "kind": "direct"
+          }
+        },
+        "descendants": []
+      }
+    }
+  ],
+  "data_sources": [],
+  "data_source_origins": [],
+  "data_source_values": [],
+  "current_states": [
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "test",
+        "resource_type": "Sink",
+        "identity": "test_sink_0990c8a18c040020"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "test",
+            "resource_type": "Sink",
+            "identity": "test_sink_0990c8a18c040020"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    },
+    {
+      "kind": "managed",
+      "id": {
+        "provider": "test",
+        "resource_type": "Thing",
+        "identity": "instance.src"
+      },
+      "current": {
+        "status": "absent",
+        "state": {
+          "id": {
+            "provider": "test",
+            "resource_type": "Thing",
+            "identity": "instance.src"
+          },
+          "identifier": null,
+          "attributes": {},
+          "exists": false,
+          "dependency_bindings": []
+        }
+      }
+    }
+  ],
+  "upstream_snapshot": {},
+  "upstream_sources": [],
+  "wait_bindings": [],
+  "persisted_directive_changes": [],
+  "schema_fingerprints": {
+    "providers": {
+      "test": {
+        "schemas": [
+          {
+            "kind": "resource",
+            "resource_type": "Sink",
+            "fingerprint": {
+              "present": "8060f57008cc1e1b29f10f09553d3f0843ffe75906521df83f0b6f024c6e206a"
+            }
+          },
+          {
+            "kind": "resource",
+            "resource_type": "Thing",
+            "fingerprint": {
+              "present": "3df8bfd8911a5d57b193ae0aa05851a40135ad86969ed51a02b57c678bf09a4e"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "provider_artifacts": {
+    "test": {
+      "kind": "wasm",
+      "sha256": "17e9b0f67d127ad63d50420d04af6084355d650443a75ddd33531844b3e84b8e",
+      "origin": {
+        "kind": "file"
+      }
+    }
+  },
+  "provider_scopes": [
+    {
+      "instance": {
+        "provider": "test",
+        "provider_instance": null
+      },
+      "scope": {
+        "kind": "unavailable"
+      }
+    }
+  ]
+}

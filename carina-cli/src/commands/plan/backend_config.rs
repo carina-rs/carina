@@ -52,15 +52,13 @@ impl SavedBackendConfig {
         }
     }
     pub(super) fn for_saved_document(
-        self,
+        &self,
         conversion: &carina_core::value::SavedDocumentConversion,
-    ) -> Result<Self, carina_core::value::SerializationError> {
-        if let Some(config) = self.candidate() {
-            for value in config.attributes.values() {
-                conversion.admit_expression(value)?;
-            }
-        }
-        Ok(self)
+    ) -> Result<
+        carina_core::value::Saved<Option<ExpandedBackendConfig>>,
+        carina_core::value::SerializationError,
+    > {
+        conversion.snapshot(self.candidate().cloned())
     }
     pub(super) fn into_wire(self) -> Option<ExpandedBackendConfig> {
         match self.source {

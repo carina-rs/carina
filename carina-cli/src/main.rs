@@ -1809,21 +1809,3 @@ mod apply_input_error_tests {
         assert_eq!(rendered.stderr, expected);
     }
 }
-
-#[cfg(test)]
-mod plan_save_error_rendering_tests {
-    use super::*;
-    #[test]
-    fn retained_call_refusal_uses_project_apply_hint() {
-        let app_error = error::AppError::RetainedUserFunctionCall {
-            problem: carina_core::value::RetainedUserFunctionCallError,
-            project_dir: Path::new(".").to_path_buf(),
-        };
-        let rendered = render_app_error(carina_cli::output_style::ColorMode::Plain, &app_error);
-        assert_eq!(rendered.exit_code, 1);
-        assert_eq!(
-            rendered.stderr,
-            "Error: Cannot save plan: the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call.\nError: Run `carina apply` directly on the project, without a saved plan.\n"
-        );
-    }
-}

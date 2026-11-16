@@ -548,7 +548,10 @@ fn native_refusal_output_worker_plan_out() {
                     ));
                     assert_eq!(
                         rendered(&result),
-                        expected_retained_plan_refusal(directory.path())
+                        expected_retained_plan_refusal(
+                            directory.path(),
+                            if name.starts_with("c1-") { "f" } else { "g" }
+                        )
                     );
                     assert!(!saved.exists());
                     assert_eq!(directory.fixture.count("create", "Sink"), 0);

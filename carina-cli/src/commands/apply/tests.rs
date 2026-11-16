@@ -37,7 +37,7 @@ mod storage_readiness;
 
 use cancellation_fixture::ApplyCancellationFixture;
 
-use crate::commands::plan::PlanFileContents;
+use crate::commands::plan::PlanFileTransport;
 use crate::commands::shared::state_writeback::{ApplyStateSave, build_state_after_apply};
 use crate::fixture_read_outcome;
 use crate::wiring::{
@@ -1034,7 +1034,7 @@ where
     registry
 }
 
-fn record_with_test_context(contents: PlanFileContents) -> PlanFile {
+fn record_with_test_context(contents: PlanFileTransport) -> PlanFile {
     let ctx = ValidatedConfig::from_factories_for_test_with_provider_phase(
         &crate::test_support::TestCommandRuntime::new(),
         (),
@@ -1051,7 +1051,7 @@ fn record_with_test_context(contents: PlanFileContents) -> PlanFile {
         .expect("test plan provider evidence must be valid")
 }
 
-fn record_with_test_schemas(contents: PlanFileContents, schemas: &SchemaRegistry) -> PlanFile {
+fn record_with_test_schemas(contents: PlanFileTransport, schemas: &SchemaRegistry) -> PlanFile {
     let additional_schemas = schemas
         .iter()
         .map(|(provider, _resource_type, _kind, schema)| (provider.to_string(), schema.clone()))
@@ -1073,7 +1073,7 @@ fn record_with_test_schemas(contents: PlanFileContents, schemas: &SchemaRegistry
         .expect("test plan provider evidence must be valid")
 }
 
-fn record_with_builtin_mock_schemas(contents: PlanFileContents) -> PlanFile {
+fn record_with_builtin_mock_schemas(contents: PlanFileTransport) -> PlanFile {
     record_with_test_schemas(
         contents,
         &mock_schema_registry(carina_provider_mock::builtin_schemas()),
@@ -1169,7 +1169,7 @@ for account_id in orgs.accounts {
         Box::new(unbound),
     )));
 
-    let plan_file = record_with_builtin_mock_schemas(PlanFileContents {
+    let plan_file = record_with_builtin_mock_schemas(PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-30T00:00:00Z".to_string(),
@@ -1304,7 +1304,7 @@ async fn run_saved_plan_schema_fingerprint_case(
     plan.add(carina_core::effect::Effect::Create(resolved(
         resource.clone(),
     )));
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-27T00:00:00Z".to_string(),
@@ -1576,7 +1576,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
     let fixture = ApplyCancellationFixture::new();
     let schemas = mock_schema_registry(carina_provider_mock::builtin_schemas());
     let id = ResourceId::with_provider_identity("mock", "example.thing", "gone", None);
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-28T00:00:00Z".to_string(),
@@ -1895,7 +1895,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     .await
     .expect("resolve empty provider config");
     let candidates = SavedPlanSecretCandidates::from_test_parts(parsed, provider_inputs);
-    let plan_file = PlanFileContents {
+    let plan_file = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
@@ -2037,7 +2037,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         .expect("capture composition snapshot")
         .into_saved_with_resolver(&mut source_identities)
         .expect("save composition");
-    let plan_file = record_with_test_context(PlanFileContents {
+    let plan_file = record_with_test_context(PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-29T00:00:00Z".to_string(),
@@ -2197,7 +2197,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
             .expect("migration graph validates")
             .classification,
     );
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-16T00:00:00Z".to_string(),
@@ -2363,7 +2363,7 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
         HashMap::from([("name".to_string(), string_value("planned"))]),
     )
     .with_identifier("example-id");
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-31T00:00:00Z".to_string(),
@@ -2562,7 +2562,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         vec![Box::new(FailBCreateFactory)],
         std::slice::from_ref(&provider_config),
     );
-    let plan_file = PlanFileContents {
+    let plan_file = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-29T00:00:00Z".to_string(),
@@ -2664,7 +2664,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         vec![Box::new(FailBCreateFactory)],
         &provider_configs,
     );
-    let plan_file = PlanFileContents {
+    let plan_file = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-29T00:00:00Z".to_string(),
@@ -4832,7 +4832,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         unresolved_attributes: Default::default(),
         binding: None,
     }]);
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-07-02T00:00:00Z".to_string(),
@@ -4999,7 +4999,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         producer.clone(),
     )));
     plan.add(carina_core::effect::Effect::Create(resolved_consumer));
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
@@ -5106,7 +5106,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
     .expect("capture composition snapshot")
     .into_saved_with_resolver(&mut source_identities)
     .expect("save composition");
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-09-29T00:00:00Z".to_string(),
@@ -5171,7 +5171,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
 async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint() {
     let fixture = ApplyCancellationFixture::new();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-14T00:00:00Z".to_string(),
@@ -5741,7 +5741,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
     plan.add(carina_core::effect::Effect::Create(resolved(
         resource.clone(),
     )));
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
         timestamp: "2026-10-21T00:00:00Z".to_string(),
@@ -11972,7 +11972,7 @@ mod saved_plan_version_tests {
         )
         .expect("test provider hints should succeed");
         assert_eq!(plan.replace_display_info().count(), 1);
-        let plan_file = crate::commands::plan::PlanFileContents {
+        let plan_file = crate::commands::plan::PlanFileTransport {
             version: crate::commands::plan::PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-07-02T00:00:00Z".to_string(),

@@ -80,7 +80,7 @@ async fn assert_refusal(json: bool) {
             "{position}: {diagnostic}"
         );
         if result.is_ok()
-            || diagnostic != expected_retained_plan_refusal(directory.path())
+            || diagnostic != expected_retained_plan_refusal(directory.path(), "checked")
             || saved.exists()
         {
             failures.push(format!(
@@ -102,16 +102,47 @@ async fn retained_calls_in_saved_document_positions_json() {
     assert_refusal(true).await;
 }
 
-#[test]
-fn an_unrelated_serializer_using_the_same_sentence_gets_no_recovery_hint() {
-    let error: serde_json::Error =
-        serde::ser::Error::custom(carina_core::value::RetainedUserFunctionCallError);
-    let actual = AppError::from_plan_serialization(error);
+#[tokio::test]
+async fn admissible_saved_document_bytes() {
+    let directory = Directory::new(&Case {
+        name: "admissible document bytes".into(),
+        main: "let child = use { source = './child' }\nlet instance = child { input = 'allowed' }\ntest.Sink { name = 'sink' value = instance.output }\n".into(),
+        child: Some("arguments { input: String }\nlet src = test.Thing { name = input }\nfn identity(value: String): String { value }\nattributes { output: String = upper(identity(src.emitted)) }\n".into()),
+        emitted: "allowed".into(),
+    });
+    let path = directory.path().join("saved.plan.json");
+    directory.plan(Some(&path)).await.unwrap();
+    let bytes = std::fs::read_to_string(path).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+    let normalized = bytes
+        .replace(directory.path().to_str().unwrap(), "<project>")
+        .replace(document["timestamp"].as_str().unwrap(), "<timestamp>");
+    insta::assert_snapshot!("admissible_saved_document_bytes", normalized);
+}
+
+#[tokio::test]
+async fn orphan_saved_state_preserves_the_persisted_secret_hash_plan_out() {
+    let directory = Directory::new(&Case {
+        name: "orphan secret snapshot".into(),
+        main: "let src = test.Thing { name = 'src' plain = secret('private-control') }\n".into(),
+        child: None,
+        emitted: "allowed".into(),
+    });
+    directory.apply().await.unwrap();
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.path().join("state.json")).unwrap())
+            .unwrap();
+    let hash = state["resources"][0]["current"]["attributes"]["plain"].clone();
+    assert!(hash["$secret"].is_string());
+    std::fs::write(directory.path().join("main.crn"), "").unwrap();
+    let path = directory.path().join("orphan.plan.json");
+    directory.plan(Some(&path)).await.unwrap();
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(
-        actual.to_string(),
-        format!(
-            "Failed to serialize plan: {}",
-            carina_core::value::RetainedUserFunctionCallError
-        )
+        document["current_states"][0]["current"]["state"]["attributes"]["plain"]["RedactedSecret"]
+            ["hash"],
+        hash["$secret"]
     );
+    directory.assert_unlocked().await;
 }

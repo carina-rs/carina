@@ -541,7 +541,9 @@ fn assert_exact_declared_diagnostic(
     body_line: Option<usize>,
 ) {
     let source = case.child.as_deref().unwrap_or(&case.main);
-    let expected = if body_line.is_some() || prefix.contains("return value") {
+    let expected = if let Some(line) = body_line.filter(|_| !prefix.contains("return value")) {
+        format!("Invalid expression at line {line}: {prefix} {SUFFIX}")
+    } else if body_line.is_some() || prefix.contains("return value") {
         let line = body_line.unwrap_or_else(|| {
             source
                 .lines()
@@ -674,7 +676,14 @@ async fn plan_out_case(case: Case) {
         assert!(!saved.exists());
         assert_eq!(
             rendered(&result),
-            expected_retained_plan_refusal(dir.path())
+            expected_retained_plan_refusal(
+                dir.path(),
+                if case.name.starts_with("c1-") {
+                    "f"
+                } else {
+                    "g"
+                }
+            )
         );
     }
     if !saved.exists() {
@@ -696,9 +705,9 @@ fn expected_saved_plan_error(case: &str, directory: &Directory) -> String {
     snapshots[case].replace("{project}", directory.path().to_str().unwrap())
 }
 
-fn expected_retained_plan_refusal(project: &Path) -> String {
+fn expected_retained_plan_refusal(project: &Path, function: &str) -> String {
     format!(
-        "Cannot save plan: the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call.\nRun `{}` directly on the project, without a saved plan.",
+        "Cannot save plan: the plan contains an unevaluated call to the user-defined function '{function}'. A saved plan cannot carry this call.\nRun `{}` directly on the project, without a saved plan.",
         carina_core::hint::ProjectCommand::new("apply", project)
     )
 }
@@ -1175,7 +1184,7 @@ async fn declared_checks_authored_and_state_valid_plan_out() {
         assert!(result.is_err());
         assert_eq!(
             rendered(&result),
-            expected_retained_plan_refusal(directory.path())
+            expected_retained_plan_refusal(directory.path(), "g")
         );
         assert!(!saved.exists());
     }

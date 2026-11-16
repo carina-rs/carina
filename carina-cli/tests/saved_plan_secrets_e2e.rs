@@ -110,9 +110,12 @@ impl Scenario {
 
     fn new_with_wasm_provider(main: &str, env: &[(&str, &str)]) -> Self {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace.join("target"));
         let wasm = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
             .into_iter()
-            .map(|name| workspace.join("target/wasm32-wasip2/debug").join(name))
+            .map(|name| target.join("wasm32-wasip2/debug").join(name))
             .find(|path| path.is_file())
             .expect("the mock WASM fixture must be built");
         Self::new_with_provider(main, env, Some(&wasm))

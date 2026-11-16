@@ -604,14 +604,16 @@ impl<P: crate::resource::PlanValueKind> SavedProviderConfigs<P> {
         })
     }
 
-    pub fn redact_secrets(&self) -> Result<SavedProviderConfigs, crate::value::SerializationError> {
-        let conversion = crate::value::SavedDocumentConversion::new(std::iter::empty())?;
-        let configs = self
-            .0
-            .iter()
-            .map(|config| config.try_map_value_stage(&mut |value| conversion.state_value(value)))
-            .collect::<Result<_, _>>()?;
-        Ok(SavedProviderConfigs(configs))
+    pub fn redact_secrets(
+        &self,
+        conversion: &crate::value::SavedDocumentConversion,
+    ) -> Result<crate::value::Saved<SavedProviderConfigs>, crate::value::SerializationError> {
+        conversion.provider_configs(self)
+    }
+    pub(crate) fn from_snapshot_configs(
+        configs: Vec<ProviderConfig<P, AbsoluteBindingAddress>>,
+    ) -> Self {
+        Self(configs)
     }
 }
 
@@ -879,16 +881,17 @@ mod saved_provider_config_secret_tests {
             ResolvedProviderConfigs::validate_known(std::slice::from_ref(&config)),
             Err(ProviderConfigInvariantError::UnresolvedAttribute { .. })
         ));
-        let error = SavedProviderConfigs(vec![config])
-            .redact_secrets()
-            .expect_err("retained provider config must not enter the saved document");
+        let error = crate::value::with_saved_document(|conversion| {
+            SavedProviderConfigs(vec![config]).redact_secrets(conversion)
+        })
+        .expect_err("retained provider config must not enter the saved document");
         assert!(matches!(
             &error,
             crate::value::SerializationError::RetainedUserFunctionCall(_)
         ));
         assert_eq!(
             error.to_string(),
-            crate::value::RetainedUserFunctionCallError.to_string()
+            "the plan contains an unevaluated call to the user-defined function 'checked'. A saved plan cannot carry this call."
         );
     }
 
@@ -922,9 +925,10 @@ mod saved_provider_config_secret_tests {
     #[test]
     fn provider_secret_placeholders_are_distinct_and_rehydrate() {
         let evaluated = SavedProviderConfigs(vec![provider("SAME_SECRET")]);
-        let redacted = evaluated
-            .redact_secrets()
-            .expect("provider secrets should redact");
+        let redacted =
+            crate::value::with_saved_document(|conversion| evaluated.redact_secrets(conversion))
+                .expect("provider secrets should redact")
+                .into_inner();
         let saved = &redacted.0[0];
 
         assert_ne!(
@@ -944,7 +948,10 @@ mod saved_provider_config_secret_tests {
     #[test]
     fn provider_secret_rehydration_rejects_missing_matching_instance() {
         let planned = SavedProviderConfigs(vec![provider("SAME_SECRET")]);
-        let redacted = planned.redact_secrets().expect("redact provider secret");
+        let redacted =
+            crate::value::with_saved_document(|conversion| planned.redact_secrets(conversion))
+                .expect("redact provider secret")
+                .into_inner();
         let mut mismatched = provider("SAME_SECRET");
         mismatched.binding = Some("different-instance".to_string());
 

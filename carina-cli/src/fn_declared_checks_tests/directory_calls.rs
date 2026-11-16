@@ -60,7 +60,7 @@ async fn retained_data_source_argument_refuses_saved_documents_plan_out() {
         );
         assert_eq!(
             rendered(&result),
-            expected_retained_plan_refusal(directory.path())
+            expected_retained_plan_refusal(directory.path(), "checked")
         );
         assert!(!saved.exists());
         directory.assert_unlocked().await;
@@ -94,7 +94,7 @@ async fn state_known_valid_calls_refuse_saved_documents_plan_out() {
             ));
             assert_eq!(
                 rendered(&result),
-                expected_retained_plan_refusal(directory.path())
+                expected_retained_plan_refusal(directory.path(), "checked")
             );
             assert!(!saved.exists());
         }
@@ -158,7 +158,7 @@ async fn retained_import_identifier_refuses_saved_documents_plan_out() {
         ));
         assert_eq!(
             rendered(&result),
-            expected_retained_plan_refusal(directory.path())
+            expected_retained_plan_refusal(directory.path(), "checked")
         );
         assert!(!saved.exists());
     }

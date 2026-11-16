@@ -1257,7 +1257,37 @@ fn locate_user_function_error<B: BindingAddress>(
     function: &crate::parser::UserFunction<B>,
     error: crate::parser::ParseError,
 ) -> crate::parser::ParseError {
-    error.in_file(function.body.location.file().path().to_path_buf())
+    match &function.body.source_file {
+        Some(path) => error.in_file(path.clone()),
+        None => error,
+    }
+}
+
+#[cfg(test)]
+mod function_error_location_compatibility {
+    #[test]
+    fn a_body_without_a_stamped_owner_does_not_add_a_file() {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "fn f(x: String): String { x }",
+            std::path::Path::new("functions.crn"),
+            &context,
+        )
+        .unwrap();
+        let mut function = parsed.user_functions["f"].clone();
+        function.body.source_file = None;
+        let error = super::locate_user_function_error(
+            &function,
+            crate::parser::ParseError::InvalidExpression {
+                line: 1,
+                message: "invalid function body".into(),
+            },
+        );
+        assert_eq!(
+            error.to_string(),
+            "Invalid expression at line 1: invalid function body"
+        );
+    }
 }
 
 fn user_function_runtime_error(
@@ -1424,13 +1454,11 @@ fn evaluate_runtime_user_function<P: PlaceholderKind, B: BindingAddress>(
             },
         )
         .map_err(|error| {
-            locate_user_function_error(
-                function,
-                user_function_runtime_error(
-                    function.body.source_line,
-                    format!("function '{}': return value: {error}", function.name),
-                ),
+            user_function_runtime_error(
+                function.body.source_line,
+                format!("function '{}': return value: {error}", function.name),
             )
+            .in_file(function.body.location.file().path().to_path_buf())
             .into()
         })
 }

@@ -640,50 +640,75 @@ pub(crate) fn annotation_requires_provider_session(expected: &TypeExpr) -> bool 
         | TypeExpr::StringLiteral(_) => false,
     }
 }
-pub(crate) fn contains_deferred_user_function_call<P: ValueKind, B: BindingAddress>(
+pub(crate) fn visit_deferred_user_function_calls<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
-) -> bool {
+    visit: &mut impl FnMut(&UserFunction<B>),
+) {
     match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
-            .values()
-            .into_iter()
-            .any(contains_deferred_user_function_call),
-        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
-            crate::builtins::builtin_arity(name).is_none()
-                || args
-                    .iter()
-                    .any(|argument| contains_deferred_user_function_call(argument.walker_value()))
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for value in deferred.values() {
+                visit_deferred_user_function_calls(value, visit);
+            }
         }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => true,
-        Value::Deferred(DeferredValue::Unavailable { args, .. }) => args
-            .iter()
-            .any(|argument| contains_deferred_user_function_call(argument.walker_value())),
+        Value::Deferred(DeferredValue::FunctionCall {
+            name: _name,
+            args,
+            source_line: _source_line,
+        })
+        | Value::Deferred(DeferredValue::Unavailable {
+            name: _name,
+            args,
+            reason: _,
+            source_line: _source_line,
+        }) => {
+            for argument in args {
+                visit_deferred_user_function_calls(argument.walker_value(), visit);
+            }
+        }
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions: _functions,
+            args,
+            source_line: _source_line,
+        }) => {
+            visit(function);
+            for argument in args {
+                visit_deferred_user_function_calls(argument.walker_value(), visit);
+            }
+        }
         Value::Concrete(ConcreteValue::List(values)) => {
-            values.iter().any(contains_deferred_user_function_call)
+            for value in values {
+                visit_deferred_user_function_calls(value, visit);
+            }
         }
         Value::Concrete(ConcreteValue::Map(values)) => {
-            values.values().any(contains_deferred_user_function_call)
+            for value in values.values() {
+                visit_deferred_user_function_calls(value, visit);
+            }
         }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(
-                part,
-                crate::resource::InterpolationPart::Expr(value)
-                    if contains_deferred_user_function_call(value)
-            )
-        }),
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                match part {
+                    crate::resource::InterpolationPart::Literal(_literal) => {}
+                    crate::resource::InterpolationPart::Expr(value) => {
+                        visit_deferred_user_function_calls(value, visit)
+                    }
+                }
+            }
+        }
         Value::Deferred(DeferredValue::Secret(value)) => {
-            value.visit(contains_deferred_user_function_call)
+            value.visit(|value| visit_deferred_user_function_calls(value, visit))
         }
         Value::Deferred(DeferredValue::Access(access)) => {
-            contains_deferred_user_function_call(access.base())
+            visit_deferred_user_function_calls(access.base(), visit)
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            contains_deferred_user_function_call(value)
-                || contains_deferred_user_function_call(default)
+            visit_deferred_user_function_calls(value, visit);
+            visit_deferred_user_function_calls(default, visit);
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            contains_deferred_user_function_call(expression.lhs())
-                || contains_deferred_user_function_call(expression.rhs())
+            visit_deferred_user_function_calls(expression.lhs(), visit);
+            visit_deferred_user_function_calls(expression.rhs(), visit);
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -696,12 +721,19 @@ pub(crate) fn contains_deferred_user_function_call<P: ValueKind, B: BindingAddre
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
+            DeferredValue::ResourceRef { path: _ }
+            | DeferredValue::BindingRef { binding: _ }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
-        ) => false,
+        ) => {}
     }
+}
+pub(crate) fn contains_deferred_user_function_call<P: ValueKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> bool {
+    let mut found = false;
+    visit_deferred_user_function_calls(value, &mut |_function| found = true);
+    found
 }
 
 #[cfg(test)]
@@ -1122,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_call_serialization_states_the_problem_only() {
+    fn retained_call_serialization_is_context_neutral_and_private() {
         let function = function("fn g(x: String): String { x }");
         let call = FunctionCompletion::new(
             &function,
@@ -1143,7 +1175,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call."
+            "deferred user-function call 'g' cannot be serialized before evaluation"
         );
         assert!(!message.contains("carina apply"));
     }
@@ -1163,9 +1195,8 @@ mod unavailable_call_walk_tests {
             source_line: 1.into(),
         });
         assert!(contains_deferred_user_function_call(&value));
-        let conversion = crate::value::SavedDocumentConversion::new(std::iter::empty()).unwrap();
         assert!(matches!(
-            conversion.value(&value.into_secret()),
+            crate::value::with_saved_document(|conversion| conversion.value(&value.into_secret())),
             Err(crate::value::SerializationError::RetainedUserFunctionCall(
                 _
             ))

@@ -1480,7 +1480,16 @@ where
     infallible(directives.try_map(resolve, |_, _, value| Ok(value), |_, _, value| Ok(value)))
 }
 
-impl Directives<AbsoluteBindingAddress, LoopSlot> {
+impl<P> Directives<AbsoluteBindingAddress, P>
+where
+    P: ValueKind<
+            DirectiveBool<AbsoluteBindingAddress> = LoopDirective<bool, AbsoluteBindingAddress>,
+            DirectivePreventDestroy<AbsoluteBindingAddress> = LoopDirective<
+                PreventDestroy,
+                AbsoluteBindingAddress,
+            >,
+        >,
+{
     pub(crate) fn try_visit_values<E>(
         &self,
         visit: &mut impl FnMut(&Value<LoopSlot>) -> Result<(), E>,

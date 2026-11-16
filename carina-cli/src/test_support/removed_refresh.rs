@@ -254,7 +254,7 @@ async fn removed_no_refresh_saved_plan_apply() {
     let snapshot = carina_core::value::redact_secrets_in_state(&snapshot).unwrap();
     let entry = plan::CurrentStateEntry::Managed {
         id,
-        current: plan::SavedManagedCurrent::from_current(
+        current: plan::SavedManagedCurrent::for_test(
             carina_core::resource::Current::from_snapshot(snapshot),
         ),
     };

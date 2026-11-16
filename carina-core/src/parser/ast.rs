@@ -11358,3 +11358,44 @@ mod diagnostic_order_tests {
         assert_eq!(seen, ["zulu", "alpha", "quartz", "bravo", "mango", "delta"]);
     }
 }
+
+impl<S, P: crate::resource::PlanValueKind, D> crate::value::saved_document::sealed::Tree
+    for DeferredForExpression<S, P, P::Template, AbsoluteBindingAddress, D>
+{
+    fn visit(&self, names: &mut crate::value::saved_document::FunctionNames) {
+        let Self {
+            location: _,
+            header: _,
+            target: _,
+            iterable,
+            binding: _,
+            template_resource,
+            deferred_effect_id: _,
+        } = self;
+        names.value(iterable);
+        let DeferredForTemplateResource {
+            resource,
+            display_type: _,
+        } = template_resource;
+        let Resource {
+            id: _,
+            attributes,
+            authored_slots: _,
+            directives,
+            resolved_ignore_changes: _,
+            prefixes: _,
+            binding: _,
+            dependencies: _,
+            module_source: _,
+            default_tag_keys: _,
+            loop_provenance: _,
+            quoted_string_attrs: _,
+            declaration: _,
+        } = resource;
+        attributes.values().for_each(|value| names.value(value));
+        let _: Result<(), std::convert::Infallible> = directives.try_visit_values(&mut |value| {
+            names.value(value);
+            Ok(())
+        });
+    }
+}
