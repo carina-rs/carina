@@ -1034,8 +1034,8 @@ pub use crate::validation::admission::configuration::provider::{
 pub struct ProviderValueConstraintErrors(Box<crate::schema::ResourceValueValidation>);
 
 impl ProviderValueConstraintErrors {
-    pub fn errors(&self) -> &[TypeError] {
-        self.0.error_slice()
+    pub fn errors(&self) -> impl Iterator<Item = &TypeError> {
+        self.0.errors()
     }
 
     fn from_admission(report: crate::schema::ResourceValueValidation) -> Self {
@@ -1075,7 +1075,78 @@ fn review_r10_constraint_display_uses_the_structured_errors() {
         crate::schema::ResourceValueValidation::from_errors(vec![TypeError::MissingRequired {
             name: "current".into(),
         }]);
-    assert_eq!(errors.to_string(), errors.errors()[0].to_string());
+    assert_eq!(
+        errors.to_string(),
+        errors.errors().next().unwrap().to_string()
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn union_unknown_key_keeps_provider_constraint_message() {
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Thing")
+            .attribute(
+                AttributeSchema::optional(
+                    "variant",
+                    AttributeType::union(vec![
+                        AttributeType::struct_(
+                            "Enabled",
+                            vec![StructField::required("enabled", AttributeType::bool()).build()],
+                        ),
+                        AttributeType::struct_(
+                            "Other",
+                            vec![StructField::required("other", AttributeType::bool()).build()],
+                        ),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let resource: Resource = Resource::with_provider("mock", "Thing", "test", None).with_attribute(
+        "variant",
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+            indexmap::IndexMap::from([
+                (
+                    "enabled".into(),
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::Bool(true)),
+                ),
+                (
+                    "typo".into(),
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::Bool(true)),
+                ),
+            ]),
+        )),
+    );
+    let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let result = crate::validation::admission::attributes::admit_apply_resource(
+            &resource,
+            None,
+            schemas.get_for(&resource).unwrap(),
+            &Default::default(),
+            session,
+        );
+        let Err(crate::validation::admission::attributes::ApplyAdmissionErrors::Constraints(
+            report,
+        )) = result
+        else {
+            panic!("unknown field must fail");
+        };
+        let expected = "Unknown field 'typo' in Enabled";
+        assert_eq!(report.errors().next().unwrap().to_string(), expected);
+        assert_eq!(
+            ProviderValueConstraintErrors::from_admission(*report).to_string(),
+            expected
+        );
+    });
 }
 
 /// Validate and prepare a resource for provider dispatch.
@@ -2163,7 +2234,6 @@ mod provider_config_tests {
                 assert_eq!(
                     errors
                         .errors()
-                        .iter()
                         .map(ToString::to_string)
                         .collect::<Vec<_>>(),
                     vec!["owner rejected `VpcId`: owner accepts `vpc-good`, not `bad`"]

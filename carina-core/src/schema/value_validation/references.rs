@@ -144,7 +144,12 @@ impl RecoveredReferences {
             if !seen.insert(identity) {
                 continue;
             }
-            findings.additional_local_errors.push(error.clone());
+            findings
+                .additional_local_errors
+                .push(PrimaryValueFinding::new(
+                    FieldPath::from_canonical_segments(path.segments().iter().cloned()),
+                    error.clone(),
+                ));
             findings.located.push((path.clone(), error.clone()));
             findings
                 .symbolic

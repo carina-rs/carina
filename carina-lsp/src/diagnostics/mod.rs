@@ -834,7 +834,7 @@ impl DiagnosticRun<'_> {
         // core's diagnostic ownership before taking those entries.
         let resource_diagnostic_errors = value_validation
             .diagnostic_errors()
-            .map(|(error, _, coverage)| (error.clone(), coverage))
+            .map(|(diagnostic, coverage)| (diagnostic.clone(), coverage))
             .collect::<Vec<_>>();
         let mut reported_attribute_diagnostics = HashSet::new();
         let retained_failures = resource_attributes
@@ -944,7 +944,7 @@ impl DiagnosticRun<'_> {
                     continue;
                 }
 
-                let attr_findings = value_validation
+                let (attr_findings, symbolic) = value_validation
                     .take_attribute(attr_name)
                     .unwrap_or_default();
                 // Admission owns the syntax verdict. Parser-owned
@@ -977,7 +977,6 @@ impl DiagnosticRun<'_> {
                 }
 
                 let assignment_value = judged_expression.assignment_value(typecheck_value);
-                let symbolic = attr_findings.symbolic_findings().to_vec();
                 let has_exact_findings = symbolic.iter().any(|finding| !finding.covers_path());
                 let mut handled_enum_diagnostic = false;
                 if matches!(
@@ -1029,22 +1028,18 @@ impl DiagnosticRun<'_> {
                     if handled_enum_diagnostic && covers_path {
                         continue;
                     }
-                    let (path, error) = finding.diagnostic();
+                    let (path, diagnostic) = finding.diagnostic();
+                    let error = diagnostic.error();
                     use carina_core::resource::SecretDiagnosticError;
                     use carina_core::validation::admission::AdmissionReferenceError;
-                    let (location, severity, message) = match error {
+                    let (severity, message) = match error {
                         TypeError::Reference { error, .. } => match error.as_ref() {
                             SecretDiagnosticError::Public(AdmissionReferenceError::Arithmetic(
                                 finding,
-                            )) => (
-                                finding.location(),
-                                DiagnosticSeverity::ERROR,
-                                finding.detail().to_string(),
-                            ),
+                            )) => (DiagnosticSeverity::ERROR, finding.detail().to_string()),
                             SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
                                 error,
                             )) => (
-                                rref.attribute_key_location(attr_name),
                                 match error {
                                     DeferredAccessTypeError::InvalidAccess { .. } => {
                                         DiagnosticSeverity::ERROR
@@ -1068,7 +1063,6 @@ impl DiagnosticRun<'_> {
                             SecretDiagnosticError::Public(
                                 AdmissionReferenceError::ResourceHandle { reference, types },
                             ) => (
-                                rref.attribute_key_location(attr_name),
                                 DiagnosticSeverity::WARNING,
                                 format!("Type mismatch: {types} (from {reference})"),
                             ),
@@ -1076,11 +1070,9 @@ impl DiagnosticRun<'_> {
                                 AdmissionReferenceError::Resolution(_)
                                 | AdmissionReferenceError::Authored(_),
                             )
-                            | SecretDiagnosticError::InsideSecret => (
-                                rref.attribute_key_location(attr_name),
-                                DiagnosticSeverity::ERROR,
-                                error.to_string(),
-                            ),
+                            | SecretDiagnosticError::InsideSecret => {
+                                (DiagnosticSeverity::ERROR, error.to_string())
+                            }
                         },
                         TypeError::TypeMismatch { types } => {
                             let message = validation::reference_mismatch_message(
@@ -1089,19 +1081,29 @@ impl DiagnosticRun<'_> {
                                 attr_name,
                                 types,
                             );
-                            (
-                                rref.attribute_key_location(attr_name),
-                                DiagnosticSeverity::WARNING,
-                                message,
-                            )
+                            (DiagnosticSeverity::WARNING, message)
                         }
-                        _ => (
-                            rref.attribute_key_location(attr_name),
-                            DiagnosticSeverity::WARNING,
-                            error.to_string(),
-                        ),
+                        _ => (DiagnosticSeverity::WARNING, error.to_string()),
                     };
-                    let finding = carina_core::parser::Located::new(location.clone(), message);
+                    let located = match rref.locate_schema_diagnostic(diagnostic, |ordinary| {
+                        if let TypeError::Reference { error, .. } = ordinary.error()
+                            && let SecretDiagnosticError::Public(
+                                AdmissionReferenceError::Arithmetic(finding),
+                            ) = error.as_ref()
+                        {
+                            finding.location().clone()
+                        } else {
+                            rref.attribute_key_location(attr_name).clone()
+                        }
+                    }) {
+                        Ok(located) => located,
+                        Err(error) => {
+                            diagnostics.extend(render_analysis_invariant(doc, &error));
+                            continue;
+                        }
+                    };
+                    let finding =
+                        carina_core::parser::Located::new(located.location().clone(), message);
                     if let Some(diagnostic) =
                         render_merged(doc, &finding, severity, finding.detail().clone())
                     {
@@ -1125,10 +1127,7 @@ impl DiagnosticRun<'_> {
                     continue;
                 }
 
-                let container_findings = attr_findings
-                    .local_findings()
-                    .iter()
-                    .any(|(path, _)| !path.is_empty())
+                let container_findings = attr_findings.has_nested_findings()
                     || matches!(
                         attr_findings.structure(),
                         carina_core::schema::ValueStructure::List
@@ -1144,11 +1143,15 @@ impl DiagnosticRun<'_> {
                     );
                 if container_findings {
                     let findings = attr_findings
-                        .into_local_findings()
+                        .into_diagnostic_findings(attr_name)
                         .into_iter()
-                        .filter(|(path, error)| {
+                        .filter(|(path, diagnostic)| {
                             (!path.is_empty() || !authored_has_function_call)
-                                && !validation::covered_by_symbolic_findings(path, error, &symbolic)
+                                && !validation::covered_by_symbolic_findings(
+                                    path,
+                                    diagnostic.error(),
+                                    &symbolic,
+                                )
                         })
                         .collect();
                     let (nested, reported_duplicate) =
@@ -1217,7 +1220,8 @@ impl DiagnosticRun<'_> {
 
         // Render the report produced by the single owner-bound walk.
         {
-            for (error, symbolic_coverage) in resource_diagnostic_errors {
+            for (diagnostic, symbolic_coverage) in resource_diagnostic_errors {
+                let error = diagnostic.error().clone();
                 if error
                     .attribute_name()
                     .is_some_and(|name| retained_failures.contains(name))
@@ -1312,25 +1316,22 @@ impl DiagnosticRun<'_> {
                 {
                     continue;
                 }
-                let location = error
-                    .attribute_name()
-                    .filter(|name| resource_attributes.contains_key(*name))
-                    .map_or(rref.type_location(), |name| {
-                        let assignment = rref.attribute_assignment_location(name);
-                        let span = assignment.span();
-                        if matches!(
-                            error,
-                            carina_core::schema::TypeError::UnknownAttribute { .. }
-                        ) && span.start_line() == span.end_line()
-                        {
-                            assignment
-                        } else {
-                            // Multiline containers retain the precise key instead
-                            // of widening beyond main's single-line anchor.
+                let finding = match rref.locate_schema_diagnostic(&diagnostic, |ordinary| {
+                    let location = ordinary
+                        .error()
+                        .attribute_name()
+                        .filter(|name| resource_attributes.contains_key(*name))
+                        .map_or(rref.type_location(), |name| {
                             rref.attribute_key_location(name)
-                        }
-                    });
-                let finding = carina_core::parser::Located::new(location.clone(), error);
+                        });
+                    location.clone()
+                }) {
+                    Ok(finding) => finding,
+                    Err(error) => {
+                        diagnostics.extend(render_analysis_invariant(doc, &error));
+                        continue;
+                    }
+                };
                 diagnostics.extend(render_merged(
                     doc,
                     &finding,

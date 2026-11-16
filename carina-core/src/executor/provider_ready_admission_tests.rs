@@ -102,6 +102,7 @@ async fn assert_ordinary_dispatch_duplicate(entry: UniqueListEntry) {
         .0
         .take_attribute("value")
         .unwrap()
+        .0
         .into_located()
         .into_iter()
         .map(|(path, error)| (path.to_string(), error.to_string()))
@@ -300,7 +301,7 @@ async fn dispatch_secret_schema_failures_keep_exact_boundary_messages() {
                     let ProviderPreparationError::ValueConstraint { mut errors, .. } = error else {
                         panic!("expected dispatch membership error")
                     };
-                    let findings = errors.0.take_attribute("value").unwrap().into_located();
+                    let findings = errors.0.take_attribute("value").unwrap().0.into_located();
                     assert_eq!(
                         findings
                             .into_iter()
@@ -353,14 +354,14 @@ fn assert_protected_constraint(error: ProviderPreparationError) {
     let ProviderPreparationError::ValueConstraint { mut errors, .. } = error else {
         panic!("expected an apply value constraint: {error:?}");
     };
-    assert!(!errors.errors().is_empty());
+    assert!(errors.errors().next().is_some());
     assert_hidden(&errors.to_string());
     assert_hidden(&format!("{errors:?}"));
     for error in errors.errors() {
         assert_hidden(&error.to_string());
         assert_hidden(&format!("{error:?}"));
     }
-    let findings = errors.0.take_attribute("value").expect("retained findings");
+    let (findings, _) = errors.0.take_attribute("value").expect("retained findings");
     assert_hidden(&format!("{findings:?}"));
     let located = findings.into_located();
     assert!(

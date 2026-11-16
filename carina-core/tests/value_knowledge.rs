@@ -597,7 +597,7 @@ mod structural_consumers {
         );
         assert_eq!(report.errors().count(), 0);
         assert_eq!(
-            report.take_attribute("values").unwrap().structure(),
+            report.take_attribute("values").unwrap().0.structure(),
             ValueStructure::List
         );
     }

@@ -352,7 +352,7 @@ fn timing_matrix(name: &str) {
                             else {
                                 panic!("expected typed local constraint failure");
                             };
-                            assert_eq!(errors.errors(), literal_errors);
+                            assert!(errors.errors().eq(literal_errors.iter()), "{errors:?}");
                             assert_eq!(errors.to_string().matches(case.path).count(), 1);
                         }
                     }
@@ -522,11 +522,10 @@ fn executor_timing_matrix(name: &str) {
                 else {
                     panic!("{failure:?}")
                 };
-                assert_eq!(errors.errors(), expected);
+                assert!(errors.errors().eq(expected.iter()), "{errors:?}");
                 assert!(
                     errors
                         .errors()
-                        .iter()
                         .all(|error| error.attribute_name() == Some(case.attribute))
                 );
                 let message = failure.to_string();

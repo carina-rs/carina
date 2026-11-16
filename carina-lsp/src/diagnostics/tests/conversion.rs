@@ -289,7 +289,11 @@ fn conversion_report_fallback_preserves_ordinary_errors_and_detects_missing_outc
                 ordinary.push(
                     findings
                         .errors()
-                        .chain(findings.symbolic_errors().map(|(_, _, error)| error))
+                        .chain(
+                            findings
+                                .symbolic_errors()
+                                .map(|(_, _, diagnostic)| diagnostic.error()),
+                        )
                         .map(ToString::to_string)
                         .collect::<Vec<_>>(),
                 );

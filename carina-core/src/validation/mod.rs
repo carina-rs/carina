@@ -5333,8 +5333,7 @@ pub struct ResourceAdmissionFinding {
 enum ResourceAdmissionDetail {
     Schema {
         resource: crate::resource::ResourceId,
-        attribute: Option<String>,
-        error: TypeError,
+        diagnostic: Box<crate::schema::SchemaDiagnostic>,
         mismatch: Option<Box<ReferenceMismatch>>,
     },
     Arithmetic(Box<crate::parser::Located<IntegerArithmeticTypeFinding>>),
@@ -5359,14 +5358,15 @@ impl ResourceAdmissionFinding {
     fn prefix(error: &crate::identifier::AttributePrefixError) -> Self {
         let mut finding = Self::schema(
             error.resource_id(),
-            None,
-            &TypeError::AttributePrefix(Box::new(error.clone())),
+            &crate::schema::SchemaDiagnostic::unlocated(TypeError::AttributePrefix(Box::new(
+                error.clone(),
+            ))),
+            error.location().cloned(),
         );
         finding.human = error.to_string();
-        finding.location = error.location().cloned();
         finding
     }
-    fn analysis(error: crate::parser::AnalysisTreeError) -> Self {
+    pub(crate) fn analysis(error: crate::parser::AnalysisTreeError) -> Self {
         let location = match error.diagnostic() {
             crate::parser::AnalysisTreeDiagnostic::Located(finding) => {
                 Some(finding.location().clone())
@@ -5382,23 +5382,22 @@ impl ResourceAdmissionFinding {
     }
     fn schema(
         resource: &crate::resource::ResourceId,
-        attribute: Option<&str>,
-        error: &TypeError,
+        diagnostic: &crate::schema::SchemaDiagnostic,
+        location: Option<crate::parser::DeclarationLocation>,
     ) -> Self {
         Self {
-            human: format!("{resource}: {error}"),
+            human: format!("{resource}: {}", diagnostic.error()),
             detail: ResourceAdmissionDetail::Schema {
                 resource: resource.clone(),
-                attribute: attribute.map(str::to_owned),
-                error: error.clone(),
+                diagnostic: Box::new(diagnostic.clone()),
                 mismatch: None,
             },
-            location: None,
+            location,
         }
     }
     pub fn type_error(&self) -> Option<&TypeError> {
         match &self.detail {
-            ResourceAdmissionDetail::Schema { error, .. } => Some(error),
+            ResourceAdmissionDetail::Schema { diagnostic, .. } => Some(diagnostic.error()),
             ResourceAdmissionDetail::Arithmetic(_)
             | ResourceAdmissionDetail::Iterable(_)
             | ResourceAdmissionDetail::UnavailableSchema(_)
@@ -5435,16 +5434,15 @@ impl ResourceAdmissionFinding {
                 mismatch: Some(mismatch),
                 ..
             } => mismatch.message(),
-            ResourceAdmissionDetail::Schema {
-                error: TypeError::Reference { error, .. },
-                ..
-            } => match error.as_ref() {
-                SecretDiagnosticError::Public(admission::AdmissionReferenceError::Arithmetic(
-                    finding,
-                )) => finding.detail().to_string(),
-                _ => error.to_string(),
+            ResourceAdmissionDetail::Schema { diagnostic, .. } => match diagnostic.error() {
+                TypeError::Reference { error, .. } => match error.as_ref() {
+                    SecretDiagnosticError::Public(
+                        admission::AdmissionReferenceError::Arithmetic(finding),
+                    ) => finding.detail().to_string(),
+                    _ => error.to_string(),
+                },
+                error => error.to_string(),
             },
-            ResourceAdmissionDetail::Schema { error, .. } => error.to_string(),
             ResourceAdmissionDetail::Arithmetic(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::Iterable(finding) => finding.detail().to_string(),
             ResourceAdmissionDetail::UnavailableSchema(error) => error.to_string(),
@@ -5520,6 +5518,14 @@ struct ValueAdmission<'a, B: BindingAddress> {
     coverage: &'a mut crate::schema::value_validation::WalkCoverage,
 }
 
+type ResourceAdmissionValues = HashMap<
+    (
+        crate::resource::ResourceId,
+        crate::parser::DeclarationLocation,
+    ),
+    crate::schema::ResourceValueValidation,
+>;
+
 struct ResourceValidationContext<'a, B: BindingAddress> {
     report: &'a crate::parser::retained::ExpressionReport<B>,
     registry: &'a SchemaRegistry,
@@ -5527,13 +5533,13 @@ struct ResourceValidationContext<'a, B: BindingAddress> {
     provider_context: &'a ProviderContext,
     all_errors: &'a mut ResourceAdmissionFindings,
     diagnostics: &'a mut dyn deferred_types::ProviderTypeCheckSink,
-    admissions:
-        Option<&'a HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>>,
+    admissions: Option<&'a ResourceAdmissionValues>,
     coverage: &'a mut crate::schema::value_validation::WalkCoverage,
 }
 
 fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
     id: &crate::resource::ResourceId,
+    provenance: &crate::parser::DeclarationProvenance,
     slots: &crate::parser::retained::AuthoredSlots<B>,
     quoted_string_attrs: &HashSet<String>,
     input: Option<(
@@ -5547,9 +5553,11 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
         Some((schema, attributes)) => {
             let mut classification_errors = Vec::new();
             let checked;
-            let values = if let Some(values) =
-                context.admissions.and_then(|reports| reports.get(id))
-            {
+            let values = if let Some(values) = context.admissions.and_then(|reports| {
+                provenance
+                    .location()
+                    .and_then(|location| reports.get(&(id.clone(), location.clone())))
+            }) {
                 let _ = crate::resource::knowledge::collect_classified_attributes(
                     attributes.iter().map(|(name, value)| (name.clone(), value)),
                     &crate::resource::knowledge::KnowledgeContext::validation(),
@@ -5606,17 +5614,33 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                 checked = outcome.values;
                 &checked
             };
-            for (error, path, symbolic) in values.diagnostic_errors() {
-                if path.is_some_and(|(name, _)| values.is_retained_failure(name)) {
+            for (diagnostic, symbolic) in values.diagnostic_errors() {
+                if diagnostic
+                    .coverage_path()
+                    .is_some_and(|(root, _)| values.is_retained_failure(root))
+                {
                     continue;
                 }
                 let rendered_symbolically = context.admissions.is_some() && symbolic.owns_path();
                 if !rendered_symbolically {
-                    context.all_errors.push(ResourceAdmissionFinding::schema(
-                        id,
-                        path.map(|(name, _)| name),
-                        error,
-                    ));
+                    // The value-only validate_resources API keeps its existing
+                    // unlocated projection. Full admission has the authored view.
+                    let location = if context.admissions.is_some() {
+                        match provenance.schema_diagnostic_location(diagnostic) {
+                            Ok(location) => location,
+                            Err(error) => {
+                                context
+                                    .all_errors
+                                    .push(ResourceAdmissionFinding::analysis(error));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    context
+                        .all_errors
+                        .push(ResourceAdmissionFinding::schema(id, diagnostic, location));
                 }
             }
             context.all_errors.extend(
@@ -5731,9 +5755,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
-    admissions: Option<
-        &HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
-    >,
+    admissions: Option<&ResourceAdmissionValues>,
     diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
     admission: ValueAdmission<'_, B>,
 ) -> Vec<ResourceAdmissionFinding> {
@@ -5783,6 +5805,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
             match resource {
                 CanonicalSchemaResource::DataSource(resource, input) => validate_resource_values(
                     &resource.id,
+                    &resource.declaration,
                     &resource.authored_slots,
                     &resource.quoted_string_attrs,
                     input.as_ref().map(|(schema, values)| (*schema, values)),
@@ -5792,6 +5815,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
                 CanonicalSchemaResource::Resource(resource, input) => {
                     validate_resource_values(
                         &resource.id,
+                        &resource.declaration,
                         &resource.authored_slots,
                         &resource.quoted_string_attrs,
                         input.as_ref().map(|(schema, values)| (*schema, values)),
@@ -5812,6 +5836,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
                 CanonicalSchemaResource::Deferred(resource, input) => {
                     validate_resource_values(
                         &resource.id,
+                        &resource.declaration,
                         &resource.authored_slots,
                         &resource.quoted_string_attrs,
                         input.as_ref().map(|(schema, values)| (*schema, values)),
@@ -6019,30 +6044,6 @@ fn complete_resource_admission_report<
             },
         )
     });
-    let tree = judged.parsed().analysis_tree()?;
-    let mut resources = HashMap::new();
-    for resource in tree.project_resources() {
-        // Preserve the former find() policy if an earlier validation phase
-        // has retained multiple declarations with the same identity.
-        resources.entry(resource.id()).or_insert(resource);
-    }
-    for finding in &mut findings {
-        if let ResourceAdmissionDetail::Schema {
-            resource: id,
-            attribute,
-            ..
-        } = &finding.detail
-            && let Some(resource) = resources.get(id)
-        {
-            finding.location = Some(
-                attribute
-                    .as_deref()
-                    .map(|name| resource.attribute_key_location(name))
-                    .unwrap_or_else(|| resource.type_location())
-                    .clone(),
-            );
-        }
-    }
     findings.extend(report.findings.0);
     report.findings = ResourceAdmissionFindings(findings);
     Ok(report)
@@ -6056,14 +6057,14 @@ fn publish_admission_diagnostics<T>(
 }
 
 struct ResourceAdmissionReport {
-    attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
+    attributes: ResourceAdmissionValues,
     // Required prefix rejections and reference findings have one consuming exit.
     findings: ResourceAdmissionFindings,
 }
 impl ResourceAdmissionReport {
     fn new<F>(
         file: &crate::identifier::PrefixCanonicalized<'_, F>,
-        attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
+        attributes: ResourceAdmissionValues,
         mut references: ResourceAdmissionFindings,
     ) -> Self {
         let mut findings = file
@@ -6186,7 +6187,18 @@ fn resource_admission_report<
                     };
                     let attrs = resource.attributes();
                     let location = resource.diagnostic_label();
-                    for (attribute, path, error) in values.symbolic_errors() {
+                    for (attribute, path, diagnostic) in values.symbolic_errors() {
+                        let located = match resource
+                            .locate_schema_diagnostic(diagnostic, |_ordinary| {
+                                resource.attribute_key_location(attribute).clone()
+                            }) {
+                            Ok(located) => located,
+                            Err(error) => {
+                                all_errors.push(ResourceAdmissionFinding::analysis(error));
+                                continue;
+                            }
+                        };
+                        let error = diagnostic.error();
                         let start = all_errors.0.len();
                         match error {
                             TypeError::Reference { error, .. } => match error.as_ref() {
@@ -6243,8 +6255,7 @@ fn resource_admission_report<
                         for finding in &mut all_errors.0[start..] {
                             finding.detail = ResourceAdmissionDetail::Schema {
                                 resource: resource.id().clone(),
-                                attribute: Some(attribute.to_string()),
-                                error: error.clone(),
+                                diagnostic: Box::new(diagnostic.clone()),
                                 mismatch: match error {
                                     TypeError::TypeMismatch { types } => {
                                         Some(Box::new(ReferenceMismatch::for_attribute(
@@ -6257,11 +6268,10 @@ fn resource_admission_report<
                                     _ => None,
                                 },
                             };
-                            finding.location =
-                                Some(resource.attribute_key_location(attribute).clone());
+                            finding.location = Some(located.location().clone());
                         }
                     }
-                    attributes.insert(resource.id().clone(), values);
+                    attributes.insert((resource.id().clone(), resource.location().clone()), values);
                 }
                 Ok(())
             },

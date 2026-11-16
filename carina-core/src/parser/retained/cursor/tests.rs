@@ -335,10 +335,13 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
         let mut actual = validate(Some(&hook));
         assert_eq!(ordinary_calls.replace(Vec::new()), expected_calls);
         assert_eq!(actual.local_error(), expected.local_error());
+        let expected_findings = expected.clone().into_diagnostic_findings("input");
+        let actual_findings = actual.clone().into_diagnostic_findings("input");
         assert!(
-            actual
-                .local_findings()
-                .starts_with(expected.local_findings())
+            actual_findings
+                .iter()
+                .take(expected_findings.len())
+                .eq(expected_findings.iter())
         );
         assert_eq!(actual.take_assignment().errors.len(), 1);
     }
@@ -2163,7 +2166,11 @@ fn review_seam_composition_computed_values_keep_main_checks() {
             assert!(
                 findings
                     .errors()
-                    .chain(findings.symbolic_errors().map(|(_, _, error)| error))
+                    .chain(
+                        findings
+                            .symbolic_errors()
+                            .map(|(_, _, diagnostic)| diagnostic.error())
+                    )
                     .any(|error| error.to_string().contains("expected String, got Int")),
                 "{expression}: {findings:?}"
             );

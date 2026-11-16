@@ -9,6 +9,13 @@ pub mod loopback;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod provider_text;
 
+/// Adapt a real parser invariant for downstream terminal-rendering tests.
+pub fn resource_analysis_finding_for_test(
+    error: crate::parser::AnalysisTreeError,
+) -> crate::validation::ResourceAdmissionFinding {
+    crate::validation::ResourceAdmissionFinding::analysis(error)
+}
+
 pub fn load_canonical_buffer_configuration<'a, E, D, B: crate::resource::BindingAddress>(
     parsed: &crate::parser::File<
         E,

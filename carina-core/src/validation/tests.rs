@@ -33,6 +33,240 @@ type RuntimeInterpolationPart =
 type RuntimeInferredExportParam =
     crate::parser::InferredExportParam<NoPlaceholder, AbsoluteBindingAddress>;
 
+fn unknown_key_locations(body: &str) -> Vec<String> {
+    unknown_key_locations_with_duplicate_id(body, false)
+}
+
+fn unknown_key_locations_with_duplicate_id(body: &str, duplicate: bool) -> Vec<String> {
+    let catalog = LoadedProviderContext::empty_for_test();
+    let config = catalog.as_provider_context();
+    let entry = || {
+        PatternAttributeType::struct_(
+            "Entry",
+            vec![
+                PatternStructField::optional("enabled", PatternAttributeType::bool()).build(),
+                PatternStructField::optional(
+                    "children",
+                    PatternAttributeType::list(PatternAttributeType::struct_("Child", vec![])),
+                )
+                .with_block_name("child")
+                .build(),
+            ],
+        )
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Thing")
+            .attribute(PatternAttributeSchema::optional("config", entry()).build())
+            .attribute(
+                PatternAttributeSchema::optional("items", PatternAttributeType::list(entry()))
+                    .with_block_name("item")
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("mapping", PatternAttributeType::map(entry()))
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "variant",
+                    PatternAttributeType::union(vec![
+                        PatternAttributeType::struct_(
+                            "Enabled",
+                            vec![
+                                PatternStructField::required(
+                                    "enabled",
+                                    PatternAttributeType::bool(),
+                                )
+                                .build(),
+                            ],
+                        ),
+                        PatternAttributeType::struct_(
+                            "Other",
+                            vec![
+                                PatternStructField::required("other", PatternAttributeType::bool())
+                                    .build(),
+                            ],
+                        ),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let source = format!("provider mock {{}}\n{body}\n");
+    let mut parsed =
+        crate::parser::parse_file(&source, std::path::Path::new("sibling.crn"), config).unwrap();
+    if duplicate {
+        parsed.resources[1].id = parsed.resources[0].id.clone();
+    }
+    crate::schema::resolve_file_block_names_with_schemas(&mut parsed, &schemas).unwrap();
+    let bindings = BindingIndex::from_parsed(&parsed, &schemas, config);
+    let loaded = crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, config);
+    let findings = resource_admission_findings(
+        loaded.judged(),
+        &bindings,
+        &HashSet::from(["mock".into()]),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    findings
+        .iter()
+        .map(|finding| {
+            let location = finding.location().expect("authored diagnostic");
+            assert_eq!(location.file().path(), std::path::Path::new("sibling.crn"));
+            eprintln!(
+                "{body}: {}:{}-{}:{} {}",
+                location.span().start_line(),
+                location.span().start_column(),
+                location.span().end_line(),
+                location.span().end_column(),
+                finding.message()
+            );
+            source[location.span().start_byte()..location.span().end_byte()].to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn unknown_attribute_report_uses_authored_key() {
+    let actual = [
+        "mock.test.Thing { typo = true }",
+        "mock.test.Thing { typo = [\n  'value'\n] }",
+    ]
+    .map(unknown_key_locations);
+    assert_eq!(actual, [vec!["typo = true"], vec!["typo"]]);
+}
+
+#[test]
+fn nested_unknown_key_location_survives_containers_and_aliases() {
+    let actual = [
+        "mock.test.Thing { config = { typo = true } }",
+        "mock.test.Thing { items = [{ enabled = true }, { typo = true }] }",
+        "mock.test.Thing { mapping = { 'a.b' = { typo = true } } }",
+        "mock.test.Thing { item { enabled = true } item { typo = true } }",
+        "mock.test.Thing { item { child {} child { typo = true } } }",
+    ]
+    .map(unknown_key_locations);
+    assert_eq!(
+        actual,
+        [
+            vec!["typo"],
+            vec!["typo"],
+            vec!["typo"],
+            vec!["typo"],
+            vec!["typo"]
+        ]
+    );
+}
+
+#[test]
+fn unknown_key_keeps_its_selected_union_arm_location() {
+    assert_eq!(
+        unknown_key_locations("mock.test.Thing { variant = { enabled = true typo = true } }"),
+        ["typo"],
+    );
+}
+
+#[test]
+fn duplicate_resource_id_keeps_the_second_unknown_key_owner() {
+    assert_eq!(
+        unknown_key_locations_with_duplicate_id(
+            "mock.test.Thing {}\nmock.test.Thing { typo = true }",
+            true
+        ),
+        ["typo = true"],
+    );
+}
+
+#[test]
+fn missing_authored_root_keeps_the_resource_invariant_and_other_findings() {
+    let catalog = LoadedProviderContext::empty_for_test();
+    let config = catalog.as_provider_context();
+    let source =
+        "provider mock {}\nmock.test.Thing { real = true }\nmock.test.Thing { typo = true }\n";
+    let parsed =
+        crate::parser::parse_file(source, std::path::Path::new("sibling.crn"), config).unwrap();
+    let mut schemas = SchemaRegistry::new();
+    let schema = PatternResourceSchema::new("test.Thing").validate().unwrap();
+    schemas.insert("mock", schema.clone());
+    let loaded = crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, config);
+    let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let mut admissions = ResourceAdmissionValues::new();
+    for (index, resource) in tree.project_resources().enumerate() {
+        let names = if index == 0 {
+            vec!["missing", "real"]
+        } else {
+            vec!["typo"]
+        };
+        let values: indexmap::IndexMap<_, RuntimeValue> = names
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    RuntimeValue::Concrete(RuntimeConcreteValue::Bool(true)),
+                )
+            })
+            .collect();
+        let classified: indexmap::IndexMap<_, _> = values
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                )
+            })
+            .collect();
+        let report = schema.as_schema().validate_admission_report(
+            &classified,
+            classified.iter(),
+            &|_| false,
+            &crate::schema::value_validation::AttributeAdmission {
+                known: &|_, _, _| Default::default(),
+                unknown: None,
+            },
+        );
+        admissions.insert((resource.id().clone(), resource.location().clone()), report);
+    }
+    let judged = loaded.judged();
+    let inputs = judged.schema_validation_resources().unwrap();
+    let mut run: ConversionValidation = ConversionValidation::new(judged.report());
+    let findings = run.walk_in(FindingSubject::Root, |coverage| {
+        resource_values_report(
+            inputs,
+            judged.schemas(),
+            &HashSet::from(["mock".into()]),
+            config,
+            Some(&admissions),
+            &mut Vec::new(),
+            ValueAdmission {
+                report: judged.report(),
+                coverage,
+            },
+        )
+    });
+    assert_eq!(findings.len(), 3, "{findings:#?}");
+    let ResourceAdmissionDetail::AnalysisInvariant(cause) = &findings[0].detail else {
+        panic!("retain the typed invariant: {:?}", findings[0]);
+    };
+    assert!(std::error::Error::source(&findings[0]).is_none());
+    assert!(
+        matches!(cause.kind(), crate::parser::AnalysisTreeErrorKind::MissingElementProvenance { declaration, .. }
+        if declaration.span().start_line() == 2)
+    );
+    assert_eq!(findings[1].message(), "Unknown attribute 'real'");
+    assert_eq!(findings[2].message(), "Unknown attribute 'typo'");
+    for (finding, expected) in findings[1..].iter().zip(["real = true", "typo = true"]) {
+        let span = finding.location().unwrap().span();
+        assert_eq!(&source[span.start_byte()..span.end_byte()], expected);
+    }
+}
+
 #[test]
 fn round9_admission_locations_use_linear_resource_work() {
     fn run(count: usize) -> usize {
