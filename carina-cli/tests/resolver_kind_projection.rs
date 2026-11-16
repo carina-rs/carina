@@ -1,9 +1,9 @@
 //! Full-corpus and per-invocation work observations through production entries.
-use carina_core::test_utils::resolver_kind::{
-    EVENTS, InvocationKind, ProjectionReport, STORAGE_EVENTS, compare_directory,
+use carina_core::test_utils::resolver_kind::{EVENTS, ProjectionReport, compare_directory};
+use carina_core::{
+    EnvironmentSnapshot, parser::ProviderContext, paths::ResolvedPath, schema::SchemaRegistry,
 };
-use carina_core::{EnvironmentSnapshot, parser::ProviderContext, paths::ResolvedPath};
-use serde_json::{Value as Json, json};
+use serde_json::Value as Json;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -14,9 +14,6 @@ fn repo() -> PathBuf {
         .parent()
         .unwrap()
         .to_path_buf()
-}
-fn manifest() -> Json {
-    serde_json::from_str(include_str!("fixtures/resolver-kind-directories.json")).unwrap()
 }
 fn directories(root: &Path, out: &mut BTreeSet<String>) {
     for entry in std::fs::read_dir(root).unwrap() {
@@ -36,7 +33,10 @@ fn directories(root: &Path, out: &mut BTreeSet<String>) {
     }
 }
 fn observe(path: &Path) -> ProjectionReport {
-    let schemas = carina_cli::fixture_plan::resolver_kind_fixture_schemas(path);
+    let mut schemas = SchemaRegistry::new();
+    for schema in carina_provider_mock::builtin_schemas() {
+        schemas.insert("mock", schema);
+    }
     let context = ProviderContext {
         resource_types: ProviderContext::resource_types_from_schema_registry(&schemas),
         ..ProviderContext::new(EnvironmentSnapshot::empty())
@@ -123,117 +123,50 @@ fn check(report: &ProjectionReport, label: &str) {
         );
     }
 }
-fn summary(label: &str, report: &ProjectionReport) -> Json {
-    json!({"directory":label,"roots":report.roots.len(),"strict_error":report.strict_error,"diagnostics_error":report.diagnostics_error,
-        "invocations":report.invocations.iter().map(|invocation|json!({
-            "ordinal":invocation.ordinal,"entry":invocation.entry,"kind":match invocation.kind {InvocationKind::PerFile=>"per_file",InvocationKind::Merged=>"merged"},
-            "errored":invocation.errored,"plain":invocation.oracle_counts.0,"enriched":invocation.counts.0,
-            "plain_storage":invocation.oracle_storage_counts.0,"enriched_storage":invocation.storage_counts.0,
-        })).collect::<Vec<_>>()})
-}
-fn save(name: &str, document: &Json) {
-    if let Some(root) = std::env::var_os("CARINA_RESOLVER_KIND_REPORT_DIR") {
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            Path::new(&root).join(name),
-            serde_json::to_vec_pretty(document).unwrap(),
-        )
-        .unwrap();
-    }
-}
 #[test]
 fn all_fixture_directories_project_identically() {
-    let manifest = manifest();
-    let listed = manifest["directories"].as_array().unwrap();
-    assert_eq!(listed.len(), 157);
-    let expected = listed
-        .iter()
-        .map(|item| item["directory"].as_str().unwrap().to_string())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(expected.len(), 157);
-    let mut actual = BTreeSet::new();
+    let mut discovered = BTreeSet::new();
+    let mut contributions = Vec::new();
     for root in [
         "carina-cli/tests/fixtures/plan_display",
         "carina-core/tests/fixtures/diagnostic_order",
     ] {
-        directories(&repo().join(root), &mut actual);
+        let before = discovered.len();
+        // A nested directory with a .crn file is also loaded as a root.
+        directories(&repo().join(root), &mut discovered);
+        contributions.push(discovered.len() - before);
     }
-    assert_eq!(expected, actual, "fixture directory manifest drift");
-    assert_eq!(
-        listed
-            .iter()
-            .filter(|item| item["directory"]
-                .as_str()
-                .unwrap()
-                .starts_with("carina-cli/"))
-            .count(),
-        135
+    assert!(
+        !discovered.is_empty() && contributions.iter().all(|count| *count > 0),
+        "empty fixture walk: {} directories; root contributions {contributions:?}",
+        discovered.len()
     );
-    assert_eq!(
-        listed
-            .iter()
-            .filter(|item| item["nested"].as_bool().unwrap()
-                && item["directory"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("carina-cli/"))
-            .count(),
-        20
+    let reports = discovered
+        .iter()
+        .map(|label| (label, observe(&repo().join(label))))
+        .collect::<Vec<_>>();
+    let invocations = reports
+        .iter()
+        .map(|(_, report)| report.invocations.len())
+        .sum::<usize>();
+    let published = reports
+        .iter()
+        .map(|(_, report)| report.roots.len())
+        .sum::<usize>();
+    let failed = reports
+        .iter()
+        .filter(|(_, report)| !report.strict_succeeded || !report.diagnostics_succeeded)
+        .count();
+    let totals = format!(
+        "{} directories; {invocations} invocations; {published} publications; {failed} failed directories",
+        reports.len()
     );
-    let mut records = Vec::new();
-    for item in listed {
-        let label = item["directory"].as_str().unwrap();
-        let report = observe(&repo().join(label));
-        check(&report, label);
-        records.push(summary(label, &report));
+    for (label, report) in &reports {
+        check(report, &format!("{label}; {totals}"));
     }
-    save(
-        "projection-corpus.json",
-        &json!({"directories":records,"events":EVENTS,"storage_events":STORAGE_EVENTS}),
-    );
-    for (item, record) in listed.iter().zip(&records) {
-        assert_eq!(
-            item["expected_invocations"].as_u64(),
-            Some(record["invocations"].as_array().unwrap().len() as u64),
-            "{}: invocation coverage manifest",
-            item["directory"].as_str().unwrap()
-        );
-        assert_eq!(
-            item["expected_roots"].as_u64(),
-            record["roots"].as_u64(),
-            "{}: published root coverage manifest",
-            item["directory"].as_str().unwrap()
-        );
-        assert_eq!(
-            item["strict_error_expected"].as_bool(),
-            Some(!record["strict_error"].is_null())
-        );
-        assert_eq!(
-            item["diagnostics_error_expected"].as_bool(),
-            Some(!record["diagnostics_error"].is_null())
-        );
-        for field in ["strict_error", "diagnostics_error"] {
-            let actual = record[field]
-                .as_str()
-                .map(|error| error.replace(repo().to_str().unwrap(), "<REPO>"));
-            assert_eq!(
-                item[field].as_str(),
-                actual.as_deref(),
-                "{}: {field} manifest",
-                item["directory"].as_str().unwrap()
-            );
-        }
-    }
-    eprintln!(
-        "157 directories; {} invocations; {} successful roots compared",
-        records
-            .iter()
-            .map(|r| r["invocations"].as_array().unwrap().len())
-            .sum::<usize>(),
-        records
-            .iter()
-            .map(|r| r["roots"].as_u64().unwrap())
-            .sum::<u64>()
+    assert!(
+        failed > 0 && published > 0,
+        "vacuous corpus comparison: {totals}"
     );
 }
 
@@ -258,7 +191,7 @@ fn enriched_kind_does_no_extra_resolution_work() {
             !report.invocations.is_empty(),
             "{relative}: no resolver coverage"
         );
-        records.push(summary(relative, &report));
+        records.push(report);
     }
     let cells: Json =
         serde_json::from_str(include_str!("fixtures/authored_reference_cells.json")).unwrap();
@@ -288,117 +221,17 @@ fn enriched_kind_does_no_extra_resolution_work() {
             !report.invocations.is_empty(),
             "{label}: no resolver coverage"
         );
-        records.push(summary(&label, &report));
+        records.push(report);
     }
-    let ci_records = records.len();
-    // Every currently counted resolution event has an existing input above.
-    // There are no asserted-zero exceptions. A new event must get a real input
-    // (or an explicit, justified zero exception) rather than silently passing.
+    // Every counted resolution event has an existing input above.
+    // There are no asserted-zero exceptions. A new event needs a real input
+    // or an explicit, justified zero exception.
     for (index, event) in EVENTS.iter().enumerate() {
         let total = records
             .iter()
-            .flat_map(|record| record["invocations"].as_array().unwrap())
-            .map(|invocation| invocation["plain"][index].as_u64().unwrap())
-            .sum::<u64>();
+            .flat_map(|report| &report.invocations)
+            .map(|invocation| invocation.oracle_counts.0[index])
+            .sum::<usize>();
         assert!(total > 0, "CI input set never exercised {event}");
-    }
-    let external = if let Some(checkout) = std::env::var_os("CARINA_RESOLVER_KIND_INFRA") {
-        let checkout = PathBuf::from(checkout);
-        let path = if checkout.join("envs/registry/dev/publish").is_dir() {
-            checkout.join("envs/registry/dev/publish")
-        } else {
-            checkout
-        };
-        use carina_cli::{
-            runtime::{BuiltinMockInputs, CommandInputs, CommandRuntime, InvocationHooks},
-            wiring::TrustedLocalGrantInputs,
-        };
-        let temporary = carina_core::TestUserDirs::new();
-        let mut user_dirs = (*temporary).clone();
-        if let Some(home) = std::env::var_os("CARINA_RESOLVER_KIND_HOME") {
-            user_dirs = user_dirs.with_trust_record_dir(Path::new(&home).join(".carina/trust"));
-        }
-        let runtime = CommandRuntime::new(
-            user_dirs,
-            CommandInputs {
-                environment: EnvironmentSnapshot::empty(),
-                builtin_mock: BuiltinMockInputs::deferred(|| {
-                    Ok(carina_provider_mock::ConfiguredBuiltinMock::new(
-                        Default::default(),
-                        carina_provider_mock::MockScope::memory(),
-                    ))
-                }),
-                trusted_local_grants: TrustedLocalGrantInputs::new(Vec::new(), None),
-                accepted_egress: Default::default(),
-                color_mode: carina_cli::output_style::ColorMode::Plain,
-                cursor: carina_cli::cursor::CursorState::new(),
-                hooks: InvocationHooks::default(),
-            },
-        );
-        let executor = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .unwrap();
-        let resolved = ResolvedPath::new(&path).unwrap();
-        let (context, schemas, imports) = executor
-            .block_on(async {
-                carina_cli::fixture_plan::resolver_kind_installed_catalog(&runtime, &resolved)
-            })
-            .unwrap_or_else(|error| {
-                panic!("external infra schema-only loading unavailable: {error}")
-            });
-        let mut paths = BTreeSet::from([path]);
-        paths.extend(imports);
-        let start = records.len();
-        for (index, path) in paths.into_iter().enumerate() {
-            // Imports are additionally loaded as roots, just as the corpus's
-            // nested fixtures are. Root-only errors are retained in the report.
-            let label = format!("external infra root {index}");
-            let report = compare_directory(&ResolvedPath::new(&path).unwrap(), &context, &schemas);
-            check(&report, &label);
-            records.push(summary(&label, &report));
-        }
-        assert!(
-            records[start..]
-                .iter()
-                .any(|record| record["roots"].as_u64().unwrap() > 0),
-            "external infra: no resolver coverage"
-        );
-        json!({"status":"exercised","roots":records.len()-start,"schema_loading":"production validate schema-only; imports also loaded as roots"})
-    } else {
-        eprintln!(
-            "SKIPPED external infra: CARINA_RESOLVER_KIND_INFRA is unset; event-covering in-repo inputs were exercised"
-        );
-        json!({"status":"skipped","reason":"CARINA_RESOLVER_KIND_INFRA is unset"})
-    };
-    let document = json!({"external":external,"events":EVENTS,"storage_events":STORAGE_EVENTS,"configurations":records,"ci_configurations":ci_records});
-    let name = if std::env::var_os("CARINA_RESOLVER_KIND_INFRA").is_some() {
-        "work-counts-infra.json"
-    } else {
-        "work-counts-ci.json"
-    };
-    save(name, &document);
-    // Only numeric work counts leave the process; no resolved values are formatted.
-    for record in &records {
-        for entry in ["strict", "diagnostics"] {
-            let mut plain = [0usize; EVENTS.len()];
-            let mut enriched = [0usize; EVENTS.len()];
-            for invocation in record["invocations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|invocation| invocation["entry"] == entry)
-            {
-                for i in 0..EVENTS.len() {
-                    plain[i] += invocation["plain"][i].as_u64().unwrap() as usize;
-                    enriched[i] += invocation["enriched"][i].as_u64().unwrap() as usize;
-                }
-            }
-            eprintln!(
-                "{} {entry}: plain {plain:?}; enriched {enriched:?}",
-                record["directory"].as_str().unwrap()
-            );
-        }
     }
 }

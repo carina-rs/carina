@@ -1,8 +1,10 @@
 //! The 216 recorded cells cover 92 reference forms and 16 same-file twins,
 //! each with known and unknown sources, through production validate entries.
 //! Refresh with this fixed command, then review the diff:
-//! ~/.local/bin/heavy-slot nice -n 19 env CARGO_BUILD_JOBS=4 NEXTEST_TEST_THREADS=4 cargo nextest run --offline -p carina-cli --test authored_reference_cells --run-ignored only -E 'test(=record_authored_reference_cells)'
+//! cargo nextest run -p carina-cli --test authored_reference_cells --run-ignored only -E 'test(=record_authored_reference_cells)'
 //! A PR that correctly changes diagnostic wording refreshes and reviews this file's golden.
+//! The golden also pins Debug rendering of errors: renaming an error field changes
+//! it too. Refresh and read the diff.
 //! The 16 erased-reference rows and their same-file twins record main's
 //! known-accept / unknown-reject behaviour where observed. The node-judge PR
 //! of #4400 changes those outcomes ON PURPOSE. An unexplained accept/reject
@@ -14,8 +16,66 @@ use carina_core::schema::{
     StringMemberConstraints, StructField, TypeError, TypeIdentity, ValidatedResourceSchema,
 };
 use serde_json::{Value as Json, json};
-#[path = "support/resolver_kind_main.rs"]
-mod baseline;
+use std::path::{Path, PathBuf};
+
+const FIRST_RECORDED_ON: &str = "dedb7bcebd10f6b9a6b2d4a7cd6c8b318f8b2ccd";
+fn golden_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/authored_reference_cells.json")
+}
+fn normalize_prefix(value: Json, root: &Path, token: &str) -> Json {
+    match value {
+        Json::String(text) => Json::String(text.replace(root.to_str().unwrap(), token)),
+        Json::Array(values) => Json::Array(
+            values
+                .into_iter()
+                .map(|v| normalize_prefix(v, root, token))
+                .collect(),
+        ),
+        Json::Object(values) => Json::Object(
+            values
+                .into_iter()
+                .map(|(k, v)| (k, normalize_prefix(v, root, token)))
+                .collect(),
+        ),
+        value => value,
+    }
+}
+fn json_difference(expected: &Json, actual: &Json) -> Option<String> {
+    fn difference(expected: &Json, actual: &Json, path: &str) -> Option<String> {
+        match (expected, actual) {
+            (Json::Array(a), Json::Array(b)) if a.len() == b.len() => a
+                .iter()
+                .zip(b)
+                .enumerate()
+                .find_map(|(i, (a, b))| difference(a, b, &format!("{path}/{i}"))),
+            (Json::Object(a), Json::Object(b)) if a.keys().eq(b.keys()) => a
+                .iter()
+                .find_map(|(k, a)| difference(a, &b[k], &format!("{path}/{k}"))),
+            _ if expected == actual => None,
+            _ => Some(format!("{path}: expected {expected}, got {actual}")),
+        }
+    }
+    difference(expected, actual, "")
+}
+fn assert_json_eq(expected: &Json, actual: &Json, context: &str) {
+    if let Some(diff) = json_difference(expected, actual) {
+        panic!("{context}: {diff}");
+    }
+}
+// Failure evidence only, outside the worktree; never an update mode.
+fn save_actual(label: &str, bytes: &[u8]) -> PathBuf {
+    use std::io::Write as _;
+    let mut file = tempfile::Builder::new()
+        .prefix(&format!(
+            "authored-reference-actual-{}-",
+            label.replace('/', "__")
+        ))
+        .suffix(".json")
+        .tempfile()
+        .unwrap();
+    file.write_all(bytes).unwrap();
+    file.keep().unwrap().1
+}
 
 fn expected() -> T {
     T::refined_string(
@@ -193,16 +253,10 @@ struct Row {
     main: String,
     same_file: bool,
     live_alternative: bool,
-    reference_count: usize,
-    known_value_count: usize,
-    require_acceptance: bool,
     second_source: Option<&'static str>,
     source_suffix: String,
     source_override: Option<[String; 2]>,
-    expected_instances: Option<Vec<&'static str>>,
-    check_public_origin: bool,
     extra_files: Vec<(&'static str, String)>,
-    expected_error_count: Option<usize>,
 }
 impl Row {
     fn new(
@@ -211,7 +265,6 @@ impl Row {
         source: &'static str,
         sink: &str,
         expression: &str,
-        reference_count: usize,
     ) -> Self {
         Self {
             id,
@@ -220,21 +273,11 @@ impl Row {
             main: format!("let sink = mock.{sink} {{ value = {expression} }}\n"),
             same_file: false,
             live_alternative: false,
-            reference_count,
-            known_value_count: 0,
-            require_acceptance: false,
             second_source: None,
             source_suffix: String::new(),
             source_override: None,
-            expected_instances: None,
-            check_public_origin: false,
             extra_files: Vec::new(),
-            expected_error_count: None,
         }
-    }
-    fn accepting(mut self) -> Self {
-        self.require_acceptance = true;
-        self
     }
     fn files(&self, known: bool) -> Vec<(&'static str, String)> {
         let mut source = if let Some(overrides) = &self.source_override {
@@ -607,7 +650,7 @@ fn cells() -> Json {
             format!("{}-samefile", row.id)
         };
         let dir = tempfile::Builder::new()
-            .prefix("pr1-4400-")
+            .prefix("authored-reference-cells-")
             .tempdir()
             .unwrap();
         let path = carina_core::paths::ResolvedPath::new(dir.path()).unwrap();
@@ -622,25 +665,19 @@ fn cells() -> Json {
             // Deliberately no catch_unwind: a panic is never a recorded rejection.
             let observed = observe(&path);
             cells.push(json!({"known": known, "files": files,
-                "observation": baseline::normalize_prefix(observed, dir.path(), "<DIR>")}));
+                "observation": normalize_prefix(observed, dir.path(), "<DIR>")}));
         }
-        records.push(json!({"row": id, "construct": row.construct, "cells": cells,
-            "original_expectations": {
-                "reference_count": row.reference_count, "known_value_count": row.known_value_count,
-                "require_acceptance": row.require_acceptance, "expected_instances": row.expected_instances,
-                "check_public_origin": row.check_public_origin, "expected_error_count": row.expected_error_count
-            }}));
+        records.push(json!({"row": id, "construct": row.construct, "cells": cells}));
     }
     json!(records)
 }
 
 #[test]
 fn authored_reference_cells_match_recorded() {
-    let golden: Json =
-        serde_json::from_slice(&std::fs::read(baseline::golden_path()).unwrap()).unwrap();
+    let golden: Json = serde_json::from_slice(&std::fs::read(golden_path()).unwrap()).unwrap();
     assert_eq!(
         golden["header"],
-        json!({"first_recorded_on": baseline::FIRST_RECORDED_ON, "original_rows": 92, "samefile_rows": 16, "rows": 108, "cells": 216})
+        json!({"first_recorded_on": FIRST_RECORDED_ON, "original_rows": 92, "samefile_rows": 16, "rows": 108, "cells": 216})
     );
     assert_eq!(golden["skipped_probes"], json!(SKIPPED_PROBES));
     assert_eq!(golden["rows"].as_array().unwrap().len(), 108);
@@ -648,357 +685,277 @@ fn authored_reference_cells_match_recorded() {
     if golden["rows"] != actual {
         eprintln!(
             "actual cells: {}",
-            baseline::save_actual("cells", &serde_json::to_vec_pretty(&actual).unwrap()).display()
+            save_actual("cells", &serde_json::to_vec_pretty(&actual).unwrap()).display()
         );
     }
-    baseline::assert_json_eq(&golden["rows"], &actual, "4400 cells");
+    assert_json_eq(&golden["rows"], &actual, "4400 cells");
 }
 
 #[test]
 #[ignore = "refresh the recorded cells, then review the diff"]
 fn record_authored_reference_cells() {
-    let header = json!({"first_recorded_on": baseline::FIRST_RECORDED_ON, "original_rows": 92, "samefile_rows": 16, "rows": 108, "cells": 216});
+    let header = json!({"first_recorded_on": FIRST_RECORDED_ON, "original_rows": 92, "samefile_rows": 16, "rows": 108, "cells": 216});
     let golden = json!({"header": header, "normalization": "temporary directory prefix only",
         "json_bytes": "compact serialization of validate_diagnostics_with_factories.json",
         "skipped_probes": SKIPPED_PROBES, "rows": cells()});
 
     std::fs::write(
-        baseline::golden_path(),
+        golden_path(),
         serde_json::to_string_pretty(&golden).unwrap() + "\n",
     )
     .unwrap();
 }
-// Original row constructors. R/V metadata below is historical, not asserted.
 macro_rules! row {
-    ($test:ident, $id:literal, $construct:literal, $source:literal, $sink:literal, $expr:literal, $r:literal) => {
+    ($test:ident, $id:literal, $construct:literal, $source:literal, $sink:literal, $expr:literal) => {
         fn $test() {
-            measure(Row::new($id, $construct, $source, $sink, $expr, $r));
+            measure(Row::new($id, $construct, $source, $sink, $expr));
         }
     };
 }
-macro_rules! accepting_row {
-    ($test:ident, $id:literal, $construct:literal, $source:literal, $sink:literal, $expr:literal, $r:literal) => {
-        fn $test() {
-            measure(Row::new($id, $construct, $source, $sink, $expr, $r).accepting());
-        }
-    };
-}
-// 1 R: one identical String -> mock.Expected rejection. V: none.
+
 row!(
     reference_4400_row1_top,
     "1",
     "attribute root: x.name",
     "Source",
     "Sink",
-    "x.name",
-    1
+    "x.name"
 );
-// 2 R: one identical rejection at the list item. V: none.
 row!(
     reference_4400_row2_list,
     "2",
     "list item: [x.name]",
     "Source",
     "ListSink",
-    "[x.name]",
-    1
+    "[x.name]"
 );
-// 3 R: one identical rejection at map value a. V: none.
 row!(
     reference_4400_row3_map,
     "3",
     "map value: { a = x.name }",
     "Source",
     "MapSink",
-    "{ a = x.name }",
-    1
+    "{ a = x.name }"
 );
-// 3b R: one identical rejection at struct field a. V: none.
 row!(
     reference_4400_row3_struct,
     "3b",
     "struct field: { a = x.name }",
     "Source",
     "StructSink",
-    "{ a = x.name }",
-    1
+    "{ a = x.name }"
 );
-// 4 R: one identical protected source-type rejection. V: none.
 row!(
     reference_4400_row4_secret,
     "4",
     "secret(x.name)",
     "Source",
     "Sink",
-    "secret(x.name)",
-    1
+    "secret(x.name)"
 );
-// Keep the original secret-literal control. R: none. V: none. Accept both.
-accepting_row!(
+row!(
     reference_4400_row4b_secret_literal,
     "4b",
     "secret literal: secret('same')",
     "Source",
     "Sink",
-    "secret('same')",
-    0
+    "secret('same')"
 );
-// 5a R: x rejected once per side, equal FULL counts/text. V: none;
-// fallback is a valid literal, and x's concrete value has no constraint.
 row!(
     reference_4400_row5_selected,
     "5a",
     "selected operand: x.name ?? 'fallback'",
     "Source",
     "Sink",
-    "x.name ?? 'fallback'",
-    1
+    "x.name ?? 'fallback'"
 );
 
 fn reference_4400_row5_live_alternative() {
-    // R: x and y each rejected once, identical stream when y becomes pending.
-    // V: none. x is pending in BOTH runs; only y switches known/unknown.
     let mut row = Row::new(
         "5b",
         "live alternative: x.name ?? y.name (x pending; y varies)",
         "Source",
         "Sink",
         "x.name ?? y.name",
-        2,
     );
     row.live_alternative = true;
     measure(row);
 }
-// 6 R: only a's reference rejected, identically once per side. V: none.
-// b's statically evaluable call creates a valid literal-like expression value.
 row!(
     reference_4400_row6_input_without_reevaluation,
     "6",
     "map reference + static call: { a = x.name, b = upper('same') }",
     "Source",
     "MapSink",
-    "{ a = x.name, b = upper('same') }",
-    1
+    "{ a = x.name, b = upper('same') }"
 );
 
-// 7 R: none; literal equals known source but has no reference. V: none. Accept.
-accepting_row!(
+row!(
     reference_4400_row7_literal,
     "7",
     "literal equal to known source: 'same'",
     "Source",
     "Sink",
-    "'same'",
-    0
+    "'same'"
 );
-// 8 R: none, mock.Expected -> mock.Expected. V: none. Accept both.
-accepting_row!(
+row!(
     reference_4400_row8_compatible,
     "8",
     "compatible reference: x.name",
     "CompatibleSource",
     "Sink",
-    "x.name",
-    0
+    "x.name"
 );
 
 fn reference_4400_row9_known_value_constraint() {
-    // R: none; same nominal identity. V: one length error for 'same' (4 > 3),
-    // none when no value is available. The source itself has no length limit.
-    let mut row = Row::new(
+    let row = Row::new(
         "9",
         "compatible type; destination member length <= 3",
         "CompatibleSource",
         "LengthSink",
         "x.name",
-        0,
     );
-    row.known_value_count = 1;
+
     measure(row);
 }
-// 10a-i R: none. Source String is incompatible with Sink DIRECTLY, but valid
-// for interpolation, which computes a new String. V: none. Accept both.
-accepting_row!(
+row!(
     reference_4400_row10a_interpolation_incompatible,
     "10a-i",
     "interpolation, directly incompatible source: p-${x.name}",
     "Source",
     "Sink",
-    "\"p-${x.name}\"",
-    0
+    "\"p-${x.name}\""
 );
-// 10a-c R: none; nominal String also valid as interpolation input. V: none.
-accepting_row!(
+row!(
     reference_4400_row10a_interpolation_compatible,
     "10a-c",
     "interpolation, directly compatible source: p-${x.name}",
     "CompatibleSource",
     "Sink",
-    "\"p-${x.name}\"",
-    0
+    "\"p-${x.name}\""
 );
-// 10b-i R: none; plain Int is valid as an addition operand, despite lacking
-// mock.ExpectedCount identity. The sum is a new Int expression. V: none.
-// This is R/V and full-stream parity, not an assertion that a computed Int is
-// implicitly admitted to a nominal Int destination. Any result-type findings
-// remain A (unforced) and must have identical content/count on both sides.
 row!(
     reference_4400_row10b_arithmetic_incompatible,
     "10b-i",
     "addition, directly incompatible source: x.count + 1",
     "Source",
     "IntSink",
-    "x.count + 1",
-    0
+    "x.count + 1"
 );
-// 10b-c R: none; nominal Int also valid as addition input. V: none.
 row!(
     reference_4400_row10b_arithmetic_compatible,
     "10b-c",
     "addition, directly compatible source: x.count + 1",
     "CompatibleSource",
     "IntSink",
-    "x.count + 1",
-    0
+    "x.count + 1"
 );
-// 10c-i R: none; upper accepts String and returns a new String. V: none.
-accepting_row!(
+row!(
     reference_4400_row10c_upper_incompatible,
     "10c-i",
     "upper(x.name), directly incompatible source",
     "Source",
     "Sink",
-    "upper(x.name)",
-    0
+    "upper(x.name)"
 );
-// 10c-c R: none; upper also accepts the compatible nominal String. V: none.
-accepting_row!(
+row!(
     reference_4400_row10c_upper_compatible,
     "10c-c",
     "upper(x.name), directly compatible source",
     "CompatibleSource",
     "Sink",
-    "upper(x.name)",
-    0
+    "upper(x.name)"
 );
-// 11 DSL supports if/else VALUES in resource attributes, not only modules.
-// Condition must be static. The selected x.name independently changes knownness.
-// 11-i R: one identical rejection of selected source. V: none.
 row!(
     reference_4400_row11_if_incompatible,
     "11-i",
     "if true { x.name } else { 'fallback' }, incompatible",
     "Source",
     "Sink",
-    "if true { x.name } else { 'fallback' }",
-    1
+    "if true { x.name } else { 'fallback' }"
 );
-// 11-c R: none for compatible selected branch. V: none. Accept both.
-accepting_row!(
+row!(
     reference_4400_row11_if_compatible,
     "11-c",
     "if true { x.name } else { 'fallback' }, compatible",
     "CompatibleSource",
     "Sink",
-    "if true { x.name } else { 'fallback' }",
-    0
+    "if true { x.name } else { 'fallback' }"
 );
 
 fn reference_4400_row12_same_file_incompatible() {
-    // R: one identical rejection (same-file control for 1). V: none.
     let mut row = Row::new(
         "12-i",
         "same-file reference, incompatible (control for 1)",
         "Source",
         "Sink",
         "x.name",
-        1,
     );
     row.same_file = true;
     measure(row);
 }
 
 fn reference_4400_row12_same_file_compatible() {
-    // R: none (same-file control for 8). V: none. Accept both.
     let mut row = Row::new(
         "12-c",
         "same-file reference, compatible (control for 8)",
         "CompatibleSource",
         "Sink",
         "x.name",
-        0,
     );
     row.same_file = true;
-    measure(row.accepting());
+    measure(row);
 }
 
 fn reference_4400_row13_alias_incompatible() {
-    // R: one identical rejection through let n = x.name. V: none.
     let mut row = Row::new(
         "13-i",
         "let n = x.name; value = n, incompatible",
         "Source",
         "Sink",
         "n",
-        1,
     );
     row.main = format!("let n = x.name\n{}", row.main);
     measure(row);
 }
 
 fn reference_4400_row13_alias_compatible() {
-    // R: none through compatible alias. V: none. Accept both.
     let mut row = Row::new(
         "13-c",
         "let n = x.name; value = n, compatible",
         "CompatibleSource",
         "Sink",
         "n",
-        0,
     );
     row.main = format!("let n = x.name\n{}", row.main);
-    measure(row.accepting());
+    measure(row);
 }
 
 fn reference_4400_row14_two_sinks() {
-    // R: only OtherSink rejects mock.Expected; Sink accepts it. One identical
-    // finding per side. Rejecting every reference would yield TWO and fail.
-    // V: none. These are two distinct authored reference uses.
     let mut row = Row::new(
         "14",
         "x.name at sinks mock.Expected and mock.OtherExpected",
         "CompatibleSource",
         "Sink",
         "x.name",
-        1,
     );
     row.main = "let accepted = mock.Sink { value = x.name }\nlet rejected = mock.OtherSink { value = x.name }\n".into();
     measure(row);
 }
 
-// SECOND MEASUREMENT: the issue's expression forms. Every issue_row has:
-// R: exactly the stated count on BOTH sides, full content/order/location equal;
-//    zero means this compatible reference must be accepted, not just R-free.
-// V: NONE on either side ('same' satisfies every source/destination value rule).
-// Aliases/containers are authored in sources.crn; only their use is in main.crn.
-// Both candidates have the SAME known literal: values cannot identify origins.
 macro_rules! issue_row {
     ($test:ident, $id:literal, $construct:literal, $source:literal,
-     $definitions:literal, $expr:literal, $pair:literal, $r:literal) => {
+     $definitions:literal, $expr:literal, $pair:literal) => {
         fn $test() {
-            let mut row = Row::new($id, $construct, $source, "Sink", $expr, $r);
+            let mut row = Row::new($id, $construct, $source, "Sink", $expr);
             row.source_suffix = $definitions.into();
             if $pair {
                 row.second_source = Some($source);
-            }
-            if $r == 0 {
-                row = row.accepting();
             }
             measure(row);
         }
     };
 }
-// 20: Sole interpolation denotes the source reference, not a new String.
 issue_row!(
     reference_4400_row20_sole_incompatible,
     "20-i",
@@ -1006,8 +963,7 @@ issue_row!(
     "Source",
     "",
     "\"${x.name}\"",
-    false,
-    1
+    false
 );
 issue_row!(
     reference_4400_row20_sole_compatible,
@@ -1016,10 +972,8 @@ issue_row!(
     "CompatibleSource",
     "",
     "\"${x.name}\"",
-    false,
-    0
+    false
 );
-// 21: The chosen element retains x.name's declared type.
 issue_row!(
     reference_4400_row21_list_incompatible,
     "21-i",
@@ -1027,8 +981,7 @@ issue_row!(
     "Source",
     "",
     "[x.name][0]",
-    false,
-    1
+    false
 );
 issue_row!(
     reference_4400_row21_list_compatible,
@@ -1037,10 +990,8 @@ issue_row!(
     "CompatibleSource",
     "",
     "[x.name][0]",
-    false,
-    0
+    false
 );
-// 22: The chosen field retains x.name's declared type.
 issue_row!(
     reference_4400_row22_map_incompatible,
     "22-i",
@@ -1048,8 +999,7 @@ issue_row!(
     "Source",
     "",
     "{ f = x.name }.f",
-    false,
-    1
+    false
 );
 issue_row!(
     reference_4400_row22_map_compatible,
@@ -1058,10 +1008,8 @@ issue_row!(
     "CompatibleSource",
     "",
     "{ f = x.name }.f",
-    false,
-    0
+    false
 );
-// 23: Cross-file let container projection, for both container shapes.
 issue_row!(
     reference_4400_row23_map_incompatible,
     "23m-i",
@@ -1069,8 +1017,7 @@ issue_row!(
     "Source",
     "let m = { f = x.name }\n",
     "m.f",
-    false,
-    1
+    false
 );
 issue_row!(
     reference_4400_row23_map_compatible,
@@ -1079,8 +1026,7 @@ issue_row!(
     "CompatibleSource",
     "let m = { f = x.name }\n",
     "m.f",
-    false,
-    0
+    false
 );
 issue_row!(
     reference_4400_row23_list_incompatible,
@@ -1089,8 +1035,7 @@ issue_row!(
     "Source",
     "let l = [x.name]\n",
     "l[0]",
-    false,
-    1
+    false
 );
 issue_row!(
     reference_4400_row23_list_compatible,
@@ -1099,10 +1044,8 @@ issue_row!(
     "CompatibleSource",
     "let l = [x.name]\n",
     "l[0]",
-    false,
-    0
+    false
 );
-// 24: Only the statically selected branch is live; expect one x finding.
 issue_row!(
     reference_4400_row24_list_incompatible,
     "24l-i",
@@ -1110,8 +1053,7 @@ issue_row!(
     "Source",
     "let s = if true { [x.name] } else { [y.name] }\n",
     "s[0]",
-    true,
-    1
+    true
 );
 issue_row!(
     reference_4400_row24_list_compatible,
@@ -1120,8 +1062,7 @@ issue_row!(
     "CompatibleSource",
     "let s = if true { [x.name] } else { [y.name] }\n",
     "s[0]",
-    true,
-    0
+    true
 );
 issue_row!(
     reference_4400_row24_map_incompatible,
@@ -1130,8 +1071,7 @@ issue_row!(
     "Source",
     "let s = if true { { f = x.name } } else { { f = y.name } }\n",
     "s.f",
-    true,
-    1
+    true
 );
 issue_row!(
     reference_4400_row24_map_compatible,
@@ -1140,11 +1080,8 @@ issue_row!(
     "CompatibleSource",
     "let s = if true { { f = x.name } } else { { f = y.name } }\n",
     "s.f",
-    true,
-    0
+    true
 );
-// 25: The non-null container is present even when its leaf is unknown.
-// R is the selected x reference's finding once, not both candidate sources.
 issue_row!(
     reference_4400_row25_list_incompatible,
     "25l-i",
@@ -1152,8 +1089,7 @@ issue_row!(
     "Source",
     "let s = [x.name] ?? [y.name]\n",
     "s[0]",
-    true,
-    1
+    true
 );
 issue_row!(
     reference_4400_row25_list_compatible,
@@ -1162,8 +1098,7 @@ issue_row!(
     "CompatibleSource",
     "let s = [x.name] ?? [y.name]\n",
     "s[0]",
-    true,
-    0
+    true
 );
 issue_row!(
     reference_4400_row25_map_incompatible,
@@ -1172,8 +1107,7 @@ issue_row!(
     "Source",
     "let s = { f = x.name } ?? { f = y.name }\n",
     "s.f",
-    true,
-    1
+    true
 );
 issue_row!(
     reference_4400_row25_map_compatible,
@@ -1182,10 +1116,8 @@ issue_row!(
     "CompatibleSource",
     "let s = { f = x.name } ?? { f = y.name }\n",
     "s.f",
-    true,
-    0
+    true
 );
-// 26: Conditional INSIDE the projected list item; selected source remains x.
 issue_row!(
     reference_4400_row26_inner_if_incompatible,
     "26-i",
@@ -1193,8 +1125,7 @@ issue_row!(
     "Source",
     "",
     "[if true { x.name } else { y.name }][0]",
-    true,
-    1
+    true
 );
 issue_row!(
     reference_4400_row26_inner_if_compatible,
@@ -1203,28 +1134,16 @@ issue_row!(
     "CompatibleSource",
     "",
     "[if true { x.name } else { y.name }][0]",
-    true,
-    0
+    true
 );
 
-fn loop_selection(
-    id: &'static str,
-    construct: &'static str,
-    x: &'static str,
-    y: &'static str,
-    rejected: Vec<&'static str>,
-) {
-    // R: ONLY the resource instance selecting a non-fitting source rejects,
-    // once, with the same full findings for known and unknown. V: none.
-    let mut row = Row::new(id, construct, x, "Sink", "", rejected.len());
+fn loop_selection(id: &'static str, construct: &'static str, x: &'static str, y: &'static str) {
+    let mut row = Row::new(id, construct, x, "Sink", "");
     row.second_source = Some(y);
     row.main =
         "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             .into();
-    if rejected.is_empty() {
-        row = row.accepting();
-    }
-    row.expected_instances = Some(rejected);
+
     measure(row);
 }
 
@@ -1234,7 +1153,6 @@ fn reference_4400_row27_bad_first() {
         "for i in [0,1]: [x.name,y.name][i]; only x incompatible",
         "Source",
         "CompatibleSource",
-        vec!["mock.Sink.probes[0]"],
     );
 }
 
@@ -1244,7 +1162,6 @@ fn reference_4400_row27_bad_second() {
         "for i in [0,1]: [x.name,y.name][i]; only y incompatible",
         "CompatibleSource",
         "Source",
-        vec!["mock.Sink.probes[1]"],
     );
 }
 
@@ -1254,12 +1171,9 @@ fn reference_4400_row27_both_compatible() {
         "for i in [0,1]: [x.name,y.name][i]; both compatible",
         "CompatibleSource",
         "CompatibleSource",
-        vec![],
     );
 }
 fn for_map_source(schema: &str, known: bool) -> String {
-    // Both resources are themselves the sources. This is not a projection
-    // through an authored x.name operand that could supply source recovery.
     let block = source_block("unused", schema, known).replacen(
         &format!("let unused = mock.{schema}"),
         &format!("  mock.{schema}"),
@@ -1269,19 +1183,9 @@ fn for_map_source(schema: &str, known: bool) -> String {
         "let input = {{ first = 0, second = 1 }}\nlet built = for key, _ in input {{\n{block}}}\n"
     )
 }
-fn resource_map_read(
-    id: &'static str,
-    construct: &'static str,
-    schema: &'static str,
-    count: usize,
-) {
-    // R: the selected built.first.name type is rejected once, or accepted,
-    // according to its declaration, equally known/unknown. V: none.
-    let mut row = Row::new(id, construct, schema, "Sink", "built['first'].name", count);
+fn resource_map_read(id: &'static str, construct: &'static str, schema: &'static str) {
+    let mut row = Row::new(id, construct, schema, "Sink", "built['first'].name");
     row.source_override = Some([for_map_source(schema, true), for_map_source(schema, false)]);
-    if count == 0 {
-        row = row.accepting();
-    }
     measure(row);
 }
 
@@ -1290,7 +1194,6 @@ fn reference_4400_row28_resource_map_incompatible() {
         "28-i",
         "for-built map of Source resources; built['first'].name, incompatible",
         "Source",
-        1,
     );
 }
 
@@ -1299,7 +1202,6 @@ fn reference_4400_row28_resource_map_compatible() {
         "28-c",
         "for-built map of CompatibleSource resources; built['first'].name, compatible",
         "CompatibleSource",
-        0,
     );
 }
 fn alias_public_secret(
@@ -1307,13 +1209,8 @@ fn alias_public_secret(
     construct: &'static str,
     schema: &'static str,
     public_first: bool,
-    count: usize,
 ) {
-    // R: two rejections (public and protected) for the incompatible source;
-    // none for the compatible source. Full known/unknown parity. V: none.
-    // Additionally, the PUBLIC finding must not acquire a protected origin
-    // just because the same let alias has another use inside secret(...).
-    let mut row = Row::new(id, construct, schema, "Sink", "n", count);
+    let mut row = Row::new(id, construct, schema, "Sink", "n");
     row.source_suffix = "let n = x.name\n".into();
     let public = "let public = mock.Sink { value = n }\n";
     let protected = "let protected = mock.Sink { value = secret(n) }\n";
@@ -1322,14 +1219,9 @@ fn alias_public_secret(
     } else {
         format!("{protected}{public}")
     };
-    row.check_public_origin = true;
-    if count == 0 {
-        row = row.accepting();
-    }
+
     measure(row);
 }
-// Main emits one finding: lexical binding-use validation rejects public n
-// and stops the directory before resource admission can visit secret(n).
 
 fn reference_4400_row29_public_first_incompatible() {
     alias_public_secret(
@@ -1337,7 +1229,6 @@ fn reference_4400_row29_public_first_incompatible() {
         "let n = x.name; public n then secret(n), incompatible",
         "Source",
         true,
-        1,
     );
 }
 
@@ -1347,7 +1238,6 @@ fn reference_4400_row29_secret_first_incompatible() {
         "let n = x.name; secret(n) then public n, incompatible",
         "Source",
         false,
-        1,
     );
 }
 
@@ -1357,7 +1247,6 @@ fn reference_4400_row29_public_first_compatible() {
         "let n = x.name; public n then secret(n), compatible",
         "CompatibleSource",
         true,
-        0,
     );
 }
 
@@ -1367,13 +1256,8 @@ fn reference_4400_row29_secret_first_compatible() {
         "let n = x.name; secret(n) then public n, compatible",
         "CompatibleSource",
         false,
-        0,
     );
 }
-// 30: Reference-typed attribute in place of the String-typed source in 20-22.
-// Incompatible identity mock.OtherExpected -> mock.Expected rejects once;
-// compatible Reference identity mock.Expected -> identified String accepts.
-// Literal known values and the omitted unknown attribute are built identically.
 issue_row!(
     reference_4400_row30_sole_incompatible,
     "30s-i",
@@ -1381,8 +1265,7 @@ issue_row!(
     "ReferenceSource",
     "",
     "\"${x.name}\"",
-    false,
-    1
+    false
 );
 issue_row!(
     reference_4400_row30_sole_compatible,
@@ -1391,8 +1274,7 @@ issue_row!(
     "CompatibleReferenceSource",
     "",
     "\"${x.name}\"",
-    false,
-    0
+    false
 );
 issue_row!(
     reference_4400_row30_list_incompatible,
@@ -1401,8 +1283,7 @@ issue_row!(
     "ReferenceSource",
     "",
     "[x.name][0]",
-    false,
-    1
+    false
 );
 issue_row!(
     reference_4400_row30_list_compatible,
@@ -1411,8 +1292,7 @@ issue_row!(
     "CompatibleReferenceSource",
     "",
     "[x.name][0]",
-    false,
-    0
+    false
 );
 issue_row!(
     reference_4400_row30_map_incompatible,
@@ -1421,8 +1301,7 @@ issue_row!(
     "ReferenceSource",
     "",
     "{ f = x.name }.f",
-    false,
-    1
+    false
 );
 issue_row!(
     reference_4400_row30_map_compatible,
@@ -1431,19 +1310,15 @@ issue_row!(
     "CompatibleReferenceSource",
     "",
     "{ f = x.name }.f",
-    false,
-    0
+    false
 );
 
-// Round 3: critique discriminators. Every row varies x's value known/unknown;
-// omitted attributes leave the raw unresolved reference on the unknown side.
-fn round3(
+fn expression_row(
     id: &'static str,
     construct: &'static str,
     compatible: bool,
     sink: &str,
     expression: &str,
-    count: usize,
     prefix: &str,
 ) {
     let mut row = Row::new(
@@ -1456,31 +1331,16 @@ fn round3(
         },
         sink,
         expression,
-        count,
     );
     row.main = format!("{prefix}{}", row.main);
-    if id.starts_with("35fnparam-") {
-        row.reference_count = 0;
-        row.require_acceptance = false;
-        row.expected_error_count = Some(if id.ends_with("-dc") { 0 } else { 2 });
-    }
-    if id.starts_with("38unknownif-") || id.starts_with("39typedlet-") {
-        row.reference_count = 0;
-        row.expected_error_count = Some(1);
-        row.require_acceptance = false;
-    }
-    if compatible && count == 0 && row.expected_error_count.is_none() {
-        row = row.accepting();
-    }
     measure(row);
 }
-fn round3_module(
+fn module_row(
     id: &'static str,
     construct: &'static str,
     compatible: bool,
     declaration: &str,
     exported: bool,
-    count: usize,
 ) {
     let mut row = Row::new(
         id,
@@ -1492,7 +1352,6 @@ fn round3_module(
         },
         "Sink",
         "child.output",
-        count,
     );
     row.main =
         "let template = use { source = './child' }\nlet child = template { input = x.name }\n"
@@ -1507,320 +1366,283 @@ fn round3_module(
         format!("arguments {{ input: {declaration} }}\nlet n = input\nmock.Sink {{ value = n }}\n")
     };
     row.extra_files.push(("child/main.crn", child));
-    // These counts are main's measured declaration-boundary behaviour.
-    if exported {
-        row.reference_count = 1;
-        row.expected_error_count = Some(if declaration == "mock.Expected" { 2 } else { 1 });
-    } else if declaration == "String" {
-        row.reference_count = 3;
-        row.expected_error_count = Some(3);
-    }
-    if compatible && count == 0 && row.expected_error_count.is_none() {
-        row = row.accepting();
-    }
     measure(row);
 }
 
 fn reference_4400_row31lookup_i() {
-    round3(
+    expression_row(
         "31lookup-i",
         "lookup({ a = x.name }, 'a', 'fallback')",
         false,
         "Sink",
         "lookup({ a = x.name }, 'a', 'fallback')",
-        1,
         "",
     );
 }
 
 fn reference_4400_row31lookup_c() {
-    round3(
+    expression_row(
         "31lookup-c",
         "lookup({ a = x.name }, 'a', 'fallback')",
         true,
         "Sink",
         "lookup({ a = x.name }, 'a', 'fallback')",
-        0,
         "",
     );
 }
 
 fn reference_4400_row31values_i() {
-    round3(
+    expression_row(
         "31values-i",
         "values({ a = x.name })[0]",
         false,
         "Sink",
         "values({ a = x.name })[0]",
-        1,
         "",
     );
 }
 
 fn reference_4400_row31values_c() {
-    round3(
+    expression_row(
         "31values-c",
         "values({ a = x.name })[0]",
         true,
         "Sink",
         "values({ a = x.name })[0]",
-        0,
         "",
     );
 }
 
 fn reference_4400_row31concat_i() {
-    round3(
+    expression_row(
         "31concat-i",
         "concat([x.name], [])[0]",
         false,
         "Sink",
         "concat([x.name], [])[0]",
-        1,
         "",
     );
 }
 
 fn reference_4400_row31concat_c() {
-    round3(
+    expression_row(
         "31concat-c",
         "concat([x.name], [])[0]",
         true,
         "Sink",
         "concat([x.name], [])[0]",
-        0,
         "",
     );
 }
 
 fn reference_4400_row31flatten_i() {
-    round3(
+    expression_row(
         "31flatten-i",
         "flatten([[x.name]])[0]",
         false,
         "Sink",
         "flatten([[x.name]])[0]",
-        1,
         "",
     );
 }
 
 fn reference_4400_row31flatten_c() {
-    round3(
+    expression_row(
         "31flatten-c",
         "flatten([[x.name]])[0]",
         true,
         "Sink",
         "flatten([[x.name]])[0]",
-        0,
         "",
     );
 }
 
 fn reference_4400_row32id_i() {
-    round3(
+    expression_row(
         "32id-i",
         "id(x.name)",
         false,
         "Sink",
         "id(x.name)",
-        1,
         "fn id(v) { v }\n",
     );
 }
 
 fn reference_4400_row32id_c() {
-    round3(
+    expression_row(
         "32id-c",
         "id(x.name)",
         true,
         "Sink",
         "id(x.name)",
-        0,
         "fn id(v) { v }\n",
     );
 }
 
 fn reference_4400_row36union_i() {
-    round3(
+    expression_row(
         "36union-i",
         "[x.name]",
         false,
         "UnionListSink",
         "[x.name]",
-        1,
         "",
     );
 }
 
 fn reference_4400_row36union_c() {
-    round3(
+    expression_row(
         "36union-c",
         "[x.name]",
         true,
         "UnionListSink",
         "[x.name]",
-        0,
         "",
     );
 }
 
 fn reference_4400_row38unknownif_i() {
-    round3(
+    expression_row(
         "38unknownif-i",
         "if x.ready { x.name } else { 'fallback' }",
         false,
         "Sink",
         "if x.ready { x.name } else { 'fallback' }",
-        1,
         "",
     );
 }
 
 fn reference_4400_row38unknownif_c() {
-    round3(
+    expression_row(
         "38unknownif-c",
         "if x.ready { x.name } else { 'fallback' }",
         true,
         "Sink",
         "if x.ready { x.name } else { 'fallback' }",
-        0,
         "",
     );
 }
 
 fn reference_4400_row33param_si_di() {
-    round3_module(
+    module_row(
         "33param-si-di",
         "module typed input read inside module; source=si, declaration=String",
         false,
         "String",
         false,
-        1,
     );
 }
 
 fn reference_4400_row33param_si_dc() {
-    round3_module(
+    module_row(
         "33param-si-dc",
         "module typed input read inside module; source=si, declaration=mock.Expected",
         false,
         "mock.Expected",
         false,
-        1,
     );
 }
 
 fn reference_4400_row33param_sc_di() {
-    round3_module(
+    module_row(
         "33param-sc-di",
         "module typed input read inside module; source=sc, declaration=String",
         true,
         "String",
         false,
-        1,
     );
 }
 
 fn reference_4400_row33param_sc_dc() {
-    round3_module(
+    module_row(
         "33param-sc-dc",
         "module typed input read inside module; source=sc, declaration=mock.Expected",
         true,
         "mock.Expected",
         false,
-        0,
     );
 }
 
 fn reference_4400_row34declalias_si_di() {
-    round3_module(
+    module_row(
         "34declalias-si-di",
         "typed output with let alias; source=si, declaration=String",
         false,
         "String",
         true,
-        1,
     );
 }
 
 fn reference_4400_row34declalias_si_dc() {
-    round3_module(
+    module_row(
         "34declalias-si-dc",
         "typed output with let alias; source=si, declaration=mock.Expected",
         false,
         "mock.Expected",
         true,
-        1,
     );
 }
 
 fn reference_4400_row34declalias_sc_di() {
-    round3_module(
+    module_row(
         "34declalias-sc-di",
         "typed output with let alias; source=sc, declaration=String",
         true,
         "String",
         true,
-        1,
     );
 }
 
 fn reference_4400_row34declalias_sc_dc() {
-    round3_module(
+    module_row(
         "34declalias-sc-dc",
         "typed output with let alias; source=sc, declaration=mock.Expected",
         true,
         "mock.Expected",
         true,
-        0,
     );
 }
 
 fn reference_4400_row35fnparam_si_di() {
-    round3(
+    expression_row(
         "35fnparam-si-di",
         "typed function parameter and return",
         false,
         "Sink",
         "typed(x.name)",
-        1,
         "fn typed(v: String): String { v }\n",
     );
 }
 
 fn reference_4400_row35fnparam_si_dc() {
-    round3(
+    expression_row(
         "35fnparam-si-dc",
         "typed function parameter and return",
         false,
         "Sink",
         "typed(x.name)",
-        1,
         "fn typed(v: mock.Expected): mock.Expected { v }\n",
     );
 }
 
 fn reference_4400_row35fnparam_sc_di() {
-    round3(
+    expression_row(
         "35fnparam-sc-di",
         "typed function parameter and return",
         true,
         "Sink",
         "typed(x.name)",
-        1,
         "fn typed(v: String): String { v }\n",
     );
 }
 
 fn reference_4400_row35fnparam_sc_dc() {
-    round3(
+    expression_row(
         "35fnparam-sc-dc",
         "typed function parameter and return",
         true,
         "Sink",
         "typed(x.name)",
-        0,
         "fn typed(v: mock.Expected): mock.Expected { v }\n",
     );
 }
@@ -1832,10 +1654,9 @@ fn reference_4400_row37ref_i() {
         "Source",
         "CastSink",
         "x.name as mock.Cast",
-        0,
     );
     row.second_source = Some("Source");
-    measure(row.accepting());
+    measure(row);
 }
 
 fn reference_4400_row37ref_c() {
@@ -1845,10 +1666,9 @@ fn reference_4400_row37ref_c() {
         "CompatibleCastSource",
         "CastSink",
         "x.name as mock.Cast",
-        0,
     );
     row.second_source = Some("CompatibleCastSource");
-    measure(row.accepting());
+    measure(row);
 }
 
 fn reference_4400_row37coalesce_i() {
@@ -1858,10 +1678,9 @@ fn reference_4400_row37coalesce_i() {
         "Source",
         "CastSink",
         "(x.name ?? y.name) as mock.Cast",
-        0,
     );
     row.second_source = Some("Source");
-    measure(row.accepting());
+    measure(row);
 }
 
 fn reference_4400_row37coalesce_c() {
@@ -1871,32 +1690,29 @@ fn reference_4400_row37coalesce_c() {
         "CompatibleCastSource",
         "CastSink",
         "(x.name ?? y.name) as mock.Cast",
-        0,
     );
     row.second_source = Some("CompatibleCastSource");
-    measure(row.accepting());
+    measure(row);
 }
 
 fn reference_4400_row39typedlet_syntax_i() {
-    round3(
+    expression_row(
         "39typedlet-i",
         "literal typed-let spelling (grammar probe)",
         false,
         "Sink",
         "n",
-        0,
         "let n: mock.Expected = x.name\n",
     );
 }
 
 fn reference_4400_row39typedlet_syntax_c() {
-    round3(
+    expression_row(
         "39typedlet-c",
         "literal typed-let spelling (grammar probe)",
         true,
         "Sink",
         "n",
-        0,
         "let n: mock.Expected = x.name\n",
     );
 }

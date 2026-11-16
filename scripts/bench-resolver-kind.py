@@ -164,9 +164,11 @@ def isolated_environment(scratch):
         "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
     }
     for key in list(env):
-        if key in credential_variables or key in {
+        if (key in credential_variables or key.upper().endswith(("_TOKEN", "_KEY"))
+                or "_SECRET" in key.upper() or key in {"GITHUB_TOKEN", "GH_TOKEN"}
+                or key in {
             "CARINA_TEST_HOME", "NEXTEST_RUN_ID", "CARINA_TRUST_RECORD_DIR", "CARINA_PLUGIN_CACHE_DIR",
-        }:
+        }):
             del env[key]
     env.update(HOME=str(home), TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary),
                AWS_EC2_METADATA_DISABLED="true", AWS_CONFIG_FILE=str(home / "absent-aws-config"),
@@ -223,6 +225,11 @@ def run(binary, config, scratch, env, log, expected):
     return {**sample, "json_sha256": fingerprint, "resource_count": document["resource_count"]}
 
 
+def exceeds_thresholds(delta):
+    return (delta["median_percent"] > 5 and delta["median_ms"] > 5) or (
+        delta["p95_percent"] > 10 and delta["p95_ms"] > 10)
+
+
 def measure(label, left, right, config, scratch, env):
     log_dir = scratch / label
     log_dir.mkdir()
@@ -249,10 +256,8 @@ def measure(label, left, right, config, scratch, env):
         baseline, candidate = stats["main"][metric + "_ms"], stats["candidate"][metric + "_ms"]
         delta[metric + "_ms"] = candidate - baseline
         delta[metric + "_percent"] = (candidate / baseline - 1) * 100
-    regression = (delta["median_percent"] > 5 and delta["median_ms"] > 5) or (
-        delta["p95_percent"] > 10 and delta["p95_ms"] > 10)
     return {"warmups": warmups, "pairs": pairs, "statistics": stats, "delta": delta,
-            "verdict": "regression" if regression else "within_thresholds"}
+            "verdict": "regression" if exceeds_thresholds(delta) else "within_thresholds"}
 
 
 def markdown(result):
@@ -264,7 +269,7 @@ def markdown(result):
         lines.append(f"| {name} | {left['median_ms']:.3f} | {right['median_ms']:.3f} | {delta['median_percent']:.2f} | "
                      f"{left['p95_ms']:.3f} | {right['p95_ms']:.3f} | {delta['p95_percent']:.2f} | {experiment['verdict']} |")
     lines.extend(["", f"Verdict: {result['verdict']}.",
-                  "Regression: median >5% and >5 ms, or p95 >10% and >10 ms. Noise is reported, never subtracted.",
+                  "Regression: median >5% and >5 ms, or p95 >10% and >10 ms. Noise exceeding those thresholds makes the result inconclusive; noise is never subtracted.",
                   "Each experiment: 5 warmups per lane, then 30 pairs reversing order each pair; p95 uses nearest rank."])
     if "reason" in result:
         lines.extend(["", result["reason"]])
@@ -296,9 +301,14 @@ def main():
         if (out.is_relative_to(script_checkout) or any(out.is_relative_to(path) for path in directories)
                 or (checkout and out.is_relative_to(Path(checkout).resolve()))):
             raise Unavailable("--out must be outside the source checkout")
-        out.mkdir(parents=True, exist_ok=True)
+        try:
+            out.mkdir(parents=True)
+        except FileExistsError:
+            if not out.is_dir():
+                raise Unavailable("--out is not a directory")
+        else:
+            os.chmod(out, 0o700)
         writable_output = True
-        os.chmod(out, 0o700)
         result["binaries"] = {name: {"path": str(binary), "sha256": digest(binary)} for name, binary in binaries.items()}
         scratch = Path(tempfile.mkdtemp(prefix="resolver-kind-", dir=out))
         copied, result["configuration"] = copy_configuration(config, out, scratch)
@@ -307,7 +317,11 @@ def main():
         result["experiments"]["main_vs_main_noise"] = measure("main-vs-main", binaries["main"], binaries["main"], copied, scratch, env)
         result["noise_floor"] = {key: abs(value) for key, value in result["experiments"]["main_vs_main_noise"]["delta"].items()}
         result["experiments"]["main_vs_head"] = measure("main-vs-head", binaries["main"], binaries["head"], copied, scratch, env)
-        result["verdict"] = result["experiments"]["main_vs_head"]["verdict"]
+        if exceeds_thresholds(result["noise_floor"]):
+            result["experiments"]["main_vs_main_noise"]["verdict"] = "inconclusive"
+            result["verdict"] = "inconclusive"
+        else:
+            result["verdict"] = result["experiments"]["main_vs_head"]["verdict"]
     except (Unavailable, OSError, ValueError, subprocess.SubprocessError) as error:
         # Exception text from the OS can contain paths, but never print source or CLI output.
         result.update(verdict="unavailable", reason=str(error) if isinstance(error, Unavailable) else type(error).__name__)
@@ -316,7 +330,7 @@ def main():
         (out / "resolver-kind.json").write_text(json.dumps(result, indent=2) + "\n")
         (out / "resolver-kind.md").write_text(table)
     print(table, end="")
-    return {"within_thresholds": 0, "regression": 1, "unavailable": 2}[result["verdict"]]
+    return {"within_thresholds": 0, "regression": 1, "unavailable": 2, "inconclusive": 3}[result["verdict"]]
 
 
 if __name__ == "__main__":

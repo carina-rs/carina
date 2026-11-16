@@ -72,31 +72,42 @@ enum RootKind {
     CallsOnly,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum Event {
-    Lookup,
-    IntegerArithmetic,
-    Interpolation,
-    UserFunction,
-    Builtin,
-    BuiltinSuccess,
-    Access,
-    TakePresent,
-    LookupHit,
-    Upper,
-    KernelVisit,
-    CallsOnlyVisit,
-    Canonicalize,
-    #[cfg(feature = "test-utils")]
-    ReferenceEnvelope,
-    #[cfg(feature = "test-utils")]
-    ConversionEnvelope,
-    #[cfg(feature = "test-utils")]
-    ProjectionVisit,
-    #[cfg(feature = "test-utils")]
-    CopyValue,
-    #[cfg(feature = "test-utils")]
-    CopyContainer,
+macro_rules! resolver_events {
+    (resolution { $($resolution:ident => $name:literal),* $(,)? }
+     storage { $($storage:ident => $storage_name:literal),* $(,)? }) => {
+        #[derive(Clone, Copy)]
+        pub(crate) enum Event {
+            $($resolution,)*
+            $(#[cfg(feature = "test-utils")] $storage,)*
+        }
+        #[cfg(feature = "test-utils")]
+        pub(crate) const RESOLUTION_EVENTS: &[&str] = &[$($name,)*];
+        #[cfg(feature = "test-utils")]
+        pub(crate) const STORAGE_EVENTS: &[&str] = &[$($storage_name,)*];
+    };
+}
+resolver_events! {
+    resolution {
+        Lookup => "lookup",
+        IntegerArithmetic => "integer_arithmetic",
+        Interpolation => "interpolation",
+        UserFunction => "user_function",
+        Builtin => "builtin",
+        BuiltinSuccess => "builtin_success",
+        Access => "access",
+        TakePresent => "take_present",
+        LookupHit => "lookup_hit",
+        KernelVisit => "kernel_visit",
+        CallsOnlyVisit => "calls_only_visit",
+        Canonicalize => "canonicalize",
+    }
+    storage {
+        ReferenceEnvelope => "reference_envelope",
+        ConversionEnvelope => "conversion_envelope",
+        ProjectionVisit => "projection_visit",
+        CopyValue => "copy_value",
+        CopyContainer => "copy_container",
+    }
 }
 
 pub(crate) fn count(event: Event) {
@@ -2752,9 +2763,6 @@ fn resolve_value_with_binding_lookup<P: ResolveKind, B: ProviderAttributeBinding
                 .map(super::functions::function_argument_as_eval)
                 .collect();
             count(Event::Builtin);
-            if name.as_str() == "upper" {
-                count(Event::Upper);
-            }
             let plain = match crate::builtins::evaluate_builtin_with_config(
                 name.as_str(),
                 &eval_args,

@@ -7696,7 +7696,7 @@ where
         } = self;
     }
 
-    /// Clone saved resolver input without requiring the export phase itself to be Clone.
+    /// Clone saved resolver input without requiring its export representation to be Clone.
     /// The observer supplies a storage-only export view; no source facts are minted.
     #[cfg(feature = "test-utils")]
     pub(crate) fn clone_for_resolver_observer<'a, F>(

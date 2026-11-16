@@ -225,4 +225,6 @@ pub(crate) use ast::resolve_loop_directive_value;
 pub(crate) use types::bare_type_for_test;
 
 #[cfg(feature = "test-utils")]
-pub(crate) use resolve::{Event as ResolverEvent, count as count_resolver_event};
+pub(crate) use resolve::{
+    Event as ResolverEvent, RESOLUTION_EVENTS, STORAGE_EVENTS, count as count_resolver_event,
+};

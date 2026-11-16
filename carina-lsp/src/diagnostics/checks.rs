@@ -299,7 +299,7 @@ impl<'a> ContextFreeValue<'a> {
                 Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
                     is_context_free(expression.lhs()) && is_context_free(expression.rhs())
                 },
-        carina_core::resource::Value::Reference(never) | carina_core::resource::Value::Conversion(never) => match *never {},
+                Value::Reference(never) | Value::Conversion(never) => match *never {},
             }
         }
 

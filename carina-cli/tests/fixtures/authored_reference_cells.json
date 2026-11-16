@@ -289,14 +289,6 @@
         }
       ],
       "construct": "attribute root: x.name",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "1"
     },
     {
@@ -579,14 +571,6 @@
         }
       ],
       "construct": "list item: [x.name]",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "2"
     },
     {
@@ -869,14 +853,6 @@
         }
       ],
       "construct": "map value: { a = x.name }",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "3"
     },
     {
@@ -1159,14 +1135,6 @@
         }
       ],
       "construct": "struct field: { a = x.name }",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "3b"
     },
     {
@@ -1449,14 +1417,6 @@
         }
       ],
       "construct": "secret(x.name)",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "4"
     },
     {
@@ -1725,14 +1685,6 @@
         }
       ],
       "construct": "secret literal: secret('same')",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "4b"
     },
     {
@@ -2015,14 +1967,6 @@
         }
       ],
       "construct": "selected operand: x.name ?? 'fallback'",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "5a"
     },
     {
@@ -2403,14 +2347,6 @@
         }
       ],
       "construct": "live alternative: x.name ?? y.name (x pending; y varies)",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 2,
-        "require_acceptance": false
-      },
       "row": "5b"
     },
     {
@@ -2693,14 +2629,6 @@
         }
       ],
       "construct": "map reference + static call: { a = x.name, b = upper('same') }",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "6"
     },
     {
@@ -2969,14 +2897,6 @@
         }
       ],
       "construct": "literal equal to known source: 'same'",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "7"
     },
     {
@@ -3157,14 +3077,6 @@
         }
       ],
       "construct": "compatible reference: x.name",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "8"
     },
     {
@@ -3396,14 +3308,6 @@
         }
       ],
       "construct": "compatible type; destination member length <= 3",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 1,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "9"
     },
     {
@@ -3584,14 +3488,6 @@
         }
       ],
       "construct": "interpolation, directly incompatible source: p-${x.name}",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "10a-i"
     },
     {
@@ -3772,14 +3668,6 @@
         }
       ],
       "construct": "interpolation, directly compatible source: p-${x.name}",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "10a-c"
     },
     {
@@ -4160,14 +4048,6 @@
         }
       ],
       "construct": "addition, directly incompatible source: x.count + 1",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "10b-i"
     },
     {
@@ -4548,14 +4428,6 @@
         }
       ],
       "construct": "addition, directly compatible source: x.count + 1",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "10b-c"
     },
     {
@@ -4736,14 +4608,6 @@
         }
       ],
       "construct": "upper(x.name), directly incompatible source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "10c-i"
     },
     {
@@ -4924,14 +4788,6 @@
         }
       ],
       "construct": "upper(x.name), directly compatible source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "10c-c"
     },
     {
@@ -5214,14 +5070,6 @@
         }
       ],
       "construct": "if true { x.name } else { 'fallback' }, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "11-i"
     },
     {
@@ -5402,14 +5250,6 @@
         }
       ],
       "construct": "if true { x.name } else { 'fallback' }, compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "11-c"
     },
     {
@@ -5692,14 +5532,6 @@
         }
       ],
       "construct": "same-file reference, incompatible (control for 1)",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "12-i"
     },
     {
@@ -5880,14 +5712,6 @@
         }
       ],
       "construct": "same-file reference, compatible (control for 8)",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "12-c"
     },
     {
@@ -6170,14 +5994,6 @@
         }
       ],
       "construct": "let n = x.name; value = n, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "13-i"
     },
     {
@@ -6358,14 +6174,6 @@
         }
       ],
       "construct": "let n = x.name; value = n, compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "13-c"
     },
     {
@@ -6736,14 +6544,6 @@
         }
       ],
       "construct": "x.name at sinks mock.Expected and mock.OtherExpected",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "14"
     },
     {
@@ -6975,14 +6775,6 @@
         }
       ],
       "construct": "sole interpolation, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "20-i"
     },
     {
@@ -7163,14 +6955,6 @@
         }
       ],
       "construct": "sole interpolation, compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "20-c"
     },
     {
@@ -7402,14 +7186,6 @@
         }
       ],
       "construct": "[x.name][0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "21-i"
     },
     {
@@ -7590,14 +7366,6 @@
         }
       ],
       "construct": "[x.name][0], compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "21-c"
     },
     {
@@ -7829,14 +7597,6 @@
         }
       ],
       "construct": "{ f = x.name }.f, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "22-i"
     },
     {
@@ -8017,14 +7777,6 @@
         }
       ],
       "construct": "{ f = x.name }.f, compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "22-c"
     },
     {
@@ -8256,14 +8008,6 @@
         }
       ],
       "construct": "let m = { f = x.name }; m.f, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "23m-i"
     },
     {
@@ -8444,14 +8188,6 @@
         }
       ],
       "construct": "let m = { f = x.name }; m.f, compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "23m-c"
     },
     {
@@ -8683,14 +8419,6 @@
         }
       ],
       "construct": "let l = [x.name]; l[0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "23l-i"
     },
     {
@@ -8871,14 +8599,6 @@
         }
       ],
       "construct": "let l = [x.name]; l[0], compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "23l-c"
     },
     {
@@ -9111,14 +8831,6 @@
         }
       ],
       "construct": "let s = if true { [x.name] } else { [y.name] }; s[0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "24l-i"
     },
     {
@@ -9301,14 +9013,6 @@
         }
       ],
       "construct": "let s = if true { [x.name] } else { [y.name] }; s[0], compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "24l-c"
     },
     {
@@ -9541,14 +9245,6 @@
         }
       ],
       "construct": "let s = if true { { f = x.name } } else { { f = y.name } }; s.f, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "24m-i"
     },
     {
@@ -9731,14 +9427,6 @@
         }
       ],
       "construct": "let s = if true { { f = x.name } } else { { f = y.name } }; s.f, compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "24m-c"
     },
     {
@@ -9971,14 +9659,6 @@
         }
       ],
       "construct": "let s = [x.name] ?? [y.name]; s[0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "25l-i"
     },
     {
@@ -10161,14 +9841,6 @@
         }
       ],
       "construct": "let s = [x.name] ?? [y.name]; s[0], compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "25l-c"
     },
     {
@@ -10401,14 +10073,6 @@
         }
       ],
       "construct": "let s = { f = x.name } ?? { f = y.name }; s.f, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "25m-i"
     },
     {
@@ -10591,14 +10255,6 @@
         }
       ],
       "construct": "let s = { f = x.name } ?? { f = y.name }; s.f, compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "25m-c"
     },
     {
@@ -10831,14 +10487,6 @@
         }
       ],
       "construct": "[if true { x.name } else { y.name }][0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "26-i"
     },
     {
@@ -11021,14 +10669,6 @@
         }
       ],
       "construct": "[if true { x.name } else { y.name }][0], compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "26-c"
     },
     {
@@ -11169,16 +10809,6 @@
         }
       ],
       "construct": "for i in [0,1]: [x.name,y.name][i]; only x incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": [
-          "mock.Sink.probes[0]"
-        ],
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "27-xbad"
     },
     {
@@ -11319,16 +10949,6 @@
         }
       ],
       "construct": "for i in [0,1]: [x.name,y.name][i]; only y incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": [
-          "mock.Sink.probes[1]"
-        ],
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "27-ybad"
     },
     {
@@ -11419,14 +11039,6 @@
         }
       ],
       "construct": "for i in [0,1]: [x.name,y.name][i]; both compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": [],
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "27-c"
     },
     {
@@ -11711,14 +11323,6 @@
         }
       ],
       "construct": "for-built map of Source resources; built['first'].name, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "28-i"
     },
     {
@@ -11953,14 +11557,6 @@
         }
       ],
       "construct": "for-built map of CompatibleSource resources; built['first'].name, compatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "28-c"
     },
     {
@@ -12151,14 +11747,6 @@
         }
       ],
       "construct": "let n = x.name; public n then secret(n), incompatible",
-      "original_expectations": {
-        "check_public_origin": true,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "29-p-i"
     },
     {
@@ -12349,14 +11937,6 @@
         }
       ],
       "construct": "let n = x.name; secret(n) then public n, incompatible",
-      "original_expectations": {
-        "check_public_origin": true,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "29-s-i"
     },
     {
@@ -12445,14 +12025,6 @@
         }
       ],
       "construct": "let n = x.name; public n then secret(n), compatible",
-      "original_expectations": {
-        "check_public_origin": true,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "29-p-c"
     },
     {
@@ -12541,14 +12113,6 @@
         }
       ],
       "construct": "let n = x.name; secret(n) then public n, compatible",
-      "original_expectations": {
-        "check_public_origin": true,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "29-s-c"
     },
     {
@@ -12780,14 +12344,6 @@
         }
       ],
       "construct": "sole interpolation, incompatible Reference source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "30s-i"
     },
     {
@@ -12968,14 +12524,6 @@
         }
       ],
       "construct": "sole interpolation, compatible Reference source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "30s-c"
     },
     {
@@ -13207,14 +12755,6 @@
         }
       ],
       "construct": "[x.name][0], incompatible Reference source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "30l-i"
     },
     {
@@ -13395,14 +12935,6 @@
         }
       ],
       "construct": "[x.name][0], compatible Reference source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "30l-c"
     },
     {
@@ -13634,14 +13166,6 @@
         }
       ],
       "construct": "{ f = x.name }.f, incompatible Reference source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "30m-i"
     },
     {
@@ -13822,14 +13346,6 @@
         }
       ],
       "construct": "{ f = x.name }.f, compatible Reference source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "30m-c"
     },
     {
@@ -14061,14 +13577,6 @@
         }
       ],
       "construct": "lookup({ a = x.name }, 'a', 'fallback')",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "31lookup-i"
     },
     {
@@ -14249,14 +13757,6 @@
         }
       ],
       "construct": "lookup({ a = x.name }, 'a', 'fallback')",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "31lookup-c"
     },
     {
@@ -14488,14 +13988,6 @@
         }
       ],
       "construct": "values({ a = x.name })[0]",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "31values-i"
     },
     {
@@ -14676,14 +14168,6 @@
         }
       ],
       "construct": "values({ a = x.name })[0]",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "31values-c"
     },
     {
@@ -14915,14 +14399,6 @@
         }
       ],
       "construct": "concat([x.name], [])[0]",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "31concat-i"
     },
     {
@@ -15103,14 +14579,6 @@
         }
       ],
       "construct": "concat([x.name], [])[0]",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "31concat-c"
     },
     {
@@ -15342,14 +14810,6 @@
         }
       ],
       "construct": "flatten([[x.name]])[0]",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "31flatten-i"
     },
     {
@@ -15530,14 +14990,6 @@
         }
       ],
       "construct": "flatten([[x.name]])[0]",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "31flatten-c"
     },
     {
@@ -15769,14 +15221,6 @@
         }
       ],
       "construct": "id(x.name)",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "32id-i"
     },
     {
@@ -15957,14 +15401,6 @@
         }
       ],
       "construct": "id(x.name)",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "32id-c"
     },
     {
@@ -16296,14 +15732,6 @@
         }
       ],
       "construct": "[x.name]",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "36union-i"
     },
     {
@@ -16484,14 +15912,6 @@
         }
       ],
       "construct": "[x.name]",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "36union-c"
     },
     {
@@ -16646,14 +16066,6 @@
         }
       ],
       "construct": "if x.ready { x.name } else { 'fallback' }",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 1,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "38unknownif-i"
     },
     {
@@ -16808,14 +16220,6 @@
         }
       ],
       "construct": "if x.ready { x.name } else { 'fallback' }",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 1,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "38unknownif-c"
     },
     {
@@ -17210,14 +16614,6 @@
         }
       ],
       "construct": "module typed input read inside module; source=si, declaration=String",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 3,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 3,
-        "require_acceptance": false
-      },
       "row": "33param-si-di"
     },
     {
@@ -17416,14 +16812,6 @@
         }
       ],
       "construct": "module typed input read inside module; source=si, declaration=mock.Expected",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "33param-si-dc"
     },
     {
@@ -17818,14 +17206,6 @@
         }
       ],
       "construct": "module typed input read inside module; source=sc, declaration=String",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 3,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 3,
-        "require_acceptance": false
-      },
       "row": "33param-sc-di"
     },
     {
@@ -17922,14 +17302,6 @@
         }
       ],
       "construct": "module typed input read inside module; source=sc, declaration=mock.Expected",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "33param-sc-dc"
     },
     {
@@ -18220,14 +17592,6 @@
         }
       ],
       "construct": "typed output with let alias; source=si, declaration=String",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 1,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "34declalias-si-di"
     },
     {
@@ -18616,14 +17980,6 @@
         }
       ],
       "construct": "typed output with let alias; source=si, declaration=mock.Expected",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 2,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "34declalias-si-dc"
     },
     {
@@ -18914,14 +18270,6 @@
         }
       ],
       "construct": "typed output with let alias; source=sc, declaration=String",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 1,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "34declalias-sc-di"
     },
     {
@@ -19310,14 +18658,6 @@
         }
       ],
       "construct": "typed output with let alias; source=sc, declaration=mock.Expected",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 2,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "34declalias-sc-dc"
     },
     {
@@ -19698,14 +19038,6 @@
         }
       ],
       "construct": "typed function parameter and return",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 2,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "35fnparam-si-di"
     },
     {
@@ -19886,14 +19218,6 @@
         }
       ],
       "construct": "typed function parameter and return",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 0,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "35fnparam-si-dc"
     },
     {
@@ -20274,14 +19598,6 @@
         }
       ],
       "construct": "typed function parameter and return",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 2,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "35fnparam-sc-di"
     },
     {
@@ -20462,14 +19778,6 @@
         }
       ],
       "construct": "typed function parameter and return",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 0,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "35fnparam-sc-dc"
     },
     {
@@ -20652,14 +19960,6 @@
         }
       ],
       "construct": "x.name as mock.Cast",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "37ref-i"
     },
     {
@@ -20842,14 +20142,6 @@
         }
       ],
       "construct": "x.name as mock.Cast",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "37ref-c"
     },
     {
@@ -21032,14 +20324,6 @@
         }
       ],
       "construct": "(x.name ?? y.name) as mock.Cast",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "37coalesce-i"
     },
     {
@@ -21222,14 +20506,6 @@
         }
       ],
       "construct": "(x.name ?? y.name) as mock.Cast",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": true
-      },
       "row": "37coalesce-c"
     },
     {
@@ -21420,14 +20696,6 @@
         }
       ],
       "construct": "literal typed-let spelling (grammar probe)",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 1,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "39typedlet-i"
     },
     {
@@ -21618,14 +20886,6 @@
         }
       ],
       "construct": "literal typed-let spelling (grammar probe)",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": 1,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 0,
-        "require_acceptance": false
-      },
       "row": "39typedlet-c"
     },
     {
@@ -21857,14 +21117,6 @@
         }
       ],
       "construct": "sole interpolation, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "20-i-samefile"
     },
     {
@@ -22096,14 +21348,6 @@
         }
       ],
       "construct": "[x.name][0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "21-i-samefile"
     },
     {
@@ -22335,14 +21579,6 @@
         }
       ],
       "construct": "{ f = x.name }.f, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "22-i-samefile"
     },
     {
@@ -22574,14 +21810,6 @@
         }
       ],
       "construct": "let l = [x.name]; l[0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "23l-i-samefile"
     },
     {
@@ -22813,14 +22041,6 @@
         }
       ],
       "construct": "let m = { f = x.name }; m.f, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "23m-i-samefile"
     },
     {
@@ -23053,14 +22273,6 @@
         }
       ],
       "construct": "let s = if true { [x.name] } else { [y.name] }; s[0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "24l-i-samefile"
     },
     {
@@ -23293,14 +22505,6 @@
         }
       ],
       "construct": "let s = if true { { f = x.name } } else { { f = y.name } }; s.f, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "24m-i-samefile"
     },
     {
@@ -23533,14 +22737,6 @@
         }
       ],
       "construct": "let s = [x.name] ?? [y.name]; s[0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "25l-i-samefile"
     },
     {
@@ -23773,14 +22969,6 @@
         }
       ],
       "construct": "let s = { f = x.name } ?? { f = y.name }; s.f, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "25m-i-samefile"
     },
     {
@@ -24013,14 +23201,6 @@
         }
       ],
       "construct": "[if true { x.name } else { y.name }][0], incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "26-i-samefile"
     },
     {
@@ -24161,16 +23341,6 @@
         }
       ],
       "construct": "for i in [0,1]: [x.name,y.name][i]; only x incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": [
-          "mock.Sink.probes[0]"
-        ],
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "27-xbad-samefile"
     },
     {
@@ -24311,16 +23481,6 @@
         }
       ],
       "construct": "for i in [0,1]: [x.name,y.name][i]; only y incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": [
-          "mock.Sink.probes[1]"
-        ],
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "27-ybad-samefile"
     },
     {
@@ -24605,14 +23765,6 @@
         }
       ],
       "construct": "for-built map of Source resources; built['first'].name, incompatible",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "28-i-samefile"
     },
     {
@@ -24844,14 +23996,6 @@
         }
       ],
       "construct": "[x.name][0], incompatible Reference source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "30l-i-samefile"
     },
     {
@@ -25083,14 +24227,6 @@
         }
       ],
       "construct": "{ f = x.name }.f, incompatible Reference source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "30m-i-samefile"
     },
     {
@@ -25322,14 +24458,6 @@
         }
       ],
       "construct": "sole interpolation, incompatible Reference source",
-      "original_expectations": {
-        "check_public_origin": false,
-        "expected_error_count": null,
-        "expected_instances": null,
-        "known_value_count": 0,
-        "reference_count": 1,
-        "require_acceptance": false
-      },
       "row": "30s-i-samefile"
     }
   ],

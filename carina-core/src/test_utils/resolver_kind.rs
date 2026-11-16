@@ -4,32 +4,12 @@
 use crate::{config_loader, parser::ProviderContext, paths::ResolvedPath, schema::SchemaRegistry};
 use std::cell::RefCell;
 
-pub const EVENTS: [&str; 13] = [
-    "lookup",
-    "integer_arithmetic",
-    "interpolation",
-    "user_function",
-    "builtin",
-    "builtin_success",
-    "access",
-    "take_present",
-    "lookup_hit",
-    "upper",
-    "kernel_visit",
-    "calls_only_visit",
-    "canonicalize",
-];
-pub const STORAGE_EVENTS: [&str; 5] = [
-    "reference_envelope",
-    "conversion_envelope",
-    "projection_visit",
-    "copy_value",
-    "copy_container",
-];
+pub const EVENTS: &[&str] = crate::parser::RESOLUTION_EVENTS;
+pub const STORAGE_EVENTS: &[&str] = crate::parser::STORAGE_EVENTS;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StorageCounts(pub [usize; 5]);
+pub struct StorageCounts(pub [usize; STORAGE_EVENTS.len()]);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Counts(pub [usize; 13]);
+pub struct Counts(pub [usize; EVENTS.len()]);
 impl Counts {
     pub fn get(&self, name: &str) -> usize {
         self.0[EVENTS

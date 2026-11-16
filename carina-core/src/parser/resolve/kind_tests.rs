@@ -171,6 +171,14 @@ fn assert_projection(report: &ProjectionReport, label: &str) {
         report.diagnostics_succeeded, report.plain_diagnostics_succeeded,
         "{label}: diagnostics success differs from the independent plain run"
     );
+    assert!(
+        report.strict_error_matches,
+        "{label}: strict directory error differs"
+    );
+    assert!(
+        report.diagnostics_error_matches,
+        "{label}: diagnostics directory error differs"
+    );
     let actual_publications = report.publications();
     assert_eq!(
         actual_publications.len(),
@@ -352,7 +360,7 @@ const DEFECTS: [&str; 16] = [
 ];
 #[test]
 fn defect_forms_keep_paths() {
-    // Consume the Phase 0 input bytes, including its same-file twins, unchanged.
+    // Reuse the recorded inputs, including their same-file twins, unchanged.
     let golden: Json = serde_json::from_str(include_str!(
         "../../../../carina-cli/tests/fixtures/authored_reference_cells.json"
     ))
