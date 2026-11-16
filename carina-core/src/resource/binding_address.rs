@@ -259,8 +259,6 @@ pub trait BindingAddress:
     /// # }
     /// ```
     fn as_str(&self) -> &str;
-
-    fn diagnostic_literal(&self) -> Option<&str>;
 }
 
 impl private::Sealed for RelativeBindingName {
@@ -319,10 +317,6 @@ impl BindingAddress for RelativeBindingName {
     fn as_str(&self) -> &str {
         self.as_str()
     }
-
-    fn diagnostic_literal(&self) -> Option<&str> {
-        self.0.diagnostic_literal()
-    }
 }
 
 impl private::Sealed for AbsoluteBindingAddress {
@@ -371,10 +365,6 @@ impl private::Sealed for AbsoluteBindingAddress {
 impl BindingAddress for AbsoluteBindingAddress {
     fn as_str(&self) -> &str {
         self.as_str()
-    }
-
-    fn diagnostic_literal(&self) -> Option<&str> {
-        self.0.diagnostic_literal()
     }
 }
 

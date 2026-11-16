@@ -1277,8 +1277,7 @@ fn validation_mismatch<P: PlaceholderKind, B: BindingAddress>(
         path: Vec::new(),
         expected: Box::new(expected.clone()),
         actual: Box::new(ValueDescription::of(value)),
-        validator_message: (!value.contains_diagnostic_sensitive_string())
-            .then(|| message.into_boxed_str()),
+        validator_message: Some(message.into_boxed_str()),
         hint: None,
     }
 }

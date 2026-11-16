@@ -212,10 +212,10 @@ integer versus float spellings and struct block aliases versus canonical field
 keys, so those spellings compare as distinct. Strings, integers, and nested
 values also support uniqueness.
 
-Elements containing secrets, environment-derived (diagnostic-sensitive) values,
-or unresolved values are excluded from duplicate comparison; known,
-nonsensitive elements in the same list are still checked. A secret wrapping the
-whole list is also excluded. Provider read-back, persisted state values, and
+Elements containing secrets or unresolved values are excluded from duplicate
+comparison; known public elements in the same list are still checked.
+Environment values participate in comparison unless wrapped in `secret(env('NAME'))`.
+A secret wrapping the whole list is also excluded. Provider read-back, persisted state values, and
 wait-condition right-hand sides are not checked for uniqueness. List length
 constraints still apply in all these cases. `list()` and `unordered_list()`
 allow duplicates.

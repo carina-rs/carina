@@ -62,7 +62,8 @@ impl<P: ValueKind, B: BindingAddress> From<Box<Value<P, B>>> for SecretPayload<P
     }
 }
 
-/// Attach diagnostic provenance once, without evaluating or changing value shapes.
+/// Attach the secret mechanism's diagnostic marking once, without evaluating or
+/// changing value shapes.
 fn mark_strings<P: ValueKind, B: BindingAddress>(value: &mut Value<P, B>) {
     use super::{ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Subscript};
     fn mark_step(step: &mut PathSegment) {

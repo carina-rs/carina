@@ -64,14 +64,7 @@ pub(crate) fn builtin_cidr_subnet<B: BindingAddress>(
         }
     };
 
-    let result =
-        calculate_cidr_subnet(prefix_str.expose_plaintext(), newbits, netnum).map_err(|error| {
-            if prefix_str.is_diagnostic_sensitive() {
-                "cidr_subnet() sensitive prefix is not a valid CIDR string".to_string()
-            } else {
-                error
-            }
-        })?;
+    let result = calculate_cidr_subnet(prefix_str.expose_plaintext(), newbits, netnum)?;
     Ok(Value::Concrete(ConcreteValue::String(
         ValueString::derived_from(result, [prefix_str]),
     )))
@@ -153,6 +146,38 @@ fn calculate_cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Stri
 mod tests {
     use crate::builtins::evaluate_builtin_to_value_for_tests as evaluate_builtin;
     use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
+
+    #[test]
+    fn parsed_secret_cidr_failures_remain_protected() {
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (prefix, newbits, netnum) in [("private-token", 1, 0), ("10.0.0.0/16", -1, 0)] {
+            let parsed = crate::parser::parse(
+                &format!(
+                    "let prefix = secret({})",
+                    crate::parser::display_string_literal(prefix)
+                ),
+                &config,
+            )
+            .unwrap();
+            let value = parsed.variables["prefix"]
+                .clone()
+                .resolve_root(&crate::resource::RootScope::new())
+                .into_expanded()
+                .unwrap();
+            let error = crate::builtins::evaluate_builtin_with_config_to_value(
+                "cidr_subnet",
+                &[
+                    value,
+                    Value::Concrete(ConcreteValue::Int(newbits)),
+                    Value::Concrete(ConcreteValue::Int(netnum)),
+                ],
+                &config,
+            )
+            .unwrap_err();
+            assert!(!error.contains(prefix), "{error}");
+            assert_eq!(error, crate::resource::INSIDE_SECRET_MESSAGE);
+        }
+    }
 
     fn cidr_subnet(prefix: &str, newbits: i64, netnum: i64) -> Result<Value, String> {
         let args = vec![
