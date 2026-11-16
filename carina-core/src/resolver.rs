@@ -1310,26 +1310,10 @@ fn evaluate_runtime_user_function<P: PlaceholderKind, B: BindingAddress>(
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     call_line: usize,
 ) -> Result<FunctionEvaluation<P, B>, RuntimeFunctionError> {
-    let required = function
-        .params
-        .iter()
-        .filter(|parameter| parameter.default.is_none())
-        .count();
-    if args.len() < required || args.len() > function.params.len() {
-        return Err(user_function_runtime_error(
-            call_line,
-            format!(
-                "function '{}' expects {}..={} argument(s), got {}",
-                function.name,
-                required,
-                function.params.len(),
-                args.len(),
-            ),
-        )
-        .into());
-    }
     let mut completion =
-        FunctionCompletion::new(function, functions, args.to_vec(), call_line.into());
+        FunctionCompletion::new(function, functions, args.to_vec(), call_line.into()).map_err(
+            |error| user_function_runtime_error(call_line, error.runtime_message(&function.name)),
+        )?;
     if config.function_declaration_failed(function) {
         return Ok(FunctionEvaluation::Retain(completion.retain()));
     }
@@ -1340,16 +1324,14 @@ fn evaluate_runtime_user_function<P: PlaceholderKind, B: BindingAddress>(
         };
         let parameter = slot.parameter();
         let argument = match slot.argument() {
-            Some(argument) => argument.clone(),
-            None => crate::resource::FunctionArgument::from_value(
-                P::lower_function_expression(
-                    parameter
-                        .default
-                        .clone()
-                        .expect("required function arguments were checked"),
+            crate::function_evaluation::ArgumentSource::Provided(argument) => argument.clone(),
+            crate::function_evaluation::ArgumentSource::Default(value) => {
+                crate::resource::FunctionArgument::from_value(
+                    P::lower_function_expression(value.clone()).map_err(|error| {
+                        user_function_runtime_error(call_line, error.to_string())
+                    })?,
                 )
-                .map_err(|error| user_function_runtime_error(call_line, error.to_string()))?,
-            ),
+            }
         };
         let argument = argument.try_map_value(|value| {
             resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))

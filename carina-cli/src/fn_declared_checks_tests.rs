@@ -84,6 +84,15 @@ impl ProviderFactory for FixtureFactory {
         }
         vec![
             thing.validate().unwrap(),
+            ResourceSchema::new("NamedThing")
+                .attribute(
+                    AttributeSchema::required("name", AttributeType::string())
+                        .create_only()
+                        .identity()
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
             ResourceSchema::new("Lookup")
                 .as_data_source()
                 .attribute(AttributeSchema::required("query", AttributeType::string()).build())
@@ -421,6 +430,14 @@ impl Directory {
                 &ResolvedPath::new(path).unwrap(),
                 path,
                 &self.context(),
+                commands::apply::SavedApplyOptions {
+                    auto_approve: true,
+                    lock: true,
+                    parallelism: crate::DEFAULT_PARALLELISM,
+                    accept_legacy_name_overrides: false,
+                    cancel: ShutdownToken::running(),
+                },
+                &commands::apply::cli_observer_factory,
             ),
             |runtime, providers, _| {
                 Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
@@ -1433,3 +1450,5 @@ mod runtime_checks;
 mod saved_document;
 
 mod directory_calls;
+
+mod secret_updates;

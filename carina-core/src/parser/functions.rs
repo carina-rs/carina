@@ -223,28 +223,13 @@ fn prepare_user_function_call<'function, 'cfg, Source: super::context::Evaluatio
         return Err(ParseError::RecursiveFunction(fn_name.clone()));
     }
 
-    // Validate argument count
-    let required_count = func.params.iter().filter(|p| p.default.is_none()).count();
-    let max_count = func.params.len();
-    if args.len() < required_count {
-        return Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}' expects at least {required_count} argument(s), got {}",
-            args.len()
-        )));
-    }
-    if args.len() > max_count {
-        return Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}' expects at most {max_count} argument(s), got {}",
-            args.len()
-        )));
-    }
-
     let mut completion = FunctionCompletion::new(
         func,
         &ctx.shared_user_function_scope(),
         args.to_vec(),
         call_line.into(),
-    );
+    )
+    .map_err(|error| ParseError::UserFunctionError(error.parser_message(fn_name)))?;
     if ctx
         .session
         .is_some_and(|session| session.function_declaration_failed(func))
@@ -268,8 +253,10 @@ fn prepare_user_function_call<'function, 'cfg, Source: super::context::Evaluatio
         };
         let param = slot.parameter();
         let argument = match slot.argument() {
-            Some(argument) => argument.clone(),
-            None => FunctionArgument::from_value(param.default.clone().unwrap()),
+            crate::function_evaluation::ArgumentSource::Provided(argument) => argument.clone(),
+            crate::function_evaluation::ArgumentSource::Default(value) => {
+                FunctionArgument::from_value(value.clone())
+            }
         };
         // Keep nested calls and module-argument placeholders intact until the
         // directory/module resolver has the complete function table and the
@@ -1567,7 +1554,7 @@ mod declared_check_regressions {
         let mut context = ParseContext::for_evaluation(&config);
         context.replace_shared_user_functions(Arc::new(parsed.user_functions.clone()));
         try_evaluate_fn_value(
-            parsed.resources.last().unwrap().attributes["value"].clone(),
+            parsed.iter_all_resources().last().unwrap().attributes()["value"].clone(),
             &context,
             4,
         )

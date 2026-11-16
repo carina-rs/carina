@@ -141,8 +141,9 @@ impl InputCheckedPlan {
         >,
         historical: &HashMap<ResourceId, SnapshotState>,
     ) -> Result<RecordedPlanSnapshot, crate::value::SerializationError> {
+        let conversion = crate::value::SavedDocumentConversion::new(std::iter::empty())?;
         Ok(RecordedPlanSnapshot {
-            plan: crate::value::redact_secrets_in_plan_with_desired_and_historical(
+            plan: conversion.redact_secrets_in_plan_with_desired_and_historical(
                 self.plan(),
                 desired,
                 historical,

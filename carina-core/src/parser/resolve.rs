@@ -161,6 +161,9 @@ impl ProviderAttributeBindingPhase for AbsoluteBindingAddress {
                     arguments.to_vec(),
                     call_line.into(),
                 )
+                .map_err(|error| {
+                    ParseError::UserFunctionError(error.parser_message(&function.name))
+                })?
                 .retain(),
             )),
         }
@@ -602,16 +605,11 @@ impl<P: crate::resource::PlanValueKind> SavedProviderConfigs<P> {
     }
 
     pub fn redact_secrets(&self) -> Result<SavedProviderConfigs, crate::value::SerializationError> {
+        let conversion = crate::value::SavedDocumentConversion::new(std::iter::empty())?;
         let configs = self
             .0
             .iter()
-            .map(|config| {
-                config.try_map_value_stage(&mut |value| {
-                    crate::value::redact_state_snapshot_value(
-                        &crate::resource::state_value_snapshot(value),
-                    )
-                })
-            })
+            .map(|config| config.try_map_value_stage(&mut |value| conversion.state_value(value)))
             .collect::<Result<_, _>>()?;
         Ok(SavedProviderConfigs(configs))
     }

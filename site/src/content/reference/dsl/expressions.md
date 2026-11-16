@@ -406,6 +406,8 @@ fn make_tags(env: String, service: String, team: String = 'platform') {
 }
 ```
 
+A plan cannot be saved with `carina plan --out` or `carina plan --json` while it still contains a call to a user-defined function whose declared types need a resource value that has not been evaluated. The saved-plan format cannot carry that call. Run `carina apply` directly on the project so the declared types are checked when the value becomes available.
+
 ### Local Bindings in Functions
 
 Functions can contain `let` bindings before the return expression:

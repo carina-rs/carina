@@ -131,6 +131,8 @@ fn name(param1: type1, param2: type2): return_type {
 - **Return type** annotation is optional (`: String`)
 - The function body is a single expression (the return value)
 
+A plan cannot be saved with `carina plan --out` or `carina plan --json` while it still contains a call to a user-defined function whose declared types need a resource value that has not been evaluated. The saved-plan format cannot carry that call. Run `carina apply` directly on the project so the declared types are checked when the value becomes available.
+
 ### Local variables in functions
 
 Functions can have local `let` bindings before the final expression:

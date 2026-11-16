@@ -1,7 +1,7 @@
 use crate::parser::{FnParam, TypeExpr, UserFunction};
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, DiagnosticSourceLine, FunctionArgument,
-    PlaceholderKind, Value,
+    PlaceholderKind, Value, ValueKind,
 };
 use crate::validation::deferred_types::ProviderTypeCheckSite;
 use crate::validation::typecheck::{TypeExprValueCheck, TypecheckProviderContext};
@@ -316,10 +316,40 @@ impl CallObservations {
         self.surviving_call |= contains_deferred_user_function_call(value);
     }
 }
+pub(crate) enum ArgumentSource<P: PlaceholderKind, B: BindingAddress> {
+    Provided(FunctionArgument<P, B>),
+    Default(Value<crate::resource::ParserPlaceholder, B>),
+}
+#[derive(Debug)]
+pub(crate) struct FunctionArityError {
+    minimum: usize,
+    maximum: usize,
+    provided: usize,
+}
+impl FunctionArityError {
+    pub(crate) fn parser_message(&self, name: &str) -> String {
+        if self.provided > self.maximum {
+            format!(
+                "function '{name}' expects at most {} argument(s), got {}",
+                self.maximum, self.provided
+            )
+        } else {
+            format!(
+                "function '{name}' expects at least {} argument(s), got {}",
+                self.minimum, self.provided
+            )
+        }
+    }
+    pub(crate) fn runtime_message(&self, name: &str) -> String {
+        format!(
+            "function '{name}' expects {}..={} argument(s), got {}",
+            self.minimum, self.maximum, self.provided
+        )
+    }
+}
 pub(crate) struct FunctionCompletion<'a, P: PlaceholderKind, B: BindingAddress> {
     function: &'a UserFunction<B>,
-    parameters: std::slice::Iter<'a, FnParam<B>>,
-    arguments: std::vec::IntoIter<FunctionArgument<P, B>>,
+    arguments: std::vec::IntoIter<(&'a FnParam<B>, ArgumentSource<P, B>)>,
     checked_arguments: Vec<FunctionArgument<P, B>>,
     pending_check: bool,
     observations: CallObservations,
@@ -331,7 +361,7 @@ pub(crate) enum ArgumentStep<'a, P: PlaceholderKind, B: BindingAddress> {
 }
 pub(crate) struct ArgumentSlot<'a, P: PlaceholderKind, B: BindingAddress> {
     parameter: &'a FnParam<B>,
-    argument: Option<FunctionArgument<P, B>>,
+    argument: ArgumentSource<P, B>,
     cursor: FunctionCompletion<'a, P, B>,
 }
 pub(crate) enum PreparedFunction<'a, P: PlaceholderKind, B: BindingAddress> {
@@ -346,11 +376,43 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionCompletion<'a, P, B> {
         functions: &Arc<IndexMap<String, UserFunction<B>>>,
         args: Vec<FunctionArgument<P, B>>,
         source_line: DiagnosticSourceLine,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, FunctionArityError> {
+        let minimum = function
+            .params
+            .iter()
+            .rposition(|parameter| parameter.default.is_none())
+            .map_or(0, |index| index + 1);
+        let mismatch = || FunctionArityError {
+            minimum,
+            maximum: function.params.len(),
+            provided: args.len(),
+        };
+        if args.len() > function.params.len() {
+            return Err(mismatch());
+        }
+        let defaults = function
+            .params
+            .iter()
+            .skip(args.len())
+            .map(|parameter| {
+                parameter
+                    .default
+                    .clone()
+                    .map(|value| (parameter, ArgumentSource::Default(value)))
+                    .ok_or_else(mismatch)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let arguments = function
+            .params
+            .iter()
+            .zip(args.iter().cloned())
+            .map(|(parameter, argument)| (parameter, ArgumentSource::Provided(argument)))
+            .chain(defaults)
+            .collect::<Vec<_>>()
+            .into_iter();
+        Ok(Self {
             function,
-            parameters: function.params.iter(),
-            arguments: args.clone().into_iter(),
+            arguments,
             checked_arguments: Vec::new(),
             pending_check: false,
             observations: CallObservations::default(),
@@ -360,21 +422,18 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionCompletion<'a, P, B> {
                 args,
                 source_line,
             ),
-        }
+        })
     }
     pub(crate) fn retain(self) -> RetainedCall<P, B> {
         self.retained
     }
     pub(crate) fn next_argument(mut self) -> ArgumentStep<'a, P, B> {
-        match self.parameters.next() {
-            Some(parameter) => {
-                let argument = self.arguments.next();
-                ArgumentStep::Argument(Box::new(ArgumentSlot {
-                    parameter,
-                    argument,
-                    cursor: self,
-                }))
-            }
+        match self.arguments.next() {
+            Some((parameter, argument)) => ArgumentStep::Argument(Box::new(ArgumentSlot {
+                parameter,
+                argument,
+                cursor: self,
+            })),
             None => {
                 self.retained.args = self.checked_arguments.clone();
                 let prepared = if self.pending_check || self.observations.surviving_call {
@@ -410,8 +469,8 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> ArgumentSlot<'a, P, B> {
     pub(crate) fn parameter(&self) -> &'a FnParam<B> {
         self.parameter
     }
-    pub(crate) fn argument(&self) -> Option<&FunctionArgument<P, B>> {
-        self.argument.as_ref()
+    pub(crate) fn argument(&self) -> &ArgumentSource<P, B> {
+        &self.argument
     }
     pub(crate) fn check(
         mut self,
@@ -581,7 +640,7 @@ pub(crate) fn annotation_requires_provider_session(expected: &TypeExpr) -> bool 
         | TypeExpr::StringLiteral(_) => false,
     }
 }
-pub(crate) fn contains_deferred_user_function_call<P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn contains_deferred_user_function_call<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> bool {
     match value {
@@ -591,13 +650,14 @@ pub(crate) fn contains_deferred_user_function_call<P: PlaceholderKind, B: Bindin
             .any(contains_deferred_user_function_call),
         Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             crate::builtins::builtin_arity(name).is_none()
-                || args.iter().any(|argument| {
-                    argument
-                        .value()
-                        .is_some_and(contains_deferred_user_function_call)
-                })
+                || args
+                    .iter()
+                    .any(|argument| contains_deferred_user_function_call(argument.walker_value()))
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => true,
+        Value::Deferred(DeferredValue::Unavailable { args, .. }) => args
+            .iter()
+            .any(|argument| contains_deferred_user_function_call(argument.walker_value())),
         Value::Concrete(ConcreteValue::List(values)) => {
             values.iter().any(contains_deferred_user_function_call)
         }
@@ -638,7 +698,6 @@ pub(crate) fn contains_deferred_user_function_call<P: PlaceholderKind, B: Bindin
         | Value::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            | DeferredValue::Unavailable { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
@@ -666,7 +725,12 @@ mod tests {
     fn completion(
         function: &Arc<UserFunction>,
     ) -> FunctionCompletion<'_, ParserPlaceholder, RelativeBindingName> {
-        FunctionCompletion::new(function, &Arc::new(IndexMap::new()), vec![], 1.into())
+        let args = function
+            .params
+            .iter()
+            .map(|_| FunctionArgument::from_value(unknown()))
+            .collect();
+        FunctionCompletion::new(function, &Arc::new(IndexMap::new()), args, 1.into()).unwrap()
     }
     fn unknown() -> AuthoredValue {
         AuthoredValue::resource_ref("src", "emitted", vec![])
@@ -839,7 +903,8 @@ mod tests {
             &Arc::new(IndexMap::new()),
             vec![FunctionArgument::from_value(pending)],
             1.into(),
-        );
+        )
+        .unwrap();
         let ArgumentStep::Argument(slot) = completion.next_argument() else {
             panic!("argument")
         };
@@ -1067,6 +1132,7 @@ mod tests {
             )],
             1.into(),
         )
+        .unwrap()
         .retain()
         .into_value();
         let message = serde_json::to_string(&call).unwrap_err().to_string();
@@ -1080,5 +1146,58 @@ mod tests {
             "the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call."
         );
         assert!(!message.contains("carina apply"));
+    }
+}
+
+#[cfg(test)]
+mod unavailable_call_walk_tests {
+    use super::*;
+    #[test]
+    fn unavailable_arguments_preserve_retained_call_observation() {
+        let value = Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![FunctionArgument::from_value(
+                crate::value::retained_call_snapshot_tests::retained_call(),
+            )],
+            reason: crate::resource::UnavailableReason::from_builtin_error("fixture error".into()),
+            source_line: 1.into(),
+        });
+        assert!(contains_deferred_user_function_call(&value));
+        let conversion = crate::value::SavedDocumentConversion::new(std::iter::empty()).unwrap();
+        assert!(matches!(
+            conversion.value(&value.into_secret()),
+            Err(crate::value::SerializationError::RetainedUserFunctionCall(
+                _
+            ))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod arity_constructor_tests {
+    use super::*;
+    #[test]
+    fn completion_constructor_rejects_missing_and_extra_arguments() {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "fn g(x): String { x }",
+            std::path::Path::new("functions.crn"),
+            &context,
+        )
+        .unwrap();
+        let function = Arc::new(parsed.user_functions["g"].clone());
+        for count in [0, 2] {
+            let args = (0..count)
+                .map(|_| {
+                    FunctionArgument::from_value(crate::resource::AuthoredValue::Concrete(
+                        ConcreteValue::String("value".into()),
+                    ))
+                })
+                .collect();
+            assert!(
+                FunctionCompletion::new(&function, &Arc::new(IndexMap::new()), args, 1.into())
+                    .is_err()
+            );
+        }
     }
 }

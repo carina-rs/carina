@@ -491,7 +491,7 @@ fn native_secret_output_worker() {
 }
 
 #[test]
-fn retained_json_has_empty_stdout_and_refusal_hint_plan_out() {
+fn retained_json_command_prints_no_document_plan_out() {
     let output = native_output_child(
         "fn_declared_checks_tests::runtime_checks::native_refusal_output_worker_plan_out",
     );
@@ -506,8 +506,6 @@ fn retained_json_has_empty_stdout_and_refusal_hint_plan_out() {
         json_commands, 2,
         "root and module JSON output were observed"
     );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(stderr.matches("Error: Cannot save plan: the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call.\nError: Run `carina apply ").count(),4);
 }
 
 #[test]
@@ -552,10 +550,6 @@ fn native_refusal_output_worker_plan_out() {
                         rendered(&result),
                         expected_retained_plan_refusal(directory.path())
                     );
-                    let error = result.unwrap_err();
-                    for line in format_error_with_source_chain(&error).lines() {
-                        eprintln!("Error: {line}");
-                    }
                     assert!(!saved.exists());
                     assert_eq!(directory.fixture.count("create", "Sink"), 0);
                     directory.assert_unlocked().await;

@@ -1117,7 +1117,7 @@ fn declared_checks_retained_handle_contributes_apply_phase() {
         std::path::Path::new("functions.crn"),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     ).unwrap();
-    let call = &parsed.resources.last().unwrap().attributes["value"];
+    let call = parsed.iter_all_resources().last().unwrap().attributes()["value"].clone();
     assert!(matches!(
         call,
         Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
@@ -1146,7 +1146,7 @@ fn declared_checks_shared_handle_callee_uses_each_binding_phase_and_known_calls_
         "fn f(r: test.Thing): 'allowed' { r.emitted }\nlet src = test.Thing { name = 'src' }\ntest.Sink { value = f(src) }",
         std::path::Path::new("functions.crn"), &config,
     ).unwrap();
-    let ready = parsed.resources.last().unwrap().attributes["value"]
+    let ready = parsed.iter_all_resources().last().unwrap().attributes()["value"]
         .clone()
         .map_bindings(&mut |binding| absolute_binding_address_for_test(binding.as_str()))
         .into_expanded()
@@ -1236,7 +1236,7 @@ fn retained_ready_handle_never_materializes_unread_attributes() {
         std::path::Path::new("functions.crn"),
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     ).unwrap();
-    let call = parsed.resources.last().unwrap().attributes["value"]
+    let call = parsed.iter_all_resources().last().unwrap().attributes()["value"]
         .clone()
         .map_bindings(&mut |binding| absolute_binding_address_for_test(binding.as_str()))
         .into_expanded()

@@ -51,6 +51,17 @@ impl SavedBackendConfig {
             SavedBackendSource::Recorded(candidate) => Some(candidate),
         }
     }
+    pub(super) fn for_saved_document(
+        self,
+        conversion: &carina_core::value::SavedDocumentConversion,
+    ) -> Result<Self, carina_core::value::SerializationError> {
+        if let Some(config) = self.candidate() {
+            for value in config.attributes.values() {
+                conversion.admit_expression(value)?;
+            }
+        }
+        Ok(self)
+    }
     pub(super) fn into_wire(self) -> Option<ExpandedBackendConfig> {
         match self.source {
             SavedBackendSource::Implicit => None,

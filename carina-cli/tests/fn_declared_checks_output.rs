@@ -83,7 +83,8 @@ fn hashes(project: &Project) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn refresh_of_function_authored_secret_state_prints_no_values() {
+fn inlined_function_secret_output_stays_private_and_hashed() {
+    // Primitive annotations let this function inline; this is a privacy control.
     for module in [false, true] {
         let body = format!(
             "let src = mock.test.resource {{ name = 'src' computed = secret('{MARKER}') }}\nfn g(r: mock.test.resource): String {{ \"prefix-${{r.computed}}\" }}\nmock.test.resource {{ name = 'sink' computed = g(src) }}\n"
@@ -108,4 +109,86 @@ fn refresh_of_function_authored_secret_state_prints_no_values() {
         assert!(!stdout.contains("computed:"));
         assert_eq!(hashes(&project), before);
     }
+}
+
+fn assert_binary_retained_refusal(json: bool) {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("target")
+        });
+    let wasm = ["carina-provider-mock.wasm", "carina_provider_mock.wasm"]
+        .into_iter()
+        .map(|name| target.join("wasm32-wasip2/debug").join(name))
+        .find(|path| path.is_file())
+        .expect("the mock WASM fixture must be built");
+    for module in [false, true] {
+        let body = "let src = mock.test.read_back { present = 'allowed' }\nfn checked(r: mock.test.read_back): mock.RecoveryProbe { r.computed }\nlet sink = mock.test.read_back { present = checked(src) }\n";
+        let project = Project::new("", None);
+        for destination in [
+            project.path().join("local.wasm"),
+            project
+                .path()
+                .join(".carina/providers/file/local/local.wasm"),
+        ] {
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(&wasm, destination).unwrap();
+        }
+        std::fs::write(
+            project.path().join("providers.crn"),
+            "provider mock { source = 'file://local.wasm' }\n",
+        )
+        .unwrap();
+        if module {
+            std::fs::write(project.path().join("main.crn"),"let child = use { source = './child' }\nlet instance = child { label = 'module' }\n").unwrap();
+            std::fs::create_dir(project.path().join("child")).unwrap();
+            std::fs::write(
+                project.path().join("child/main.crn"),
+                format!("arguments {{ label: String }}\n{body}"),
+            )
+            .unwrap();
+        } else {
+            std::fs::write(project.path().join("main.crn"), body).unwrap();
+        }
+        let saved = project.path().join("saved.plan.json");
+        let args = if json {
+            vec!["plan", "--refresh=false", "--json"]
+        } else {
+            vec!["plan", "--refresh=false", "--out", saved.to_str().unwrap()]
+        };
+        {
+            let expected = format!(
+                "Warning: using cached managed-resource state (--refresh=false). Data sources are still read, but the plan may not reflect actual managed infrastructure.\n{}Error: Cannot save plan: {}\nError: Run `{}` directly on the project, without a saved plan.\n",
+                if json {
+                    "Using mock (instance=default, source: file://local.wasm)\n"
+                } else {
+                    ""
+                },
+                carina_core::value::RetainedUserFunctionCallError,
+                carina_core::hint::ProjectCommand::new("apply", project.path()),
+            );
+            let output = project.run(&args);
+            assert_eq!(output.status.code(), Some(1));
+            if json {
+                assert!(
+                    output.stdout.is_empty(),
+                    "refused JSON command must not print a document"
+                );
+            }
+            assert_eq!(String::from_utf8(output.stderr).unwrap(), expected);
+            assert!(!saved.exists());
+        }
+    }
+}
+
+#[test]
+fn retained_calls_refuse_saved_output_through_the_binary_json() {
+    assert_binary_retained_refusal(true);
+}
+#[test]
+fn retained_calls_refuse_saved_output_through_the_binary_plan_out() {
+    assert_binary_retained_refusal(false);
 }

@@ -1,5 +1,23 @@
 //! Value conversion and formatting utilities
 
+mod saved_document;
+pub use saved_document::SavedDocumentConversion;
+trait SnapshotAdmission {
+    fn check<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+        &self,
+        value: &Value<P, B>,
+    ) -> Result<(), SerializationError>;
+}
+struct RedactionOnly;
+impl SnapshotAdmission for RedactionOnly {
+    fn check<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+        &self,
+        _: &Value<P, B>,
+    ) -> Result<(), SerializationError> {
+        Ok(())
+    }
+}
+
 use crate::resource::DiagnosticScope;
 use crate::resource::InsideSecret;
 use std::borrow::Cow;
@@ -2656,8 +2674,22 @@ fn redact_snapshot_secrets<P: PlaceholderKind>(
                 source_line: *source_line,
             }))
         }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => {
-            Err(RetainedUserFunctionCallError.into())
+        Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function,
+            functions,
+            args,
+            source_line,
+        }) => {
+            let redacted = args
+                .iter()
+                .map(|argument| argument.try_map_value(redact_snapshot_secrets))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function: function.clone(),
+                functions: functions.clone(),
+                args: redacted,
+                source_line: *source_line,
+            }))
         }
         Value::Deferred(DeferredValue::Access(access)) => Ok(Value::Deferred(
             DeferredValue::Access(access.with_stage_base(redact_snapshot_secrets(access.base())?)),
@@ -2841,8 +2873,18 @@ fn canonical_secret_template<P: PlaceholderKind>(
             );
             tagged("function_call", JsonValue::Object(call))
         }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => {
-            return Err(RetainedUserFunctionCallError.into());
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
+            let mut call = Map::new();
+            call.insert("name".to_string(), JsonValue::String(function.name.clone()));
+            call.insert(
+                "args".to_string(),
+                JsonValue::Array(
+                    args.iter()
+                        .map(|argument| canonical_secret_template(argument.walker_value()))
+                        .collect::<Result<_, _>>()?,
+                ),
+            );
+            tagged("function_call", JsonValue::Object(call))
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let mut encoded = Map::new();
@@ -3191,9 +3233,6 @@ fn redact_with_guide(
     guide: SecretRedactionGuide<'_>,
 ) -> Result<SnapshotValue, SerializationError> {
     if let Some(secret_value) = guide.secret_value(source) {
-        if crate::function_evaluation::contains_deferred_user_function_call(source) {
-            return Err(RetainedUserFunctionCallError.into());
-        }
         let previous = guide.previous_hash();
         return Ok(SnapshotValue::redacted(hash_secret_value(
             secret_value,
@@ -3239,9 +3278,6 @@ pub fn redact_secrets_using_evaluated(
     evaluated: &Value,
 ) -> Result<SnapshotValue, SerializationError> {
     if contains_secret(evaluated) {
-        if crate::function_evaluation::contains_deferred_user_function_call(source) {
-            return Err(RetainedUserFunctionCallError.into());
-        }
         // Once evaluation reveals a secret anywhere below this path, persist
         // the evaluated subtree rather than the authored expression. This
         // keeps unresolved refs/unknowns needed at apply time while ensuring
@@ -3906,14 +3942,6 @@ pub fn rehydrate_secret_entry<P: PlaceholderKind>(
     Ok(Some(value))
 }
 
-/// Convert an expression that remains in project source, retaining ordinary
-/// deferred values while applying the same saved-document admission rules.
-pub fn redact_secrets_in_saved_expression(
-    value: &Value,
-) -> Result<SnapshotValue, SerializationError> {
-    redact_secrets_only(value)
-}
-
 pub fn redact_secrets_in_value(value: &Value) -> Result<SnapshotValue, SerializationError> {
     match value {
         Value::Deferred(DeferredValue::Unknown(reason)) => {
@@ -3939,6 +3967,7 @@ pub fn redact_secrets_in_value(value: &Value) -> Result<SnapshotValue, Serializa
 }
 
 fn redact_attrs_with_guide<'a, P: ValueKind + 'a, Attributes, Redact>(
+    admission: &impl SnapshotAdmission,
     attrs: impl Iterator<Item = (&'a String, &'a Value<P>)>,
     mut redact: Redact,
 ) -> Result<Attributes, SerializationError>
@@ -3947,7 +3976,10 @@ where
     Redact: FnMut(&str, &Value<P>) -> Result<SnapshotValue, SerializationError>,
 {
     attrs
-        .map(|(key, value)| redact(key, value).map(|value| (key.clone(), value)))
+        .map(|(key, value)| {
+            admission.check(value)?;
+            redact(key, value).map(|value| (key.clone(), value))
+        })
         .collect()
 }
 
@@ -3955,7 +3987,9 @@ where
 pub fn redact_secrets_in_attributes(
     attrs: &HashMap<String, Value>,
 ) -> Result<HashMap<String, SnapshotValue>, SerializationError> {
-    redact_attrs_with_guide(attrs.iter(), |_, value| redact_secrets_in_value(value))
+    redact_attrs_with_guide(&RedactionOnly, attrs.iter(), |_, value| {
+        redact_secrets_in_value(value)
+    })
 }
 
 /// Redact all secrets in a `Resource`, returning a new Resource with secrets replaced by hashes.
@@ -3970,7 +4004,22 @@ pub fn redact_secrets_in_resource<S: Clone, D: Clone>(
     crate::resource::Resource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
     SerializationError,
 > {
-    let attributes = redact_attrs_with_guide(resource.attributes.iter(), |_, value| {
+    redact_secrets_in_resource_with_admission(&RedactionOnly, resource)
+}
+
+fn redact_secrets_in_resource_with_admission<S: Clone, D: Clone>(
+    admission: &impl SnapshotAdmission,
+    resource: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> Result<
+    crate::resource::Resource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
+    SerializationError,
+> {
+    let attributes = redact_attrs_with_guide(admission, resource.attributes.iter(), |_, value| {
         redact_secrets_in_value(value)
     })?;
     Ok(resource.to_snapshot().with_value_stage(
@@ -3993,15 +4042,37 @@ pub fn redact_secrets_in_resource_reusing_persisted_hashes<S: Clone, D: Clone>(
     crate::resource::Resource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
     SerializationError,
 > {
-    let attributes = redact_attrs_with_guide(resource.attributes.iter(), |key, value| {
-        match persisted.encoded_value(key) {
+    redact_secrets_in_resource_reusing_persisted_hashes_with_admission(
+        &RedactionOnly,
+        resource,
+        persisted,
+    )
+}
+
+fn redact_secrets_in_resource_reusing_persisted_hashes_with_admission<S: Clone, D: Clone>(
+    admission: &impl SnapshotAdmission,
+    resource: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    persisted: &crate::provider::PersistedAttributes,
+) -> Result<
+    crate::resource::Resource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
+    SerializationError,
+> {
+    let attributes = redact_attrs_with_guide(
+        admission,
+        resource.attributes.iter(),
+        |key, value| match persisted.encoded_value(key) {
             Some(previous) => redact_with_guide(
                 value,
                 SecretRedactionGuide::PersistedDesired(previous.view()),
             ),
             None => redact_secrets_only(value),
-        }
-    })?;
+        },
+    )?;
     Ok(resource.to_snapshot().with_value_stage(
         attributes,
         crate::resource::convert_directives(resource.directives.clone()),
@@ -4013,7 +4084,8 @@ pub fn redact_secrets_in_resource_reusing_persisted_hashes<S: Clone, D: Clone>(
 /// stay exactly as they appear in the effect: replacement creates may carry a
 /// temporary name, and cascade updates may deliberately retain unresolved
 /// references for apply-time resolution.
-fn redact_resource_using_redacted_shape<S: Clone, D: Clone, T, E>(
+fn redact_resource_using_redacted_shape_with_admission<S: Clone, D: Clone, T, E>(
+    admission: &impl SnapshotAdmission,
     resource: &crate::resource::Resource<
         S,
         crate::resource::NoPlaceholder,
@@ -4025,13 +4097,14 @@ fn redact_resource_using_redacted_shape<S: Clone, D: Clone, T, E>(
     crate::resource::Resource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
     SerializationError,
 > {
-    let attributes = redact_attrs_with_guide(resource.attributes.iter(), |key, value| match guide
-        .attributes
-        .get(key)
-    {
-        Some(shape) => redact_desired_reusing_redacted_shape(value, shape),
-        None => redact_secrets_only(value),
-    })?;
+    let attributes = redact_attrs_with_guide(
+        admission,
+        resource.attributes.iter(),
+        |key, value| match guide.attributes.get(key) {
+            Some(shape) => redact_desired_reusing_redacted_shape(value, shape),
+            None => redact_secrets_only(value),
+        },
+    )?;
     Ok(resource.to_snapshot().with_value_stage(
         attributes,
         crate::resource::convert_directives(resource.directives.clone()),
@@ -4058,13 +4131,36 @@ pub fn redact_secrets_in_resource_using_evaluated<S: Clone, D: Clone, T, E>(
     crate::resource::Resource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
     SerializationError,
 > {
+    redact_secrets_in_resource_using_evaluated_with_admission(&RedactionOnly, source, evaluated)
+}
+
+fn redact_secrets_in_resource_using_evaluated_with_admission<S: Clone, D: Clone, T, E>(
+    admission: &impl SnapshotAdmission,
+    source: &crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    evaluated: &crate::resource::Resource<
+        T,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        E,
+    >,
+) -> Result<
+    crate::resource::Resource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
+    SerializationError,
+> {
     let attributes =
-        redact_attrs_with_guide(source.attributes.iter(), |key, value| {
-            match evaluated.attributes.get(key) {
+        redact_attrs_with_guide(
+            admission,
+            source.attributes.iter(),
+            |key, value| match evaluated.attributes.get(key) {
                 Some(evaluated) => redact_secrets_using_evaluated(value, evaluated),
                 None => redact_secrets_only(value),
-            }
-        })?;
+            },
+        )?;
     Ok(source.to_snapshot().with_value_stage(
         attributes,
         crate::resource::convert_directives(source.directives.clone()),
@@ -4123,7 +4219,22 @@ pub fn redact_secrets_in_data_source<S: Clone, D: Clone>(
     crate::resource::DataSource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
     SerializationError,
 > {
-    let attributes = redact_attrs_with_guide(resource.attributes.iter(), |_, value| {
+    redact_secrets_in_data_source_with_admission(&RedactionOnly, resource)
+}
+
+fn redact_secrets_in_data_source_with_admission<S: Clone, D: Clone>(
+    admission: &impl SnapshotAdmission,
+    resource: &crate::resource::DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> Result<
+    crate::resource::DataSource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
+    SerializationError,
+> {
+    let attributes = redact_attrs_with_guide(admission, resource.attributes.iter(), |_, value| {
         redact_secrets_in_value(value)
     })?;
     Ok(resource.to_snapshot().with_value_stage(
@@ -4149,13 +4260,36 @@ pub fn redact_secrets_in_data_source_using_evaluated<S: Clone, D: Clone, T, E>(
     crate::resource::DataSource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
     SerializationError,
 > {
+    redact_secrets_in_data_source_using_evaluated_with_admission(&RedactionOnly, source, evaluated)
+}
+
+fn redact_secrets_in_data_source_using_evaluated_with_admission<S: Clone, D: Clone, T, E>(
+    admission: &impl SnapshotAdmission,
+    source: &crate::resource::DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    evaluated: &crate::resource::DataSource<
+        T,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        E,
+    >,
+) -> Result<
+    crate::resource::DataSource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
+    SerializationError,
+> {
     let attributes =
-        redact_attrs_with_guide(source.attributes.iter(), |key, value| {
-            match evaluated.attributes.get(key) {
+        redact_attrs_with_guide(
+            admission,
+            source.attributes.iter(),
+            |key, value| match evaluated.attributes.get(key) {
                 Some(evaluated) => redact_secrets_using_evaluated(value, evaluated),
                 None => redact_secrets_only(value),
-            }
-        })?;
+            },
+        )?;
     Ok(source.to_snapshot().with_value_stage(
         attributes,
         crate::resource::convert_directives(source.directives.clone()),
@@ -4207,17 +4341,19 @@ pub fn rehydrate_data_source_secrets<S: Clone, D: Clone, T, E>(
     ))
 }
 
-fn snapshot_constraints(
+fn snapshot_constraints_with_admission(
+    admission: &impl SnapshotAdmission,
     constraints: &[crate::resource::PendingModuleConstraint],
 ) -> Result<Vec<crate::resource::PendingModuleConstraint<SnapshotLeaf>>, SerializationError> {
     constraints
         .iter()
         .map(|constraint| {
-            Ok(constraint.with_expression(
-                constraint
-                    .expression
-                    .try_map_stage(&mut redact_secrets_in_value)?,
-            ))
+            Ok(
+                constraint.with_expression(constraint.expression.try_map_stage(&mut |value| {
+                    admission.check(value)?;
+                    redact_secrets_in_value(value)
+                })?),
+            )
         })
         .collect()
 }
@@ -4225,11 +4361,19 @@ fn snapshot_constraints(
 pub fn redact_secrets_in_live_composition(
     resource: &crate::resource::LiveComposition,
 ) -> Result<crate::resource::LiveComposition<SnapshotLeaf>, SerializationError> {
+    redact_secrets_in_live_composition_with_admission(&RedactionOnly, resource)
+}
+
+fn redact_secrets_in_live_composition_with_admission(
+    admission: &impl SnapshotAdmission,
+    resource: &crate::resource::LiveComposition,
+) -> Result<crate::resource::LiveComposition<SnapshotLeaf>, SerializationError> {
     let arguments = resource
         .signature
         .arguments
         .iter()
         .map(|(key, argument)| {
+            admission.check(argument.value())?;
             redact_secrets_in_value(argument.value())
                 .map(|value| (key.clone(), argument.with_value(value)))
         })
@@ -4240,7 +4384,10 @@ pub fn redact_secrets_in_live_composition(
         .iter()
         .map(|(key, attribute)| {
             attribute
-                .try_map_value(redact_secrets_in_value)
+                .try_map_value(|value| {
+                    admission.check(value)?;
+                    redact_secrets_in_value(value)
+                })
                 .map(|value| (key.clone(), value))
         })
         .collect::<Result<_, _>>()?;
@@ -4249,7 +4396,10 @@ pub fn redact_secrets_in_live_composition(
         .with_signature(crate::resource::LiveCompositionSignature {
             arguments,
             attributes,
-            pending_constraints: snapshot_constraints(&resource.signature.pending_constraints)?,
+            pending_constraints: snapshot_constraints_with_admission(
+                admission,
+                &resource.signature.pending_constraints,
+            )?,
         }))
 }
 
@@ -4391,11 +4541,21 @@ pub fn rehydrate_saved_composition_with_candidate(
 pub fn redact_secrets_in_state<P: crate::resource::StateValueLeaf>(
     state: &crate::resource::State<P>,
 ) -> Result<crate::resource::SnapshotState, SerializationError> {
+    redact_secrets_in_state_with_admission(&RedactionOnly, state)
+}
+
+fn redact_secrets_in_state_with_admission<P: crate::resource::StateValueLeaf>(
+    admission: &impl SnapshotAdmission,
+    state: &crate::resource::State<P>,
+) -> Result<crate::resource::SnapshotState, SerializationError> {
     let state = state.to_snapshot();
     let attributes = state
         .attributes
         .iter()
-        .map(|(key, value)| redact_snapshot_secrets(value).map(|value| (key.clone(), value)))
+        .map(|(key, value)| {
+            admission.check(value)?;
+            redact_snapshot_secrets(value).map(|value| (key.clone(), value))
+        })
         .collect::<Result<_, _>>()?;
     Ok(crate::resource::State {
         attributes,
@@ -4412,11 +4572,25 @@ pub fn redact_secrets_in_state_using_resource<D, P: crate::resource::StateValueL
         D,
     >,
 ) -> Result<crate::resource::SnapshotState, SerializationError> {
+    redact_secrets_in_state_using_resource_with_admission(&RedactionOnly, state, desired)
+}
+
+fn redact_secrets_in_state_using_resource_with_admission<D, P: crate::resource::StateValueLeaf>(
+    admission: &impl SnapshotAdmission,
+    state: &crate::resource::State<P>,
+    desired: &crate::resource::Resource<
+        crate::resource::ModuleSource,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+) -> Result<crate::resource::SnapshotState, SerializationError> {
     let state = state.to_snapshot();
     let attributes = state
         .attributes
         .iter()
         .map(|(key, value)| {
+            admission.check(value)?;
             let value = match desired.attributes.get(key) {
                 Some(shape) => redact_plaintext_using_secret_shape(value, shape)?,
                 None => redact_snapshot_secrets(value)?,
@@ -4434,11 +4608,20 @@ pub fn redact_secrets_in_state_using_persisted<P: crate::resource::StateValueLea
     state: &crate::resource::State<P>,
     persisted: &crate::provider::PersistedAttributes,
 ) -> Result<crate::resource::SnapshotState, SerializationError> {
+    redact_secrets_in_state_using_persisted_with_admission(&RedactionOnly, state, persisted)
+}
+
+fn redact_secrets_in_state_using_persisted_with_admission<P: crate::resource::StateValueLeaf>(
+    admission: &impl SnapshotAdmission,
+    state: &crate::resource::State<P>,
+    persisted: &crate::provider::PersistedAttributes,
+) -> Result<crate::resource::SnapshotState, SerializationError> {
     let state = state.to_snapshot();
     let attributes = state
         .attributes
         .iter()
         .map(|(key, value)| {
+            admission.check(value)?;
             let value = match persisted.encoded().get(key) {
                 Some(previous) => redact_plaintext_using_persisted_state(value, previous.view())?,
                 None => redact_snapshot_secrets(value)?,
@@ -4552,43 +4735,65 @@ pub fn rehydrate_state_secrets_from_plaintext(
     verify_historical_state_secrets(saved, actual)?.into_verified_state()
 }
 
-fn redact_deferred_template<S: Clone>(
+fn redact_deferred_template_with_admission<S: Clone>(
+    admission: &impl SnapshotAdmission,
     template: &crate::parser::CompiledDeferredForExpression<S>,
 ) -> Result<
     crate::parser::CompiledDeferredForExpression<S, SnapshotLeaf, SnapshotLeaf<LoopSlot>>,
     SerializationError,
 > {
+    template
+        .template_resource()
+        .as_resource()
+        .directives
+        .try_visit_values(&mut |value| admission.check(value))?;
     crate::effect::value_stage::map_template::<S, crate::resource::NoPlaceholder, SnapshotLeaf, _>(
         template,
-        redact_secrets_only,
-        |_, value| redact_secrets_only(value),
+        |value| {
+            admission.check(value)?;
+            redact_secrets_only(value)
+        },
+        |_, value| {
+            admission.check(value)?;
+            redact_secrets_only(value)
+        },
     )
 }
 
 pub fn redact_secrets_in_effect<S: Clone>(
     effect: &crate::effect::Effect<S>,
 ) -> Result<crate::effect::Effect<S, SnapshotLeaf>, SerializationError> {
-    redact_secrets_in_effect_with_history(effect, &HashMap::new())
+    redact_secrets_in_effect_with_history_with_admission(&RedactionOnly, effect, &HashMap::new())
 }
 
-fn redact_historical_attributes<'a>(
+fn redact_historical_attributes_with_admission<'a>(
+    admission: &impl SnapshotAdmission,
     attributes: &HashMap<String, SnapshotValue>,
     mut guide: impl FnMut(&str) -> Option<&'a SnapshotValue>,
 ) -> Result<HashMap<String, SnapshotValue>, SerializationError> {
-    redact_attrs_with_guide(attributes.iter(), |key, value| match guide(key) {
-        Some(shape) => redact_using_redacted_shape(value, shape),
-        None => redact_snapshot_secrets(value),
+    redact_attrs_with_guide(admission, attributes.iter(), |key, value| {
+        match guide(key) {
+            Some(shape) => redact_using_redacted_shape(value, shape),
+            None => redact_snapshot_secrets(value),
+        }
     })
 }
 
-fn redact_secrets_in_effect_with_history<S: Clone>(
+fn redact_secrets_in_effect_with_history_with_admission<S: Clone>(
+    admission: &impl SnapshotAdmission,
     effect: &crate::effect::Effect<S>,
     historical: &HashMap<crate::resource::ResourceId, crate::resource::SnapshotState>,
 ) -> Result<crate::effect::Effect<S, SnapshotLeaf>, SerializationError> {
     let mut redacted = effect.try_map_value_stage(
-        |_, _, value| redact_secrets_in_value(value),
-        |_, value| redact_secrets_in_value(value),
-        redact_deferred_template,
+        |_, _, value| {
+            admission.check(value)?;
+            redact_secrets_in_value(value)
+        },
+        |_, value| {
+            admission.check(value)?;
+            redact_secrets_in_value(value)
+        },
+        |template| redact_deferred_template_with_admission(admission, template),
     )?;
     match &mut redacted {
         crate::effect::Effect::DeferredReplace(payload) => {
@@ -4599,20 +4804,22 @@ fn redact_secrets_in_effect_with_history<S: Clone>(
                     .is_current()
                     .then(|| historical.get(old.id.as_inner()))
                     .flatten();
-                old.previous_attributes =
-                    redact_historical_attributes(&old.previous_attributes, |key| {
-                        historical.and_then(|state| state.attributes.get(key))
-                    })?;
+                old.previous_attributes = redact_historical_attributes_with_admission(
+                    admission,
+                    &old.previous_attributes,
+                    |key| historical.and_then(|state| state.attributes.get(key)),
+                )?;
             }
         }
 
         crate::effect::Effect::Update { from, .. } => {
-            **from = redact_secrets_in_state(from)?;
+            **from = redact_secrets_in_state_with_admission(admission, from)?;
         }
         crate::effect::Effect::ReleaseListKeys { keys, .. } => {
             *keys = crate::effect::ReleasedListKeys::try_new(
                 keys.iter()
                     .map(|key| {
+                        admission.check(key.retained_value())?;
                         redact_snapshot_secrets(key.retained_value()).map(|retained| {
                             crate::effect::ReleasedListKey::new(key.key(), retained)
                         })
@@ -4621,7 +4828,15 @@ fn redact_secrets_in_effect_with_history<S: Clone>(
             )
             .expect("redaction preserves non-empty unique release keys");
         }
-        _ => {}
+        crate::effect::Effect::Read { .. }
+        | crate::effect::Effect::Create(_)
+        | crate::effect::Effect::ResumeCreate { .. }
+        | crate::effect::Effect::Delete { .. }
+        | crate::effect::Effect::Import { .. }
+        | crate::effect::Effect::Remove { .. }
+        | crate::effect::Effect::Move { .. }
+        | crate::effect::Effect::Wait { .. }
+        | crate::effect::Effect::DeferredCreate(_) => {}
     }
     Ok(redacted)
 }
@@ -4672,6 +4887,28 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
     >,
     historical: &HashMap<crate::resource::ResourceId, crate::resource::SnapshotState>,
 ) -> Result<crate::plan::SnapshotPlan, SerializationError> {
+    redact_secrets_in_plan_with_desired_and_historical_with_admission(
+        &RedactionOnly,
+        plan,
+        planned_resources,
+        historical,
+    )
+}
+
+fn redact_secrets_in_plan_with_desired_and_historical_with_admission<D>(
+    admission: &impl SnapshotAdmission,
+    plan: &crate::plan::Plan,
+    planned_resources: &HashMap<
+        crate::resource::ResourceId,
+        crate::resource::Resource<
+            crate::resource::ModuleSource,
+            SnapshotLeaf,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+    >,
+    historical: &HashMap<crate::resource::ResourceId, crate::resource::SnapshotState>,
+) -> Result<crate::plan::SnapshotPlan, SerializationError> {
     let reusable_resource = |id: &crate::resource::ResourceId| {
         planned_resources
             .get(id)
@@ -4683,14 +4920,16 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
         .iter()
         .map(|effect| {
             let effect = match effect {
-                crate::effect::Effect::Create(resource) => {
-                    match reusable_resource(&resource.id) {
-                        Some(planned) => crate::effect::Effect::Create(resource.replace_inner(
-                            redact_resource_using_redacted_shape(resource, planned)?,
-                        )),
-                        None => redact_secrets_in_effect(effect)?,
-                    }
-                }
+                crate::effect::Effect::Create(resource) => match reusable_resource(&resource.id) {
+                    Some(planned) => crate::effect::Effect::Create(resource.replace_inner(
+                        redact_resource_using_redacted_shape_with_admission(
+                            admission, resource, planned,
+                        )?,
+                    )),
+                    None => redact_secrets_in_effect_with_history_with_admission(
+                        admission, effect, historical,
+                    )?,
+                },
                 crate::effect::Effect::Update {
                     from,
                     identifier,
@@ -4698,22 +4937,28 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
                     changed_attributes,
                 } => crate::effect::Effect::Update {
                     from: Box::new(crate::resource::SnapshotState {
-                        attributes: redact_historical_attributes(&from.attributes, |key| {
-                            match historical.get(&from.id) {
+                        attributes: redact_historical_attributes_with_admission(
+                            admission,
+                            &from.attributes,
+                            |key| match historical.get(&from.id) {
                                 Some(state) => state.attributes.get(key),
                                 None => planned_resources
                                     .get(&from.id)
                                     .and_then(|resource| resource.attributes.get(key)),
-                            }
-                        })?,
+                            },
+                        )?,
                         ..from.as_ref().clone()
                     }),
                     identifier: identifier.clone(),
                     to: match reusable_resource(&to.id) {
                         Some(planned) => {
-                            to.replace_inner(redact_resource_using_redacted_shape(to, planned)?)
+                            to.replace_inner(redact_resource_using_redacted_shape_with_admission(
+                                admission, to, planned,
+                            )?)
                         }
-                        None => to.replace_inner(redact_secrets_in_resource(to)?),
+                        None => to.replace_inner(redact_secrets_in_resource_with_admission(
+                            admission, to,
+                        )?),
                     },
                     changed_attributes: changed_attributes.clone(),
                 },
@@ -4727,7 +4972,9 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
                 | crate::effect::Effect::Wait { .. }
                 | crate::effect::Effect::DeferredCreate(_)
                 | crate::effect::Effect::DeferredReplace(_) => {
-                    redact_secrets_in_effect_with_history(effect, historical)?
+                    redact_secrets_in_effect_with_history_with_admission(
+                        admission, effect, historical,
+                    )?
                 }
             };
             Ok(effect)
@@ -4751,11 +4998,12 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
             .is_current()
             .then(|| planned_resources.get(old.instance.id()))
             .flatten();
-        old.attributes = redact_historical_attributes(&old.attributes, |key| {
-            historical
-                .and_then(|state| state.attributes.get(key))
-                .or_else(|| desired.and_then(|resource| resource.attributes.get(key)))
-        })?;
+        old.attributes =
+            redact_historical_attributes_with_admission(admission, &old.attributes, |key| {
+                historical
+                    .and_then(|state| state.attributes.get(key))
+                    .or_else(|| desired.and_then(|resource| resource.attributes.get(key)))
+            })?;
     }
 
     let create_ids = create_effect_ids(&redacted);
@@ -4765,6 +5013,7 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
         let guide = resource_id.and_then(|id| planned_resources.get(id));
         #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut metadata.previous_attributes {
+            admission.check(value)?;
             *value = if let Some(shape) = historical.and_then(|state| state.attributes.get(key)) {
                 redact_using_redacted_shape(value, shape)?
             } else {
@@ -12018,8 +12267,9 @@ mod tests {
             )),
         );
 
-        let redacted = redact_resource_using_redacted_shape(&resource, &guide)
-            .expect("effect resource redaction");
+        let redacted =
+            redact_resource_using_redacted_shape_with_admission(&RedactionOnly, &resource, &guide)
+                .expect("effect resource redaction");
         let Some(crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(settings))) =
             redacted.attributes.get("settings")
         else {
@@ -15993,7 +16243,7 @@ pub(crate) mod retained_call_snapshot_tests {
         );
     }
     #[test]
-    fn retained_call_snapshot_conversion_rejects_before_serde() {
+    fn saved_document_admission_rejects_nested_calls_before_redaction() {
         let mut missed = Vec::new();
         for (position, value) in [
             ("direct", retained_call()),
@@ -16019,7 +16269,9 @@ pub(crate) mod retained_call_snapshot_tests {
             ),
         ] {
             if !matches!(
-                redact_secrets_in_value(&value),
+                SavedDocumentConversion::new(std::iter::empty())
+                    .unwrap()
+                    .value(&value),
                 Err(SerializationError::RetainedUserFunctionCall(_))
             ) {
                 missed.push(position);
@@ -16031,13 +16283,18 @@ pub(crate) mod retained_call_snapshot_tests {
         );
     }
     #[test]
-    fn retained_call_resource_conversion_rejects_before_serde() {
+    fn saved_document_resource_admission_rejects_before_redaction() {
         let resource: Resource =
             Resource::new("test.Thing", "src").with_attribute("plain", retained_call());
-        assert_refused(redact_secrets_in_resource(&resource), "resource attribute");
+        assert_refused(
+            SavedDocumentConversion::new(std::iter::empty())
+                .unwrap()
+                .redact_secrets_in_resource(&resource),
+            "resource attribute",
+        );
     }
     #[test]
-    fn retained_call_composition_fields_reject_before_serde() {
+    fn saved_document_composition_admission_covers_arguments_outputs_and_constraints() {
         let mut missed = Vec::new();
         for position in ["argument", "output", "require operand"] {
             let mut signature = LiveCompositionSignature {
@@ -16095,7 +16352,9 @@ pub(crate) mod retained_call_snapshot_tests {
                 declaration: Default::default(),
             };
             if !matches!(
-                redact_secrets_in_live_composition(&composition),
+                SavedDocumentConversion::new(std::iter::empty())
+                    .unwrap()
+                    .redact_secrets_in_live_composition(&composition),
                 Err(SerializationError::RetainedUserFunctionCall(_))
             ) {
                 missed.push(position);
@@ -16107,33 +16366,37 @@ pub(crate) mod retained_call_snapshot_tests {
         );
     }
     #[test]
-    fn evaluated_secret_guide_cannot_erase_an_authored_retained_call() {
+    fn saved_document_admission_precedes_secret_guide_replacement() {
         let source = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "pending".into(),
             retained_call(),
         )])));
         let evaluated =
             Value::Concrete(ConcreteValue::String("known-sensitive".into())).into_secret();
+        let authored_resource: Resource =
+            Resource::new("test.Thing", "src").with_attribute("plain", source.clone());
+        let evaluated_resource: Resource =
+            Resource::new("test.Thing", "src").with_attribute("plain", evaluated.clone());
         assert_refused(
-            redact_secrets_using_evaluated(&source, &evaluated),
+            SavedDocumentConversion::new(std::iter::empty())
+                .unwrap()
+                .redact_secrets_in_resource_using_evaluated(
+                    &authored_resource,
+                    &evaluated_resource,
+                ),
             "replaced source subtree",
         );
+        let redacted = redact_secrets_using_evaluated(&source, &evaluated).unwrap();
+        assert!(contains_redacted_secret(&redacted));
     }
     #[test]
-    fn project_expression_conversion_preserves_an_ordinary_upstream_unknown() {
+    fn saved_document_export_admission_preserves_an_ordinary_upstream_unknown() {
         let value = Value::Deferred(DeferredValue::Unknown(
             crate::resource::ApplyTimeUnknown::UpstreamExport {
                 path: crate::resource::AccessPath::new("upstream", "value").resolve_root_for_test(),
             },
         ));
-        let snapshot = redact_secrets_in_saved_expression(&value).unwrap();
-        let Value::Deferred(DeferredValue::Unknown(
-            crate::resource::ApplyTimeUnknown::UpstreamExport { path },
-        )) = snapshot
-        else {
-            panic!("upstream unknown must remain deferred")
-        };
-        assert_eq!(path.to_dot_string(), "upstream.value");
+        assert!(SavedDocumentConversion::new([&value]).is_ok());
     }
     #[test]
     fn wait_operand_type_cannot_carry_a_retained_call() {
@@ -16141,5 +16404,26 @@ pub(crate) mod retained_call_snapshot_tests {
             crate::wait::WaitRhs::try_from(retained_call()),
             Err(crate::wait::predicate::WaitPredicateError::UnsupportedOperand)
         ));
+    }
+}
+
+#[cfg(test)]
+mod retained_secret_hash_regressions {
+    use super::*;
+    #[test]
+    fn retained_call_hash_material_is_independent_of_saved_document_admission() {
+        let value = super::retained_call_snapshot_tests::retained_call();
+        let secret = value.into_secret();
+        let Value::Deferred(DeferredValue::Secret(payload)) = secret else {
+            panic!("secret")
+        };
+        let hash = payload
+            .hash(None)
+            .expect("ordinary hashing must accept retained calls");
+        assert!(
+            payload
+                .verify_hash(&hash)
+                .expect("verification must not emit a saved-plan refusal")
+        );
     }
 }

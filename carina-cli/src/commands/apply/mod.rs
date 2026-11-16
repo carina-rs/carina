@@ -209,7 +209,7 @@ fn saved_plan_secret_orphan_vanished_error(
     )
 }
 
-fn cli_observer_factory<S: Send + Sync + 'static>(
+pub(crate) fn cli_observer_factory<S: Send + Sync + 'static>(
     color_mode: crate::output_style::ColorMode,
     plan: &carina_core::plan::Plan<S>,
     project_dir: &Path,
@@ -3784,14 +3784,20 @@ pub async fn run_apply_from_plan(
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
     run_apply_from_plan_using(
-        SavedApplyInvocation {
-            auto_approve,
-            lock,
-            parallelism,
-            accept_legacy_name_overrides,
-            cancel,
-            ..SavedApplyInvocation::for_project(runtime, plan, plan_argument, provider_context)
-        },
+        SavedApplyInvocation::for_project(
+            runtime,
+            plan,
+            plan_argument,
+            provider_context,
+            SavedApplyOptions {
+                auto_approve,
+                lock,
+                parallelism,
+                accept_legacy_name_overrides,
+                cancel,
+            },
+            &cli_observer_factory,
+        ),
         |runtime, providers, base_dir| {
             ProviderLoad::load(
                 runtime,
@@ -3816,24 +3822,41 @@ pub(crate) struct SavedApplyInvocation<'a, 'observer> {
     pub(crate) cancel: ShutdownToken,
     observer_factory: &'a ObserverFactory<'observer, SavedModuleSource>,
 }
+pub(crate) struct SavedApplyOptions {
+    pub(crate) auto_approve: bool,
+    pub(crate) lock: bool,
+    pub(crate) parallelism: NonZeroUsize,
+    pub(crate) accept_legacy_name_overrides: bool,
+    pub(crate) cancel: ShutdownToken,
+}
+
 impl<'a> SavedApplyInvocation<'a, 'static> {
     pub(crate) fn for_project(
         runtime: &'a crate::runtime::CommandRuntime,
         plan: &'a ResolvedPath,
         plan_argument: &'a Path,
         provider_context: &'a ProviderContext,
+        options: SavedApplyOptions,
+        observer_factory: &'a ObserverFactory<'static, SavedModuleSource>,
     ) -> Self {
+        let SavedApplyOptions {
+            auto_approve,
+            lock,
+            parallelism,
+            accept_legacy_name_overrides,
+            cancel,
+        } = options;
         Self {
             runtime,
             plan,
             plan_argument,
             provider_context,
-            auto_approve: true,
-            lock: true,
-            parallelism: crate::DEFAULT_PARALLELISM,
-            accept_legacy_name_overrides: false,
-            cancel: ShutdownToken::running(),
-            observer_factory: &cli_observer_factory,
+            auto_approve,
+            lock,
+            parallelism,
+            accept_legacy_name_overrides,
+            cancel,
+            observer_factory,
         }
     }
 }
