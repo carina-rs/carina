@@ -3049,7 +3049,12 @@ fn round2_plain_reference_skips_expression_callback() {
             result
                 .values
                 .errors()
-                .chain(result.values.symbolic_errors().map(|(_, _, error)| error))
+                .chain(
+                    result
+                        .values
+                        .symbolic_errors()
+                        .map(|(_, _, diagnostic)| diagnostic.error()),
+                )
                 .map(ToString::to_string)
                 .collect()
         });

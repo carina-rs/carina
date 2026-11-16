@@ -28,7 +28,7 @@ pub(super) fn covered_by_symbolic_findings(
 ) -> bool {
     if symbolic.iter().any(|finding| {
         let (symbolic_path, symbolic_error) = finding.diagnostic();
-        error == symbolic_error
+        error == symbolic_error.error()
             && path.steps().len() == symbolic_path.segments().len()
             && path
                 .steps()

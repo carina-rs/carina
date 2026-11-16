@@ -79,7 +79,12 @@ fn check_report_selection(reported: bool) {
                 outcome
                     .values
                     .errors()
-                    .chain(outcome.values.symbolic_errors().map(|(_, _, error)| error))
+                    .chain(
+                        outcome
+                            .values
+                            .symbolic_errors()
+                            .map(|(_, _, diagnostic)| diagnostic.error()),
+                    )
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
             });
@@ -198,7 +203,11 @@ fn round2_lsp_missing_expanded_report_selects_main_fallback() {
             actual.push(result.map(|report| {
                 report
                     .errors()
-                    .chain(report.symbolic_errors().map(|(_, _, error)| error))
+                    .chain(
+                        report
+                            .symbolic_errors()
+                            .map(|(_, _, diagnostic)| diagnostic.error()),
+                    )
                     .map(ToString::to_string)
                     .collect()
             }));

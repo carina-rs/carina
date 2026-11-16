@@ -1682,6 +1682,20 @@ where
         locate_unknown_key(self.elements, self.location, finding)
     }
 
+    /// Resolve a symbolic schema diagnostic; ordinary adapters receive only Other.
+    pub fn locate_schema_diagnostic(
+        &self,
+        diagnostic: &crate::schema::SchemaDiagnostic,
+        other: impl FnOnce(&crate::schema::OtherSchemaFinding) -> DeclarationLocation,
+    ) -> Result<Located<crate::schema::TypeError>, AnalysisTreeError> {
+        match diagnostic {
+            crate::schema::SchemaDiagnostic::UnknownKey(key) => self.locate_unknown_key(key),
+            crate::schema::SchemaDiagnostic::Other(finding) => {
+                Ok(Located::new(other(finding), finding.error().clone()))
+            }
+        }
+    }
+
     pub fn attribute_assignment_location(&self, name: &str) -> &'a DeclarationLocation {
         self.attribute_locations[name].assignment_location()
     }
@@ -3196,6 +3210,46 @@ mod location_tests {
             misses.is_empty(),
             "missing-child, protected-key, enum-alias lookup aborted in cases {misses:?}"
         );
+    }
+
+    #[test]
+    fn symbolic_unknown_key_cannot_use_the_ordinary_location_adapter() {
+        use crate::schema::{LeafPath, LeafPathSegment, SchemaDiagnostic, TypeError};
+        let source = "mock.PendingSink { direct = { unknown = true } }";
+        let parsed = super::super::parse_file(
+            source,
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let diagnostic = SchemaDiagnostic::from_value(
+            "direct",
+            LeafPath::from_segments([LeafPathSegment::StructField("unknown".into())]),
+            TypeError::UnknownStructField {
+                struct_name: "B".into(),
+                field: "unknown".into(),
+                suggestion: None,
+            },
+        );
+        let located = resource
+            .locate_schema_diagnostic(&diagnostic, |_ordinary| {
+                panic!("UnknownKey must not reach the ordinary location adapter")
+            })
+            .unwrap();
+        let start = source.find("unknown").unwrap();
+        let span = located.location().span();
+        assert_eq!(
+            (
+                span.start_line(),
+                span.start_column(),
+                span.end_line(),
+                span.end_column()
+            ),
+            (1, start + 1, 1, start + "unknown".len() + 1),
+        );
+        assert_eq!(located.detail().to_string(), "Unknown field 'unknown' in B");
     }
 
     #[test]

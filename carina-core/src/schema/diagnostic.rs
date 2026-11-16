@@ -52,7 +52,7 @@ impl SchemaKeyPath {
         let mut prefix = FieldPath::new();
         for (step, segment) in path.steps().iter().zip(canonical.segments()) {
             if matches!(step, FieldPathStep::Redacted(_)) {
-                return Self::Key(secret_parent(&prefix));
+                return Self::SecretParent(secret_parent(&prefix));
             }
             prefix = prefix.pushed(step.clone(), segment.clone(), FieldPathDirection::After);
         }
@@ -84,6 +84,10 @@ pub struct OtherSchemaFinding {
 }
 
 impl OtherSchemaFinding {
+    pub fn error(&self) -> &TypeError {
+        &self.error
+    }
+
     pub fn path(&self) -> Option<(&str, &LeafPath)> {
         self.path.as_ref().map(|(root, path)| (root.as_str(), path))
     }
@@ -151,7 +155,7 @@ impl SchemaDiagnostic {
         }
     }
 
-    fn at_attribute(mut self, root: &str) -> Self {
+    pub(super) fn at_attribute(mut self, root: &str) -> Self {
         match &mut self {
             Self::UnknownKey(finding) => match &mut finding.key {
                 SchemaDiagnosticKey::Attribute { name } => *name = root.into(),
@@ -166,7 +170,34 @@ impl SchemaDiagnostic {
         self
     }
 
-    fn with_error(mut self, error: TypeError) -> Self {
+    fn with_error(mut self, error: TypeError, source: &FieldPath) -> Self {
+        let same_contract = match &self {
+            Self::UnknownKey(finding) => match &finding.key {
+                SchemaDiagnosticKey::Attribute { .. } => {
+                    matches!(error, TypeError::UnknownAttribute { .. })
+                }
+                SchemaDiagnosticKey::Value { .. } => {
+                    is_unknown_key(&error) && !matches!(error, TypeError::UnknownAttribute { .. })
+                }
+            },
+            Self::Other(_) => !is_unknown_key(&error),
+        };
+        if !same_contract {
+            let root = match &self {
+                Self::UnknownKey(finding) => match &finding.key {
+                    SchemaDiagnosticKey::Attribute { name } => name.as_str(),
+                    SchemaDiagnosticKey::Value { root, .. } => root.as_str(),
+                },
+                Self::Other(finding) => finding.path().map_or("", |(root, _)| root),
+            };
+            let coverage = self.coverage_path().map(|(_, path)| path.clone());
+            let replacement = Self::relative(source, error).at_attribute(root);
+            return if matches!(replacement, Self::Other(_)) {
+                replacement.with_coverage(coverage.as_ref())
+            } else {
+                replacement
+            };
+        }
         match &mut self {
             Self::UnknownKey(finding) => finding.error = error,
             Self::Other(finding) => finding.error = error,
@@ -289,7 +320,7 @@ impl PrimaryValueFinding {
     }
     pub(super) fn map_error(mut self, wrap: impl FnOnce(TypeError) -> TypeError) -> Self {
         let error = wrap(self.error().clone());
-        self.diagnostic = self.diagnostic.with_error(error);
+        self.diagnostic = self.diagnostic.with_error(error, &self.path);
         self
     }
     pub(super) fn in_container(mut self, path: &FieldPath) -> Self {
@@ -308,7 +339,10 @@ impl PrimaryValueFinding {
         }
     }
     pub(super) fn diagnostic(&self, root: &str, error: TypeError) -> SchemaDiagnostic {
-        self.diagnostic.clone().with_error(error).at_attribute(root)
+        self.diagnostic
+            .clone()
+            .with_error(error, &self.path)
+            .at_attribute(root)
     }
     pub(super) fn into_diagnostic(self, root: &str) -> (FieldPath, SchemaDiagnostic) {
         (self.path, self.diagnostic.at_attribute(root))
@@ -347,6 +381,72 @@ mod tests {
             panic!("nested unknown key")
         };
         relative.path()
+    }
+
+    #[test]
+    fn protected_key_keeps_its_public_prefix_after_inside_secret() {
+        let finding = PrimaryValueFinding::new(
+            FieldPath::from_canonical_segments([
+                LeafPathSegment::StructField("public".into()),
+                LeafPathSegment::MapKey(crate::resource::ValueString::diagnostic_sensitive(
+                    "PRIVATE_KEY",
+                )),
+                LeafPathSegment::StructField("PRIVATE_SUFFIX".into()),
+            ]),
+            unknown_field(),
+        )
+        .inside_secret();
+        assert_eq!(
+            target(&finding).steps().first(),
+            Some(&FieldPathStep::Field("public".into()))
+        );
+        assert_eq!(target(&finding).steps().len(), 2);
+        assert!(!target(&finding).to_string().contains("PRIVATE"));
+    }
+
+    fn unknown_field() -> TypeError {
+        TypeError::UnknownStructField {
+            struct_name: "B".into(),
+            field: "unknown".into(),
+            suggestion: None,
+        }
+    }
+
+    #[test]
+    fn replacement_errors_reclassify_the_location_contract() {
+        let path = FieldPath::new().push_field("unknown");
+        let ordinary = || TypeError::value_type_mismatch("Bool".into(), "String".into());
+        let mut failures = Vec::new();
+        for (label, old, replacement) in [
+            ("unknown_to_other", unknown_field(), ordinary()),
+            ("other_to_unknown", ordinary(), unknown_field()),
+        ] {
+            let expected_unknown = is_unknown_key(&replacement);
+            let expected_error = replacement.clone();
+            for (operation, diagnostic) in [
+                (
+                    "with_error",
+                    SchemaDiagnostic::relative(&path, old.clone())
+                        .with_error(replacement.clone(), &path),
+                ),
+                (
+                    "map_error",
+                    PrimaryValueFinding::new(path.clone(), old.clone())
+                        .map_error(|_| replacement.clone())
+                        .diagnostic,
+                ),
+                (
+                    "diagnostic",
+                    PrimaryValueFinding::new(path.clone(), old).diagnostic("direct", replacement),
+                ),
+            ] {
+                assert_eq!(diagnostic.error(), &expected_error, "{label}/{operation}");
+                if matches!(diagnostic, SchemaDiagnostic::UnknownKey(_)) != expected_unknown {
+                    failures.push((label, operation));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "replacement drift: {failures:?}");
     }
 
     #[test]

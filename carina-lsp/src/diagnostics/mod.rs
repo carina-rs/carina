@@ -1029,22 +1029,18 @@ impl DiagnosticRun<'_> {
                     if handled_enum_diagnostic && covers_path {
                         continue;
                     }
-                    let (path, error) = finding.diagnostic();
+                    let (path, diagnostic) = finding.diagnostic();
+                    let error = diagnostic.error();
                     use carina_core::resource::SecretDiagnosticError;
                     use carina_core::validation::admission::AdmissionReferenceError;
-                    let (location, severity, message) = match error {
+                    let (severity, message) = match error {
                         TypeError::Reference { error, .. } => match error.as_ref() {
                             SecretDiagnosticError::Public(AdmissionReferenceError::Arithmetic(
                                 finding,
-                            )) => (
-                                finding.location(),
-                                DiagnosticSeverity::ERROR,
-                                finding.detail().to_string(),
-                            ),
+                            )) => (DiagnosticSeverity::ERROR, finding.detail().to_string()),
                             SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
                                 error,
                             )) => (
-                                rref.attribute_key_location(attr_name),
                                 match error {
                                     DeferredAccessTypeError::InvalidAccess { .. } => {
                                         DiagnosticSeverity::ERROR
@@ -1068,7 +1064,6 @@ impl DiagnosticRun<'_> {
                             SecretDiagnosticError::Public(
                                 AdmissionReferenceError::ResourceHandle { reference, types },
                             ) => (
-                                rref.attribute_key_location(attr_name),
                                 DiagnosticSeverity::WARNING,
                                 format!("Type mismatch: {types} (from {reference})"),
                             ),
@@ -1076,11 +1071,9 @@ impl DiagnosticRun<'_> {
                                 AdmissionReferenceError::Resolution(_)
                                 | AdmissionReferenceError::Authored(_),
                             )
-                            | SecretDiagnosticError::InsideSecret => (
-                                rref.attribute_key_location(attr_name),
-                                DiagnosticSeverity::ERROR,
-                                error.to_string(),
-                            ),
+                            | SecretDiagnosticError::InsideSecret => {
+                                (DiagnosticSeverity::ERROR, error.to_string())
+                            }
                         },
                         TypeError::TypeMismatch { types } => {
                             let message = validation::reference_mismatch_message(
@@ -1089,19 +1082,29 @@ impl DiagnosticRun<'_> {
                                 attr_name,
                                 types,
                             );
-                            (
-                                rref.attribute_key_location(attr_name),
-                                DiagnosticSeverity::WARNING,
-                                message,
-                            )
+                            (DiagnosticSeverity::WARNING, message)
                         }
-                        _ => (
-                            rref.attribute_key_location(attr_name),
-                            DiagnosticSeverity::WARNING,
-                            error.to_string(),
-                        ),
+                        _ => (DiagnosticSeverity::WARNING, error.to_string()),
                     };
-                    let finding = carina_core::parser::Located::new(location.clone(), message);
+                    let located = match rref.locate_schema_diagnostic(diagnostic, |ordinary| {
+                        if let TypeError::Reference { error, .. } = ordinary.error()
+                            && let SecretDiagnosticError::Public(
+                                AdmissionReferenceError::Arithmetic(finding),
+                            ) = error.as_ref()
+                        {
+                            finding.location().clone()
+                        } else {
+                            rref.attribute_key_location(attr_name).clone()
+                        }
+                    }) {
+                        Ok(located) => located,
+                        Err(error) => {
+                            diagnostics.extend(render_analysis_invariant(doc, &error));
+                            continue;
+                        }
+                    };
+                    let finding =
+                        carina_core::parser::Located::new(located.location().clone(), message);
                     if let Some(diagnostic) =
                         render_merged(doc, &finding, severity, finding.detail().clone())
                     {

@@ -388,7 +388,11 @@ where
                 .ok_or_else(|| format!("missing fixture schema: {:?}", resource.id()))?;
             let mut local = admitted
                 .errors()
-                .chain(admitted.symbolic_errors().map(|(_, _, error)| error))
+                .chain(
+                    admitted
+                        .symbolic_errors()
+                        .map(|(_, _, diagnostic)| diagnostic.error()),
+                )
                 .map(|e| finding(e))
                 .collect::<Vec<_>>();
             findings.extend(local.iter().map(|error| Finding {

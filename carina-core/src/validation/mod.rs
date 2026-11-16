@@ -5500,7 +5500,14 @@ impl std::fmt::Display for ResourceAdmissionFinding {
         }
     }
 }
-impl std::error::Error for ResourceAdmissionFinding {}
+impl std::error::Error for ResourceAdmissionFinding {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.detail {
+            ResourceAdmissionDetail::AnalysisInvariant(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Default)]
 struct ResourceAdmissionFindings(Vec<ResourceAdmissionFinding>);
@@ -5623,7 +5630,15 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                     // The value-only validate_resources API keeps its existing
                     // unlocated projection. Full admission has the authored view.
                     let location = if context.admissions.is_some() {
-                        provenance.schema_diagnostic_location(diagnostic)?
+                        match provenance.schema_diagnostic_location(diagnostic) {
+                            Ok(location) => location,
+                            Err(error) => {
+                                context
+                                    .all_errors
+                                    .push(ResourceAdmissionFinding::analysis(error));
+                                continue;
+                            }
+                        }
                     } else {
                         None
                     };
@@ -6180,7 +6195,18 @@ fn resource_admission_report<
                     };
                     let attrs = resource.attributes();
                     let location = resource.diagnostic_label();
-                    for (attribute, path, error) in values.symbolic_errors() {
+                    for (attribute, path, diagnostic) in values.symbolic_errors() {
+                        let located = match resource
+                            .locate_schema_diagnostic(diagnostic, |_ordinary| {
+                                resource.attribute_key_location(attribute).clone()
+                            }) {
+                            Ok(located) => located,
+                            Err(error) => {
+                                all_errors.push(ResourceAdmissionFinding::analysis(error));
+                                continue;
+                            }
+                        };
+                        let error = diagnostic.error();
                         let start = all_errors.0.len();
                         match error {
                             TypeError::Reference { error, .. } => match error.as_ref() {
@@ -6237,11 +6263,7 @@ fn resource_admission_report<
                         for finding in &mut all_errors.0[start..] {
                             finding.detail = ResourceAdmissionDetail::Schema {
                                 resource: resource.id().clone(),
-                                diagnostic: Box::new(crate::schema::SchemaDiagnostic::from_value(
-                                    attribute,
-                                    path.clone(),
-                                    error.clone(),
-                                )),
+                                diagnostic: Box::new(diagnostic.clone()),
                                 mismatch: match error {
                                     TypeError::TypeMismatch { types } => {
                                         Some(Box::new(ReferenceMismatch::for_attribute(
@@ -6254,8 +6276,7 @@ fn resource_admission_report<
                                     _ => None,
                                 },
                             };
-                            finding.location =
-                                Some(resource.attribute_key_location(attribute).clone());
+                            finding.location = Some(located.location().clone());
                         }
                     }
                     attributes.insert((resource.id().clone(), resource.location().clone()), values);

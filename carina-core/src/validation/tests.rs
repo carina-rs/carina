@@ -182,6 +182,81 @@ fn duplicate_resource_id_keeps_the_second_unknown_key_owner() {
 }
 
 #[test]
+fn missing_authored_root_keeps_the_resource_invariant_and_other_findings() {
+    let catalog = LoadedProviderContext::empty_for_test();
+    let config = catalog.as_provider_context();
+    let source =
+        "provider mock {}\nmock.test.Thing { real = true }\nmock.test.Thing { typo = true }\n";
+    let parsed =
+        crate::parser::parse_file(source, std::path::Path::new("sibling.crn"), config).unwrap();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Thing").validate().unwrap(),
+    );
+    let loaded = crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, config);
+    let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let mut admissions = ResourceAdmissionValues::new();
+    for (index, resource) in tree.project_resources().enumerate() {
+        let names = if index == 0 {
+            vec!["missing", "real"]
+        } else {
+            vec!["typo"]
+        };
+        admissions.insert(
+            (resource.id().clone(), resource.location().clone()),
+            crate::schema::ResourceValueValidation::from_errors(
+                names
+                    .into_iter()
+                    .map(|name| TypeError::UnknownAttribute {
+                        name: name.into(),
+                        suggestion: None,
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    let judged = loaded.judged();
+    let inputs = judged.schema_validation_resources().unwrap();
+    let mut run: ConversionValidation = ConversionValidation::new(judged.report());
+    let findings = run
+        .walk_in(FindingSubject::Root, |coverage| {
+            resource_values_report(
+                inputs,
+                judged.schemas(),
+                &HashSet::from(["mock".into()]),
+                config,
+                Some(&admissions),
+                &mut Vec::new(),
+                ValueAdmission {
+                    report: judged.report(),
+                    coverage,
+                },
+            )
+        })
+        .expect("one missing authored root must not abort the report");
+    assert_eq!(findings.len(), 3, "{findings:#?}");
+    assert!(matches!(
+        findings[0].detail,
+        ResourceAdmissionDetail::AnalysisInvariant(_)
+    ));
+    let cause = std::error::Error::source(&findings[0]).expect("keep the invariant error chain");
+    let cause = cause
+        .downcast_ref::<crate::parser::AnalysisTreeError>()
+        .unwrap();
+    assert!(
+        matches!(cause.kind(), crate::parser::AnalysisTreeErrorKind::MissingElementProvenance { declaration, .. }
+        if declaration.span().start_line() == 2)
+    );
+    assert_eq!(findings[1].message(), "Unknown attribute 'real'");
+    assert_eq!(findings[2].message(), "Unknown attribute 'typo'");
+    for (finding, expected) in findings[1..].iter().zip(["real = true", "typo = true"]) {
+        let span = finding.location().unwrap().span();
+        assert_eq!(&source[span.start_byte()..span.end_byte()], expected);
+    }
+}
+
+#[test]
 fn round9_admission_locations_use_linear_resource_work() {
     fn run(count: usize) -> usize {
         let catalog = LoadedProviderContext::empty_for_test();

@@ -668,7 +668,7 @@ fn substituted_reference_retains_the_ordinary_assignment_callback() {
         let findings = error.findings.unwrap();
         let errors: Vec<_> = findings
             .symbolic_errors()
-            .map(|(_, error)| error.to_string())
+            .map(|(_, diagnostic)| diagnostic.error().to_string())
             .collect();
         assert_eq!(errors, ["Validation failed: ordinary validation finding"]);
     });

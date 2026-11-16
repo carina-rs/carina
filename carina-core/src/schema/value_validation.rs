@@ -421,42 +421,42 @@ pub enum SymbolicFindingOrigin {
 pub struct SymbolicFinding {
     origin: SymbolicFindingOrigin,
     path: LeafPath,
-    error: TypeError,
+    diagnostic: SchemaDiagnostic,
 }
 impl SymbolicFinding {
     fn ordinary(path: LeafPath, error: TypeError) -> Self {
         Self {
             origin: SymbolicFindingOrigin::Ordinary,
+            diagnostic: SchemaDiagnostic::from_value("", path.clone(), error),
             path,
-            error,
         }
     }
     fn authored_hook(path: LeafPath, error: TypeError) -> Self {
         Self {
             origin: SymbolicFindingOrigin::AuthoredHook,
+            diagnostic: SchemaDiagnostic::from_value("", path.clone(), error),
             path,
-            error,
         }
     }
     fn recovered_reference(path: LeafPath, error: TypeError) -> Self {
         Self {
             origin: SymbolicFindingOrigin::RecoveredReference,
+            diagnostic: SchemaDiagnostic::from_value("", path.clone(), error),
             path,
-            error,
         }
     }
     pub fn origin(&self) -> SymbolicFindingOrigin {
         self.origin
     }
-    pub fn diagnostic(&self) -> (&LeafPath, &TypeError) {
-        (&self.path, &self.error)
+    pub fn diagnostic(&self) -> (&LeafPath, &SchemaDiagnostic) {
+        (&self.path, &self.diagnostic)
     }
     /// A reference inside secret uses the ordinary protected type diagnostic.
     /// Execution retains the masked reference origin in the underlying error.
     pub fn diagnostic_message(&self) -> String {
         use crate::resource::SecretDiagnosticError;
         use crate::validation::admission::AdmissionReferenceError;
-        if let TypeError::Reference { error, .. } = &self.error {
+        if let TypeError::Reference { error, .. } = self.diagnostic.error() {
             if self.origin == SymbolicFindingOrigin::RecoveredReference
                 && matches!(self.path.1, super::LeafPathRendering::Redacted)
                 && let SecretDiagnosticError::Public(AdmissionReferenceError::Computed(
@@ -470,7 +470,7 @@ impl SymbolicFinding {
             }
             return error.to_string();
         }
-        self.error.to_string()
+        self.diagnostic.error().to_string()
     }
     /// Existing symbolic checks retain main's attribute-wide ownership. A
     /// restored reference owns its exact error, preserving other value errors.
@@ -486,7 +486,7 @@ impl InsideSecret for SymbolicFinding {
         Self {
             origin: self.origin,
             path: self.path.inside_secret(),
-            error: self.error.inside_secret(),
+            diagnostic: self.diagnostic.inside_secret(),
         }
     }
 }
@@ -538,6 +538,18 @@ pub struct ValueValidationFindings {
 }
 
 impl ValueValidationFindings {
+    pub(super) fn with_symbolic_attribute(mut self, root: &str) -> Self {
+        self.symbolic = self
+            .symbolic
+            .into_iter()
+            .map(|mut finding| {
+                finding.diagnostic = finding.diagnostic.at_attribute(root);
+                finding
+            })
+            .collect();
+        self
+    }
+
     pub(crate) fn rejected_by_claim(&self) -> bool {
         self.claim_effect == ClaimEffect::Rejected
     }
@@ -594,7 +606,7 @@ impl ValueValidationFindings {
             .collect()
     }
 
-    pub fn symbolic_errors(&self) -> impl Iterator<Item = (&LeafPath, &TypeError)> {
+    pub fn symbolic_errors(&self) -> impl Iterator<Item = (&LeafPath, &SchemaDiagnostic)> {
         self.symbolic.iter().map(SymbolicFinding::diagnostic)
     }
 
@@ -710,8 +722,9 @@ impl ResourceValueValidation {
                                 finding.origin,
                                 SymbolicFindingOrigin::AuthoredHook
                                     | SymbolicFindingOrigin::RecoveredReference
-                            ) && (error == &finding.error
-                                || *error == finding.error.clone().with_attribute(name))
+                            ) && (error == finding.diagnostic.error()
+                                || *error
+                                    == finding.diagnostic.error().clone().with_attribute(name))
                         }) {
                             SymbolicDiagnosticCoverage::Finding
                         } else if findings.iter().any(|finding| finding.covers_path()) {
@@ -791,12 +804,12 @@ impl ResourceValueValidation {
         self.attributes.shift_remove(name)
     }
 
-    pub fn symbolic_errors(&self) -> impl Iterator<Item = (&str, &LeafPath, &TypeError)> {
+    pub fn symbolic_errors(&self) -> impl Iterator<Item = (&str, &LeafPath, &SchemaDiagnostic)> {
         self.attributes.iter().flat_map(|(name, findings)| {
             findings
                 .symbolic
                 .iter()
-                .map(move |finding| (name.as_str(), &finding.path, &finding.error))
+                .map(move |finding| (name.as_str(), &finding.path, &finding.diagnostic))
         })
     }
 

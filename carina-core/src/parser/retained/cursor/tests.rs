@@ -2164,7 +2164,11 @@ fn review_seam_composition_computed_values_keep_main_checks() {
             assert!(
                 findings
                     .errors()
-                    .chain(findings.symbolic_errors().map(|(_, _, error)| error))
+                    .chain(
+                        findings
+                            .symbolic_errors()
+                            .map(|(_, _, diagnostic)| diagnostic.error())
+                    )
                     .any(|error| error.to_string().contains("expected String, got Int")),
                 "{expression}: {findings:?}"
             );
