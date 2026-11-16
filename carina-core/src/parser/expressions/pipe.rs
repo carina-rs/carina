@@ -75,7 +75,7 @@ pub(crate) fn apply_pipe_step(
                     && eval_args.iter().all(is_static_eval)
                 {
                     return evaluate_user_function_eval(&user_fn, eval_args, ctx, line)
-                        .map(EvalValue::from_value);
+                        .map(|evaluation| EvalValue::from_value(evaluation.into_value()));
                 }
                 let args = lower_function_arguments(eval_args, line)?;
                 record_deferred_function_type_check(

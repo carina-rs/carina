@@ -1789,3 +1789,41 @@ mod cursor_abort_tests {
 #[cfg(test)]
 #[path = "../../carina-core/tests/support/provider_text.rs"]
 mod provider_text_fixtures;
+
+#[cfg(test)]
+mod apply_input_error_tests {
+    use super::*;
+
+    #[test]
+    fn missing_saved_plan_reports_missing_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("saved.plan.json");
+        let error = classify_apply_input(&path).unwrap_err();
+        assert!(matches!(&error, error::AppError::ApplyInputNotFound { .. }));
+        let rendered = render_app_error(carina_cli::output_style::ColorMode::Plain, &error);
+        assert_eq!(rendered.exit_code, 1);
+        let expected: String = error::format_error_with_source_chain(&error)
+            .lines()
+            .map(|line| format!("Error: {line}\n"))
+            .collect();
+        assert_eq!(rendered.stderr, expected);
+    }
+}
+
+#[cfg(test)]
+mod plan_save_error_rendering_tests {
+    use super::*;
+    #[test]
+    fn retained_call_refusal_uses_project_apply_hint() {
+        let app_error = error::AppError::RetainedUserFunctionCall {
+            problem: carina_core::value::RetainedUserFunctionCallError,
+            project_dir: Path::new(".").to_path_buf(),
+        };
+        let rendered = render_app_error(carina_cli::output_style::ColorMode::Plain, &app_error);
+        assert_eq!(rendered.exit_code, 1);
+        assert_eq!(
+            rendered.stderr,
+            "Error: Cannot save plan: a user-defined function call still needs its declared types checked against values available only during apply. A saved plan cannot carry this call.\nError: Run `carina apply` directly on the project, without a saved plan.\n"
+        );
+    }
+}

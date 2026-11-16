@@ -5151,7 +5151,13 @@ fn build_plan_file<E>(
     directive_changes: Vec<PersistedDirectiveChange>,
     validated_plan: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
     checked: &carina_core::input_rules::InputCheckedPlan,
-) -> Result<PlanFile, PlanSaveError> {
+) -> Result<PlanFile, PlanSaveError>
+where
+    E: carina_core::parser::ExportParamLike<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+{
     let ctx = validated_plan.resources();
     let parsed = ctx.parsed();
     build_plan_file_contents(
@@ -5177,7 +5183,13 @@ pub(crate) fn build_plan_file_from_parts<E, R>(
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
     validated_config: &ValidatedConfig<R>,
-) -> Result<PlanFile, PlanSaveError> {
+) -> Result<PlanFile, PlanSaveError>
+where
+    E: carina_core::parser::ExportParamLike<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+{
     let directive_changes =
         persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
     build_plan_file_contents(
@@ -5206,7 +5218,13 @@ fn build_plan_file_contents<E>(
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
     checked: &carina_core::input_rules::InputCheckedPlan,
-) -> Result<CheckedPlanFileContents, PlanSaveError> {
+) -> Result<CheckedPlanFileContents, PlanSaveError>
+where
+    E: carina_core::parser::ExportParamLike<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >,
+{
     assert_eq!(
         ctx.data_sources.len(),
         parsed.data_sources.len(),
@@ -5235,6 +5253,13 @@ fn build_plan_file_contents<E>(
         .iter()
         .map(|resource| (resource.id.clone(), resource.as_inner().clone()))
         .collect();
+    // Exports are re-read from project source at apply rather than stored in
+    // the document. Admit their expressions in this same conversion owner.
+    for export in &parsed.export_params {
+        if let Some(value) = export.value() {
+            carina_core::value::redact_secrets_in_saved_expression(value)?;
+        }
+    }
     let provider_configs = SavedProviderConfigs::from(provider_configs).redact_secrets()?;
     #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (binding, attributes) in &ctx.upstream_snapshot {
@@ -5628,8 +5653,14 @@ fn build_plan_file_contents<E>(
 
 /// Preserve typed plan-save failures where available, while adding the CLI's
 /// display-only fallback guidance to serialization failures that need it.
-fn map_plan_save_error(error: PlanSaveError, flag: &str) -> AppError {
+fn map_plan_save_error(error: PlanSaveError, flag: &str, project_dir: &Path) -> AppError {
     match error {
+        PlanSaveError::Serialization(
+            carina_core::value::SerializationError::RetainedUserFunctionCall(problem),
+        ) => AppError::RetainedUserFunctionCall {
+            problem,
+            project_dir: project_dir.to_path_buf(),
+        },
         PlanSaveError::Serialization(
             carina_core::value::SerializationError::UnknownNotAllowed { reason, .. },
         ) => AppError::Config(format!(
@@ -6378,9 +6409,9 @@ pub(crate) async fn run_plan_using(
             &validated_plan,
             planned.checked(),
         )
-        .map_err(|error| map_plan_save_error(error, "--json"))?;
-        let json_str = serde_json::to_string_pretty(&plan_file)
-            .map_err(|e| format!("Failed to serialize plan: {}", e))?;
+        .map_err(|error| map_plan_save_error(error, "--json", path))?;
+        let json_str =
+            serde_json::to_string_pretty(&plan_file).map_err(AppError::from_plan_serialization)?;
         println!("{}", json_str);
         // JSON stdout is the versioned saved-plan document and now carries the
         // exact directive change set as machine-readable current-format data. Keep
@@ -6466,9 +6497,9 @@ pub(crate) async fn run_plan_using(
             &validated_plan,
             planned.checked(),
         )
-        .map_err(|error| map_plan_save_error(error, "--out"))?;
+        .map_err(|error| map_plan_save_error(error, "--out", path))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
-            .map_err(|e| format!("Failed to serialize plan: {}", e))?;
+            .map_err(AppError::from_plan_serialization)?;
         Some((pinned, json_out, *authored))
     } else {
         None
@@ -10427,7 +10458,7 @@ mod run_plan_out_tests {
             ) if provider == "aws"
         ));
         assert_eq!(
-            map_plan_save_error(error, "--out").to_string(),
+            map_plan_save_error(error, "--out", std::path::Path::new(".")).to_string(),
             "Cannot save plan: invalid saved-plan provider evidence: provider_artifacts is missing expected provider `aws`"
         );
     }
@@ -10444,6 +10475,7 @@ mod run_plan_out_tests {
         let error = map_plan_save_error(
             PlanSaveError::CompositionSourceIdentity(identity_error),
             "--out",
+            std::path::Path::new("."),
         );
         let AppError::CompositionSourceIdentity(identity_error) = error else {
             panic!("plan save flattened the composition identity error: {error:?}");
@@ -10663,6 +10695,24 @@ mod plan_serialization_error_tests {
     };
     use carina_core::value::{PersistedValue, SerializationError, redact_secrets_in_resource};
 
+    #[test]
+    fn retained_call_refusal_uses_a_typed_decision_for_both_saved_outputs() {
+        for flag in ["--out", "--json"] {
+            let error = SerializationError::RetainedUserFunctionCall(
+                carina_core::value::RetainedUserFunctionCallError,
+            );
+            let mapped = super::map_plan_save_error(error.into(), flag, std::path::Path::new("."));
+            assert!(matches!(
+                &mapped,
+                crate::error::AppError::RetainedUserFunctionCall { .. }
+            ));
+            assert_eq!(
+                mapped.to_string(),
+                "Cannot save plan: a user-defined function call still needs its declared types checked against values available only during apply. A saved plan cannot carry this call.\nRun `carina apply` directly on the project, without a saved plan."
+            );
+        }
+    }
+
     fn upstream_unknown() -> Value {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
             .resolve_root_for_test();
@@ -10682,7 +10732,7 @@ mod plan_serialization_error_tests {
             if matches!(reason.as_ref(), ApplyTimeUnknown::UpstreamExport { .. })),
             "{error:?}"
         );
-        let error = super::map_plan_save_error(error.into(), "--out");
+        let error = super::map_plan_save_error(error.into(), "--out", std::path::Path::new("."));
         let message = error.to_string();
         assert!(
             message.contains("Apply the upstream module(s) first"),
@@ -10724,7 +10774,9 @@ mod plan_serialization_error_tests {
                 assert!(!rendered.contains("token"), "{rendered}");
             }
             let error = match flag {
-                Some(flag) => super::map_plan_save_error(error.into(), flag),
+                Some(flag) => {
+                    super::map_plan_save_error(error.into(), flag, std::path::Path::new("."))
+                }
                 None => AppError::from(error),
             };
             assert!(

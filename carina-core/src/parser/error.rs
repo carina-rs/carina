@@ -222,7 +222,7 @@ pub enum ParseError {
         diagnostic: super::AuthoredExpressionDiagnostic,
     },
 
-    #[error("Invalid expression at line {line}: {error}")]
+    #[error("{}", format_evaluation_error(*line, error))]
     Evaluation {
         line: usize,
         error: Box<crate::resolver::ResolutionError>,
@@ -379,6 +379,13 @@ pub enum ParseError {
 
     #[error("User-defined function error: {0}")]
     UserFunctionError(String),
+}
+
+fn format_evaluation_error(line: usize, error: &crate::resolver::ResolutionError) -> String {
+    match error.authored_expression_line() {
+        Some(_) => error.to_string(),
+        None => format!("Invalid expression at line {line}: {error}"),
+    }
 }
 
 fn format_cyclic_let_binding(
@@ -621,13 +628,17 @@ impl ParseError {
     pub(crate) fn from_resolution(error: crate::resolver::ResolutionError, line: usize) -> Self {
         use crate::resolver::ResolutionError;
         match error {
+            ResolutionError::Expression { line, error } => Self::from_resolution(*error, line),
+            ResolutionError::InFile { path, error } => {
+                Self::from_resolution(*error, line).in_file(path)
+            }
             ResolutionError::Message(message) => Self::InvalidExpression { line, message },
             ResolutionError::UnavailableSecret(error) => Self::UnavailableSecret(error),
             ResolutionError::InsideSecret {} => Self::InsideSecret { line },
             error @ (ResolutionError::Knowledge(_)
             | ResolutionError::AdmissionConstraints(_)
             | ResolutionError::Context { .. }) => Self::Evaluation {
-                line,
+                line: error.authored_expression_line().unwrap_or(line),
                 error: Box::new(error),
             },
         }

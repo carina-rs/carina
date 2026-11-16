@@ -3,6 +3,7 @@
 //! Resolves `Value::ResourceRef` references by looking up bound resource attributes
 //! from both the DSL definition and current infrastructure state.
 
+use crate::function_evaluation::{FunctionCompletion, FunctionEvaluation, PreparedFunction};
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
@@ -30,6 +31,16 @@ pub enum ResolutionError {
     Knowledge(Box<crate::resource::knowledge::KnowledgeDiagnostic>),
     #[error(transparent)]
     AdmissionConstraints(Box<crate::validation::admission::AdmissionFindings>),
+    #[error("Invalid expression at line {line}: {error}")]
+    Expression {
+        line: usize,
+        error: Box<ResolutionError>,
+    },
+    #[error("{path}: {error}")]
+    InFile {
+        path: std::path::PathBuf,
+        error: Box<ResolutionError>,
+    },
     #[error("{context}{error}")]
     Context {
         context: String,
@@ -38,11 +49,30 @@ pub enum ResolutionError {
 }
 
 impl ResolutionError {
+    pub(crate) fn authored_expression_line(&self) -> Option<usize> {
+        match self {
+            Self::Expression { line, .. } => Some(*line),
+            Self::InFile { error, .. } | Self::Context { error, .. } => {
+                error.authored_expression_line()
+            }
+            Self::InsideSecret {}
+            | Self::UnavailableSecret(_)
+            | Self::Message(_)
+            | Self::Knowledge(_)
+            | Self::AdmissionConstraints(_) => None,
+        }
+    }
     pub(crate) fn with_context(self, context: impl Into<String>) -> Self {
         let context = context.into();
         match self {
             Self::Message(message) => Self::Message(format!("{context}{message}")),
-            error => Self::Context {
+            error @ (Self::InsideSecret {}
+            | Self::UnavailableSecret(_)
+            | Self::Knowledge(_)
+            | Self::AdmissionConstraints(_)
+            | Self::Expression { .. }
+            | Self::InFile { .. }
+            | Self::Context { .. }) => Self::Context {
                 context,
                 error: Box::new(error),
             },
@@ -68,7 +98,11 @@ impl crate::resource::InsideSecret for ResolutionError {
             Self::AdmissionConstraints(findings) => {
                 Self::AdmissionConstraints(Box::new((*findings).inside_secret()))
             }
-            _ => Self::InsideSecret {},
+            Self::Expression { error, .. } | Self::InFile { error, .. } => (*error).inside_secret(),
+            Self::InsideSecret {}
+            | Self::Message(_)
+            | Self::Knowledge(_)
+            | Self::Context { .. } => Self::InsideSecret {},
         }
     }
 }
@@ -99,17 +133,27 @@ impl From<crate::parser::ParseError> for ResolutionError {
         match error {
             crate::parser::ParseError::UnavailableSecret(error) => Self::UnavailableSecret(error),
             crate::parser::ParseError::InsideSecret { .. } => Self::InsideSecret {},
+            crate::parser::ParseError::InvalidExpression { line, message } => Self::Expression {
+                line,
+                error: Box::new(Self::Message(message)),
+            },
             crate::parser::ParseError::Evaluation { line, error } => {
-                error.with_context(format!("Invalid expression at line {line}: "))
+                match error.authored_expression_line() {
+                    Some(_) => *error,
+                    None => Self::Expression { line, error },
+                }
             }
             crate::parser::ParseError::Located { path, error } => match Self::from(*error) {
-                Self::Message(message) => Self::Message(format!("{}: {message}", path.display())),
-                error @ (Self::Knowledge(_)
+                error @ (Self::Message(_)
+                | Self::Knowledge(_)
                 | Self::AdmissionConstraints(_)
-                | Self::Context { .. }) => error.with_context(format!("{}: ", path.display())),
-                unavailable @ (Self::UnavailableSecret(_) | Self::InsideSecret { .. }) => {
-                    unavailable
-                }
+                | Self::Expression { .. }
+                | Self::InFile { .. }
+                | Self::Context { .. }) => Self::InFile {
+                    path,
+                    error: Box::new(error),
+                },
+                unavailable @ (Self::UnavailableSecret(_) | Self::InsideSecret {}) => unavailable,
             },
             crate::parser::ParseError::AtElement(finding) => {
                 let (location, error) = (*finding).into_parts();
@@ -119,7 +163,9 @@ impl From<crate::parser::ParseError> for ResolutionError {
                     }
                     error @ (Self::Knowledge(_)
                     | Self::AdmissionConstraints(_)
-                    | Self::Context { .. }) => {
+                    | Self::Context { .. }
+                    | Self::Expression { .. }
+                    | Self::InFile { .. }) => {
                         error.with_context(crate::parser::Located::new(location, "").to_string())
                     }
                     unavailable @ (Self::UnavailableSecret(_) | Self::InsideSecret { .. }) => {
@@ -127,7 +173,37 @@ impl From<crate::parser::ParseError> for ResolutionError {
                     }
                 }
             }
-            error => Self::Message(error.to_string()),
+            error @ (crate::parser::ParseError::RetainedEvidence(..)
+            | crate::parser::ParseError::SecretInConstraint { .. }
+            | crate::parser::ParseError::InterpolationInConstraintString { .. }
+            | crate::parser::ParseError::ValueWalk(..)
+            | crate::parser::ParseError::ProtectedFile(..)
+            | crate::parser::ParseError::Syntax(..)
+            | crate::parser::ParseError::InvalidAuthoredExpression { .. }
+            | crate::parser::ParseError::InvalidFloatLiteral { .. }
+            | crate::parser::ParseError::IntegerArithmetic { .. }
+            | crate::parser::ParseError::UnboundLoopRead { .. }
+            | crate::parser::ParseError::DeferredForBodyUnsupported(..)
+            | crate::parser::ParseError::DeferredForBodyTemplate { .. }
+            | crate::parser::ParseError::UnresolvedDeclarationType { .. }
+            | crate::parser::ParseError::UnknownFunction { .. }
+            | crate::parser::ParseError::ReservedResourceAttribute { .. }
+            | crate::parser::ParseError::SecretDerivedBackendAttribute { .. }
+            | crate::parser::ParseError::InterpolationNotAllowedInLiteralString {
+                ..
+            }
+            | crate::parser::ParseError::InvalidResourceIdentity { .. }
+            | crate::parser::ParseError::UndefinedVariable(..)
+            | crate::parser::ParseError::InvalidResourceType(..)
+            | crate::parser::ParseError::DuplicateModule(..)
+            | crate::parser::ParseError::DuplicateBinding { .. }
+            | crate::parser::ParseError::UndefinedIdentifier { .. }
+            | crate::parser::ParseError::UndefinedDeferredIterable { .. }
+            | crate::parser::ParseError::ModuleNotFound(..)
+            | crate::parser::ParseError::InternalError { .. }
+            | crate::parser::ParseError::RecursiveFunction(..)
+            | crate::parser::ParseError::CyclicLetBinding { .. }
+            | crate::parser::ParseError::UserFunctionError(..)) => Self::Message(error.to_string()),
         }
     }
 }
@@ -618,7 +694,9 @@ pub fn resolve_value_for_plan(
             | ResolutionError::InsideSecret { .. }
             | ResolutionError::Knowledge(_)
             | ResolutionError::AdmissionConstraints(_)
-            | ResolutionError::Context { .. },
+            | ResolutionError::Context { .. }
+            | ResolutionError::Expression { .. }
+            | ResolutionError::InFile { .. },
         ) => value.clone(),
     };
     Ok(if unresolved_upstream_bindings.is_empty() {
@@ -1177,10 +1255,7 @@ fn locate_user_function_error<B: BindingAddress>(
     function: &crate::parser::UserFunction<B>,
     error: crate::parser::ParseError,
 ) -> crate::parser::ParseError {
-    match &function.body.source_file {
-        Some(path) => error.in_file(path.clone()),
-        None => error,
-    }
+    error.in_file(function.body.location.file().path().to_path_buf())
 }
 
 fn user_function_runtime_error(
@@ -1192,31 +1267,47 @@ fn user_function_runtime_error(
 
 fn function_annotation_site<B: BindingAddress>(
     function: &crate::parser::UserFunction<B>,
-    kind: crate::validation::TypeResolutionDeclarationKind,
-    name: &str,
+    span: Option<crate::parser::SourceSpan>,
     context: String,
-) -> crate::validation::deferred_types::ProviderTypeCheckSite {
-    use crate::validation::deferred_types::ProviderTypeCheckSite;
-    let annotation = crate::validation::TypeResolutionContext::Declaration {
-        kind,
-        name: name.to_string(),
-    };
+) -> Option<crate::validation::deferred_types::ProviderTypeCheckSite> {
     let location = function
         .type_annotations
         .iter()
-        .find(|finding| finding.detail() == &annotation)
-        .expect("function annotation parser provenance")
+        .find(|finding| Some(finding.location().span()) == span)?
         .location();
-    ProviderTypeCheckSite::new(location.clone(), context)
+    Some(crate::validation::deferred_types::ProviderTypeCheckSite::new(location.clone(), context))
 }
 
-fn evaluate_runtime_user_function<B: BindingAddress>(
-    function: &crate::parser::UserFunction<B>,
-    args: &[crate::resource::FunctionArgument<crate::resource::ParserPlaceholder, B>],
-    bindings: &ResolvedBindings<crate::resource::ParserPlaceholder, B>,
+#[derive(Debug, thiserror::Error)]
+enum RuntimeFunctionError {
+    #[error(transparent)]
+    Resolution(#[from] ResolutionError),
+    #[error(transparent)]
+    Parser(#[from] crate::parser::ParseError),
+}
+impl RuntimeFunctionError {
+    fn into_resolution(self) -> ResolutionError {
+        match self {
+            Self::Resolution(error) => error,
+            Self::Parser(error) => error.into(),
+        }
+    }
+    fn into_parser(self, line: usize) -> crate::parser::ParseError {
+        match self {
+            Self::Parser(error) => error,
+            Self::Resolution(error) => crate::parser::ParseError::from_resolution(error, line),
+        }
+    }
+}
+
+fn evaluate_runtime_user_function<P: PlaceholderKind, B: BindingAddress>(
+    function: &std::sync::Arc<crate::parser::UserFunction<B>>,
+    functions: &std::sync::Arc<indexmap::IndexMap<String, crate::parser::UserFunction<B>>>,
+    args: &[crate::resource::FunctionArgument<P, B>],
+    bindings: &ResolvedBindings<P, B>,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     call_line: usize,
-) -> Result<Value<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError> {
+) -> Result<FunctionEvaluation<P, B>, RuntimeFunctionError> {
     let required = function
         .params
         .iter()
@@ -1230,155 +1321,135 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
                 function.name,
                 required,
                 function.params.len(),
-                args.len()
+                args.len(),
             ),
-        ));
+        )
+        .into());
     }
-
-    let provider_config = config;
-    let mut substitutions = HashMap::new();
+    let mut completion =
+        FunctionCompletion::new(function, functions, args.to_vec(), call_line.into());
+    if config.function_declaration_failed(function) {
+        return Ok(FunctionEvaluation::Retain(completion.retain()));
+    }
     for (index, parameter) in function.params.iter().enumerate() {
         let argument = match args.get(index) {
             Some(argument) => argument.clone(),
             None => crate::resource::FunctionArgument::from_value(
-                parameter
-                    .default
-                    .clone()
-                    .expect("required function arguments were checked"),
+                P::lower_function_expression(
+                    parameter
+                        .default
+                        .clone()
+                        .expect("required function arguments were checked"),
+                )
+                .map_err(|error| user_function_runtime_error(call_line, error.to_string()))?,
             ),
         };
-        let argument = argument
-            .try_map_value(|value| {
-                resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))
-            })
-            .map_err(|message| user_function_runtime_error(call_line, message))?;
-        if let Some(expected) = &parameter.param_type {
-            let resolved_parameter = crate::validation::resolve_parameter_type_for_check(
-                expected,
-                provider_config.catalog(),
-            )
-            .map_err(|message| {
-                user_function_runtime_error(
-                    call_line,
-                    format!(
-                        "function '{}': parameter '{}': {message}",
-                        function.name, parameter.name
-                    ),
-                )
-            })?;
-            if let (Some(resolved_parameter), Some(handle)) =
-                (resolved_parameter.as_ref(), argument.handle())
-            {
-                crate::validation::check_handle_sink(handle, resolved_parameter).map_err(
-                    |error| {
-                        user_function_runtime_error(
-                            call_line,
-                            format!(
-                                "function '{}': parameter '{}': {error}",
-                                function.name, parameter.name
-                            ),
-                        )
-                    },
-                )?;
-            } else if argument.pending_parameter().is_none()
-                && let Some(value) = argument.value()
-                && let Some(resolved_constraints) = (value)
-                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .ok()
-                    .and_then(|value| value.into_known().ok())
-            {
-                crate::validation::typecheck::TypecheckProviderContext::for_session(
-                    provider_config,
-                )
-                .check_resolved_constraints_at(
-                    &resolved_parameter
-                        .map_or_else(|| expected.clone(), |resolved| resolved.as_type_expr()),
-                    &resolved_constraints,
+        let argument = argument.try_map_value(|value| {
+            resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))
+        })?;
+        completion
+            .check_argument(
+                index,
+                argument,
+                crate::validation::typecheck::TypecheckProviderContext::for_session(config),
+                || {
                     function_annotation_site(
                         function,
-                        crate::validation::TypeResolutionDeclarationKind::FunctionParameter,
-                        &format!("{}' parameter '{}", function.name, parameter.name),
+                        parameter.type_span,
                         format!(
                             "function '{}' parameter '{}'",
                             function.name, parameter.name
                         ),
-                    ),
-                )
-                .map_err(|error| {
-                    user_function_runtime_error(
-                        call_line,
-                        format!(
-                            "function '{}': parameter '{}': {error}",
-                            function.name, parameter.name
-                        ),
                     )
-                })?;
-            }
-        }
-        substitutions.insert(parameter.name.clone(), argument);
-    }
-
-    for (name, expression, source_line) in &function.local_lets {
-        let substituted = crate::value_walk::substitute_function_parameters(
-            expression,
-            &substitutions,
-            *source_line,
-            crate::value_walk::RewritePosition::Value,
-        )
-        .map_err(|error| locate_user_function_error(function, error))?;
-        let resolved =
-            resolve_ref_value_inner(&substituted, bindings, RuntimeContext::Session(config))
-                .map_err(|message| user_function_runtime_error(*source_line, message))
-                .map_err(|error| locate_user_function_error(function, error))?;
-        substitutions.insert(
-            name.clone(),
-            crate::resource::FunctionArgument::from_value(resolved),
-        );
-    }
-
-    let substituted = crate::value_walk::substitute_function_parameters(
-        &function.body.value,
-        &substitutions,
-        function.body.source_line,
-        crate::value_walk::RewritePosition::Value,
-    )
-    .map_err(|error| locate_user_function_error(function, error))?;
-    let result = resolve_ref_value_inner(&substituted, bindings, RuntimeContext::Session(config))
-        .map_err(|message| user_function_runtime_error(function.body.source_line, message))
-        .map_err(|error| locate_user_function_error(function, error))?;
-    if let Some(expected) = &function.return_type
-        && let Some(resolved_constraints) = result
-            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-            .map(|proof| proof.into_classification())
-            .ok()
-            .and_then(|value| value.into_known().ok())
-    {
-        crate::validation::typecheck::TypecheckProviderContext::for_session(provider_config)
-            .check_resolved_constraints_at(
-                expected,
-                &resolved_constraints,
-                function_annotation_site(
-                    function,
-                    crate::validation::TypeResolutionDeclarationKind::FunctionReturn,
-                    &function.name,
-                    format!("function '{}' return value", function.name),
+                },
+                &format!(
+                    "function '{}' parameter '{}'",
+                    function.name, parameter.name
                 ),
             )
             .map_err(|error| {
                 user_function_runtime_error(
-                    function.body.source_line,
-                    format!("function '{}': return value: {error}", function.name),
+                    call_line,
+                    format!(
+                        "function '{}': parameter '{}': {error}",
+                        function.name, parameter.name
+                    ),
                 )
-            })
+            })?;
+    }
+    let mut completion = match completion.prepare() {
+        PreparedFunction::Ready { completion } => completion,
+        PreparedFunction::Retain(call) => return Ok(FunctionEvaluation::Retain(call)),
+    };
+    for (index, (_name, _expression, source_line)) in function.local_lets.iter().enumerate() {
+        let substituted = completion
+            .substitute_local_value(index)
+            .map_err(|error| locate_user_function_error(function, error))?;
+        let lowered = P::lower_function_expression(substituted).map_err(|error| {
+            locate_user_function_error(
+                function,
+                user_function_runtime_error(*source_line, error.to_string()),
+            )
+        })?;
+        let resolved = resolve_ref_value_inner(&lowered, bindings, RuntimeContext::Session(config))
+            .map_err(|error| {
+                locate_user_function_error(
+                    function,
+                    user_function_runtime_error(*source_line, error),
+                )
+            })?;
+        completion
+            .bind_local(
+                index,
+                crate::resource::FunctionArgument::from_value(resolved).into_parser_stage(),
+            )
             .map_err(|error| locate_user_function_error(function, error))?;
     }
-
-    Ok(result)
+    let substituted = completion
+        .substitute_body()
+        .map_err(|error| locate_user_function_error(function, error))?;
+    let lowered = P::lower_function_expression(substituted).map_err(|error| {
+        locate_user_function_error(
+            function,
+            user_function_runtime_error(function.body.source_line, error.to_string()),
+        )
+    })?;
+    let result = resolve_ref_value_inner(&lowered, bindings, RuntimeContext::Session(config))
+        .map_err(|error| {
+            locate_user_function_error(
+                function,
+                user_function_runtime_error(function.body.source_line, error),
+            )
+        })?;
+    completion
+        .finish(
+            result,
+            crate::validation::typecheck::TypecheckProviderContext::for_session(config),
+            || {
+                function_annotation_site(
+                    function,
+                    function.return_type_span,
+                    format!("function '{}' return value", function.name),
+                )
+            },
+        )
+        .map_err(|error| {
+            locate_user_function_error(
+                function,
+                user_function_runtime_error(
+                    function.body.source_line,
+                    format!("function '{}': return value: {error}", function.name),
+                ),
+            )
+            .into()
+        })
 }
 
 pub(crate) fn evaluate_module_resolved_user_function(
-    function: &crate::parser::UserFunction<AbsoluteBindingAddress>,
+    function: &std::sync::Arc<crate::parser::UserFunction<AbsoluteBindingAddress>>,
+    functions: &std::sync::Arc<
+        indexmap::IndexMap<String, crate::parser::UserFunction<AbsoluteBindingAddress>>,
+    >,
     arguments: &[crate::resource::FunctionArgument<
         crate::resource::ParserPlaceholder,
         AbsoluteBindingAddress,
@@ -1386,19 +1457,21 @@ pub(crate) fn evaluate_module_resolved_user_function(
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     call_line: usize,
 ) -> Result<
-    Value<crate::resource::ParserPlaceholder, AbsoluteBindingAddress>,
+    FunctionEvaluation<crate::resource::ParserPlaceholder, AbsoluteBindingAddress>,
     crate::parser::ParseError,
 > {
     evaluate_runtime_user_function(
         function,
+        functions,
         arguments,
         &ResolvedBindings::default(),
         config,
         call_line,
     )
+    .map_err(|error| error.into_parser(call_line))
 }
 
-fn parser_stage_function_arguments<P: PlaceholderKind, B: BindingAddress>(
+fn parser_stage_builtin_arguments<P: PlaceholderKind, B: BindingAddress>(
     args: &[crate::resource::FunctionArgument<P, B>],
 ) -> Option<Vec<crate::resource::FunctionArgument<crate::resource::ParserPlaceholder, B>>> {
     let expanded = args
@@ -1544,7 +1617,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             // supposed to surface that as a parse error, so treat any
             // closure here as a resolver-level invariant break.
             use crate::eval_value::EvalValue;
-            let Some(parser_args) = parser_stage_function_arguments(&resolved_args) else {
+            let Some(parser_args) = parser_stage_builtin_arguments(&resolved_args) else {
                 return Ok(Value::Deferred(DeferredValue::FunctionCall {
                     name: *name,
                     args: resolved_args,
@@ -1585,53 +1658,16 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 RuntimeContext::Projection(_context) => return Ok(value.clone()),
             };
 
-            // Declaration resolution already owns this failure. Preserve the
-            // call just as the parser's pending-function path does.
-            if session.function_declaration_failed(function) {
-                return Ok(value.clone());
-            }
-
-            let resolved_args = resolve_function_arguments(args, bindings, config)?;
-            if !resolved_args.iter().all(|argument| {
-                argument.handle().is_some()
-                    || argument.value().is_some_and(|value| {
-                        value
-                            .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
-                                bindings,
-                            ))
-                            .map(|proof| proof.into_classification())
-                            .is_ok_and(|knowledge| knowledge.into_known().is_ok())
-                    })
-            }) {
-                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                    function: function.clone(),
-                    functions: functions.clone(),
-                    args: resolved_args,
-                    source_line: *source_line,
-                }));
-            }
-
-            let Some(parser_args) = parser_stage_function_arguments(&resolved_args) else {
-                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                    function: function.clone(),
-                    functions: functions.clone(),
-                    args: resolved_args,
-                    source_line: *source_line,
-                }));
-            };
-            let evaluated = evaluate_runtime_user_function(
+            evaluate_runtime_user_function(
                 function,
-                &parser_args,
-                &ResolvedBindings::default(),
+                functions,
+                args,
+                bindings,
                 session,
                 source_line.get().unwrap_or(function.body.source_line),
             )
-            .map_err(ResolutionError::from)?;
-            let evaluated = evaluated
-                .into_expanded()
-                .map(Value::into_placeholder_type)
-                .map_err(|error| error.to_string())?;
-            resolve_ref_value_inner(&evaluated, bindings, config)
+            .map(FunctionEvaluation::into_value)
+            .map_err(RuntimeFunctionError::into_resolution)
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let access_expression = crate::value::format_value(value);
@@ -4966,6 +5002,8 @@ mod runtime_provider_type_tests {
                     crate::resource::AuthoredConcreteValue::String("bad".into()),
                 ),
             )];
+            let function = std::sync::Arc::new(function);
+            let functions = std::sync::Arc::new(parsed.user_functions.clone());
             let bindings = ResolvedBindings::for_authored_validation(&parsed);
             let loaded = ProviderContext {
                 custom_types: ProviderCustomTypes::loaded(
@@ -4985,7 +5023,9 @@ mod runtime_provider_type_tests {
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&loaded, |session| {
-                    evaluate_runtime_user_function(&function, &arguments, &bindings, session, 8)
+                    evaluate_runtime_user_function(
+                        &function, &functions, &arguments, &bindings, session, 8,
+                    )
                 })
                 .unwrap_err();
             assert!(error.to_string().contains("rejected by ready"), "{error}");
@@ -4997,16 +5037,27 @@ mod runtime_provider_type_tests {
             };
             let error =
                 crate::validation::deferred_types::with_session_for_test(&partial, |session| {
-                    evaluate_runtime_user_function(&function, &arguments, &bindings, session, 8)
+                    evaluate_runtime_user_function(
+                        &function, &functions, &arguments, &bindings, session, 8,
+                    )
                 })
                 .unwrap_err();
             assert!(error.to_string().contains("rejected by ready"), "{error}");
 
             let result = crate::validation::deferred_types::TypeCheckSession::run(
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-                |unloaded| {
-                    evaluate_runtime_user_function(&function, &arguments, &bindings, unloaded, 8)
-                        .unwrap();
+                |unloaded| match evaluate_runtime_user_function(
+                    &function, &functions, &arguments, &bindings, unloaded, 8,
+                )
+                .unwrap()
+                {
+                    FunctionEvaluation::Inline(value) => {
+                        panic!("unsettled provider check inlined: {:?}", value.into_value())
+                    }
+                    FunctionEvaluation::Retain(call) => assert!(matches!(
+                        call.into_value(),
+                        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+                    )),
                 },
             );
             assert!(
@@ -5015,5 +5066,321 @@ mod runtime_provider_type_tests {
                 result.diagnostics()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod declared_check_regressions {
+    use super::*;
+    use crate::parser::{ProviderContext, parse_file};
+    use crate::resource::{AuthoredValue, FunctionArgument};
+
+    #[test]
+    fn declared_checks_runtime_annotation_predicate_matrix() {
+        use crate::parser::TypeExpr;
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (annotation, pending) in [
+            (TypeExpr::String, false),
+            (TypeExpr::Bool, false),
+            (TypeExpr::Int, false),
+            (TypeExpr::Float, false),
+            (TypeExpr::Duration, false),
+            (TypeExpr::List(Box::new(TypeExpr::String)), false),
+            (TypeExpr::Map(Box::new(TypeExpr::Int)), false),
+            (
+                TypeExpr::Struct {
+                    fields: vec![("x".into(), TypeExpr::String)],
+                },
+                false,
+            ),
+            (TypeExpr::StringLiteral("allowed".into()), true),
+            (
+                TypeExpr::List(Box::new(TypeExpr::StringLiteral("allowed".into()))),
+                true,
+            ),
+            (
+                TypeExpr::Map(Box::new(TypeExpr::StringLiteral("allowed".into()))),
+                true,
+            ),
+            (
+                TypeExpr::Union(vec![
+                    TypeExpr::String,
+                    TypeExpr::StringLiteral("allowed".into()),
+                ]),
+                true,
+            ),
+            (
+                TypeExpr::Struct {
+                    fields: vec![("x".into(), TypeExpr::StringLiteral("allowed".into()))],
+                },
+                true,
+            ),
+        ] {
+            for parameter in [false, true] {
+                let source = if parameter {
+                    format!("fn g(x: {annotation}) {{ x }}")
+                } else {
+                    format!("fn g(x): {annotation} {{ x }}")
+                };
+                let parsed =
+                    parse_file(&source, std::path::Path::new("functions.crn"), &config).unwrap();
+                let function = parsed.user_functions["g"].clone();
+                let args = [FunctionArgument::from_value(AuthoredValue::resource_ref(
+                    "src",
+                    "emitted",
+                    vec![],
+                ))];
+                let result =
+                    crate::validation::deferred_types::with_session_for_test(&config, |session| {
+                        evaluate_runtime_user_function(
+                            &std::sync::Arc::new(function.clone()),
+                            &std::sync::Arc::new(parsed.user_functions.clone()),
+                            &args,
+                            &ResolvedBindings::default(),
+                            session,
+                            1,
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(
+                    matches!(result, FunctionEvaluation::Retain(_)),
+                    pending,
+                    "{annotation:?}, parameter={parameter}: {result:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn declared_checks_runtime_arguments_locals_and_wrappers_retain_outer() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (body, nested_argument) in [
+            ("fn outer(x) { let unused = checked(x)\n 'const' }", false),
+            ("fn outer(x) { 'const' }", true),
+            ("fn outer(x) { checked(x) }", false),
+        ] {
+            let source = format!("fn checked(x: 'allowed') {{ x }}\n{body}");
+            let parsed =
+                parse_file(&source, std::path::Path::new("functions.crn"), &config).unwrap();
+            let unknown =
+                FunctionArgument::from_value(AuthoredValue::resource_ref("src", "emitted", vec![]));
+            let argument = if nested_argument {
+                FunctionArgument::from_value(AuthoredValue::Deferred(
+                    DeferredValue::ResolvedFunctionCall {
+                        function: std::sync::Arc::new(parsed.user_functions["checked"].clone()),
+                        functions: std::sync::Arc::new(parsed.user_functions.clone()),
+                        args: vec![unknown],
+                        source_line: 1.into(),
+                    },
+                ))
+            } else {
+                unknown
+            };
+            let result =
+                crate::validation::deferred_types::with_session_for_test(&config, |session| {
+                    evaluate_runtime_user_function(
+                        &std::sync::Arc::new(parsed.user_functions["outer"].clone()),
+                        &std::sync::Arc::new(parsed.user_functions.clone()),
+                        &[argument],
+                        &ResolvedBindings::default(),
+                        session,
+                        2,
+                    )
+                })
+                .unwrap();
+            let call = match result {
+                FunctionEvaluation::Inline(value) => panic!("{body}: {:?}", value.into_value()),
+                FunctionEvaluation::Retain(call) => call.into_value(),
+            };
+            assert!(
+                matches!(call, AuthoredValue::Deferred(DeferredValue::ResolvedFunctionCall { ref function, .. }) if function.name == "outer"),
+                "{body}: {call:?}"
+            );
+        }
+    }
+    #[test]
+    fn declared_checks_runtime_loop_argument_lift_preserves_placeholder() {
+        let arguments: Vec<
+            FunctionArgument<crate::resource::LoopSlot, crate::resource::RelativeBindingName>,
+        > = vec![FunctionArgument::from_value(Value::Deferred(
+            DeferredValue::Placeholder(crate::resource::LoopSlot::Value),
+        ))];
+        let lifted: Vec<_> = arguments
+            .into_iter()
+            .map(crate::resource::FunctionArgument::into_parser_stage)
+            .collect();
+        assert!(matches!(
+            lifted[0].value(),
+            Some(AuthoredValue::Deferred(DeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::Loop(crate::resource::LoopSlot::Value)
+            )))
+        ));
+    }
+    #[test]
+    fn declared_checks_runtime_pending_parameter_and_return_retain() {
+        for source in ["fn g(x: 'allowed') { 'const' }", "fn g(x): 'allowed' { x }"] {
+            let parsed = parse_file(
+                source,
+                std::path::Path::new("functions.crn"),
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            let function = &parsed.user_functions["g"];
+            let args = [FunctionArgument::from_value(AuthoredValue::resource_ref(
+                "src",
+                "emitted",
+                vec![],
+            ))];
+            let result = crate::validation::deferred_types::with_session_for_test(
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                |session| {
+                    evaluate_runtime_user_function(
+                        &std::sync::Arc::new(function.clone()),
+                        &std::sync::Arc::new(parsed.user_functions.clone()),
+                        &args,
+                        &ResolvedBindings::default(),
+                        session,
+                        1,
+                    )
+                },
+            )
+            .unwrap();
+            assert!(
+                matches!(result, FunctionEvaluation::Retain(_)),
+                "{result:?}"
+            );
+        }
+    }
+    #[test]
+    fn runtime_primitive_missing_span_is_not_required() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = parse_file(
+            "fn g(x: String): String { x }",
+            std::path::Path::new("functions.crn"),
+            &config,
+        )
+        .unwrap();
+        let mut function = parsed.user_functions["g"].clone();
+        function.type_annotations.clear();
+        function.params[0].type_span = None;
+        function.return_type_span = None;
+        let args = [FunctionArgument::from_value(AuthoredValue::resource_ref(
+            "src",
+            "emitted",
+            vec![],
+        ))];
+        let result = crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            evaluate_runtime_user_function(
+                &std::sync::Arc::new(function),
+                &std::sync::Arc::new(parsed.user_functions),
+                &args,
+                &ResolvedBindings::default(),
+                session,
+                1,
+            )
+        })
+        .unwrap();
+        assert!(matches!(result, FunctionEvaluation::Inline(_)));
+    }
+}
+
+#[cfg(test)]
+mod deferral_regressions {
+    use super::*;
+    #[test]
+    fn repeated_runtime_deferral_reports_once() {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "fn f(x: test.Name): String { 'allowed' }",
+            std::path::Path::new("functions.crn"),
+            &context,
+        )
+        .unwrap();
+        let function = std::sync::Arc::new(parsed.user_functions["f"].clone());
+        let functions = std::sync::Arc::new(parsed.user_functions.clone());
+        let args = [crate::resource::FunctionArgument::from_value(
+            crate::resource::AuthoredValue::Concrete(ConcreteValue::String("allowed".into())),
+        )];
+        let settled =
+            crate::validation::deferred_types::TypeCheckSession::run(&context, |session| {
+                for _pass in 0..5 {
+                    let evaluated = evaluate_runtime_user_function(
+                        &function,
+                        &functions,
+                        &args,
+                        &ResolvedBindings::default(),
+                        session,
+                        1,
+                    )
+                    .unwrap();
+                    eprintln!("review2 unloaded runtime result={evaluated:?}");
+                }
+            });
+        assert_eq!(
+            settled.diagnostics().len(),
+            1,
+            "repeated resolves must deduplicate declaration deferral"
+        );
+    }
+    #[test]
+    fn resolution_errors_keep_the_original_authored_expression() {
+        let plain = RuntimeFunctionError::Resolution(ResolutionError::from(
+            "upper(): invalid fixture argument",
+        ))
+        .into_parser(2);
+        assert!(matches!(
+            plain,
+            crate::parser::ParseError::InvalidExpression { line: 2, .. }
+        ));
+        let nested = RuntimeFunctionError::Resolution(ResolutionError::from(
+            user_function_runtime_error(4, "inner fixture failure"),
+        ))
+        .into_parser(9);
+        assert!(matches!(
+            nested,
+            crate::parser::ParseError::InvalidExpression { line: 4, .. }
+        ));
+        assert_eq!(
+            nested.to_string(),
+            "Invalid expression at line 4: inner fixture failure"
+        );
+    }
+}
+
+#[cfg(test)]
+mod runtime_context_measure {
+    use super::*;
+    #[test]
+    fn runtime_return_error_context() {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "fn f(x): 'allowed' { x }",
+            std::path::Path::new("functions.crn"),
+            &context,
+        )
+        .unwrap();
+        let function = std::sync::Arc::new(parsed.user_functions["f"].clone());
+        let functions = std::sync::Arc::new(parsed.user_functions);
+        let args = [crate::resource::FunctionArgument::from_value(
+            crate::resource::AuthoredValue::Concrete(ConcreteValue::String("bad".into())),
+        )];
+        let error = crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            evaluate_runtime_user_function(
+                &function,
+                &functions,
+                &args,
+                &ResolvedBindings::default(),
+                session,
+                2,
+            )
+        })
+        .unwrap_err()
+        .to_string();
+        eprintln!("review2 runtime return context: {error}");
+        assert!(
+            error.starts_with(
+                "functions.crn: Invalid expression at line 1: function 'f': return value:"
+            ),
+            "{error}"
+        );
     }
 }

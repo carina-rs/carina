@@ -539,6 +539,11 @@ impl ValidateReport {
             Outcome::Failure(_) => 1,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn diagnostic_output_for_test(&self) -> serde_json::Value {
+        serde_json::to_value(self.output()).unwrap()
+    }
     fn render_json(&self, stdout: &mut impl Write) -> io::Result<()> {
         serde_json::to_writer_pretty(&mut *stdout, &self.output())?;
         writeln!(stdout)

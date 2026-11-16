@@ -3525,6 +3525,23 @@ impl<P: ValueKind, B: BindingAddress> FunctionArgument<P, B> {
         Ok(Self { operand })
     }
 
+    pub(crate) fn into_parser_stage(self) -> FunctionArgument<ParserPlaceholder, B>
+    where
+        P: PlaceholderKind,
+    {
+        let operand = self
+            .operand
+            .try_map_stage(&mut |value| {
+                value.try_map_placeholder(&mut |placeholder| {
+                    Ok::<_, std::convert::Infallible>(Value::Deferred(DeferredValue::Placeholder(
+                        placeholder.into_preview(),
+                    )))
+                })
+            })
+            .unwrap_or_else(|never| match never {});
+        FunctionArgument { operand }
+    }
+
     pub(crate) fn try_into_expanded(self) -> Result<FunctionArgument<NoPlaceholder, B>, ()> {
         let mut reject = |_placeholder| Err(());
         let operand = self
@@ -4486,10 +4503,9 @@ where
                 }
                 .serialize(serializer)
             }
-            Self::ResolvedFunctionCall { function, .. } => Err(serde::ser::Error::custom(format!(
-                "deferred user-function call '{}' cannot be serialized before evaluation",
-                function.name
-            ))),
+            Self::ResolvedFunctionCall { .. } => Err(serde::ser::Error::custom(
+                crate::value::RetainedUserFunctionCallError,
+            )),
             Self::Access(access) => SerializableDeferredValue::Access {
                 base: access.base(),
                 step: access.step(),
@@ -6410,6 +6426,11 @@ mod evaluable_leaf {
     pub trait Sealed {
         fn substitution_kind(&self) -> super::knowledge::SubstitutionKind;
         fn into_preview(self) -> super::ParserPlaceholder;
+        fn lower_function_expression<B: super::BindingAddress>(
+            value: super::Value<super::ParserPlaceholder, B>,
+        ) -> Result<super::Value<Self, B>, super::LeftoverPlaceholder>
+        where
+            Self: super::PlaceholderKind;
     }
 }
 

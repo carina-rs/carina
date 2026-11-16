@@ -1827,6 +1827,8 @@ impl DeferredForExpansionError {
                 error,
             },
             error @ (crate::resolver::ResolutionError::Context { .. }
+            | crate::resolver::ResolutionError::Expression { .. }
+            | crate::resolver::ResolutionError::InFile { .. }
             | crate::resolver::ResolutionError::AdmissionConstraints(_)) => Self::Evaluation {
                 line,
                 expression,

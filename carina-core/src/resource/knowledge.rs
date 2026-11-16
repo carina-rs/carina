@@ -2601,6 +2601,12 @@ impl SubstitutionKind {
     }
 }
 impl super::evaluable_leaf::Sealed for NoPlaceholder {
+    fn lower_function_expression<B: BindingAddress>(
+        value: Value<ParserPlaceholder, B>,
+    ) -> Result<Value<Self, B>, super::LeftoverPlaceholder> {
+        value.into_expanded()
+    }
+
     fn into_preview(self) -> ParserPlaceholder {
         match self {}
     }
@@ -2610,6 +2616,12 @@ impl super::evaluable_leaf::Sealed for NoPlaceholder {
     }
 }
 impl super::evaluable_leaf::Sealed for ParserPlaceholder {
+    fn lower_function_expression<B: BindingAddress>(
+        value: Value<ParserPlaceholder, B>,
+    ) -> Result<Value<Self, B>, super::LeftoverPlaceholder> {
+        Ok(value)
+    }
+
     fn into_preview(self) -> ParserPlaceholder {
         self
     }
@@ -2627,6 +2639,12 @@ impl super::evaluable_leaf::Sealed for ParserPlaceholder {
     }
 }
 impl super::evaluable_leaf::Sealed for super::LoopSlot {
+    fn lower_function_expression<B: BindingAddress>(
+        value: Value<ParserPlaceholder, B>,
+    ) -> Result<Value<Self, B>, super::LeftoverPlaceholder> {
+        value.into_loop_template()
+    }
+
     fn into_preview(self) -> ParserPlaceholder {
         ParserPlaceholder::Loop(self)
     }
@@ -3175,11 +3193,43 @@ fn classify_value<
         }) => {
             let mut inputs = Vec::new();
             for (i, arg) in args.iter().enumerate() {
-                if arg.value().is_some() || arg.pending_parameter().is_some() {
-                    inputs.push(Input::value(
-                        OperandStep::Argument(i),
-                        classify(arg.walker_value(), cx, pos)?,
-                    ));
+                let argument = match arg.handle() {
+                    Some(handle) => match handle.kind() {
+                        crate::eval_value::UnexpandedStructuralHandleKind::ModuleParameter
+                        | crate::eval_value::UnexpandedStructuralHandleKind::FunctionParameter => {
+                            Some(classify(arg.walker_value(), cx, pos)?)
+                        }
+                        crate::eval_value::UnexpandedStructuralHandleKind::Resource(_)
+                        | crate::eval_value::UnexpandedStructuralHandleKind::For
+                        | crate::eval_value::UnexpandedStructuralHandleKind::If
+                        | crate::eval_value::UnexpandedStructuralHandleKind::Use
+                        | crate::eval_value::UnexpandedStructuralHandleKind::Module
+                        | crate::eval_value::UnexpandedStructuralHandleKind::Wait
+                        | crate::eval_value::UnexpandedStructuralHandleKind::UpstreamState
+                        | crate::eval_value::UnexpandedStructuralHandleKind::Provider => {
+                            match cx.inputs {
+                                kernel::Inputs::Validation => None,
+                                kernel::Inputs::Plan(bindings) => {
+                                    if bindings.binding_is_fully_definitive(
+                                        handle.canonical_binding().as_str(),
+                                    ) {
+                                        None
+                                    } else {
+                                        Some(pending(
+                                            arg.walker_value(),
+                                            WaitOn::Binding(handle.canonical_binding().clone()),
+                                            Phase::Apply,
+                                            PendingReason::BindingSelection,
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    None => Some(classify(arg.walker_value(), cx, pos)?),
+                };
+                if let Some(argument) = argument {
+                    inputs.push(Input::value(OperandStep::Argument(i), argument));
                 }
             }
             let analysis = classify_function(function, cx, pos)?;

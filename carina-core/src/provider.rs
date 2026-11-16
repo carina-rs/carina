@@ -6924,6 +6924,7 @@ pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::Pla
                 | SerializationError::UnresolvedIntegerArithmetic { .. }
                 | SerializationError::UnresolvedInterpolation { .. }
                 | SerializationError::UnresolvedFunctionCall { .. }
+                | SerializationError::RetainedUserFunctionCall(_)
                 | SerializationError::UnresolvedAccess { .. }
                 | SerializationError::Knowledge { .. }
                 | SerializationError::SecretNotAllowed { .. }

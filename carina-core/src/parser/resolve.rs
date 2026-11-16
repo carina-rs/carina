@@ -115,24 +115,25 @@ fn provider_analysis_failure(
 
 trait ProviderAttributeBindingPhase: BindingAddress {
     fn evaluate_resolved_user_function(
-        function: &super::UserFunction<Self>,
+        function: &std::sync::Arc<super::UserFunction<Self>>,
         functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
         call_line: usize,
-    ) -> Result<GenericValue<ParserPlaceholder, Self>, ParseError>;
+    ) -> Result<crate::function_evaluation::FunctionEvaluation<ParserPlaceholder, Self>, ParseError>;
 }
 
 impl ProviderAttributeBindingPhase for RelativeBindingName {
     fn evaluate_resolved_user_function(
-        function: &super::UserFunction<Self>,
+        function: &std::sync::Arc<super::UserFunction<Self>>,
         functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
         call_line: usize,
-    ) -> Result<GenericValue<ParserPlaceholder, Self>, ParseError> {
+    ) -> Result<crate::function_evaluation::FunctionEvaluation<ParserPlaceholder, Self>, ParseError>
+    {
         super::functions::evaluate_resolved_user_function(
             function, functions, arguments, config, session, call_line,
         )
@@ -141,24 +142,26 @@ impl ProviderAttributeBindingPhase for RelativeBindingName {
 
 impl ProviderAttributeBindingPhase for AbsoluteBindingAddress {
     fn evaluate_resolved_user_function(
-        function: &super::UserFunction<Self>,
+        function: &std::sync::Arc<super::UserFunction<Self>>,
         functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         _config: &ProviderContext,
         session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
         call_line: usize,
-    ) -> Result<GenericValue<ParserPlaceholder, Self>, ParseError> {
+    ) -> Result<crate::function_evaluation::FunctionEvaluation<ParserPlaceholder, Self>, ParseError>
+    {
         match session {
             Some(session) => crate::resolver::evaluate_module_resolved_user_function(
-                function, arguments, session, call_line,
+                function, functions, arguments, session, call_line,
             ),
-            None => Ok(GenericValue::Deferred(
-                DeferredValue::ResolvedFunctionCall {
-                    function: std::sync::Arc::new(function.clone()),
-                    functions: std::sync::Arc::clone(functions),
-                    args: arguments.to_vec(),
-                    source_line: call_line.into(),
-                },
+            None => Ok(crate::function_evaluation::FunctionEvaluation::Retain(
+                crate::function_evaluation::FunctionCompletion::new(
+                    function,
+                    functions,
+                    arguments.to_vec(),
+                    call_line.into(),
+                )
+                .retain(),
             )),
         }
     }
@@ -863,6 +866,32 @@ mod saved_provider_config_secret_tests {
                     if matches!(*error, ProviderConfigValueError::Deferred { .. })
             ));
         }
+    }
+
+    #[test]
+    fn retained_provider_config_call_is_refused_before_serde() {
+        let mut config = provider("unused");
+        config.attributes = [(
+            "token",
+            crate::value::retained_call_snapshot_tests::retained_call(),
+        )]
+        .into_iter()
+        .collect();
+        assert!(matches!(
+            ResolvedProviderConfigs::validate_known(std::slice::from_ref(&config)),
+            Err(ProviderConfigInvariantError::UnresolvedAttribute { .. })
+        ));
+        let error = SavedProviderConfigs(vec![config])
+            .redact_secrets()
+            .expect_err("retained provider config must not enter the saved document");
+        assert!(matches!(
+            &error,
+            crate::value::SerializationError::RetainedUserFunctionCall(_)
+        ));
+        assert_eq!(
+            error.to_string(),
+            crate::value::RetainedUserFunctionCallError.to_string()
+        );
     }
 
     fn snapshot_configs(configs: &SavedProviderConfigs<NoPlaceholder>) -> SavedProviderConfigs {
@@ -2519,7 +2548,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             if resolution.retains_failed_calls() && evaluated.is_err() {
                 return Ok(value.clone());
             }
-            evaluated
+            evaluated.map(crate::function_evaluation::FunctionEvaluation::into_value)
         }
         GenericValue::Deferred(DeferredValue::FunctionCall {
             name,

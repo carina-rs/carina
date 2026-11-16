@@ -1109,3 +1109,154 @@ fn shared_function_locals_keep_their_operand_and_apply_timing() {
         assert_eq!(site.operand, [OperandStep::FunctionLocal(0)]);
     }
 }
+
+#[test]
+fn declared_checks_retained_handle_contributes_apply_phase() {
+    let parsed = crate::parser::parse_file(
+        "fn f(r: test.Thing): 'allowed' { r.emitted }\nlet src = test.Thing { name = 'src' }\ntest.Sink { value = f(src) }",
+        std::path::Path::new("functions.crn"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
+    let call = &parsed.resources.last().unwrap().attributes["value"];
+    assert!(matches!(
+        call,
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
+    let bindings = ResolvedBindings::default();
+    let plan = call.knowledge(&KnowledgeContext::plan(&bindings)).unwrap();
+    let sites: Vec<_> = plan.sites().collect();
+    assert!(
+        sites.iter().all(|site| site.phase() == Phase::Apply),
+        "{sites:?}"
+    );
+    assert!(PlanResolved::try_from(plan).is_ok());
+    let validation = call.knowledge(&KnowledgeContext::validation()).unwrap();
+    assert!(validation.sites().all(|site| site.phase() == Phase::Plan));
+}
+
+#[test]
+fn declared_checks_shared_handle_callee_uses_each_binding_phase_and_known_calls_reduce() {
+    use crate::binding_index::{BindingCompleteness, BindingValueSource};
+    use crate::resource::{FunctionArgument, absolute_binding_address_for_test};
+    let mut config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    config
+        .resource_types
+        .insert(("test".into(), "Thing".into()));
+    let parsed = crate::parser::parse_file(
+        "fn f(r: test.Thing): 'allowed' { r.emitted }\nlet src = test.Thing { name = 'src' }\ntest.Sink { value = f(src) }",
+        std::path::Path::new("functions.crn"), &config,
+    ).unwrap();
+    let ready = parsed.resources.last().unwrap().attributes["value"]
+        .clone()
+        .map_bindings(&mut |binding| absolute_binding_address_for_test(binding.as_str()))
+        .into_expanded()
+        .unwrap();
+    let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        function,
+        functions,
+        args,
+        source_line,
+    }) = &ready
+    else {
+        panic!("retained handle call");
+    };
+    let late_args: Vec<FunctionArgument> = args
+        .iter()
+        .cloned()
+        .map(|mut argument| {
+            argument
+                .map_absolute_bindings(&mut |_binding| absolute_binding_address_for_test("late"));
+            argument
+        })
+        .collect();
+    let late = Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        function: function.clone(),
+        functions: functions.clone(),
+        args: late_args,
+        source_line: *source_line,
+    });
+    let mut bindings = ResolvedBindings::default();
+    let attributes = std::collections::HashMap::from([(
+        "emitted".into(),
+        Value::Concrete(ConcreteValue::String("allowed".into())),
+    )]);
+    bindings.set_with_completeness(
+        "src",
+        attributes.clone(),
+        BindingValueSource::Local,
+        BindingCompleteness::Complete,
+    );
+    bindings.set_with_completeness(
+        "late",
+        attributes,
+        BindingValueSource::Local,
+        BindingCompleteness::Incomplete,
+    );
+    let combined = Value::Concrete(ConcreteValue::List(vec![ready.clone(), late]));
+    let plan = combined
+        .knowledge(&KnowledgeContext::plan(&bindings))
+        .unwrap();
+    let mut phases = [Vec::new(), Vec::new()];
+    for site in plan.sites() {
+        let Some(crate::schema::LeafPathSegment::ListIndex(index)) = site.path.segments().first()
+        else {
+            panic!("list location");
+        };
+        phases[*index].push(site.phase());
+    }
+    assert!(!phases[0].is_empty() && phases[0].iter().all(|phase| *phase == Phase::Plan));
+    assert!(!phases[1].is_empty() && phases[1].iter().all(|phase| *phase == Phase::Apply));
+    assert!(
+        combined
+            .knowledge(&KnowledgeContext::validation())
+            .unwrap()
+            .sites()
+            .all(|site| site.phase() == Phase::Plan)
+    );
+    let evaluated = crate::validation::deferred_types::with_session_for_test(&config, |session| {
+        crate::resolver::resolve_ref_value(&ready, &bindings, session)
+    })
+    .unwrap();
+    assert!(
+        evaluated
+            .knowledge(&KnowledgeContext::plan(&bindings))
+            .unwrap()
+            .into_classification()
+            .into_known()
+            .is_ok()
+    );
+}
+
+#[test]
+fn retained_ready_handle_never_materializes_unread_attributes() {
+    use crate::binding_index::{BindingCompleteness, BindingValueSource};
+    use crate::resource::{RedactedSecretHash, SnapshotLeaf, absolute_binding_address_for_test};
+    let parsed = crate::parser::parse_file(
+        "let db = test.Thing { name = 'db' }\nlet other = test.Thing { name = 'other' }\nfn f(r: test.Thing, x: test.Name): String { x }\ntest.Sink { value = f(db, other.emitted) }",
+        std::path::Path::new("functions.crn"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
+    let call = parsed.resources.last().unwrap().attributes["value"]
+        .clone()
+        .map_bindings(&mut |binding| absolute_binding_address_for_test(binding.as_str()))
+        .into_expanded()
+        .unwrap();
+    let historical = Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret {
+        hash: RedactedSecretHash::generate(b"fixture opaque input"),
+    }));
+    for private in [
+        historical,
+        Value::Concrete(ConcreteValue::String("public".into())),
+    ] {
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_historical_with_completeness(
+            "db",
+            std::collections::HashMap::from([("private".into(), private)]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+        let knowledge = call.knowledge(&KnowledgeContext::plan(&bindings)).unwrap();
+        assert!(knowledge.sites().all(|site| site.phase() == Phase::Apply));
+        assert!(PlanResolved::try_from(knowledge).is_ok());
+    }
+}

@@ -48,6 +48,13 @@ impl std::fmt::Display for SerializationContext {
     }
 }
 
+/// A retained call is executable data that the saved-plan document cannot carry.
+#[derive(Debug, Clone, Copy, Error)]
+#[error(
+    "a user-defined function call still needs its declared types checked against values available only during apply. A saved plan cannot carry this call."
+)]
+pub struct RetainedUserFunctionCallError;
+
 /// Error produced when a `Value` cannot be serialized for transport
 /// out of the planner (provider/state/plan-file).
 ///
@@ -59,6 +66,9 @@ impl std::fmt::Display for SerializationContext {
 /// message string.
 #[derive(Debug, Clone, Error)]
 pub enum SerializationError {
+    #[error(transparent)]
+    RetainedUserFunctionCall(#[from] RetainedUserFunctionCallError),
+
     #[error("cannot serialize: {}", crate::resource::INSIDE_SECRET_MESSAGE)]
     InsideSecret { kind: SecretSerializationErrorKind },
 
@@ -177,7 +187,9 @@ impl crate::resource::InsideSecret for SerializationError {
                 return Self::UnavailableSecret(error.inside_secret());
             }
             Self::UnexpandedModuleIf { .. } => SecretSerializationErrorKind::UnexpandedModuleIf,
-            error @ Self::UnknownNotAllowed { .. } => return error,
+            error @ (Self::UnknownNotAllowed { .. } | Self::RetainedUserFunctionCall(_)) => {
+                return error;
+            }
             Self::UnresolvedResourceRef { .. } => {
                 SecretSerializationErrorKind::UnresolvedResourceRef
             }
@@ -2644,22 +2656,8 @@ fn redact_snapshot_secrets<P: PlaceholderKind>(
                 source_line: *source_line,
             }))
         }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => {
-            let redacted = args
-                .iter()
-                .map(|argument| argument.try_map_value(redact_snapshot_secrets))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                function: function.clone(),
-                functions: functions.clone(),
-                args: redacted,
-                source_line: *source_line,
-            }))
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => {
+            Err(RetainedUserFunctionCallError.into())
         }
         Value::Deferred(DeferredValue::Access(access)) => Ok(Value::Deferred(
             DeferredValue::Access(access.with_stage_base(redact_snapshot_secrets(access.base())?)),
@@ -2677,8 +2675,27 @@ fn redact_snapshot_secrets<P: PlaceholderKind>(
                     .try_map_stage(|value| redact_snapshot_secrets(&value))?,
             )))
         }
-        // `Unknown` and every other deferred / concrete shape pass through.
-        other => Ok(other.clone()),
+        Value::Deferred(DeferredValue::ModuleIf(_)) => {
+            Err(SerializationError::UnexpandedModuleIf {
+                context: SerializationContext::SecretRedaction,
+            })
+        }
+        Value::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | Value::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
+        ) => Ok(value.clone()),
     }
 }
 
@@ -2824,18 +2841,8 @@ fn canonical_secret_template<P: PlaceholderKind>(
             );
             tagged("function_call", JsonValue::Object(call))
         }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
-            let mut call = Map::new();
-            call.insert("name".to_string(), JsonValue::String(function.name.clone()));
-            call.insert(
-                "args".to_string(),
-                JsonValue::Array(
-                    args.iter()
-                        .map(|argument| canonical_secret_template(argument.walker_value()))
-                        .collect::<Result<_, _>>()?,
-                ),
-            );
-            tagged("function_call", JsonValue::Object(call))
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => {
+            return Err(RetainedUserFunctionCallError.into());
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let mut encoded = Map::new();
@@ -3184,6 +3191,9 @@ fn redact_with_guide(
     guide: SecretRedactionGuide<'_>,
 ) -> Result<SnapshotValue, SerializationError> {
     if let Some(secret_value) = guide.secret_value(source) {
+        // A whole-value guide replaces the authored subtree. Convert that
+        // otherwise unvisited source before the replacement hides its calls.
+        canonical_secret_template(source)?;
         let previous = guide.previous_hash();
         return Ok(SnapshotValue::redacted(hash_secret_value(
             secret_value,
@@ -3229,6 +3239,7 @@ pub fn redact_secrets_using_evaluated(
     evaluated: &Value,
 ) -> Result<SnapshotValue, SerializationError> {
     if contains_secret(evaluated) {
+        canonical_secret_template(source)?;
         // Once evaluation reveals a secret anywhere below this path, persist
         // the evaluated subtree rather than the authored expression. This
         // keeps unresolved refs/unknowns needed at apply time while ensuring
@@ -3891,6 +3902,14 @@ pub fn rehydrate_secret_entry<P: PlaceholderKind>(
     }
     .map_err(|source| SecretRehydrationSiteError::new(location, source))?;
     Ok(Some(value))
+}
+
+/// Convert an expression that remains in project source, retaining ordinary
+/// deferred values while applying the same saved-document admission rules.
+pub fn redact_secrets_in_saved_expression(
+    value: &Value,
+) -> Result<SnapshotValue, SerializationError> {
+    redact_secrets_only(value)
 }
 
 pub fn redact_secrets_in_value(value: &Value) -> Result<SnapshotValue, SerializationError> {
@@ -15911,5 +15930,214 @@ mod unknown_secret_diagnostic_tests {
             matches!(error, SerializationError::UnknownNotAllowed { reason, .. }
             if matches!(reason.as_ref(), ApplyTimeUnknown::UpstreamExport { path } if path.to_dot_string() == "network.vpc.vpc_id"))
         );
+    }
+}
+
+#[cfg(test)]
+mod retained_call_error_tests {
+    use super::*;
+    #[test]
+    fn retained_call_serializer_fails_closed_with_problem_only() {
+        let call = super::retained_call_snapshot_tests::retained_call();
+        let error = serde_json::to_string(&call).unwrap_err();
+        assert_eq!(error.to_string(), RetainedUserFunctionCallError.to_string());
+        assert!(
+            serde_json::to_string(
+                &serde_json::json!({"value":RetainedUserFunctionCallError.to_string()})
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod retained_call_snapshot_tests {
+    use super::*;
+    use crate::resource::{
+        AuthoredValue, FunctionArgument, LiveComposition, LiveCompositionArgument,
+        LiveCompositionAttribute, LiveCompositionSignature, PendingModuleConstraint,
+        ResolvedResourceId, Resource, ResourceId,
+    };
+    pub(crate) fn retained_call() -> Value {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "fn checked(x: test.Name): String { x }",
+            std::path::Path::new("functions.crn"),
+            &context,
+        )
+        .unwrap();
+        let call: AuthoredValue = Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: std::sync::Arc::new(parsed.user_functions["checked"].clone()),
+            functions: std::sync::Arc::new(parsed.user_functions),
+            args: vec![FunctionArgument::from_value(AuthoredValue::resource_ref(
+                "src",
+                "emitted",
+                vec![],
+            ))],
+            source_line: 1.into(),
+        });
+        call.into_expanded().unwrap().resolve_root_for_test()
+    }
+    fn assert_refused<T: std::fmt::Debug>(result: Result<T, SerializationError>, position: &str) {
+        let error = result.expect_err(position);
+        assert!(
+            matches!(&error, SerializationError::RetainedUserFunctionCall(_)),
+            "{position}: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            RetainedUserFunctionCallError.to_string(),
+            "{position}"
+        );
+    }
+    #[test]
+    fn retained_call_snapshot_conversion_rejects_before_serde() {
+        let mut missed = Vec::new();
+        for (position, value) in [
+            ("direct", retained_call()),
+            (
+                "nested list",
+                Value::Concrete(ConcreteValue::List(vec![retained_call()])),
+            ),
+            (
+                "nested map",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "key".into(),
+                    retained_call(),
+                )]))),
+            ),
+            ("inside secret", retained_call().into_secret()),
+            (
+                "secret nested map",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "key".into(),
+                    retained_call(),
+                )])))
+                .into_secret(),
+            ),
+        ] {
+            if !matches!(
+                redact_secrets_in_value(&value),
+                Err(SerializationError::RetainedUserFunctionCall(_))
+            ) {
+                missed.push(position);
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "retained calls passed conversion at {missed:?}"
+        );
+    }
+    #[test]
+    fn retained_call_resource_conversion_rejects_before_serde() {
+        let resource: Resource =
+            Resource::new("test.Thing", "src").with_attribute("plain", retained_call());
+        assert_refused(redact_secrets_in_resource(&resource), "resource attribute");
+    }
+    #[test]
+    fn retained_call_composition_fields_reject_before_serde() {
+        let mut missed = Vec::new();
+        for position in ["argument", "output", "require operand"] {
+            let mut signature = LiveCompositionSignature {
+                arguments: IndexMap::new(),
+                attributes: IndexMap::new(),
+                pending_constraints: vec![],
+            };
+            match position {
+                "argument" => {
+                    signature.arguments.insert(
+                        "input".into(),
+                        LiveCompositionArgument::from_value(
+                            retained_call(),
+                            crate::validation::resolve_consumer_static_type_for_signature(
+                                &crate::parser::TypeExpr::String,
+                                &crate::parser::ProviderContext::new(
+                                    crate::EnvironmentSnapshot::empty(),
+                                ),
+                            ),
+                            crate::parser::ArgumentOrigin::Defaulted,
+                        ),
+                    );
+                }
+                "output" => {
+                    signature.attributes.insert(
+                        "output".into(),
+                        LiveCompositionAttribute::from_value(retained_call(), None),
+                    );
+                }
+                "require operand" => {
+                    signature.pending_constraints.push(
+                        PendingModuleConstraint::argument_validation(
+                            "input",
+                            0,
+                            crate::parser::ValidateExpr::BoundArgument {
+                                argument: "input".into(),
+                                operand: "input".into(),
+                                value: retained_call(),
+                            },
+                            "required".into(),
+                        ),
+                    );
+                }
+                other => panic!("unexpected position {other}"),
+            }
+            let composition = LiveComposition {
+                id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "instance")),
+                signature,
+                binding: None,
+                dependency_bindings: Default::default(),
+                module_name: "child".into(),
+                instance: "instance".into(),
+                call_path: Default::default(),
+                quoted_string_attrs: Default::default(),
+                declaration: Default::default(),
+            };
+            if !matches!(
+                redact_secrets_in_live_composition(&composition),
+                Err(SerializationError::RetainedUserFunctionCall(_))
+            ) {
+                missed.push(position);
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "retained calls passed composition conversion at {missed:?}"
+        );
+    }
+    #[test]
+    fn evaluated_secret_guide_cannot_erase_an_authored_retained_call() {
+        let source = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "pending".into(),
+            retained_call(),
+        )])));
+        let evaluated =
+            Value::Concrete(ConcreteValue::String("known-sensitive".into())).into_secret();
+        assert_refused(
+            redact_secrets_using_evaluated(&source, &evaluated),
+            "replaced source subtree",
+        );
+    }
+    #[test]
+    fn project_expression_conversion_preserves_an_ordinary_upstream_unknown() {
+        let value = Value::Deferred(DeferredValue::Unknown(
+            crate::resource::ApplyTimeUnknown::UpstreamExport {
+                path: crate::resource::AccessPath::new("upstream", "value").resolve_root_for_test(),
+            },
+        ));
+        let snapshot = redact_secrets_in_saved_expression(&value).unwrap();
+        let Value::Deferred(DeferredValue::Unknown(
+            crate::resource::ApplyTimeUnknown::UpstreamExport { path },
+        )) = snapshot
+        else {
+            panic!("upstream unknown must remain deferred")
+        };
+        assert_eq!(path.to_dot_string(), "upstream.value");
+    }
+    #[test]
+    fn wait_operand_type_cannot_carry_a_retained_call() {
+        assert!(matches!(
+            crate::wait::WaitRhs::try_from(retained_call()),
+            Err(crate::wait::predicate::WaitPredicateError::UnsupportedOperand)
+        ));
     }
 }

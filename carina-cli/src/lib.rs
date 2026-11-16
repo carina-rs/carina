@@ -26,6 +26,8 @@ pub(crate) mod module_walk;
 pub(crate) mod provider_upstream_test_support;
 
 #[cfg(test)]
+mod fn_declared_checks_tests;
+#[cfg(test)]
 mod lock_file_api_tests;
 #[cfg(test)]
 mod module_info_snapshot_tests;

@@ -1,7 +1,7 @@
 //! Native schema fixtures enter the server's reload and document-analysis path.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -18,6 +18,7 @@ pub struct Diagnostics {
     root: PathBuf,
     snapshot: Arc<LoadedProviderSnapshot>,
     providers: BTreeSet<String>,
+    load_errors: BTreeMap<String, String>,
 }
 
 impl Diagnostics {
@@ -26,7 +27,13 @@ impl Diagnostics {
             root: root.to_path_buf(),
             snapshot,
             providers: providers.into_iter().collect(),
+            load_errors: BTreeMap::new(),
         }
+    }
+
+    pub fn with_load_errors(mut self, errors: BTreeMap<String, String>) -> Self {
+        self.load_errors = errors;
+        self
     }
 
     pub fn from_schemas(root: &Path, schemas: SchemaRegistry) -> Self {
@@ -62,6 +69,7 @@ impl Diagnostics {
                         .block_on(async {
                             let snapshot = self.snapshot.clone();
                             let providers = self.providers.clone();
+                            let load_errors = self.load_errors.clone();
                             let builder: FactoryBuilder = Arc::new(move |configs| {
                                 let mut seen = BTreeSet::new();
                                 let mut factories = Vec::new();
@@ -75,7 +83,7 @@ impl Diagnostics {
                                             as Box<dyn ProviderFactory>);
                                     }
                                 }
-                                (factories, Default::default(), Vec::new())
+                                (factories, load_errors.clone(), Vec::new())
                             });
                             let states = tokio::sync::RwLock::new(ProviderStates::new(
                                 document.provider_context().environment.clone(),

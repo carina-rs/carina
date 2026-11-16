@@ -173,8 +173,13 @@ impl CommandRuntime {
 }
 
 #[cfg(test)]
+type TestProviderFactories =
+    Box<dyn Fn() -> Vec<crate::wiring::LoadedProviderFactory> + Send + Sync>;
+
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct TestInvocationHooks {
+    pub provider_factories: Mutex<Option<TestProviderFactories>>,
     pub refresh_drain:
         Mutex<Option<crate::commands::shared::cancellation_test_support::RefreshDrainBarrier>>,
     pub destroy_success: Mutex<Option<crate::commands::destroy::DestroySuccessCancelHook>>,

@@ -1173,6 +1173,12 @@ fn validation_finding_display(prefix: Option<&str>, finding: &impl std::fmt::Dis
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("Cannot save plan: {problem}\nRun `{command}` directly on the project, without a saved plan.", command = ProjectCommand::new("apply", project_dir))]
+    RetainedUserFunctionCall {
+        problem: carina_core::value::RetainedUserFunctionCallError,
+        project_dir: PathBuf,
+    },
+
     #[error("{}", .0.message)]
     ProviderTypeCheck(Box<carina_core::parser::ParseWarning>),
     #[error("{0}")]
@@ -1796,6 +1802,10 @@ impl carina_core::validation::ValidationClientError for AppError {
 }
 
 impl AppError {
+    pub fn from_plan_serialization(error: serde_json::Error) -> Self {
+        Self::Config(format!("Failed to serialize plan: {error}"))
+    }
+
     pub(crate) fn invalid_saved_plan_provider_evidence(
         path: carina_core::paths::DisplayPath,
         replan_command: Option<String>,
@@ -3001,6 +3011,19 @@ mod backend_locate_chain_tests {
             rendered.matches("native locate cause").count(),
             1,
             "{rendered}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retained_call_plan_guidance_tests {
+    use super::*;
+    #[test]
+    fn ordinary_plan_serialization_errors_keep_their_diagnostic() {
+        let error: serde_json::Error = serde::ser::Error::custom("another serialization failure");
+        assert_eq!(
+            AppError::from_plan_serialization(error).to_string(),
+            "Failed to serialize plan: another serialization failure"
         );
     }
 }
