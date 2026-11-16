@@ -1074,7 +1074,8 @@ fn issue_4474_reference_chain_of_128_reports_the_depth_limit_in_both_shapes() {
 }
 
 #[test]
-fn issue_4474_deeper_chains_report_errors_without_stack_growth_in_both_shapes() {
+fn issue_4474_deep_chains_parse_and_resolve_without_stack_growth_in_both_shapes() {
+    // Parser value resolution and dependency walks traverse all 5000 hops; the secrecy walk stops at 128.
     for shape in CHAIN_SHAPES {
         for last in [256, 5000] {
             let report = resource_chain(last, shape);

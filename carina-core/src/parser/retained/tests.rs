@@ -11,6 +11,38 @@ fn config() -> ProviderContext {
 }
 
 #[test]
+fn merged_syntax_invalidates_the_shared_secrecy_index() {
+    let config = config();
+    let schemas = SchemaRegistry::new();
+    let first = crate::parser::parse_file(
+        "let first = mock.Resource { name = 'first' }",
+        Path::new("first.crn"),
+        &config,
+    )
+    .unwrap();
+    let second = crate::parser::parse_file(
+        "let second = mock.Resource { name = 'second' }",
+        Path::new("second.crn"),
+        &config,
+    )
+    .unwrap();
+    let first_location = first.parser_binding_metadata.syntax().expressions().roots()[0].location();
+    let second_location = second
+        .parser_binding_metadata
+        .syntax()
+        .expressions()
+        .roots()[0]
+        .location();
+    let mut report = judge_expressions(&first, &schemas, &config);
+    let second_report = judge_expressions(&second, &schemas, &config);
+    assert!(report.secrecy_at(first_location).is_some());
+    assert!(report.secrecy_at(second_location).is_none());
+    report.extend(second_report);
+    assert!(report.secrecy_at(first_location).is_some());
+    assert!(report.secrecy_at(second_location).is_some());
+}
+
+#[test]
 fn expressions_equality_includes_authored_secrecy_argument_roots() {
     let parsed =
         crate::parser::parse_file("let value = 'public'", Path::new("equality.crn"), &config())

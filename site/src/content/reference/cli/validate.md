@@ -147,7 +147,7 @@ Failures have `"status": "error"`, an empty resource inventory, and a nonempty `
 }
 ```
 
-Each diagnostic contains `message`, `severity`, `code`, and `location`. Existing warning messages keep their original JSON wording, with secret duplicate keys replaced by `<redacted>`. Other diagnostics use safe human diagnostic text. Locations identify the source file and, when available, its range. Lines and columns start at `1`; columns count Unicode scalar values, and range ends are exclusive. A file-only location has `"range": null`. Unavailable codes and locations are `null`.
+Each diagnostic contains `message`, `severity`, `code`, and `location`. A diagnostic reported inside a module also carries `related`, a list of locations in the same shape as `location` that names the module call it came through; the field is omitted when empty. Existing warning messages keep their original JSON wording, with secret duplicate keys replaced by `<redacted>`. Other diagnostics use safe human diagnostic text. Locations identify the source file and, when available, its range. Lines and columns start at `1`; columns count Unicode scalar values, and range ends are exclusive. A file-only location has `"range": null`. Unavailable codes and locations are `null`.
 
 Empty `errors` and `warnings` arrays are omitted. Warning `type` values such as `input_rule`, `unused_binding`, and `duplicate_attribute` remain available; duplicate-attribute warnings also retain the legacy `file` field. Provider and parser warnings use the same diagnostic fields. Only safe diagnostic text is serialized, without source snippets or provider payloads.
 
