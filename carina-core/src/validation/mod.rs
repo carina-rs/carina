@@ -6095,10 +6095,18 @@ impl ResourceAdmissionReport {
         file: &crate::identifier::PrefixCanonicalized<'_, F>,
         attributes: ResourceAdmissionValues,
         mut references: ResourceAdmissionFindings,
+        boundary: presentation::AdmissionBoundary,
     ) -> Self {
         let mut findings = file
             .prefix_errors()
             .iter()
+            // This is a pending template obligation, not an apply-time value
+            // until module arguments have been substituted. Rejected owners
+            // still cannot reach missing-required/unknown-attribute admission.
+            .filter(|error| {
+                !matches!(boundary, presentation::AdmissionBoundary::Preflight)
+                    || !error.needs_module_arguments()
+            })
             .map(ResourceAdmissionFinding::prefix)
             .collect::<Vec<_>>();
         findings.append(&mut references.0);
@@ -6315,7 +6323,9 @@ fn resource_admission_report<
         ));
     }
 
-    Ok(ResourceAdmissionReport::new(judged, attributes, all_errors))
+    Ok(ResourceAdmissionReport::new(
+        judged, attributes, all_errors, boundary,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

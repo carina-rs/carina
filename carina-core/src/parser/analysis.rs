@@ -460,12 +460,7 @@ fn locate_unknown_key(
             .unwrap_or(declaration),
         SchemaDiagnosticKey::Attribute { name } => {
             let root = authored_root(name)?;
-            let assignment = root.assignment_location();
-            if assignment.span().start_line() == assignment.span().end_line() {
-                assignment
-            } else {
-                root.location()
-            }
+            root.finding_location()
         }
         SchemaDiagnosticKey::Value {
             root: name,
@@ -481,6 +476,14 @@ fn locate_unknown_key(
 }
 
 impl DeclarationProvenance {
+    pub(crate) fn attribute_key_finding_location(&self, name: &str) -> Option<DeclarationLocation> {
+        self.elements()
+            .diagnostic_index()
+            .attribute(name)
+            .and_then(|node| node.root_key(self.elements()))
+            .map(|key| key.finding_location().clone())
+    }
+
     /// Locate a schema finding while its declaration is still in hand. Unauthored
     /// programmatic resources have no source span; an authored missing root is an invariant.
     pub(crate) fn schema_diagnostic_location(

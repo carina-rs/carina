@@ -1202,6 +1202,36 @@ impl JudgedSlot {
 }
 
 impl<B: BindingAddress> JudgedSlot<B> {
+    /// Diagnostic syntax inventory, independent of the current projection/judgement.
+    /// Inlining an alias or substituting a module argument must retain its authored name.
+    pub(crate) fn visit_authored_bindings(
+        &self,
+        visitor: &mut impl FnMut(&B, crate::resource::DiagnosticScope),
+    ) {
+        fn visit<B: BindingAddress>(
+            node: &AuthoredExpr<ParserPlaceholder, B>,
+            scope: crate::resource::DiagnosticScope,
+            visitor: &mut impl FnMut(&B, crate::resource::DiagnosticScope),
+        ) {
+            let scope = if matches!(node.kind, ExprKind::Secret) {
+                crate::resource::DiagnosticScope::Secret
+            } else {
+                scope
+            };
+            if let ExprKind::Binding(binding) = &node.kind {
+                visitor(binding, scope);
+            }
+            for child in &node.children {
+                visit(&child.authored, scope, visitor);
+            }
+        }
+        visit(
+            &self.root,
+            crate::resource::DiagnosticScope::Public,
+            visitor,
+        );
+    }
+
     pub(crate) fn secrecy_conditions(&self) -> ConditionSnapshot {
         self.conditions.clone()
     }

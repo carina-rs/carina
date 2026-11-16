@@ -7902,7 +7902,7 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
-    #[error(transparent)]
+    #[error("{}", .0.diagnostic_message())]
     AttributePrefix(Box<crate::identifier::AttributePrefixError>),
 
     #[error("Type mismatch: {types}")]

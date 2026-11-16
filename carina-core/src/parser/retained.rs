@@ -1192,6 +1192,21 @@ impl<B: BindingAddress> Expressions<B> {
         &self.roots
     }
 
+    pub(crate) fn is_module_argument(&self, binding: &B) -> bool {
+        self.arguments.contains_key(binding)
+    }
+
+    /// Provisional alias payload for diagnostic provenance, never admission evidence.
+    pub(crate) fn binding_projection(&self, binding: &B) -> Option<&Value<ParserPlaceholder, B>> {
+        self.definitions
+            .get(binding)
+            .and_then(|definition| match &definition.payload {
+                Projection::Value(value) => Some(value),
+                Projection::Pending => None,
+            })
+            .or_else(|| self.secrecy_arguments.get(binding))
+    }
+
     pub(super) fn extend(&mut self, other: Self) {
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);

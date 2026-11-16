@@ -1,7 +1,8 @@
 //! The file that crossed prefix canonicalization is admission's authority.
 mod read;
 use super::{
-    AttributePrefixError, ResourcePrefixSource, generate_random_suffix, prefix_companion_attribute,
+    AttributePrefixError, AttributePrefixFailure, DeferredPrefixDependencies, PrefixDependency,
+    ResourcePrefixSource, generate_random_suffix, prefix_companion_attribute,
 };
 use crate::parser::retained::JudgedFile;
 use crate::parser::{
@@ -9,8 +10,8 @@ use crate::parser::{
     ExportParamLike, File, ProviderContext, ResourceRef,
 };
 use crate::resource::{
-    BindingAddress, ConcreteValue, DeferredValue, ModuleSource, ParserPlaceholder, PlaceholderKind,
-    Resource, ResourceId, Value, ValueString,
+    BindingAddress, ConcreteValue, ModuleSource, ParserPlaceholder, PlaceholderKind, Resource,
+    ResourceId, Value, ValueString,
 };
 use crate::schema::{OwnerBoundResourceSchema, SchemaKind, SchemaRegistry};
 use crate::validation::admission::{DeclarationIdentity, attributes::declaration_identity};
@@ -231,26 +232,58 @@ pub fn canonicalize_file_prefixes<
             errors: start..errors.len(),
         });
     };
+    let expressions = file.parser_binding_metadata.syntax().expressions();
+    let variables = &file.variables;
     for (index, resource) in file.resources.iter_mut().enumerate() {
         record(
             OwnerAddress::Resource(index),
-            resolve_resource(resource, schemas, suffix),
+            resolve_resource(
+                resource,
+                schemas,
+                suffix,
+                Some(expressions),
+                Some(variables),
+            ),
         );
     }
-    // Exclusions are visited explicitly: reads never generate names and
-    // deferred-for bodies retain the CLI's raw-key language behavior.
+    // Reads never generate names. Deferred-for templates retain their existing
+    // literal-prefix behavior, but a deferred companion must own its rejection.
     for index in 0..file.data_sources.len() {
         record(OwnerAddress::DataSource(index), Vec::new());
     }
-    for (index, _) in file.deferred_for_phase.analysis_resource_refs().enumerate() {
-        record(OwnerAddress::DeferredFor(index), Vec::new());
+    for (index, resource) in file.deferred_for_phase.analysis_resource_refs().enumerate() {
+        let mut findings = Vec::new();
+        if let ResourceRef::Deferred { resource, .. } = resource {
+            let resource = resource.as_resource();
+            if let Some(schema) = schemas.get_for(resource) {
+                let source = PrefixSource {
+                    id: &resource.id,
+                    declaration: Some(&resource.declaration),
+                    slots: Some(&resource.authored_slots),
+                    expressions: Some(expressions),
+                    variables: None,
+                };
+                for (key, value) in &resource.attributes {
+                    if let CompanionRecognition::Deferred { base, dependencies } =
+                        recognize_companion(key, value, schema.schema().as_schema(), &source)
+                    {
+                        findings.push(deferred_companion_error(base, dependencies, &source));
+                    }
+                }
+            }
+        }
+        record(OwnerAddress::DeferredFor(index), findings);
     }
     for (conditional, deferred) in file.deferred_module_ifs.iter_mut().enumerate() {
         for (branch, body) in deferred.branches_mut().enumerate() {
             let findings = match body {
-                crate::parser::DeferredIfBody::Resource(resource) => {
-                    resolve_resource(resource, schemas, suffix)
-                }
+                crate::parser::DeferredIfBody::Resource(resource) => resolve_resource(
+                    resource,
+                    schemas,
+                    suffix,
+                    Some(expressions),
+                    Some(variables),
+                ),
                 crate::parser::DeferredIfBody::DataSource(_) => Vec::new(),
                 crate::parser::DeferredIfBody::ModuleCall(_) => continue,
             };
@@ -779,24 +812,30 @@ where
     }
     pub fn prefix_failures(
         &self,
-    ) -> impl Iterator<
-        Item = (
-            &Resource<ModuleSource, ParserPlaceholder, B>,
-            &AttributePrefixError,
-        ),
-    > {
+    ) -> impl Iterator<Item = (Option<&ModuleSource>, &AttributePrefixError)> {
         let file = self.file.file();
-        self.visits.iter().flat_map(move |visit| {
-            visit
-                .owner
-                .managed_resource(file)
-                .into_iter()
-                .flat_map(move |owner| {
-                    self.errors[visit.errors.clone()]
-                        .iter()
-                        .map(move |error| (owner, error))
-                })
-        })
+        self.visits
+            .iter()
+            .filter(|visit| !visit.errors.is_empty())
+            .flat_map(move |visit| {
+                let source = match visit.owner {
+                    OwnerAddress::DeferredFor(index) => file
+                        .deferred_for_phase
+                        .analysis_resource_refs()
+                        .nth(index)
+                        .and_then(|resource| match resource {
+                            ResourceRef::Deferred { resource, .. } => resource.module_source(),
+                            _ => None,
+                        }),
+                    _ => visit
+                        .owner
+                        .managed_resource(file)
+                        .and_then(|owner| owner.module_source.as_ref()),
+                };
+                self.errors[visit.errors.clone()]
+                    .iter()
+                    .map(move |error| (source, error))
+            })
     }
 
     pub fn analysis_tree(&self) -> Result<CanonicalAnalysisTree<'_, X, D, B>, AnalysisTreeError> {
@@ -858,7 +897,7 @@ pub(super) fn resolve_resources<P: PlaceholderKind, B: BindingAddress>(
 ) -> Vec<AttributePrefixError> {
     resources
         .iter_mut()
-        .flat_map(|resource| resolve_resource(resource, schemas, suffix))
+        .flat_map(|resource| resolve_resource(resource, schemas, suffix, None, None))
         .collect()
 }
 
@@ -866,6 +905,8 @@ fn resolve_resource<P: PlaceholderKind, B: BindingAddress>(
     resource: &mut Resource<ModuleSource, P, B>,
     schemas: &SchemaRegistry,
     suffix: SuffixSource,
+    expressions: Option<&crate::parser::retained::Expressions<B>>,
+    variables: Option<&IndexMap<String, Value<P, B>>>,
 ) -> Vec<AttributePrefixError> {
     let Some(schema) = schemas.get_for(resource) else {
         return Vec::new();
@@ -873,8 +914,13 @@ fn resolve_resource<P: PlaceholderKind, B: BindingAddress>(
     let (rewrites, findings) = rewrite_prefix_values(
         &mut resource.attributes,
         schema,
-        &resource.id,
-        resource.declaration.location().cloned(),
+        PrefixSource {
+            id: &resource.id,
+            declaration: Some(&resource.declaration),
+            slots: Some(&resource.authored_slots),
+            expressions,
+            variables,
+        },
         suffix,
     );
     for rewrite in rewrites {
@@ -902,7 +948,18 @@ pub(crate) fn canonicalize_prefix_values<P: PlaceholderKind, B: BindingAddress>(
     mut values: IndexMap<String, Value<P, B>>,
     suffix: SuffixSource,
 ) -> Result<CanonicalAttributeValues<P, B>, Vec<AttributePrefixError>> {
-    let (_rewrites, errors) = rewrite_prefix_values(&mut values, schema, id, None, suffix);
+    let (_rewrites, errors) = rewrite_prefix_values(
+        &mut values,
+        schema,
+        PrefixSource {
+            id,
+            declaration: None,
+            slots: None,
+            expressions: None,
+            variables: None,
+        },
+        suffix,
+    );
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -912,41 +969,94 @@ pub(crate) fn canonicalize_prefix_values<P: PlaceholderKind, B: BindingAddress>(
     })
 }
 
+struct PrefixSource<'a, P: PlaceholderKind, B: BindingAddress> {
+    id: &'a ResourceId,
+    declaration: Option<&'a crate::parser::DeclarationProvenance>,
+    slots: Option<&'a crate::parser::retained::AuthoredSlots<B>>,
+    expressions: Option<&'a crate::parser::retained::Expressions<B>>,
+    variables: Option<&'a IndexMap<String, Value<P, B>>>,
+}
+
+/// Recognition owns deferred companions too. Only NotCompanion can proceed to
+/// ordinary unknown-key/required-attribute admission; Deferred rejects the owner.
+enum CompanionRecognition {
+    Known {
+        base: String,
+        prefix: ValueString,
+    },
+    Deferred {
+        base: String,
+        dependencies: DeferredPrefixDependencies,
+    },
+    NotCompanion,
+}
+
+fn recognize_companion<P: PlaceholderKind, B: BindingAddress>(
+    key: &str,
+    value: &Value<P, B>,
+    schema: &crate::schema::CompiledResourceSchema,
+    source: &PrefixSource<'_, P, B>,
+) -> CompanionRecognition {
+    let Some(base) = key.strip_suffix(super::PREFIX_COMPANION_SUFFIX) else {
+        return CompanionRecognition::NotCompanion;
+    };
+    let Some(attribute) = schema.attributes.get(base) else {
+        return CompanionRecognition::NotCompanion;
+    };
+    if !crate::validation::is_string_compatible_type(&attribute.attr_type, &schema.defs) {
+        return CompanionRecognition::NotCompanion;
+    }
+    match value {
+        Value::Concrete(ConcreteValue::String(prefix)) => CompanionRecognition::Known {
+            base: base.to_owned(),
+            prefix: prefix.clone(),
+        },
+        Value::Concrete(_) => CompanionRecognition::NotCompanion,
+        Value::Deferred(_) => CompanionRecognition::Deferred {
+            base: base.to_owned(),
+            dependencies: deferred_prefix_dependencies(value, key, source),
+        },
+    }
+}
+
 fn rewrite_prefix_values<P: PlaceholderKind, B: BindingAddress>(
     values: &mut IndexMap<String, Value<P, B>>,
     bound: OwnerBoundResourceSchema<'_>,
-    id: &ResourceId,
-    location: Option<crate::parser::DeclarationLocation>,
+    source: PrefixSource<'_, P, B>,
     suffix: SuffixSource,
 ) -> (Vec<PrefixRewrite>, Vec<AttributePrefixError>) {
     let schema = bound.schema().as_schema();
     if schema.kind != SchemaKind::Resource {
         return (Vec::new(), Vec::new());
     }
-    let prefixes = values
+    let companions = values
         .iter()
-        .filter_map(|(key, value)| {
-            let base = key.strip_suffix(super::PREFIX_COMPANION_SUFFIX)?;
-            let prefix = concrete_prefix(value)?;
-            let attribute = schema.attributes.get(base)?;
-            crate::validation::is_string_compatible_type(&attribute.attr_type, &schema.defs)
-                .then(|| (base.to_owned(), prefix.clone()))
-        })
+        .map(|(key, value)| recognize_companion(key, value, schema, &source))
         .collect::<Vec<_>>();
     let mut rewrites = Vec::new();
     let mut errors = Vec::new();
-    for (base, prefix) in prefixes {
+    for companion in companions {
+        let (base, prefix) = match companion {
+            CompanionRecognition::NotCompanion => continue,
+            CompanionRecognition::Deferred { base, dependencies } => {
+                errors.push(deferred_companion_error(base, dependencies, &source));
+                continue;
+            }
+            CompanionRecognition::Known { base, prefix } => (base, prefix),
+        };
         let authored = prefix_companion_attribute(&base);
         if prefix.expose_plaintext().is_empty() || values.contains_key(&base) {
             errors.push(AttributePrefixError {
-                resource: id.clone(),
+                resource: source.id.clone(),
                 prefix: authored,
-                conflict: if prefix.expose_plaintext().is_empty() {
-                    None
+                failure: if prefix.expose_plaintext().is_empty() {
+                    AttributePrefixFailure::Empty
                 } else {
-                    Some(base)
+                    AttributePrefixFailure::Conflict(base)
                 },
-                location: location.clone(),
+                location: source
+                    .declaration
+                    .and_then(|declaration| declaration.location().cloned()),
             });
             continue;
         }
@@ -968,56 +1078,100 @@ fn rewrite_prefix_values<P: PlaceholderKind, B: BindingAddress>(
     (rewrites, errors)
 }
 
-// Exhaustive on both axes: adding a reference-bearing representation requires
-// deciding its eligibility here, rather than silently treating it as a String.
-fn concrete_prefix<P: PlaceholderKind, B: BindingAddress>(
+fn deferred_companion_error<P: PlaceholderKind, B: BindingAddress>(
+    base: String,
+    dependencies: DeferredPrefixDependencies,
+    source: &PrefixSource<'_, P, B>,
+) -> AttributePrefixError {
+    let authored = prefix_companion_attribute(&base);
+    AttributePrefixError {
+        resource: source.id.clone(),
+        location: source
+            .declaration
+            .and_then(|declaration| declaration.attribute_key_finding_location(&authored)),
+        prefix: authored,
+        failure: AttributePrefixFailure::Deferred { base, dependencies },
+    }
+}
+
+fn deferred_prefix_dependencies<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
-) -> Option<&ValueString> {
-    match value {
-        Value::Concrete(concrete) => match concrete {
-            ConcreteValue::String(prefix) => Some(prefix),
-            ConcreteValue::EnumIdentifier(_identifier) => None,
-            ConcreteValue::CanonicalEnum(_enumeration) => None,
-            ConcreteValue::Int(_integer) => None,
-            ConcreteValue::Float(_float) => None,
-            ConcreteValue::Bool(_boolean) => None,
-            ConcreteValue::Duration(_duration) => None,
-            ConcreteValue::List(_list) => None,
-            ConcreteValue::StringList(_strings) => None,
-            ConcreteValue::Map(_map) => None,
-        },
-        Value::Deferred(deferred) => match deferred {
-            DeferredValue::ModuleIf(_condition) => None,
-            DeferredValue::ResourceRef { path: _path } => None,
-            DeferredValue::BindingRef { binding: _binding } => None,
-            DeferredValue::Coalesce {
-                value: _value,
-                default: _default,
-            } => None,
-            DeferredValue::IntegerArithmetic(_arithmetic) => None,
-            DeferredValue::Interpolation(_parts) => None,
-            DeferredValue::FunctionCall {
-                name: _name,
-                args: _args,
-                source_line: _line,
-            } => None,
-            DeferredValue::Unavailable {
-                name: _name,
-                args: _args,
-                reason: _reason,
-                source_line: _line,
-            } => None,
-            DeferredValue::ResolvedFunctionCall {
-                function: _function,
-                functions: _functions,
-                args: _args,
-                source_line: _line,
-            } => None,
-            DeferredValue::Access(_access) => None,
-            DeferredValue::Secret(_secret) => None,
-            DeferredValue::Unknown(_unknown) => None,
-            DeferredValue::Placeholder(_placeholder) => None,
-        },
+    authored: &str,
+    source: &PrefixSource<'_, P, B>,
+) -> DeferredPrefixDependencies {
+    use crate::resource::{DiagnosticScope, ReferencePath};
+
+    // Source names survive substitution independently of the resolved leaves.
+    // Keep diagnostic paths scoped so a reference inside secret(...) stays opaque.
+    let mut origins = Vec::new();
+    if let Some(slots) = source.slots
+        && let Ok(slot) = slots.get(authored)
+    {
+        slot.visit_authored_bindings(&mut |binding, scope| {
+            let name = scope.path(ReferencePath::Binding(binding.clone())).render(
+                |path| path.to_dot_string().rsplit('.').next().unwrap().to_owned(),
+                || "<secret>".to_owned(),
+            );
+            let module_argument = source
+                .expressions
+                .is_some_and(|expressions| expressions.is_module_argument(binding));
+            let mut paths = Vec::new();
+            if let Some(value) = source
+                .variables
+                .and_then(|variables| variables.get(binding.as_str()))
+            {
+                value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                    paths.push(reference.diagnostic_path().to_dot_string());
+                });
+            } else if let Some(projection) = source
+                .expressions
+                .and_then(|expressions| expressions.binding_projection(binding))
+            {
+                projection.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                    paths.push(reference.diagnostic_path().to_dot_string());
+                });
+            }
+            origins.push((name, module_argument, paths));
+        });
+    }
+    let mut dependencies = Vec::new();
+    let mut push = |dependency| {
+        if !dependencies.contains(&dependency) {
+            dependencies.push(dependency);
+        }
+    };
+    value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+        let path = reference.diagnostic_path().to_dot_string();
+        let origin = origins.iter().find(|(_, _, paths)| paths.contains(&path));
+        push(match origin {
+            Some((name, true, _)) => PrefixDependency::ModuleArgument(name.clone()),
+            origin => PrefixDependency::Reference {
+                path,
+                through: origin.map(|(name, _, _)| name.clone()),
+            },
+        });
+    });
+    value.visit_binding_refs_for_diagnostics(&mut |binding| {
+        push(PrefixDependency::Reference {
+            path: binding.diagnostic_path().to_dot_string(),
+            through: None,
+        });
+    });
+    value.visit_placeholders(&mut |placeholder, scope| {
+        if let Some(name) = placeholder.module_argument_name() {
+            push(PrefixDependency::UnboundModuleArgument(
+                if scope == DiagnosticScope::Secret {
+                    "<secret>".to_owned()
+                } else {
+                    name.to_owned()
+                },
+            ));
+        }
+    });
+    let mut dependencies = dependencies.into_iter();
+    DeferredPrefixDependencies {
+        first: dependencies.next().unwrap_or(PrefixDependency::Expression),
+        rest: dependencies.collect(),
     }
 }
 
@@ -1065,6 +1219,48 @@ mod tests {
                 .unwrap(),
         );
         schemas
+    }
+
+    #[test]
+    fn deferred_prefix_rejects_owner_before_attribute_admission() {
+        let schemas = schemas();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (value, dependency) in [
+            ("src.generated", "'src.generated'"),
+            ("\"${src.generated}-x\"", "'src.generated'"),
+            ("p", "'src.generated' (through 'p')"),
+        ] {
+            let parsed = crate::parser::parse_and_resolve(&format!(
+                "let src = mock.Sink {{ name = 'source' }}\nlet p = src.generated\nmock.Sink {{ name_prefix = {value} }}\n"
+            ))
+            .unwrap();
+            let canonical =
+                canonicalize_file_prefixes(parsed, &schemas, SuffixSource::Preview).judge(&context);
+            assert_eq!(canonical.prefix_errors().len(), 1);
+            let error = &canonical.prefix_errors()[0];
+            assert!(matches!(
+                error.failure,
+                AttributePrefixFailure::Deferred { .. }
+            ));
+            assert_eq!(
+                error.diagnostic_message(),
+                format!(
+                    "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is known only after apply"
+                )
+            );
+            assert_eq!(
+                crate::schema::TypeError::AttributePrefix(Box::new(error.clone())).to_string(),
+                error.diagnostic_message(),
+                "preflight wrappers must retain the same semantic message"
+            );
+            let owners = canonical.analysis_tree().unwrap();
+            assert_eq!(
+                owners.resources().count(),
+                1,
+                "only src can enter admission"
+            );
+            assert_eq!(owners.rejected_resources().count(), 1);
+        }
     }
 
     #[test]

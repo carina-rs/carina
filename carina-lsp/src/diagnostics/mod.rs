@@ -3724,6 +3724,24 @@ fn decorate_schema_diagnostic(diagnostic: &mut Diagnostic, error: &carina_core::
     }
 }
 
+/// Publication policy shared by module resource findings, including prefix
+/// deferred/empty/conflict findings. carina#4461 case d leaves the choice open:
+/// retain both the authored module file and the root call site for now.
+/// carina#4492 will use this same seam; changing the policy belongs only here.
+fn module_resource_finding_location<'a>(
+    doc: &Document,
+    authored: Option<&'a carina_core::parser::DeclarationLocation>,
+    source: Option<&'a carina_core::resource::ModuleSource>,
+) -> Option<&'a carina_core::parser::DeclarationLocation> {
+    authored
+        .filter(|location| location.file().path() == doc.source_file())
+        .or_else(|| {
+            source
+                .and_then(carina_core::resource::ModuleSource::module_call)
+                .map(|origin| origin.module_call_path().root().id.declaration_location())
+        })
+}
+
 fn publish_prefix_errors<X, D, B: BindingAddress>(
     doc: &Document,
     configuration: &PrefixCanonicalized<'_, carina_core::parser::retained::JudgedFile<'_, X, D, B>>,
@@ -3732,23 +3750,14 @@ fn publish_prefix_errors<X, D, B: BindingAddress>(
     X: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    for (resource, error) in configuration.prefix_failures() {
-        let location = error
-            .location()
-            .filter(|location| location.file().path() == doc.source_file())
-            .or_else(|| {
-                resource
-                    .module_source
-                    .as_ref()
-                    .and_then(carina_core::resource::ModuleSource::module_call)
-                    .map(|origin| origin.module_call_path().root().id.declaration_location())
-            });
+    for (source, error) in configuration.prefix_failures() {
+        let location = module_resource_finding_location(doc, error.location(), source);
         if let Some(location) = location
             && let Some(diagnostic) = render_merged(
                 doc,
                 &carina_core::parser::Located::new(location.clone(), ()),
                 DiagnosticSeverity::ERROR,
-                error.to_string(),
+                error.diagnostic_message(),
             )
             && !diagnostics.contains(&diagnostic)
         {

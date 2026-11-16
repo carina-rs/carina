@@ -1499,30 +1499,124 @@ pub(crate) struct ResourcePrefixSource(());
 pub struct AttributePrefixError {
     resource: ResourceId,
     prefix: String,
-    conflict: Option<String>,
+    failure: AttributePrefixFailure,
     location: Option<crate::parser::DeclarationLocation>,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+enum AttributePrefixFailure {
+    Empty,
+    Conflict(String),
+    Deferred {
+        base: String,
+        dependencies: DeferredPrefixDependencies,
+    },
+}
+
+/// A deferred companion always retains a cause; it cannot masquerade as an
+/// unrecognized attribute or authorize ordinary required-attribute admission.
+#[derive(Debug, Clone, PartialEq)]
+struct DeferredPrefixDependencies {
+    first: PrefixDependency,
+    rest: Vec<PrefixDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PrefixDependency {
+    Reference {
+        path: String,
+        through: Option<String>,
+    },
+    ModuleArgument(String),
+    UnboundModuleArgument(String),
+    Expression,
+}
+
+impl std::fmt::Display for PrefixDependency {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reference { path, through } => {
+                write!(formatter, "'{path}'")?;
+                if let Some(alias) = through {
+                    write!(formatter, " (through '{alias}')")?;
+                }
+                Ok(())
+            }
+            Self::ModuleArgument(name) | Self::UnboundModuleArgument(name) => {
+                write!(formatter, "module argument '{name}'")
+            }
+            Self::Expression => formatter.write_str("an apply-time value"),
+        }
+    }
+}
+
+impl std::fmt::Display for DeferredPrefixDependencies {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.first.fmt(formatter)?;
+        for dependency in &self.rest {
+            write!(formatter, " and {dependency}")?;
+        }
+        Ok(())
+    }
+}
+
 impl AttributePrefixError {
+    /// A module template cannot decide whether its caller supplies a known
+    /// prefix. Keep its owner out of ordinary admission and check the actual
+    /// value after substitution, rather than rejecting every caller in preflight.
+    pub(crate) fn needs_module_arguments(&self) -> bool {
+        match &self.failure {
+            AttributePrefixFailure::Deferred { dependencies, .. } => {
+                std::iter::once(&dependencies.first)
+                    .chain(&dependencies.rest)
+                    .all(|dependency| {
+                        matches!(dependency, PrefixDependency::UnboundModuleArgument(_))
+                    })
+            }
+            AttributePrefixFailure::Empty | AttributePrefixFailure::Conflict(_) => false,
+        }
+    }
+
     pub(crate) fn resource_id(&self) -> &ResourceId {
         &self.resource
     }
     pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
         self.location.as_ref()
     }
+
+    /// The same semantic finding is rendered by validate JSON and the LSP.
+    /// Existing empty/conflict messages retain their resource-label decoration.
+    pub fn diagnostic_message(&self) -> String {
+        match &self.failure {
+            AttributePrefixFailure::Deferred { base, dependencies } => format!(
+                "'{}' must be known at plan time to generate '{base}', but it depends on {dependencies}, which is known only after apply",
+                self.prefix
+            ),
+            AttributePrefixFailure::Empty | AttributePrefixFailure::Conflict(_) => self.to_string(),
+        }
+    }
 }
 impl std::fmt::Display for AttributePrefixError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.conflict {
-            None => write!(
+        match &self.failure {
+            AttributePrefixFailure::Empty => write!(
                 formatter,
                 "{}: '{}' cannot be empty",
                 self.resource, self.prefix
             ),
-            Some(base) => write!(
+            AttributePrefixFailure::Conflict(base) => write!(
                 formatter,
                 "{}: cannot specify both '{}' and '{}'",
                 self.resource, self.prefix, base
             ),
+            AttributePrefixFailure::Deferred { .. } => {
+                write!(
+                    formatter,
+                    "{}: {}",
+                    self.resource,
+                    self.diagnostic_message()
+                )
+            }
         }
     }
 }
