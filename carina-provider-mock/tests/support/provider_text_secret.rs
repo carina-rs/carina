@@ -2,8 +2,7 @@
 //! serialization boundary as WASM errors; plaintext comes from checked inputs.
 #![allow(dead_code)] // Each consuming integration-test binary uses a subset.
 
-#[path = "../../../carina-core/tests/support/provider_text.rs"]
-pub mod text_fixtures;
+pub use carina_core::test_utils::provider_text as text_fixtures;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use text_fixtures::NativeWireFixture;
@@ -32,11 +31,17 @@ pub const PUBLIC: &str = "public-value-4305";
 pub enum Failure {
     CreateMessage,
     CreateCause,
+    DebugCreate,
+    CreateEvents,
+    NormalizeEvents,
+    TagEvents,
+    ResumeTagEvents,
     Update,
     Delete,
     Refresh,
     RecoveryRefresh,
     DataSource,
+    DataSourceEvents,
     ConfigCause,
     JsonEscaped,
     Repeated,
@@ -77,6 +82,7 @@ pub struct EchoMock {
     // credential received during initialization or a prior successful create.
     password: Mutex<Option<String>>,
     deletes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    diagnostics: Option<carina_core::provider_text::ProviderDiagnosticChannel>,
 }
 
 impl EchoMock {
@@ -87,6 +93,7 @@ impl EchoMock {
             failure,
             password: Mutex::new(None),
             deletes: Default::default(),
+            diagnostics: None,
         }
     }
 
@@ -96,6 +103,42 @@ impl EchoMock {
     ) -> Self {
         self.deletes = deletes;
         self
+    }
+
+    pub fn with_diagnostics(
+        mut self,
+        diagnostics: carina_core::provider_text::ProviderDiagnosticChannel,
+    ) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    // Deliberately change the received bytes: exact-byte redaction cannot hide
+    // these events. Only the inventory of protected value paths can do so.
+    fn emit_observed(
+        &self,
+        id: &ResourceId,
+        path: &[String],
+        candidate: carina_core::resource::Value,
+    ) {
+        use carina_core::provider_text::{
+            EventLevel, ProviderEvent, ProviderValueDiagnostic, ValueOrigin,
+        };
+        let id = carina_core::protocol_convert::resource_id_to_protocol(id);
+        let proof = candidate
+            .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification()
+            .into_known()
+            .unwrap();
+        let candidate = carina_core::protocol_convert::try_core_to_protocol_value(&proof).unwrap();
+        self.diagnostics
+            .as_ref()
+            .expect("factory-installed channel")
+            .emit(ProviderEvent::value(
+                EventLevel::Warn,
+                ProviderValueDiagnostic::typed(Some(&id), path, ValueOrigin::Observed, &candidate),
+            ));
     }
     fn remembered_password(&self) -> String {
         self.password
@@ -168,8 +211,35 @@ impl Provider for EchoMock {
         &self,
         resource: &ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        assert_eq!(self.failure, Failure::DataSource);
+        assert!(matches!(
+            self.failure,
+            Failure::DataSource | Failure::DataSourceEvents
+        ));
         let plaintext = password(resource.wire_attributes());
+        if self.failure == Failure::DataSourceEvents {
+            use carina_core::provider_text::{
+                EventLevel, ProviderEvent, ProviderValueDiagnostic, ValueOrigin,
+            };
+            let id = carina_core::protocol_convert::resource_id_to_protocol(&resource.id);
+            let changed: String = plaintext.chars().rev().collect();
+            for (name, value) in [
+                ("password", serde_json::json!(changed)),
+                ("strings", serde_json::json!([changed])),
+            ] {
+                self.diagnostics
+                    .as_ref()
+                    .expect("factory-installed channel")
+                    .emit(ProviderEvent::value(
+                        EventLevel::Warn,
+                        ProviderValueDiagnostic::json(
+                            Some(&id),
+                            &[name.into()],
+                            ValueOrigin::Observed,
+                            &value,
+                        ),
+                    ));
+            }
+        }
         let error = self.error("data source read", &plaintext);
         Box::pin(async { Err(error) })
     }
@@ -180,6 +250,15 @@ impl Provider for EchoMock {
         request: CreateRequest,
         attempt: CreateAttempt,
     ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+        if self.failure == Failure::CreateEvents
+            && request
+                .resource()
+                .wire_attributes()
+                .get("name")
+                .is_some_and(|value| wire_string(value) == "producer")
+        {
+            return self.inner.create(id, request, attempt);
+        }
         let plaintext = if self.failure == Failure::ScalarStatus {
             "3".to_owned()
         } else {
@@ -233,6 +312,58 @@ impl Provider for EchoMock {
                 ProviderError::api_error("mock create rejected password 3 true").with_status(403)
             }
             Failure::CreateMessage => self.error("create", &plaintext),
+            Failure::DebugCreate => ProviderError::api_error(format!(
+                "mock create debug password {:?}",
+                request.resource().as_resource().attributes["password"]
+            )),
+            Failure::CreateEvents | Failure::NormalizeEvents => {
+                use carina_core::resource::{ConcreteValue, Value};
+                let changed: String = plaintext.chars().rev().collect();
+                self.emit_observed(
+                    id,
+                    &["password".into()],
+                    Value::Concrete(ConcreteValue::String(changed.clone().into())),
+                );
+                self.emit_observed(
+                    id,
+                    &["strings".into()],
+                    Value::Concrete(ConcreteValue::StringList(vec![changed.into()])),
+                );
+                self.error("create", &plaintext)
+            }
+            Failure::ResumeTagEvents => {
+                let error = ProviderError::api_error("fixture create remains pending");
+                return Box::pin(async {
+                    Err(attempt
+                        .pending(
+                            carina_core::provider::PendingToken::new("event-resume"),
+                            carina_core::provider::Sent::AllRequestAttributes,
+                            0,
+                        )
+                        .preserve(error))
+                });
+            }
+            Failure::TagEvents => {
+                use carina_core::resource::{ConcreteValue, Value};
+                let tags = serde_json::to_value(
+                    request
+                        .resource()
+                        .wire_attributes()
+                        .get("tags")
+                        .unwrap()
+                        .value(),
+                )
+                .unwrap();
+                let private = tags["Private"].as_str().unwrap();
+                self.emit_observed(
+                    id,
+                    &["tags".into(), "Private".into()],
+                    Value::Concrete(ConcreteValue::String(
+                        private.chars().rev().collect::<String>().into(),
+                    )),
+                );
+                self.error("create", private)
+            }
             Failure::CreateCause => round_trip(ProviderError::api_error_caused_by(
                 "mock create rejected password",
                 std::io::Error::other(format!("invalid password {plaintext}; public={PUBLIC}")),
@@ -254,6 +385,35 @@ impl Provider for EchoMock {
         &self,
         request: ResumeCreateRequest,
     ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+        if self.failure == Failure::ResumeTagEvents {
+            use carina_core::resource::{ConcreteValue, Value};
+            let id = request.id().clone();
+            let (resume, request) = request.into_parts();
+            let tags = serde_json::to_value(
+                request
+                    .resource()
+                    .wire_attributes()
+                    .get("tags")
+                    .unwrap()
+                    .value(),
+            )
+            .unwrap();
+            let private = tags["Private"].as_str().unwrap();
+            self.emit_observed(
+                &id,
+                &["tags".into(), "Private".into()],
+                Value::Concrete(ConcreteValue::String(
+                    private.chars().rev().collect::<String>().into(),
+                )),
+            );
+            let error = self.error("resume", private);
+            return Box::pin(async {
+                Err(match resume {
+                    carina_core::provider::Resume::Unissued(attempt) => attempt.preserve(error),
+                    carina_core::provider::Resume::Issued(issued) => issued.preserve(error),
+                })
+            });
+        }
         self.inner.resume_create(request)
     }
 
@@ -340,7 +500,7 @@ impl ProviderFactory for EchoFactory {
         config: &carina_core::provider::ProviderSession,
         _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        let provider = EchoMock::new(self.0);
+        let provider = EchoMock::new(self.0).with_diagnostics(config.diagnostics());
         let config = config.configuration();
         if config.wire_attributes().get("password").is_some() {
             *provider.password.lock().unwrap() = Some(password(config.wire_attributes()));
@@ -348,11 +508,39 @@ impl ProviderFactory for EchoFactory {
         Box::pin(async { Ok(InitializeOutcome::unavailable().with_provider(Box::new(provider))) })
     }
 
+    fn create_normalizer(
+        &self,
+        _config: &carina_core::provider::ProviderSession,
+        _: InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>> {
+        let normalizer: Box<dyn carina_core::provider::ProviderNormalizer> =
+            if self.0 == Failure::NormalizeEvents {
+                Box::new(CopyPasswordNormalizer)
+            } else {
+                Box::new(carina_core::provider::NoopNormalizer)
+            };
+        Box::pin(async { Ok(normalizer) })
+    }
+
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
         vec![
             ResourceSchema::new("test.resource")
                 .attribute(AttributeSchema::required("name", AttributeType::string()).build())
                 .attribute(AttributeSchema::optional("password", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                        .build(),
+                )
+                .attribute(
+                    AttributeSchema::optional(
+                        "strings",
+                        AttributeType::union(vec![
+                            AttributeType::string(),
+                            AttributeType::list(AttributeType::string()),
+                        ]),
+                    )
+                    .build(),
+                )
                 .attribute(AttributeSchema::optional("numeric", AttributeType::int()).build())
                 .attribute(AttributeSchema::optional("boolean", AttributeType::bool()).build())
                 .attribute(
@@ -363,6 +551,16 @@ impl ProviderFactory for EchoFactory {
             ResourceSchema::new("test.lookup")
                 .as_data_source()
                 .attribute(AttributeSchema::required("password", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional(
+                        "strings",
+                        AttributeType::union(vec![
+                            AttributeType::string(),
+                            AttributeType::list(AttributeType::string()),
+                        ]),
+                    )
+                    .build(),
+                )
                 .validate()
                 .unwrap(),
         ]
@@ -389,4 +587,39 @@ pub fn schemas() -> SchemaRegistry {
         schemas.insert("mock", schema);
     }
     schemas
+}
+
+struct CopyPasswordNormalizer;
+impl carina_core::provider::ProviderNormalizer for CopyPasswordNormalizer {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [carina_core::resource::ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for resource in resources {
+                if let Some(password) = resource.attributes.get("password").cloned() {
+                    resource.attributes.insert(
+                        "strings".into(),
+                        carina_core::resource::Value::Concrete(
+                            carina_core::resource::ConcreteValue::List(vec![password]),
+                        ),
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+    fn normalize_state<'a>(
+        &'a self,
+        _states: &'a mut carina_core::provider::StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _states: &'a mut carina_core::provider::StateTransformMap,
+        _saved: &'a carina_core::provider::SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }

@@ -5,6 +5,338 @@ use crate::schema::{AttributeSchema, AttributeType, ResourceSchema as DraftSchem
 const PLAINTEXT: &str = "apply-admission-secret-plaintext";
 const MAP_KEY: &str = "apply-admission-private-map-key";
 
+#[derive(Clone, Copy)]
+enum UniqueListEntry {
+    Resource,
+    DataSource,
+}
+
+async fn prepare_parsed_unique_list(
+    expression: &str,
+    entry: UniqueListEntry,
+) -> Result<(), ProviderPreparationError> {
+    let parser = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut parsed = crate::parser::parse(&format!("let value = {expression}"), &parser).unwrap();
+    crate::parser::resolve_resource_refs_with_config(&mut parsed, &parser).unwrap();
+    let value = parsed
+        .variables
+        .shift_remove("value")
+        .unwrap()
+        .resolve_root(&crate::resource::RootScope::new())
+        .into_expanded()
+        .unwrap();
+    let mut schemas = SchemaRegistry::new();
+    for schema in [
+        DraftSchema::new("UniqueStrings"),
+        DraftSchema::new("UniqueStrings").as_data_source(),
+    ] {
+        schemas.insert(
+            "test",
+            schema
+                .attribute(
+                    AttributeSchema::required(
+                        "value",
+                        AttributeType::refined_list(
+                            AttributeType::string(),
+                            true,
+                            None,
+                            crate::schema::ListElements::Unique,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+    }
+    let bindings = ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |session| {
+            let context = ProviderPreparationContext::for_test(
+                &bindings,
+                &gate,
+                &[],
+                &crate::provider::NoopNormalizer,
+                &schemas,
+                session,
+            );
+            match entry {
+                UniqueListEntry::Resource => prepare_provider_ready_resource(
+                    Resource::with_provider("test", "UniqueStrings", "item", None)
+                        .with_attribute("value", value),
+                    &context,
+                )
+                .await
+                .map(|_| ()),
+                UniqueListEntry::DataSource => prepare_provider_ready_data_source(
+                    DataSource::with_provider("test", "UniqueStrings", "item", None)
+                        .with_attribute("value", value),
+                    &context,
+                )
+                .map(|_| ()),
+            }
+        },
+    )
+    .await
+}
+
+async fn assert_unique_dispatch_succeeds(expression: &str, entry: UniqueListEntry) {
+    assert_eq!(
+        prepare_parsed_unique_list(expression, entry)
+            .await
+            .map_err(|error| error.to_string()),
+        Ok(())
+    );
+}
+
+async fn assert_ordinary_dispatch_duplicate(entry: UniqueListEntry) {
+    let error = prepare_parsed_unique_list("['a', 'a']", entry)
+        .await
+        .unwrap_err();
+    let ProviderPreparationError::ValueConstraint { mut errors, .. } = error else {
+        panic!("expected an ordinary duplicate finding: {error:?}");
+    };
+    let actual = errors
+        .0
+        .take_attribute("value")
+        .unwrap()
+        .into_located()
+        .into_iter()
+        .map(|(path, error)| (path.to_string(), error.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [(
+            "[1]".to_string(),
+            "Duplicate list element 'a' at index 1 (first at index 0)".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_resource_secret_elements() {
+    assert_unique_dispatch_succeeds("[secret('a'), secret('a')]", UniqueListEntry::Resource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_resource_whole_secret() {
+    assert_unique_dispatch_succeeds("secret(['a', 'a'])", UniqueListEntry::Resource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_resource_mixed_secret() {
+    assert_unique_dispatch_succeeds("[secret('a'), 'a']", UniqueListEntry::Resource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_resource_ordinary_duplicate() {
+    assert_ordinary_dispatch_duplicate(UniqueListEntry::Resource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_data_source_secret_elements() {
+    assert_unique_dispatch_succeeds("[secret('a'), secret('a')]", UniqueListEntry::DataSource)
+        .await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_data_source_whole_secret() {
+    assert_unique_dispatch_succeeds("secret(['a', 'a'])", UniqueListEntry::DataSource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_data_source_mixed_secret() {
+    assert_unique_dispatch_succeeds("[secret('a'), 'a']", UniqueListEntry::DataSource).await;
+}
+
+#[tokio::test]
+async fn dispatch_unique_string_list_data_source_ordinary_duplicate() {
+    assert_ordinary_dispatch_duplicate(UniqueListEntry::DataSource).await;
+}
+
+#[test]
+fn prepared_data_source_attributes_identity_batch_keeps_debug_mask() {
+    let parser = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed =
+        crate::parser::parse("let value = secret('normalization-private-token')", &parser).unwrap();
+    let value = parsed.variables["value"]
+        .clone()
+        .resolve_root(&crate::resource::RootScope::new())
+        .into_expanded()
+        .unwrap();
+    let source =
+        DataSource::with_provider("test", "Sink", "item", None).with_attribute("value", value);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        DraftSchema::new("Sink")
+            .as_data_source()
+            .attribute(AttributeSchema::required("value", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let bindings = ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    crate::validation::deferred_types::with_session_for_test(&parser, |session| {
+        let context = ProviderPreparationContext::for_test(
+            &bindings,
+            &gate,
+            &[],
+            &crate::provider::NoopNormalizer,
+            &schemas,
+            session,
+        );
+        let ready = prepare_provider_ready_data_source(source, &context).unwrap();
+        // Copy prepared data-source attributes into a resource and return an
+        // unchanged NormalizationBatch; this does not call ConfiguredNormalizer.
+        let mut resource =
+            Resource::with_provider("test", "Sink", "item", None).into_provider_resource();
+        resource.attributes = ready.attributes.clone();
+        let batch = crate::desired::NormalizationBatch::new(&[resource]).unwrap();
+        let returned = batch.resources().to_vec();
+        let restored = batch.finish(returned).unwrap();
+        assert_eq!(
+            format!("{:?}", restored[0]["value"]),
+            "Concrete(String(<sensitive string>))"
+        );
+    });
+}
+
+#[tokio::test]
+async fn dispatch_secret_schema_failures_keep_exact_boundary_messages() {
+    use crate::schema::{PatternMatch, PatternSpec, legacy_validator};
+
+    let parser = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut parsed =
+        crate::parser::parse("let value = secret('dispatch-private-token')", &parser).unwrap();
+    crate::parser::resolve_resource_refs_with_config(&mut parsed, &parser).unwrap();
+    let value = parsed.variables["value"]
+        .clone()
+        .resolve_root(&crate::resource::RootScope::new())
+        .into_expanded()
+        .unwrap();
+    for (attribute, expected) in [
+        (
+            AttributeType::refined_string(
+                None,
+                Some(PatternSpec::new("allowed", PatternMatch::Full)),
+                None,
+                None,
+            ),
+            "Invalid value (secret): does not match required pattern /allowed/ (Full)",
+        ),
+        (
+            AttributeType::refined_string(None, None, Some((None, Some(3))), None),
+            "Invalid value (secret): length 22 is outside allowed range unbounded..=3",
+        ),
+        (
+            AttributeType::enum_(
+                TypeIdentity::bare("Mode"),
+                Some(vec!["Allowed".into()]),
+                vec![],
+                None,
+                None,
+            ),
+            "Mode expects an enum identifier, got a string literal (secret). Use one of: Allowed",
+        ),
+        (
+            AttributeType::refined_string_with_validator(
+                TypeIdentity::bare("Token"),
+                None,
+                None,
+                legacy_validator(|value| {
+                    Err(format!("rejected {}", crate::value::format_value(value)).into())
+                }),
+                None,
+            ),
+            "Validation failed: (secret) failed validation",
+        ),
+    ] {
+        let mut schemas = SchemaRegistry::new();
+        for schema in [
+            DraftSchema::new("Sink"),
+            DraftSchema::new("Sink").as_data_source(),
+        ] {
+            schemas.insert(
+                "test",
+                schema
+                    .attribute(AttributeSchema::required("value", attribute.clone()).build())
+                    .validate()
+                    .unwrap(),
+            );
+        }
+        let bindings = ResolvedBindings::default();
+        let gate = ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |session| {
+                let context = ProviderPreparationContext::for_test(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &schemas,
+                    session,
+                );
+                let errors = [
+                    prepare_provider_ready_resource(
+                        Resource::with_provider("test", "Sink", "item", None)
+                            .with_attribute("value", value.clone()),
+                        &context,
+                    )
+                    .await
+                    .unwrap_err(),
+                    prepare_provider_ready_data_source(
+                        DataSource::with_provider("test", "Sink", "item", None)
+                            .with_attribute("value", value.clone()),
+                        &context,
+                    )
+                    .unwrap_err(),
+                ];
+                for error in errors {
+                    assert!(!format!("{error:?}").contains("dispatch-private-token"));
+                    let ProviderPreparationError::ValueConstraint { mut errors, .. } = error else {
+                        panic!("expected dispatch membership error")
+                    };
+                    let findings = errors.0.take_attribute("value").unwrap().into_located();
+                    assert_eq!(
+                        findings
+                            .into_iter()
+                            .map(|(path, error)| (path.to_string(), error.to_string()))
+                            .collect::<Vec<_>>(),
+                        [(String::new(), expected.to_string())]
+                    );
+                }
+                // Use the owning production dispatch constructor. It retains
+                // the DSL value for diagnostics and strips its annotation for
+                // the exact payload admitted below.
+                let source = DataSource::with_provider("test", "Sink", "item", None)
+                    .with_attribute("value", value.clone())
+                    .into_provider_data_source();
+                let schema = schemas.get_for_data_source(&source).unwrap();
+                let input = DispatchPayload::data_source(ResolvedDataSource::new(source));
+                let error = admit_dispatch(input, None, schema, &bindings, session).unwrap_err();
+                assert!(!format!("{error:?}").contains("dispatch-private-token"));
+                let ProviderPreparationError::FinalInput(
+                    crate::validation::admission::final_input::FinalInputError::Membership {
+                        path,
+                        error,
+                        ..
+                    },
+                ) = error
+                else {
+                    panic!("expected final dispatch membership error")
+                };
+                assert_eq!(path.to_string(), "value");
+                assert_eq!(error.to_string(), expected);
+            },
+        )
+        .await;
+    }
+}
+
 fn text(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
 }

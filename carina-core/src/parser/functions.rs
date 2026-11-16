@@ -9,7 +9,6 @@ use super::types::parse_type_expr;
 use super::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
 use super::{ProviderContext, Rule, is_static_eval, parse_expression};
 use crate::eval_value::{EvalValue, UnexpandedStructuralHandleKind};
-use crate::resource::InsideSecret;
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder, PlaceholderKind,
     Value as GenericValue, ValueString,
@@ -810,7 +809,6 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
     // The resolved witness can cross a catalog boundary (including serde).
     // Retain its constraints even when the current catalog is less restrictive.
     if let Some(witness) = witness {
-        let sensitive = value.contains_diagnostic_sensitive_string();
         let invalid_value = |error: crate::schema::TypeError| {
             super::CustomTypeValidationError::InvalidDeclarationValue {
                 owner: owned
@@ -819,11 +817,7 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
                     .expect("nonempty owners")
                     .into(),
                 identity: owned.identity().clone(),
-                error: Box::new(if sensitive {
-                    error.inside_secret()
-                } else {
-                    error
-                }),
+                error: Box::new(error),
             }
         };
         let enumeration = match projection.as_ref() {

@@ -676,14 +676,11 @@ pub(crate) fn parse_for_expr(
                 format!("for-binding '{binding}'")
             } else {
                 match &iterable {
-                    Value::Concrete(ConcreteValue::String(s)) => match s.diagnostic_literal() {
-                        Some(s) => {
-                            let (truncated, marker) =
-                                crate::utils::truncate_chars_for_display(s, 50);
-                            format!("string {}{marker}", display_string_literal(&truncated))
-                        }
-                        None => "string".to_string(),
-                    },
+                    Value::Concrete(ConcreteValue::String(s)) => {
+                        let (truncated, marker) =
+                            crate::utils::truncate_chars_for_display(s.expose_plaintext(), 50);
+                        format!("string {}{marker}", display_string_literal(&truncated))
+                    }
                     Value::Concrete(ConcreteValue::EnumIdentifier(s)) => {
                         let (truncated, marker) =
                             crate::utils::truncate_chars_for_display(s.as_str(), 50);

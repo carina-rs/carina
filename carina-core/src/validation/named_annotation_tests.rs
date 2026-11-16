@@ -975,7 +975,7 @@ fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
     }
 }
 
-fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
+fn assert_enum_witness_shows_env_and_masks_secret_value(base: DraftType, expected: &str) {
     let open_enum = |base| DraftType::enum_with_base(identity(), base, None, vec![], None, None);
     let strict = snapshot(vec![("p", vec![open_enum(base)])]);
     let lax = snapshot(vec![("p", vec![open_enum(DraftType::string())])]);
@@ -993,10 +993,25 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
     crate::parser::resolve_resource_refs_with_config(&mut parsed, context.as_provider_context())
         .unwrap();
     let env_value = parsed.resources[0].get_attr("value0").unwrap();
-    assert!(env_value.contains_diagnostic_sensitive_string());
+    assert!(!env_value.contains_diagnostic_sensitive_string());
+    let mut secret_parsed = crate::parser::parse(
+        "let source = p.Values { value0 = secret(env('ANNOTATION_SECRET')) }",
+        context.as_provider_context(),
+    )
+    .unwrap();
+    crate::parser::resolve_resource_refs_with_config(
+        &mut secret_parsed,
+        context.as_provider_context(),
+    )
+    .unwrap();
+    let secret_value = secret_parsed.resources[0].get_attr("value0").unwrap();
     let ty: TypeExpr =
         serde_json::from_value(serde_json::to_value(annotation(&strict)).unwrap()).unwrap();
-    for value in [env_value, &text(plaintext)] {
+    for (value, hidden) in [
+        (env_value, false),
+        (&text(plaintext), false),
+        (secret_value, true),
+    ] {
         let error = typecheck::check_type_expr_value(
             &ty,
             value,
@@ -1008,26 +1023,28 @@ fn assert_enum_witness_masks_env_value(base: DraftType, expected: &str) {
         .require_provider_schemas()
         .expect_err("the retained witness must reject the value");
         let message = error.to_string();
-        assert!(message.contains(expected), "{message}");
-        if value.contains_diagnostic_sensitive_string() {
+        if hidden {
             assert!(!message.contains(plaintext), "secret leaked: {message}");
             assert!(!format!("{error:?}").contains(plaintext));
-            assert!(message.contains("(secret)"), "{message}");
-            assert!(!message.contains("'(secret)'"), "{message}");
+            assert_eq!(message, "expected aws.iam.Role.Name, got secret");
         } else {
+            assert_eq!(message, expected);
             assert!(message.contains(plaintext), "{message}");
         }
     }
 }
 
 #[test]
-fn review_enum_witness_length_error_masks_env_value() {
-    assert_enum_witness_masks_env_value(string(2, 4, None), "outside allowed range 2..=4");
+fn review_enum_witness_length_error_shows_env_and_masks_secret_value() {
+    assert_enum_witness_shows_env_and_masks_secret_value(
+        string(2, 4, None),
+        "expected aws.iam.Role.Name, got string 'private-token': p rejected `aws.iam.Role.Name`: Invalid Name value 'private-token': length 13 is outside allowed range 2..=4",
+    );
 }
 
 #[test]
-fn review_enum_witness_pattern_error_masks_env_value() {
-    assert_enum_witness_masks_env_value(
+fn review_enum_witness_pattern_error_shows_env_and_masks_secret_value() {
+    assert_enum_witness_shows_env_and_masks_secret_value(
         string(
             1,
             32,
@@ -1036,7 +1053,7 @@ fn review_enum_witness_pattern_error_masks_env_value() {
                 crate::schema::PatternMatch::Full,
             )),
         ),
-        "required pattern",
+        "expected aws.iam.Role.Name, got string 'private-token': p rejected `aws.iam.Role.Name`: Invalid Name value 'private-token': does not match required pattern /^[A-Z]+$/ (Full)",
     );
 }
 
