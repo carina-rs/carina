@@ -1823,7 +1823,7 @@ mod plan_save_error_rendering_tests {
         assert_eq!(rendered.exit_code, 1);
         assert_eq!(
             rendered.stderr,
-            "Error: Cannot save plan: a user-defined function call still needs its declared types checked against values available only during apply. A saved plan cannot carry this call.\nError: Run `carina apply` directly on the project, without a saved plan.\n"
+            "Error: Cannot save plan: the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call.\nError: Run `carina apply` directly on the project, without a saved plan.\n"
         );
     }
 }

@@ -1,68 +1,5 @@
 use super::*;
-use std::io::{Read, Seek, Write};
-use std::os::fd::AsRawFd;
-
-pub(super) struct CapturedOutput {
-    stdout: std::fs::File,
-    stderr: std::fs::File,
-    saved_stdout: libc::c_int,
-    saved_stderr: libc::c_int,
-}
-impl CapturedOutput {
-    pub(super) fn start() -> Self {
-        std::io::stdout().flush().unwrap();
-        std::io::stderr().flush().unwrap();
-        let stdout = tempfile::tempfile().unwrap();
-        let stderr = tempfile::tempfile().unwrap();
-        // Each nextest test runs in its own process. Restore both descriptors
-        // before inspecting any captured diagnostic.
-        let (saved_stdout, saved_stderr) = unsafe {
-            let out = libc::dup(libc::STDOUT_FILENO);
-            let err = libc::dup(libc::STDERR_FILENO);
-            assert!(out >= 0 && err >= 0);
-            assert!(libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) >= 0);
-            assert!(libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) >= 0);
-            (out, err)
-        };
-        Self {
-            stdout,
-            stderr,
-            saved_stdout,
-            saved_stderr,
-        }
-    }
-    pub(super) fn finish(mut self) -> (String, String) {
-        self.restore();
-        let mut out = String::new();
-        let mut err = String::new();
-        self.stdout.rewind().unwrap();
-        self.stderr.rewind().unwrap();
-        self.stdout.read_to_string(&mut out).unwrap();
-        self.stderr.read_to_string(&mut err).unwrap();
-        (out, err)
-    }
-    fn restore(&mut self) {
-        if self.saved_stdout >= 0 {
-            std::io::stdout().flush().unwrap();
-            std::io::stderr().flush().unwrap();
-            unsafe {
-                libc::dup2(self.saved_stdout, libc::STDOUT_FILENO);
-                libc::dup2(self.saved_stderr, libc::STDERR_FILENO);
-                libc::close(self.saved_stdout);
-                libc::close(self.saved_stderr);
-            }
-            self.saved_stdout = -1;
-            self.saved_stderr = -1;
-        }
-    }
-}
-impl Drop for CapturedOutput {
-    fn drop(&mut self) {
-        self.restore();
-    }
-}
-
-pub(super) const SECRET_PROBE: &str = "review2-private-cobalt-784531";
+pub(super) const SECRET_PROBE: &str = "declared-secret-cobalt-784531";
 
 pub(super) fn assert_no_secret(text: &str, surface: &str) {
     assert!(
@@ -71,7 +8,7 @@ pub(super) fn assert_no_secret(text: &str, surface: &str) {
     );
 }
 pub(super) fn secret_case(interpolation: bool) -> Case {
-    let mut case = measured_case("c2-module-upstream-param-identity-late-invalid");
+    let mut case = fixture_case("c2-module-upstream-param-identity-late-invalid");
     case.child = Some(if interpolation {
         format!(
             "arguments {{ label: String }}\nlet src = test.Thing {{ name = 'src' plain = secret('{SECRET_PROBE}') }}\nfn g(r: test.Thing): test.Name {{ \"prefix-${{r.plain}}\" }}\ntest.Sink {{ name = 'sink' value = g(src) }}\n"
@@ -90,16 +27,14 @@ async fn secret_commands(save: bool) {
         for apply in [false, true] {
             let directory = Directory::new(&secret_case(interpolation));
             let saved = directory.path().join("secret.plan.json");
-            let capture = CapturedOutput::start();
+
             let result = if apply {
                 directory.apply().await.map(|()| false)
             } else {
                 directory.plan(if save { Some(&saved) } else { None }).await
             };
             let diagnostic = rendered(&result);
-            let (stdout, stderr) = capture.finish();
-            assert_no_secret(&stdout, "stdout");
-            assert_no_secret(&stderr, "stderr");
+
             assert_no_secret(&diagnostic, "diagnostic");
             for (file, surface) in [
                 (directory.path().join("state.json"), "state"),
@@ -145,7 +80,7 @@ async fn secret_parameter_and_interpolation_plan_out() {
     secret_commands(true).await;
 }
 async fn unused_handle_secret(computed: bool) {
-    let mut case = measured_case("c1-handle-late-invalid");
+    let mut case = fixture_case("c1-handle-late-invalid");
     case.emitted = "allowed".into();
     let db = if computed {
         "let db = test.Thing { name = 'db' }\n".to_owned()
@@ -157,12 +92,10 @@ async fn unused_handle_secret(computed: bool) {
     if computed {
         *directory.fixture.private.lock().unwrap() = Some(SECRET_PROBE.into());
     }
-    let capture = CapturedOutput::start();
+
     let seeded = directory.apply().await;
     let seeded_error = rendered(&seeded);
-    let (stdout, stderr) = capture.finish();
-    assert_no_secret(&stdout, "stdout");
-    assert_no_secret(&stderr, "stderr");
+
     assert_no_secret(&seeded_error, "diagnostic");
     let state = std::fs::read_to_string(directory.path().join("state.json")).unwrap();
     assert_no_secret(&state, "state");
@@ -172,18 +105,13 @@ async fn unused_handle_secret(computed: bool) {
         "sensitive output must persist only as a hash"
     );
     std::fs::write(directory.path().join("main.crn"), format!("{db}let other = test.Thing {{ name = 'other' }}\nfn f(r: test.Thing, x: test.Name): String {{ x }}\ntest.Sink {{ name = 'sink' value = f(db, other.emitted) }}\n")).unwrap();
-    let capture = CapturedOutput::start();
+
     let planned = directory.plan(None).await;
     let applied = directory.apply().await;
     let plan_error = rendered(&planned);
     let apply_error = rendered(&applied);
-    let (stdout, stderr) = capture.finish();
-    for (text, surface) in [
-        (&stdout, "stdout"),
-        (&stderr, "stderr"),
-        (&plan_error, "diagnostic"),
-        (&apply_error, "diagnostic"),
-    ] {
+
+    for (text, surface) in [(&plan_error, "diagnostic"), (&apply_error, "diagnostic")] {
         assert_no_secret(text, surface);
     }
     assert_no_secret(
@@ -212,33 +140,15 @@ async fn late_rejection_refresh_and_destroy() {
         "c2-module-handle-param-const-late-invalid",
         "c1-handle-late-invalid",
     ] {
-        let directory = Directory::new(&measured_case(name));
+        let directory = Directory::new(&fixture_case(name));
         let rejected = directory.apply().await;
         directory.assert_unlocked().await;
         let state = std::fs::read_to_string(directory.path().join("state.json")).unwrap();
         assert!(state.contains("bad-name"));
         let planned = directory.plan(None).await;
         directory.assert_unlocked().await;
-        let refreshed = commands::state::run_state_refresh(
-            &directory.runtime,
-            directory.path(),
-            true,
-            &directory.context(),
-            ShutdownToken::running(),
-        )
-        .await;
-        let destroyed = commands::destroy::run_destroy(
-            &directory.runtime,
-            directory.path(),
-            true,
-            true,
-            true,
-            false,
-            crate::DEFAULT_PARALLELISM,
-            &directory.context(),
-            ShutdownToken::running(),
-        )
-        .await;
+        let refreshed = directory.refresh().await;
+        let destroyed = directory.destroy().await;
         assert!(rejected.is_err(), "late apply must reject");
         assert!(
             planned.is_err(),
@@ -260,7 +170,7 @@ async fn late_rejection_refresh_and_destroy() {
 #[tokio::test]
 async fn retained_module_attribute() {
     for valid in [true, false] {
-        let mut case = measured_case("c2-module-upstream-param-identity-late-invalid");
+        let mut case = fixture_case("c2-module-upstream-param-identity-late-invalid");
         case.main
             .push_str("test.Sink { name = 'sink' value = instance.output }\n");
         case.child = Some("arguments { label: String }\nlet src = test.Thing { name = 'src' }\nfn g(x: test.Name): String { x }\nattributes { output: String = g(src.emitted) }\n".into());
@@ -281,7 +191,7 @@ async fn retained_module_attribute() {
 #[tokio::test]
 async fn nested_call_error_has_one_prefix() {
     for module in [false, true] {
-        let mut case = measured_case("c1-handle-late-invalid");
+        let mut case = fixture_case("c1-handle-late-invalid");
         let body = "let src = test.Thing { name = 'src' }\nfn inner(x: test.Name): String { x }\nfn outer(x) { 'ignored' }\ntest.Sink { name = 'sink' value = outer(inner(src.emitted)) }\n";
         let line = if module {
             case.main = "let child = use { source = './child' }\nlet instance = child { label = 'module' }\n".into();
@@ -314,29 +224,13 @@ async fn retained_plan_json() {
             "expected test.Name",
         ),
     ] {
-        let directory = Directory::new(&measured_case(name));
-        let capture = CapturedOutput::start();
-        let result = commands::plan::run_plan(
-            &directory.runtime,
-            directory.path(),
-            None,
-            None,
-            None,
-            crate::DetailLevel::None,
-            false,
-            false,
-            true,
-            false,
-            false,
-            &directory.context(),
-        )
-        .await;
+        let directory = Directory::new(&fixture_case(name));
+
+        let result = directory.plan_output(None, true).await;
         let diagnostic = rendered(&result);
-        let (stdout, stderr) = capture.finish();
-        assert_no_secret(&stdout, "JSON stdout");
-        assert_no_secret(&stderr, "JSON stderr");
+
         assert_no_secret(&diagnostic, "JSON diagnostic");
-        assert!(stdout.is_empty());
+
         assert!(
             result.is_err(),
             "retained/rejected plans have no JSON artifact"
@@ -376,7 +270,7 @@ async fn non_resource_handle_arguments() {
         } else {
             declaration.into()
         };
-        let mut case = measured_case("c1-handle-late-invalid");
+        let mut case = fixture_case("c1-handle-late-invalid");
         case.main = format!(
             "{declaration}\nlet src = test.Thing {{ name = 'src' }}\nfn f(r, x: test.Name): String {{ x }}\ntest.Sink {{ name = 'sink' value = f(handle, src.emitted) }}\n"
         );
@@ -407,7 +301,7 @@ async fn non_resource_handle_arguments() {
 #[tokio::test]
 async fn retained_export_consumed_upstream() {
     for valid in [true, false] {
-        let mut case = measured_case("c1-handle-late-invalid");
+        let mut case = fixture_case("c1-handle-late-invalid");
         case.main = "let src = test.Thing { name = 'src' }\nfn g(x: test.Name): String { x }\nexports { output: String = g(src.emitted) }\n".into();
         case.emitted = if valid { "allowed" } else { "bad-name" }.into();
         let producer = Directory::new(&case);
@@ -500,11 +394,7 @@ async fn return_annotation_resolution_is_declaration_owned() {
             child: None,
             emitted: "allowed".into(),
         });
-        let validation = commands::validate::collect_validate(
-            Ok(&directory.runtime),
-            directory.path(),
-            Some(&directory.context()),
-        );
+        let validation = directory.validate();
         let planned = directory.plan(None).await;
         assert_ne!(validation.exit_code(), 0);
         assert!(planned.is_err());
@@ -514,11 +404,7 @@ async fn return_annotation_resolution_is_declaration_owned() {
 async fn return_reference_schema_mismatch_precedes_shadow_recheck() {
     let case = Case { name: "shadowed-parameter".into(), main: "let src = test.Thing { name = 'src' }\nfn g(x: 'allowed'): test.Name { let x = 'bad'\nsrc.emitted }\ntest.Sink { name = 'sink' value = g('allowed') }\n".into(), child: None, emitted: "allowed".into() };
     let directory = Directory::new(&case);
-    let validation = commands::validate::collect_validate(
-        Ok(&directory.runtime),
-        directory.path(),
-        Some(&directory.context()),
-    );
+    let validation = directory.validate();
     let plan = directory.plan(None).await;
     let apply = directory.apply().await;
     let message = "function 'g': return value: reference src.emitted: expected test.Name, got String (from src.emitted)";
@@ -534,7 +420,7 @@ async fn return_reference_schema_mismatch_precedes_shadow_recheck() {
 }
 #[tokio::test]
 async fn primitive_module_argument_reaches_runtime_saved_plan_control() {
-    let mut case = measured_case("c2-module-param-identity-late-invalid");
+    let mut case = fixture_case("c2-module-param-identity-late-invalid");
     case.child = Some("arguments { input: String }\nfn g(x: String): String { x }\ntest.Sink { name = 'sink' value = g(input) }\n".into());
     let directory = Directory::new(&case);
     let parsed = carina_core::parser::parse_file(
@@ -561,4 +447,119 @@ async fn primitive_module_argument_reaches_runtime_saved_plan_control() {
         [serde_json::json!("bad-name")]
     );
     directory.assert_unlocked().await;
+}
+
+fn native_output_child(test: &str) -> std::process::Output {
+    let args = ["--exact", test, "--ignored", "--nocapture"];
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(args)
+        .output()
+        .unwrap();
+    for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(SECRET_PROBE),
+            "secret in native command output: args={args:?}, stream={stream}"
+        );
+    }
+    assert!(
+        output.status.success(),
+        "native command worker failed: {test}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "native command worker must execute exactly one test: {test}"
+    );
+    output
+}
+
+#[test]
+fn secret_parameter_and_interpolation_command_output_is_private() {
+    native_output_child("fn_declared_checks_tests::runtime_checks::native_secret_output_worker");
+}
+
+#[test]
+#[ignore = "spawned by the output assertion with isolated stdout/stderr"]
+fn native_secret_output_worker() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            secret_commands(false).await;
+            secret_commands(true).await;
+        });
+}
+
+#[test]
+fn retained_json_has_empty_stdout_and_refusal_hint_plan_out() {
+    let output = native_output_child(
+        "fn_declared_checks_tests::runtime_checks::native_refusal_output_worker_plan_out",
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut json_commands = 0;
+    for following in stdout.split("BEGIN_JSON_COMMAND\n").skip(1) {
+        let (body, _) = following.split_once("END_JSON_COMMAND").unwrap();
+        assert_eq!(body, "", "refused JSON command must print no document");
+        json_commands += 1;
+    }
+    assert_eq!(
+        json_commands, 2,
+        "root and module JSON output were observed"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.matches("Error: Cannot save plan: the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call.\nError: Run `carina apply ").count(),4);
+}
+
+#[test]
+#[ignore = "spawned by the output assertion with isolated stdout/stderr"]
+fn native_refusal_output_worker_plan_out() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for name in [
+                "c1-handle-late-valid",
+                "c2-module-upstream-param-identity-late-valid",
+            ] {
+                let mut case = fixture_case(name);
+                let source = case.child.as_mut().unwrap_or(&mut case.main);
+                *source = source.replace(
+                    "name = 'src'",
+                    &format!("name = 'src' plain = secret('{SECRET_PROBE}')"),
+                );
+                let root = tempfile::Builder::new()
+                    .prefix("plan project ' ")
+                    .tempdir()
+                    .unwrap();
+                let directory = Directory::in_directory(&case, root);
+                let saved = directory.path().join("saved.plan.json");
+                for json in [false, true] {
+                    if json {
+                        println!("BEGIN_JSON_COMMAND");
+                    }
+                    let result = directory
+                        .plan_output(if json { None } else { Some(&saved) }, json)
+                        .await;
+                    if json {
+                        println!("END_JSON_COMMAND");
+                    }
+                    assert!(matches!(
+                        &result,
+                        Err(AppError::RetainedUserFunctionCall { .. })
+                    ));
+                    assert_eq!(
+                        rendered(&result),
+                        expected_retained_plan_refusal(directory.path())
+                    );
+                    let error = result.unwrap_err();
+                    for line in format_error_with_source_chain(&error).lines() {
+                        eprintln!("Error: {line}");
+                    }
+                    assert!(!saved.exists());
+                    assert_eq!(directory.fixture.count("create", "Sink"), 0);
+                    directory.assert_unlocked().await;
+                }
+            }
+        });
 }

@@ -3783,7 +3783,73 @@ pub async fn run_apply_from_plan(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
-    run_apply_from_plan_with_observer_factory(
+    run_apply_from_plan_using(
+        SavedApplyInvocation {
+            auto_approve,
+            lock,
+            parallelism,
+            accept_legacy_name_overrides,
+            cancel,
+            ..SavedApplyInvocation::for_project(runtime, plan, plan_argument, provider_context)
+        },
+        |runtime, providers, base_dir| {
+            ProviderLoad::load(
+                runtime,
+                providers,
+                base_dir,
+                &mut crate::commands::human_provider_notices(runtime.color_mode()),
+            )
+        },
+    )
+    .await
+}
+
+pub(crate) struct SavedApplyInvocation<'a, 'observer> {
+    pub(crate) runtime: &'a crate::runtime::CommandRuntime,
+    pub(crate) plan: &'a ResolvedPath,
+    pub(crate) plan_argument: &'a Path,
+    pub(crate) auto_approve: bool,
+    pub(crate) lock: bool,
+    pub(crate) parallelism: NonZeroUsize,
+    pub(crate) accept_legacy_name_overrides: bool,
+    pub(crate) provider_context: &'a ProviderContext,
+    pub(crate) cancel: ShutdownToken,
+    observer_factory: &'a ObserverFactory<'observer, SavedModuleSource>,
+}
+impl<'a> SavedApplyInvocation<'a, 'static> {
+    pub(crate) fn for_project(
+        runtime: &'a crate::runtime::CommandRuntime,
+        plan: &'a ResolvedPath,
+        plan_argument: &'a Path,
+        provider_context: &'a ProviderContext,
+    ) -> Self {
+        Self {
+            runtime,
+            plan,
+            plan_argument,
+            provider_context,
+            auto_approve: true,
+            lock: true,
+            parallelism: crate::DEFAULT_PARALLELISM,
+            accept_legacy_name_overrides: false,
+            cancel: ShutdownToken::running(),
+            observer_factory: &cli_observer_factory,
+        }
+    }
+}
+
+pub(crate) async fn run_apply_from_plan_using(
+    invocation: SavedApplyInvocation<'_, '_>,
+    load: impl FnOnce(
+        &crate::runtime::CommandRuntime,
+        &[carina_core::parser::ProviderConfig<
+            NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >],
+        &ResolvedPath,
+    ) -> Result<ProviderLoad, AppError>,
+) -> Result<(), AppError> {
+    let SavedApplyInvocation {
         runtime,
         plan,
         plan_argument,
@@ -3792,26 +3858,9 @@ pub async fn run_apply_from_plan(
         parallelism,
         accept_legacy_name_overrides,
         provider_context,
-        cancel.clone(),
-        &cli_observer_factory,
-    )
-    .await
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[allow(clippy::too_many_arguments)]
-async fn run_apply_from_plan_with_observer_factory(
-    runtime: &crate::runtime::CommandRuntime,
-    plan: &ResolvedPath,
-    plan_argument: &Path,
-    auto_approve: bool,
-    lock: bool,
-    parallelism: NonZeroUsize,
-    accept_legacy_name_overrides: bool,
-    provider_context: &ProviderContext,
-    cancel: ShutdownToken,
-    observer_factory: &ObserverFactory<'_, SavedModuleSource>,
-) -> Result<(), AppError> {
+        cancel,
+        observer_factory,
+    } = invocation;
     let color_mode = runtime.color_mode();
     let plan_path = plan_argument;
     let bytes = plan.read().map_err(|error| AppError::PlanFileRead {
@@ -4027,13 +4076,7 @@ async fn run_apply_from_plan_with_observer_factory(
         .iter()
         .map(carina_core::parser::ProviderConfig::loading_projection)
         .collect::<Vec<_>>();
-    let providers = ProviderLoad::load(
-        runtime,
-        &loading_configs,
-        base_dir,
-        &mut crate::commands::human_provider_notices(runtime.color_mode()),
-    )?
-    .into_complete()?;
+    let providers = load(runtime, &loading_configs, base_dir)?.into_complete()?;
     // Backend drift remains a mutation-safety gate even when the saved plan
     // has no secrets. Loading the syntax tree is deliberately separate from
     // validation and provider-config resolution: placeholder-free plans may

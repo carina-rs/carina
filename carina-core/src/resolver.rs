@@ -3,7 +3,9 @@
 //! Resolves `Value::ResourceRef` references by looking up bound resource attributes
 //! from both the DSL definition and current infrastructure state.
 
-use crate::function_evaluation::{FunctionCompletion, FunctionEvaluation, PreparedFunction};
+use crate::function_evaluation::{
+    ArgumentStep, FunctionCompletion, FunctionEvaluation, LocalStep, PreparedFunction,
+};
 use std::collections::HashMap;
 
 use indexmap::IndexMap;
@@ -1331,8 +1333,13 @@ fn evaluate_runtime_user_function<P: PlaceholderKind, B: BindingAddress>(
     if config.function_declaration_failed(function) {
         return Ok(FunctionEvaluation::Retain(completion.retain()));
     }
-    for (index, parameter) in function.params.iter().enumerate() {
-        let argument = match args.get(index) {
+    let prepared = loop {
+        let slot = match completion.next_argument() {
+            ArgumentStep::Argument(slot) => slot,
+            ArgumentStep::Complete(prepared) => break prepared,
+        };
+        let parameter = slot.parameter();
+        let argument = match slot.argument() {
             Some(argument) => argument.clone(),
             None => crate::resource::FunctionArgument::from_value(
                 P::lower_function_expression(
@@ -1347,9 +1354,8 @@ fn evaluate_runtime_user_function<P: PlaceholderKind, B: BindingAddress>(
         let argument = argument.try_map_value(|value| {
             resolve_ref_value_inner(value, bindings, RuntimeContext::Session(config))
         })?;
-        completion
-            .check_argument(
-                index,
+        let (next, _) = slot
+            .check(
                 argument,
                 crate::validation::typecheck::TypecheckProviderContext::for_session(config),
                 || {
@@ -1376,35 +1382,37 @@ fn evaluate_runtime_user_function<P: PlaceholderKind, B: BindingAddress>(
                     ),
                 )
             })?;
-    }
-    let mut completion = match completion.prepare() {
+        completion = next;
+    };
+    let mut completion = match prepared {
         PreparedFunction::Ready { completion } => completion,
         PreparedFunction::Retain(call) => return Ok(FunctionEvaluation::Retain(call)),
     };
-    for (index, (_name, _expression, source_line)) in function.local_lets.iter().enumerate() {
-        let substituted = completion
-            .substitute_local_value(index)
+    let completion = loop {
+        let slot = match completion.next_local() {
+            LocalStep::Local(slot) => slot,
+            LocalStep::Body(body) => break body,
+        };
+        let source_line = slot.source_line();
+        let substituted = slot
+            .substitute_value()
             .map_err(|error| locate_user_function_error(function, error))?;
         let lowered = P::lower_function_expression(substituted).map_err(|error| {
             locate_user_function_error(
                 function,
-                user_function_runtime_error(*source_line, error.to_string()),
+                user_function_runtime_error(source_line, error.to_string()),
             )
         })?;
         let resolved = resolve_ref_value_inner(&lowered, bindings, RuntimeContext::Session(config))
             .map_err(|error| {
                 locate_user_function_error(
                     function,
-                    user_function_runtime_error(*source_line, error),
+                    user_function_runtime_error(source_line, error),
                 )
             })?;
-        completion
-            .bind_local(
-                index,
-                crate::resource::FunctionArgument::from_value(resolved).into_parser_stage(),
-            )
-            .map_err(|error| locate_user_function_error(function, error))?;
-    }
+        completion =
+            slot.bind(crate::resource::FunctionArgument::from_value(resolved).into_parser_stage());
+    };
     let substituted = completion
         .substitute_body()
         .map_err(|error| locate_user_function_error(function, error))?;
@@ -2950,7 +2958,7 @@ mod tests {
     }
 
     #[test]
-    fn review2_f2_resolving_secret_reference_matches_main_single_wrapper() {
+    fn resolving_secret_reference_preserves_single_wrapper() {
         let secret = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String("t".into()))).into(),
         ));
@@ -5312,7 +5320,7 @@ mod deferral_regressions {
                         1,
                     )
                     .unwrap();
-                    eprintln!("review2 unloaded runtime result={evaluated:?}");
+                    assert!(matches!(evaluated, FunctionEvaluation::Retain(_)));
                 }
             });
         assert_eq!(
@@ -5347,7 +5355,7 @@ mod deferral_regressions {
 }
 
 #[cfg(test)]
-mod runtime_context_measure {
+mod runtime_return_annotation_tests {
     use super::*;
     #[test]
     fn runtime_return_error_context() {
@@ -5375,7 +5383,6 @@ mod runtime_context_measure {
         })
         .unwrap_err()
         .to_string();
-        eprintln!("review2 runtime return context: {error}");
         assert!(
             error.starts_with(
                 "functions.crn: Invalid expression at line 1: function 'f': return value:"

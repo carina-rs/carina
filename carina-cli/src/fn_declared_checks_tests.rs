@@ -84,6 +84,14 @@ impl ProviderFactory for FixtureFactory {
         }
         vec![
             thing.validate().unwrap(),
+            ResourceSchema::new("Lookup")
+                .as_data_source()
+                .attribute(AttributeSchema::required("query", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::provider_populated("value", AttributeType::string()).build(),
+                )
+                .validate()
+                .unwrap(),
             ResourceSchema::new("Sink")
                 .attribute(AttributeSchema::required("name", AttributeType::string()).build())
                 .attribute(AttributeSchema::required("value", AttributeType::string()).build())
@@ -174,9 +182,10 @@ impl Provider for FixtureProvider {
     }
     fn read_data_source(
         &self,
-        _: &ProviderReadyDataSource,
+        source: &ProviderReadyDataSource,
     ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
-        panic!("no data sources")
+        let id = source.id.clone();
+        Box::pin(async move { Ok(carina_core::resource::State::not_found(id)) })
     }
     fn resume_create(
         &self,
@@ -324,10 +333,6 @@ impl Directory {
             operations: Mutex::new(Vec::new()),
         });
         let runtime = TestCommandRuntime::new();
-        let factory_fixture = fixture.clone();
-        *runtime.test_hooks().provider_factories.lock().unwrap() = Some(Box::new(move || {
-            LoadedProviderFactory::for_test(vec![Box::new(FixtureFactory(factory_fixture.clone()))])
-        }));
         std::fs::write(root.path().join("main.crn"), &case.main).unwrap();
         std::fs::write(
             root.path().join("providers.crn"),
@@ -364,8 +369,21 @@ impl Directory {
     fn context(&self) -> ProviderContext {
         ProviderContext::new(self.runtime.environment().clone())
     }
+    fn factories(&self) -> Vec<LoadedProviderFactory> {
+        LoadedProviderFactory::for_test(vec![Box::new(FixtureFactory(self.fixture.clone()))])
+    }
+    fn validate(&self) -> commands::validate::ValidateReport {
+        commands::validate::collect_with_factories(
+            &ResolvedPath::new(self.path()).unwrap(),
+            self.factories(),
+            HashMap::new(),
+        )
+    }
     async fn plan(&self, out: Option<&Path>) -> Result<bool, AppError> {
-        commands::plan::run_plan(
+        self.plan_output(out, false).await
+    }
+    async fn plan_output(&self, out: Option<&Path>, json: bool) -> Result<bool, AppError> {
+        commands::plan::run_plan_using(
             &self.runtime,
             self.path(),
             out,
@@ -374,38 +392,83 @@ impl Directory {
             crate::DetailLevel::None,
             false,
             false,
-            false,
+            json,
             false,
             false,
             &self.context(),
+            |runtime, providers, _| {
+                Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                    runtime,
+                    self.factories(),
+                    providers,
+                ))
+            },
         )
         .await
     }
     async fn apply(&self) -> Result<(), AppError> {
-        commands::apply::run_apply(
+        commands::apply::run_apply_with_factories_for_test(
             &self.runtime,
-            &ResolvedPath::new(self.path()).unwrap(),
             self.path(),
-            true,
-            true,
-            crate::DEFAULT_PARALLELISM,
-            false,
-            &self.context(),
-            ShutdownToken::running(),
+            self.factories(),
         )
         .await
     }
     async fn apply_saved(&self, path: &Path) -> Result<(), AppError> {
-        commands::apply::run_apply_from_plan(
+        commands::apply::run_apply_from_plan_using(
+            commands::apply::SavedApplyInvocation::for_project(
+                &self.runtime,
+                &ResolvedPath::new(path).unwrap(),
+                path,
+                &self.context(),
+            ),
+            |runtime, providers, _| {
+                Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                    runtime,
+                    self.factories(),
+                    providers,
+                ))
+            },
+        )
+        .await
+    }
+    async fn refresh(&self) -> Result<(), AppError> {
+        commands::state::run_state_refresh_using(
             &self.runtime,
-            &ResolvedPath::new(path).unwrap(),
-            path,
+            self.path(),
             true,
-            true,
-            crate::DEFAULT_PARALLELISM,
-            false,
             &self.context(),
             ShutdownToken::running(),
+            |runtime, providers, _| {
+                Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                    runtime,
+                    self.factories(),
+                    providers,
+                ))
+            },
+        )
+        .await
+    }
+    async fn destroy(&self) -> Result<(), AppError> {
+        commands::destroy::run_destroy_using(
+            commands::destroy::DestroyInvocation {
+                runtime: &self.runtime,
+                path: self.path(),
+                auto_approve: true,
+                lock: true,
+                refresh: true,
+                force: false,
+                parallelism: crate::DEFAULT_PARALLELISM,
+                provider_context: &self.context(),
+                cancel: ShutdownToken::running(),
+            },
+            |runtime, providers, _| {
+                Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                    runtime,
+                    self.factories(),
+                    providers,
+                ))
+            },
         )
         .await
     }
@@ -453,23 +516,22 @@ fn assert_declared_error(text: &str, prefix: &str) {
         "expected exact diagnostic {diagnostic:?}, got {text}"
     );
 }
-fn assert_measured_declared_diagnostic(
+fn assert_exact_declared_diagnostic(
     text: &str,
     case: &Case,
     directory: &Directory,
     prefix: &str,
+    body_line: Option<usize>,
 ) {
-    let original = measured_case(&case.name);
-    if original.main != case.main || original.child != case.child {
-        return;
-    }
     let source = case.child.as_deref().unwrap_or(&case.main);
-    let expected = if prefix.contains("return value") {
-        let line = source
-            .lines()
-            .position(|line| line.starts_with("fn "))
-            .unwrap()
-            + 1;
+    let expected = if body_line.is_some() || prefix.contains("return value") {
+        let line = body_line.unwrap_or_else(|| {
+            source
+                .lines()
+                .position(|line| line.starts_with("fn "))
+                .unwrap()
+                + 1
+        });
         let file = directory.path().join(if case.child.is_some() {
             "child/main.crn"
         } else {
@@ -482,7 +544,7 @@ fn assert_measured_declared_diagnostic(
     } else {
         let line = source
             .lines()
-            .position(|line| line.contains("value = g("))
+            .position(|line| line.contains("value = "))
             .unwrap()
             + 1;
         format!("Invalid expression at line {line}: {prefix} {SUFFIX}")
@@ -491,12 +553,11 @@ fn assert_measured_declared_diagnostic(
 }
 
 async fn commands_case(case: Case) {
+    commands_case_with_body_site(case, None).await
+}
+async fn commands_case_with_body_site(case: Case, body_line: Option<usize>) {
     let validate = Directory::new(&case);
-    let report = commands::validate::collect_validate(
-        Ok(&validate.runtime),
-        validate.path(),
-        Some(&validate.context()),
-    );
+    let report = validate.validate();
     let validation = report.diagnostic_output_for_test().to_string();
     let plan = Directory::new(&case);
     let planned = plan.plan(None).await;
@@ -524,19 +585,29 @@ async fn commands_case(case: Case) {
         rendered(&applied)
     );
     assert_eq!(apply.fixture.count("create", "Sink"), usize::from(!reject));
+    if static_rejection(&case) {
+        let expected = expected_saved_plan_error(&case.name, &plan);
+        assert_eq!(rendered(&planned), expected);
+        assert_eq!(
+            rendered(&applied),
+            expected_saved_plan_error(&case.name, &apply)
+        );
+    }
     if known_handle_rejection(&case) {
         assert_declared_error(&rendered(&planned), "function 'f': return value:");
-        assert_measured_declared_diagnostic(
+        assert_exact_declared_diagnostic(
             &rendered(&planned),
             &case,
             &plan,
             "function 'f': return value:",
+            body_line,
         );
-        assert_measured_declared_diagnostic(
+        assert_exact_declared_diagnostic(
             &rendered(&applied),
             &case,
             &apply,
             "function 'f': return value:",
+            body_line,
         );
     }
     if late_rejection(&case) {
@@ -548,7 +619,7 @@ async fn commands_case(case: Case) {
             "function 'g': parameter 'x':"
         };
         assert_declared_error(&rendered(&applied), prefix);
-        assert_measured_declared_diagnostic(&rendered(&applied), &case, &apply, prefix);
+        assert_exact_declared_diagnostic(&rendered(&applied), &case, &apply, prefix, body_line);
         assert_eq!(apply.fixture.count("create", "Thing"), 1);
         let state = std::fs::read_to_string(apply.path().join("state.json")).unwrap();
         assert!(
@@ -610,17 +681,15 @@ fn expected_saved_plan_error(case: &str, directory: &Directory) -> String {
 
 fn expected_retained_plan_refusal(project: &Path) -> String {
     format!(
-        "Cannot save plan: a user-defined function call still needs its declared types checked against values available only during apply. A saved plan cannot carry this call.\nRun `{}` directly on the project, without a saved plan.",
+        "Cannot save plan: the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call.\nRun `{}` directly on the project, without a saved plan.",
         carina_core::hint::ProjectCommand::new("apply", project)
     )
 }
 
-#[cfg(unix)]
 mod saved_plans;
 
-#[cfg(unix)]
 mod secret_state;
-macro_rules! measured {
+macro_rules! fixture_tests {
     ($name:ident, $plan_out:ident, $case:literal) => {
         #[tokio::test]
         async fn $name() {
@@ -632,340 +701,340 @@ macro_rules! measured {
         }
     };
 }
-measured!(
+fixture_tests!(
     c1_handle_known_invalid,
     c1_handle_known_invalid_plan_out,
     "c1-handle-known-invalid"
 );
-measured!(
+fixture_tests!(
     c1_handle_known_valid,
     c1_handle_known_valid_plan_out,
     "c1-handle-known-valid"
 );
-measured!(
+fixture_tests!(
     c1_handle_late_invalid,
     c1_handle_late_invalid_plan_out,
     "c1-handle-late-invalid"
 );
-measured!(
+fixture_tests!(
     c1_handle_late_valid,
     c1_handle_late_valid_plan_out,
     "c1-handle-late-valid"
 );
-measured!(
+fixture_tests!(
     c1_scalar_known_invalid,
     c1_scalar_known_invalid_plan_out,
     "c1-scalar-known-invalid"
 );
-measured!(
+fixture_tests!(
     c1_literal_return_invalid,
     c1_literal_return_invalid_plan_out,
     "c1-literal-return-invalid"
 );
-measured!(
+fixture_tests!(
     c1_scalar_known_valid,
     c1_scalar_known_valid_plan_out,
     "c1-scalar-known-valid"
 );
-measured!(
+fixture_tests!(
     c1_literal_return_valid,
     c1_literal_return_valid_saved_plan_control,
     "c1-literal-return-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_param_const_late_invalid,
     c2_module_param_const_late_invalid_plan_out,
     "c2-module-param-const-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_param_const_late_valid,
     c2_module_param_const_late_valid_plan_out,
     "c2-module-param-const-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_param_identity_late_invalid,
     c2_module_param_identity_late_invalid_plan_out,
     "c2-module-param-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_param_identity_late_valid,
     c2_module_param_identity_late_valid_plan_out,
     "c2-module-param-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_param_return_identity_late_invalid,
     c2_module_param_return_identity_late_invalid_plan_out,
     "c2-module-param-return-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_param_return_identity_late_valid,
     c2_module_param_return_identity_late_valid_plan_out,
     "c2-module-param-return-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_return_identity_late_invalid,
     c2_module_return_identity_late_invalid_plan_out,
     "c2-module-return-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_return_identity_late_valid,
     c2_module_return_identity_late_valid_plan_out,
     "c2-module-return-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_return_untyped_late_invalid,
     c2_module_return_untyped_late_invalid_plan_out,
     "c2-module-return-untyped-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_return_untyped_late_valid,
     c2_module_return_untyped_late_valid_plan_out,
     "c2-module-return-untyped-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_return_const_late_invalid,
     c2_module_return_const_late_invalid_plan_out,
     "c2-module-return-const-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_return_const_late_valid,
     c2_module_return_const_late_valid_saved_plan_control,
     "c2-module-return-const-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_param_const_late_invalid,
     c2_module_upstream_param_const_late_invalid_plan_out,
     "c2-module-upstream-param-const-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_param_const_late_valid,
     c2_module_upstream_param_const_late_valid_plan_out,
     "c2-module-upstream-param-const-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_param_identity_late_invalid,
     c2_module_upstream_param_identity_late_invalid_plan_out,
     "c2-module-upstream-param-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_param_identity_late_valid,
     c2_module_upstream_param_identity_late_valid_plan_out,
     "c2-module-upstream-param-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_param_return_identity_late_invalid,
     c2_module_upstream_param_return_identity_late_invalid_plan_out,
     "c2-module-upstream-param-return-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_param_return_identity_late_valid,
     c2_module_upstream_param_return_identity_late_valid_plan_out,
     "c2-module-upstream-param-return-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_return_identity_late_invalid,
     c2_module_upstream_return_identity_late_invalid_plan_out,
     "c2-module-upstream-return-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_return_identity_late_valid,
     c2_module_upstream_return_identity_late_valid_plan_out,
     "c2-module-upstream-return-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_return_untyped_late_invalid,
     c2_module_upstream_return_untyped_late_invalid_plan_out,
     "c2-module-upstream-return-untyped-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_return_untyped_late_valid,
     c2_module_upstream_return_untyped_late_valid_plan_out,
     "c2-module-upstream-return-untyped-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_return_const_late_invalid,
     c2_module_upstream_return_const_late_invalid_plan_out,
     "c2-module-upstream-return-const-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_upstream_return_const_late_valid,
     c2_module_upstream_return_const_late_valid_saved_plan_control,
     "c2-module-upstream-return-const-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_param_const_late_invalid,
     c2_module_handle_param_const_late_invalid_plan_out,
     "c2-module-handle-param-const-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_param_const_late_valid,
     c2_module_handle_param_const_late_valid_plan_out,
     "c2-module-handle-param-const-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_param_identity_late_invalid,
     c2_module_handle_param_identity_late_invalid_plan_out,
     "c2-module-handle-param-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_param_identity_late_valid,
     c2_module_handle_param_identity_late_valid_plan_out,
     "c2-module-handle-param-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_param_return_identity_late_invalid,
     c2_module_handle_param_return_identity_late_invalid_plan_out,
     "c2-module-handle-param-return-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_param_return_identity_late_valid,
     c2_module_handle_param_return_identity_late_valid_plan_out,
     "c2-module-handle-param-return-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_return_identity_late_invalid,
     c2_module_handle_return_identity_late_invalid_plan_out,
     "c2-module-handle-return-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_return_identity_late_valid,
     c2_module_handle_return_identity_late_valid_plan_out,
     "c2-module-handle-return-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_return_untyped_late_invalid,
     c2_module_handle_return_untyped_late_invalid_plan_out,
     "c2-module-handle-return-untyped-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_return_untyped_late_valid,
     c2_module_handle_return_untyped_late_valid_plan_out,
     "c2-module-handle-return-untyped-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_return_const_late_invalid,
     c2_module_handle_return_const_late_invalid_plan_out,
     "c2-module-handle-return-const-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_handle_return_const_late_valid,
     c2_module_handle_return_const_late_valid_saved_plan_control,
     "c2-module-handle-return-const-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_root_param_const_late_invalid,
     c2_root_param_const_late_invalid_plan_out,
     "c2-root-param-const-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_root_param_const_late_valid,
     c2_root_param_const_late_valid_plan_out,
     "c2-root-param-const-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_root_param_identity_late_invalid,
     c2_root_param_identity_late_invalid_plan_out,
     "c2-root-param-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_root_param_identity_late_valid,
     c2_root_param_identity_late_valid_plan_out,
     "c2-root-param-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_root_param_return_identity_late_invalid,
     c2_root_param_return_identity_late_invalid_plan_out,
     "c2-root-param-return-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_root_param_return_identity_late_valid,
     c2_root_param_return_identity_late_valid_plan_out,
     "c2-root-param-return-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_root_return_identity_late_invalid,
     c2_root_return_identity_late_invalid_plan_out,
     "c2-root-return-identity-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_root_return_identity_late_valid,
     c2_root_return_identity_late_valid_plan_out,
     "c2-root-return-identity-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_root_return_untyped_late_invalid,
     c2_root_return_untyped_late_invalid_plan_out,
     "c2-root-return-untyped-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_root_return_untyped_late_valid,
     c2_root_return_untyped_late_valid_plan_out,
     "c2-root-return-untyped-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_root_return_const_late_invalid,
     c2_root_return_const_late_invalid_plan_out,
     "c2-root-return-const-late-invalid"
 );
-measured!(
+fixture_tests!(
     c2_root_return_const_late_valid,
     c2_root_return_const_late_valid_saved_plan_control,
     "c2-root-return-const-late-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_param_const_literal_invalid,
     c2_module_param_const_literal_invalid_plan_out,
     "c2-module-param-const-literal-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_param_const_literal_valid,
     c2_module_param_const_literal_valid_plan_out,
     "c2-module-param-const-literal-valid"
 );
-measured!(
+fixture_tests!(
     c2_module_return_identity_literal_invalid,
     c2_module_return_identity_literal_invalid_plan_out,
     "c2-module-return-identity-literal-invalid"
 );
-measured!(
+fixture_tests!(
     c2_module_return_identity_literal_valid,
     c2_module_return_identity_literal_valid_plan_out,
     "c2-module-return-identity-literal-valid"
 );
-measured!(
+fixture_tests!(
     c2_root_param_const_literal_invalid,
     c2_root_param_const_literal_invalid_plan_out,
     "c2-root-param-const-literal-invalid"
 );
-measured!(
+fixture_tests!(
     c2_root_param_const_literal_valid,
     c2_root_param_const_literal_valid_saved_plan_control,
     "c2-root-param-const-literal-valid"
 );
-measured!(
+fixture_tests!(
     c2_root_return_identity_literal_invalid,
     c2_root_return_identity_literal_invalid_plan_out,
     "c2-root-return-identity-literal-invalid"
 );
-measured!(
+fixture_tests!(
     c2_root_return_identity_literal_valid,
     c2_root_return_identity_literal_valid_plan_out,
     "c2-root-return-identity-literal-valid"
 );
 
-fn measured_case(name: &str) -> Case {
+fn fixture_case(name: &str) -> Case {
     cases().into_iter().find(|case| case.name == name).unwrap()
 }
 
 #[tokio::test]
 async fn declared_checks_nested_arguments_locals_wrappers_in_module_and_root() {
     for scope in ["root", "module-upstream", "module-handle"] {
-        for wrapper in [
-            "fn outer(x) { g(x) }",
-            "fn outer(x) { let unused = g(x)\n 'const' }",
-            "fn outer(x) { 'const' }",
+        for (wrapper, body_line) in [
+            ("fn outer(x) { g(x) }", Some(1)),
+            ("fn outer(x) { let unused = g(x)\n 'const' }", Some(1)),
+            ("fn outer(x) { 'const' }", None),
         ] {
-            let mut case = measured_case(&format!("c2-{scope}-param-identity-late-invalid"));
+            let mut case = fixture_case(&format!("c2-{scope}-param-identity-late-invalid"));
             let source = case.child.as_mut().unwrap_or(&mut case.main);
             source.insert_str(0, &format!("{wrapper}\n"));
             let call = if scope == "module-handle" {
@@ -979,7 +1048,7 @@ async fn declared_checks_nested_arguments_locals_wrappers_in_module_and_root() {
                 call.replacen("g(", "outer(", 1)
             };
             *source = source.replace(call, &replacement);
-            commands_case(case).await;
+            commands_case_with_body_site(case, body_line).await;
         }
     }
 }
@@ -993,7 +1062,7 @@ async fn declared_checks_primitive_and_builtin_controls_inline_and_save() {
             "fn g(x) { x }",
             "fn g(x: list(String)): list(String) { x }",
         ] {
-            let mut case = measured_case(&format!("c2-{scope}-param-identity-late-invalid"));
+            let mut case = fixture_case(&format!("c2-{scope}-param-identity-late-invalid"));
             let source = case.child.as_mut().unwrap_or(&mut case.main);
             *source = source.replace("fn g(x: test.Name): String { x }", function);
             if function == "fn g(x) { x }" {
@@ -1024,7 +1093,7 @@ async fn declared_checks_primitive_and_builtin_controls_inline_and_save() {
 #[tokio::test]
 async fn declared_checks_authored_sibling_and_state_values() {
     for validity in ["invalid", "valid"] {
-        let mut case = measured_case(&format!(
+        let mut case = fixture_case(&format!(
             "c2-module-upstream-param-identity-late-{validity}"
         ));
         let child = case.child.as_mut().unwrap();
@@ -1053,7 +1122,7 @@ async fn declared_checks_authored_sibling_and_state_values() {
 
 #[tokio::test]
 async fn declared_checks_authored_and_state_valid_plan_out() {
-    let mut case = measured_case("c2-module-upstream-param-identity-late-valid");
+    let mut case = fixture_case("c2-module-upstream-param-identity-late-valid");
     let child = case.child.as_mut().unwrap();
     *child = child
         .replace("name = 'src'", "name = 'src' plain = 'allowed'")
@@ -1097,7 +1166,7 @@ async fn declared_checks_authored_and_state_valid_plan_out() {
 
 #[tokio::test]
 async fn declared_checks_existing_sink_update_rejects_after_source_update() {
-    let mut case = measured_case("c1-handle-late-valid");
+    let mut case = fixture_case("c1-handle-late-valid");
     case.main = case
         .main
         .replace("test.Sink", "let sink = test.Sink")
@@ -1144,7 +1213,7 @@ async fn declared_checks_existing_sink_update_rejects_after_source_update() {
 
 #[tokio::test]
 async fn declared_checks_sensitive_handle_diagnostic_is_masked() {
-    let mut case = measured_case("c1-handle-known-invalid");
+    let mut case = fixture_case("c1-handle-known-invalid");
     case.main = case
         .main
         .replace("plain = 'bad-name'", "plain = secret('bad-name')")
@@ -1167,12 +1236,8 @@ async fn declared_checks_provider_loaded_lsp_directory_matches_validate() {
         "c1-handle-known-invalid",
         "c2-module-upstream-param-const-late-invalid",
     ] {
-        let directory = Directory::new(&measured_case(name));
-        let report = commands::validate::collect_validate(
-            Ok(&directory.runtime),
-            directory.path(),
-            Some(&directory.context()),
-        );
+        let directory = Directory::new(&fixture_case(name));
+        let report = directory.validate();
         assert_eq!(
             report.exit_code(),
             0,
@@ -1206,39 +1271,19 @@ async fn declared_checks_provider_loaded_lsp_directory_matches_validate() {
 
 #[tokio::test]
 async fn declared_checks_destroy_and_refresh_use_construction_inputs() {
-    let directory = Directory::new(&measured_case(
+    let directory = Directory::new(&fixture_case(
         "c2-module-upstream-param-identity-late-valid",
     ));
     directory.apply().await.unwrap();
-    commands::state::run_state_refresh(
-        &directory.runtime,
-        directory.path(),
-        true,
-        &directory.context(),
-        ShutdownToken::running(),
-    )
-    .await
-    .unwrap();
+    directory.refresh().await.unwrap();
     assert!(directory.fixture.count("read", "Thing") > 0);
-    commands::destroy::run_destroy(
-        &directory.runtime,
-        directory.path(),
-        true,
-        true,
-        true,
-        false,
-        crate::DEFAULT_PARALLELISM,
-        &directory.context(),
-        ShutdownToken::running(),
-    )
-    .await
-    .unwrap();
+    directory.destroy().await.unwrap();
     directory.assert_unlocked().await;
 }
 
 #[tokio::test]
 async fn declared_checks_defaults_nested_and_multiple_module_instances() {
-    let mut case = measured_case("c2-module-handle-param-const-late-invalid");
+    let mut case = fixture_case("c2-module-handle-param-const-late-invalid");
     case.main
         .push_str("let second = child { source = src }\nchild { source = src }\n");
     case.child = Some("arguments { source: test.Thing }\nfn g(x: test.Name, extra: String = 'default'): String { extra }\nlet nested = use { source = './nested' }\nlet n = nested { source = source }\n".into());
@@ -1260,7 +1305,7 @@ async fn declared_checks_immediate_deferred_loops_and_selected_conditionals() {
         "for x in src.items { test.Sink { name = 'sink' value = g(x) } }",
         "if true { test.Sink { name = 'sink' value = g(src.emitted) } }",
     ] {
-        let mut case = measured_case("c2-module-upstream-param-const-late-invalid");
+        let mut case = fixture_case("c2-module-upstream-param-const-late-invalid");
         case.child = Some(format!(
             "arguments {{ label: String }}\nlet src = test.Thing {{ name = 'src' }}\nfn g(x: test.Name): String {{ 'const' }}\n{body}\n"
         ));
@@ -1276,7 +1321,7 @@ async fn declared_checks_immediate_deferred_loops_and_selected_conditionals() {
 
 #[tokio::test]
 async fn declared_checks_invalid_declaration_fails_before_dispatch() {
-    let mut case = measured_case("c1-handle-late-invalid");
+    let mut case = fixture_case("c1-handle-late-invalid");
     case.main = case.main.replace(": test.Name", ": test.MissingName");
     let directory = Directory::new(&case);
     let result = directory.plan(None).await;
@@ -1293,7 +1338,7 @@ async fn declared_checks_invalid_declaration_fails_before_dispatch() {
 
 #[tokio::test]
 async fn declared_checks_invalid_value_already_in_state_rejects_at_plan() {
-    let case = measured_case("c2-module-upstream-param-identity-late-invalid");
+    let case = fixture_case("c2-module-upstream-param-identity-late-invalid");
     let directory = Directory::new(&case);
     let child_path = directory.path().join("child/main.crn");
     std::fs::write(
@@ -1312,7 +1357,7 @@ async fn declared_checks_invalid_value_already_in_state_rejects_at_plan() {
 
 #[tokio::test]
 async fn declared_checks_scalar_authored_and_state_saved_plan_control() {
-    let mut case = measured_case("c2-module-upstream-param-identity-late-valid");
+    let mut case = fixture_case("c2-module-upstream-param-identity-late-valid");
     let child = case.child.as_mut().unwrap();
     *child = child
         .replace("name = 'src'", "name = 'src' plain = 'allowed'")
@@ -1333,7 +1378,7 @@ async fn declared_checks_scalar_authored_and_state_saved_plan_control() {
 
 #[tokio::test]
 async fn declared_checks_invalid_value_already_in_state_plan_out() {
-    let case = measured_case("c2-module-upstream-param-identity-late-invalid");
+    let case = fixture_case("c2-module-upstream-param-identity-late-invalid");
     let directory = Directory::new(&case);
     let child_path = directory.path().join("child/main.crn");
     std::fs::write(
@@ -1348,11 +1393,12 @@ async fn declared_checks_invalid_value_already_in_state_plan_out() {
     let planned = directory.plan(Some(&saved)).await;
     assert!(planned.is_err());
     assert_declared_error(&rendered(&planned), "function 'g': parameter 'x':");
-    assert_measured_declared_diagnostic(
+    assert_exact_declared_diagnostic(
         &rendered(&planned),
         &case,
         &directory,
         "function 'g': parameter 'x':",
+        None,
     );
     assert!(!saved.exists());
     assert_eq!(directory.fixture.count("create", "Sink"), 0);
@@ -1362,7 +1408,7 @@ async fn declared_checks_invalid_value_already_in_state_plan_out() {
 
 #[tokio::test]
 async fn declared_checks_authored_invalid_control_plan_out() {
-    let mut case = measured_case("c2-module-upstream-param-identity-late-invalid");
+    let mut case = fixture_case("c2-module-upstream-param-identity-late-invalid");
     let child = case.child.as_mut().unwrap();
     *child = child
         .replace("name = 'src'", "name = 'src' plain = 'bad-name'")
@@ -1382,8 +1428,8 @@ async fn declared_checks_authored_invalid_control_plan_out() {
     directory.assert_unlocked().await;
 }
 
-#[cfg(unix)]
 mod runtime_checks;
 
-#[cfg(unix)]
 mod saved_document;
+
+mod directory_calls;

@@ -10,14 +10,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug)]
-struct Discharged<S, V> {
-    slot: S,
+struct Discharged<V> {
     value: V,
     provider_recheck: bool,
 }
 #[derive(Debug)]
-struct AwaitingValue<S, V> {
-    slot: S,
+struct AwaitingValue<V> {
     value: V,
     reason: AwaitingReason,
 }
@@ -28,28 +26,25 @@ pub(crate) enum AwaitingReason {
     ProviderSchema,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AnnotationStatus {
+enum AnnotationStatus {
     Discharged { provider_recheck: bool },
     AwaitingValue(AwaitingReason),
 }
 #[derive(Debug)]
-enum AnnotationCheck<S, V> {
-    Discharged(Discharged<S, V>),
-    AwaitingValue(AwaitingValue<S, V>),
+enum AnnotationCheck<V> {
+    Discharged(Discharged<V>),
+    AwaitingValue(AwaitingValue<V>),
 }
-impl<S, V> AnnotationCheck<S, V> {
-    fn new(slot: S, value: V, status: AnnotationStatus) -> Self {
+impl<V> AnnotationCheck<V> {
+    fn new(value: V, status: AnnotationStatus) -> Self {
         match status {
             AnnotationStatus::Discharged { provider_recheck } => Self::Discharged(Discharged {
-                slot,
                 value,
                 provider_recheck,
             }),
-            AnnotationStatus::AwaitingValue(reason) => Self::AwaitingValue(AwaitingValue {
-                slot,
-                value,
-                reason,
-            }),
+            AnnotationStatus::AwaitingValue(reason) => {
+                Self::AwaitingValue(AwaitingValue { value, reason })
+            }
         }
     }
     fn status(&self) -> AnnotationStatus {
@@ -70,13 +65,6 @@ pub(crate) enum AnnotationError {
     #[error(transparent)]
     Value(#[from] crate::validation::typecheck::TypeExprValueError),
 }
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ArgumentCheckError {
-    #[error(transparent)]
-    Annotation(#[from] AnnotationError),
-    #[error("function argument slot {index} is already settled or does not exist")]
-    InvalidSlot { index: usize },
-}
 trait AnnotationValue<P: PlaceholderKind, B: BindingAddress> {
     fn value(&self) -> Option<&Value<P, B>>;
 }
@@ -91,13 +79,12 @@ impl<P: PlaceholderKind, B: BindingAddress> AnnotationValue<P, B> for Value<P, B
     }
 }
 
-fn check_declared_annotation<P: PlaceholderKind, B: BindingAddress, S, V: AnnotationValue<P, B>>(
-    slot: S,
+fn check_declared_annotation<P: PlaceholderKind, B: BindingAddress, V: AnnotationValue<P, B>>(
     annotation: Option<&TypeExpr>,
     value: V,
     provider: TypecheckProviderContext<'_>,
     site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
-) -> Result<AnnotationCheck<S, V>, crate::validation::typecheck::TypeExprValueError> {
+) -> Result<AnnotationCheck<V>, crate::validation::typecheck::TypeExprValueError> {
     let discharged = AnnotationStatus::Discharged {
         provider_recheck: false,
     };
@@ -144,19 +131,18 @@ fn check_declared_annotation<P: PlaceholderKind, B: BindingAddress, S, V: Annota
             }
         }
     };
-    Ok(AnnotationCheck::new(slot, value, status))
+    Ok(AnnotationCheck::new(value, status))
 }
 
-fn check_parameter<'a, P: PlaceholderKind, B: BindingAddress>(
-    parameter: &'a FnParam<B>,
+fn check_parameter<P: PlaceholderKind, B: BindingAddress>(
+    parameter: &FnParam<B>,
     argument: FunctionArgument<P, B>,
     provider: TypecheckProviderContext<'_>,
     site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
     context: &str,
-) -> Result<AnnotationCheck<&'a FnParam<B>, FunctionArgument<P, B>>, AnnotationError> {
+) -> Result<AnnotationCheck<FunctionArgument<P, B>>, AnnotationError> {
     let Some(annotation) = &parameter.param_type else {
         return Ok(AnnotationCheck::new(
-            parameter,
             argument,
             AnnotationStatus::Discharged {
                 provider_recheck: false,
@@ -177,7 +163,6 @@ fn check_parameter<'a, P: PlaceholderKind, B: BindingAddress>(
     if provider.session().is_none() && !catalog.custom_types_loaded() {
         if matching_handle {
             return Ok(AnnotationCheck::new(
-                parameter,
                 argument,
                 AnnotationStatus::Discharged {
                     provider_recheck: false,
@@ -186,7 +171,6 @@ fn check_parameter<'a, P: PlaceholderKind, B: BindingAddress>(
         }
         if annotation_requires_provider_session(annotation) {
             return Ok(AnnotationCheck::new(
-                parameter,
                 argument,
                 AnnotationStatus::AwaitingValue(AwaitingReason::ProviderSession),
             ));
@@ -208,12 +192,11 @@ fn check_parameter<'a, P: PlaceholderKind, B: BindingAddress>(
         } else {
             AnnotationStatus::AwaitingValue(AwaitingReason::ProviderSchema)
         };
-        return Ok(AnnotationCheck::new(parameter, argument, status));
+        return Ok(AnnotationCheck::new(argument, status));
     };
     if let Some(handle) = argument.handle() {
         crate::validation::check_handle_sink(handle, &resolved_type)?;
         return Ok(AnnotationCheck::new(
-            parameter,
             argument,
             AnnotationStatus::Discharged {
                 provider_recheck: false,
@@ -221,7 +204,6 @@ fn check_parameter<'a, P: PlaceholderKind, B: BindingAddress>(
         ));
     }
     check_declared_annotation(
-        parameter,
         Some(&resolved_type.as_type_expr()),
         argument,
         provider,
@@ -230,14 +212,40 @@ fn check_parameter<'a, P: PlaceholderKind, B: BindingAddress>(
     .map_err(Into::into)
 }
 
+pub(crate) struct ParameterAnnotationCheck<P: PlaceholderKind, B: BindingAddress> {
+    check: AnnotationCheck<FunctionArgument<P, B>>,
+}
+impl<P: PlaceholderKind, B: BindingAddress> ParameterAnnotationCheck<P, B> {
+    pub(crate) fn requires_provider_session(&self) -> bool {
+        self.check.status().requires_provider_session()
+    }
+}
+pub(crate) struct ParameterCheckReport(AnnotationStatus);
+impl ParameterCheckReport {
+    pub(crate) fn needs_recheck(&self) -> bool {
+        self.0.needs_recheck()
+    }
+}
+impl AnnotationStatus {
+    fn needs_recheck(self) -> bool {
+        match self {
+            Self::Discharged { provider_recheck } => provider_recheck,
+            Self::AwaitingValue(_) => true,
+        }
+    }
+    fn requires_provider_session(self) -> bool {
+        matches!(self, Self::AwaitingValue(AwaitingReason::ProviderSession))
+    }
+}
 pub(crate) fn check_parameter_annotation<P: PlaceholderKind, B: BindingAddress>(
     parameter: &FnParam<B>,
     argument: FunctionArgument<P, B>,
     provider: TypecheckProviderContext<'_>,
     site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
     context: &str,
-) -> Result<AnnotationStatus, AnnotationError> {
-    check_parameter(parameter, argument, provider, site, context).map(|check| check.status())
+) -> Result<ParameterAnnotationCheck<P, B>, AnnotationError> {
+    check_parameter(parameter, argument, provider, site, context)
+        .map(|check| ParameterAnnotationCheck { check })
 }
 
 #[derive(Debug)]
@@ -299,19 +307,36 @@ impl<P: PlaceholderKind, B: BindingAddress> FunctionEvaluation<P, B> {
         }
     }
 }
-enum ParameterSettlement<'a, P: PlaceholderKind, B: BindingAddress> {
-    Unsettled,
-    Checked(Box<AnnotationCheck<&'a FnParam<B>, FunctionArgument<P, B>>>),
-    Invalid,
+#[derive(Default)]
+struct CallObservations {
+    surviving_call: bool,
+}
+impl CallObservations {
+    fn observe<P: PlaceholderKind, B: BindingAddress>(&mut self, value: &Value<P, B>) {
+        self.surviving_call |= contains_deferred_user_function_call(value);
+    }
 }
 pub(crate) struct FunctionCompletion<'a, P: PlaceholderKind, B: BindingAddress> {
     function: &'a UserFunction<B>,
-    slots: Vec<ParameterSettlement<'a, P, B>>,
+    parameters: std::slice::Iter<'a, FnParam<B>>,
+    arguments: std::vec::IntoIter<FunctionArgument<P, B>>,
+    checked_arguments: Vec<FunctionArgument<P, B>>,
+    pending_check: bool,
+    observations: CallObservations,
     retained: RetainedCall<P, B>,
+}
+pub(crate) enum ArgumentStep<'a, P: PlaceholderKind, B: BindingAddress> {
+    Argument(Box<ArgumentSlot<'a, P, B>>),
+    Complete(PreparedFunction<'a, P, B>),
+}
+pub(crate) struct ArgumentSlot<'a, P: PlaceholderKind, B: BindingAddress> {
+    parameter: &'a FnParam<B>,
+    argument: Option<FunctionArgument<P, B>>,
+    cursor: FunctionCompletion<'a, P, B>,
 }
 pub(crate) enum PreparedFunction<'a, P: PlaceholderKind, B: BindingAddress> {
     Ready {
-        completion: FunctionBodyCompletion<'a, P, B>,
+        completion: FunctionLocals<'a, P, B>,
     },
     Retain(RetainedCall<P, B>),
 }
@@ -324,11 +349,11 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionCompletion<'a, P, B> {
     ) -> Self {
         Self {
             function,
-            slots: function
-                .params
-                .iter()
-                .map(|_| ParameterSettlement::Unsettled)
-                .collect(),
+            parameters: function.params.iter(),
+            arguments: args.clone().into_iter(),
+            checked_arguments: Vec::new(),
+            pending_check: false,
+            observations: CallObservations::default(),
             retained: RetainedCall::new(
                 Arc::clone(function),
                 Arc::clone(functions),
@@ -337,172 +362,156 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionCompletion<'a, P, B> {
             ),
         }
     }
-    pub(crate) fn check_argument(
-        &mut self,
-        index: usize,
+    pub(crate) fn retain(self) -> RetainedCall<P, B> {
+        self.retained
+    }
+    pub(crate) fn next_argument(mut self) -> ArgumentStep<'a, P, B> {
+        match self.parameters.next() {
+            Some(parameter) => {
+                let argument = self.arguments.next();
+                ArgumentStep::Argument(Box::new(ArgumentSlot {
+                    parameter,
+                    argument,
+                    cursor: self,
+                }))
+            }
+            None => {
+                self.retained.args = self.checked_arguments.clone();
+                let prepared = if self.pending_check || self.observations.surviving_call {
+                    PreparedFunction::Retain(self.retained)
+                } else {
+                    let substitutions = self
+                        .function
+                        .params
+                        .iter()
+                        .zip(self.checked_arguments)
+                        .map(|(parameter, argument)| {
+                            (parameter.name.clone(), argument.into_parser_stage())
+                        })
+                        .collect();
+                    PreparedFunction::Ready {
+                        completion: FunctionLocals {
+                            locals: self.function.local_lets.iter(),
+                            completion: FunctionBodyCompletion {
+                                function: self.function,
+                                retained: self.retained,
+                                observations: self.observations,
+                                substitutions,
+                            },
+                        },
+                    }
+                };
+                ArgumentStep::Complete(prepared)
+            }
+        }
+    }
+}
+impl<'a, P: PlaceholderKind, B: BindingAddress> ArgumentSlot<'a, P, B> {
+    pub(crate) fn parameter(&self) -> &'a FnParam<B> {
+        self.parameter
+    }
+    pub(crate) fn argument(&self) -> Option<&FunctionArgument<P, B>> {
+        self.argument.as_ref()
+    }
+    pub(crate) fn check(
+        mut self,
         argument: FunctionArgument<P, B>,
         provider: TypecheckProviderContext<'_>,
         site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
         context: &str,
-    ) -> Result<AnnotationStatus, ArgumentCheckError> {
-        let Some(slot) = self.slots.get_mut(index) else {
-            return Err(ArgumentCheckError::InvalidSlot { index });
+    ) -> Result<(FunctionCompletion<'a, P, B>, ParameterCheckReport), AnnotationError> {
+        let check = check_parameter(self.parameter, argument, provider, site, context)?;
+        let report = ParameterCheckReport(check.status());
+        let argument = match check {
+            AnnotationCheck::Discharged(witness) => witness.value,
+            AnnotationCheck::AwaitingValue(witness) => {
+                self.cursor.pending_check = true;
+                witness.value
+            }
         };
-        match slot {
-            ParameterSettlement::Unsettled => {}
-            ParameterSettlement::Checked(_) | ParameterSettlement::Invalid => {
-                *slot = ParameterSettlement::Invalid;
-                return Err(ArgumentCheckError::InvalidSlot { index });
-            }
-        }
-        // Taking the slot also prevents a failed check from being replaced by
-        // an unrelated successful check if a caller handles the error.
-        *slot = ParameterSettlement::Invalid;
-        let checked = check_parameter(
-            &self.function.params[index],
-            argument,
-            provider,
-            site,
-            context,
-        )
-        .map_err(ArgumentCheckError::Annotation)?;
-        let status = checked.status();
-        *slot = ParameterSettlement::Checked(Box::new(checked));
-        Ok(status)
+        self.cursor.observations.observe(argument.walker_value());
+        self.cursor.checked_arguments.push(argument);
+        Ok((self.cursor, report))
     }
+}
+pub(crate) struct FunctionLocals<'a, P: PlaceholderKind, B: BindingAddress> {
+    locals: std::slice::Iter<'a, (String, Value<crate::resource::ParserPlaceholder, B>, usize)>,
+    completion: FunctionBodyCompletion<'a, P, B>,
+}
+pub(crate) enum LocalStep<'a, P: PlaceholderKind, B: BindingAddress> {
+    Local(LocalSlot<'a, P, B>),
+    Body(FunctionBodyCompletion<'a, P, B>),
+}
+pub(crate) struct LocalSlot<'a, P: PlaceholderKind, B: BindingAddress> {
+    local: &'a (String, Value<crate::resource::ParserPlaceholder, B>, usize),
+    cursor: FunctionLocals<'a, P, B>,
+}
+impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionLocals<'a, P, B> {
     pub(crate) fn retain(self) -> RetainedCall<P, B> {
-        self.retained
+        self.completion.retained
     }
-    pub(crate) fn prepare(mut self) -> PreparedFunction<'a, P, B> {
-        let mut arguments = Vec::with_capacity(self.slots.len());
-        let mut pending = false;
-        for (index, slot) in self.slots.into_iter().enumerate() {
-            let argument = match slot {
-                ParameterSettlement::Unsettled | ParameterSettlement::Invalid => {
-                    return PreparedFunction::Retain(self.retained);
-                }
-                ParameterSettlement::Checked(check) => match *check {
-                    AnnotationCheck::Discharged(witness) => {
-                        if !std::ptr::eq(witness.slot, &self.function.params[index]) {
-                            return PreparedFunction::Retain(self.retained);
-                        }
-                        witness.value
-                    }
-                    AnnotationCheck::AwaitingValue(witness) => {
-                        if !std::ptr::eq(witness.slot, &self.function.params[index]) {
-                            return PreparedFunction::Retain(self.retained);
-                        }
-                        pending = true;
-                        witness.value
-                    }
-                },
-            };
-            pending |= contains_deferred_user_function_call(argument.walker_value());
-            arguments.push(argument);
+    pub(crate) fn next_local(mut self) -> LocalStep<'a, P, B> {
+        match self.locals.next() {
+            Some(local) => LocalStep::Local(LocalSlot {
+                local,
+                cursor: self,
+            }),
+            None => LocalStep::Body(self.completion),
         }
-        self.retained.args = arguments.clone();
-        if pending {
-            PreparedFunction::Retain(self.retained)
-        } else {
-            let substitutions = self
-                .function
-                .params
-                .iter()
-                .zip(arguments)
-                .map(|(parameter, argument)| (parameter.name.clone(), argument.into_parser_stage()))
-                .collect();
-            PreparedFunction::Ready {
-                completion: FunctionBodyCompletion {
-                    function: self.function,
-                    retained: self.retained,
-                    surviving_call: false,
-                    substitutions,
-                    next_local: 0,
-                },
-            }
-        }
+    }
+}
+impl<'a, P: PlaceholderKind, B: BindingAddress> LocalSlot<'a, P, B> {
+    pub(crate) fn name(&self) -> &str {
+        &self.local.0
+    }
+    pub(crate) fn source_line(&self) -> usize {
+        self.local.2
+    }
+    pub(crate) fn substitute_argument(
+        &self,
+    ) -> Result<FunctionArgument<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError>
+    {
+        crate::value_walk::substitute_function_call_argument(
+            &FunctionArgument::from_value(self.local.1.clone()),
+            &self.cursor.completion.substitutions,
+            self.source_line(),
+        )
+    }
+    pub(crate) fn substitute_value(
+        &self,
+    ) -> Result<Value<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError> {
+        crate::value_walk::substitute_function_parameters(
+            &self.local.1,
+            &self.cursor.completion.substitutions,
+            self.source_line(),
+            crate::value_walk::RewritePosition::Value,
+        )
+    }
+    pub(crate) fn bind(
+        mut self,
+        value: FunctionArgument<crate::resource::ParserPlaceholder, B>,
+    ) -> FunctionLocals<'a, P, B> {
+        self.cursor
+            .completion
+            .observations
+            .observe(value.walker_value());
+        self.cursor
+            .completion
+            .substitutions
+            .insert(self.local.0.clone(), value);
+        self.cursor
     }
 }
 pub(crate) struct FunctionBodyCompletion<'a, P: PlaceholderKind, B: BindingAddress> {
     function: &'a UserFunction<B>,
     retained: RetainedCall<P, B>,
-    surviving_call: bool,
+    observations: CallObservations,
     substitutions: HashMap<String, FunctionArgument<crate::resource::ParserPlaceholder, B>>,
-    next_local: usize,
 }
-impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionBodyCompletion<'a, P, B> {
-    pub(crate) fn retain(self) -> RetainedCall<P, B> {
-        self.retained
-    }
-    fn local_expression(
-        &self,
-        index: usize,
-    ) -> Result<(&Value<crate::resource::ParserPlaceholder, B>, usize), crate::parser::ParseError>
-    {
-        if index != self.next_local {
-            return Err(crate::parser::ParseError::UserFunctionError(
-                "function local slot is out of order".into(),
-            ));
-        }
-        self.function
-            .local_lets
-            .get(index)
-            .map(|(_, expression, line)| (expression, *line))
-            .ok_or_else(|| {
-                crate::parser::ParseError::UserFunctionError(
-                    "function local slot does not exist".into(),
-                )
-            })
-    }
-    pub(crate) fn substitute_local_argument(
-        &self,
-        index: usize,
-    ) -> Result<FunctionArgument<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError>
-    {
-        let (expression, line) = self.local_expression(index)?;
-        crate::value_walk::substitute_function_call_argument(
-            &FunctionArgument::from_value(expression.clone()),
-            &self.substitutions,
-            line,
-        )
-    }
-    pub(crate) fn substitute_local_value(
-        &self,
-        index: usize,
-    ) -> Result<Value<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError> {
-        let (expression, line) = self.local_expression(index)?;
-        crate::value_walk::substitute_function_parameters(
-            expression,
-            &self.substitutions,
-            line,
-            crate::value_walk::RewritePosition::Value,
-        )
-    }
-    pub(crate) fn bind_local(
-        &mut self,
-        index: usize,
-        value: FunctionArgument<crate::resource::ParserPlaceholder, B>,
-    ) -> Result<(), crate::parser::ParseError> {
-        if index != self.next_local || index >= self.function.local_lets.len() {
-            self.surviving_call = true;
-            return Err(crate::parser::ParseError::UserFunctionError(
-                "function local slot is already settled or out of order".into(),
-            ));
-        }
-        self.surviving_call |= contains_deferred_user_function_call(value.walker_value());
-        self.substitutions
-            .insert(self.function.local_lets[index].0.clone(), value);
-        self.next_local += 1;
-        Ok(())
-    }
+impl<P: PlaceholderKind, B: BindingAddress> FunctionBodyCompletion<'_, P, B> {
     pub(crate) fn substitute_body(
         &self,
     ) -> Result<Value<crate::resource::ParserPlaceholder, B>, crate::parser::ParseError> {
-        if self.next_local != self.function.local_lets.len() {
-            return Err(crate::parser::ParseError::UserFunctionError(
-                "function locals are not settled".into(),
-            ));
-        }
         crate::value_walk::substitute_function_parameters(
             &self.function.body.value,
             &self.substitutions,
@@ -510,36 +519,24 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionBodyCompletion<'a, P, B>
             crate::value_walk::RewritePosition::Value,
         )
     }
-    pub(crate) fn observe(&mut self, value: &Value<P, B>) {
-        self.surviving_call |= contains_deferred_user_function_call(value);
-    }
     pub(crate) fn finish(
         mut self,
         value: Value<P, B>,
         provider: TypecheckProviderContext<'_>,
         site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
     ) -> Result<FunctionEvaluation<P, B>, crate::validation::typecheck::TypeExprValueError> {
-        self.observe(&value);
-        self.surviving_call |= self.next_local != self.function.local_lets.len();
-        let check = check_declared_annotation(
-            self.function,
-            self.function.return_type.as_ref(),
-            value,
-            provider,
-            site,
-        )?;
+        self.observations.observe(&value);
+        let check =
+            check_declared_annotation(self.function.return_type.as_ref(), value, provider, site)?;
         Ok(match check {
             AnnotationCheck::Discharged(witness) => {
-                if std::ptr::eq(witness.slot, self.function) && !self.surviving_call {
-                    FunctionEvaluation::Inline(CheckedValue(witness.value))
-                } else {
+                if self.observations.surviving_call {
                     FunctionEvaluation::Retain(self.retained)
+                } else {
+                    FunctionEvaluation::Inline(CheckedValue(witness.value))
                 }
             }
-            AnnotationCheck::AwaitingValue(witness) => {
-                let _ = witness.slot;
-                FunctionEvaluation::Retain(self.retained)
-            }
+            AnnotationCheck::AwaitingValue(_) => FunctionEvaluation::Retain(self.retained),
         })
     }
 }
@@ -677,33 +674,47 @@ mod tests {
     fn text(text: &str) -> AuthoredValue {
         Value::Concrete(ConcreteValue::String(text.into()))
     }
+    fn locals<'a>(
+        function: &'a Arc<UserFunction>,
+        config: &ProviderContext,
+    ) -> FunctionLocals<'a, ParserPlaceholder, RelativeBindingName> {
+        let mut cursor = completion(function);
+        loop {
+            match cursor.next_argument() {
+                ArgumentStep::Argument(slot) => {
+                    (cursor, _) = slot
+                        .check(
+                            FunctionArgument::from_value(unknown()),
+                            TypecheckProviderContext::for_parser(config),
+                            || None,
+                            "argument",
+                        )
+                        .unwrap();
+                }
+                ArgumentStep::Complete(PreparedFunction::Ready { completion }) => {
+                    return completion;
+                }
+                ArgumentStep::Complete(PreparedFunction::Retain(_)) => {
+                    panic!("primitive arguments must prepare")
+                }
+            }
+        }
+    }
     fn body<'a>(
         function: &'a Arc<UserFunction>,
         config: &ProviderContext,
     ) -> FunctionBodyCompletion<'a, ParserPlaceholder, RelativeBindingName> {
-        let mut completion = completion(function);
-        for index in 0..function.params.len() {
-            completion
-                .check_argument(
-                    index,
-                    FunctionArgument::from_value(unknown()),
-                    TypecheckProviderContext::for_parser(config),
-                    || None,
-                    "argument",
-                )
-                .unwrap();
-        }
-        match completion.prepare() {
-            PreparedFunction::Ready { completion } => completion,
-            PreparedFunction::Retain(_) => panic!("primitive arguments must prepare"),
+        match locals(function, config).next_local() {
+            LocalStep::Body(completion) => completion,
+            LocalStep::Local(_) => panic!("locals require their tokens"),
         }
     }
     #[test]
     fn declared_checks_completion_requires_every_declared_slot() {
         let function = function("fn g(x: String): 'allowed' { x }");
         assert!(matches!(
-            completion(&function).prepare(),
-            PreparedFunction::Retain(_)
+            completion(&function).next_argument(),
+            ArgumentStep::Argument(_)
         ));
         assert!(matches!(
             body(&function, &config())
@@ -731,17 +742,18 @@ mod tests {
         let mut function = function("fn g(x: String): String { x }");
         let duplicate = function.params[0].clone();
         Arc::make_mut(&mut function).params.push(duplicate);
-        let mut incomplete = completion(&function);
-        incomplete
-            .check_argument(
-                0,
+        let ArgumentStep::Argument(slot) = completion(&function).next_argument() else {
+            panic!("first slot")
+        };
+        let (cursor, _) = slot
+            .check(
                 FunctionArgument::from_value(unknown()),
                 TypecheckProviderContext::for_parser(&config()),
                 || None,
                 "argument",
             )
             .unwrap();
-        assert!(matches!(incomplete.prepare(), PreparedFunction::Retain(_)));
+        assert!(matches!(cursor.next_argument(), ArgumentStep::Argument(_)));
         assert!(matches!(
             body(&function, &config())
                 .finish(
@@ -757,7 +769,6 @@ mod tests {
     fn declared_checks_shared_check_requires_values_for_nested_literals() {
         let expected = TypeExpr::List(Box::new(TypeExpr::StringLiteral("allowed".into())));
         let check = check_declared_annotation(
-            &expected,
             Some(&expected),
             unknown(),
             TypecheckProviderContext::for_parser(&config()),
@@ -767,7 +778,6 @@ mod tests {
         assert!(matches!(check, AnnotationCheck::AwaitingValue(_)));
         assert!(
             check_declared_annotation(
-                &expected,
                 Some(&expected),
                 AuthoredValue::Concrete(ConcreteValue::List(vec![text("bad-name")])),
                 TypecheckProviderContext::for_parser(&config()),
@@ -824,24 +834,29 @@ mod tests {
     fn declared_checks_resolved_arguments_replace_pending_inputs() {
         let function = function("fn g(x: String): String { x }");
         let pending = completion(&function).retain().into_value();
-        let mut completion = FunctionCompletion::new(
+        let completion = FunctionCompletion::new(
             &function,
             &Arc::new(IndexMap::new()),
             vec![FunctionArgument::from_value(pending)],
             1.into(),
         );
-        completion
-            .check_argument(
-                0,
+        let ArgumentStep::Argument(slot) = completion.next_argument() else {
+            panic!("argument")
+        };
+        let (cursor, _) = slot
+            .check(
                 FunctionArgument::from_value(unknown()),
                 TypecheckProviderContext::for_parser(&config()),
                 || None,
                 "argument",
             )
             .unwrap();
-        let completed = match completion.prepare() {
-            PreparedFunction::Ready { completion } => completion,
-            PreparedFunction::Retain(_) => panic!("resolved argument"),
+        let ArgumentStep::Complete(PreparedFunction::Ready { completion }) = cursor.next_argument()
+        else {
+            panic!("resolved argument")
+        };
+        let LocalStep::Body(completed) = completion.next_local() else {
+            panic!("no locals")
         };
         assert!(matches!(
             completed
@@ -858,7 +873,6 @@ mod tests {
     fn checked_return_cannot_authorize_another_value() {
         let function = function("fn g(): 'allowed' { 'allowed' }");
         let checked = check_declared_annotation(
-            function.as_ref(),
             function.return_type.as_ref(),
             text("allowed"),
             TypecheckProviderContext::for_parser(&config()),
@@ -877,43 +891,47 @@ mod tests {
         );
     }
     #[test]
-    fn mixed_checks_for_one_slot_never_inline() {
-        let function = function("fn g(x: 'allowed'): String { x }");
+    fn mixed_checks_for_distinct_slots_never_inline() {
+        let mut function = function("fn g(x: 'allowed'): String { x }");
+        let duplicate = function.params[0].clone();
+        Arc::make_mut(&mut function).params.push(duplicate);
         for first_known in [false, true] {
-            let mut completion = completion(&function);
-            let (first, second) = if first_known {
-                (text("allowed"), unknown())
-            } else {
-                (unknown(), text("allowed"))
-            };
-            completion
-                .check_argument(
-                    0,
-                    FunctionArgument::from_value(first),
-                    TypecheckProviderContext::for_parser(&config()),
-                    || None,
-                    "argument",
-                )
-                .unwrap();
+            let mut cursor = completion(&function);
+            for known in [first_known, !first_known] {
+                let ArgumentStep::Argument(slot) = cursor.next_argument() else {
+                    panic!("distinct slot")
+                };
+                (cursor, _) = slot
+                    .check(
+                        FunctionArgument::from_value(if known {
+                            text("allowed")
+                        } else {
+                            unknown()
+                        }),
+                        TypecheckProviderContext::for_parser(&config()),
+                        || None,
+                        "argument",
+                    )
+                    .unwrap();
+            }
             assert!(matches!(
-                completion.check_argument(
-                    0,
-                    FunctionArgument::from_value(second),
-                    TypecheckProviderContext::for_parser(&config()),
-                    || None,
-                    "argument"
-                ),
-                Err(ArgumentCheckError::InvalidSlot { index: 0 })
+                cursor.next_argument(),
+                ArgumentStep::Complete(PreparedFunction::Retain(_))
             ));
-            assert!(matches!(completion.prepare(), PreparedFunction::Retain(_)));
         }
     }
     #[test]
-    fn observed_local_survives_argument_replacement() {
-        let function = function("fn g(x: String): String { x }");
-        let mut completed = body(&function, &config());
-        completed.observe(&completion(&function).retain().into_value());
-        // This stage has no argument-replacement or record API.
+    fn observed_local_survives_body_evaluation() {
+        let function = function("fn g(x: String): String { let unused = x\nx }");
+        let LocalStep::Local(slot) = locals(&function, &config()).next_local() else {
+            panic!("local")
+        };
+        let cursor = slot.bind(FunctionArgument::from_value(
+            completion(&function).retain().into_value(),
+        ));
+        let LocalStep::Body(completed) = cursor.next_local() else {
+            panic!("one local")
+        };
         assert!(matches!(
             completed
                 .finish(
@@ -948,7 +966,6 @@ mod tests {
             (TypeExpr::StringLiteral("allowed".into()), false),
         ] {
             let checked = check_declared_annotation(
-                &annotation,
                 Some(&annotation),
                 failed.clone(),
                 TypecheckProviderContext::for_parser(&config()),
@@ -964,18 +981,23 @@ mod tests {
     #[test]
     fn checked_arguments_cannot_be_replaced_before_body() {
         let function = function("fn g(x: 'allowed') { x }");
-        let mut completion = completion(&function);
-        completion
-            .check_argument(
-                0,
+        let ArgumentStep::Argument(slot) = completion(&function).next_argument() else {
+            panic!("argument")
+        };
+        let (cursor, _) = slot
+            .check(
                 FunctionArgument::from_value(text("allowed")),
                 TypecheckProviderContext::for_parser(&config()),
                 || None,
                 "argument",
             )
             .unwrap();
-        let PreparedFunction::Ready { completion } = completion.prepare() else {
-            panic!("checked argument");
+        let ArgumentStep::Complete(PreparedFunction::Ready { completion }) = cursor.next_argument()
+        else {
+            panic!("checked argument")
+        };
+        let LocalStep::Body(completion) = completion.next_local() else {
+            panic!("no locals")
         };
         let mut arguments = completion.retained.arguments_for_recheck();
         arguments[0] = FunctionArgument::from_value(text("bad"));
@@ -991,11 +1013,19 @@ mod tests {
         assert_eq!(result, text("allowed"));
     }
     #[test]
-    fn body_cannot_inline_without_settling_unused_locals() {
+    fn settling_unused_pending_local_retains_the_call() {
         let function = function(
             "fn checked(x: 'allowed') { x }\nfn g(x: String) { let unused = checked(x)\n 'const' }",
         );
-        let completed = body(&function, &config());
+        let LocalStep::Local(slot) = locals(&function, &config()).next_local() else {
+            panic!("unused local token")
+        };
+        let cursor = slot.bind(FunctionArgument::from_value(
+            completion(&function).retain().into_value(),
+        ));
+        let LocalStep::Body(completed) = cursor.next_local() else {
+            panic!("one local")
+        };
         let result = completed
             .finish(
                 text("const"),
@@ -1005,6 +1035,27 @@ mod tests {
             .unwrap();
         assert!(matches!(result, FunctionEvaluation::Retain(_)));
     }
+    #[test]
+    fn argument_cursor_cannot_revisit_an_awaiting_slot() {
+        let function = function("fn g(x: 'allowed'): String { x }");
+        let ArgumentStep::Argument(slot) = completion(&function).next_argument() else {
+            panic!("one parameter");
+        };
+        let (cursor, report) = slot
+            .check(
+                FunctionArgument::from_value(unknown()),
+                TypecheckProviderContext::for_parser(&config()),
+                || None,
+                "argument",
+            )
+            .unwrap();
+        assert!(report.needs_recheck());
+        assert!(matches!(
+            cursor.next_argument(),
+            ArgumentStep::Complete(PreparedFunction::Retain(_))
+        ));
+    }
+
     #[test]
     fn retained_call_serialization_states_the_problem_only() {
         let function = function("fn g(x: String): String { x }");
@@ -1026,7 +1077,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "a user-defined function call still needs its declared types checked against values available only during apply. A saved plan cannot carry this call."
+            "the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call."
         );
         assert!(!message.contains("carina apply"));
     }

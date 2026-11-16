@@ -10,8 +10,8 @@ use super::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
 use super::{ProviderContext, Rule, is_static_eval, parse_expression};
 use crate::eval_value::{EvalValue, UnexpandedStructuralHandleKind};
 use crate::function_evaluation::{
-    AnnotationError, AnnotationStatus, ArgumentCheckError, AwaitingReason, FunctionBodyCompletion,
-    FunctionCompletion, FunctionEvaluation, PreparedFunction, RetainedCall,
+    AnnotationError, ArgumentStep, FunctionBodyCompletion, FunctionCompletion, FunctionEvaluation,
+    LocalStep, ParameterAnnotationCheck, PreparedFunction, RetainedCall,
     annotation_requires_provider_session, check_parameter_annotation,
     contains_deferred_user_function_call,
 };
@@ -261,11 +261,15 @@ fn prepare_user_function_call<'function, 'cfg, Source: super::context::Evaluatio
             .as_ref()
             .is_some_and(annotation_requires_provider_session);
     let mut has_deferred_type_check = requires_session;
-    for (i, param) in func.params.iter().enumerate() {
-        let argument = if i < args.len() {
-            args[i].clone()
-        } else {
-            FunctionArgument::from_value(param.default.clone().unwrap())
+    let prepared = loop {
+        let slot = match completion.next_argument() {
+            ArgumentStep::Argument(slot) => slot,
+            ArgumentStep::Complete(prepared) => break prepared,
+        };
+        let param = slot.parameter();
+        let argument = match slot.argument() {
+            Some(argument) => argument.clone(),
+            None => FunctionArgument::from_value(param.default.clone().unwrap()),
         };
         // Keep nested calls and module-argument placeholders intact until the
         // directory/module resolver has the complete function table and the
@@ -276,30 +280,20 @@ fn prepare_user_function_call<'function, 'cfg, Source: super::context::Evaluatio
         } else {
             argument.try_map_value(|value| try_evaluate_fn_value(value.clone(), ctx, call_line))?
         };
-        let status = completion
-            .check_argument(
-                i,
+        let (next, report) = slot
+            .check(
                 argument.clone(),
                 ctx.typecheck_provider_context(),
                 || None,
                 &format!("function '{}' parameter '{}'", func.name, param.name),
             )
-            .map_err(|error| match error {
-                ArgumentCheckError::Annotation(error) => {
-                    function_argument_annotation_error(func, param, &argument, call_line, error)
-                }
-                ArgumentCheckError::InvalidSlot { index } => ParseError::UserFunctionError(
-                    format!("function argument slot {index} is already settled or does not exist"),
-                ),
+            .map_err(|error| {
+                function_argument_annotation_error(func, param, &argument, call_line, error)
             })?;
-        match status {
-            AnnotationStatus::Discharged { provider_recheck } => {
-                has_deferred_type_check |= provider_recheck
-            }
-            AnnotationStatus::AwaitingValue(_) => has_deferred_type_check = true,
-        }
+        completion = next;
+        has_deferred_type_check |= report.needs_recheck();
         effective_args.push(argument);
-    }
+    };
     if has_deferred_type_check {
         ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
             location: func.body.location.clone(),
@@ -311,7 +305,7 @@ fn prepare_user_function_call<'function, 'cfg, Source: super::context::Evaluatio
             source_file: None,
         });
     }
-    let mut completion = match completion.prepare() {
+    let mut completion = match prepared {
         PreparedFunction::Retain(call) => return Ok(PreparedUserFunctionCall::Deferred(call)),
         PreparedFunction::Ready { completion } => {
             if requires_session
@@ -330,12 +324,18 @@ fn prepare_user_function_call<'function, 'cfg, Source: super::context::Evaluatio
     child_ctx.evaluating_functions.push(fn_name.clone());
 
     // Evaluate local lets, substituting and resolving each one
-    for (index, (let_name, _let_expr, source_line)) in func.local_lets.iter().enumerate() {
-        let local = completion
-            .substitute_local_argument(index)
+    let completion = loop {
+        let slot = match completion.next_local() {
+            LocalStep::Local(slot) => slot,
+            LocalStep::Body(body) => break body,
+        };
+        let let_name = slot.name().to_owned();
+        let source_line = slot.source_line();
+        let local = slot
+            .substitute_argument()
             .map_err(|error| locate_function_body_error(func, error))?
             .try_map_value(|value| {
-                try_evaluate_fn_value(value.clone(), &child_ctx, *source_line)
+                try_evaluate_fn_value(value.clone(), &child_ctx, source_line)
                     .map_err(|error| locate_function_body_error(func, error))
             })?;
 
@@ -352,10 +352,8 @@ fn prepare_user_function_call<'function, 'cfg, Source: super::context::Evaluatio
                 local
             }
         };
-        completion
-            .bind_local(index, local)
-            .map_err(|error| locate_function_body_error(func, error))?;
-    }
+        completion = slot.bind(local);
+    };
 
     Ok(PreparedUserFunctionCall::Ready {
         child_ctx: Box::new(child_ctx),
@@ -829,7 +827,10 @@ fn check_fn_arg_type<Source: super::context::EvaluationSource>(
     ctx: &ParseContext<'_, Source>,
     call_line: usize,
     site: Option<crate::validation::deferred_types::ProviderTypeCheckSite>,
-) -> Result<Option<AnnotationStatus>, ParseError> {
+) -> Result<
+    Option<ParameterAnnotationCheck<ParserPlaceholder, crate::resource::RelativeBindingName>>,
+    ParseError,
+> {
     if parameter.param_type.is_none() {
         return Ok(None);
     }
@@ -1055,15 +1056,14 @@ pub(crate) fn validate_pending_function_type_check(
                     ),
                 );
                 match result {
-                    Ok(None) | Ok(Some(AnnotationStatus::Discharged { .. })) => {}
-                    Ok(Some(AnnotationStatus::AwaitingValue(reason))) => match reason {
-                        AwaitingReason::ConcreteValue | AwaitingReason::ProviderSchema => {}
-                        AwaitingReason::ProviderSession => {
+                    Ok(None) => {}
+                    Ok(Some(check)) => {
+                        if check.requires_provider_session() {
                             return Err(ParseError::UserFunctionError(
                                 "provider annotation check requires its session".into(),
                             ));
                         }
-                    },
+                    }
                     Err(error) => {
                         let located = match error {
                             ParseError::InvalidExpression { message, .. }

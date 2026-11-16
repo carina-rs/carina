@@ -51,7 +51,7 @@ impl std::fmt::Display for SerializationContext {
 /// A retained call is executable data that the saved-plan document cannot carry.
 #[derive(Debug, Clone, Copy, Error)]
 #[error(
-    "a user-defined function call still needs its declared types checked against values available only during apply. A saved plan cannot carry this call."
+    "the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call."
 )]
 pub struct RetainedUserFunctionCallError;
 
@@ -3191,9 +3191,9 @@ fn redact_with_guide(
     guide: SecretRedactionGuide<'_>,
 ) -> Result<SnapshotValue, SerializationError> {
     if let Some(secret_value) = guide.secret_value(source) {
-        // A whole-value guide replaces the authored subtree. Convert that
-        // otherwise unvisited source before the replacement hides its calls.
-        canonical_secret_template(source)?;
+        if crate::function_evaluation::contains_deferred_user_function_call(source) {
+            return Err(RetainedUserFunctionCallError.into());
+        }
         let previous = guide.previous_hash();
         return Ok(SnapshotValue::redacted(hash_secret_value(
             secret_value,
@@ -3239,7 +3239,9 @@ pub fn redact_secrets_using_evaluated(
     evaluated: &Value,
 ) -> Result<SnapshotValue, SerializationError> {
     if contains_secret(evaluated) {
-        canonical_secret_template(source)?;
+        if crate::function_evaluation::contains_deferred_user_function_call(source) {
+            return Err(RetainedUserFunctionCallError.into());
+        }
         // Once evaluation reveals a secret anywhere below this path, persist
         // the evaluated subtree rather than the authored expression. This
         // keeps unresolved refs/unknowns needed at apply time while ensuring

@@ -10708,7 +10708,7 @@ mod plan_serialization_error_tests {
             ));
             assert_eq!(
                 mapped.to_string(),
-                "Cannot save plan: a user-defined function call still needs its declared types checked against values available only during apply. A saved plan cannot carry this call.\nRun `carina apply` directly on the project, without a saved plan."
+                "Cannot save plan: the plan contains an unevaluated call to a user-defined function. A saved plan cannot carry this call.\nRun `carina apply` directly on the project, without a saved plan."
             );
         }
     }

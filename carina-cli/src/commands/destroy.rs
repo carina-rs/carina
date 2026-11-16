@@ -135,6 +135,61 @@ pub async fn run_destroy(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    run_destroy_using(
+        DestroyInvocation {
+            runtime,
+            path,
+            auto_approve,
+            lock,
+            refresh,
+            force,
+            parallelism,
+            provider_context,
+            cancel,
+        },
+        |runtime, providers, base_dir| {
+            ProviderLoad::load(
+                runtime,
+                providers,
+                base_dir,
+                &mut crate::commands::human_provider_notices(runtime.color_mode()),
+            )
+        },
+    )
+    .await
+}
+
+pub(crate) struct DestroyInvocation<'a> {
+    pub(crate) runtime: &'a crate::runtime::CommandRuntime,
+    pub(crate) path: &'a Path,
+    pub(crate) auto_approve: bool,
+    pub(crate) lock: bool,
+    pub(crate) refresh: bool,
+    pub(crate) force: bool,
+    pub(crate) parallelism: NonZeroUsize,
+    pub(crate) provider_context: &'a ProviderContext,
+    pub(crate) cancel: ShutdownToken,
+}
+
+pub(crate) async fn run_destroy_using(
+    invocation: DestroyInvocation<'_>,
+    load: impl FnOnce(
+        &crate::runtime::CommandRuntime,
+        &[carina_core::parser::ProviderConfig<carina_core::resource::ParserPlaceholder>],
+        &carina_core::paths::ResolvedPath,
+    ) -> Result<ProviderLoad, AppError>,
+) -> Result<(), AppError> {
+    let DestroyInvocation {
+        runtime,
+        path,
+        auto_approve,
+        lock,
+        refresh,
+        force,
+        parallelism,
+        provider_context,
+        cancel,
+    } = invocation;
     let project = carina_core::paths::ResolvedPath::new(path)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
@@ -148,12 +203,7 @@ pub async fn run_destroy(
     let parsed = loaded.parsed;
 
     super::apply::symlink_retarget_test_barrier("CARINA_TEST_DESTROY_CONFIG_HANDSHAKE_DIR").await;
-    let providers = ProviderLoad::load(
-        runtime,
-        &parsed.providers,
-        base_dir,
-        &mut crate::commands::human_provider_notices(runtime.color_mode()),
-    )?;
+    let providers = load(runtime, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_read_only_config(parsed, base_dir, &duplicate_declarations)?;
 

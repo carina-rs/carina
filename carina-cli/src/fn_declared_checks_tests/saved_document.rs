@@ -1,4 +1,4 @@
-use super::runtime_checks::{CapturedOutput, assert_no_secret};
+use super::runtime_checks::assert_no_secret;
 use super::*;
 
 fn positions() -> Vec<(&'static str, Case)> {
@@ -68,25 +68,11 @@ async fn assert_refusal(json: bool) {
     for (position, case) in positions() {
         let directory = Directory::new(&case);
         let saved = directory.path().join("saved.plan.json");
-        let captured = CapturedOutput::start();
-        let result = commands::plan::run_plan(
-            &directory.runtime,
-            directory.path(),
-            if json { None } else { Some(&saved) },
-            None,
-            None,
-            crate::DetailLevel::None,
-            false,
-            false,
-            json,
-            false,
-            false,
-            &directory.context(),
-        )
-        .await;
-        let (stdout, stderr) = captured.finish();
-        assert_no_secret(&stdout, "saved document stdout");
-        assert_no_secret(&stderr, "saved document stderr");
+
+        let result = directory
+            .plan_output(if json { None } else { Some(&saved) }, json)
+            .await;
+
         let diagnostic = rendered(&result);
         assert_no_secret(&diagnostic, "saved document diagnostic");
         assert!(

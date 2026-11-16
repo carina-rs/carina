@@ -1701,20 +1701,6 @@ impl ProviderLoad {
         base_dir: &ResolvedPath,
         notices: &mut ProviderNoticeSink,
     ) -> Result<Self, AppError> {
-        #[cfg(test)]
-        if let Some(factories) = runtime
-            .test_hooks()
-            .provider_factories
-            .lock()
-            .unwrap()
-            .as_ref()
-        {
-            return Ok(Self::for_test_with_provider_phase(
-                runtime,
-                factories(),
-                providers,
-            ));
-        }
         let (factories, load_errors) =
             build_factories_from_providers(runtime, providers, base_dir, notices)?;
         Ok(Self {
@@ -1734,20 +1720,6 @@ impl ProviderLoad {
         base_dir: &ResolvedPath,
         notices: &mut ProviderNoticeSink,
     ) -> Result<(ReportingProviderLoad, Option<AppError>), AppError> {
-        #[cfg(test)]
-        if let Some(factories) = runtime
-            .test_hooks()
-            .provider_factories
-            .lock()
-            .unwrap()
-            .as_ref()
-        {
-            return Ok((
-                Self::for_test_with_provider_phase(runtime, factories(), providers)
-                    .into_reporting(),
-                None,
-            ));
-        }
         Ok(
             match build_schema_factories_from_providers(runtime, providers, base_dir, notices) {
                 Ok((factories, load_errors)) => (
