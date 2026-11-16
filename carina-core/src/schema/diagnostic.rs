@@ -488,13 +488,10 @@ mod tests {
     #[test]
     fn protected_key_keeps_its_public_prefix_after_inside_secret() {
         let finding = PrimaryValueFinding::new(
-            FieldPath::from_canonical_segments([
-                LeafPathSegment::StructField("public".into()),
-                LeafPathSegment::MapKey(crate::resource::ValueString::diagnostic_sensitive(
-                    "PRIVATE_KEY",
-                )),
-                LeafPathSegment::StructField("PRIVATE_SUFFIX".into()),
-            ]),
+            FieldPath::new()
+                .push_field("public")
+                .push_protected_map_key()
+                .push_field("PRIVATE_SUFFIX"),
             unknown_field(),
         )
         .inside_secret();
@@ -557,12 +554,9 @@ mod tests {
     fn protected_map_key_target_drops_runtime_key_and_suffix() {
         use super::super::LeafPathSegment;
         let finding = PrimaryValueFinding::new(
-            FieldPath::from_canonical_segments([
-                LeafPathSegment::MapKey(crate::resource::ValueString::diagnostic_sensitive(
-                    "PRIVATE_KEY",
-                )),
-                LeafPathSegment::StructField("PRIVATE_FIELD".into()),
-            ]),
+            FieldPath::new()
+                .push_protected_map_key()
+                .push_field("PRIVATE_FIELD"),
             TypeError::UnknownStructField {
                 struct_name: "Entry".into(),
                 field: "PRIVATE_FIELD".into(),

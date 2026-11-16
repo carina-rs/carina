@@ -3164,7 +3164,9 @@ mod location_tests {
 
     #[test]
     fn inaccessible_unknown_child_uses_the_shared_parent_walk() {
-        use crate::schema::{FieldPath, LeafPath, LeafPathSegment, SchemaDiagnostic, TypeError};
+        use crate::resource::InsideSecret;
+        use crate::schema::diagnostic::SchemaDiagnosticKey;
+        use crate::schema::{FieldPath, FieldPathStep, SchemaDiagnostic, TypeError};
         let source = "mock.test.Thing { config = { inner = {} allow = { typo = true } } }";
         let parsed = super::super::parse_file(
             source,
@@ -3175,37 +3177,43 @@ mod location_tests {
         let tree = AnalysisTree::try_from_file(&parsed).unwrap();
         let resource = tree.resources().next().unwrap();
         let mut misses = Vec::new();
-        for (case, segments) in [
-            vec![
-                LeafPathSegment::StructField("inner".into()),
-                LeafPathSegment::StructField("missing".into()),
-            ],
-            vec![
-                LeafPathSegment::MapKey(crate::resource::ValueString::diagnostic_sensitive(
-                    "PRIVATE_KEY",
-                )),
-                LeafPathSegment::StructField("missing".into()),
-            ],
-            vec![
-                LeafPathSegment::MapKey("Allow".into()),
-                LeafPathSegment::StructField("typo".into()),
-            ],
+        for (case, path) in [
+            FieldPath::new().push_field("inner").push_field("missing"),
+            FieldPath::new()
+                .push_protected_map_key()
+                .push_field("missing"),
+            FieldPath::new().push_map_key("Allow").push_field("typo"),
         ]
         .into_iter()
         .enumerate()
         {
-            let path = FieldPath::from_canonical_segments(segments.clone());
-            let SchemaDiagnostic::UnknownKey(key) = SchemaDiagnostic::from_value(
+            let diagnostic = SchemaDiagnostic::from_value(
                 "config",
-                LeafPath::from_segments(segments),
+                path.canonical(),
                 TypeError::UnknownStructField {
                     struct_name: "Config".into(),
                     field: "missing".into(),
                     suggestion: None,
                 },
-            ) else {
+            );
+            // Canonical paths do not encode protection. Use the secret boundary
+            // for the diagnostic, as the value walk does for a secret map.
+            let diagnostic = if case == 1 {
+                assert!(matches!(path.steps()[0], FieldPathStep::Redacted(_)));
+                diagnostic.inside_secret()
+            } else {
+                diagnostic
+            };
+            let SchemaDiagnostic::UnknownKey(key) = diagnostic else {
                 panic!("keyed finding")
             };
+            if case == 1 {
+                assert!(matches!(
+                    &key.key,
+                    SchemaDiagnosticKey::Value { relative, .. }
+                        if relative.path().steps().iter().any(|step| matches!(step, FieldPathStep::Redacted(_)))
+                ));
+            }
             match resource.locate_unknown_key(&key) {
                 Ok(finding) => assert_eq!(
                     finding.location(),
