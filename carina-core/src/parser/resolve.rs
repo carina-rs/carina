@@ -1318,17 +1318,10 @@ pub fn resolve_resource_refs_in_session<E: ExportParamLike>(
     .map_err(AnalysisResolutionError::from_parse_failure)
 }
 
-/// Resolve a copy of the already sealed input. The original remains a valid
-/// read-only analysis view; no independently supplied raw file can bypass it.
-///
-/// ```compile_fail,E0308
-/// use carina_core::parser::{ParsedFile, resolve_resource_refs_from_analysis};
-/// use carina_core::validation::deferred_types::ProviderTypeCheckContext;
-/// fn resolve(file: &ParsedFile, session: &dyn ProviderTypeCheckContext) {
-///     resolve_resource_refs_from_analysis(file, session);
-/// }
-/// ```
-pub fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
+/// Resolve a copy of the already sealed input. Editor publication goes
+/// through the consuming request in `config_loader`; value consumers use
+/// `evaluate_resource_ref_values_from_analysis`.
+pub(crate) fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
     tree: &super::AnalysisTree<
         '_,
         ParserPlaceholder,
@@ -1348,6 +1341,51 @@ pub fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
     )
     .map_err(AnalysisResolutionError::from_parse_failure)?;
     Ok(parsed)
+}
+
+/// Evaluate a sealed view for values. A failed judgement supplies no value
+/// view and no diagnostic capability to the caller.
+pub fn evaluate_resource_ref_values_from_analysis<E: ExportParamLike + Clone>(
+    tree: &super::AnalysisTree<
+        '_,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        super::ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
+        RelativeBindingName,
+        E,
+    >,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> Option<File<E>> {
+    resolve_resource_refs_from_analysis(tree, session).ok()
+}
+
+/// A provider value query records only body-dependency receipts. Its attempted
+/// resolution error cannot escape to the editor's publication path.
+pub(crate) fn editor_provider_value_uses_owned_body(
+    parsed: &ParsedFile,
+    value: &Value,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    owned: &crate::validation::deferred_types::EditorFunctionBodyJudgements,
+) -> bool {
+    let context = crate::validation::deferred_types::EditorFunctionBodyContext::new(
+        session,
+        parsed.expression_report(),
+    );
+    let mut bindings = HashMap::new();
+    for resource in parsed.iter_top_level_resources() {
+        if let Some(binding) = resource.binding() {
+            bindings.insert(binding.to_string(), resource.resolved_attributes());
+        }
+    }
+    let _values = resolve_value_with_config(
+        value,
+        &bindings,
+        session.catalog(),
+        Some(&context),
+        diagnostics_resolution_context(),
+    )
+    .ok();
+    owned.owns_rejection_from(&context.into_judgements())
 }
 
 /// Parser/module-loader evaluation before the analysis boundary is sealed.

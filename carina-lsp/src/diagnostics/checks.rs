@@ -40,6 +40,17 @@ pub(super) struct MergedParseResult {
     pub(super) module_resolution: MergedModuleResolution,
 }
 
+impl MergedParseResult {
+    pub(super) fn new(directory: std::sync::Arc<DirectoryParseResult>) -> Self {
+        Self {
+            directory,
+            module_resolution: MergedModuleResolution::Unanalyzed,
+            analysis_errors: Vec::new(),
+            authored_module_findings: Vec::new(),
+        }
+    }
+}
+
 pub(super) enum MergedModuleResolution {
     Unanalyzed,
     Expanded {
@@ -68,129 +79,6 @@ impl ExpansionBoundaryScope {
             Self::Authored => placeholder.authored_location().is_some(),
             Self::Unlocated => placeholder.authored_location().is_none(),
         }
-    }
-}
-
-fn value_depends_on_module_output(
-    value: &Value,
-    module_bindings: &HashSet<RelativeBindingName>,
-    variables: &indexmap::IndexMap<String, Value>,
-    visiting_variables: &mut HashSet<RelativeBindingName>,
-) -> bool {
-    match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            deferred.values().into_iter().any(|value| {
-                value_depends_on_module_output(
-                    value,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
-            })
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            if module_bindings.contains(path.binding()) {
-                return true;
-            }
-            let binding = path.binding_address();
-            visiting_variables.insert(binding.clone())
-                && variables.get(binding.as_str()).is_some_and(|value| {
-                    value_depends_on_module_output(
-                        value,
-                        module_bindings,
-                        variables,
-                        visiting_variables,
-                    )
-                })
-        }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            if module_bindings.contains(binding) {
-                return true;
-            }
-            visiting_variables.insert(binding.clone())
-                && variables.get(binding.as_str()).is_some_and(|value| {
-                    value_depends_on_module_output(
-                        value,
-                        module_bindings,
-                        variables,
-                        visiting_variables,
-                    )
-                })
-        }
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }),
-        Value::Concrete(ConcreteValue::Map(entries)) => entries.values().any(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(
-                part,
-                carina_core::resource::InterpolationPart::Expr(value)
-                    if value_depends_on_module_output(
-                        value,
-                        module_bindings,
-                        variables,
-                        visiting_variables,
-                    )
-            )
-        }),
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
-        ) => args.iter().any(|argument| {
-            argument.value().is_some_and(|value| {
-                value_depends_on_module_output(
-                    value,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
-            })
-        }),
-        Value::Deferred(DeferredValue::Access(access)) => value_depends_on_module_output(
-            access.base(),
-            module_bindings,
-            variables,
-            visiting_variables,
-        ),
-        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-                || value_depends_on_module_output(
-                    default,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            value_depends_on_module_output(
-                expression.lhs(),
-                module_bindings,
-                variables,
-                visiting_variables,
-            ) || value_depends_on_module_output(
-                expression.rhs(),
-                module_bindings,
-                variables,
-                visiting_variables,
-            )
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::Placeholder(_)) => false,
     }
 }
 
@@ -849,19 +737,13 @@ impl DiagnosticRun<'_> {
         &self,
         base_path: &carina_core::paths::ResolvedPath,
         overrides: &carina_core::config_loader::SourceOverrides,
-    ) -> Result<MergedParseResult, carina_core::config_loader::DirectoryParseFailure> {
-        let result = carina_core::config_loader::parse_directory_with_overrides_and_diagnostics_with_schemas(
+    ) -> carina_core::config_loader::MergedAttempt {
+        carina_core::config_loader::parse_editor_directory_with_overrides_and_schemas(
             base_path,
             self.provider_context.catalog(),
             overrides,
             &self.schemas,
-        )?;
-        Ok(MergedParseResult {
-            directory: std::sync::Arc::new(result),
-            module_resolution: MergedModuleResolution::Unanalyzed,
-            analysis_errors: Vec::new(),
-            authored_module_findings: Vec::new(),
-        })
+        )
     }
 
     /// Compute the canonical authored findings once, then reuse them to claim
@@ -931,7 +813,7 @@ impl DiagnosticRun<'_> {
         &self,
         doc: &Document,
         base_path: &carina_core::paths::ResolvedPath,
-    ) -> Result<MergedParseResult, carina_core::config_loader::DirectoryParseFailure> {
+    ) -> Option<MergedParseResult> {
         let file_name = doc
             .source_file()
             .file_name()
@@ -942,7 +824,10 @@ impl DiagnosticRun<'_> {
                 .expect("resolve test document against pinned base"),
             doc.text(),
         );
-        let mut result = self.parse_merged_with_buffer(base_path, &overrides)?;
+        let (directory, _resolution_request) = self
+            .parse_merged_with_buffer(base_path, &overrides)
+            .into_parts(doc.source_file(), doc.parsed_buffer());
+        let mut result = MergedParseResult::new(directory?);
         let directory = std::sync::Arc::clone(&result.directory);
         match carina_core::parser::AnalysisTree::try_from_file(directory.parsed.parsed()) {
             Ok(tree) => {
@@ -960,7 +845,7 @@ impl DiagnosticRun<'_> {
             }
             Err(error) => result.analysis_errors.push(error),
         }
-        Ok(result)
+        Some(result)
     }
 
     pub(super) fn module_resolver_error_diagnostics(
@@ -1058,70 +943,20 @@ impl DiagnosticRun<'_> {
             .collect()
     }
 
-    /// Run finalize-against-a-buffer in isolation so the engine can surface
-    /// `default_tags must resolve to a map` etc. as diagnostics. The merged
-    /// parse + module-expansion + resolve pair is rebuilt here intentionally:
-    /// `parse_merged_with_buffer` swallows the finalize error to keep
-    /// identifier-scope diagnostics running, but that error must surface
-    /// somewhere (#2717 / #2753).
+    /// Consume the provider judgement after root resolution, retaining only
+    /// inputs whose function/module dependencies remain available.
     pub(super) fn finalize_provider_diagnostic(
         &self,
         base_path: &carina_core::paths::ResolvedPath,
         overrides: &carina_core::config_loader::SourceOverrides,
-    ) -> Option<carina_core::parser::AnalysisResolutionError> {
-        let merged = carina_core::config_loader::parse_directory_for_metadata_report(
+        function_bodies: carina_core::config_loader::EditorFunctionBodyJudgements,
+    ) -> Option<carina_core::config_loader::OwnedResolutionFinding> {
+        function_bodies.finalize_providers(
             base_path,
-            self.provider_context.catalog(),
             overrides,
-            &self.schemas,
-        )
-        .ok()?;
-        // This is a projected provider-value query, not authored admission.
-        // It returns only provider finalization errors and publishes no AST
-        // findings from its deliberately separate metadata parse.
-        match carina_core::module_resolver::finalize_provider_metadata_with_module_overrides(
-            &merged,
-            base_path,
             self.provider_context,
             &self.schemas,
-            overrides,
-        ) {
-            carina_core::module_resolver::ProviderMetadataResolution::Expanded(result) => {
-                return result.err();
-            }
-            carina_core::module_resolver::ProviderMetadataResolution::Unavailable => {}
-        }
-        let mut merged = merged.into_parsed();
-        {
-            // The primary diagnostics pass owns the module error. A provider
-            // value that reads a failed module's output cannot be finalized
-            // soundly, but unrelated provider values still can (and must) be
-            // diagnosed. Remove only the dependent values before finalizing
-            // the surviving, context-free subset.
-            let module_bindings = merged
-                .module_calls
-                .iter()
-                .filter_map(|call| call.binding_name.clone())
-                .collect::<HashSet<_>>();
-            let variables = merged.variables.clone();
-            for provider in &mut merged.providers {
-                provider.unresolved_attributes.retain(|_, value| {
-                    !value_depends_on_module_output(
-                        value,
-                        &module_bindings,
-                        &variables,
-                        &mut HashSet::new(),
-                    )
-                });
-            }
-        }
-        if let Err(e) = carina_core::parser::resolve_provider_unresolved_attributes_for_analysis(
-            &mut merged,
-            self.provider_context.catalog(),
-        ) {
-            return Some(e);
-        }
-        carina_core::parser::finalize_provider_configs_for_analysis(&mut merged).err()
+        )
     }
 
     /// Collect every binding name declared anywhere in `base_path` by

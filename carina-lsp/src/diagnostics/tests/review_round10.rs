@@ -76,9 +76,12 @@ fn r10_provider_finalization_observes_unsaved_imported_module_values() {
         };
         let notices = validation.complete().into_presented();
         assert!(notices.is_empty(), "no-as metadata control: {notices:?}");
+        let (_, function_bodies) = carina_core::config_loader::editor_buffer_resolution(None)
+            .finish(run.provider_context)
+            .into_parts();
         let actual = run
-            .finalize_provider_diagnostic(&base, &overrides)
-            .map(|error| error.to_string());
+            .finalize_provider_diagnostic(&base, &overrides, function_bodies)
+            .map(|finding| finding.into_error().to_string());
         (old, actual, notices.len())
     });
     let ordinary_analysis =
@@ -285,9 +288,12 @@ fn r18_provider_finalization_preserves_mains_forwarded_template_query() {
             ),
         };
         assert!(validation.complete().into_presented().is_empty());
+        let (_, function_bodies) = carina_core::config_loader::editor_buffer_resolution(None)
+            .finish(run.provider_context)
+            .into_parts();
         let actual = run
-            .finalize_provider_diagnostic(&base, &overrides)
-            .map(|error| error.to_string());
+            .finalize_provider_diagnostic(&base, &overrides, function_bodies)
+            .map(|finding| finding.into_error().to_string());
         (old, actual, strict_error)
     });
     println!(

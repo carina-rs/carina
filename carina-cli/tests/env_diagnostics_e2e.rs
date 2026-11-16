@@ -199,10 +199,7 @@ fn secret_builtin_failures_use_payload_boundary_in_cli_and_lsp() {
                 .contains(&private_literal.to_ascii_lowercase()),
             "{builtin}: {diagnostics:#?}"
         );
-        let mut expected_lsp = vec![
-            expected.clone(),
-            format!("Invalid expression at line 1: {expected}"),
-        ];
+        let mut expected_lsp = vec![expected.clone()];
         if builtin == "map" {
             expected_lsp.push("Consider using pipe form for 'map': data |> map(...)".into());
         }
@@ -506,7 +503,7 @@ fn real_secret_directory_reachability_preserves_diagnostic_boundaries() {
       "Finalize error: Invalid expression at line 0: Provider 'mock': default_tags must resolve to a map, got Deferred(Secret((secret)))"
     ],
     "lsp": [
-      "Invalid expression at line 0: Provider 'mock': default_tags must resolve to a map, got Deferred(Secret((secret)))"
+      "Provider 'mock': default_tags must resolve to a map, got Deferred(Secret((secret)))"
     ],
     "runtime": null,
     "plan_errors": [],
@@ -521,9 +518,6 @@ fn real_secret_directory_reachability_preserves_diagnostic_boundaries() {
       "Invalid expression at line 1: backend s3 attribute 'bucket' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed"
     ],
     "lsp": [
-      "Invalid expression at line 1: backend s3 attribute 'bucket' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed",
-      "Invalid expression at line 1: backend s3 attribute 'bucket' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed",
-      "Invalid expression at line 1: backend s3 attribute 'bucket' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed",
       "Invalid expression at line 1: backend s3 attribute 'bucket' must be a plain string or other non-secret value; secret()- and decrypt()-derived values are not allowed"
     ],
     "runtime": null,
@@ -896,9 +890,8 @@ fn real_secret_directory_reachability_preserves_diagnostic_boundaries() {
         }
         assert_eq!(statuses, expected_case.validation_codes, "{label}");
         assert_eq!(messages, expected_case.errors, "CLI JSON: {label}");
-        // The `backend_attribute` case pins the same finding four times at one
-        // range: the editor publishes it from four passes (carina#4492). When that
-        // is fixed, the pinned list shrinks to one entry.
+        // Resolution has one publisher, including the backend attribute finding
+        // whose cardinality previously depended on four editor passes (#4492).
         assert_eq!(lsp_messages, expected_case.lsp, "LSP: {label}");
     }
     assert!(expected.is_empty(), "every expected case must run");

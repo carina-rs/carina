@@ -244,19 +244,20 @@ fn render_analysis_invariant(
     }
 }
 
-fn render_analysis_resolution_error(
+/// The one consuming frontend conversion for editor resolution.
+fn render_editor_resolution(
     doc: &Document,
-    error: &carina_core::parser::AnalysisResolutionError,
+    finding: carina_core::config_loader::OwnedResolutionFinding,
 ) -> Option<Diagnostic> {
-    match error {
+    match finding.into_error() {
         carina_core::parser::AnalysisResolutionError::Invariant(error) => {
-            render_analysis_invariant(doc, error)
+            render_analysis_invariant(doc, &error)
         }
         carina_core::parser::AnalysisResolutionError::Diagnostic(finding) => render_merged(
             doc,
             finding.as_ref(),
             DiagnosticSeverity::ERROR,
-            finding.detail().to_string(),
+            finding.detail().diagnostic_message(),
         ),
     }
 }
@@ -1530,11 +1531,8 @@ impl DiagnosticRun<'_> {
         // substituted for its on-disk copy so diagnostics update on
         // keystrokes.
         let merged_attempt = base_path.map(|base| self.parse_merged_with_buffer(base, &overrides));
-        let duplicates = match merged_attempt
-            .as_ref()
-            .and_then(|attempt| attempt.as_ref().ok())
-        {
-            Some(result) => result.directory.duplicate_declarations.clone(),
+        let duplicates = match merged_attempt.as_ref().and_then(|attempt| attempt.merged()) {
+            Some(result) => result.duplicate_declarations.clone(),
             None => match buffer_analysis.as_ref() {
                 Some(tree) => carina_core::config_loader::find_duplicate_declarations_in_analysis(
                     doc.source_file(),
@@ -1547,11 +1545,17 @@ impl DiagnosticRun<'_> {
             },
         };
         let mut failed_directory_type_resolution = None;
-        let directory_error_emitted = if let (Some(Err(error)), Some(current_file_path)) =
-            (merged_attempt.as_ref(), current_file_path)
-            && error
-                .source_file()
-                .is_some_and(|source_file| source_file == current_file_path)
+        let resolution_pending = merged_attempt.as_ref().is_some_and(|attempt| {
+            attempt.has_resolution_for(current_file_path.unwrap_or_else(|| doc.source_file()))
+        });
+        let directory_error_emitted = if let (Some(error), Some(current_file_path)) = (
+            merged_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.source_failure()),
+            current_file_path,
+        ) && error
+            .source_file()
+            .is_some_and(|source_file| source_file == current_file_path)
             && let Some(parse_error) = error.parse_error()
         {
             // The directory parse has the classified sibling bindings and is
@@ -1599,9 +1603,20 @@ impl DiagnosticRun<'_> {
             failed_directory_type_resolution = type_resolution;
             true
         } else {
-            false
+            resolution_pending
         };
-        let mut merged_result = merged_attempt.and_then(Result::ok);
+        let fallback_buffer = doc.parsed_buffer().filter(|_| buffer_analysis.is_some());
+        let (merged_directory, resolution_request) = match merged_attempt {
+            Some(attempt) => attempt.into_parts(
+                current_file_path.unwrap_or_else(|| doc.source_file()),
+                fallback_buffer,
+            ),
+            None => (
+                None,
+                carina_core::config_loader::editor_buffer_resolution(fallback_buffer),
+            ),
+        };
+        let mut merged_result = merged_directory.map(checks::MergedParseResult::new);
 
         // Keep the parsed input stable while module-analysis results are filled
         // in. Cloning this Arc preserves the exact sealed directory without
@@ -1795,45 +1810,23 @@ impl DiagnosticRun<'_> {
             }
         }
 
-        // The diagnostic directory parse deliberately preserves a user-function
-        // call when evaluating its body fails, so the rest of the editor checks
-        // can still inspect the authored call. Run the strict resolver on a
-        // clone after declaration resolution so the session already owns any
-        // failed signatures. This surfaces source-owned body errors (for example, a
-        // sibling call that binds a structural handle and then uses the
-        // parameter bare). Resolution retains the parser-owned expression
-        // location through the merged pass.
-        if let Some(tree) = merged_analysis.as_ref()
-            && let Err(error) = carina_core::parser::resolve_resource_refs_from_analysis(
-                tree,
-                self.provider_context,
-            )
-        {
-            diagnostics.extend(render_analysis_resolution_error(doc, &error));
+        // Declaration checks have populated the shared session. Consume the
+        // selected merged/buffer judgement here; all later resolution is values-only.
+        let (resolution_finding, function_bodies) = resolution_request
+            .finish(self.provider_context)
+            .into_parts();
+        let provider_finding = base_path
+            .and_then(|base| self.finalize_provider_diagnostic(base, &overrides, function_bodies));
+        for finding in resolution_finding.into_iter().chain(provider_finding) {
+            diagnostics.extend(render_editor_resolution(doc, finding));
         }
         // Every catalog runs the same declaration producers. An incomplete
         // catalog records deferrals; a loaded owner produces strict diagnostics.
         {
-            let custom_type_findings = match merged {
-                Some(_) => type_resolution
-                    .as_ref()
-                    .map(|report| report.diagnostics().to_vec())
-                    .unwrap_or_default(),
-                None => {
-                    if let Some(tree) = current_analysis.as_ref()
-                        && let Err(error) = carina_core::parser::resolve_resource_refs_from_analysis(
-                            tree,
-                            self.provider_context,
-                        )
-                    {
-                        diagnostics.extend(render_analysis_resolution_error(doc, &error));
-                    }
-                    type_resolution
-                        .as_ref()
-                        .map(|report| report.diagnostics().to_vec())
-                        .unwrap_or_default()
-                }
-            };
+            let custom_type_findings = type_resolution
+                .as_ref()
+                .map(|report| report.diagnostics().to_vec())
+                .unwrap_or_default();
             for finding in custom_type_findings {
                 if let Some(diagnostic) = render_merged(
                     doc,
@@ -1858,19 +1851,6 @@ impl DiagnosticRun<'_> {
         if let Some(tree) = preferred_analysis {
             diagnostics.extend(self.check_wait_bindings(doc, tree));
             diagnostics.extend(self.check_deferred_populate_refs(doc, tree));
-        }
-
-        // Provider-attribute finalize diagnostic (#2717 / #2753): if a
-        // non-literal `default_tags` (or future deferred attribute) does
-        // not resolve to the expected shape, surface that error as a
-        // diagnostic so editors flag it the same way `carina validate`
-        // does.
-        if let Some(base) = base_path
-            && let Some(err) = self.finalize_provider_diagnostic(base, &overrides)
-            && let Some(diagnostic) = render_analysis_resolution_error(doc, &err)
-            && !diagnostics.contains(&diagnostic)
-        {
-            diagnostics.push(diagnostic);
         }
 
         // Directory binding authority for parser-owned reference occurrences.
@@ -2037,20 +2017,13 @@ impl DiagnosticRun<'_> {
             );
             if merged.is_none()
                 && let Ok(tree) = carina_core::parser::AnalysisTree::try_from_file(&admission_file)
+                && let Some(resolved) =
+                    carina_core::parser::evaluate_resource_ref_values_from_analysis(
+                        &tree,
+                        self.provider_context,
+                    )
             {
-                match carina_core::parser::resolve_resource_refs_from_analysis(
-                    &tree,
-                    self.provider_context,
-                ) {
-                    Ok(resolved) => admission_file = resolved,
-                    Err(error) => {
-                        if matches!(&error, carina_core::parser::AnalysisResolutionError::Diagnostic(finding)
-                                if matches!(finding.detail(), ParseError::SecretDerivedBackendAttribute { .. }))
-                        {
-                            diagnostics.extend(render_analysis_resolution_error(doc, &error));
-                        }
-                    }
-                }
+                admission_file = resolved;
             }
             let canonical_pre_expansion =
                 canonicalize_file_prefixes(admission_file, &self.schemas, SuffixSource::Preview);
@@ -2167,14 +2140,15 @@ impl DiagnosticRun<'_> {
             // even when no typed resource sink consumes them. Binding and
             // schema authority remains directory-wide, while source anchoring
             // comes from each authored operator.
-            for finding in pre_expansion_configuration.integer_arithmetic_findings(&binding_index) {
+            for finding in
+                pre_expansion_configuration.remaining_integer_arithmetic_findings(&binding_index)
+            {
                 if let Some(diagnostic) = render_merged(
                     doc,
                     &finding,
                     DiagnosticSeverity::ERROR,
                     finding.detail().to_string(),
-                ) && !diagnostics.contains(&diagnostic)
-                {
+                ) {
                     diagnostics.push(diagnostic);
                 }
             }
@@ -2458,20 +2432,10 @@ impl DiagnosticRun<'_> {
                 .and_then(semantic_tree_for_values);
             // Main evaluates a separate buffer copy for function-call display;
             // folding directory references into admission would change wording.
-            let evaluated_buffer = match carina_core::parser::resolve_resource_refs_from_analysis(
+            let evaluated_buffer = carina_core::parser::evaluate_resource_ref_values_from_analysis(
                 tree,
                 self.provider_context,
-            ) {
-                Ok(file) => Some(file),
-                Err(error) => {
-                    if matches!(&error, carina_core::parser::AnalysisResolutionError::Diagnostic(finding)
-                        if matches!(finding.detail(), ParseError::SecretDerivedBackendAttribute { .. }))
-                    {
-                        diagnostics.extend(render_analysis_resolution_error(doc, &error));
-                    }
-                    None
-                }
-            };
+            );
             let evaluated_buffer_tree =
                 evaluated_buffer.as_ref().and_then(semantic_tree_for_values);
             // Syntax correspondence is checked against the document's own

@@ -334,10 +334,10 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
             &substitutions,
             *source_line,
         )
-        .map_err(|error| locate_function_body_error(func, error))?
+        .map_err(|error| locate_function_body_error(func, args, ctx.session, error))?
         .try_map_value(|value| {
             try_evaluate_fn_value(value.clone(), &child_ctx, *source_line)
-                .map_err(|error| locate_function_body_error(func, error))
+                .map_err(|error| locate_function_body_error(func, args, ctx.session, error))
         })?;
 
         let local = match local.handle() {
@@ -1337,9 +1337,9 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
         func.body.source_line,
         crate::value_walk::RewritePosition::Value,
     )
-    .map_err(|error| locate_function_body_error(func, error))?;
+    .map_err(|error| locate_function_body_error(func, args, ctx.session, error))?;
     let result = try_evaluate_fn_value(substituted_body, &child_ctx, func.body.source_line)
-        .map_err(|error| locate_function_body_error(func, error))?
+        .map_err(|error| locate_function_body_error(func, args, ctx.session, error))?
         .canonicalize();
     // Check return type if annotated
     if let Some(ref return_type) = func.return_type {
@@ -1349,7 +1349,7 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
             &result,
             child_ctx.typecheck_provider_context(),
         )
-        .map_err(|error| locate_function_body_error(func, error))?;
+        .map_err(|error| locate_function_body_error(func, args, ctx.session, error))?;
         let retain_check = match return_check {
             FunctionArgumentTypeCheck::RecordedProviderDeferral
             | FunctionArgumentTypeCheck::AwaitingRuntimeValue => true,
@@ -1417,7 +1417,15 @@ pub(crate) fn evaluate_resolved_user_function(
     evaluate_user_function(function, arguments, &context, call_line)
 }
 
-fn locate_function_body_error(func: &UserFunction, error: ParseError) -> ParseError {
+fn locate_function_body_error(
+    func: &UserFunction,
+    args: &[FunctionArgument],
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    error: ParseError,
+) -> ParseError {
+    if let Some(session) = session {
+        session.rejected_function_body(func, args);
+    }
     error.at(&func.body.location)
 }
 

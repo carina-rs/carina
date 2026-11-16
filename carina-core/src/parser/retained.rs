@@ -4940,6 +4940,26 @@ mod judgement {
                 .ok_or_else(|| MissingEvidence::new("access location"))?;
             self.expression(location.expression_location())
         }
+        /// Abstract body rejection is definition-owned, independently of any
+        /// concrete invocation's argument values.
+        pub(crate) fn rejects_function_body(
+            &self,
+            function: &super::super::UserFunction<B>,
+        ) -> bool {
+            self.expression(&function.body.location)
+                .is_ok_and(|expression| expression.failed())
+        }
+        /// The retained producer claims an operator by parser syntax identity,
+        /// before a second arithmetic proof can manufacture another finding.
+        pub(crate) fn owns_integer_operand_failure(
+            &self,
+            operator: &crate::integer_arithmetic::IntegerOperatorSpan,
+        ) -> bool {
+            let Some(node) = operator.node_id() else {
+                return false;
+            };
+            self.findings.iter().any(|finding| matches!(finding.detail(), InferenceError::InvalidIntegerArithmeticOperand { operator_span, .. } if operator_span.node_id() == Some(node)))
+        }
         pub fn findings(&self) -> &[Located<InferenceError>] {
             &self.findings
         }
@@ -6150,7 +6170,10 @@ mod judgement {
                     ordinary(
                         inference::judge_integer_operands(
                             *op,
-                            location,
+                            crate::integer_arithmetic::IntegerOperatorSpan::authored(
+                                location.clone(),
+                            )
+                            .with_node(Some(root.id)),
                             &operands,
                             self.schemas,
                             self.config,

@@ -12,6 +12,12 @@ use crate::parser::{self, File, ParsedFile, ProviderContext};
 use crate::resource::{BindingAddress, ParserPlaceholder};
 use crate::schema::SchemaRegistry;
 
+mod editor;
+pub use editor::{
+    EditorFunctionBodyJudgements, EditorResolution, EditorResolutionRequest, MergedAttempt,
+    OwnedResolutionFinding, editor_buffer_resolution,
+    parse_editor_directory_with_overrides_and_schemas,
+};
 mod resolution;
 pub(crate) use resolution::ResolutionContext;
 use resolution::{AnalysisMode, ResolutionPhase};
@@ -1610,6 +1616,7 @@ pub fn parse_directory_for_metadata_report(
         schemas,
     )
     .map(|result| result.parsed)
+    .map_err(DirectoryAttemptError::into_failure)
 }
 
 /// Parse and merge a directory in strict mode with identity-keyed [`SourceOverrides`].
@@ -1827,6 +1834,7 @@ pub fn parse_directory_with_overrides_and_diagnostics(
         diagnostics_resolution_context(),
         &SchemaRegistry::new(),
     )
+    .map_err(DirectoryAttemptError::into_failure)
 }
 
 /// Diagnostic-preserving directory parsing with identity-keyed [`SourceOverrides`]
@@ -1844,6 +1852,24 @@ pub fn parse_directory_with_overrides_and_diagnostics_with_schemas(
         diagnostics_resolution_context(),
         schemas,
     )
+    .map_err(DirectoryAttemptError::into_failure)
+}
+
+/// Failure origin is assigned where the failing operation runs. Legacy
+/// callers erase this tag; editor attempts retain it until judgement selection.
+#[derive(Debug, thiserror::Error)]
+enum DirectoryAttemptError {
+    #[error(transparent)]
+    Source(#[from] DirectoryParseFailure),
+    #[error(transparent)]
+    Resolution(DirectoryParseFailure),
+}
+impl DirectoryAttemptError {
+    fn into_failure(self) -> DirectoryParseFailure {
+        match self {
+            Self::Source(failure) | Self::Resolution(failure) => failure,
+        }
+    }
 }
 
 fn parse_directory_with_overrides_impl(
@@ -1852,7 +1878,7 @@ fn parse_directory_with_overrides_impl(
     overrides: &SourceOverrides,
     resolution: ResolutionContext,
     schemas: &SchemaRegistry,
-) -> Result<DirectoryParseResult, DirectoryParseFailure> {
+) -> Result<DirectoryParseResult, DirectoryAttemptError> {
     let resolved = dir.clone();
     let dir_label = resolved.source_label();
     let dir = dir_label.as_path();
@@ -1862,7 +1888,8 @@ fn parse_directory_with_overrides_impl(
         return Err(DirectoryParseFailure::message(format!(
             "No .crn files found in {}",
             dir.display()
-        )));
+        ))
+        .into());
     }
 
     // Resolve every file's source text (disk or override) up front so
@@ -1877,13 +1904,14 @@ fn parse_directory_with_overrides_impl(
                 .source_file
                 .clone()
                 .unwrap_or_else(|| dir.to_path_buf());
-            return Err(DirectoryParseFailure::new(
-                DirectoryParseFailureKind::Parse {
+            return Err(
+                DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
                     location,
                     source_file: located.source_file,
                     error: located.error,
-                },
-            ));
+                })
+                .into(),
+            );
         }
     };
     let authored_bindings = AuthoredBindingView::from_directory_files(&parsed_files);
@@ -1906,16 +1934,21 @@ fn parse_directory_with_overrides_impl(
                 parser::resolve_resource_refs_for_diagnostics(&mut semantic, config).map_err(
                     |error| {
                         let located = LocatedParseError::in_file(path, error);
-                        DirectoryParseFailure::new(DirectoryParseFailureKind::Parse {
-                            location: located.source_file.clone().unwrap_or_else(|| path.clone()),
-                            source_file: located.source_file,
-                            error: located.error,
-                        })
+                        DirectoryAttemptError::Resolution(DirectoryParseFailure::new(
+                            DirectoryParseFailureKind::Parse {
+                                location: located
+                                    .source_file
+                                    .clone()
+                                    .unwrap_or_else(|| path.clone()),
+                                source_file: located.source_file,
+                                error: located.error,
+                            },
+                        ))
                     },
                 )?;
                 Ok((path.clone(), semantic))
             })
-            .collect::<Result<Vec<_>, DirectoryParseFailure>>()?
+            .collect::<Result<Vec<_>, DirectoryAttemptError>>()?
     } else {
         Vec::new()
     };
@@ -1940,7 +1973,9 @@ fn parse_directory_with_overrides_impl(
     let resolve_result =
         parser::resolve_resource_refs_in_context(&mut merged, config, None, resolution);
     if let Err(error) = resolve_result {
-        return Err(DirectoryParseFailure::from_parse_error(error));
+        return Err(DirectoryAttemptError::Resolution(
+            DirectoryParseFailure::from_parse_error(error),
+        ));
     }
     // `finalize_provider_configs` is intentionally NOT called here. The
     // merged result is pre-module-expansion; deferred provider
@@ -1957,7 +1992,7 @@ fn parse_directory_with_overrides_impl(
     if !resolution.is_diagnostics()
         && let Some(error) = merged.expression_report().first_function_error()
     {
-        return Err(DirectoryParseFailure::from_parse_error(error));
+        return Err(DirectoryParseFailure::from_parse_error(error).into());
     }
     Ok(DirectoryParseResult {
         parsed: RootDirectoryParse::with_resolution(merged, resolution),

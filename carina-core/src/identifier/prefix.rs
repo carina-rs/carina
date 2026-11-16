@@ -771,6 +771,14 @@ where
     ) -> Vec<crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>> {
         crate::validation::check_file_integer_arithmetic_values(&self.file, bindings)
     }
+    /// Check only operators whose operand judgement is not owned by the
+    /// retained expression publisher. Ownership uses parser syntax identity.
+    pub fn remaining_integer_arithmetic_findings(
+        &self,
+        bindings: &crate::binding_index::BindingIndex<'_, B>,
+    ) -> Vec<crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>> {
+        crate::validation::check_file_remaining_integer_arithmetic_values(&self.file, bindings)
+    }
     pub fn judged(&self) -> &Self {
         self
     }

@@ -117,8 +117,8 @@ mod sealed {
     pub trait SessionEvidence {}
 }
 
-/// A borrowed view of a scoped session. Only the session implements this
-/// sealed interface; borrowing it never transfers ownership of evidence.
+/// A borrowed view of a scoped session or its editor judgement recorder.
+/// Borrowing this sealed interface never transfers ownership of evidence.
 pub trait ProviderTypeCheckContext:
     sealed::SessionEvidence + std::fmt::Debug + Send + Sync
 {
@@ -129,6 +129,17 @@ pub trait ProviderTypeCheckContext:
     /// the authored expression while unrelated function checks still run.
     fn fail_function_declaration(&self, source: &Path, name: &str);
     fn has_failed_function_declaration(&self, source: &Path, name: &str) -> bool;
+    /// Record a rejected body in the editor's judgement owner.
+    fn rejected_function_body(
+        &self,
+        _function: &UserFunction,
+        _arguments: &[crate::resource::FunctionArgument<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >],
+    ) {
+    }
+
     fn record(&self, expected: &TypeExpr, site: ProviderTypeCheckSite);
     fn record_type(&self, expected: &TypeExpr, context: &str);
     fn publish_checks(
@@ -156,6 +167,159 @@ impl dyn ProviderTypeCheckContext + '_ {
             output,
             brand: PhantomData,
         }
+    }
+}
+
+/// Value-only receipts for function bodies already judged by editor resolution.
+/// Rejected bodies expose no error payload or publication API. Consuming these
+/// receipts permits the independent provider judgement; they cannot be cloned.
+#[derive(Debug)]
+pub struct EditorFunctionBodyJudgements {
+    rejected: Vec<RejectedFunctionBody>,
+}
+#[derive(Debug)]
+struct RejectedFunctionBody {
+    source: PathBuf,
+    name: String,
+    // An abstract body rejection owns the definition. A value-dependent
+    // rejection owns only this invocation; other arguments still need judgement.
+    definition: bool,
+    arguments: Vec<
+        crate::resource::FunctionArgument<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
+    >,
+}
+impl EditorFunctionBodyJudgements {
+    pub(crate) fn empty() -> Self {
+        Self {
+            rejected: Vec::new(),
+        }
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rejected.is_empty()
+    }
+    pub(crate) fn rejects_definition(&self, function: &UserFunction) -> bool {
+        self.rejected
+            .iter()
+            .any(|rejected| rejected.definition && rejected.matches(function))
+    }
+    pub(crate) fn owns_rejection_from(&self, query: &Self) -> bool {
+        self.rejected.iter().any(|owner| {
+            query.rejected.iter().any(|attempt| {
+                owner.source == attempt.source
+                    && owner.name == attempt.name
+                    && (owner.definition || owner.arguments == attempt.arguments)
+            })
+        })
+    }
+}
+impl RejectedFunctionBody {
+    fn matches(&self, function: &UserFunction) -> bool {
+        self.name == function.name
+            && self.source
+                == crate::utils::normalize_source_path(function.body.location.file().path())
+    }
+}
+fn effective_function_arguments(
+    function: &UserFunction,
+    arguments: &[crate::resource::FunctionArgument<
+        crate::resource::ParserPlaceholder,
+        crate::resource::RelativeBindingName,
+    >],
+) -> Vec<
+    crate::resource::FunctionArgument<
+        crate::resource::ParserPlaceholder,
+        crate::resource::RelativeBindingName,
+    >,
+> {
+    let mut arguments = arguments.to_vec();
+    for parameter in function.params.iter().skip(arguments.len()) {
+        if let Some(default) = &parameter.default {
+            arguments.push(crate::resource::FunctionArgument::from_value(
+                default.clone(),
+            ));
+        }
+    }
+    arguments
+}
+
+/// The editor owner records body judgements. Provider value projections use
+/// the same recorder to identify unavailable inputs without exporting errors.
+#[derive(Debug)]
+pub(crate) struct EditorFunctionBodyContext<'a> {
+    session: &'a dyn ProviderTypeCheckContext,
+    report: &'a crate::parser::retained::ExpressionReport<crate::resource::RelativeBindingName>,
+    rejected: Mutex<Vec<RejectedFunctionBody>>,
+}
+impl<'a> EditorFunctionBodyContext<'a> {
+    pub(crate) fn new(
+        session: &'a dyn ProviderTypeCheckContext,
+        report: &'a crate::parser::retained::ExpressionReport<crate::resource::RelativeBindingName>,
+    ) -> Self {
+        Self {
+            session,
+            report,
+            rejected: Mutex::new(Vec::new()),
+        }
+    }
+    pub(crate) fn into_judgements(self) -> EditorFunctionBodyJudgements {
+        EditorFunctionBodyJudgements {
+            rejected: self
+                .rejected
+                .into_inner()
+                .expect("editor function body lock"),
+        }
+    }
+}
+impl sealed::SessionEvidence for EditorFunctionBodyContext<'_> {}
+impl ProviderTypeCheckContext for EditorFunctionBodyContext<'_> {
+    fn catalog(&self) -> &ProviderContext {
+        self.session.catalog()
+    }
+    fn loaded_context(&self) -> Option<&crate::parser::LoadedProviderContext> {
+        self.session.loaded_context()
+    }
+    fn declaration(&self, expected: &TypeExpr, site: ProviderTypeCheckSite) {
+        self.session.declaration(expected, site);
+    }
+    fn fail_function_declaration(&self, source: &Path, name: &str) {
+        self.session.fail_function_declaration(source, name);
+    }
+    fn has_failed_function_declaration(&self, source: &Path, name: &str) -> bool {
+        self.session.has_failed_function_declaration(source, name)
+    }
+    fn rejected_function_body(
+        &self,
+        function: &UserFunction,
+        arguments: &[crate::resource::FunctionArgument<
+            crate::resource::ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >],
+    ) {
+        let definition = function.params.is_empty() || self.report.rejects_function_body(function);
+        self.rejected
+            .lock()
+            .expect("editor function body lock")
+            .push(RejectedFunctionBody {
+                source: crate::utils::normalize_source_path(function.body.location.file().path()),
+                name: function.name.clone(),
+                definition,
+                arguments: effective_function_arguments(function, arguments),
+            });
+    }
+    fn record(&self, expected: &TypeExpr, site: ProviderTypeCheckSite) {
+        self.session.record(expected, site);
+    }
+    fn record_type(&self, expected: &TypeExpr, context: &str) {
+        self.session.record_type(expected, context);
+    }
+    fn publish_checks(
+        &self,
+        sink: &mut dyn ProviderTypeCheckSink,
+    ) -> Result<(), ProviderTypeCheckFailure> {
+        self.session.publish_checks(sink)
     }
 }
 

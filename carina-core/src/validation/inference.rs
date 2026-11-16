@@ -222,7 +222,7 @@ fn require_proven_integer_operand(
 
 pub(crate) fn judge_integer_operands(
     op: crate::integer_arithmetic::IntegerOp,
-    location: &crate::parser::DeclarationLocation,
+    span: crate::integer_arithmetic::IntegerOperatorSpan,
     operands: &[crate::parser::retained::JudgedExpr; 2],
     schemas: &SchemaRegistry,
     provider_context: &crate::parser::ProviderContext,
@@ -232,7 +232,6 @@ pub(crate) fn judge_integer_operands(
             return Err(InferenceIssue::NotInferable(reason.clone()));
         }
     }
-    let span = crate::integer_arithmetic::IntegerOperatorSpan::authored(location.clone());
     let lhs = require_proven_integer_operand(
         operands[0].static_type().cloned(),
         op,

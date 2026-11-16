@@ -5071,20 +5071,19 @@ fn secret_derived_backend_attribute_matches_cli_diagnostic() {
     );
 
     let diagnostics = engine.analyze(&doc, None);
-    let diagnostic = diagnostics
+    let matching = diagnostics
         .iter()
-        .find(|diagnostic| {
+        .filter(|diagnostic| {
             diagnostic
                 .message
                 .contains("backend local attribute 'path'")
                 && diagnostic.message.contains("plain string")
                 && diagnostic.message.contains("secret()")
         })
-        .unwrap_or_else(|| {
-            panic!(
-        "LSP must surface the same backend secret rejection as validate/plan: {diagnostics:#?}",
-            )
-        });
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    let diagnostic = matching[0];
     assert_eq!(diagnostic.range.start.line, 1);
     assert_eq!(diagnostic.range.start.character, 4);
     assert_eq!(diagnostic.range.end.line, 1);
@@ -13666,9 +13665,19 @@ provider awscc {
         providers.to_string(),
     );
     let finalize_error = engine
-        .with_run_for_test(|run| run.finalize_provider_diagnostic(&base, &overrides))
+        .with_run_for_test(|run| {
+            let (_, function_bodies) = carina_core::config_loader::editor_buffer_resolution(None)
+                .finish(run.provider_context)
+                .into_parts();
+            run.finalize_provider_diagnostic(&base, &overrides, function_bodies)
+        })
         .expect("independent provider finalization must survive a module witness failure");
-    assert!(finalize_error.to_string().contains("default_tags"));
+    assert!(
+        finalize_error
+            .into_error()
+            .to_string()
+            .contains("default_tags")
+    );
 
     let diagnostics = analyze_with_buffer(&engine, root.path(), "providers.crn", providers);
     assert!(
@@ -13707,7 +13716,13 @@ let instance = module { count = 'wrong' }
     );
     assert!(
         engine
-            .with_run_for_test(|run| run.finalize_provider_diagnostic(&base, &overrides))
+            .with_run_for_test(|run| {
+                let (_, function_bodies) =
+                    carina_core::config_loader::editor_buffer_resolution(None)
+                        .finish(run.provider_context)
+                        .into_parts();
+                run.finalize_provider_diagnostic(&base, &overrides, function_bodies)
+            })
             .is_none(),
         "a provider value downstream of failed expansion cannot be finalized independently"
     );

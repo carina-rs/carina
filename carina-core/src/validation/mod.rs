@@ -3261,6 +3261,12 @@ trait IntegerOperandEvidence<B: BindingAddress> {
         expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
         side: crate::integer_arithmetic::IntegerOperandSide,
     ) -> Result<&'a crate::parser::retained::JudgedExpr, crate::parser::retained::MissingEvidence>;
+    fn requested(
+        &self,
+        _expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
+    ) -> bool {
+        true
+    }
 }
 impl<B: BindingAddress> IntegerOperandEvidence<B> for crate::parser::retained::ExpressionReport<B> {
     fn operand<'a>(
@@ -3276,6 +3282,29 @@ impl<B: BindingAddress> IntegerOperandEvidence<B> for crate::parser::retained::E
         self.operand(location, side)
     }
 }
+/// Editor arithmetic requests exclude syntax already owned by retained judgement.
+struct RemainingIntegerOperands<'a, B: BindingAddress>(
+    &'a crate::parser::retained::ExpressionReport<B>,
+);
+impl<B: BindingAddress> IntegerOperandEvidence<B> for RemainingIntegerOperands<'_, B> {
+    fn operand<'a>(
+        &'a self,
+        expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
+        side: crate::integer_arithmetic::IntegerOperandSide,
+    ) -> Result<&'a crate::parser::retained::JudgedExpr, crate::parser::retained::MissingEvidence>
+    {
+        IntegerOperandEvidence::operand(self.0, expression, side)
+    }
+    fn requested(
+        &self,
+        expression: &crate::integer_arithmetic::ValidatedIntegerExpr<ParserPlaceholder, B>,
+    ) -> bool {
+        !self
+            .0
+            .owns_integer_operand_failure(&expression.operator_span())
+    }
+}
+
 impl<B: BindingAddress> IntegerOperandEvidence<B>
     for crate::parser::retained::JudgedNodeRef<'_, B>
 {
@@ -3497,6 +3526,9 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
             else {
                 return Vec::new();
             };
+            if !report.requested(expression) {
+                return Vec::new();
+            }
             let result = prove_integer_operand(
                 expression.lhs(),
                 expression,
@@ -3613,7 +3645,7 @@ fn append_unique_integer_arithmetic_findings<B: BindingAddress>(
     findings: &mut Vec<crate::parser::Located<IntegerArithmeticTypeFinding>>,
     value: &GenericValue<ParserPlaceholder, B>,
     sink: Option<RefSink<'_>>,
-    report: &crate::parser::retained::ExpressionReport<B>,
+    report: &(impl IntegerOperandEvidence<B> + ?Sized),
     binding_index: &BindingIndex<'_, B>,
 ) {
     for finding in check_integer_arithmetic_types_with_sink(value, sink, report, binding_index) {
@@ -3647,8 +3679,34 @@ pub fn check_file_integer_arithmetic_values<
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
+    check_file_integer_arithmetic_values_with_evidence(judged, binding_index, judged.report())
+}
+
+pub(crate) fn check_file_remaining_integer_arithmetic_values<
+    B: BindingAddress,
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    binding_index: &BindingIndex<'_, B>,
+) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
+    check_file_integer_arithmetic_values_with_evidence(
+        judged,
+        binding_index,
+        &RemainingIntegerOperands(judged.report()),
+    )
+}
+
+fn check_file_integer_arithmetic_values_with_evidence<
+    B: BindingAddress,
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    binding_index: &BindingIndex<'_, B>,
+    report: &(impl IntegerOperandEvidence<B> + ?Sized),
+) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
     let parsed = judged.file();
-    let report = judged.report();
     let mut findings = Vec::new();
     let mut check = |value: &GenericValue<ParserPlaceholder, B>, sink: Option<RefSink<'_>>| {
         append_unique_integer_arithmetic_findings(

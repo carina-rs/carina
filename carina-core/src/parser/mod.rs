@@ -52,13 +52,17 @@ mod resolve;
 pub mod retained;
 mod scalar_constraints;
 mod value_type;
-pub(crate) use resolve::resolve_resource_refs_in_session_unsealed;
 pub use resolve::{
     AnalysisResolutionError, DEFAULT_TAGS_ATTRIBUTE, PlanPreviewProviderConfigs,
     PlanProviderConfigurations, ProviderConfiguration, ProviderConfigurations,
-    ReadOnlyProviderConfig, ReadOnlyProviderConfigs, finalize_provider_configs_for_analysis,
+    ReadOnlyProviderConfig, ReadOnlyProviderConfigs, evaluate_resource_ref_values_from_analysis,
+    finalize_provider_configs_for_analysis,
     resolve_expanded_provider_unresolved_attributes_for_analysis,
-    resolve_provider_unresolved_attributes_for_analysis, resolve_resource_refs_from_analysis,
+    resolve_provider_unresolved_attributes_for_analysis,
+};
+pub(crate) use resolve::{
+    editor_provider_value_uses_owned_body, resolve_resource_refs_from_analysis,
+    resolve_resource_refs_in_session_unsealed,
 };
 
 mod resource_body;

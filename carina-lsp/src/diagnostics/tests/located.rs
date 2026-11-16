@@ -637,11 +637,12 @@ fn expanded_provider_invariant_is_rendered() {
     for name in ["main.crn", "sibling.crn"] {
         let source = std::fs::read_to_string(directory.root.path().join(name)).unwrap();
         let doc = create_document_at(&source, directory.root.path().join(name));
-        let diagnostic = render_analysis_resolution_error(
-            &doc.for_diagnostics().expect("public fixture"),
-            &error,
-        )
-        .expect("surface the directory invariant");
+        let AnalysisResolutionError::Invariant(invariant) = &error else {
+            unreachable!("the expanded provider query rejected an invariant")
+        };
+        let diagnostic =
+            render_analysis_invariant(&doc.for_diagnostics().expect("public fixture"), invariant)
+                .expect("surface the directory invariant");
         assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
         assert!(diagnostic.message.contains("provider aws declaration"));
     }
