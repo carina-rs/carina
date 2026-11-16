@@ -4,6 +4,15 @@ experimental = ["setup-scripts"]
 [scripts.setup.carina-user-dirs]
 command = "scripts/setup-nextest-user-dirs.sh"
 
+[profile.default]
+# Keep the period in seconds: the in-process isolation check reads this limit too.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+# Corpus tests take up to about three minutes in CI.
+filter = "binary(validate_diagnostic_order) | binary(diagnostic_replay)"
+slow-timeout = { period = "120s", terminate-after = 10 }
+
 [[profile.default.scripts]]
 filter = "all()"
 setup = "carina-user-dirs"
