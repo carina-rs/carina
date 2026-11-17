@@ -292,8 +292,146 @@ fn output_kind_first_gate() {
     }
 }
 
+// Recorded: with these values the lookup-chain tests pass on a stack four times
+// smaller (128 KiB); resolving a lookup hit with a nested native call instead of
+// a queued work item exhausts the thread stack already at 256 hops. The nested
+// value tests pass at 96 KiB. Dropping and comparing nested values is natively
+// recursive in Value itself, so those tests walk the result with a loop and keep
+// the depth at 512.
+const SMALL_STACK_BYTES: usize = 512 * 1024;
+const LOOKUP_HOPS: usize = 1024;
+const NESTED_DEPTH: usize = 512;
+
+fn on_small_stack(name: &str, body: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .name(name.into())
+        .stack_size(SMALL_STACK_BYTES)
+        .spawn(body)
+        .expect("spawn resolver stack test")
+        .join()
+        .expect("resolver stack test panicked");
+}
+
+fn reference_to(binding: &str) -> S<RelativeBindingName> {
+    S::Deferred(DeferredValue::ResourceRef {
+        path: AccessPath::new(binding, "value"),
+    })
+}
+
+fn lookup_chain_on_small_stack<P: ResolveKind>(name: &str) {
+    on_small_stack(name, || {
+        let visits = std::cell::Cell::new(0);
+        let input = reference_to("r0");
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let output = resolve_value_with_binding_lookup::<P, _>(
+            &input,
+            &|binding: &RelativeBindingName, attribute| {
+                assert_eq!(attribute, "value");
+                visits.set(visits.get() + 1);
+                let index = binding
+                    .as_str()
+                    .strip_prefix('r')
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                Some(if index == LOOKUP_HOPS {
+                    S::Concrete(ConcreteValue::Int(7))
+                } else {
+                    reference_to(&format!("r{}", index + 1))
+                })
+            },
+            &config,
+            None,
+            strict_resolution_context(),
+            DiagnosticScope::Public,
+        )
+        .expect("resolve lookup chain");
+        assert!(matches!(
+            P::project(&output).as_ref(),
+            S::Concrete(ConcreteValue::Int(7))
+        ));
+        assert_eq!(visits.get(), LOOKUP_HOPS + 1);
+    });
+}
+
+fn assert_nested_list(value: &S<RelativeBindingName>, expected_depth: usize) {
+    let mut depth = 0;
+    let mut value = value;
+    loop {
+        match value {
+            S::Concrete(ConcreteValue::List(items)) => {
+                assert_eq!(items.len(), 1);
+                value = &items[0];
+                depth += 1;
+            }
+            S::Concrete(ConcreteValue::Int(7)) => break,
+            _ => panic!("nested-list shape or leaf changed"),
+        }
+    }
+    assert_eq!(depth, expected_depth);
+}
+
+fn nested_values_on_small_stack<P: ResolveKind>(name: &str) {
+    on_small_stack(name, || {
+        let mut input = reference_to("leaf");
+        for _ in 0..NESTED_DEPTH {
+            input = S::Concrete(ConcreteValue::List(vec![input]));
+        }
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let visits = std::cell::Cell::new(0);
+        let output = resolve_value_with_binding_lookup::<P, _>(
+            &input,
+            &|_, _| {
+                visits.set(visits.get() + 1);
+                Some(S::Concrete(ConcreteValue::Int(7)))
+            },
+            &config,
+            None,
+            strict_resolution_context(),
+            DiagnosticScope::Public,
+        )
+        .expect("resolve nested output");
+        assert_eq!(visits.get(), 1);
+        assert_nested_list(P::project(&output).as_ref(), NESTED_DEPTH);
+        let (plain, operand) = P::split_operand(output);
+        let mut retained = vec![operand];
+        // Exercise the same production packaging hooks with the already
+        // lowered deep result; no child is evaluated again.
+        let output = P::read(&AccessPath::new("source", "value"), plain);
+        assert_nested_list(P::project(&output).as_ref(), NESTED_DEPTH);
+        let (plain, operand) = P::split_operand(output);
+        retained.push(operand);
+        let output = P::embed_plain(plain);
+        assert_nested_list(P::project(&output).as_ref(), NESTED_DEPTH);
+        let (plain, operand) = P::split_operand(output);
+        retained.push(operand);
+        assert_nested_list(&plain, NESTED_DEPTH);
+        drop((input, plain, retained));
+    });
+}
+
 #[test]
 fn output_kind_lookup_chains_stay_iterative() {
+    lookup_chain_on_small_stack::<ParserPlaceholder>("plain-lookup");
+}
+
+#[test]
+fn output_kind_enriched_lookup_chains_stay_iterative() {
+    lookup_chain_on_small_stack::<EnrichedAuthored>("enriched-lookup");
+}
+
+#[test]
+fn output_kind_nested_values_stay_iterative() {
+    nested_values_on_small_stack::<ParserPlaceholder>("plain-nested");
+}
+
+#[test]
+fn output_kind_enriched_nested_values_stay_iterative() {
+    nested_values_on_small_stack::<EnrichedAuthored>("enriched-nested");
+}
+
+#[test]
+fn output_kind_lookup_chain_kinds_agree() {
     const HOPS: usize = 256;
     let mut source = "let r0 = mock.Source { name = 'same' }\n".to_string();
     for index in 1..=HOPS {

@@ -2654,7 +2654,10 @@ fn resolve_value_with_binding_lookup<P: ResolveKind, B: ProviderAttributeBinding
                         Resolved::Plain(_) => Resolved::Plain(rebuilt),
                     });
                 } else {
-                    let plain = matches!(&left, Resolved::Plain(_));
+                    let plain = match &left {
+                        Resolved::Plain(_) => true,
+                        Resolved::Output(_) => false,
+                    };
                     work.push(Work::Default(left));
                     work.push(Work::Enter(default, resolution.retained(), scope, plain));
                 }
@@ -2674,12 +2677,18 @@ fn resolve_value_with_binding_lookup<P: ResolveKind, B: ProviderAttributeBinding
                             default: Box::new(default),
                         }))
                     }
-                    _ => unreachable!("coalesce operands use the same output kind"),
+                    (Resolved::Output(_), Resolved::Plain(_))
+                    | (Resolved::Plain(_), Resolved::Output(_)) => {
+                        unreachable!("coalesce operands use the same output kind")
+                    }
                 });
             }
             Work::Read(value) => {
-                let Resolved::Plain(result) = values.pop().expect("scheduled lookup target") else {
-                    unreachable!("lookup targets are resolved at the plain kind")
+                let result = match values.pop().expect("scheduled lookup target") {
+                    Resolved::Plain(result) => result,
+                    Resolved::Output(_) => {
+                        unreachable!("lookup targets are resolved at the plain kind")
+                    }
                 };
                 let GenericValue::Deferred(DeferredValue::ResourceRef { path }) = value.as_ref()
                 else {
