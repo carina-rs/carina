@@ -199,8 +199,8 @@ pub fn get_parsed_file(
 /// ```
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ModuleLoadError {
-    #[error("{0}")]
-    Unavailable(#[source] ModuleSourceFailure),
+    #[error(transparent)]
+    Unavailable(ModuleSourceFailure),
     /// A readable prohibition is conclusive even when sibling IO prevents a
     /// complete parse. Only main-skipping consumers may use this signature.
     #[error("{}", .read_failure.with_analysis(.analysis.as_deref()))]
@@ -216,6 +216,63 @@ pub enum ModuleLoadError {
         /// cannot be admitted as a successfully loaded module.
         signature: ModuleSignatureView,
     },
+}
+
+impl ModuleLoadError {
+    pub(super) fn for_directory(self, directory: &ResolvedPath) -> Self {
+        fn body(body: ModuleBodyAnalysis, directory: &ResolvedPath) -> ModuleBodyAnalysis {
+            match body {
+                ModuleBodyAnalysis::Failed(source) => {
+                    ModuleBodyAnalysis::Failed(source.for_directory(directory))
+                }
+                body
+                @ (ModuleBodyAnalysis::Available(_) | ModuleBodyAnalysis::ProhibitionsOnly) => body,
+            }
+        }
+        match self {
+            Self::Unavailable(source) => Self::Unavailable(source.for_directory(directory)),
+            Self::NotModule { error, signature } => {
+                let error = match *error {
+                    ModuleRejection::Prohibited {
+                        prohibitions,
+                        body: captured,
+                    } => ModuleRejection::Prohibited {
+                        prohibitions,
+                        body: body(captured, directory),
+                    },
+                    error @ (ModuleRejection::NotADirectory { path: _ }
+                    | ModuleRejection::NoConfigurationFiles { path: _ }) => error,
+                };
+                Self::NotModule {
+                    error: Box::new(error),
+                    signature,
+                }
+            }
+            Self::Partial {
+                analysis,
+                signature,
+                read_failure,
+            } => {
+                let analysis = analysis.map(|analysis| {
+                    Box::new(match *analysis {
+                        ModuleAnalysisOutcome::Prohibited {
+                            prohibitions,
+                            body: captured,
+                        } => ModuleAnalysisOutcome::Prohibited {
+                            prohibitions,
+                            body: body(captured, directory),
+                        },
+                        analysis @ ModuleAnalysisOutcome::Importable(_) => analysis,
+                    })
+                });
+                Self::Partial {
+                    analysis,
+                    signature,
+                    read_failure,
+                }
+            }
+        }
+    }
 }
 
 /// Successfully inspected inputs that cannot be imported. The payload cannot
@@ -242,26 +299,44 @@ pub struct ModuleSourceFailure {
     error: std::sync::Arc<ModuleError>,
 }
 impl ModuleSourceFailure {
-    fn io(error: std::io::Error) -> Self {
+    pub(super) fn io(error: std::io::Error) -> Self {
         Self {
             error: std::sync::Arc::new(ModuleError::Io(error)),
-        }
-    }
-    pub(super) fn parse_error(error: crate::parser::ParseError) -> Self {
-        Self {
-            error: std::sync::Arc::new(ModuleError::Parse(error)),
         }
     }
     fn parse(located: crate::config_loader::LocatedParseError) -> Self {
         let error = match located.source_file {
             Some(path) => ModuleError::ParseInFile {
                 path,
-                error: located.error,
+                error: located.error.into(),
             },
             None => ModuleError::Parse(*located.error),
         };
         Self {
             error: std::sync::Arc::new(error),
+        }
+    }
+    /// Original typed IO remains inspectable; Display is a terminal rendering.
+    pub fn io_error(&self) -> Option<&std::io::Error> {
+        if let ModuleError::Io(error) = self.error.as_ref() {
+            Some(error)
+        } else {
+            None
+        }
+    }
+    fn for_directory(self, directory: &ResolvedPath) -> Self {
+        if let ModuleError::ParseInFile { path, error } = self.error.as_ref() {
+            Self {
+                error: std::sync::Arc::new(ModuleError::ParseInFile {
+                    path: directory.source_label().join(
+                        path.file_name()
+                            .expect("a captured parse failure has a source file"),
+                    ),
+                    error: error.clone(),
+                }),
+            }
+        } else {
+            self
         }
     }
     pub(super) fn error(&self) -> &ModuleError {
@@ -278,7 +353,8 @@ impl std::fmt::Display for ModuleSourceFailure {
 }
 impl std::error::Error for ModuleSourceFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.error.as_ref())
+        // This wrapper prints the complete typed leaf; delegate transparently.
+        std::error::Error::source(self.error.as_ref())
     }
 }
 
@@ -295,12 +371,12 @@ impl std::fmt::Display for ModuleReadFailure {
         write!(formatter, "IO error: {}", self.0.source)
     }
 }
-impl std::error::Error for ModuleReadFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.0.source.as_ref())
-    }
-}
+// Display contains the IO cause. Keep this a terminal leaf for chain walkers.
+impl std::error::Error for ModuleReadFailure {}
 impl ModuleReadFailure {
+    pub fn io_error(&self) -> &std::io::Error {
+        &self.0.source
+    }
     fn new(error: std::io::Error) -> Self {
         Self(std::sync::Arc::new(ReadOccurrence {
             source: std::sync::Arc::new(error),
@@ -1746,6 +1822,29 @@ mod importability_tests {
             ModuleError::ParseInFile { path: _, error: _ }
         ));
     }
+    #[test]
+    fn captured_sources_render_each_cause_once() {
+        let source = ModuleSourceFailure::io(std::io::Error::other("unique IO cause"));
+        let read = ModuleReadFailure::new(std::io::Error::other("unique IO cause"));
+        let errors: Vec<Box<dyn std::error::Error>> = vec![
+            Box::new(source.clone()),
+            Box::new(ModuleLoadError::Unavailable(source.clone())),
+            Box::new(source.into_error()),
+            Box::new(read.clone()),
+            Box::new(read.into_error()),
+        ];
+        for error in errors {
+            let mut rendered = error.to_string();
+            let mut next = error.source();
+            while let Some(source) = next {
+                rendered.push_str(": ");
+                rendered.push_str(&source.to_string());
+                next = source.source();
+            }
+            assert_eq!(rendered.matches("unique IO cause").count(), 1, "{rendered}");
+        }
+    }
+
     #[test]
     fn module_load_distinguishes_unavailable_source_from_rejected_directories() {
         let directory = tempfile::tempdir().unwrap();

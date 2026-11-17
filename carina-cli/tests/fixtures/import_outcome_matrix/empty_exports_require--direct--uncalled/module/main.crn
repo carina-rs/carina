@@ -1,0 +1,4 @@
+arguments { n: Int = 1 }
+attributes { value: String = 'one' }
+require n > 5, 'n must exceed five'
+exports {}

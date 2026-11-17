@@ -45,6 +45,131 @@ fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
 }
 
 #[test]
+fn captured_parse_errors_keep_each_route_spelling() {
+    for body in ["let broken =\n", "let a = 'present'\nlet broken = a ?? 1\n"] {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "shared"] {
+            fs::create_dir(directory.path().join(name)).unwrap();
+        }
+        fs::write(directory.path().join("main.crn"),
+        "let first = use { source = './a/../shared' }\nlet second = use { source = './b/../shared' }\n").unwrap();
+        fs::write(
+            directory.path().join("shared/main.crn"),
+            format!("arguments {{ n: Int = 1 }}\n{body}"),
+        )
+        .unwrap();
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let schemas = crate::schema::SchemaRegistry::new();
+        let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let (_, captured) = collect_module_imports(parsed.admit(&schemas, session), &root);
+            let report = resolve_modules_with_collected_imports(captured, &[]);
+            let mut run = crate::test_utils::conversion_validation::<std::convert::Infallible>();
+            let ModuleResolutionDiagnosticResult::Unowned { errors } =
+                report.into_validation(&mut run)
+            else {
+                panic!("both imports must fail");
+            };
+            assert_eq!(errors.len(), 2);
+            for (error, spelling) in errors
+                .iter()
+                .zip(["a/../shared/main.crn", "b/../shared/main.crn"])
+            {
+                let message = error.display_relative_to(directory.path());
+                assert!(message.contains(spelling), "{message}");
+                let other = if spelling.starts_with('a') {
+                    "b/../shared/main.crn"
+                } else {
+                    "a/../shared/main.crn"
+                };
+                assert!(
+                    !message.contains(other),
+                    "the route borrowed another source label: {message}"
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn collected_expansion_keeps_require_beside_new_prohibitions() {
+    for sibling in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("child")).unwrap();
+        fs::write(
+            directory.path().join("main.crn"),
+            "let service = use { source = './child' }\nlet result = service {}\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("child/arguments.crn"),
+            "arguments { n: Int = 1 }\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("child/main.crn"),
+            "require n > 5, 'n must exceed five'\n",
+        )
+        .unwrap();
+        if sibling {
+            fs::create_dir(directory.path().join("blocked")).unwrap();
+            fs::write(
+                directory.path().join("blocked/main.crn"),
+                "exports { value = 1 }\n",
+            )
+            .unwrap();
+            fs::write(
+                directory.path().join("imports.crn"),
+                "let blocked = use { source = './blocked' }\n",
+            )
+            .unwrap();
+        } else {
+            fs::write(directory.path().join("child/exports.crn"), "exports {}\n").unwrap();
+        }
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let root = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let schemas = crate::schema::SchemaRegistry::new();
+        let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
+        crate::validation::deferred_types::with_session_for_test(&context, |session| {
+            let (_, captured) = collect_module_imports(parsed.admit(&schemas, session), &root);
+            super::loader::DIRECTORY_INSPECTIONS.set(0);
+            super::resolver::BODY_PREPARATIONS.set(0);
+            let report = resolve_modules_with_collected_imports(captured, &[]);
+            let mut run = crate::test_utils::conversion_validation::<std::convert::Infallible>();
+            let ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors } =
+                report.into_validation(&mut run)
+            else {
+                panic!("the real expansion must retain the violated require; sibling={sibling}");
+            };
+            assert_eq!(findings.len(), 1);
+            assert!(
+                findings[0]
+                    .message()
+                    .to_string()
+                    .contains("n must exceed five")
+            );
+            assert_eq!(errors.len(), 1);
+            assert!(
+                errors[0]
+                    .lsp_message_relative_to(directory.path())
+                    .contains("exports blocks")
+            );
+            assert_eq!(
+                super::loader::DIRECTORY_INSPECTIONS.get(),
+                0,
+                "resolution must consume captured imports"
+            );
+            assert_eq!(
+                super::resolver::BODY_PREPARATIONS.get(),
+                if sibling { 2 } else { 1 },
+                "one body preparation per import in the real run"
+            );
+        });
+    }
+}
+
+#[test]
 fn collected_read_failures_belong_to_their_ancestor_path() {
     for prohibited_parent in [false, true] {
         for unreadable_first in [false, true] {
@@ -109,13 +234,13 @@ fn imported_read_failure_preserves_the_original_io_source() {
     )
     .unwrap_err()
     .into_error();
-    let mut source: &dyn std::error::Error = &error;
-    while let Some(next) = source.source() {
-        source = next;
-    }
+    let ModuleError::ImportReadFailure(failure) = &error else {
+        panic!("typed read failure: {error}");
+    };
+    assert_eq!(failure.io_error().kind(), std::io::ErrorKind::InvalidData);
     assert!(
-        source.downcast_ref::<std::io::Error>().is_some(),
-        "IO source lost: {error}"
+        std::error::Error::source(&error).is_none(),
+        "the full Display must be terminal"
     );
 }
 
@@ -150,6 +275,30 @@ fn repeated_routes_inspect_a_directory_once() {
         counts[0], counts[1],
         "a second import route must reuse the inspection"
     );
+
+    fs::write(directory.path().join("child/exports.crn"), "exports {}\n").unwrap();
+    let parsed = crate::config_loader::parse_directory(&root, &context).unwrap();
+    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+        super::loader::DIRECTORY_INSPECTIONS.set(0);
+        super::resolver::BODY_PREPARATIONS.set(0);
+        let report = resolve_modules_with_diagnostics(parsed.admit(&schemas, session), &root, &[]);
+        let mut run = crate::test_utils::conversion_validation::<std::convert::Infallible>();
+        let ModuleResolutionDiagnosticResult::Unowned { errors } = report.into_validation(&mut run)
+        else {
+            panic!("each use must retain the empty-export prohibition");
+        };
+        assert_eq!(errors.len(), 2);
+        assert_eq!(
+            super::loader::DIRECTORY_INSPECTIONS.get(),
+            1,
+            "the editor diagnostic entry point must consume captured source outcomes"
+        );
+        assert_eq!(
+            super::resolver::BODY_PREPARATIONS.get(),
+            1,
+            "the real resolver must share the formerly importable template"
+        );
+    });
 }
 
 #[test]

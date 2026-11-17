@@ -24,6 +24,11 @@ use super::error::{ModuleError, ModuleErrorCallSource};
 use super::expander::instance_prefix_for_call;
 use super::validation::{ConstraintOrigin, ModuleConstraintDiagnostic};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static BODY_PREPARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 type ModuleResolvedValue = crate::resource::Value<ParserPlaceholder, AbsoluteBindingAddress>;
 type JudgedModuleFile<'a, E> =
     crate::parser::retained::JudgedFile<'a, E, ParsedDeferredForPhase, RelativeBindingName>;
@@ -90,19 +95,7 @@ impl CollectedImportAnchor {
 #[derive(Clone)]
 enum CollectedImportSource {
     Prohibition(super::loader::ModuleProhibitions),
-    ReadFailure(AssociatedReadFailure),
-}
-#[derive(Clone)]
-enum AssociatedReadFailure {
-    BesideProhibition(super::loader::ModuleReadFailure),
-    BelowProhibition(super::loader::ModuleReadFailure),
-}
-impl AssociatedReadFailure {
-    fn source(&self) -> &super::loader::ModuleReadFailure {
-        match self {
-            Self::BesideProhibition(source) | Self::BelowProhibition(source) => source,
-        }
-    }
+    ReadFailure(super::loader::ModuleReadFailure),
 }
 impl CollectedImportFinding {
     pub fn prohibition_path(&self) -> Option<&crate::paths::DisplayPath> {
@@ -114,7 +107,7 @@ impl CollectedImportFinding {
                 self.anchor.attach(prohibitions.clone().into_error())
             }
             CollectedImportSource::ReadFailure(failure) => {
-                self.anchor.attach(failure.source().clone().into_error())
+                self.anchor.attach(failure.clone().into_error())
             }
         }
     }
@@ -153,9 +146,20 @@ impl CollectedImportProhibitions {
     pub(super) fn contains_read_failure(&self, source: &super::loader::ModuleReadFailure) -> bool {
         self.findings.iter().any(|finding| {
             matches!(&finding.source, CollectedImportSource::ReadFailure(failure)
-                if failure.source().same_occurrence(source))
+                if failure.same_occurrence(source))
         })
     }
+    fn merge_errors(&self, mut ordinary: Vec<ModuleError>) -> Vec<ModuleError> {
+        // Insert before the first ordinary IO without changing the relative
+        // order of any main findings. Associated IO follows its prohibitions.
+        let position = ordinary
+            .iter()
+            .position(ModuleError::is_read_failure)
+            .unwrap_or(ordinary.len());
+        ordinary.splice(position..position, self.errors());
+        ordinary
+    }
+
     fn errors(&self) -> impl Iterator<Item = ModuleError> + '_ {
         self.findings.iter().map(CollectedImportFinding::error)
     }
@@ -178,7 +182,8 @@ enum OrdinaryBodyPolicy {
 }
 
 impl ModuleImportTraversal {
-    pub fn load<E>(
+    #[cfg(test)]
+    pub(super) fn load<E>(
         parsed: &crate::config_loader::RootDirectoryParse<E>,
         base: &ResolvedPath,
         config: &ProviderContext,
@@ -205,15 +210,10 @@ impl ModuleImportTraversal {
         &self.base
     }
 
-    /// Main's static boundary gate applies to the entire ordinary resolution
-    /// result. Every residual variant survives when that gate was open;
-    /// associated IO already belongs to the issued prohibition collection.
+    /// Remove boundaries already presented as lint warnings. The completed
+    /// resolver run has already applied main's lint-stage gate.
     pub fn ordinary_resolution_error(&self, error: ModuleError) -> Option<ModuleError> {
-        let error = error.without_collected_import_findings(&self.prohibitions)?;
-        match self.ordinary_body_policy {
-            OrdinaryBodyPolicy::Operational => Some(error),
-            OrdinaryBodyPolicy::BlockedByMainStaticBoundary => None,
-        }
+        error.without_collected_import_findings(&self.prohibitions)
     }
 }
 
@@ -240,7 +240,7 @@ pub fn collect_module_imports<'cfg, E>(
     base: &ResolvedPath,
 ) -> (ModuleImportTraversal, CapturedModuleImports<'cfg, E>) {
     let (parsed, resolution, config) = parsed.into_parts();
-    let traversal = ImportTraversalCapture::collect(
+    let mut traversal = ImportTraversalCapture::collect(
         &parsed.file().uses,
         &parsed.file().module_calls,
         base,
@@ -249,7 +249,7 @@ pub fn collect_module_imports<'cfg, E>(
         &Default::default(),
         super::loader::StaticSnapshots::Capture,
     );
-    let view = traversal.view.clone();
+    let view = traversal.take_static_view();
     (
         view,
         CapturedModuleImports {
@@ -262,157 +262,173 @@ pub fn collect_module_imports<'cfg, E>(
     )
 }
 
-/// A blocked input owns both issued boundaries and main's operational import
-/// residuals. The residuals are a later validation stage, after call findings;
-/// they cannot be mistaken for prohibition-associated IO.
-pub struct BlockedModuleImports {
-    boundaries: Box<CollectedImportProhibitions>,
-    residuals: Vec<ResidualModuleResolutionError>,
+/// Command import sources retain their one owned root while it is normalized.
+/// The unresolved stages have no resolution transition.
+pub struct UnboundModuleImports<'cfg, Stage = UnresolvedRootTypes> {
+    root: crate::config_loader::InferredRootDirectory,
+    sources: CapturedModuleSources<'cfg>,
+    stage: PhantomData<Stage>,
 }
-impl BlockedModuleImports {
-    pub fn boundaries(&self) -> &CollectedImportProhibitions {
-        &self.boundaries
+pub struct UnresolvedRootTypes;
+pub struct ResolvedRootTypes;
+pub struct NormalizedRootImports;
+struct CapturedModuleSources<'cfg> {
+    config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    schemas: &'cfg SchemaRegistry,
+    base: ResolvedPath,
+    traversal: ImportTraversalCapture,
+}
+impl<Stage> std::ops::Deref for UnboundModuleImports<'_, Stage> {
+    type Target = crate::config_loader::InferredRootDirectory;
+    fn deref(&self) -> &Self::Target {
+        &self.root
     }
-    pub fn into_residuals(self) -> Vec<ResidualModuleResolutionError> {
-        self.residuals
+}
+impl<'cfg> UnboundModuleImports<'cfg, UnresolvedRootTypes> {
+    pub fn retry_unchecked_export_inference(
+        &mut self,
+        schemas: &crate::provider::ProviderLoadedSchemaRegistry,
+    ) -> Result<
+        crate::validation::inference::ExportsInferredWithLoadedProviderSchemas<'_>,
+        crate::parser::AnalysisTreeError,
+    > {
+        self.root
+            .retry_unchecked_export_inference(schemas, self.sources.config.catalog())
+    }
+    pub fn normalize_types(
+        self,
+    ) -> Result<
+        (
+            UnboundModuleImports<'cfg, ResolvedRootTypes>,
+            crate::validation::FileTypeResolutionReport,
+        ),
+        crate::parser::AnalysisTreeError,
+    > {
+        let (root, report) = self
+            .root
+            .analysis()?
+            .resolve_type_exprs_report(self.sources.config);
+        Ok((
+            UnboundModuleImports {
+                root,
+                sources: self.sources,
+                stage: PhantomData,
+            },
+            report,
+        ))
+    }
+}
+impl<'cfg> UnboundModuleImports<'cfg, ResolvedRootTypes> {
+    pub fn normalize_resource_refs(
+        mut self,
+    ) -> (
+        UnboundModuleImports<'cfg, NormalizedRootImports>,
+        Result<(), crate::parser::AnalysisResolutionError>,
+    ) {
+        let report = self
+            .root
+            .resolve_resource_refs_in_session(self.sources.config);
+        (
+            UnboundModuleImports {
+                root: self.root,
+                sources: self.sources,
+                stage: PhantomData,
+            },
+            report,
+        )
+    }
+}
+impl<'cfg> UnboundModuleImports<'cfg, NormalizedRootImports> {
+    /// Bind the one normalized root, using the original provider session.
+    /// ```compile_fail,E0599
+    /// use carina_core::module_resolver::UnboundModuleImports;
+    /// fn before_normalization(imports: UnboundModuleImports<'_>) {
+    ///     let _ = imports.bind_root();
+    /// }
+    /// ```
+    pub fn bind_root(
+        self,
+    ) -> (
+        crate::config_loader::InferredRootDirectory,
+        CapturedModuleImports<'cfg, crate::parser::InferredExportParam>,
+    ) {
+        let (parsed, resolution, config) = self
+            .root
+            .clone()
+            .admit(self.sources.schemas, self.sources.config)
+            .into_parts();
+        (
+            self.root,
+            CapturedModuleImports {
+                parsed,
+                resolution,
+                config,
+                base: self.sources.base,
+                traversal: self.sources.traversal,
+            },
+        )
     }
 }
 
-impl<E> CapturedModuleImports<'_, E> {
-    /// Consume the command's captured inputs. Only the ready branch can enter
-    /// expansion; a blocked command retains main's operational import failures
-    /// alongside the traversal's issued findings. No source is reread or parsed.
-    pub fn validate_imports<F: crate::validation::ValidationClientError>(
-        self,
-        run: &crate::validation::ConversionValidation<F>,
-        covered: &[crate::validation::ModuleCallFinding],
-    ) -> Result<Self, BlockedModuleImports> {
-        let findings = self.traversal.view.prohibitions.clone();
-        if findings.findings.is_empty() && run.ordinary_failure().is_none() {
-            return Ok(self);
-        }
-        if run.ordinary_failure().is_some()
-            || matches!(
-                self.traversal.view.ordinary_body_policy,
-                OrdinaryBodyPolicy::BlockedByMainStaticBoundary
-            )
-        {
-            return Err(BlockedModuleImports {
-                boundaries: Box::new(findings),
-                residuals: Vec::new(),
-            });
-        }
-        let CapturedModuleImports {
-            parsed,
-            resolution,
-            config,
-            base,
-            traversal,
-        } = self;
-        let mut resolver =
-            ModuleResolver::with_config_and_schemas(&base, config, parsed.schemas(), resolution);
-        resolver.traversal = Some(traversal);
-        let errors = resolver.main_ordinary_import_errors(
-            &parsed.file().uses,
-            &parsed.file().module_calls,
-            OrdinaryImportReach::AllRoots,
-        );
-        let mut residuals = Vec::new();
-        for error in errors {
-            if let Some(error) = error.without_collected_import_findings(&findings)
-                && let Some(error) = ResidualModuleResolutionError::new(error, covered)
-            {
-                residuals.push(error);
-            }
-        }
-        Err(BlockedModuleImports {
-            boundaries: Box::new(findings),
-            residuals,
-        })
-    }
+pub fn collect_unbound_module_imports<'cfg>(
+    root: crate::config_loader::InferredRootDirectory,
+    base: &ResolvedPath,
+    schemas: &'cfg SchemaRegistry,
+    config: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> (ModuleImportTraversal, UnboundModuleImports<'cfg>) {
+    let mut traversal = ImportTraversalCapture::collect(
+        &root.parsed().uses,
+        &root.parsed().module_calls,
+        base,
+        config.catalog(),
+        schemas,
+        &Default::default(),
+        super::loader::StaticSnapshots::Capture,
+    );
+    let view = traversal.take_static_view();
+    (
+        view,
+        UnboundModuleImports {
+            root,
+            sources: CapturedModuleSources {
+                config,
+                schemas,
+                base: base.clone(),
+                traversal,
+            },
+            stage: PhantomData,
+        },
+    )
+}
+
+/// A route is either inspected source or a recorded cycle; absence never means success.
+#[derive(Clone)]
+enum CapturedImportSource {
+    Inspected {
+        outcome: Box<Result<super::loader::LoadedModule, super::loader::ModuleLoadError>>,
+        main_static: super::loader::MainStaticRead,
+    },
+    Circular,
+}
+enum ModuleLoadSource {
+    Direct,
+    Captured(CapturedImportSource),
 }
 
 struct ImportTraversalCapture {
     view: ModuleImportTraversal,
     sources: HashMap<crate::paths::CanonicalPath, super::loader::ModuleInspection>,
-    read_occurrences:
-        HashMap<Vec<crate::parser::DeclarationLocation>, super::loader::ModuleReadFailure>,
+    routes: HashMap<Vec<crate::parser::DeclarationLocation>, CapturedImportSource>,
 }
 
 impl ImportTraversalCapture {
-    /// A private checker can consume the same immutable source facts to retain
-    /// main's operational failures. It receives no admitted root, and its
-    /// resolver type cannot enter either published root-graph constructor.
-    fn snapshot_for_ordinary_checks(&self) -> Self {
-        Self {
-            view: ModuleImportTraversal {
-                base: self.view.base.clone(),
-                modules: Vec::new(),
-                prohibitions: self.view.prohibitions.clone(),
-                ordinary_body_policy: self.view.ordinary_body_policy,
-            },
-            sources: self
-                .sources
-                .iter()
-                .map(|(path, inspection)| {
-                    (
-                        path.clone(),
-                        super::loader::ModuleInspection {
-                            outcome: inspection.outcome.clone(),
-                            imports: Vec::new(),
-                            static_body: None,
-                            main_static: inspection.main_static,
-                        },
-                    )
-                })
-                .collect(),
-            read_occurrences: self.read_occurrences.clone(),
+    fn take_static_view(&mut self) -> ModuleImportTraversal {
+        ModuleImportTraversal {
+            base: self.view.base.clone(),
+            modules: std::mem::take(&mut self.view.modules),
+            prohibitions: self.view.prohibitions.clone(),
+            ordinary_body_policy: self.view.ordinary_body_policy,
         }
-    }
-
-    fn outcome_for(
-        &self,
-        path: &ResolvedPath,
-        route: &[crate::parser::DeclarationLocation],
-    ) -> Result<super::loader::LoadedModule, super::loader::ModuleLoadError> {
-        use super::loader::{ModuleLoadError, ModuleSourceFailure};
-        let missing = || {
-            ModuleLoadError::Unavailable(ModuleSourceFailure::parse_error(
-                ParseError::InternalError {
-                    expected: "an import and read occurrence captured by the resolver traversal"
-                        .into(),
-                    context: "module body resolution".into(),
-                },
-            ))
-        };
-        let Some(inspection) = self.sources.get(&path.identity()) else {
-            return Err(missing());
-        };
-        let mut outcome = inspection.outcome.clone();
-        if let Err(ModuleLoadError::Partial {
-            analysis: _,
-            signature: _,
-            read_failure,
-        }) = &mut outcome
-        {
-            match self.read_occurrences.get(route) {
-                Some(occurrence) => *read_failure = occurrence.clone(),
-                None if route.is_empty() => (),
-                None => return Err(missing()),
-            }
-        }
-        outcome
-    }
-
-    fn merge_errors(&self, mut ordinary: Vec<ModuleError>) -> Vec<ModuleError> {
-        // Insert before the first ordinary IO without changing the relative
-        // order of any main findings. Associated IO follows its prohibitions.
-        let position = ordinary
-            .iter()
-            .position(ModuleError::is_read_failure)
-            .unwrap_or(ordinary.len());
-        ordinary.splice(position..position, self.view.prohibitions.errors());
-        ordinary
     }
 
     fn collect(
@@ -435,7 +451,7 @@ impl ImportTraversalCapture {
                 ordinary_body_policy: OrdinaryBodyPolicy::Operational,
             },
             sources: HashMap::new(),
-            read_occurrences: HashMap::new(),
+            routes: HashMap::new(),
         };
         let mut static_seen = HashSet::new();
         let mut roots = Vec::new();
@@ -488,6 +504,9 @@ impl ImportTraversalCapture {
             .prohibitions
             .findings
             .sort_by_key(CollectedImportFinding::category);
+        // Only route source outcomes are read by resolution. Static bodies have
+        // moved to their view and the collection memo is no longer needed.
+        traversal.sources.clear();
         traversal
     }
 
@@ -512,14 +531,31 @@ impl ImportTraversalCapture {
         snapshots: super::loader::StaticSnapshots,
     ) -> Option<crate::paths::CanonicalPath> {
         use super::loader::{ModuleAnalysisOutcome, ModuleLoadError, ModuleRejection};
-        let Ok(path) = owner.join(&import.path) else {
-            return None;
+        let path = match owner.join(&import.path) {
+            Ok(path) => path,
+            Err(error) => {
+                let mut failed_route = route.clone();
+                failed_route.push(import.declaration_location().clone());
+                self.routes.insert(
+                    failed_route,
+                    CapturedImportSource::Inspected {
+                        outcome: Box::new(Err(ModuleLoadError::Unavailable(
+                            super::loader::ModuleSourceFailure::io(error),
+                        ))),
+                        main_static: super::loader::MainStaticRead::Unavailable,
+                    },
+                );
+                return None;
+            }
         };
         let identity = path.identity();
+        route.push(import.declaration_location().clone());
         if !ancestors.insert(identity.clone()) {
+            self.routes
+                .insert(route.clone(), CapturedImportSource::Circular);
+            route.pop();
             return None;
         }
-        route.push(import.declaration_location().clone());
         let inspection = self.sources.entry(identity.clone()).or_insert_with(|| {
             super::loader::inspect_imported_directory(
                 &path,
@@ -530,7 +566,19 @@ impl ImportTraversalCapture {
                 snapshots,
             )
         });
-        let (prohibitions, read_failure) = match &inspection.outcome {
+        let mut outcome = inspection
+            .outcome
+            .clone()
+            .map_err(|error| error.for_directory(&path));
+        if let Err(ModuleLoadError::Partial {
+            read_failure,
+            analysis: _,
+            signature: _,
+        }) = &mut outcome
+        {
+            *read_failure = read_failure.for_route();
+        }
+        let (prohibitions, read_failure) = match &outcome {
             Err(ModuleLoadError::NotModule {
                 error,
                 signature: _,
@@ -559,12 +607,13 @@ impl ImportTraversalCapture {
             Ok(_) | Err(ModuleLoadError::Unavailable(_)) => (None, None),
         };
         let children = inspection.imports.clone();
-        let read_failure = read_failure.map(|failure| {
-            let occurrence = failure.for_route();
-            self.read_occurrences
-                .insert(route.clone(), occurrence.clone());
-            occurrence
-        });
+        self.routes.insert(
+            route.clone(),
+            CapturedImportSource::Inspected {
+                outcome: Box::new(outcome),
+                main_static: inspection.main_static,
+            },
+        );
         let main_static_children = main_static_allowed
             && matches!(
                 inspection.main_static,
@@ -612,13 +661,7 @@ impl ImportTraversalCapture {
         }
         // This decision is made at the failure's own path. A later sibling
         // prohibition cannot change an unrelated failure's publication scope.
-        let associated_failure = match (read_failure, prohibited_here, prohibited_ancestor) {
-            (Some(failure), true, false | true) => {
-                Some(AssociatedReadFailure::BesideProhibition(failure))
-            }
-            (Some(failure), false, true) => Some(AssociatedReadFailure::BelowProhibition(failure)),
-            (Some(_), false, false) | (None, false | true, false | true) => None,
-        };
+        let associated_failure = read_failure.filter(|_| prohibited_here || prohibited_ancestor);
         if let Some(failure) = associated_failure {
             self.view
                 .prohibitions
@@ -759,8 +802,51 @@ pub enum ModuleResolutionDiagnosticResult<E> {
 pub struct ModuleResolutionReport<E> {
     outcome: ModuleResolutionDiagnosticResult<E>,
     placements: std::sync::Arc<crate::ConversionChannel>,
+    boundaries: CollectedImportProhibitions,
+    ordinary_body_policy: OrdinaryBodyPolicy,
 }
 impl<E> ModuleResolutionReport<E> {
+    /// Main's command gate selects from this run's imports, expansion and constraints.
+    /// Boundary presentation uses the same issued collection in the static view.
+    pub fn into_command_validation<F: crate::validation::ValidationClientError>(
+        self,
+        run: &mut crate::validation::ConversionValidation<F>,
+    ) -> ModuleResolutionDiagnosticResult<E> {
+        let ordinary = run.ordinary_failure().is_none()
+            && matches!(self.ordinary_body_policy, OrdinaryBodyPolicy::Operational);
+        if !ordinary {
+            return ModuleResolutionDiagnosticResult::Unowned { errors: Vec::new() };
+        }
+        run.produced_placements(self.placements);
+        let residuals = |errors: Vec<ResidualModuleResolutionError>| {
+            errors
+                .into_iter()
+                .filter_map(|error| {
+                    error
+                        .0
+                        .without_collected_import_findings(&self.boundaries)
+                        .map(|error| ResidualModuleResolutionError(Box::new(error)))
+                })
+                .collect()
+        };
+        match self.outcome {
+            ModuleResolutionDiagnosticResult::Expanded { graph } => {
+                ModuleResolutionDiagnosticResult::Expanded { graph }
+            }
+            ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors } => {
+                ModuleResolutionDiagnosticResult::ConstraintFailed {
+                    findings,
+                    errors: residuals(errors),
+                }
+            }
+            ModuleResolutionDiagnosticResult::Unowned { errors } => {
+                ModuleResolutionDiagnosticResult::Unowned {
+                    errors: residuals(errors),
+                }
+            }
+        }
+    }
+
     pub fn into_validation<F: crate::validation::ValidationClientError>(
         self,
         run: &mut crate::validation::ConversionValidation<F>,
@@ -1007,12 +1093,11 @@ impl ResidualModuleResolutionError {
         match self.0.root_cause() {
             ModuleError::RequireOutsideModule(_) => None,
             ModuleError::AnalysisInvariant(_) => None,
-            ModuleError::WithProviderTypeWarnings {
+            ModuleError::CapturedSource(_)
+            | ModuleError::WithProviderTypeWarnings {
                 error: _,
                 warnings: _,
-            } => {
-                unreachable!("root_cause removes diagnostic wrappers")
-            }
+            } => unreachable!("root_cause removes diagnostic wrappers"),
             ModuleError::ImportDiagnostics(_errors) => {
                 Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
@@ -1068,9 +1153,7 @@ impl ResidualModuleResolutionError {
                 import_path: _,
             } => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::CircularImport(_module) => None,
-            ModuleError::Io(_) | ModuleError::CapturedSource(_) => {
-                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
-            }
+            ModuleError::Io(_) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::ImportReadFailure(_) => {
                 Some(ResidualModuleResolutionDiagnostic::ModuleCall)
             }
@@ -1133,12 +1216,11 @@ impl ResidualModuleResolutionError {
         let root_cause = self.0.root_cause();
         match root_cause {
             ModuleError::AnalysisInvariant(_) => false,
-            ModuleError::WithProviderTypeWarnings {
+            ModuleError::CapturedSource(_)
+            | ModuleError::WithProviderTypeWarnings {
                 error: _,
                 warnings: _,
-            } => {
-                unreachable!("root_cause removes diagnostic wrappers")
-            }
+            } => unreachable!("root_cause removes diagnostic wrappers"),
             ModuleError::ImportDiagnostics(_errors) => false,
             ModuleError::Multiple(_errors) => false,
             ModuleError::MissingArgument { module, argument } => findings.iter().any(|finding| {
@@ -1196,9 +1278,7 @@ impl ResidualModuleResolutionError {
                 line: _,
             }
             | ModuleError::UnexpandedModuleTemplate { context: _ } => false,
-            ModuleError::Io(_)
-            | ModuleError::CapturedSource(_)
-            | ModuleError::ImportReadFailure(_) => false,
+            ModuleError::Io(_) | ModuleError::ImportReadFailure(_) => false,
             ModuleError::Parse(error) => match error {
                 ParseError::Located { path, error } => {
                     crate::validation::type_resolution_parser_error_is_covered(
@@ -1680,21 +1760,13 @@ pub(super) struct RefCheckWitness(
     >,
 );
 
-/// Compile-time policy for resolving type annotations in loaded modules.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ImportResolutionPurpose {
-    Strict,
-    Upstream,
-    OrdinaryChecks,
-}
-
 pub(crate) trait TypeResolutionPolicy {
-    const IMPORT_PURPOSE: ImportResolutionPurpose;
     fn resolve_file_type_exprs<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     >(
         parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+        source_directory: Option<&ResolvedPath>,
     ) -> Result<(), ModuleError>;
 
     fn resolve_static_type(
@@ -1707,15 +1779,19 @@ pub(crate) trait TypeResolutionPolicy {
 pub(crate) struct StrictTypeResolution;
 
 impl TypeResolutionPolicy for StrictTypeResolution {
-    const IMPORT_PURPOSE: ImportResolutionPurpose = ImportResolutionPurpose::Strict;
     fn resolve_file_type_exprs<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     >(
         parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+        source_directory: Option<&ResolvedPath>,
     ) -> Result<(), ModuleError> {
         let type_errors = crate::validation::resolve_file_type_exprs(parsed, config)?;
         if let Some(first) = type_errors.into_iter().next() {
+            let first = match source_directory {
+                Some(directory) => first.in_directory(&directory.source_label()),
+                None => first,
+            };
             return Err(ModuleError::TypeResolution(Box::new(first)));
         }
         Ok(())
@@ -1734,12 +1810,12 @@ impl TypeResolutionPolicy for StrictTypeResolution {
 struct DeferredUpstreamTypeResolution;
 
 impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
-    const IMPORT_PURPOSE: ImportResolutionPurpose = ImportResolutionPurpose::Upstream;
     fn resolve_file_type_exprs<
         E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
     >(
         parsed: &mut crate::parser::File<E>,
         config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+        _source_directory: Option<&ResolvedPath>,
     ) -> Result<(), ModuleError> {
         crate::validation::resolve_file_type_exprs_best_effort(parsed, config)?;
         Ok(())
@@ -1751,35 +1827,6 @@ impl TypeResolutionPolicy for DeferredUpstreamTypeResolution {
     ) -> crate::static_type::ConsumerStaticType {
         crate::validation::resolve_consumer_static_type(type_expr, config)
     }
-}
-
-/// Only operational findings leave this private resolver. No published graph
-/// constructor accepts its type. Failed body authority is never admitted.
-struct MainOrdinaryImportChecks;
-
-impl TypeResolutionPolicy for MainOrdinaryImportChecks {
-    const IMPORT_PURPOSE: ImportResolutionPurpose = ImportResolutionPurpose::OrdinaryChecks;
-
-    fn resolve_file_type_exprs<
-        E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingName>,
-    >(
-        parsed: &mut crate::parser::File<E>,
-        config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Result<(), ModuleError> {
-        StrictTypeResolution::resolve_file_type_exprs(parsed, config)
-    }
-
-    fn resolve_static_type(
-        type_expr: &crate::parser::TypeExpr,
-        config: &ProviderContext,
-    ) -> crate::static_type::ConsumerStaticType {
-        StrictTypeResolution::resolve_static_type(type_expr, config)
-    }
-}
-
-enum OrdinaryImportReach {
-    FirstFailure,
-    AllRoots,
 }
 
 /// An import location uses its owner's captured locator. Registration and
@@ -1995,7 +2042,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         let judged = crate::parser::retained::JudgedFile::new(parsed, self.schemas, self.config());
         let verdict = (|| {
             if let Some(error) = judged.report().first_error() {
-                return Err(ModuleError::Parse(error));
+                return Err(ModuleError::Parse(
+                    error.in_directory(&self.io_base_dir.source_label()),
+                ));
             }
             let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
                 judged.file(), self.schemas, None, &imported_modules, self.session,
@@ -2058,14 +2107,23 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         self.imported_modules.insert(name, file)
     }
 
+    #[cfg(test)]
     pub fn load_module(&mut self, path: &str) -> Result<ParsedFile, ModuleError> {
+        self.load_module_from(path, ModuleLoadSource::Direct)
+    }
+
+    fn load_module_from(
+        &mut self,
+        path: &str,
+        source: ModuleLoadSource,
+    ) -> Result<ParsedFile, ModuleError> {
         let full_path = self.resolve_path(path)?;
 
         // Distinguish "file exists but isn't a directory" from
         // "path doesn't exist / permission denied": only the former is the
         // single-file-module contract violation. Otherwise let canonicalize()
         // surface the underlying IO error (NotFound, PermissionDenied, ...).
-        if self.traversal.is_none() {
+        if matches!(source, ModuleLoadSource::Direct) {
             let metadata = full_path.metadata()?;
             if !metadata.is_dir() {
                 return Err(ModuleError::NotADirectory {
@@ -2094,7 +2152,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         }
 
         self.resolving.insert(canonical.clone());
-        let loaded = self.load_directory_module(&full_path, path);
+        let loaded = self.load_directory_module(&full_path, path, source);
         let mut parsed = match loaded {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -2130,26 +2188,28 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         &mut self,
         dir_path: &ResolvedPath,
         requested: &str,
+        source: ModuleLoadSource,
     ) -> Result<ParsedFile, ModuleError> {
         use super::loader::{ModuleBodyAnalysis, ModuleLoadError, ModuleRejection};
-        let formerly_importable = match P::IMPORT_PURPOSE {
-            ImportResolutionPurpose::Strict | ImportResolutionPurpose::Upstream => false,
-            ImportResolutionPurpose::OrdinaryChecks => self
-                .traversal
-                .as_ref()
-                .and_then(|capture| capture.sources.get(&dir_path.identity()))
-                .is_some_and(|inspection| {
-                    matches!(
-                        inspection.main_static,
-                        super::loader::MainStaticRead::Traversable(
-                            super::loader::MainStaticBoundary::Clear
-                        )
+        let formerly_importable = self.records_constraint_reports()
+            && matches!(
+                &source,
+                ModuleLoadSource::Captured(CapturedImportSource::Inspected {
+                    outcome: _,
+                    main_static: super::loader::MainStaticRead::Traversable(
+                        super::loader::MainStaticBoundary::Clear
                     )
-                }),
-        };
-        let loaded = match &mut self.traversal {
-            Some(traversal) => traversal.outcome_for(dir_path, &self.import_route),
-            None => super::loader::load_imported_directory(
+                })
+            );
+        let loaded = match source {
+            ModuleLoadSource::Captured(CapturedImportSource::Inspected {
+                outcome,
+                main_static: _,
+            }) => *outcome,
+            ModuleLoadSource::Captured(CapturedImportSource::Circular) => {
+                return Err(ModuleError::CircularImport(requested.to_owned()));
+            }
+            ModuleLoadSource::Direct => super::loader::load_imported_directory(
                 dir_path,
                 self.config(),
                 &self.source_overrides,
@@ -2158,14 +2218,14 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             ),
         };
         match loaded {
-            Ok(module) => self.prepare_module_body(module.into_parsed()),
+            Ok(module) => self.prepare_module_body(module.into_parsed(), dir_path),
             Err(ModuleLoadError::NotModule {
                 error,
                 signature: _,
             }) => match *error {
                 ModuleRejection::Prohibited { prohibitions, body } => match body {
                     ModuleBodyAnalysis::Available(body) => {
-                        match self.prepare_module_body(body.into_parsed()) {
+                        match self.prepare_module_body(body.into_parsed(), dir_path) {
                             Ok(parsed) if formerly_importable => Ok(parsed),
                             Ok(_) => Err(prohibitions.into_error()),
                             Err(body_error) => Err(prohibitions.with_body_error(body_error)),
@@ -2199,7 +2259,13 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
 
     /// Main's body preflight is shared by admitted and no-root rejected inputs.
     /// A rejected input is still returned exclusively as a resolver failure.
-    fn prepare_module_body(&self, mut merged: ParsedFile) -> Result<ParsedFile, ModuleError> {
+    fn prepare_module_body(
+        &self,
+        mut merged: ParsedFile,
+        directory: &ResolvedPath,
+    ) -> Result<ParsedFile, ModuleError> {
+        #[cfg(test)]
+        BODY_PREPARATIONS.update(|count| count + 1);
         // Preserve authored value trees while this file is a reusable
         // template. Reference resolution may fold a direct reference, but an
         // argument-dependent `if` must derive dependencies only after its
@@ -2215,16 +2281,18 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             self.session,
             self.resolution.context(),
         )
-        .map_err(ModuleError::Parse)?;
+        .map_err(|error| ModuleError::Parse(error.in_directory(&directory.source_label())))?;
 
-        P::resolve_file_type_exprs(&mut merged, self.session)?;
+        P::resolve_file_type_exprs(&mut merged, self.session, Some(directory))?;
         crate::parser::retained::judge_configuration(
             &mut merged,
             self.schemas,
             self.session.catalog(),
         );
         if let Some(error) = merged.expression_report().first_error() {
-            return Err(ModuleError::Parse(error));
+            return Err(ModuleError::Parse(
+                error.in_directory(&directory.source_label()),
+            ));
         }
         Ok(merged)
     }
@@ -2252,41 +2320,19 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
     fn load_import(&mut self, import: &UseStatement) -> Result<ParsedFile, ModuleError> {
         self.import_route
             .push(import.declaration_location().clone());
-        let result = self.load_module(&import.path);
+        let source = match &self.traversal {
+            Some(capture) => ModuleLoadSource::Captured(
+                capture
+                    .routes
+                    .get(&self.import_route)
+                    .expect("the traversal captured every authored import route")
+                    .clone(),
+            ),
+            None => ModuleLoadSource::Direct,
+        };
+        let result = self.load_module_from(&import.path, source);
         self.import_route.pop();
         result
-    }
-
-    fn main_ordinary_import_errors(
-        &self,
-        imports: &[UseStatement],
-        calls: &[crate::parser::ModuleCall],
-        reach: OrdinaryImportReach,
-    ) -> Vec<ModuleError> {
-        let mut checker = ModuleResolver::<MainOrdinaryImportChecks>::with_type_resolution(
-            &self.io_base_dir,
-            self.session,
-            self.schemas,
-            self.resolution,
-        );
-        checker.traversal = Some(
-            self.traversal
-                .as_ref()
-                .expect("captured operational import checks")
-                .snapshot_for_ordinary_checks(),
-        );
-        checker.source_overrides = self.source_overrides.clone();
-        match reach {
-            OrdinaryImportReach::FirstFailure => {
-                let error = checker.process_imports(imports, calls).err();
-                let warnings = checker.provider_type_warnings();
-                error
-                    .map(|error| error.with_provider_type_warnings(warnings))
-                    .into_iter()
-                    .collect()
-            }
-            OrdinaryImportReach::AllRoots => checker.process_imports_collecting(imports, calls),
-        }
     }
 
     /// Operational loading retains main's ordinary fail-fast path. The one
@@ -2296,51 +2342,29 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         imports: &[UseStatement],
         calls: &[crate::parser::ModuleCall],
     ) -> Result<(), ModuleError> {
-        let root = P::IMPORT_PURPOSE != ImportResolutionPurpose::OrdinaryChecks
-            && self.import_depth == 0
-            && self.resolving.is_empty();
+        let root = self.import_depth == 0 && self.resolving.is_empty();
         if root {
             self.capture_imports(imports, calls);
         }
         self.import_depth += 1;
-        let keep_main_ordinary = root
-            && P::IMPORT_PURPOSE == ImportResolutionPurpose::Strict
-            && self.traversal.as_ref().is_some_and(|capture| {
-                !capture.view.prohibitions.findings.is_empty()
-                    && matches!(
-                        capture.view.ordinary_body_policy,
-                        OrdinaryBodyPolicy::Operational
-                    )
-            });
-        let result = if keep_main_ordinary {
-            match ModuleError::from_errors(self.main_ordinary_import_errors(
-                imports,
-                calls,
-                OrdinaryImportReach::FirstFailure,
-            )) {
-                Some(error) => Err(error),
-                None => Ok(()),
+        let result = (|| {
+            for import in imports {
+                let module = self.load_import(import).map_err(|error| {
+                    let owners = calls
+                        .iter()
+                        .filter(|call| call.module_name == import.alias)
+                        .map(|call| call.id().clone())
+                        .collect();
+                    error.with_import_owners(import.declaration_location().clone(), owners)
+                })?;
+                self.imported_modules.insert(import.alias.clone(), module);
+                self.module_paths
+                    .insert(import.alias.clone(), import.path.clone());
             }
-        } else {
-            (|| {
-                for import in imports {
-                    let module = self.load_import(import).map_err(|error| {
-                        let owners = calls
-                            .iter()
-                            .filter(|call| call.module_name == import.alias)
-                            .map(|call| call.id().clone())
-                            .collect();
-                        error.with_import_owners(import.declaration_location().clone(), owners)
-                    })?;
-                    self.imported_modules.insert(import.alias.clone(), module);
-                    self.module_paths
-                        .insert(import.alias.clone(), import.path.clone());
-                }
-                Ok(())
-            })()
-        };
+            Ok(())
+        })();
         self.import_depth -= 1;
-        if !root {
+        if !root || self.records_constraint_reports() {
             return result;
         }
         let errors = result
@@ -2361,6 +2385,8 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             .traversal
             .as_ref()
             .expect("captured root imports")
+            .view
+            .prohibitions
             .merge_errors(errors);
         match ModuleError::from_errors(errors) {
             Some(error) => Err(error),
@@ -2372,17 +2398,11 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         &mut self,
         imports: &[UseStatement],
         calls: &[crate::parser::ModuleCall],
-    ) -> Vec<ModuleError> {
+    ) -> (Vec<ModuleError>, Vec<crate::parser::ParseWarning>) {
         self.capture_imports(imports, calls);
-        let main_ordinary_owner = P::IMPORT_PURPOSE == ImportResolutionPurpose::Strict
-            && self.import_depth == 0
-            && self.resolving.is_empty()
-            && self
-                .traversal
-                .as_ref()
-                .is_some_and(|capture| !capture.view.prohibitions.findings.is_empty());
         self.import_depth += 1;
         let mut errors = Vec::new();
+        let mut first_failure_warnings = Vec::new();
         for import in imports {
             match self.load_import(import) {
                 Ok(module) => {
@@ -2391,6 +2411,9 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
                         .insert(import.alias.clone(), import.path.clone());
                 }
                 Err(error) => {
+                    if errors.is_empty() {
+                        first_failure_warnings = self.provider_type_warnings();
+                    }
                     let owners = calls
                         .iter()
                         .filter(|call| call.module_name == import.alias)
@@ -2403,14 +2426,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             }
         }
         self.import_depth -= 1;
-        if main_ordinary_owner {
-            // Candidate loading still supplies only admitted bodies to the
-            // partial graph. Operational errors belong to the private checker;
-            // the traversal separately owns every boundary finding.
-            self.main_ordinary_import_errors(imports, calls, OrdinaryImportReach::AllRoots)
-        } else {
-            errors
-        }
+        (errors, first_failure_warnings)
     }
 
     /// Resolve nested module imports within a parsed module.
@@ -2690,7 +2706,7 @@ impl<'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, RelativeBindingN
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     ) -> Result<Self, ModuleError> {
         let mut parsed = parsed.into_file();
-        StrictTypeResolution::resolve_file_type_exprs(&mut parsed, resolver.session)?;
+        StrictTypeResolution::resolve_file_type_exprs(&mut parsed, resolver.session, None)?;
         if let Some(error) = parsed.expression_report().first_error() {
             return Err(ModuleError::Parse(error));
         }
@@ -2989,7 +3005,9 @@ pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPl
 
 /// Command resolution reuses the resolver-issued import snapshots collected
 /// before static checks, rather than walking or reading those directories again.
-pub fn resolve_module_template_with_imports<E: ResolveExportBindingPhase<ParserPlaceholder>>(
+pub fn resolve_module_template_with_imports<
+    E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
+>(
     imports: CapturedModuleImports<'_, E>,
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let CapturedModuleImports {
@@ -3000,11 +3018,9 @@ pub fn resolve_module_template_with_imports<E: ResolveExportBindingPhase<ParserP
         traversal,
     } = imports;
     let schemas = parsed.schemas();
-    let mut resolver = ModuleResolver::with_config_and_schemas(&base, config, schemas, resolution);
+    let mut resolver = ModuleResolver::with_constraint_reports(&base, config, schemas, resolution);
     resolver.traversal = Some(traversal);
-    let expanded = RefCheckedModuleGraph::check_with_resolver(parsed, resolver)?.expand()?;
-    finalize_deferred_for_bodies(expanded)
-        .map(|graph| publish_authored_module_graph(graph, config.catalog()))
+    run_module_resolution(parsed, resolver).into_lint_result()
 }
 
 /// Providerless form of [`resolve_module_template_with_config`]. Like
@@ -3200,26 +3216,56 @@ fn resolve_modules_with_diagnostics_and_resolver<
     E: ResolveExportBindingPhase<ParserPlaceholder> + Clone,
 >(
     parsed: JudgedModuleFile<'_, E>,
-    mut resolver: ModuleResolver<'_, StrictTypeResolution>,
+    resolver: ModuleResolver<'_, StrictTypeResolution>,
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionReport<E::Absolute> {
+    run_module_resolution(parsed, resolver).into_report(covered_findings)
+}
+
+fn run_module_resolution<'cfg, E: ResolveExportBindingPhase<ParserPlaceholder> + Clone>(
+    parsed: JudgedModuleFile<'cfg, E>,
+    mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
+) -> ModuleResolutionRun<'cfg, E::Absolute> {
     let graph = parsed.into_file();
     let root = root_expansion_scope();
-    let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
+    let (mut errors, import_failure_warnings) =
+        resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
+    let mut first_lint_failure = (!errors.is_empty()).then_some(FirstLintFailure::Error {
+        index: 0,
+        warnings: import_failure_warnings,
+    });
     let mut contributions = Vec::new();
     let (graph, reference_verdict) = resolver.judge_reference_types(graph);
     match reference_verdict {
         Ok(root_witness) => {
-            let (expanded, expansion_errors) = resolve_modules_with_resolver_collecting(
-                &graph,
-                &mut resolver,
-                &root_witness,
-                &root,
-            );
+            if first_lint_failure.is_none() {
+                first_lint_failure = resolver
+                    .check_require_placement(&graph)
+                    .err()
+                    .map(|error| FirstLintFailure::Owned(Box::new(error)));
+            }
+            let (expanded, expansion_errors, call_failure) =
+                resolve_modules_with_resolver_collecting(
+                    &graph,
+                    &mut resolver,
+                    &root_witness,
+                    &root,
+                );
             contributions = expanded;
+            if first_lint_failure.is_none() {
+                first_lint_failure = call_failure.map(|failure| failure.after(errors.len()));
+            }
             errors.extend(expansion_errors);
         }
-        Err(error) => errors.push(error),
+        Err(error) => {
+            if first_lint_failure.is_none() {
+                first_lint_failure = Some(FirstLintFailure::Error {
+                    index: errors.len(),
+                    warnings: resolver.provider_type_warnings(),
+                });
+            }
+            errors.push(error);
+        }
     }
     let mut graph = graph.into_file();
     graph.warnings.extend(resolver.provider_type_warnings());
@@ -3245,6 +3291,12 @@ fn resolve_modules_with_diagnostics_and_resolver<
     }
     crate::parser::retained::judge_configuration(&mut graph, resolver.schemas, resolver.config());
     let (graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
+    if first_lint_failure.is_none() && !deferred_for_errors.is_empty() {
+        first_lint_failure = Some(FirstLintFailure::Error {
+            index: errors.len(),
+            warnings: Vec::new(),
+        });
+    }
     errors.extend(deferred_for_errors);
     let constraint_reports = resolver
         .constraint_reports
@@ -3257,47 +3309,112 @@ fn resolve_modules_with_diagnostics_and_resolver<
         },
         resolver.session.catalog(),
     );
-    let resolution_failed = !errors.is_empty()
-        || resolver
-            .traversal
-            .as_ref()
-            .is_some_and(|t| !t.view.prohibitions.findings.is_empty());
-    let errors = errors
-        .into_iter()
-        .filter_map(|error| {
-            error.without_collected_import_findings(
-                &resolver
-                    .traversal
-                    .as_ref()
-                    .expect("captured root imports")
-                    .view
-                    .prohibitions,
-            )
-        })
-        .flat_map(ModuleError::into_import_prohibition_errors)
-        .collect::<Vec<_>>();
-    let errors = resolver
-        .traversal
-        .as_ref()
-        .expect("captured root imports")
-        .merge_errors(errors)
-        .into_iter()
-        .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings))
-        .collect::<Vec<_>>();
-    let placements = graph.expression_report().placements.clone();
-    let outcome = if !findings.is_empty() {
-        ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
-    } else if !resolution_failed {
-        let graph = publish_authored_module_graph(graph, resolver.session.catalog());
-        ModuleResolutionDiagnosticResult::Expanded {
-            graph: Box::new(graph),
+    let capture = resolver.traversal.take().expect("captured root imports");
+    ModuleResolutionRun {
+        graph,
+        errors,
+        findings,
+        first_lint_failure,
+        boundaries: capture.view.prohibitions,
+        ordinary_body_policy: capture.view.ordinary_body_policy,
+        config: resolver.session.catalog(),
+    }
+}
+
+/// Selection into the single run's ordered findings, for main's lint stages.
+enum FirstLintFailure {
+    Error {
+        index: usize,
+        warnings: Vec<crate::parser::ParseWarning>,
+    },
+    Owned(Box<ModuleError>),
+}
+impl FirstLintFailure {
+    fn after(self, offset: usize) -> Self {
+        match self {
+            Self::Error { index, warnings } => Self::Error {
+                index: index + offset,
+                warnings,
+            },
+            Self::Owned(error) => Self::Owned(error),
         }
-    } else {
-        ModuleResolutionDiagnosticResult::Unowned { errors }
-    };
-    ModuleResolutionReport {
-        outcome,
-        placements,
+    }
+}
+struct ModuleResolutionRun<'cfg, E> {
+    graph: ModuleResolvedFile<E>,
+    errors: Vec<ModuleError>,
+    findings: Vec<crate::validation::ModuleCallFinding>,
+    first_lint_failure: Option<FirstLintFailure>,
+    boundaries: CollectedImportProhibitions,
+    ordinary_body_policy: OrdinaryBodyPolicy,
+    config: &'cfg ProviderContext,
+}
+impl<E: crate::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress> + Clone>
+    ModuleResolutionRun<'_, E>
+{
+    fn into_lint_result(self) -> Result<ModuleResolvedFile<E>, ModuleError> {
+        let ordinary = match self.ordinary_body_policy {
+            OrdinaryBodyPolicy::BlockedByMainStaticBoundary => None,
+            OrdinaryBodyPolicy::Operational => match self.first_lint_failure {
+                Some(FirstLintFailure::Error { index, warnings }) => Some(
+                    self.errors
+                        .into_iter()
+                        .nth(index)
+                        .expect("the selected failure belongs to this resolver run")
+                        .with_provider_type_warnings(warnings),
+                ),
+                Some(FirstLintFailure::Owned(error)) => Some(*error),
+                None => None,
+            },
+        }
+        .and_then(|error| error.without_collected_import_findings(&self.boundaries));
+        let errors = self.boundaries.merge_errors(ordinary.into_iter().collect());
+        match ModuleError::from_errors(errors) {
+            Some(error) => Err(error),
+            None => Ok(publish_authored_module_graph(self.graph, self.config)),
+        }
+    }
+    fn into_report(
+        self,
+        covered_findings: &[crate::validation::ModuleCallFinding],
+    ) -> ModuleResolutionReport<E> {
+        let Self {
+            graph,
+            errors,
+            findings,
+            boundaries,
+            ordinary_body_policy,
+            config,
+            first_lint_failure: _,
+        } = self;
+        let placements = graph.expression_report().placements.clone();
+        let resolution_failed = !errors.is_empty() || !boundaries.findings.is_empty();
+        let errors = errors
+            .into_iter()
+            .filter_map(|error| error.without_collected_import_findings(&boundaries))
+            .flat_map(ModuleError::into_import_prohibition_errors)
+            .collect::<Vec<_>>();
+        let errors = boundaries
+            .merge_errors(errors)
+            .into_iter()
+            .filter_map(|error| ResidualModuleResolutionError::new(error, covered_findings))
+            .collect::<Vec<_>>();
+        let outcome = if !findings.is_empty() {
+            ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
+        } else if !resolution_failed {
+            let graph = publish_authored_module_graph(graph, config);
+            ModuleResolutionDiagnosticResult::Expanded {
+                graph: Box::new(graph),
+            }
+        } else {
+            ModuleResolutionDiagnosticResult::Unowned { errors }
+        };
+        ModuleResolutionReport {
+            outcome,
+            placements,
+            boundaries,
+            ordinary_body_policy,
+        }
     }
 }
 
@@ -3536,7 +3653,7 @@ fn deferred_for_resource_expression_error(
             match file {
                 Some(path) => ModuleError::ParseInFile {
                     path: std::path::PathBuf::from(path),
-                    error: Box::new(error),
+                    error: std::sync::Arc::new(error),
                 },
                 None => ModuleError::Parse(error),
             }
@@ -3546,7 +3663,10 @@ fn deferred_for_resource_expression_error(
 
 fn parse_error_to_module_error(error: ParseError) -> ModuleError {
     match error {
-        ParseError::Located { path, error } => ModuleError::ParseInFile { path, error },
+        ParseError::Located { path, error } => ModuleError::ParseInFile {
+            path,
+            error: error.into(),
+        },
         error => ModuleError::Parse(error),
     }
 }
@@ -3589,6 +3709,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
 ) -> (
     Vec<crate::parser::RootBindingResolvedParsedFile>,
     Vec<ModuleError>,
+    Option<FirstLintFailure>,
 ) {
     let parsed = judged.file();
     let module_calls = parsed.module_calls.clone();
@@ -3600,6 +3721,7 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
         crate::binding_index::ResolvedBindings::for_root_validation(parsed, root);
     let mut expanded_calls = Vec::with_capacity(module_calls.len());
     let mut errors = Vec::new();
+    let mut first_lint_failure = None;
     // Diagnostic resolution publishes placement findings from the graph's
     // retained report. Only strict resolution converts them to ModuleError.
     for call in &module_calls {
@@ -3615,19 +3737,55 @@ fn resolve_modules_with_resolver_collecting<E, P: TypeResolutionPolicy>(
         let expanded_call = call
             .clone()
             .resolve_bindings(&mut |binding| root.resolve(binding));
-        match resolver.expand_module_call_checked_collecting(
+        let reports_before = resolver
+            .constraint_reports
+            .borrow()
+            .as_ref()
+            .map_or(0, Vec::len);
+        let result = resolver.expand_module_call_checked_collecting(
             call,
             &expanded_call,
             &instance_prefix,
             ref_check,
             Some(&binding_index),
             Some(&resolved_bindings),
-        ) {
+        );
+        if first_lint_failure.is_none() {
+            first_lint_failure =
+                resolver
+                    .constraint_reports
+                    .borrow()
+                    .as_ref()
+                    .and_then(|reports| {
+                        reports[reports_before..]
+                            .iter()
+                            .flat_map(|report| &report.outcomes)
+                            .find_map(|outcome| match &outcome.status {
+                                ResolvedModuleConstraintStatus::Failed {
+                                    diagnostic,
+                                    origin: _,
+                                } => Some(FirstLintFailure::Owned(Box::new(
+                                    ModuleError::Constraint(diagnostic.clone()),
+                                ))),
+                                ResolvedModuleConstraintStatus::Satisfied
+                                | ResolvedModuleConstraintStatus::Pending => None,
+                            })
+                    });
+        }
+        match result {
             Ok(expanded) => expanded_calls.push(expanded),
-            Err(call_errors) => errors.extend(call_errors),
+            Err(call_errors) => {
+                if first_lint_failure.is_none() && !call_errors.is_empty() {
+                    first_lint_failure = Some(FirstLintFailure::Error {
+                        index: errors.len(),
+                        warnings: Vec::new(),
+                    });
+                }
+                errors.extend(call_errors);
+            }
         }
     }
-    (expanded_calls, errors)
+    (expanded_calls, errors, first_lint_failure)
 }
 
 fn resolve_modules_with_resolver<E, P: TypeResolutionPolicy>(

@@ -136,7 +136,19 @@ fn collect_files(root: &Path, directory: &Path, files: &mut BTreeMap<String, Str
 }
 
 impl Inputs {
-    fn new(fixtures: &Path, fixture: &Fixture) -> Self {
+    fn new(fixtures: &Path, fixture: &Fixture) -> Option<Self> {
+        if fixture
+            .runtime_unreadable
+            .values()
+            .any(|kind| matches!(kind, Unreadable::Mode000))
+            && !mode000_supported()
+        {
+            eprintln!(
+                "SKIP {}: mode-000 fixtures require an unprivileged Unix runner",
+                fixture.id
+            );
+            return None;
+        }
         let temp = tempfile::tempdir().unwrap();
         let mut files = BTreeMap::new();
         collect_files(
@@ -169,8 +181,6 @@ impl Inputs {
                     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
                     mode000.push(path.clone());
                 }
-                #[cfg(not(unix))]
-                panic!("mode-000 fixtures require an unprivileged Unix runner");
             }
             if fixture.runtime_unreadable.contains_key(relative) {
                 assert!(
@@ -184,12 +194,12 @@ impl Inputs {
             fixture.unreadable_paths.iter().collect::<BTreeSet<_>>(),
             fixture.runtime_unreadable.keys().collect()
         );
-        Self {
+        Some(Self {
             temp,
             files,
             disk,
             mode000,
-        }
+        })
     }
 
     fn root(&self) -> &Path {
@@ -705,76 +715,84 @@ async fn import_outcome_matrix_shard(shard: usize) {
             .to_string_lossy()
             .into_owned();
         let outcome = std::panic::AssertUnwindSafe(async {
-        let expected: ExpectedFixture =
-            serde_json::from_slice(&fs::read(directory.join("expected.json")).unwrap()).unwrap();
-        let fixture = &expected.fixture;
-        let main: MainFixture =
-            serde_json::from_slice(&fs::read(directory.join("main.json")).unwrap()).unwrap();
-        assert_eq!(main.revision, "66063dd7f96561c274807d6943b5441783ee3d71");
-        assert_eq!(
-            main.columns.keys().cloned().collect::<BTreeSet<_>>(),
-            columns
-        );
-        assert_eq!(
-            expected.columns.keys().cloned().collect::<BTreeSet<_>>(),
-            columns,
-            "{}: expected columns",
-            fixture.id
-        );
-        let mut failures = Vec::new();
-        for column in COLUMNS {
-            let id = format!("{}:{column}", fixture.id);
-            let cell = &expected.columns[column];
-            if matches!(
-                cell.classification,
-                Classification::Main | Classification::Main4485
-            ) && cell.value != main.columns[column] {
-                failures.push(format!("{id}: main classification must equal stored genuine main"));
-            }
-        }
-        if fixture
-            .runtime_unreadable
-            .values()
-            .any(|kind| matches!(kind, Unreadable::Mode000))
-            && !mode000_supported()
-        {
-            eprintln!(
-                "SKIP {}: mode-000 fixtures require an unprivileged Unix runner; root can read mode 000",
+            let expected: ExpectedFixture =
+                serde_json::from_slice(&fs::read(directory.join("expected.json")).unwrap())
+                    .unwrap();
+            let fixture = &expected.fixture;
+            let main: MainFixture =
+                serde_json::from_slice(&fs::read(directory.join("main.json")).unwrap()).unwrap();
+            assert_eq!(main.revision, "66063dd7f96561c274807d6943b5441783ee3d71");
+            assert_eq!(
+                main.columns.keys().cloned().collect::<BTreeSet<_>>(),
+                columns
+            );
+            assert_eq!(
+                expected.columns.keys().cloned().collect::<BTreeSet<_>>(),
+                columns,
+                "{}: expected columns",
                 fixture.id
             );
-            return failures;
-        }
-        let inputs = Inputs::new(&fixtures_path, fixture);
-        let cells = measure(fixture, &inputs).await;
-        let actual_signatures = signatures(fixture, &inputs);
-        for column in COLUMNS {
-            let id = format!("{}:{column}", fixture.id);
-            let actual = normalize(&cells[column], inputs.root());
-            let value = &expected.columns[column].value;
-            if actual != *value {
-                failures.push(format!("{id}\nexpected: {value}\nactual: {actual}"));
+            let mut failures = Vec::new();
+            for column in COLUMNS {
+                let id = format!("{}:{column}", fixture.id);
+                let cell = &expected.columns[column];
+                if matches!(
+                    cell.classification,
+                    Classification::Main | Classification::Main4485
+                ) && cell.value != main.columns[column]
+                {
+                    failures.push(format!(
+                        "{id}: main classification must equal stored genuine main"
+                    ));
+                }
             }
-        }
-        if actual_signatures != expected.signatures {
-            failures.push(format!(
-                "{}: direct signatures\nexpected: {}\nactual: {actual_signatures}",
-                fixture.id, expected.signatures
-            ));
-        }
-        if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inputs.assert_restored())) {
-            failures.push(format!("{}: input restoration: {}", fixture.id, panic_message(error.as_ref())));
-        }
-        if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assert_decisions(fixture, &cells))) {
-            failures.push(format!("{}: decision audit: {}", fixture.id, panic_message(error.as_ref())));
-        }
-        if !failures.is_empty() {
-            let retained = inputs.root().to_path_buf();
-            inputs.restore_permissions();
-            std::mem::forget(inputs);
-            failures.push(format!("Retained: {}", retained.display()));
-        }
-        failures
-        }).catch_unwind().await;
+            let Some(inputs) = Inputs::new(&fixtures_path, fixture) else {
+                return failures;
+            };
+            let cells = measure(fixture, &inputs).await;
+            let actual_signatures = signatures(fixture, &inputs);
+            for column in COLUMNS {
+                let id = format!("{}:{column}", fixture.id);
+                let actual = normalize(&cells[column], inputs.root());
+                let value = &expected.columns[column].value;
+                if actual != *value {
+                    failures.push(format!("{id}\nexpected: {value}\nactual: {actual}"));
+                }
+            }
+            if actual_signatures != expected.signatures {
+                failures.push(format!(
+                    "{}: direct signatures\nexpected: {}\nactual: {actual_signatures}",
+                    fixture.id, expected.signatures
+                ));
+            }
+            if let Err(error) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inputs.assert_restored()))
+            {
+                failures.push(format!(
+                    "{}: input restoration: {}",
+                    fixture.id,
+                    panic_message(error.as_ref())
+                ));
+            }
+            if let Err(error) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_decisions(fixture, &cells)
+            })) {
+                failures.push(format!(
+                    "{}: decision audit: {}",
+                    fixture.id,
+                    panic_message(error.as_ref())
+                ));
+            }
+            if !failures.is_empty() {
+                let retained = inputs.root().to_path_buf();
+                inputs.restore_permissions();
+                std::mem::forget(inputs);
+                failures.push(format!("Retained: {}", retained.display()));
+            }
+            failures
+        })
+        .catch_unwind()
+        .await;
         match outcome {
             Ok(failures) => all_failures.extend(failures),
             Err(error) => all_failures.push(format!(
@@ -831,7 +849,8 @@ async fn nested_negative_calls_republish_root_diagnostics() {
         &fs::read(fixtures_path.join("normal--nested--called/expected.json")).unwrap(),
     )
     .unwrap();
-    let inputs = Inputs::new(&fixtures_path, &expected.fixture);
+    let inputs =
+        Inputs::new(&fixtures_path, &expected.fixture).expect("normal fixture is portable");
     let cells = measure(&expected.fixture, &inputs).await;
     let diagnostics = &cells["callsite_argument_checks"]["lsp_caller"]["caller/main.crn"];
     assert!(

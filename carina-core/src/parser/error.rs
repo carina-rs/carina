@@ -657,6 +657,28 @@ impl ParseError {
         }
     }
 
+    /// Reuse a template's typed failure under its current import spelling.
+    /// Only location wrappers change; spans, details and protected causes stay intact.
+    pub(crate) fn in_directory(self, directory: &Path) -> Self {
+        match self {
+            Self::Located { path, error } => Self::Located {
+                path: directory.join(
+                    path.file_name()
+                        .expect("a located parser failure has a source file"),
+                ),
+                error: Box::new(error.in_directory(directory)),
+            },
+            Self::AtElement(finding) => {
+                let (location, detail) = (*finding).in_directory(directory).into_parts();
+                Self::AtElement(Box::new(super::Located::new(
+                    location,
+                    detail.in_directory(directory),
+                )))
+            }
+            leaf => leaf,
+        }
+    }
+
     pub(crate) fn in_file(self, path: impl Into<PathBuf>) -> Self {
         if matches!(self, Self::Located { .. } | Self::AtElement(_)) {
             self

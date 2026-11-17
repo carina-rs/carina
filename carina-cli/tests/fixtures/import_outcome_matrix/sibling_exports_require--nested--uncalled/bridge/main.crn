@@ -1,0 +1,4 @@
+arguments { outer_n: Int = 1 }
+let service = use { source = '../module' }
+let blocked = use { source = '../blocked' }
+

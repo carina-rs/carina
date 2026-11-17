@@ -39,12 +39,14 @@ mod tests {
         .unwrap();
         let directory_parse =
             carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed.clone());
-        let walk = ModuleWalk::load(
-            &directory_parse,
-            &ResolvedPath::new(&project).unwrap(),
-            &context,
-            &carina_core::schema::SchemaRegistry::new(),
-        );
+        let walk =
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                module_resolver::collect_module_imports(
+                    directory_parse.admit(&carina_core::schema::SchemaRegistry::new(), session),
+                    &ResolvedPath::new(&project).unwrap(),
+                )
+                .0
+            });
         assert_eq!(
             walk.iter()
                 .map(|module| module.diagnostic_path())
@@ -87,11 +89,15 @@ mod unavailable_tests {
                 carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(
                     parsed.clone(),
                 );
-            let walk = ModuleWalk::load(
-                &directory_parse,
-                &path,
+            let walk = carina_core::validation::deferred_types::with_session_for_test(
                 &context,
-                &carina_core::schema::SchemaRegistry::new(),
+                |session| {
+                    module_resolver::collect_module_imports(
+                        directory_parse.admit(&carina_core::schema::SchemaRegistry::new(), session),
+                        &path,
+                    )
+                    .0
+                },
             );
             assert_eq!(walk.iter().count(), expected_modules);
             assert!(walk.prohibitions().boundary_findings().next().is_none());
@@ -119,12 +125,14 @@ mod rejected_import_tests {
         ).unwrap();
         let directory_parse =
             carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed.clone());
-        let walk = ModuleWalk::load(
-            &directory_parse,
-            &ResolvedPath::new(directory.path()).unwrap(),
-            &context,
-            &carina_core::schema::SchemaRegistry::new(),
-        );
+        let walk =
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                module_resolver::collect_module_imports(
+                    directory_parse.admit(&carina_core::schema::SchemaRegistry::new(), session),
+                    &ResolvedPath::new(directory.path()).unwrap(),
+                )
+                .0
+            });
         assert!(walk.prohibitions().boundary_findings().next().is_none());
         assert!(crate::wiring::validate_module_boundaries(walk.prohibitions()).is_empty());
     }
@@ -156,12 +164,14 @@ mod rejected_import_tests {
         .unwrap();
         let directory_parse =
             carina_core::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed.clone());
-        let walk = ModuleWalk::load(
-            &directory_parse,
-            &ResolvedPath::new(directory.path()).unwrap(),
-            &context,
-            &carina_core::schema::SchemaRegistry::new(),
-        );
+        let walk =
+            carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+                module_resolver::collect_module_imports(
+                    directory_parse.admit(&carina_core::schema::SchemaRegistry::new(), session),
+                    &ResolvedPath::new(directory.path()).unwrap(),
+                )
+                .0
+            });
         assert_eq!(walk.iter().count(), 0);
         assert_eq!(walk.prohibitions().boundary_findings().count(), 2);
         assert!(

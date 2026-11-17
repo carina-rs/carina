@@ -40,7 +40,7 @@ using saved binary pairs and an explicit output directory outside the repository
 Pass `--refresh-main-baselines` to regenerate `main.json` from the measured main
 cells after a fixture path change. The saved binary hashes and baseline revision
 must match; candidate output is never used for these baselines.
-The stored baselines cover 192 fixtures. Empty-interface body expectations derive
+The stored baselines cover 200 fixtures. Empty-interface body expectations derive
 from genuine main's equivalent declared-argument modules. Added shapes cover two
 uses of one prohibited directory, two prohibited children, body-failing and
 unreadable bridges, prohibited parents with prohibited or unreadable children,
@@ -56,3 +56,5 @@ and PR review ledgers belong in the caller-selected external evidence directory.
 The four deterministic matrix shards collect every differing cell before failing. Added controls isolate unrelated unreadable cousins in both import orders, clean descendants of prohibited parents, resolver-only body failures behind main's boundary gate, and empty blocks. Argument/reference overlays preserve and call both aliases in duplicate-use fixtures.
 
 `associated_io` declares that the fixture's unreadable inputs are beside a prohibition or below a prohibited ancestor. These rows require cross-transport IO count, text, and range parity. Ordinary IO keeps the independently measured main value in every column, including main's different CLI/LSP reach; every native cell is still compared exactly. A clean bridge's unreadable child or cousin does not become associated merely because another child is prohibited.
+
+Round 35 adds `empty_exports_require` and `sibling_exports_require`, each direct/nested and called/uncalled. Their ordinary constraints and consumer gates come from freshly measured genuine main; only the recorded prohibitions and retired module-not-found findings change.

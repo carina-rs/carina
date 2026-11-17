@@ -360,7 +360,9 @@ fn lint_result(
             let (module_boundary_findings, boundary_errors): (Vec<_>, Vec<_>) =
                 validate_module_boundaries(module_walk.prohibitions())
                     .into_iter()
-                    .partition(|finding| matches!(finding, AppError::ModuleImport { .. }));
+                    .partition(|finding| {
+                        matches!(finding, AppError::ModuleImport { path: _, error: _ })
+                    });
             import_errors.extend(boundary_errors);
             for module in module_walk.iter() {
                 type_findings.extend(

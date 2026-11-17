@@ -202,6 +202,80 @@ fn provider_custom_type_exports_plan_and_validate_map_and_list() {
 }
 
 #[test]
+fn normalized_root_rejects_resource_handle_exports_in_validate_and_plan() {
+    let scenario = Scenario::new();
+    fs::write(
+        scenario.project.join("main.crn"),
+        "let value = mock.test.recovery_probe { value = 'one' }\n",
+    )
+    .unwrap();
+    scenario.replace_exports("exports { value: mock.test.recovery_probe = value }\n");
+    for args in [
+        vec!["validate", "--json", "."],
+        vec!["plan", "--refresh=false", "--json", "."],
+        vec![
+            "plan",
+            "--refresh=false",
+            "--out",
+            "rejected-plan.json",
+            ".",
+        ],
+    ] {
+        let output = scenario.carina(&args);
+        assert!(
+            !output.status.success(),
+            "{args:?}: {}",
+            output_text(&output)
+        );
+        assert!(
+            output_text(&output).contains("cannot cross a state boundary"),
+            "{args:?}: {}",
+            output_text(&output)
+        );
+    }
+    assert!(!scenario.project.join("rejected-plan.json").exists());
+}
+
+#[test]
+fn normalized_root_keeps_provider_function_and_list_export_types() {
+    let scenario = Scenario::new();
+    fs::write(scenario.project.join("main.crn"),
+        "fn echo(value: mock.RecoveryProbe): String { value }\nlet value = mock.test.read_back { present = echo('one') }\n").unwrap();
+    scenario.replace_exports("exports { values: list(mock.RecoveryProbe) = ['one', 'two'] }\n");
+    assert_success(
+        "validate normalized provider function",
+        &scenario.carina(&["validate", "--json", "."]),
+    );
+    // Genuine main retains the authored deferred call in saved-plan metadata.
+    // Keep that existing serialization failure after normalization.
+    for args in [
+        vec!["plan", "--refresh=false", "--json", "."],
+        vec![
+            "plan",
+            "--refresh=false",
+            "--out",
+            "normalized-plan.json",
+            ".",
+        ],
+    ] {
+        let output = scenario.carina(&args);
+        assert!(
+            !output.status.success(),
+            "{args:?}: {}",
+            output_text(&output)
+        );
+        assert!(
+            output_text(&output).contains(
+                "deferred user-function call 'echo' cannot be serialized before evaluation"
+            ),
+            "{args:?}: {}",
+            output_text(&output)
+        );
+    }
+    assert!(!scenario.project.join("normalized-plan.json").exists());
+}
+
+#[test]
 fn provider_custom_type_resource_attribute_exports_apply_then_plan_from_state() {
     let scenario = Scenario::new();
     scenario.write_resource_attribute_exports();

@@ -70,12 +70,12 @@ impl std::fmt::Display for ImportReadFailure {
         self.source.fmt(formatter)
     }
 }
-impl std::error::Error for ImportReadFailure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
+// The reader's complete message is already rendered by Display.
+impl std::error::Error for ImportReadFailure {}
 impl ImportReadFailure {
+    pub fn io_error(&self) -> &std::io::Error {
+        self.source.io_error()
+    }
     fn with_owners(
         mut self,
         location: crate::parser::DeclarationLocation,
@@ -233,8 +233,8 @@ fn require_outside_module_message(
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
-    #[error("{0}")]
-    CapturedSource(#[source] super::loader::ModuleSourceFailure),
+    #[error(transparent)]
+    CapturedSource(super::loader::ModuleSourceFailure),
     #[error(transparent)]
     AnalysisInvariant(#[from] crate::parser::AnalysisTreeError),
     /// Terminal providerless failure together with every unresolved type site.
@@ -249,8 +249,8 @@ pub enum ModuleError {
     #[error("{0}")]
     ImportDiagnostics(Box<ImportDiagnostics>),
 
-    #[error("{0}")]
-    ImportReadFailure(#[source] Box<ImportReadFailure>),
+    #[error(transparent)]
+    ImportReadFailure(Box<ImportReadFailure>),
 
     /// Resolver failure owned by concrete call sites in the containing
     /// configuration. Nested wrappers preserve the full import chain; editor
@@ -357,7 +357,7 @@ pub enum ModuleError {
     #[error("Parse error in {path}: {error}")]
     ParseInFile {
         path: PathBuf,
-        error: Box<ParseError>,
+        error: std::sync::Arc<ParseError>,
     },
 
     /// Declaration type resolution remains typed through recursive module
@@ -1817,10 +1817,13 @@ impl ModuleError {
     pub(super) fn is_read_failure(&self) -> bool {
         match self.root_cause() {
             Self::Io(_) | Self::ImportReadFailure(_) => true,
-            Self::CapturedSource(source) => source.error().is_read_failure(),
-            Self::OwnedByCalls { calls: _, error }
-            | Self::AtCall { call: _, error }
-            | Self::WithProviderTypeWarnings { error, warnings: _ } => error.is_read_failure(),
+            Self::CapturedSource(_)
+            | Self::OwnedByCalls { calls: _, error: _ }
+            | Self::AtCall { call: _, error: _ }
+            | Self::WithProviderTypeWarnings {
+                error: _,
+                warnings: _,
+            } => unreachable!("root_cause removes diagnostic wrappers"),
             Self::Multiple(errors) => errors.iter().all(Self::is_read_failure),
             Self::ImportDiagnostics(errors) => errors.iter().all(Self::is_read_failure),
             Self::ImportProhibitions(_)
@@ -1886,10 +1889,11 @@ impl ModuleError {
 
     fn is_deferred_for_body_rejection(&self) -> bool {
         match self.root_cause() {
-            Self::CapturedSource(source) => source.error().is_deferred_for_body_rejection(),
-            Self::WithProviderTypeWarnings { error, warnings: _ } => {
-                error.is_deferred_for_body_rejection()
-            }
+            Self::CapturedSource(_)
+            | Self::WithProviderTypeWarnings {
+                error: _,
+                warnings: _,
+            } => unreachable!("root_cause removes diagnostic wrappers"),
             Self::ImportDiagnostics(errors) => errors
                 .iter()
                 .all(ModuleError::is_deferred_for_body_rejection),

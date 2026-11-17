@@ -206,6 +206,20 @@ impl DeclarationLocation {
     pub fn span(&self) -> SourceSpan {
         self.span
     }
+
+    pub(in crate::parser) fn in_directory(self, directory: &Path) -> Self {
+        Self {
+            file: SourceFileId::new(
+                directory.join(
+                    self.file
+                        .path()
+                        .file_name()
+                        .expect("a parser location has a source file"),
+                ),
+            ),
+            span: self.span,
+        }
+    }
 }
 
 /// Declaration metadata on runtime nodes. Programmatic and deserialized nodes
@@ -573,6 +587,13 @@ impl<D> Located<D> {
 
     pub fn into_parts(self) -> (DeclarationLocation, D) {
         (self.location, self.detail)
+    }
+
+    pub(crate) fn in_directory(self, directory: &Path) -> Self {
+        Self {
+            location: self.location.in_directory(directory),
+            detail: self.detail,
+        }
     }
 }
 
