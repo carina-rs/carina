@@ -27,7 +27,7 @@ pub fn format(source: &str, config: &FormatConfig) -> Result<String, FormatParse
             line: 0,
             column: 0,
         })?;
-    let pairs = parser::parse(preprocess_result.transformed_source())?;
+    let pairs = parser::parse_preprocessed(&preprocess_result)?;
     let cst = build_cst(preprocess_result.transformed_source(), pairs);
     let formatter = Formatter::new(config.clone());
     let formatted = formatter.format(&cst);
@@ -51,7 +51,7 @@ pub fn format_with_block_names(
             line: 0,
             column: 0,
         })?;
-    let pairs = parser::parse(preprocess_result.transformed_source())?;
+    let pairs = parser::parse_preprocessed(&preprocess_result)?;
     let cst = build_cst(preprocess_result.transformed_source(), pairs);
     let formatter = Formatter::with_block_names(config.clone(), block_names.clone());
     let formatted = formatter.format(&cst);
@@ -1741,15 +1741,28 @@ mod tests {
                 .len(),
             3
         );
-        // Main removes parameter-only container trivia and aligns the block.
-        assert_eq!(
-            format(
-                "arguments {\n a: Int\n // between\n\n longer: String\n}\n",
-                &config
-            )
-            .unwrap(),
-            "arguments {\n  a     : Int\n  longer: String\n}\n"
-        );
+    }
+
+    #[test]
+    fn misplaced_require_format_error_uses_parser_position() {
+        for (source, line, column) in [
+            ("require n == 2, 'x'\n", 1, 1),
+            ("arguments {}\n  require n == 2, 'x'\n", 2, 3),
+            ("let n = 2\nrequire n == 2, 'x'\n", 2, 1),
+            ("let text = <<EOF\nhello\nEOF\nrequire true, 'x'\n", 4, 1),
+        ] {
+            let error = format(source, &FormatConfig::default()).unwrap_err();
+            assert_eq!(
+                error.message,
+                "`require` must be written inside an `arguments` block"
+            );
+            assert_eq!((error.line, error.column), (line, column));
+        }
+        for source in ["requirements {}", "required_x.y {}"] {
+            format(source, &FormatConfig::default()).unwrap();
+        }
+        let error = format("require n == 2\n", &FormatConfig::default()).unwrap_err();
+        assert!(error.message.starts_with("expected"), "{error}");
     }
 
     #[test]

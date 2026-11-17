@@ -7,6 +7,9 @@ use crate::eval_value::EvalValueError;
 use crate::resource::InsideSecret;
 use std::path::{Path, PathBuf};
 
+const REQUIRE_OUTSIDE_ARGUMENTS_MESSAGE: &str =
+    "`require` must be written inside an `arguments` block";
+
 pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
 
 /// A body kind that cannot be expanded after a deferred `for` iterable
@@ -212,6 +215,9 @@ pub enum ParseError {
     // Display and do not expose it again through Error::source.
     #[error("Syntax error: {0}")]
     Syntax(super::SyntaxDiagnostic),
+
+    #[error("Syntax error at {}:{}: {REQUIRE_OUTSIDE_ARGUMENTS_MESSAGE}", span.start_line(), span.start_column())]
+    RequireOutsideArguments { span: SourceSpan },
 
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
@@ -504,7 +510,8 @@ impl ParseError {
             Self::Located { error, .. } => error.diagnostic_range(),
             Self::AtElement(finding) => Some(from_span(finding.location().span())),
             Self::InvalidAuthoredExpression { diagnostic, .. } => diagnostic.range(),
-            Self::InterpolationInConstraintString { span, .. } => Some(from_span(*span)),
+            Self::InterpolationInConstraintString { span, .. }
+            | Self::RequireOutsideArguments { span } => Some(from_span(*span)),
             Self::ProtectedFile(failure) => Some(failure.range().clone()),
             Self::Syntax(error) => {
                 let (start, end) = match error.line_col {
@@ -580,6 +587,7 @@ impl ParseError {
             // Pest's Display includes the source line. Keep authored text out
             // of machine diagnostics, including malformed secret expressions.
             Self::Syntax(error) => format!("Syntax error: {}", error.variant.message()),
+            Self::RequireOutsideArguments { .. } => REQUIRE_OUTSIDE_ARGUMENTS_MESSAGE.to_string(),
             Self::ProtectedFile(failure) => failure.kind().to_string(),
             Self::InsideSecret { .. } => crate::resource::INSIDE_SECRET_MESSAGE.to_string(),
             Self::InterpolationInConstraintString { kind, .. } => {

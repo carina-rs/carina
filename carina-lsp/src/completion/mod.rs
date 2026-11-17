@@ -1,6 +1,5 @@
 //! Completion provider for the Carina LSP.
 
-mod arguments;
 pub(crate) mod dsl_source;
 mod top_level;
 mod values;

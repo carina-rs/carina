@@ -624,7 +624,6 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                         authored: true,
                     }
                 }
-                ExprKind::RequireCondition => AuthoredNavigation::Covered,
                 _ => AuthoredNavigation::Covered,
             },
             AuthoredForm::Forward | AuthoredForm::Literal | AuthoredForm::Reference => {

@@ -536,7 +536,8 @@ impl ResidualModuleResolutionError {
                 | ParseError::InterpolationInConstraintString { .. }
                 | ParseError::ValueWalk(_)
                 | ParseError::UserFunctionError(_)
-                | ParseError::RetainedEvidence(_) => false,
+                | ParseError::RetainedEvidence(_)
+                | ParseError::RequireOutsideArguments { .. } => false,
             },
             ModuleError::ParseInFile { path, error } => {
                 crate::validation::type_resolution_parser_error_is_covered(
@@ -1727,7 +1728,6 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
         parsed: &'parsed mut crate::parser::File<E>,
         mut resolver: ModuleResolver<'cfg, StrictTypeResolution>,
     ) -> Result<Self, ModuleError> {
-        crate::parser::retained::judge_configuration(parsed, resolver.schemas, resolver.config());
         StrictTypeResolution::resolve_file_type_exprs(parsed, resolver.session)?;
         if let Some(error) = parsed.expression_report().first_error() {
             return Err(ModuleError::Parse(error));
@@ -1790,7 +1790,6 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
             base_dir, config, schemas, resolution,
         );
         resolver.source_overrides = overrides.clone();
-        crate::parser::retained::judge_configuration(parsed, resolver.schemas, resolver.config());
         resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
@@ -1813,7 +1812,6 @@ impl<'parsed, 'cfg, E: crate::parser::ExportParamLike<ParserPlaceholder, Relativ
                 base_dir, config, schemas, resolution,
             );
         resolver.source_overrides = overrides.clone();
-        crate::parser::retained::judge_configuration(parsed, resolver.schemas, resolver.config());
         resolver.process_imports(&parsed.uses, &parsed.module_calls)?;
         let root_witness = resolver.validate_reference_types(parsed)?;
         Ok(Self {
@@ -2021,7 +2019,6 @@ pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPl
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let resolution = parsed.module_resolution_context();
     let mut parsed = parsed.into_parsed();
-    crate::parser::retained::judge_configuration(&mut parsed, schemas, config.catalog());
     let expanded =
         RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas, resolution)?
             .expand()?;
@@ -2040,7 +2037,6 @@ pub fn resolve_module_template_with_providerless_config<
 ) -> Result<ModuleResolvedFile<E::Absolute>, ModuleError> {
     let resolution = parsed.module_resolution_context();
     let mut parsed = parsed.into_parsed();
-    crate::parser::retained::judge_configuration(&mut parsed, schemas, config.catalog());
     let warnings = parsed
         .warnings
         .iter()
@@ -2228,7 +2224,6 @@ fn resolve_modules_with_diagnostics_and_resolver<
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionReport<E::Absolute> {
     let mut graph = parsed.clone();
-    crate::parser::retained::judge_configuration(&mut graph, resolver.schemas, resolver.config());
     let root = root_expansion_scope();
     let mut errors = resolver.process_imports_collecting(&graph.uses, &graph.module_calls);
     let mut contributions = Vec::new();

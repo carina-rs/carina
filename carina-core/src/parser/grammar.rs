@@ -206,8 +206,8 @@ impl PreprocessedFile {
     }
 
     pub(crate) fn parse(&self) -> Result<Pairs<'_, Rule>, ParseError> {
-        CarinaParser::parse(Rule::file, self.preprocess_result.transformed_source()).map_err(
-            |error| {
+        let pairs = CarinaParser::parse(Rule::file, self.preprocess_result.transformed_source())
+            .map_err(|error| {
                 let error = map_pest_error_lines(error, self);
                 match super::failed_file_text(self.preprocess_result.authored_source()) {
                     super::FailedFileText::Public(_) => ParseError::Syntax(SyntaxDiagnostic(error)),
@@ -215,8 +215,25 @@ impl PreprocessedFile {
                         ParseError::ProtectedFile(super::ProtectedParseFailure::syntax(&error))
                     }
                 }
-            },
-        )
+            })?;
+        for statement in pairs
+            .clone()
+            .flatten()
+            .filter(|pair| pair.as_rule() == Rule::statement)
+        {
+            let member = statement.into_inner().next().expect("statement member");
+            if member.as_rule() == Rule::require_statement {
+                let start = member.as_span().start();
+                return Err(ParseError::RequireOutsideArguments {
+                    span: super::SourceSpan::from_preprocessed_range(
+                        start,
+                        start + "require".len(),
+                        self,
+                    ),
+                });
+            }
+        }
+        Ok(pairs)
     }
 
     pub(super) fn protected_regions(&self) -> &super::protected_regions::SecretOwnedRanges {
@@ -329,6 +346,47 @@ pub(super) fn coalesce_operator_offset(source: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn misplaced_require_reports_keyword_range() {
+        for (source, line, column) in [
+            ("require n == 2, 'x'\n", 1, 1),
+            ("arguments {}\n  require n == 2, 'x'\n", 2, 3),
+            ("let n = 2\nrequire n == 2, 'x'\n", 2, 1),
+            ("let text = <<EOF\nhello\nEOF\nrequire true, 'x'\n", 4, 1),
+        ] {
+            let file = preprocess_file(source).unwrap();
+            let error = file.parse().unwrap_err();
+            assert_eq!(
+                error.diagnostic_message(),
+                "`require` must be written inside an `arguments` block"
+            );
+            let range = error.diagnostic_range().unwrap();
+            assert_eq!((range.start_line, range.start_column), (line, column));
+            assert_eq!((range.end_line, range.end_column), (line, column + 7));
+        }
+    }
+
+    #[test]
+    fn require_prefixed_statement_names_keep_parsing() {
+        for source in ["requirements {}", "required_x.y {}", "requirement {}"] {
+            let file = preprocess_file(source).unwrap();
+            file.parse()
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+        }
+    }
+
+    #[test]
+    fn incomplete_misplaced_require_keeps_pest_error() {
+        let file = preprocess_file("require n == 2\n").unwrap();
+        let error = file.parse().unwrap_err();
+        assert!(matches!(error, ParseError::Syntax(_)), "{error}");
+        assert!(
+            error
+                .diagnostic_message()
+                .starts_with("Syntax error: expected")
+        );
+    }
 
     #[test]
     fn round14_syntax_failure_is_admitted_from_its_own_source() {

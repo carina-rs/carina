@@ -480,8 +480,8 @@ arguments {
 An `arguments` block may contain zero or more requirements, in any order with
 its parameters. Each requirement sees every argument declared by the module,
 including later parameters, other `arguments` blocks, and sibling `.crn` files.
-A `require` anywhere outside an `arguments` block is a syntax error. Root
-configurations cannot contain `arguments` blocks.
+A `require` outside an `arguments` block reports the syntax error "`require` must be written inside an `arguments` block" at the `require` keyword.
+Root configurations cannot contain `arguments` blocks.
 
 When validated directly, a module directory keeps its requirements unevaluated
 until its arguments are supplied by a call. Per-argument `validation` blocks

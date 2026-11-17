@@ -927,17 +927,6 @@ pub enum UpstreamExportSourceError {
 }
 
 impl UpstreamExportSourceError {
-    /// Source directory and typed resolver failure whose complete diagnostic
-    /// is already rendered by this error's Display.
-    pub fn module_failure(
-        &self,
-    ) -> Option<(&std::path::Path, &crate::module_resolver::ModuleError)> {
-        match self {
-            Self::Module { base, error } => Some((base, error)),
-            _ => None,
-        }
-    }
-
     fn into_resolve_failure(
         self,
         binding: String,
@@ -1886,7 +1875,7 @@ fn visit_subscript_access<B: BindingAddress>(
 mod tests {
     #[cfg(unix)]
     #[test]
-    fn round3_non_utf8_upstream_guard_is_not_omitted() {
+    fn non_utf8_upstream_syntax_error_keeps_its_authored_path() {
         use std::os::unix::ffi::OsStringExt;
         let directory = tempfile::tempdir().unwrap();
         let upstream_dir = directory.path().join("upstream");
@@ -1913,14 +1902,14 @@ mod tests {
                 &overrides,
             )
             .unwrap();
-            assert_eq!(errors.len(), 1, "upstream guard was omitted");
+            assert_eq!(errors.len(), 1, "upstream syntax error was omitted");
             let failure = errors[0].detail().parse_failure().unwrap();
             assert_eq!(failure.source_file(), Some(guard.as_path()));
             let error = failure.parse_error().unwrap();
             assert!(
                 error
                     .diagnostic_message()
-                    .starts_with("Syntax error: expected")
+                    .contains("`require` must be written inside an `arguments` block")
             );
             let location = error.diagnostic_range().unwrap();
             assert_eq!(location.start_line, 1);

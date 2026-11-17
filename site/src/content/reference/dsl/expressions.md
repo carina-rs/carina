@@ -500,9 +500,7 @@ arguments {
 
 A requirement sees all module arguments, including later declarations and
 arguments in sibling files. Outside an `arguments` block, `require` is a syntax
-error. A condition must return a boolean. `length` counts string bytes;
-constraint strings retain their authored escape spelling, so
-`length("a\nb")` is `4`. Collection literals are not part of validate
+error. A condition must return a boolean. Collection literals are not part of validate
 expressions; field access and indexing require a module argument as their base.
 
 Validate expressions are evaluated when their referenced values become known.

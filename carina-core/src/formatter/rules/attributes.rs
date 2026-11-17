@@ -101,8 +101,7 @@ impl Formatter {
         }
     }
 
-    // Parameter-only gaps retain main's normalization. Requirements keep
-    // their adjacent comments and blank lines without changing alignment.
+    // Preserve comments and blank lines adjacent to requirements.
     fn format_require_member_trivia(&mut self, trivia: &[&Trivia]) {
         let mut newlines: usize = 0;
         for item in trivia {

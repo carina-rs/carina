@@ -2758,9 +2758,6 @@ fn compile_remaining_form(
             operands.extend(parts.map(|part| compile(part, file, source, scope, captures)));
             node(&pair, ExprKind::Wait, operands, file, source)
         }
-        Rule::require_condition => {
-            node(&pair, ExprKind::RequireCondition, children(), file, source)
-        }
         Rule::validate_expr | Rule::validate_primary => {
             node(&pair, ExprKind::Alias, children(), file, source)
         }
@@ -2964,6 +2961,7 @@ fn compile_remaining_form(
         | Rule::paren_open
         | Rule::pipe_step
         | Rule::pipe_token
+        | Rule::require_condition
         | Rule::require_head
         | Rule::require_keyword
         | Rule::single_quote) => node(

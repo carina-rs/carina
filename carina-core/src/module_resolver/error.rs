@@ -276,7 +276,12 @@ impl ModuleError {
     }
 
     pub(crate) fn with_owning_calls(self, calls: Vec<ModuleCallId>) -> Self {
-        if calls.is_empty() {
+        // Misplaced statement syntax belongs to the parsed file, before any
+        // call is evaluated. Retain that ownership through nested imports.
+        if calls.is_empty()
+            || matches!(self.root_cause(), Self::ParseInFile { error, .. }
+                if matches!(error.as_ref(), ParseError::RequireOutsideArguments { .. }))
+        {
             self
         } else {
             Self::OwnedByCalls {
@@ -637,6 +642,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         | ParseError::SecretInConstraint { .. }
         | ParseError::InterpolationInConstraintString { .. }
         | ParseError::Syntax(_)
+        | ParseError::RequireOutsideArguments { .. }
         | ParseError::ProtectedFile(_)
         | ParseError::UnavailableSecret(_)
         | ParseError::InvalidFloatLiteral { .. }

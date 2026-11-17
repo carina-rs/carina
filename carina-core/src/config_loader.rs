@@ -469,17 +469,8 @@ impl<E> RootDirectoryParse<E> {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    /// Wrap test data without granting directory declaration completeness.
-    /// Directory-scoped guard tests must use a real directory loader.
-    pub fn from_parsed_for_test(mut parsed: File<E>) -> Self
-    where
-        E: crate::parser::ExportParamLike,
-    {
-        crate::parser::retained::judge_configuration(
-            &mut parsed,
-            &SchemaRegistry::new(),
-            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        );
+    /// Wrap test data with strict directory resolution.
+    pub fn from_parsed_for_test(parsed: File<E>) -> Self {
         Self::with_resolution(parsed, strict_resolution_context())
     }
 }
@@ -676,8 +667,8 @@ where
     }
 }
 
-/// A parser-minted buffer whose identity, contents and AST cannot be replaced
-/// independently. Clones retain the same parser node identities.
+/// Shared parsed file for an editor buffer, retaining parser node identities
+/// across clones.
 #[derive(Clone)]
 pub struct ParsedSourceBuffer {
     parsed: std::sync::Arc<ParsedFile>,

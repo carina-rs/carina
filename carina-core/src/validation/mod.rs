@@ -7358,6 +7358,16 @@ fn is_string_compatible_type_on_path<'a>(
     }
 }
 
+const ARGUMENTS_IN_ROOT_MESSAGE: &str =
+    "arguments blocks are only valid inside module definitions, not in root configurations.";
+
+fn arguments_block_is_misplaced(
+    block: &crate::parser::ConfigurationBlock,
+    is_root_configuration: bool,
+) -> bool {
+    *block == crate::parser::ConfigurationBlock::Arguments && is_root_configuration
+}
+
 /// Check that a root configuration does not contain `arguments` blocks.
 ///
 /// `arguments` is a module-input declaration: it belongs on the module side
@@ -7379,19 +7389,15 @@ pub fn validate_no_arguments_in_root<
 >(
     tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
 ) -> Result<(), String> {
-    // Consume the existing placement judgement, selecting the arguments rule
-    // by its parser-owned block location. CLI and LSP use one predicate and
-    // one message; parameter count does not establish block presence.
-    match configuration_placement_diagnostics(tree)
-        .into_iter()
-        .find(|finding| {
-            tree.syntax().configuration_blocks().iter().any(|block| {
-                *block.detail() == crate::parser::ConfigurationBlock::Arguments
-                    && block.location() == finding.location()
-            })
-        }) {
-        Some(finding) => Err(finding.detail().to_string()),
-        None => Ok(()),
+    if tree
+        .syntax()
+        .configuration_blocks()
+        .iter()
+        .any(|block| arguments_block_is_misplaced(block.detail(), tree.is_root_configuration()))
+    {
+        Err(ARGUMENTS_IN_ROOT_MESSAGE.to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -8353,7 +8359,7 @@ pub fn configuration_placement_diagnostics<
     use crate::parser::ConfigurationBlock;
     tree.syntax().configuration_blocks().iter().filter_map(|block| {
         let message = match block.detail() {
-            ConfigurationBlock::Arguments if tree.is_root_configuration() => "arguments blocks are only valid inside module definitions, not in root configurations.",
+            kind if arguments_block_is_misplaced(kind, tree.is_root_configuration()) => ARGUMENTS_IN_ROOT_MESSAGE,
             ConfigurationBlock::Provider if tree.is_module_definition() => "provider blocks are not allowed inside modules. Define providers at the root configuration level.",
             ConfigurationBlock::State if tree.is_module_definition() => "state blocks (moved, removed, and import) are not allowed inside modules. Define state blocks at the root configuration level.",
             ConfigurationBlock::Backend if tree.is_module_definition() => "backend blocks are not allowed inside modules. Define the backend at the root configuration level.",

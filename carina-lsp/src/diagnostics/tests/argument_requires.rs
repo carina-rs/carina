@@ -41,7 +41,7 @@ fn issue4398_require_buffer_recovery() {
 
 #[cfg(unix)]
 #[test]
-fn round3_non_utf8_editor_file_keeps_its_authored_path() {
+fn non_utf8_editor_argument_keeps_its_authored_path() {
     use std::os::unix::ffi::OsStringExt;
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(

@@ -10,7 +10,7 @@
 // Entry point
 file = { SOI ~ statement* ~ EOI }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource | require_statement }
 
 // Require statement: require <validate_expr>, "error message"
 require_head = _{ require_keyword ~ require_condition }

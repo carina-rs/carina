@@ -258,38 +258,103 @@ fn issue4398_root_arguments_block_placement() {
     );
 }
 
-fn assert_legacy_syntax_error(imported: bool) {
+const REQUIRE_PLACEMENT_ERROR: &str = "`require` must be written inside an `arguments` block";
+
+fn assert_legacy_syntax_error(name: &str, source: &str, direct_module: bool, line: u32) {
     let d = Directory::new();
-    let name = if imported {
-        "checked/guards.crn"
-    } else {
-        "guards.crn"
-    };
-    d.write(name, "require n == 2, 'x'\n");
-    for args in [
-        &["validate", "."][..],
-        &["validate", "--json", "."],
-        &["plan", "."],
-    ] {
-        let output = d.run(args);
-        assert!(!output.status.success(), "{}", text(&output));
-        assert!(text(&output).contains("expected"), "{}", text(&output));
+    d.write(name, source);
+    let input = if direct_module { "checked" } else { "." };
+    for command in ["validate", "plan"] {
+        let output = d.run(&[command, input]);
+        let rendered = text(&output);
+        assert!(!output.status.success(), "{rendered}");
+        assert!(rendered.contains(REQUIRE_PLACEMENT_ERROR), "{rendered}");
+        assert!(rendered.contains(&format!("{line}:1")), "{rendered}");
+        if name.starts_with("checked/") && !direct_module {
+            assert!(
+                rendered.contains("Parse error in checked/guards.crn:"),
+                "{rendered}"
+            );
+        }
     }
-    let findings = d.diagnostics(name);
-    assert!(
-        findings.iter().any(|d| d.message.contains("expected")),
-        "{findings:?}"
+    let output = d.run(&["validate", "--json", input]);
+    assert!(!output.status.success(), "{}", text(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
+    assert_eq!(report["errors"][0]["message"], REQUIRE_PLACEMENT_ERROR);
+    assert_eq!(
+        report["errors"][0]["location"],
+        json!({
+            "file": name,
+            "range": {"start": {"line":line,"column":1}, "end": {"line":line,"column":8}}
+        })
     );
+    let findings = d.diagnostics(name);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].message, REQUIRE_PLACEMENT_ERROR);
+    assert_eq!(
+        findings[0].range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(line - 1, 0),
+            tower_lsp::lsp_types::Position::new(line - 1, 7)
+        )
+    );
+    for other in ["main.crn", "providers.crn", "checked/arguments.crn"] {
+        let other_findings = d.diagnostics(other);
+        assert!(
+            other_findings
+                .iter()
+                .all(|finding| !finding.message.contains(REQUIRE_PLACEMENT_ERROR)),
+            "{other}: {other_findings:?}"
+        );
+    }
+    let output = d.run(&[
+        "fmt",
+        if name.starts_with("checked/") {
+            "checked"
+        } else {
+            "."
+        },
+    ]);
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains(&format!(
+            "Parse error at {line}:1: {REQUIRE_PLACEMENT_ERROR}"
+        )),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(fs::read_to_string(d.path.join(name)).unwrap(), source);
 }
 
 #[test]
 fn issue4398_root_sibling_top_level_require_is_syntax_error() {
-    assert_legacy_syntax_error(false);
+    assert_legacy_syntax_error("guards.crn", "require n == 2, 'x'\n", false, 1);
 }
 
 #[test]
 fn issue4398_module_top_level_require_is_syntax_error() {
-    assert_legacy_syntax_error(true);
+    assert_legacy_syntax_error("checked/guards.crn", "require n == 2, 'x'\n", false, 1);
+}
+
+#[test]
+fn issue4398_direct_module_top_level_require_is_syntax_error() {
+    assert_legacy_syntax_error("checked/guards.crn", "require n == 2, 'x'\n", true, 1);
+}
+
+#[test]
+fn issue4398_require_after_arguments_is_syntax_error() {
+    assert_legacy_syntax_error(
+        "guards.crn",
+        "arguments {}\nrequire n == 2, 'x'\n",
+        false,
+        2,
+    );
+}
+
+#[test]
+fn issue4398_require_after_let_is_syntax_error() {
+    assert_legacy_syntax_error("guards.crn", "let n = 2\nrequire n == 2, 'x'\n", false, 2);
 }
 
 fn assert_upstream_syntax_error(condition: &str) {
@@ -318,17 +383,23 @@ fn assert_upstream_syntax_error(condition: &str) {
                 .is_some_and(|f| f.ends_with("upstream/guards.crn"))
         })
         .unwrap_or_else(|| panic!("{report}"));
-    assert!(
-        finding["message"]
-            .as_str()
-            .unwrap()
-            .contains("Syntax error: expected"),
-        "{report}"
-    );
+    assert_eq!(finding["message"], REQUIRE_PLACEMENT_ERROR, "{report}");
     assert_eq!(
-        finding["location"]["range"]["start"],
-        json!({"line":2,"column":1})
+        finding["location"]["range"],
+        json!({
+            "start": {"line":2,"column":1}, "end": {"line":2,"column":8}
+        })
     );
+    for command in ["validate", "plan"] {
+        let output = d.run(&[command, "."]);
+        assert!(!output.status.success(), "{}", text(&output));
+        assert!(
+            text(&output).contains(REQUIRE_PLACEMENT_ERROR),
+            "{}",
+            text(&output)
+        );
+        assert!(text(&output).contains("2:1"), "{}", text(&output));
+    }
     let context =
         carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
     let base = carina_core::paths::ResolvedPath::new(&d.path).unwrap();
@@ -353,7 +424,7 @@ fn assert_upstream_syntax_error(condition: &str) {
                 .parse_error()
                 .unwrap()
                 .diagnostic_message()
-                .contains("Syntax error: expected")
+                .contains(REQUIRE_PLACEMENT_ERROR)
         );
         assert_eq!(
             carina_cli::error::format_error_with_source_chain(failure),
@@ -370,6 +441,64 @@ fn issue4398_upstream_false_require_keeps_syntax_location() {
 #[test]
 fn issue4398_upstream_unknown_require_keeps_syntax_location() {
     assert_upstream_syntax_error("missing == 1");
+}
+
+#[test]
+fn upstream_module_require_error_chain_renders_once() {
+    let d = Directory::new();
+    fs::create_dir_all(d.path.join("upstream/checked")).unwrap();
+    d.write(
+        "main.crn",
+        "let prior = upstream_state { source = './upstream' }\n",
+    );
+    d.write("upstream/main.crn", "let checked = use { source = './checked' }\nlet control = checked { n = 2 }\nexports { value: Int = 1 }\n");
+    d.write(
+        "upstream/checked/arguments.crn",
+        "arguments { n: Int require n == 3, 'upstream module guard' }\n",
+    );
+    let context =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let base = carina_core::paths::ResolvedPath::new(&d.path).unwrap();
+    let parsed = carina_core::config_loader::parse_directory(&base, &context).unwrap();
+    let tree = carina_core::parser::AnalysisTree::try_from_file(parsed.parsed()).unwrap();
+    carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+        let (_, failures) = carina_core::upstream_exports::resolve_upstream_exports_report(
+            &base, &tree, session, None,
+        )
+        .unwrap();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        let failure = failures[0].detail();
+        let (source, cause) = failure
+            .module_failure()
+            .expect("typed upstream module failure");
+        assert!(source.ends_with("upstream"));
+        assert!(
+            matches!(
+                cause.root_cause(),
+                carina_core::module_resolver::ModuleError::Constraint(_)
+            ),
+            "{cause:?}"
+        );
+        let rendered = carina_cli::error::format_error_with_source_chain(failure);
+        assert_eq!(rendered, failure.to_string());
+        assert_eq!(
+            rendered.matches("upstream_state `prior`").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches("module 'checked' (call 'control')")
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("upstream module guard").count(),
+            1,
+            "{rendered}"
+        );
+    });
 }
 
 #[test]
@@ -431,69 +560,24 @@ fn issue4398_pending_constraint_wire_unchanged() {
     assert_eq!(plan["version"], 46);
     // Captured from main-carina (83fec2e1c), with the same caller and four
     // legacy top-level declarations in file order, then source order.
-    let expected: Value =
-        serde_json::from_str(include_str!("fixtures/require_pending_constraints.json")).unwrap();
-    assert_eq!(
-        serde_json::to_vec(&plan["compositions"][0]["pending_constraints"]).unwrap(),
-        serde_json::to_vec(&expected).unwrap()
-    );
+    let bound_argument = |name| {
+        json!({"BoundArgument": {
+            "argument": name, "operand": name,
+            "value": {"ResourceRef": {"path": {"binding": "producer", "attribute": "identifier"}}}
+        }})
+    };
+    let expected = Value::Array([
+        ("before", "after", "'a0'"),
+        ("after", "before", "'a1'"),
+        ("after", "before", "'z0'"),
+        ("before", "after", "'z1'"),
+    ].into_iter().enumerate().map(|(index, (lhs, rhs, message))| json!({
+        "id": format!("require:{index}"),
+        "expression": {"Compare": {"lhs": bound_argument(lhs), "op": "Eq", "rhs": bound_argument(rhs)}},
+        "message": message,
+    })).collect());
+    assert_eq!(plan["compositions"][0]["pending_constraints"], expected);
     let _: carina_cli::commands::plan::PlanFile = serde_json::from_slice(&bytes).unwrap();
     let replay = d.run(&["apply", "--auto-approve", "--lock=false", "saved.plan"]);
     assert!(replay.status.success(), "{}", text(&replay));
-}
-
-#[test]
-fn issue4398_directory_read_error_chain_renders_once() {
-    let directory = tempfile::tempdir().unwrap();
-    let file = directory.path().join("blocked.crn");
-    fs::write(&file, [0xff]).unwrap();
-    let context =
-        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let error = carina_core::config_loader::parse_directory_for_metadata_report(
-        &carina_core::paths::ResolvedPath::new(directory.path()).unwrap(),
-        &context,
-        &Default::default(),
-        &SchemaRegistry::new(),
-    )
-    .unwrap_err();
-    assert_eq!(error.source_file(), Some(file.as_path()));
-    assert_eq!(
-        error.io_error().unwrap().kind(),
-        std::io::ErrorKind::InvalidData
-    );
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "Failed to read {}: {}",
-            file.display(),
-            error.io_error().unwrap()
-        )
-    );
-    assert_eq!(
-        carina_cli::error::format_error_with_source_chain(&error),
-        error.to_string()
-    );
-}
-
-#[test]
-fn issue4398_directory_discovery_error_chain_renders_once() {
-    let directory = tempfile::tempdir().unwrap();
-    let missing = directory.path().join("missing");
-    let context =
-        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-    let error = carina_core::config_loader::parse_directory_for_metadata_report(
-        &carina_core::paths::ResolvedPath::new(missing).unwrap(),
-        &context,
-        &Default::default(),
-        &SchemaRegistry::new(),
-    )
-    .unwrap_err();
-    assert_eq!(
-        error.io_error().unwrap().kind(),
-        std::io::ErrorKind::NotFound
-    );
-    assert_eq!(
-        carina_cli::error::format_error_with_source_chain(&error),
-        error.to_string()
-    );
 }

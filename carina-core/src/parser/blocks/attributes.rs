@@ -12,7 +12,9 @@ use crate::parser::ast::{
 use crate::parser::context::{ParseContext, first_inner, next_pair};
 use crate::parser::error::{ParseError, ParseWarning};
 use crate::parser::expressions::string_literal::parse_string_value;
-use crate::parser::expressions::validate_expr::parse_validate_expr;
+use crate::parser::expressions::validate_expr::{
+    ConstraintStringPosition, parse_constraint_string, parse_validate_expr,
+};
 use crate::parser::grammar::PreprocessedFile;
 use crate::parser::types::parse_type_expr;
 use crate::parser::{ParserRequireBlock as RequireBlock, ProviderContext};
@@ -412,26 +414,27 @@ pub(in crate::parser) fn parse_exports_block(
 /// Parse a require statement: `require <validate_expr>, "error message"`
 fn parse_require_statement(
     pair: pest::iterators::Pair<Rule>,
-    ctx: &crate::parser::ParseContext,
-    preprocessed_file: &crate::parser::PreprocessedFile,
+    ctx: &ParseContext,
+    preprocessed_file: &PreprocessedFile,
 ) -> Result<RequireBlock, ParseError> {
     let mut inner = pair.into_inner();
     let condition_pair = next_pair(&mut inner, "validate_expr", "require statement")?;
     // Constraint diagnostics belong to the offending expression, not to the
     // beginning of a potentially multi-line `require` statement.
-    let source_span = crate::parser::SourceSpan::from_pest(&condition_pair, preprocessed_file);
+    let source_span = SourceSpan::from_pest(&condition_pair, preprocessed_file);
     let location = ctx.declaration_location(&condition_pair);
     let condition = parse_validate_expr(
         condition_pair,
         ctx,
-        crate::parser::ConstraintStringPosition::RequireCondition,
+        ConstraintStringPosition::RequireCondition,
     )?;
     let message_pair = next_pair(&mut inner, "string", "require statement")?;
-    let error_message = crate::parser::expressions::validate_expr::parse_constraint_string(
-        message_pair,
-        ctx,
-        crate::parser::ConstraintStringPosition::RequireMessage,
-    )?;
-    let declaration = RequireBlock::new_in_source(condition, error_message, source_span, location);
-    Ok(declaration)
+    let error_message =
+        parse_constraint_string(message_pair, ctx, ConstraintStringPosition::RequireMessage)?;
+    Ok(RequireBlock::new_in_source(
+        condition,
+        error_message,
+        source_span,
+        location,
+    ))
 }
