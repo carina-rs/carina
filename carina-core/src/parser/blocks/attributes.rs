@@ -5,7 +5,6 @@
 
 use crate::parser::ParsedValue as Value;
 use crate::parser::ParserValidationBlock as ValidationBlock;
-use crate::parser::ProviderContext;
 use crate::parser::Rule;
 use crate::parser::ast::{
     ArgumentParameter, AttributeParameter, BoundaryExpression, ExportParameter, SourceSpan,
@@ -16,6 +15,7 @@ use crate::parser::expressions::string_literal::parse_string_value;
 use crate::parser::expressions::validate_expr::parse_validate_expr;
 use crate::parser::grammar::PreprocessedFile;
 use crate::parser::types::parse_type_expr;
+use crate::parser::{ParserRequireBlock as RequireBlock, ProviderContext};
 use crate::parser::{parse_expression, parse_expression_eval};
 use crate::resource::{ConcreteValue, DeferredValue};
 
@@ -39,6 +39,11 @@ fn parse_boundary_expression(
         .map_err(|error| ParseError::from_eval_value(error, line))
 }
 
+pub(in crate::parser) struct ParsedArgumentsBlock {
+    pub arguments: Vec<ArgumentParameter>,
+    pub requires: Vec<RequireBlock>,
+}
+
 /// Parse arguments block. See `register_argument_binding` for the
 /// incremental scoping discipline that lets a later argument's default
 /// expression reference earlier arguments (#2393).
@@ -49,131 +54,154 @@ pub(in crate::parser) fn parse_arguments_block(
     preprocessed_file: &PreprocessedFile,
     _source_file: &std::path::Path,
     warnings: &mut Vec<ParseWarning>,
-) -> Result<Vec<ArgumentParameter>, ParseError> {
+) -> Result<ParsedArgumentsBlock, ParseError> {
     let mut arguments = Vec::new();
+    let mut requires = Vec::new();
 
     for param in pair.into_inner() {
-        if param.as_rule() == Rule::arguments_param {
-            let mut param_inner = param.into_inner();
-            let name = next_pair(&mut param_inner, "parameter name", "arguments block")?
-                .as_str()
-                .to_string();
-            let type_pair = next_pair(&mut param_inner, "type expression", "arguments parameter")?;
-            let type_expr = parse_type_expr(type_pair, config, warnings, Some(preprocessed_file))?;
+        match param.as_rule() {
+            Rule::require_statement => {
+                requires.push(parse_require_statement(param, ctx, preprocessed_file)?)
+            }
+            Rule::arguments_param => {
+                let mut param_inner = param.into_inner();
+                let name = next_pair(&mut param_inner, "parameter name", "arguments block")?
+                    .as_str()
+                    .to_string();
+                let type_pair =
+                    next_pair(&mut param_inner, "type expression", "arguments parameter")?;
+                let type_expr =
+                    parse_type_expr(type_pair, config, warnings, Some(preprocessed_file))?;
 
-            let mut description = None;
-            let mut default = None;
-            let mut validations = Vec::new();
+                let mut description = None;
+                let mut default = None;
+                let mut validations = Vec::new();
 
-            if let Some(next) = param_inner.next() {
-                if next.as_rule() == Rule::arguments_param_block {
-                    for attr in next.into_inner() {
-                        if attr.as_rule() == Rule::arguments_param_attr {
-                            let inner_attr =
-                                first_inner(attr, "attribute", "arguments_param_attr")?;
-                            match inner_attr.as_rule() {
-                                Rule::arg_description_attr => {
-                                    let string_pair =
-                                        first_inner(inner_attr, "string", "arg_description_attr")?;
-                                    let value = parse_string_value(string_pair, ctx)?;
-                                    if let Value::Concrete(ConcreteValue::String(s)) = value {
-                                        description = Some(s.into_plaintext());
+                if let Some(next) = param_inner.next() {
+                    if next.as_rule() == Rule::arguments_param_block {
+                        for attr in next.into_inner() {
+                            if attr.as_rule() == Rule::arguments_param_attr {
+                                let inner_attr =
+                                    first_inner(attr, "attribute", "arguments_param_attr")?;
+                                match inner_attr.as_rule() {
+                                    Rule::arg_description_attr => {
+                                        let string_pair = first_inner(
+                                            inner_attr,
+                                            "string",
+                                            "arg_description_attr",
+                                        )?;
+                                        let value = parse_string_value(string_pair, ctx)?;
+                                        if let Value::Concrete(ConcreteValue::String(s)) = value {
+                                            description = Some(s.into_plaintext());
+                                        }
                                     }
-                                }
-                                Rule::arg_default_attr => {
-                                    let expr_pair =
-                                        first_inner(inner_attr, "expression", "arg_default_attr")?;
-                                    default = Some(
-                                        parse_expression(expr_pair, ctx)?
-                                            .projection()
-                                            .expect("materialized parser expression")
-                                            .clone(),
-                                    );
-                                }
-                                Rule::arg_validation_block => {
-                                    let mut rule = None;
-                                    let mut error_msg = None;
-                                    for vattr in inner_attr.into_inner() {
-                                        if vattr.as_rule() == Rule::validation_block_attr {
-                                            let inner_vattr = first_inner(
-                                                vattr,
-                                                "validation_block_attr",
-                                                "validation_block_attr",
-                                            )?;
-                                            match inner_vattr.as_rule() {
-                                                Rule::validation_condition_attr => {
-                                                    let validate_pair = first_inner(
-                                                        inner_vattr,
-                                                        "validate_expr",
-                                                        "validation_condition_attr",
-                                                    )?;
-                                                    let source_span = SourceSpan::from_pest(
-                                                        &validate_pair,
-                                                        preprocessed_file,
-                                                    );
-                                                    let location =
-                                                        ctx.declaration_location(&validate_pair);
-                                                    rule = Some((
+                                    Rule::arg_default_attr => {
+                                        let expr_pair = first_inner(
+                                            inner_attr,
+                                            "expression",
+                                            "arg_default_attr",
+                                        )?;
+                                        default = Some(
+                                            parse_expression(expr_pair, ctx)?
+                                                .projection()
+                                                .expect("materialized parser expression")
+                                                .clone(),
+                                        );
+                                    }
+                                    Rule::arg_validation_block => {
+                                        let mut rule = None;
+                                        let mut error_msg = None;
+                                        for vattr in inner_attr.into_inner() {
+                                            if vattr.as_rule() == Rule::validation_block_attr {
+                                                let inner_vattr = first_inner(
+                                                    vattr,
+                                                    "validation_block_attr",
+                                                    "validation_block_attr",
+                                                )?;
+                                                match inner_vattr.as_rule() {
+                                                    Rule::validation_condition_attr => {
+                                                        let validate_pair = first_inner(
+                                                            inner_vattr,
+                                                            "validate_expr",
+                                                            "validation_condition_attr",
+                                                        )?;
+                                                        let source_span = SourceSpan::from_pest(
+                                                            &validate_pair,
+                                                            preprocessed_file,
+                                                        );
+                                                        let location = ctx
+                                                            .declaration_location(&validate_pair);
+                                                        rule = Some((
                                                         parse_validate_expr(validate_pair, ctx, crate::parser::ConstraintStringPosition::ValidationCondition)?,
                                                         source_span,
                                                         location,
                                                     ));
-                                                }
-                                                Rule::validation_error_message_attr => {
-                                                    let string_pair = first_inner(
-                                                        inner_vattr,
-                                                        "string",
-                                                        "validation_error_message_attr",
-                                                    )?;
-                                                    let value =
-                                                        parse_string_value(string_pair, ctx)?;
-                                                    if let Value::Concrete(ConcreteValue::String(
-                                                        s,
-                                                    )) = value
-                                                    {
-                                                        error_msg = Some(s.into_plaintext());
                                                     }
+                                                    Rule::validation_error_message_attr => {
+                                                        let string_pair = first_inner(
+                                                            inner_vattr,
+                                                            "string",
+                                                            "validation_error_message_attr",
+                                                        )?;
+                                                        let value =
+                                                            parse_string_value(string_pair, ctx)?;
+                                                        if let Value::Concrete(
+                                                            ConcreteValue::String(s),
+                                                        ) = value
+                                                        {
+                                                            error_msg = Some(s.into_plaintext());
+                                                        }
+                                                    }
+                                                    _ => {}
                                                 }
-                                                _ => {}
                                             }
                                         }
+                                        if let Some((condition, source_span, location)) = rule {
+                                            validations.push(ValidationBlock::new_in_source(
+                                                condition,
+                                                error_msg,
+                                                source_span,
+                                                location,
+                                            ));
+                                        }
                                     }
-                                    if let Some((condition, source_span, location)) = rule {
-                                        validations.push(ValidationBlock::new_in_source(
-                                            condition,
-                                            error_msg,
-                                            source_span,
-                                            location,
-                                        ));
-                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
+                    } else {
+                        // Simple form: the next element is the default expression itself.
+                        default = Some(
+                            parse_expression(next, ctx)?
+                                .projection()
+                                .expect("materialized parser expression")
+                                .clone(),
+                        );
                     }
-                } else {
-                    // Simple form: the next element is the default expression itself.
-                    default = Some(
-                        parse_expression(next, ctx)?
-                            .projection()
-                            .expect("materialized parser expression")
-                            .clone(),
-                    );
                 }
-            }
 
-            register_argument_binding(ctx, &name, &type_expr);
-            arguments.push(ArgumentParameter {
-                name,
-                static_type: type_expr,
-                default,
-                description,
-                validations,
-            });
+                register_argument_binding(ctx, &name, &type_expr);
+                arguments.push(ArgumentParameter {
+                    name,
+                    static_type: type_expr,
+                    default,
+                    description,
+                    validations,
+                });
+            }
+            rule => {
+                return Err(ParseError::InvalidExpression {
+                    line: param.line_col().0,
+                    message: format!("unexpected {rule:?} in arguments block"),
+                });
+            }
         }
     }
 
-    Ok(arguments)
+    Ok(ParsedArgumentsBlock {
+        arguments,
+        requires,
+    })
 }
 
 /// Register an argument name as a lexical binding so subsequent expressions
@@ -379,4 +407,31 @@ pub(in crate::parser) fn parse_exports_block(
     }
 
     Ok(export_params)
+}
+
+/// Parse a require statement: `require <validate_expr>, "error message"`
+fn parse_require_statement(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &crate::parser::ParseContext,
+    preprocessed_file: &crate::parser::PreprocessedFile,
+) -> Result<RequireBlock, ParseError> {
+    let mut inner = pair.into_inner();
+    let condition_pair = next_pair(&mut inner, "validate_expr", "require statement")?;
+    // Constraint diagnostics belong to the offending expression, not to the
+    // beginning of a potentially multi-line `require` statement.
+    let source_span = crate::parser::SourceSpan::from_pest(&condition_pair, preprocessed_file);
+    let location = ctx.declaration_location(&condition_pair);
+    let condition = parse_validate_expr(
+        condition_pair,
+        ctx,
+        crate::parser::ConstraintStringPosition::RequireCondition,
+    )?;
+    let message_pair = next_pair(&mut inner, "string", "require statement")?;
+    let error_message = crate::parser::expressions::validate_expr::parse_constraint_string(
+        message_pair,
+        ctx,
+        crate::parser::ConstraintStringPosition::RequireMessage,
+    )?;
+    let declaration = RequireBlock::new_in_source(condition, error_message, source_span, location);
+    Ok(declaration)
 }

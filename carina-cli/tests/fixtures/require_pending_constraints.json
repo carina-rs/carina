@@ -1,0 +1,150 @@
+[
+  {
+    "id": "require:0",
+    "expression": {
+      "Compare": {
+        "lhs": {
+          "BoundArgument": {
+            "argument": "before",
+            "operand": "before",
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "producer",
+                  "attribute": "identifier"
+                }
+              }
+            }
+          }
+        },
+        "op": "Eq",
+        "rhs": {
+          "BoundArgument": {
+            "argument": "after",
+            "operand": "after",
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "producer",
+                  "attribute": "identifier"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "message": "'a0'"
+  },
+  {
+    "id": "require:1",
+    "expression": {
+      "Compare": {
+        "lhs": {
+          "BoundArgument": {
+            "argument": "after",
+            "operand": "after",
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "producer",
+                  "attribute": "identifier"
+                }
+              }
+            }
+          }
+        },
+        "op": "Eq",
+        "rhs": {
+          "BoundArgument": {
+            "argument": "before",
+            "operand": "before",
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "producer",
+                  "attribute": "identifier"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "message": "'a1'"
+  },
+  {
+    "id": "require:2",
+    "expression": {
+      "Compare": {
+        "lhs": {
+          "BoundArgument": {
+            "argument": "after",
+            "operand": "after",
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "producer",
+                  "attribute": "identifier"
+                }
+              }
+            }
+          }
+        },
+        "op": "Eq",
+        "rhs": {
+          "BoundArgument": {
+            "argument": "before",
+            "operand": "before",
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "producer",
+                  "attribute": "identifier"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "message": "'z0'"
+  },
+  {
+    "id": "require:3",
+    "expression": {
+      "Compare": {
+        "lhs": {
+          "BoundArgument": {
+            "argument": "before",
+            "operand": "before",
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "producer",
+                  "attribute": "identifier"
+                }
+              }
+            }
+          }
+        },
+        "op": "Eq",
+        "rhs": {
+          "BoundArgument": {
+            "argument": "after",
+            "operand": "after",
+            "value": {
+              "ResourceRef": {
+                "path": {
+                  "binding": "producer",
+                  "attribute": "identifier"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "message": "'z1'"
+  }
+]

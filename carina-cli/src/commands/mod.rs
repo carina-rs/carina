@@ -875,7 +875,8 @@ fn validate_and_resolve_configuration<'s>(
     // root-arguments rule (#2198).
     if let Err(msg) = carina_core::validation::validate_no_backend_in_module(parsed.parsed()) {
         errors.push(AppError::Validation(msg));
-    } else if let Err(msg) = carina_core::validation::validate_no_arguments_in_root(parsed.parsed())
+    } else if let Ok(tree) = &analysis
+        && let Err(msg) = carina_core::validation::validate_no_arguments_in_root(tree.tree())
     {
         errors.push(AppError::Validation(msg));
     }

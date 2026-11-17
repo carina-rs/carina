@@ -3229,8 +3229,7 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::DirectoryConstraint(_)
-            | inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }
@@ -6575,8 +6574,7 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::DirectoryConstraint(_)
-            | inference::InferenceError::InsideSecret { .. }
+            error @ (inference::InferenceError::InsideSecret { .. }
             | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::MissingEvidence(_)
             | inference::InferenceError::IncompatibleCoalesceTypes { .. }
@@ -7372,14 +7370,29 @@ fn is_string_compatible_type_on_path<'a>(
 /// the user is validating in isolation. We only flag the misplaced block
 /// when a `backend` or `provider` block is also present, since both are
 /// root-only constructs and unambiguously identify a root configuration.
-pub fn validate_no_arguments_in_root<E>(parsed: &crate::parser::File<E>) -> Result<(), String> {
-    let is_root = parsed.backend.is_some() || !parsed.providers.is_empty();
-    if !parsed.arguments.is_empty() && is_root {
-        return Err(
-            "arguments blocks are only valid inside module definitions, not in root configurations.".to_string(),
-        );
+pub fn validate_no_arguments_in_root<
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    E,
+>(
+    tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
+) -> Result<(), String> {
+    // Consume the existing placement judgement, selecting the arguments rule
+    // by its parser-owned block location. CLI and LSP use one predicate and
+    // one message; parameter count does not establish block presence.
+    match configuration_placement_diagnostics(tree)
+        .into_iter()
+        .find(|finding| {
+            tree.syntax().configuration_blocks().iter().any(|block| {
+                *block.detail() == crate::parser::ConfigurationBlock::Arguments
+                    && block.location() == finding.location()
+            })
+        }) {
+        Some(finding) => Err(finding.detail().to_string()),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn unknown_type_resolution_error(
@@ -8333,8 +8346,9 @@ pub fn configuration_placement_diagnostics<
     T: crate::resource::PlaceholderKind,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    E,
 >(
-    tree: &crate::parser::AnalysisTree<'_, P, T, D, B>,
+    tree: &crate::parser::AnalysisTree<'_, P, T, D, B, E>,
 ) -> Vec<crate::parser::Located<&'static str>> {
     use crate::parser::ConfigurationBlock;
     tree.syntax().configuration_blocks().iter().filter_map(|block| {
@@ -8571,7 +8585,7 @@ pub enum ModuleCallFindingMessage {
     ReferenceType(Box<ModuleCallReferenceDiagnostic>),
     TypeResolution(Box<crate::parser::Located<TypeResolutionDiagnostic>>),
     AttributeReference(Box<CompositionAttributeRefError>),
-    Constraint(crate::module_resolver::ConstraintDiagnostic),
+    Constraint(Box<crate::module_resolver::ModuleConstraintDiagnostic>),
 }
 
 impl ModuleCallFindingMessage {
@@ -8973,12 +8987,7 @@ impl ModuleCallFinding {
                     ModuleCallFindingMessage::ReferenceType(error) => call
                         .argument_value_location(&error.identity.argument)
                         .unwrap_or_else(|| call.declaration_location()),
-                    ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::Directory(_),
-                    ) => unreachable!("directory findings have authored anchors"),
-                    ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(diagnostic),
-                    ) => match &diagnostic.kind {
+                    ModuleCallFindingMessage::Constraint(diagnostic) => match &diagnostic.kind {
                         crate::module_resolver::ModuleConstraintKind::ArgumentValidation {
                             argument,
                         } => call
@@ -10160,30 +10169,6 @@ impl ModuleCallChecker<'_> {
         compositions: &[crate::resource::LiveComposition<P>],
     ) {
         for report in reports {
-            let report = match report {
-                crate::module_resolver::ConstraintScopeReport::Directory(failures) => {
-                    for failure in failures {
-                        let anchor = ModuleCallFindingAnchor::new(failure.location().clone());
-                        let owner = ModuleCallFindingOwnerSource::Authored(anchor.clone());
-                        self.push_finding(ModuleCallFinding {
-                            kind: ModuleCallFindingKind::Constraint,
-                            owners: vec![ModuleCallFindingOwner {
-                                root: owner.clone(),
-                                immediate: owner,
-                            }],
-                            anchor,
-                            message: ModuleCallFindingMessage::Constraint(
-                                crate::module_resolver::ConstraintDiagnostic::Directory(
-                                    failure.detail().clone(),
-                                ),
-                            ),
-                            identity: None,
-                        });
-                    }
-                    continue;
-                }
-                crate::module_resolver::ConstraintScopeReport::ModuleCall(report) => report,
-            };
             for outcome in &report.outcomes {
                 let crate::module_resolver::ResolvedModuleConstraintStatus::Failed {
                     diagnostic,
@@ -10225,11 +10210,7 @@ impl ModuleCallChecker<'_> {
                     });
                 }
                 for owner in owners {
-                    let message = ModuleCallFindingMessage::Constraint(
-                        crate::module_resolver::ConstraintDiagnostic::ModuleCall(
-                            diagnostic.clone(),
-                        ),
-                    );
+                    let message = ModuleCallFindingMessage::Constraint(diagnostic.clone());
                     match authored_argument {
                         true => self.push_finding(ModuleCallFinding::argument_value(
                             ModuleCallFindingKind::Constraint,

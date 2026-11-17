@@ -440,68 +440,6 @@ impl<'a> InferredRootAnalysis<'a> {
     }
 }
 
-/// Negative scope evidence minted only after directory discovery and a
-/// successful declaration parse of every source in that snapshot. A caller
-/// cannot obtain it from an isolated buffer or a caller-supplied source batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CompleteDirectoryDeclarations(());
-
-fn mark_complete_directory_files(
-    files: &mut [(PathBuf, DirectoryResolvedFile)],
-    config: &ProviderContext,
-) {
-    let scope = CompleteDirectoryInventories {
-        inventories: files
-            .iter()
-            .map(|(_, file)| file.parsed.parser_binding_metadata.syntax())
-            .collect(),
-    }
-    .require_scope();
-    for (_, file) in files {
-        crate::parser::retained::set_require_scope(&mut file.parsed, scope.clone());
-        crate::parser::retained::judge_configuration(
-            &mut file.parsed,
-            &SchemaRegistry::new(),
-            config,
-        );
-    }
-}
-
-/// Constructible only after every member of one sealed source snapshot has
-/// yielded a complete syntax inventory. Both semantic loading and recovery
-/// use this single issuer; recovery need not evaluate sibling values.
-struct CompleteDirectoryInventories<'a> {
-    inventories: Vec<&'a parser::SyntaxInventory>,
-}
-
-impl CompleteDirectoryInventories<'_> {
-    fn require_scope(self) -> crate::parser::retained::RequireScope {
-        use crate::parser::retained::RequireScope;
-        match require_scope_from_inventories(self.inventories) {
-            RequireScope::Unknown => {
-                RequireScope::UnvalidatedDirectory(CompleteDirectoryDeclarations(()))
-            }
-            scope => scope,
-        }
-    }
-}
-
-fn require_scope_from_inventories<'a>(
-    inventories: impl IntoIterator<Item = &'a parser::SyntaxInventory>,
-) -> crate::parser::retained::RequireScope {
-    let mut blocks = parser::ModuleDeclarationBlocks::Absent;
-    let mut arguments = BTreeSet::new();
-    for inventory in inventories {
-        blocks = blocks.union(inventory.module_declaration_blocks());
-        for declaration in inventory.declarations() {
-            if declaration.detail().kind() == DeclarationKind::Argument {
-                arguments.insert(declaration.detail().name().to_owned());
-            }
-        }
-    }
-    crate::parser::retained::RequireScope::for_declarations(arguments.into_iter(), blocks)
-}
-
 impl<E> RootDirectoryParse<E> {
     fn with_resolution(parsed: File<E>, resolution: ResolutionContext) -> Self {
         let mut root = Self { parsed, resolution };
@@ -742,8 +680,6 @@ where
 /// independently. Clones retain the same parser node identities.
 #[derive(Clone)]
 pub struct ParsedSourceBuffer {
-    file: parser::SourceFileId,
-    text: std::sync::Arc<str>,
     parsed: std::sync::Arc<ParsedFile>,
 }
 
@@ -755,143 +691,12 @@ impl ParsedSourceBuffer {
     ) -> Result<Self, parser::ParseError> {
         let parsed = parser::parse_file(text, file, config)?;
         Ok(Self {
-            file: parser::SourceFileId::new(file.to_path_buf()),
-            text: text.into(),
             parsed: std::sync::Arc::new(parsed),
         })
     }
 
     pub fn parsed(&self) -> &ParsedFile {
         &self.parsed
-    }
-}
-
-struct SnapshotSource {
-    file: ResolvedPath,
-    text: Option<std::sync::Arc<str>>,
-}
-
-struct SnapshotBufferMember {
-    index: usize,
-    buffer: ParsedSourceBuffer,
-}
-
-/// A discovered directory snapshot sealed with one parsed buffer member.
-/// The member's parser-owned contents override disk and conflicting snapshots;
-/// there is no constructor accepting an unrelated File or mutable source list.
-pub struct DirectoryBufferSnapshot {
-    sources: Vec<SnapshotSource>,
-    member: SnapshotBufferMember,
-}
-
-impl DirectoryBufferSnapshot {
-    pub fn capture(
-        directory: &ResolvedPath,
-        buffer: ParsedSourceBuffer,
-        overrides: &SourceOverrides,
-    ) -> Result<Self, DirectoryParseFailure> {
-        let pinned = ResolvedPath::new(buffer.file.path()).map_err(|error| {
-            DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error))
-        })?;
-        if pinned
-            .parent()
-            .is_none_or(|parent| parent.identity() != directory.identity())
-        {
-            return Err(DirectoryParseFailure::new(
-                DirectoryParseFailureKind::Discovery(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "buffer source is not a member of this directory",
-                )),
-            ));
-        }
-        let overrides = overrides.replacing(pinned.clone(), buffer.text.to_string());
-        let files = DirectoryFiles::discover(directory, &overrides).map_err(|error| {
-            DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(error))
-        })?;
-        let index = files
-            .paths
-            .iter()
-            .position(|file| file.identity() == pinned.identity())
-            .ok_or_else(|| {
-                DirectoryParseFailure::new(DirectoryParseFailureKind::Discovery(
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "buffer source was not discovered in the directory",
-                    ),
-                ))
-            })?;
-        let sources = files
-            .paths
-            .into_iter()
-            .map(|file| {
-                let text = if file.identity() == pinned.identity() {
-                    Some(buffer.text.clone())
-                } else {
-                    read_source_with_overrides(&file, &overrides)
-                        .ok()
-                        .map(std::sync::Arc::from)
-                };
-                SnapshotSource { file, text }
-            })
-            .collect();
-        Ok(Self {
-            sources,
-            member: SnapshotBufferMember { index, buffer },
-        })
-    }
-
-    /// Retain this snapshot's require scope without judging or admitting raw keys.
-    pub fn into_scoped_file(self) -> parser::ParsedFile {
-        let scope = self.require_scope();
-        let member = &self.sources[self.member.index];
-        debug_assert!(member.text.as_deref() == Some(self.member.buffer.text.as_ref()));
-        let mut parsed = self.member.buffer.parsed().clone();
-        crate::parser::retained::set_require_scope(&mut parsed, scope);
-        parsed
-    }
-
-    fn require_scope(&self) -> crate::parser::retained::RequireScope {
-        let inventories = self
-            .sources
-            .iter()
-            .map(|source| {
-                source.text.as_ref().and_then(|text| {
-                    parser::parse_syntax_inventory(text, &source.file.source_label()).ok()
-                })
-            })
-            .collect::<Vec<_>>();
-        if inventories.iter().all(Option::is_some) {
-            CompleteDirectoryInventories {
-                inventories: inventories
-                    .iter()
-                    .filter_map(Option::as_ref)
-                    .map(|metadata| metadata.syntax())
-                    .collect(),
-            }
-            .require_scope()
-        } else {
-            require_scope_from_inventories(
-                inventories
-                    .iter()
-                    .filter_map(Option::as_ref)
-                    .map(|metadata| metadata.syntax()),
-            )
-        }
-    }
-}
-
-/// Judge the buffer parsed from the exact member text of this sealed snapshot.
-/// Incomplete syntax knowledge retains ordinary expression checks without a
-/// require verdict. A known module block proves template scope; only complete
-/// absence of module blocks admits directory evaluation.
-pub fn load_buffer_configuration_in_directory<'a>(
-    snapshot: DirectoryBufferSnapshot,
-    schemas: &'a SchemaRegistry,
-    config: &ProviderContext,
-) -> BufferConfiguration<'a> {
-    let parsed = snapshot.into_scoped_file();
-    BufferConfiguration {
-        judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
     }
 }
 
@@ -1122,13 +927,6 @@ impl SourceOverrides {
         Ok(overrides)
     }
 
-    // Only the parser-owned buffer may replace text already in a snapshot.
-    pub(crate) fn replacing(&self, path: ResolvedPath, text: String) -> Self {
-        let mut overrides = self.clone();
-        overrides.entries.insert(path.identity(), (path, text));
-        overrides
-    }
-
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&ResolvedPath, &str)> {
         self.entries
             .values()
@@ -1230,9 +1028,7 @@ impl DirectoryInputs {
             .iter()
             .map(|(file, source)| (file.source_label(), source.clone()))
             .collect::<Vec<_>>();
-        let mut parsed = parse_directory_files_located(&inputs, config)?;
-        mark_complete_directory_files(&mut parsed, config);
-        Ok(parsed)
+        parse_directory_files_located(&inputs, config)
     }
 }
 
@@ -2421,23 +2217,7 @@ pub(crate) fn parse_directory_files_located_from_root(
         .iter_names()
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
-    let require_scope = crate::parser::retained::RequireScope::for_declarations(
-        merged
-            .arguments
-            .iter()
-            .map(|argument| argument.name.clone()),
-        merged
-            .parser_binding_metadata
-            .syntax()
-            .module_declaration_blocks(),
-    );
     for (_, file) in &mut out {
-        crate::parser::retained::set_require_scope(&mut file.parsed, require_scope.clone());
-        crate::parser::retained::judge_configuration(
-            &mut file.parsed,
-            &SchemaRegistry::new(),
-            config,
-        );
         file.parsed.set_loop_binding_scope(binding_scope.clone());
     }
     Ok(out)
@@ -2794,37 +2574,6 @@ mod tests {
         assert_eq!(
             read_source_with_overrides(&ResolvedPath::new(&alias).unwrap(), &overrides).unwrap(),
             "new disk text"
-        );
-    }
-
-    #[test]
-    fn source_override_snapshot_buffer_replaces_alias() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = ResolvedPath::new(temp.path()).unwrap();
-        let file = root.join("f.crn").unwrap();
-        let alias = ResolvedPath::new(temp.path().join("./f.crn")).unwrap();
-        let overrides = SourceOverrides::single(alias, "let value = 'A'\n".to_string());
-        let text = "let value = 'B'\n";
-        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-        let buffer = ParsedSourceBuffer::parse(text, &file.source_label(), &context).unwrap();
-
-        let snapshot = DirectoryBufferSnapshot::capture(&root, buffer, &overrides).unwrap();
-        assert_eq!(snapshot.sources.len(), 1);
-        assert_eq!(
-            snapshot.sources[snapshot.member.index].text.as_deref(),
-            Some(text)
-        );
-        let schemas = SchemaRegistry::new();
-        let configuration = load_buffer_configuration_in_directory(snapshot, &schemas, &context);
-        assert_eq!(
-            configuration.parsed().variables.get("value"),
-            Some(&Value::Concrete(crate::resource::ConcreteValue::String(
-                "B".into()
-            )))
-        );
-        assert_eq!(
-            read_source_with_overrides(&file, &overrides).unwrap(),
-            "let value = 'A'\n"
         );
     }
 
@@ -4525,15 +4274,7 @@ awscc.ec2.SecurityGroup {
         let exports_path = temp.path().join("exports.crn");
         fs::write(
             &attributes_path,
-            "let child = use { source = './child' }\n\
-             arguments {\n\
-               input: String {\n\
-                 validation { condition = input != 'invalid' }\n\
-               }\n\
-             }\n\
-             require input != 'invalid', \"input is required\"\n\
-             child {}\n\
-             attributes {\n    output: String = 'value'\n}\n",
+            "let child = use { source = './child' }\narguments {\ninput: String {\nvalidation { condition = input != 'invalid' }\n}\n\nrequire input != 'invalid', \"input is required\" }\nchild {}\nattributes {\n    output: String = 'value'\n}\n",
         )
         .unwrap();
         fs::write(

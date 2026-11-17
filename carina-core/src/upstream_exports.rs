@@ -1914,20 +1914,17 @@ mod tests {
             )
             .unwrap();
             assert_eq!(errors.len(), 1, "upstream guard was omitted");
-            let (_, error) = errors[0].detail().module_failure().unwrap();
-            let crate::module_resolver::ModuleError::DirectoryConstraint(finding) =
-                error.root_cause()
-            else {
-                panic!("expected a located directory constraint: {error}");
-            };
-            assert_eq!(finding.location().file().path(), guard);
-            assert_eq!(finding.location().span().start_line(), 1);
-            assert_eq!(finding.location().span().start_column(), 9);
-            assert_eq!(finding.location().span().end_column(), 14);
-            assert_eq!(
-                finding.detail().to_string(),
-                "require failed: upstream guard"
+            let failure = errors[0].detail().parse_failure().unwrap();
+            assert_eq!(failure.source_file(), Some(guard.as_path()));
+            let error = failure.parse_error().unwrap();
+            assert!(
+                error
+                    .diagnostic_message()
+                    .starts_with("Syntax error: expected")
             );
+            let location = error.diagnostic_range().unwrap();
+            assert_eq!(location.start_line, 1);
+            assert!(errors[0].detail().to_string().contains("upstream"));
             if physical {
                 let (_, errors) = super::resolve_upstream_export_report_inner(
                     &ResolvedPath::new(directory.path()).unwrap(),

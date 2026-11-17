@@ -210,38 +210,6 @@ fn duplicate_let_does_not_hide_collected_directive_findings_in_cli() {
 }
 
 #[test]
-fn duplicate_directives_in_a_sibling_keep_the_require_scope_complete() {
-    let directory = fixture();
-    std::fs::write(
-        directory.path().join("resources.crn"),
-        "mock.test.resource {\n  name = 'example'\n  directives {}\n  directives {}\n}\n",
-    )
-    .unwrap();
-    std::fs::write(
-        directory.path().join("main.crn"),
-        "require false, 'root guard'\n",
-    )
-    .unwrap();
-    let diagnostics = lsp(directory.path(), "main.crn");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message == "require failed: root guard"),
-        "{diagnostics:#?}"
-    );
-    let output = validate(directory.path(), true);
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(
-        report["errors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|error| error["message"] == "require failed: root guard"),
-        "{report:#}"
-    );
-}
-
-#[test]
 fn unknown_directive_key_has_identical_cli_and_lsp_message_and_key_range() {
     let directory = fixture();
     let message = "Unknown directive 'prevent_destory', did you mean 'prevent_destroy'?";

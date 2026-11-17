@@ -195,7 +195,7 @@ pub(crate) fn parse_validate_expr(
     position: ConstraintStringPosition,
 ) -> Result<ValidateExpr, ParseError> {
     match pair.as_rule() {
-        Rule::validate_expr => {
+        Rule::require_condition | Rule::validate_expr => {
             let inner = first_inner(pair, "validate_or_expr", "validate_expr")?;
             parse_validate_expr(inner, ctx, position)
         }

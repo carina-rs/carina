@@ -441,7 +441,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             | ExprKind::ModuleCall
             | ExprKind::Boolean
             | ExprKind::Declaration
-            | ExprKind::RequireCondition(_)
+            | ExprKind::RequireCondition
             | ExprKind::ProviderDeclaration
             | ExprKind::Unsupported(_)
             | ExprKind::NestedBlock { .. } => AuthoredForm::Computed,
@@ -624,7 +624,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
                         authored: true,
                     }
                 }
-                ExprKind::RequireCondition(_) => AuthoredNavigation::Covered,
+                ExprKind::RequireCondition => AuthoredNavigation::Covered,
                 _ => AuthoredNavigation::Covered,
             },
             AuthoredForm::Forward | AuthoredForm::Literal | AuthoredForm::Reference => {
@@ -638,7 +638,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             ExprKind::Interpolation { .. } => EdgeRole::InterpolationPart,
             ExprKind::Call(_) => EdgeRole::CallArgument,
             ExprKind::Integer { .. } => EdgeRole::ArithmeticOperand,
-            ExprKind::RequireCondition(_) => EdgeRole::Condition,
+            ExprKind::RequireCondition => EdgeRole::Condition,
             ExprKind::Access(_) | ExprKind::DynamicAccess => {
                 if index == 0 {
                     EdgeRole::AccessBase
@@ -1483,7 +1483,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
             let role = match &usage.node.node.kind {
                 ExprKind::Parens => EdgeRole::Parens,
                 ExprKind::Convert { .. } => EdgeRole::ConvertOperand,
-                ExprKind::RequireCondition(_) => EdgeRole::Condition,
+                ExprKind::RequireCondition => EdgeRole::Condition,
                 ExprKind::Definition => EdgeRole::AliasDefinition,
                 ExprKind::Secret => EdgeRole::SecretArgument,
                 ExprKind::List => EdgeRole::ListItem,

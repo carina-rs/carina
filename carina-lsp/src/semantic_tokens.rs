@@ -1426,6 +1426,18 @@ mod tests {
     // the coloring without being overridden by a blanket `keyword` token.
 
     #[test]
+    fn issue4398_require_semantic_tokens() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider
+            .tokenize("arguments { require before == after, 'same' before: Int after: Int }");
+        assert!(!tokens.is_empty());
+        assert!(
+            tokens.iter().all(|token| token.token_type != 0),
+            "{tokens:?}"
+        );
+    }
+
+    #[test]
     fn keywords_do_not_emit_keyword_semantic_token() {
         let provider = SemanticTokensProvider::new(&[]);
         let sources = [

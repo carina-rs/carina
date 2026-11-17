@@ -1707,11 +1707,57 @@ mod tests {
     }
 
     #[test]
+    fn issue4398_arguments_require_format_round_trip() {
+        let input = "arguments {\n// first\nrequire before==after, 'same'\n\nbefore:Int\n// guard\nrequire /* inside */ before==after, 'same'\nafter:Int\nrequire after==before, 'last'\n// end\n}\n";
+        let config = FormatConfig::default();
+        let formatted = format(input, &config).unwrap();
+        assert!(
+            formatted.contains("  require before == after, 'same'"),
+            "{formatted}"
+        );
+        for comment in ["// first", "// guard", "/* inside */", "// end"] {
+            assert!(formatted.contains(comment), "{formatted}");
+        }
+        assert!(formatted.contains("'same'\n\n"), "{formatted}");
+        assert_eq!(format(&formatted, &config).unwrap(), formatted);
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let original = crate::parser::parse(input, &context).unwrap();
+        let reparsed = crate::parser::parse(&formatted, &context).unwrap();
+        assert_eq!(
+            format!("{:?}", original.arguments),
+            format!("{:?}", reparsed.arguments)
+        );
+        assert_eq!(original.requires.len(), reparsed.requires.len());
+        for (a, b) in original.requires.iter().zip(&reparsed.requires) {
+            assert_eq!(a.condition, b.condition);
+            assert_eq!(a.error_message, b.error_message);
+        }
+        let names = "arguments { require:Int required:Int requirements:Int }";
+        let formatted = format(names, &config).unwrap();
+        assert_eq!(
+            crate::parser::parse(&formatted, &context)
+                .unwrap()
+                .arguments
+                .len(),
+            3
+        );
+        // Main removes parameter-only container trivia and aligns the block.
+        assert_eq!(
+            format(
+                "arguments {\n a: Int\n // between\n\n longer: String\n}\n",
+                &config
+            )
+            .unwrap(),
+            "arguments {\n  a     : Int\n  longer: String\n}\n"
+        );
+    }
+
+    #[test]
     fn test_format_require_statement() {
         let input = r#"arguments {
   port: Int
-}
-require   port >= 1 && port <= 65535  , "port must be valid"
+
+require   port >= 1 && port <= 65535  , "port must be valid" }
 "#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
@@ -1721,8 +1767,8 @@ require   port >= 1 && port <= 65535  , "port must be valid"
             result
         );
 
-        let compact = format("require count>=1, \"p\"\n", &config).unwrap();
-        assert_eq!(compact, "require count >= 1, 'p'\n");
+        let compact = format("arguments { require count>=1, \"p\" }\n", &config).unwrap();
+        assert_eq!(compact, "arguments {\n  require count >= 1, 'p'\n}\n");
     }
 
     #[test]
@@ -1775,8 +1821,8 @@ exports {
       error_message='invalid'
     }
   }
-}
-require limit/2%3==1,"invalid"
+
+require limit/2%3==1,"invalid" }
 "#;
         let config = FormatConfig::default();
         let formatted = format(input, &config).unwrap();

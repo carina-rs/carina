@@ -24,7 +24,7 @@ fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
     scenario.write_root_file("main.crn", "backend local { path = 'carina.state.json' }\nprovider mock {}\nlet vpc = mock.test.resource { name = 'vpc' }\nlet checked = use { source = './checked' }\nchecked { r = vpc }\n");
     scenario.write_module(
         "checked",
-        "arguments { r: mock.test.resource }\nrequire r.identifier != 'x', 'bad identifier'\n",
+        "arguments { r: mock.test.resource \nrequire r.identifier != 'x', 'bad identifier' }\n",
     );
     assert_success("save literal constraint", &scenario.plan());
     let original = read_json(&scenario.project.join("plan.json"));

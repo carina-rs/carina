@@ -135,7 +135,7 @@ arguments {
 
 A `validation` block is local to the argument that contains it. Its
 `condition` may reference that argument, but not another argument in the same
-module. Use a module-level `require` when a rule relates multiple arguments.
+module. Use a `require` inside the `arguments` block when a rule relates multiple arguments.
 
 ### Require Constraints
 
@@ -147,9 +147,8 @@ shown when the condition is false:
 arguments {
   min_size: Int
   max_size: Int
+  require min_size <= max_size, 'min_size must not exceed max_size'
 }
-
-require min_size <= max_size, 'min_size must not exceed max_size'
 ```
 
 Unlike an argument-local `validation` block, a `require` condition can
@@ -157,15 +156,13 @@ reference every argument declared by the module. An undeclared name is an
 error during validation, even when one of the declared argument values is
 still unresolved.
 
-In a configuration directory with no `arguments` or `attributes` blocks, a
-`require` condition has no arguments in scope. It may use constants and
-supported constraint functions, but cannot reference directory `let` bindings
-or resources. Root requirements are always checked during validation. See
-[Require Statement](/reference/dsl/syntax/#require-statement).
+Requirements are members of `arguments` blocks and may appear before or after
+parameters. Their scope includes arguments from all blocks and sibling files
+in the module directory. A `require` outside an `arguments` block is a syntax
+error. Root configurations cannot contain `arguments` blocks.
 
-When validated directly, a directory containing either module declaration
-block keeps its `require` conditions unevaluated as a template, including
-when the block is empty.
+When a module directory is validated directly, its requirements remain
+unevaluated until the module is called.
 
 ### When Constraints Run
 
@@ -184,10 +181,9 @@ Pending constraints remain attached to the module call and are checked again
 at later resolution boundaries. This matters when an update or replacement
 publishes a value that differs from the value available during planning.
 
-Saving a plan requires successful validation of root requirements. Saved-plan
-apply reloads current source to check backend drift. Plans that need secret
-verification also validate the current configuration, so both directory and
-module requirements must still pass. Plans without secrets apply the saved
+Saved-plan apply reloads current source to check backend drift. Plans that need
+secret verification also validate the current configuration, so module
+requirements must still pass. Plans without secrets apply the saved
 snapshot without rechecking the current source's requirements. Pending module
 constraints in that snapshot are still checked when their inputs resolve.
 Plans with an unsupported format version must be regenerated.

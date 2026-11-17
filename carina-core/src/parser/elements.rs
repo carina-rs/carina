@@ -573,6 +573,9 @@ pub(in crate::parser) fn declaration_inventory(
                         _ => Kind::ModuleAttribute,
                     };
                     for param in pair.into_inner() {
+                        if kind == Kind::Argument && param.as_rule() != Rule::arguments_param {
+                            continue;
+                        }
                         let mut inner = param.into_inner();
                         if let Some(name) = inner.next() {
                             let value = inner
@@ -1003,27 +1006,6 @@ pub enum ConfigurationBlock {
     Exports,
 }
 
-/// Parser-owned presence of module declarations, independent of their entries.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ModuleDeclarationBlocks {
-    #[default]
-    Absent,
-    Arguments,
-    Attributes,
-    Both,
-}
-
-impl ModuleDeclarationBlocks {
-    pub(crate) fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Absent, blocks) | (blocks, Self::Absent) => blocks,
-            (Self::Arguments, Self::Arguments) => Self::Arguments,
-            (Self::Attributes, Self::Attributes) => Self::Attributes,
-            _ => Self::Both,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxInventory<
     B: crate::resource::BindingAddress = crate::resource::RelativeBindingName,
@@ -1038,7 +1020,6 @@ pub struct SyntaxInventory<
     providers: Vec<Located<ProviderDeclaration>>,
     upstream_sources: Vec<Located<B>>,
     configuration_blocks: Vec<Located<ConfigurationBlock>>,
-    module_declaration_blocks: ModuleDeclarationBlocks,
     backend_keys: Vec<Located<super::AttributeKey>>,
     anonymous_headers: Vec<DeclarationLocation>,
     loops: Vec<DeclarationLocation>,
@@ -1055,7 +1036,6 @@ impl<B: crate::resource::BindingAddress> Default for SyntaxInventory<B> {
             providers: Vec::new(),
             upstream_sources: Vec::new(),
             configuration_blocks: Vec::new(),
-            module_declaration_blocks: ModuleDeclarationBlocks::Absent,
             backend_keys: Vec::new(),
             anonymous_headers: Vec::new(),
             loops: Vec::new(),
@@ -1082,9 +1062,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
     }
     pub fn configuration_blocks(&self) -> &[Located<ConfigurationBlock>] {
         &self.configuration_blocks
-    }
-    pub(crate) fn module_declaration_blocks(&self) -> ModuleDeclarationBlocks {
-        self.module_declaration_blocks
     }
     pub(crate) fn backend_keys(&self) -> &[Located<super::AttributeKey>] {
         &self.backend_keys
@@ -1125,9 +1102,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
         self.providers.extend(other.providers);
         self.upstream_sources.extend(other.upstream_sources);
         self.configuration_blocks.extend(other.configuration_blocks);
-        self.module_declaration_blocks = self
-            .module_declaration_blocks
-            .union(other.module_declaration_blocks);
         self.backend_keys.extend(other.backend_keys);
         self.anonymous_headers.extend(other.anonymous_headers);
         self.loops.extend(other.loops);
@@ -1145,7 +1119,6 @@ impl<B: crate::resource::BindingAddress> SyntaxInventory<B> {
             attribute_keys: self.attribute_keys,
             providers: self.providers,
             configuration_blocks: self.configuration_blocks,
-            module_declaration_blocks: self.module_declaration_blocks,
             backend_keys: self.backend_keys,
             anonymous_headers: self.anonymous_headers,
             loops: self.loops,
@@ -1236,12 +1209,6 @@ impl SyntaxInventory {
             .filter(|pair| pair.as_rule() == Rule::statement)
         {
             let pair = statement.into_inner().next().expect("statement body");
-            out.module_declaration_blocks =
-                out.module_declaration_blocks.union(match pair.as_rule() {
-                    Rule::arguments_block => ModuleDeclarationBlocks::Arguments,
-                    Rule::attributes_block => ModuleDeclarationBlocks::Attributes,
-                    _ => ModuleDeclarationBlocks::Absent,
-                });
             let kind = match pair.as_rule() {
                 Rule::arguments_block => Some(ConfigurationBlock::Arguments),
                 Rule::provider_block => Some(ConfigurationBlock::Provider),

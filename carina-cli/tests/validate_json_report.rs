@@ -457,7 +457,7 @@ fn public_heredoc_marker_errors_keep_their_original_text() {
 fn constraint_secret_duplicate_is_redacted_in_failed_json_and_lsp() {
     let fixture = tempfile::tempdir().unwrap();
     let path = fixture.path().join("main.crn");
-    let source = "require secret(x[{ 'private-key' = 1 'private-key' = 2 }]), 'no'\n";
+    let source = "arguments { require secret(x[{ 'private-key' = 1 'private-key' = 2 }]), 'no' }\n";
     std::fs::write(&path, source).unwrap();
     let output = validate(fixture.path(), true);
     let json = report(&output, 1, 1);

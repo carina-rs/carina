@@ -19,7 +19,7 @@ comment = _{ line_comment | block_comment }
 line_comment = @{ ("//" | "#") ~ (!NEWLINE ~ ANY)* }
 block_comment = @{ "/*" ~ (block_comment | (!"*/" ~ ANY))* ~ "*/" }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | require_statement | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
 // Require statement: require <validate_expr>, "error message"
 require_head = _{ kw_require ~ trivia+ ~ validate_expr }
@@ -53,7 +53,7 @@ arguments_block = {
     kw_arguments ~ trivia* ~ open_brace ~ arguments_block_content* ~ close_brace
 }
 
-arguments_block_content = _{ trivia | arguments_param }
+arguments_block_content = _{ trivia | require_statement | arguments_param }
 
 // Arguments parameter: name: type or name: type = default, or block form
 arguments_param = {

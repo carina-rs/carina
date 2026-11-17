@@ -7,6 +7,7 @@ use carina_core::provider::ProviderFactory;
 use carina_core::resource::knowledge::collect_classified_attributes;
 use carina_core::schema::SchemaRegistry;
 
+mod argument_requires;
 mod basic;
 mod classification;
 mod configuration_admission;
@@ -16,7 +17,6 @@ mod enum_continuation;
 mod extended;
 mod located;
 mod review_round10;
-mod root_requires;
 mod seam_review;
 mod seam_round2;
 mod seam_round8;

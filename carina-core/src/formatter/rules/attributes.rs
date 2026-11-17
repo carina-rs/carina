@@ -70,9 +70,55 @@ impl Formatter {
             0
         };
 
-        for param in params {
-            self.format_arguments_param(param, max_key_len);
+        let mut trivia = Vec::new();
+        let mut previous_require = false;
+        for child in &node.children {
+            match child {
+                CstChild::Trivia(item) => trivia.push(item),
+                CstChild::Node(member)
+                    if matches!(
+                        member.kind,
+                        NodeKind::ArgumentsParam | NodeKind::RequireStatement
+                    ) =>
+                {
+                    let is_require = member.kind == NodeKind::RequireStatement;
+                    if previous_require || is_require {
+                        self.format_require_member_trivia(&trivia);
+                    }
+                    trivia.clear();
+                    if is_require {
+                        self.format_require_statement(member);
+                    } else {
+                        self.format_arguments_param(member, max_key_len);
+                    }
+                    previous_require = is_require;
+                }
+                _ => {}
+            }
         }
+        if previous_require {
+            self.format_require_member_trivia(&trivia);
+        }
+    }
+
+    // Parameter-only gaps retain main's normalization. Requirements keep
+    // their adjacent comments and blank lines without changing alignment.
+    fn format_require_member_trivia(&mut self, trivia: &[&Trivia]) {
+        let mut newlines: usize = 0;
+        for item in trivia {
+            match item {
+                Trivia::Newline => newlines += 1,
+                Trivia::LineComment(comment) | Trivia::BlockComment(comment) => {
+                    self.write_newlines(newlines.saturating_sub(1));
+                    self.write_indent();
+                    self.write(comment);
+                    self.write_newline();
+                    newlines = 0;
+                }
+                Trivia::Whitespace(_) => {}
+            }
+        }
+        self.write_newlines(newlines.saturating_sub(1));
     }
 
     fn format_attributes_params(&mut self, node: &CstNode) {

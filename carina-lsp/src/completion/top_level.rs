@@ -199,14 +199,6 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
-                label: "require".to_string(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("require ${1:condition}, \"${2:error message}\"".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Cross-argument constraint".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
                 label: "wait".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
                 insert_text: Some(wait_snippet.to_string()),

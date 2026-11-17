@@ -12,6 +12,43 @@ mod basic;
 mod extended;
 
 #[test]
+fn issue4398_require_completion_context() {
+    for source in [
+        "arguments {\n  |\n}",
+        "arguments {\n  req|",
+        "arguments { n: Int\n  |\n}",
+    ] {
+        let items = schema_selection_completions(source);
+        let item = items
+            .iter()
+            .find(|item| item.label == "require")
+            .unwrap_or_else(|| panic!("{source}: {items:?}"));
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("require ${1:condition}, '${2:error message}'")
+        );
+    }
+    for source in [
+        "|",
+        "req|",
+        "arguments { n: Int {\n |\n} }",
+        "arguments { n: Int { validation {\n |\n} } }",
+        "arguments { n: Int = {\n |\n} }",
+        "provider mock {\n |\n}",
+        "arguments {\n // req|\n}",
+        "arguments {\n /* req| */\n}",
+        "arguments { n: String = 'req|' }",
+        "if true {\n |\n}",
+    ] {
+        let items = schema_selection_completions(source);
+        assert!(
+            !items.iter().any(|item| item.label == "require"),
+            "{source}: {items:?}"
+        );
+    }
+}
+
+#[test]
 fn github_admission_completion_uses_backend_declarations() {
     let items = schema_selection_completions("backend | ");
     assert!(items.iter().any(|item| item.label == "github"), "{items:?}");

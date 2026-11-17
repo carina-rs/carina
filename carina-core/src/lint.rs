@@ -819,7 +819,8 @@ mod secret_duplicate_tests {
 
     #[test]
     fn constraint_secret_calls_own_duplicate_names_and_locations() {
-        let source = "require secret(x[{ 'private-key' = 1 'private-key' = 2 }]), 'no'";
+        let source =
+            "arguments { require secret(x[{ 'private-key' = 1 'private-key' = 2 }]), 'no' }";
         let findings = find_duplicate_attrs(source);
         assert_eq!(findings.len(), 1);
         assert!(matches!(

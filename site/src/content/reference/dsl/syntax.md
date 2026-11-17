@@ -465,35 +465,26 @@ See [Expressions](/reference/dsl/expressions/) for details on function definitio
 
 ## Require Statement
 
-Assert conditions that must be true, with a custom error message if they fail.
-Inside a module, a condition can reference its declared arguments:
+Declare argument validation inside a module's `arguments` block. A `require`
+statement contains a boolean condition and the message shown when it is false:
 
 ```crn
 arguments {
   subnets: list(String)
+  require length(subnets) > 0, 'At least one subnet must be specified'
   cidr_block: String
+  require cidr_block != '', 'CIDR block cannot be empty'
 }
-
-require length(subnets) > 0, 'At least one subnet must be specified'
-require cidr_block != '', 'CIDR block cannot be empty'
 ```
 
-In a configuration directory with no `arguments` or `attributes` blocks,
-`require` has no arguments in scope.
-Its condition must use literals, operators, and supported constraint functions
-(`len` and `length`). Root conditions cannot reference `let` bindings,
-resources, data sources, or module calls, including those in sibling files.
-Every root condition is decided during validation; a false condition prevents
-planning, saving a plan, and live apply. The CLI and language server report it
-at the condition's own file and position.
+An `arguments` block may contain zero or more requirements, in any order with
+its parameters. Each requirement sees every argument declared by the module,
+including later parameters, other `arguments` blocks, and sibling `.crn` files.
+A `require` anywhere outside an `arguments` block is a syntax error. Root
+configurations cannot contain `arguments` blocks.
 
-```crn
-require length('production') > 0, 'Environment label cannot be empty'
-```
-
-A directory containing either module declaration block is treated as an
-uninstantiated template when validated directly, even if the block is empty.
-Its `require` conditions are not evaluated. Calling the directory as a module
-still requires at least one declared argument or output attribute.
+When validated directly, a module directory keeps its requirements unevaluated
+until its arguments are supplied by a call. Per-argument `validation` blocks
+remain local to their containing argument.
 
 The condition is a [validate expression](/reference/dsl/expressions/#validate-expressions) that supports comparison operators (`==`, `!=`, `>`, `<`, `>=`, `<=`), integer arithmetic (`+`, `-`, `*`, `/`, `%`), and logical operators (`&&`, `||`, `!`).

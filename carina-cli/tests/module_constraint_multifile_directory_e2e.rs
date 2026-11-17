@@ -27,9 +27,9 @@ impl Scenario {
     }
   }
   peer: String
-}
 
-require value == peer, "value and peer identifiers must match"
+
+require value == peer, "value and peer identifiers must match" }
 "#,
         )
         .expect("write module arguments");
