@@ -11,7 +11,7 @@ use carina_lsp::backend::{
 use carina_lsp::document::Document;
 use carina_lsp::factories::{build_factories, install_prober};
 use serde_json::json;
-use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Position, Range};
 
 const SOURCE: &str = "let src = mock.test.resource { name = 'source' }\n";
 
@@ -76,13 +76,21 @@ impl Fixture {
             .unwrap()
     }
 
-    async fn assert_editor(
-        &self,
-        message: Option<&str>,
-        authored: &str,
-        range: Range,
-        module: bool,
-    ) {
+    async fn assert_editor(&self, message: Option<&str>, authored: &str, range: Range) {
+        let inventory = self.editor_inventory().await;
+        for file in &self.files {
+            let expected_range = if file == authored { Some(range) } else { None };
+            let expected = match (message, expected_range) {
+                (Some(message), Some(range)) => {
+                    json!([{"message":message, "range":range, "severity":1}])
+                }
+                _ => json!([]),
+            };
+            assert_eq!(inventory[file], expected, "{file}");
+        }
+    }
+
+    async fn editor_inventory(&self) -> serde_json::Value {
         let home = tempfile::tempdir().unwrap();
         let dirs = UserDirs::under(home.path());
         let builder: FactoryBuilder =
@@ -93,6 +101,7 @@ impl Fixture {
         assert!(reload.warnings.is_empty(), "{:?}", reload.warnings);
         assert!(reload.schemas > 0);
         let states = states.into_inner();
+        let mut inventory = serde_json::Map::new();
         for file in &self.files {
             let path = self.root().join(file);
             let document = Document::new_with_path(
@@ -101,22 +110,11 @@ impl Fixture {
                 Arc::new(ProviderContext::new(EnvironmentSnapshot::empty())),
             );
             let diagnostics = analyze_document(&states, &document, Some(&path));
-            let expected_range = if file == authored {
-                Some(range)
-            } else if module && file == "main.crn" {
-                Some(Range::new(Position::new(2, 11), Position::new(4, 1)))
-            } else {
-                None
-            };
-            if let (Some(message), Some(expected_range)) = (message, expected_range) {
-                assert_eq!(diagnostics.len(), 1, "{file}: {diagnostics:#?}");
-                assert_eq!(diagnostics[0].message, message, "{file}");
-                assert_eq!(diagnostics[0].range, expected_range, "{file}");
-                assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
-            } else {
-                assert!(diagnostics.is_empty(), "{file}: {diagnostics:#?}");
-            }
+            inventory.insert(file.clone(), json!(diagnostics.into_iter().map(|diagnostic| {
+                json!({"message": diagnostic.message, "range": diagnostic.range, "severity": diagnostic.severity})
+            }).collect::<Vec<_>>()));
         }
+        serde_json::Value::Object(inventory)
     }
 }
 
@@ -128,13 +126,7 @@ fn text(output: &Output) -> String {
     )
 }
 
-async fn assert_rejected(
-    fixture: Fixture,
-    dependency: &str,
-    authored: &str,
-    range: Range,
-    module: bool,
-) {
+async fn assert_rejected(fixture: Fixture, dependency: &str, authored: &str, range: Range) {
     let message = format!(
         "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is known only after apply"
     );
@@ -164,9 +156,7 @@ async fn assert_rejected(
     let output = fixture.cli(&["plan", "."]);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(text(&output), human);
-    fixture
-        .assert_editor(Some(&message), authored, range, module)
-        .await;
+    fixture.assert_editor(Some(&message), authored, range).await;
 }
 
 fn assignment(end: u32) -> Range {
@@ -184,7 +174,6 @@ async fn deferred_prefix_a_direct_directory() {
         "'src.identifier'",
         "main.crn",
         assignment(30),
-        false,
     )
     .await;
 }
@@ -213,7 +202,7 @@ async fn deferred_prefix_b_known_directory_control() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(text(&output), expected);
     fixture
-        .assert_editor(None, "main.crn", assignment(24), false)
+        .assert_editor(None, "main.crn", assignment(24))
         .await;
     let output = fixture.cli(&["init", "."]);
     assert!(output.status.success(), "{output:?}");
@@ -233,7 +222,6 @@ async fn deferred_prefix_c1_interpolation_directory() {
         "'src.identifier'",
         "main.crn",
         assignment(37),
-        false,
     )
     .await;
 }
@@ -249,14 +237,102 @@ async fn deferred_prefix_c2_alias_directory() {
         "'src.identifier' (through 'p')",
         "main.crn",
         assignment(17),
-        false,
     )
     .await;
 }
 
+async fn assert_module_argument_findings(
+    fixture: Fixture,
+    dependencies: &[&str],
+    ranges: &[Range],
+) {
+    let messages = dependencies.iter().map(|dependency| format!(
+        "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is known only after apply"
+    )).collect::<Vec<_>>();
+    let errors = messages
+        .iter()
+        .zip(ranges)
+        .map(|(message, range)| {
+            json!({
+                "message": message, "severity":"error", "code":null,
+                "location":{"file":"main.crn", "range":{
+                    "start":{"line":range.start.line+1, "column":range.start.character+1},
+                    "end":{"line":range.end.line+1, "column":range.end.character+1}
+                }}
+            })
+        })
+        .collect::<Vec<_>>();
+    let human = messages
+        .iter()
+        .zip(ranges)
+        .map(|(message, range)| {
+            format!(
+                "Error: ./main.crn:{}:{}: {message}\n",
+                range.start.line + 1,
+                range.start.character + 1
+            )
+        })
+        .collect::<String>();
+    let mut lsp = fixture
+        .files
+        .iter()
+        .map(|file| (file.clone(), json!([])))
+        .collect::<serde_json::Map<_, _>>();
+    lsp.insert(
+        "main.crn".into(),
+        json!(
+            messages
+                .iter()
+                .zip(ranges)
+                .map(|(message, range)| json!({
+                    "message":message,"range":range,"severity":1
+                }))
+                .collect::<Vec<_>>()
+        ),
+    );
+    let validate = fixture.cli(&["validate", "."]);
+    let json_output = fixture.cli(&["validate", ".", "--json"]);
+    let plan = fixture.cli(&["plan", "."]);
+    let actual = json!({
+        "text":text(&validate), "text_exit":validate.status.code(),
+        "json":serde_json::from_slice::<serde_json::Value>(&json_output.stdout).unwrap(),
+        "json_exit":json_output.status.code(), "json_stderr":String::from_utf8_lossy(&json_output.stderr),
+        "plan":text(&plan), "plan_exit":plan.status.code(),
+        "lsp":fixture.editor_inventory().await
+    });
+    let expected = json!({
+        "text":format!("Validating...\n{human}"), "text_exit":1,
+        "json":{"status":"error", "resource_count":0,"resources":[],"errors":errors},
+        "json_exit":1,"json_stderr":"", "plan":human,"plan_exit":1,"lsp":lsp
+    });
+    assert_eq!(actual, expected, "full CLI/LSP case-d observation");
+}
+
 #[tokio::test]
 async fn deferred_prefix_d_module_argument_directory_publication_sites() {
-    assert_rejected(Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = src.identifier\n}\n", SOURCE, true), "module argument 'prefix'", "child/main.crn", assignment(22), true).await;
+    assert_module_argument_findings(
+        Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = src.identifier\n}\n", SOURCE, true),
+        &["'src.identifier'"],
+        &[Range::new(Position::new(2,11), Position::new(4,1))],
+    ).await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_d_two_call_sites_have_distinct_owners() {
+    assert_module_argument_findings(
+        Fixture::new("let sink_module = use { source = './child' }\n\nlet first = sink_module {\n  prefix = src.identifier\n}\n\nlet second = sink_module {\n  prefix = src.identifier\n}\n", SOURCE, true),
+        &["'src.identifier'", "'src.identifier'"],
+        &[Range::new(Position::new(2,12), Position::new(4,1)), Range::new(Position::new(6,13), Position::new(8,1))],
+    ).await;
+}
+
+#[tokio::test]
+async fn deferred_prefix_d_caller_alias_is_preserved() {
+    assert_module_argument_findings(
+        Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = p\n}\n", &format!("{SOURCE}let p = src.identifier\n"), true),
+        &["'src.identifier' (through 'p')"],
+        &[Range::new(Position::new(2,11), Position::new(4,1))],
+    ).await;
 }
 
 #[tokio::test]
@@ -270,14 +346,13 @@ async fn deferred_prefix_multiline_value_uses_key_range() {
         "'src.identifier'",
         "main.crn",
         assignment(13),
-        false,
     )
     .await;
 }
 
 #[tokio::test]
 async fn deferred_prefix_several_references_join_with_and() {
-    assert_rejected(Fixture::new("mock.test.resource {\n  name_prefix = \"${a.identifier}-${b.identifier}\"\n}\n", "let a = mock.test.resource { name = 'a' }\nlet b = mock.test.resource { name = 'b' }\n", false), "'a.identifier' and 'b.identifier'", "main.crn", assignment(49), false).await;
+    assert_rejected(Fixture::new("mock.test.resource {\n  name_prefix = \"${a.identifier}-${b.identifier}\"\n}\n", "let a = mock.test.resource { name = 'a' }\nlet b = mock.test.resource { name = 'b' }\n", false), "'a.identifier' and 'b.identifier'", "main.crn", assignment(49)).await;
 }
 
 #[tokio::test]
@@ -289,7 +364,6 @@ async fn deferred_prefix_known_alias_does_not_claim_direct_dependency() {
         "'src.identifier'",
         "main.crn",
         range,
-        false,
     )
     .await;
 }
@@ -307,7 +381,6 @@ async fn deferred_prefix_in_deferred_for_body_is_recognized() {
         "'src.identifier'",
         "main.crn",
         Range::new(Position::new(2, 4), Position::new(2, 32)),
-        false,
     )
     .await;
 }

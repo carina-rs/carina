@@ -47,6 +47,7 @@ pub(crate) mod eval_value;
 pub mod execution_authority;
 pub mod executor;
 pub mod explicit;
+pub mod finding;
 pub mod formatter;
 pub mod github_auth;
 pub mod heredoc;

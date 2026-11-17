@@ -1500,7 +1500,7 @@ pub struct AttributePrefixError {
     resource: ResourceId,
     prefix: String,
     failure: AttributePrefixFailure,
-    location: Option<crate::parser::DeclarationLocation>,
+    owner: crate::finding::FindingOwner,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1519,6 +1519,7 @@ enum AttributePrefixFailure {
 struct DeferredPrefixDependencies {
     first: PrefixDependency,
     rest: Vec<PrefixDependency>,
+    argument_call: Option<crate::parser::ModuleCallId>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1527,7 +1528,6 @@ enum PrefixDependency {
         path: String,
         through: Option<String>,
     },
-    ModuleArgument(String),
     UnboundModuleArgument(String),
     Expression,
 }
@@ -1542,7 +1542,7 @@ impl std::fmt::Display for PrefixDependency {
                 }
                 Ok(())
             }
-            Self::ModuleArgument(name) | Self::UnboundModuleArgument(name) => {
+            Self::UnboundModuleArgument(name) => {
                 write!(formatter, "module argument '{name}'")
             }
             Self::Expression => formatter.write_str("an apply-time value"),
@@ -1561,62 +1561,49 @@ impl std::fmt::Display for DeferredPrefixDependencies {
 }
 
 impl AttributePrefixError {
-    /// A module template cannot decide whether its caller supplies a known
-    /// prefix. Keep its owner out of ordinary admission and check the actual
-    /// value after substitution, rather than rejecting every caller in preflight.
-    pub(crate) fn needs_module_arguments(&self) -> bool {
-        match &self.failure {
-            AttributePrefixFailure::Deferred { dependencies, .. } => {
-                std::iter::once(&dependencies.first)
-                    .chain(&dependencies.rest)
-                    .all(|dependency| {
-                        matches!(dependency, PrefixDependency::UnboundModuleArgument(_))
-                    })
-            }
-            AttributePrefixFailure::Empty | AttributePrefixFailure::Conflict(_) => false,
-        }
+    pub fn owner(&self) -> &crate::finding::FindingOwner {
+        &self.owner
     }
 
     pub(crate) fn resource_id(&self) -> &ResourceId {
         &self.resource
     }
     pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
-        self.location.as_ref()
+        self.owner.location()
     }
 
-    /// The same semantic finding is rendered by validate JSON and the LSP.
-    /// Existing empty/conflict messages retain their resource-label decoration.
-    pub fn diagnostic_message(&self) -> String {
+    fn semantic_message(&self) -> String {
         match &self.failure {
+            AttributePrefixFailure::Empty => format!("'{}' cannot be empty", self.prefix),
+            AttributePrefixFailure::Conflict(base) => {
+                format!("cannot specify both '{}' and '{}'", self.prefix, base)
+            }
             AttributePrefixFailure::Deferred { base, dependencies } => format!(
                 "'{}' must be known at plan time to generate '{base}', but it depends on {dependencies}, which is known only after apply",
                 self.prefix
             ),
-            AttributePrefixFailure::Empty | AttributePrefixFailure::Conflict(_) => self.to_string(),
+        }
+    }
+
+    /// All argument-owned failure kinds share their semantic message and owner.
+    /// Existing declaration-owned empty/conflict messages retain their decoration.
+    pub fn diagnostic_message(&self) -> String {
+        match (&self.failure, &self.owner) {
+            (AttributePrefixFailure::Deferred { .. }, _)
+            | (_, crate::finding::FindingOwner::ModuleArgument(_)) => self.semantic_message(),
+            _ => self.to_string(),
         }
     }
 }
 impl std::fmt::Display for AttributePrefixError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.failure {
-            AttributePrefixFailure::Empty => write!(
-                formatter,
-                "{}: '{}' cannot be empty",
-                self.resource, self.prefix
-            ),
-            AttributePrefixFailure::Conflict(base) => write!(
-                formatter,
-                "{}: cannot specify both '{}' and '{}'",
-                self.resource, self.prefix, base
-            ),
-            AttributePrefixFailure::Deferred { .. } => {
-                write!(
-                    formatter,
-                    "{}: {}",
-                    self.resource,
-                    self.diagnostic_message()
-                )
+        let message = self.semantic_message();
+        match &self.owner {
+            crate::finding::FindingOwner::ModuleArgument(call) => {
+                crate::parser::Located::new(call.declaration_location().clone(), message)
+                    .fmt(formatter)
             }
+            _ => write!(formatter, "{}: {message}", self.resource),
         }
     }
 }

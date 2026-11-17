@@ -1208,28 +1208,8 @@ impl<B: BindingAddress> JudgedSlot<B> {
         &self,
         visitor: &mut impl FnMut(&B, crate::resource::DiagnosticScope),
     ) {
-        fn visit<B: BindingAddress>(
-            node: &AuthoredExpr<ParserPlaceholder, B>,
-            scope: crate::resource::DiagnosticScope,
-            visitor: &mut impl FnMut(&B, crate::resource::DiagnosticScope),
-        ) {
-            let scope = if matches!(node.kind, ExprKind::Secret) {
-                crate::resource::DiagnosticScope::Secret
-            } else {
-                scope
-            };
-            if let ExprKind::Binding(binding) = &node.kind {
-                visitor(binding, scope);
-            }
-            for child in &node.children {
-                visit(&child.authored, scope, visitor);
-            }
-        }
-        visit(
-            &self.root,
-            crate::resource::DiagnosticScope::Public,
-            visitor,
-        );
+        self.root
+            .visit_bindings(crate::resource::DiagnosticScope::Public, visitor);
     }
 
     pub(crate) fn secrecy_conditions(&self) -> ConditionSnapshot {

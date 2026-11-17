@@ -389,6 +389,24 @@ enum ParseOwnership {
     Ordinary,
 }
 impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
+    fn visit_bindings(
+        &self,
+        scope: DiagnosticScope,
+        visitor: &mut impl FnMut(&B, DiagnosticScope),
+    ) {
+        let scope = if matches!(self.kind, ExprKind::Secret) {
+            DiagnosticScope::Secret
+        } else {
+            scope
+        };
+        if let ExprKind::Binding(binding) = &self.kind {
+            visitor(binding, scope);
+        }
+        for child in &self.children {
+            child.authored.visit_bindings(scope, visitor);
+        }
+    }
+
     fn conversion_role(&self) -> conversion::flow::PlacementRole {
         match self.roles {
             AuthoredChildRoles::Computed => conversion::flow::PlacementRole::Computed,
@@ -1190,6 +1208,27 @@ impl<B: BindingAddress> Expressions<B> {
 
     pub fn roots(&self) -> &[ExprValue<ParserPlaceholder, B>] {
         &self.roots
+    }
+
+    /// Retained caller-side syntax at an argument's parser-owned location.
+    /// Substituting its value never replaces the authored alias/use inventory.
+    pub(crate) fn bindings_at(&self, location: &DeclarationLocation) -> Vec<(B, DiagnosticScope)> {
+        let mut pending = self
+            .roots
+            .iter()
+            .map(|root| root.authored.as_ref())
+            .collect::<Vec<_>>();
+        while let Some(node) = pending.pop() {
+            if &node.location.authored == location {
+                let mut bindings = Vec::new();
+                node.visit_bindings(DiagnosticScope::Public, &mut |binding, scope| {
+                    bindings.push((binding.clone(), scope))
+                });
+                return bindings;
+            }
+            pending.extend(node.children.iter().map(|child| child.authored.as_ref()));
+        }
+        Vec::new()
     }
 
     pub(crate) fn is_module_argument(&self, binding: &B) -> bool {
