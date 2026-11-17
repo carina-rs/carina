@@ -1619,9 +1619,9 @@ impl MockProvider {
         let states = state_guard.load_states_for_operation()?;
         let stored = match target {
             MockReadTarget::Managed(identifier) => states.states.get(identifier),
-            MockReadTarget::DataSource => states
-                .data_sources
-                .get(&Self::resolved_resource_address(id)?),
+            MockReadTarget::DataSource => {
+                Self::resource_address(id).and_then(|address| states.data_sources.get(&address))
+            }
         };
         let attributes = stored.map(|attrs| {
             let mut attributes: HashMap<_, _> = attrs
@@ -1954,23 +1954,23 @@ impl Provider for MockProvider {
                 return Err(error);
             }
             self.append_update_request_if_configured(&request)?;
-            append_update_patch_log(
-                &self.behavior.observations.update_patch_log,
-                &id,
-                &request.patch().ops,
-            )?;
-
             let state_guard = self.lock_state_file()?;
             let mut states = state_guard.load_states_for_operation()?;
-            // Apply only the requested operations to the provider's current
-            // value. In particular, a read may omit write-only leaves that
-            // still exist in the backend and must survive an unrelated patch.
             let stored = states.states.get(&identifier).ok_or_else(|| {
                 ProviderError::not_found(format!(
                     "builtin mock object with identifier {:?} was not found",
                     identifier.as_str()
                 ))
             })?;
+            append_update_patch_log(
+                &self.behavior.observations.update_patch_log,
+                &id,
+                &request.patch().ops,
+            )?;
+
+            // Apply only the requested operations to the provider's current
+            // value. In particular, a read may omit write-only leaves that
+            // still exist in the backend and must survive an unrelated patch.
             let mut attributes = stored
                 .iter()
                 .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
@@ -2606,8 +2606,19 @@ mod tests {
 
     #[tokio::test]
     async fn update_missing_identifier_returns_not_found_without_creating_object() {
-        let provider = ConfiguredBuiltinMock::new(MockBehavior::default(), MockScope::memory())
-            .create_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let patch_log = tmp.path().join("update-patches.jsonl");
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    update_patch_log: Some(patch_log.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            MockScope::memory(),
+        )
+        .create_provider();
         let identifier = AppliedIdentifier::new("never-created").unwrap();
         let resource = Resource::with_provider("mock", "test.resource", "missing", None)
             .with_attribute("name", string_value("missing"))
@@ -2632,6 +2643,7 @@ mod tests {
             error.kind(),
             carina_core::provider::ProviderErrorKind::NotFound
         );
+        assert!(!patch_log.exists(), "missing objects must not log patches");
         assert!(
             provider
                 .lock_state_file()
@@ -3201,6 +3213,21 @@ mod tests {
             Some(Value::Concrete(ConcreteValue::Map(values)))
                 if values.get("nested") == Some(&plain.to_snapshot())
         ));
+    }
+
+    #[tokio::test]
+    async fn data_source_read_with_unresolved_identity_returns_not_found() {
+        let provider = ConfiguredBuiltinMock::new(MockBehavior::default(), MockScope::memory())
+            .create_provider();
+        let id = ResourceId::pending_with_provider("mock", "test.resource", None);
+
+        assert!(
+            provider
+                .read_attributes(&id, MockReadTarget::DataSource)
+                .await
+                .expect("an unresolved data-source identity must be treated as not found")
+                .is_none()
+        );
     }
 
     #[test]
