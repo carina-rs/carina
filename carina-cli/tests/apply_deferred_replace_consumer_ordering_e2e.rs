@@ -176,7 +176,7 @@ provider mock {}
             .expect("test state setup must be valid");
 
         let mut consumer =
-            ResourceState::try_applied("test.resource", "consumer", "mock", "mock-id")
+            ResourceState::try_applied("test.resource", "consumer", "mock", "consumer-id")
                 .expect("fixture identifier is non-empty")
                 .with_attribute("name", serde_json::json!("consumer"))
                 .with_attribute("identifier", serde_json::json!("consumer-id"))
@@ -214,7 +214,7 @@ provider mock {}
                 "name": "old-validation-token",
                 "identifier": "old-validation-id"
             },
-            "mock-id": {
+            "consumer-id": {
                 "name": "consumer",
                 "identifier": "consumer-id",
                 "web_acl_arn": "old-validation-id"
@@ -291,7 +291,7 @@ fn consumer_current_state(id: &ResourceId) -> State {
             ("web_acl_arn".to_string(), string("old-validation-id")),
         ]),
     )
-    .with_identifier("mock-id")
+    .with_identifier("consumer-id")
 }
 
 fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFile) -> PlanFile {

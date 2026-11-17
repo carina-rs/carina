@@ -83,7 +83,7 @@ struct MockStateFileRef<'a> {
 
 #[derive(Debug)]
 struct MockStateValueDecodeError {
-    resource_key: String,
+    store_key: String,
     attribute_key: String,
     source: serde_json::Error,
 }
@@ -92,8 +92,8 @@ impl std::fmt::Display for MockStateValueDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "mock state resource {:?} attribute {:?} is not valid persisted JSON",
-            self.resource_key, self.attribute_key
+            "mock state store key {:?} attribute {:?} is not valid persisted JSON",
+            self.store_key, self.attribute_key
         )
     }
 }
@@ -947,7 +947,7 @@ impl MockProvider {
             ));
         }
         fn decode_attributes(
-            resource_key: &str,
+            store_key: &str,
             attributes: RawMockAttributes,
         ) -> io::Result<MockAttributes> {
             attributes
@@ -957,7 +957,7 @@ impl MockProvider {
                         io::Error::new(
                             ErrorKind::InvalidData,
                             MockStateValueDecodeError {
-                                resource_key: resource_key.to_owned(),
+                                store_key: store_key.to_owned(),
                                 attribute_key: attribute_key.clone(),
                                 source,
                             },
@@ -1509,6 +1509,12 @@ impl MockProvider {
     ) -> ProviderResult<HashMap<String, Value>> {
         let state_guard = self.lock_state_file()?;
         let mut states = state_guard.load_states_for_operation()?;
+        if states.states.contains_key(identifier) {
+            return Err(ProviderError::internal(format!(
+                "builtin mock resumed-create identifier {:?} is already held by an object",
+                identifier.as_str()
+            )));
+        }
         let mut persisted_values = resource.resolved_attributes();
         Self::add_server_list_defaults(id, &mut persisted_values);
         let mut persisted = persisted_values
@@ -1959,15 +1965,16 @@ impl Provider for MockProvider {
             // Apply only the requested operations to the provider's current
             // value. In particular, a read may omit write-only leaves that
             // still exist in the backend and must survive an unrelated patch.
-            let mut attributes = states.states.get(&identifier).map_or_else(
-                || request.from().attributes.clone(),
-                |attributes| {
-                    attributes
-                        .iter()
-                        .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
-                        .collect()
-                },
-            );
+            let stored = states.states.get(&identifier).ok_or_else(|| {
+                ProviderError::not_found(format!(
+                    "builtin mock object with identifier {:?} was not found",
+                    identifier.as_str()
+                ))
+            })?;
+            let mut attributes = stored
+                .iter()
+                .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
+                .collect();
             for op in &request.patch().ops {
                 match op {
                     PatchOp::Add { key, value }
@@ -2016,6 +2023,12 @@ impl Provider for MockProvider {
                     )
                 })?
                 .unwrap_or_else(|| identifier.clone());
+            if applied_identifier != identifier && states.states.contains_key(&applied_identifier) {
+                return Err(ProviderError::internal(format!(
+                    "builtin mock update result identifier {:?} is already held by another object",
+                    applied_identifier.as_str()
+                )));
+            }
             states.states.remove(&identifier);
             states.states.insert(applied_identifier.clone(), attrs);
             state_guard
@@ -2553,6 +2566,209 @@ mod tests {
         );
     }
 
+    async fn dispatch_mock_update(
+        provider: &MockProvider,
+        identifier: AppliedIdentifier,
+        from: State<carina_core::resource::SnapshotLeaf>,
+        resource: Resource,
+    ) -> Result<carina_core::provider::HostUpdateOutcome, carina_core::provider::HostError> {
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = fixture_schemas();
+        let provider_types = carina_core::test_utils::loaded_fixture_snapshot(schemas.clone());
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &schemas,
+                    type_checks,
+                );
+                let request = carina_core::executor::prepare_update_request(
+                    resource,
+                    from,
+                    &["comment".to_string()],
+                    &preparation,
+                )
+                .await
+                .expect("mock update fixture passes preparation");
+                let permit = carina_core::replacement::update_permit_with_schemas_for_test(
+                    identifier, request, &schemas,
+                );
+                carina_core::executor::dispatch_update(&mock_boundary(provider), permit).await
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn update_missing_identifier_returns_not_found_without_creating_object() {
+        let provider = ConfiguredBuiltinMock::new(MockBehavior::default(), MockScope::memory())
+            .create_provider();
+        let identifier = AppliedIdentifier::new("never-created").unwrap();
+        let resource = Resource::with_provider("mock", "test.resource", "missing", None)
+            .with_attribute("name", string_value("missing"))
+            .with_attribute("comment", string_value("before"));
+        let from =
+            State::<NoPlaceholder>::existing(resource.id.clone(), resource.resolved_attributes())
+                .with_identifier(identifier.as_str())
+                .to_snapshot();
+
+        let error = dispatch_mock_update(
+            &provider,
+            identifier.clone(),
+            from,
+            resource
+                .clone()
+                .with_attribute("comment", string_value("after")),
+        )
+        .await
+        .expect_err("updating an identifier never created must return NotFound");
+
+        assert_eq!(
+            error.kind(),
+            carina_core::provider::ProviderErrorKind::NotFound
+        );
+        assert!(
+            provider
+                .lock_state_file()
+                .unwrap()
+                .load()
+                .unwrap()
+                .states
+                .is_empty()
+        );
+        assert!(
+            !provider
+                .read(&resource.id, &identifier, ReadRequest)
+                .await
+                .unwrap()
+                .into_state()
+                .exists
+        );
+    }
+
+    #[tokio::test]
+    async fn update_result_identifier_collision_preserves_both_objects() {
+        let scope = MockScope::memory();
+        let provider =
+            ConfiguredBuiltinMock::new(MockBehavior::default(), scope.clone()).create_provider();
+        let resource = Resource::with_provider("mock", "test.resource", "same", None)
+            .with_attribute("name", string_value("same"))
+            .with_attribute("comment", string_value("first"));
+        let first = created_identifier(
+            dispatch_mock_create(&provider, resource.clone())
+                .await
+                .unwrap(),
+        );
+        let second = created_identifier(
+            dispatch_mock_create(
+                &provider,
+                resource
+                    .clone()
+                    .with_attribute("comment", string_value("second")),
+            )
+            .await
+            .unwrap(),
+        );
+        let before = provider.lock_state_file().unwrap().load().unwrap().states;
+        let from = provider
+            .read(&resource.id, &first, ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                update_result_identifier: Some(second.as_str().to_owned()),
+                ..MockBehavior::default()
+            },
+            scope,
+        )
+        .create_provider();
+
+        let error = dispatch_mock_update(
+            &provider,
+            first,
+            from,
+            resource.with_attribute("comment", string_value("updated")),
+        )
+        .await
+        .expect_err("update must reject another object's identifier");
+
+        assert_eq!(
+            error.kind(),
+            carina_core::provider::ProviderErrorKind::Internal
+        );
+        assert_eq!(
+            provider.lock_state_file().unwrap().load().unwrap().states,
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn issued_resume_identifier_collision_preserves_existing_object() {
+        let provider = ConfiguredBuiltinMock::new(MockBehavior::default(), MockScope::memory())
+            .create_provider();
+        let existing = Resource::with_provider("mock", "test.resource", "existing", None)
+            .with_attribute("name", string_value("existing"));
+        let identifier =
+            created_identifier(dispatch_mock_create(&provider, existing).await.unwrap());
+        let before = provider.lock_state_file().unwrap().load().unwrap().states;
+        let resource = Resource::with_provider("mock", "test.resource", "resuming", None)
+            .with_attribute("name", string_value("resuming"));
+        let pending = create_attempt_for_test(resource.id.clone())
+            .issued(identifier.clone(), Sent::AllRequestAttributes)
+            .pending(PendingToken::new("builtin-mock-pending"), 1)
+            .persist(Default::default(), Default::default());
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = fixture_schemas();
+        let provider_types = carina_core::test_utils::loaded_fixture_snapshot(schemas.clone());
+        let request = carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &schemas,
+                    type_checks,
+                );
+                let request = carina_core::executor::prepare_create_request(resource, &preparation)
+                    .await
+                    .expect("resume fixture passes create preparation");
+                ResumeCreateRequest::for_test(pending.clone(), request).unwrap()
+            },
+        )
+        .await;
+
+        let error = provider
+            .resume_create(request)
+            .await
+            .expect_err("issued resume must reject another object's identifier");
+
+        let ResumeFailureKind::InFlight {
+            pending: preserved,
+            error,
+        } = error.into_kind()
+        else {
+            panic!("a rejected issued resume must preserve its continuation");
+        };
+        assert_eq!(
+            error.kind(),
+            carina_core::provider::ProviderErrorKind::Internal
+        );
+        assert_eq!(preserved, pending);
+        assert_eq!(
+            provider.lock_state_file().unwrap().load().unwrap().states,
+            before
+        );
+    }
+
     #[test]
     fn normalizer_construction_does_not_initialize_storage_or_telemetry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3040,13 +3256,26 @@ mod tests {
                 serde_json::json!({
                     "version": 3,
                     "states": {
+                        "broken-id": {
+                            "payload": {"$unknown": true}
+                        }
+                    }
+                })
+                .to_string(),
+                "mock state store key \"broken-id\" attribute \"payload\" is not valid persisted JSON",
+            ),
+            (
+                serde_json::json!({
+                    "version": 3,
+                    "states": {},
+                    "data_sources": {
                         "test.resource.broken": {
                             "payload": {"$unknown": true}
                         }
                     }
                 })
                 .to_string(),
-                "mock state resource \"test.resource.broken\" attribute \"payload\" is not valid persisted JSON",
+                "mock state store key \"test.resource.broken\" attribute \"payload\" is not valid persisted JSON",
             ),
         ] {
             fs::write(&state_file, content).unwrap();
