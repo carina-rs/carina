@@ -20,6 +20,7 @@ jobs:
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       code: ${{ steps.filter.outputs.code }}
       version_only: ${{ steps.filter.outputs.version_only }}
@@ -63,6 +64,7 @@ jobs:
     # Push builds refresh this job's main-branch cache for PR/queue restores.
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,6 +78,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,6 +93,7 @@ jobs:
     needs: changes
     if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-toolchain
@@ -100,6 +104,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -112,6 +117,7 @@ jobs:
     name: Provider Boundary Check
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh provider-boundaries
@@ -120,6 +126,7 @@ jobs:
     name: Error Source Display Check
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh error-source-display
@@ -128,6 +135,7 @@ jobs:
     name: Check Wall Clock Test Assertions
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh no-wall-clock-test-assertions
@@ -136,6 +144,7 @@ jobs:
     name: Docs Spelling Check
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh docs-spellings
@@ -144,6 +153,7 @@ jobs:
     name: Check Direct parsed.resources Access
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh resources-access
@@ -152,6 +162,7 @@ jobs:
     name: Check CLI Project Hint Rendering
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh cli-hints
@@ -160,6 +171,7 @@ jobs:
     name: Check Home Environment Reads
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh no-home-env-reads
@@ -168,6 +180,7 @@ jobs:
     name: Check Crates Not Publishable
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh crates-not-publishable
@@ -176,6 +189,7 @@ jobs:
     name: Check wit-bindgen Workspace Dependency
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-toolchain
@@ -185,6 +199,7 @@ jobs:
     name: Check Plan Fixtures
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh plan-fixtures
@@ -193,6 +208,7 @@ jobs:
     name: Check Rust Cache Usage
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh rust-cache
@@ -201,6 +217,7 @@ jobs:
     name: Check Pinned Rust Toolchain
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: scripts/verify.sh pinned-toolchain
@@ -209,6 +226,7 @@ jobs:
     name: Check Vendored Patches Used
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -221,6 +239,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-toolchain
@@ -232,6 +251,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -245,6 +265,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -260,6 +281,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
         with:
@@ -302,6 +324,7 @@ jobs:
     needs: [changes, test]
     if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -317,10 +340,13 @@ jobs:
         timeout-minutes: 3
         with:
           version: ${{ env.NEXTEST_VERSION }}
+      # Longest green download in the last 60 CI runs: 12.6 minutes.
       - uses: actions/download-artifact@v4
+        timeout-minutes: 25
         with:
           name: nextest-archive
       - uses: actions/download-artifact@v4
+        timeout-minutes: 25
         with:
           name: wasm-fixtures
           path: target/wasm32-wasip2/debug
@@ -335,6 +361,7 @@ jobs:
     needs: [changes, test]
     if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -344,10 +371,13 @@ jobs:
         timeout-minutes: 3
         with:
           version: ${{ env.NEXTEST_VERSION }}
+      # Longest green download in the last 60 CI runs: 12.6 minutes.
       - uses: actions/download-artifact@v4
+        timeout-minutes: 25
         with:
           name: nextest-archive
       - uses: actions/download-artifact@v4
+        timeout-minutes: 25
         with:
           name: wasm-fixtures
           path: target/wasm32-wasip2/debug
@@ -359,6 +389,7 @@ jobs:
     needs: changes
     if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -376,6 +407,7 @@ jobs:
     needs: changes
     if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -394,6 +426,7 @@ jobs:
     # unsuccessful change detector must instead run this job and fail closed.
     if: always() && github.event_name != 'push' && (needs.changes.result != 'success' || (needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')))
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Require every test job to succeed
         env:
@@ -417,6 +450,7 @@ jobs:
     runs-on: ubuntu-latest
     # Use a baseline Debian userland for linux x86_64; see #3963.
     container: rust:1-bookworm
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
         with:
