@@ -612,7 +612,8 @@ async fn prefix_companion_module_preflight_reference_findings_are_preserved() {
 }
 
 #[tokio::test]
-async fn prefix_companion_module_outputs_on_unnamed_roots_rejected_once_per_owner() {
+async fn prefix_companion_module_outputs_on_unnamed_roots_keep_deferred_companions_and_unknown_siblings()
+ {
     let fixture = PrefixDirectory::new(&[
         (
             "main.crn",
@@ -634,6 +635,12 @@ async fn prefix_companion_module_outputs_on_unnamed_roots_rejected_once_per_owne
     let expected = ["first", "second"].map(|attribute| format!(
         "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.{attribute}', which is known only after apply"
     ));
+    let expected = vec![
+        expected[0].as_str(),
+        expected[1].as_str(),
+        "Unknown attribute 'bogus'",
+        "Unknown attribute 'bogus'",
+    ];
     assert_eq!(cli_messages, expected, "{cli:#}");
     assert_eq!(error_messages(&lsp), cli_messages, "{lsp:#?}");
 }

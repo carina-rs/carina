@@ -26,6 +26,10 @@ impl<K> DependencyKey<K> {
     pub fn new(key: K) -> Self {
         Self(key)
     }
+    /// Change a graph key's binding phase without using diagnostic spelling.
+    pub(crate) fn map_key<T>(self, map: impl FnOnce(K) -> T) -> DependencyKey<T> {
+        DependencyKey::new(map(self.0))
+    }
     /// Add an identity to an existing graph's key collection.
     pub(crate) fn record_graph_key(&self, keys: &mut impl Extend<K>)
     where

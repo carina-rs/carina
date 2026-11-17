@@ -1595,6 +1595,19 @@ where
         }
     }
 
+    pub(crate) fn loop_argument_iterable(&self) -> Option<&'a Value<P, B>> {
+        match self.resource {
+            ResourceRef::Deferred { deferred, .. } => D::deferred_argument_iterable(deferred),
+            _ => None,
+        }
+    }
+    pub(crate) fn loop_iterable_location(&self) -> Option<&'a super::DeclarationLocation> {
+        match self.resource {
+            ResourceRef::Deferred { deferred, .. } => D::deferred_iterable_location(deferred),
+            _ => None,
+        }
+    }
+
     pub(crate) fn loop_binding(&self) -> Option<&'a super::ForBinding> {
         match self.resource {
             ResourceRef::Deferred { deferred, .. } => Some(D::deferred_binding(deferred)),

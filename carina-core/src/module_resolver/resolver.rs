@@ -189,18 +189,6 @@ impl ResidualModuleResolutionError {
         self.0.individual_errors()
     }
 
-    /// Imported-template schema findings keep their declaration identity and
-    /// remain individual findings through resolver error containers.
-    pub fn resource_findings(&self) -> Option<Vec<&crate::validation::ResourceAdmissionFinding>> {
-        self.individual_errors()
-            .into_iter()
-            .map(|finding| match finding.error {
-                ModuleError::Resource(resource) => Some(resource.as_ref()),
-                _ => None,
-            })
-            .collect()
-    }
-
     pub fn call_source(&self) -> ModuleErrorCallSource<'_> {
         self.0.call_source()
     }
@@ -250,28 +238,12 @@ impl ResidualModuleResolutionError {
             ResidualModuleResolutionDiagnostic::Constraint { origin } => Some(origin),
             _ => None,
         };
-        let has_resource_findings = self.resource_findings().is_some();
-        let mut findings: Vec<_> = tree
-            .module_calls()
-            .filter(|call| match self.call_source() {
-                ModuleErrorCallSource::Failing(identity) => identity == call.id(),
-                ModuleErrorCallSource::Owners(owners) => {
-                    owners.iter().any(|identity| identity == call.id())
-                }
-                ModuleErrorCallSource::Unavailable => false,
-            })
-            .filter(|call| {
-                !matches!(constraint_origin, Some(ConstraintOrigin::LiveCall(identity)) if identity == call.id())
-            })
-            .map(|call| {
-                let location = if has_resource_findings {
-                    call.id().declaration_location()
-                } else {
-                    call.id().module_name_location()
-                };
-                crate::parser::Located::new(location.clone(), self)
-            })
-            .collect();
+        let mut findings: Vec<_> = tree.module_calls().filter(|call| match self.call_source() {
+            ModuleErrorCallSource::Failing(identity) => identity == call.id(),
+            ModuleErrorCallSource::Owners(owners) => owners.iter().any(|identity| identity == call.id()),
+            ModuleErrorCallSource::Unavailable => false,
+        }).filter(|call| !matches!(constraint_origin, Some(ConstraintOrigin::LiveCall(identity)) if identity == call.id()))
+            .map(|call| crate::parser::Located::new(call.id().module_name_location().clone(), self)).collect();
         if let ModuleError::ReferenceType(errors) = self.0.root_cause() {
             for error in errors.iter() {
                 if let crate::validation::ExpansionBoundaryReferenceError::ModuleCall(error) = error
@@ -318,9 +290,7 @@ impl ResidualModuleResolutionError {
             ModuleError::WithProviderTypeWarnings { .. } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
-            ModuleError::Multiple(_) | ModuleError::Resource(_) => {
-                Some(ResidualModuleResolutionDiagnostic::ModuleCall)
-            }
+            ModuleError::Multiple(_errors) => Some(ResidualModuleResolutionDiagnostic::ModuleCall),
             ModuleError::Constraint(diagnostic) => {
                 Some(ResidualModuleResolutionDiagnostic::Constraint {
                     origin: &diagnostic.origin,
@@ -425,7 +395,7 @@ impl ResidualModuleResolutionError {
     fn is_covered_by(&self, findings: &[crate::validation::ModuleCallFinding]) -> bool {
         let root_cause = self.0.root_cause();
         match root_cause {
-            ModuleError::AnalysisInvariant(_) | ModuleError::Resource(_) => false,
+            ModuleError::AnalysisInvariant(_) => false,
             ModuleError::WithProviderTypeWarnings { .. } => {
                 unreachable!("root_cause removes diagnostic wrappers")
             }
@@ -687,7 +657,6 @@ fn without_covered_reference_type_members(
             line: _,
         }
         | ModuleError::UnexpandedModuleTemplate { context: _ }
-        | ModuleError::Resource(_)
         | ModuleError::Io(_)
         | ModuleError::Parse(_)
         | ModuleError::ParseInFile { path: _, error: _ }
@@ -1327,24 +1296,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
                 let mut frame = frames.pop().expect("completed module import");
                 // This runs after all child imports have populated this scope,
                 // exactly as the recursive loader did.
-                let checked =
-                    self.validate_reference_types(&mut frame.parsed)
-                        .and_then(|witness| {
-                            let findings = crate::validation::awaiting_prefix_sibling_findings(
-                                &frame.parsed,
-                                self.schemas,
-                                self.config(),
-                            )?;
-                            match ModuleError::from_errors(
-                                findings
-                                    .into_iter()
-                                    .map(|finding| ModuleError::Resource(Box::new(finding)))
-                                    .collect(),
-                            ) {
-                                Some(error) => Err(error),
-                                None => Ok(witness),
-                            }
-                        });
+                let checked = self.validate_reference_types(&mut frame.parsed);
                 self.resolving.remove(&frame.canonical);
                 self.restore_import_scope(frame.scope);
                 checked?;

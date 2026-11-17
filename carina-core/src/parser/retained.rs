@@ -1074,12 +1074,18 @@ pub(in crate::parser) fn resource_slots(
 /// let signatures = ResolvedModuleSignatures::default();
 /// let unchecked = ValidationTypeContext::new_providerless(&raw, &config, &signatures);
 /// ```
+#[derive(Clone, PartialEq)]
+struct BoundModuleArgument {
+    name: RelativeBindingName,
+    type_expr: TypeExpr,
+}
+
 #[derive(Clone)]
 pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     roots: Vec<ExprValue<ParserPlaceholder, B>>,
     definitions: IndexMap<B, ExprValue<ParserPlaceholder, B>>,
     report: Arc<ExpressionReport<B>>,
-    arguments: IndexMap<B, TypeExpr>,
+    arguments: IndexMap<B, BoundModuleArgument>,
     secrecy_arguments: IndexMap<B, Value<ParserPlaceholder, B>>,
     secrecy_argument_modules: IndexMap<B, B>,
     secrecy_argument_roots: IndexMap<ExpressionLocation, String>,
@@ -1279,17 +1285,36 @@ impl<B: BindingAddress> Expressions<B> {
         uses
     }
 
-    /// Select the concrete caller environment as well as the authored span.
-    /// Two expanded instances may share that span and have different arguments.
+    /// The same authored span can occur in several concrete module instances.
+    fn dependency_uses_at(
+        &self,
+        instance: &ExpressionInstance,
+        location: &DeclarationLocation,
+    ) -> Vec<AuthoredDependency<B>> {
+        let mut pending = self
+            .roots
+            .iter()
+            .map(|root| root.authored.as_ref())
+            .collect::<Vec<_>>();
+        while let Some(node) = pending.pop() {
+            if &node.location.instance == instance && &node.location.authored == location {
+                let mut uses = Vec::new();
+                node.dependency_uses(DiagnosticScope::Public, &mut uses);
+                return uses;
+            }
+            pending.extend(node.children.iter().map(|child| child.authored.as_ref()));
+        }
+        Vec::new()
+    }
+
+    /// Retain the argument's declared name separately from its binding address.
     pub(crate) fn argument_dependency_uses(
         &self,
         binding: &B,
         call: &super::ModuleCallId,
-    ) -> Vec<AuthoredDependency<B>> {
-        let name = binding.as_str().rsplit('.').next().expect("binding name");
-        let Some(location) = call.argument_value_location(name) else {
-            return Vec::new();
-        };
+    ) -> Option<Vec<AuthoredDependency<B>>> {
+        let argument = self.arguments.get(binding)?;
+        let location = call.argument_value_location(argument.name.as_str())?;
         let caller = self.secrecy_argument_modules.get(binding).map(B::as_str);
         let mut pending = self
             .roots
@@ -1307,11 +1332,11 @@ impl<B: BindingAddress> Expressions<B> {
             if owns_instance && &node.location.authored == location {
                 let mut uses = Vec::new();
                 node.dependency_uses(DiagnosticScope::Public, &mut uses);
-                return uses;
+                return Some(uses);
             }
             pending.extend(node.children.iter().map(|child| child.authored.as_ref()));
         }
-        Vec::new()
+        None
     }
 
     pub(crate) fn is_module_argument(&self, binding: &B) -> bool {
@@ -1439,7 +1464,7 @@ impl<B: BindingAddress> Expressions<B> {
     pub(crate) fn bind_arguments(
         &mut self,
         scope: &crate::resource::ModuleInstanceScope,
-        arguments: impl IntoIterator<Item = (B, TypeExpr)>,
+        arguments: impl IntoIterator<Item = (B, RelativeBindingName, TypeExpr)>,
     ) {
         self.set_require_scope(RequireScope::ModuleCall);
         self.instance = ExpressionInstance::for_scope(scope);
@@ -1475,7 +1500,11 @@ impl<B: BindingAddress> Expressions<B> {
         for root in self.definitions.values_mut() {
             qualify(root, &self.instance, &mut memo);
         }
-        self.arguments.extend(arguments);
+        self.arguments.extend(
+            arguments.into_iter().map(|(binding, name, type_expr)| {
+                (binding, BoundModuleArgument { name, type_expr })
+            }),
+        );
         self.report = Arc::new(ExpressionReport::empty());
     }
 }
@@ -6714,12 +6743,14 @@ mod judgement {
         }
 
         fn parameter_type(&self, binding: &B) -> Option<&TypeExpr> {
-            self.expressions.arguments.get(binding).or_else(|| {
-                match self.bindings.get(binding.as_str()) {
+            self.expressions
+                .arguments
+                .get(binding)
+                .map(|argument| &argument.type_expr)
+                .or_else(|| match self.bindings.get(binding.as_str()) {
                     Some(InferenceBinding::Argument { type_expr }) => Some(type_expr),
                     _ => None,
-                }
-            })
+                })
         }
 
         fn narrow_declared(

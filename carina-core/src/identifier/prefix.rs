@@ -2,7 +2,8 @@
 mod read;
 use super::{
     AttributePrefixError, AttributePrefixFailure, DeferredPrefixDependencies, PrefixDependency,
-    ResourcePrefixSource, generate_random_suffix, prefix_companion_attribute,
+    PrefixDependencyKey, PrefixDependencyPath, ResourcePrefixSource, generate_random_suffix,
+    prefix_companion_attribute,
 };
 use crate::parser::retained::JudgedFile;
 use crate::parser::{
@@ -100,15 +101,16 @@ struct OwnerVisit {
     owner: OwnerAddress,
     state: PrefixAdmission,
 }
-/// A companion judgement waiting for substitution, never an error owner.
+/// A recognized companion owns its base while value judgement is pending.
+/// The obligation admits siblings and can never be used as an error owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AwaitingPrefix {
+struct PrefixObligation {
     prefix: String,
     base: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PrefixObligations(Vec<AwaitingPrefix>);
+pub(crate) struct PrefixObligations(Vec<PrefixObligation>);
 impl PrefixObligations {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -126,10 +128,25 @@ struct PrefixJudgements {
     errors: Vec<AttributePrefixError>,
     awaiting: PrefixObligations,
 }
+impl PrefixJudgements {
+    fn pending<P: PlaceholderKind, B: BindingAddress>(
+        &mut self,
+        obligation: PrefixObligation,
+        dependencies: Vec<DeferredPrefixDependencies>,
+        source: &PrefixSource<'_, P, B>,
+    ) {
+        self.errors
+            .extend(dependencies.into_iter().map(|dependencies| {
+                deferred_companion_error(obligation.base.clone(), dependencies, source)
+            }));
+        self.awaiting.0.push(obligation);
+    }
+}
+
 #[derive(Clone)]
 enum PrefixAdmission {
     Ready,
-    AwaitingArguments(PrefixObligations),
+    Pending(PrefixObligations),
     Rejected,
 }
 impl PrefixAdmission {
@@ -138,7 +155,7 @@ impl PrefixAdmission {
     }
     fn awaiting(&self) -> PrefixObligations {
         match self {
-            Self::AwaitingArguments(awaiting) => awaiting.clone(),
+            Self::Pending(awaiting) => awaiting.clone(),
             _ => PrefixObligations::default(),
         }
     }
@@ -246,11 +263,6 @@ impl<F: std::fmt::Debug> std::fmt::Debug for PrefixCanonicalized<'_, F> {
     }
 }
 impl<'s, F> PrefixCanonicalized<'s, F> {
-    pub(crate) fn has_awaiting_prefixes(&self) -> bool {
-        self.visits
-            .iter()
-            .any(|visit| matches!(visit.state, PrefixAdmission::AwaitingArguments(_)))
-    }
     pub fn prefix_errors(&self) -> &[AttributePrefixError] {
         &self.errors
     }
@@ -294,14 +306,26 @@ fn canonicalize_in_place<
     let mut judgements = PrefixJudgements::default();
     let mut visits = Vec::new();
     let mut record = |owner, findings: PrefixJudgements| {
-        let state = if !findings.errors.is_empty() {
+        let state = if findings
+            .errors
+            .iter()
+            .any(AttributePrefixError::blocks_name_resolution)
+        {
             PrefixAdmission::Rejected
         } else if findings.awaiting.0.is_empty() {
             PrefixAdmission::Ready
         } else {
-            PrefixAdmission::AwaitingArguments(findings.awaiting.clone())
+            PrefixAdmission::Pending(findings.awaiting.clone())
         };
-        judgements.errors.extend(findings.errors);
+        for error in findings.errors {
+            if !judgements
+                .errors
+                .iter()
+                .any(|existing| existing.same_argument_finding(&error))
+            {
+                judgements.errors.push(error);
+            }
+        }
         judgements.awaiting.0.extend(findings.awaiting.0);
         visits.push(OwnerVisit { owner, state });
     };
@@ -314,7 +338,7 @@ fn canonicalize_in_place<
         );
     }
     // Reads never generate names. Deferred-for templates retain their existing
-    // literal-prefix behavior, but a deferred companion must own its rejection.
+    // literal-prefix behavior; pending companions retain their obligations.
     for index in 0..file.data_sources.len() {
         record(OwnerAddress::DataSource(index), PrefixJudgements::default());
     }
@@ -330,15 +354,17 @@ fn canonicalize_in_place<
                     expressions,
                     variables,
                     loop_binding: Some(D::deferred_binding(deferred)),
+                    loop_argument_iterable: D::deferred_argument_iterable(deferred),
+                    loop_iterable_location: D::deferred_iterable_location(deferred),
                     module_source: resource.module_source.as_ref(),
                 };
                 for (key, value) in &resource.attributes {
                     match recognize_companion(key, value, schema.schema().as_schema(), &source) {
-                        CompanionRecognition::Deferred { base, dependencies } => findings
-                            .errors
-                            .push(deferred_companion_error(base, dependencies, &source)),
-                        CompanionRecognition::Awaiting(obligation) => {
-                            findings.awaiting.0.push(obligation)
+                        CompanionRecognition::Pending {
+                            obligation,
+                            dependencies,
+                        } => {
+                            findings.pending(obligation, dependencies, &source);
                         }
                         CompanionRecognition::Known { .. } | CompanionRecognition::NotCompanion => {
                         }
@@ -735,6 +761,8 @@ where
                 variables: &self.file.variables,
                 module_source: self.resource.module_source(),
                 loop_binding: self.resource.loop_binding(),
+                loop_argument_iterable: self.resource.loop_argument_iterable(),
+                loop_iterable_location: self.resource.loop_iterable_location(),
             },
             values.clone(),
             SuffixSource::Preview,
@@ -986,6 +1014,8 @@ fn resolve_resource<P: PlaceholderKind, B: BindingAddress>(
             variables,
             module_source: resource.module_source.as_ref(),
             loop_binding: None,
+            loop_argument_iterable: None,
+            loop_iterable_location: None,
         },
         suffix,
     );
@@ -1044,6 +1074,8 @@ pub(crate) fn canonicalize_fixture_prefix_values<P: PlaceholderKind, B: BindingA
             variables: &IndexMap::new(),
             module_source: None,
             loop_binding: None,
+            loop_argument_iterable: None,
+            loop_iterable_location: None,
         },
         values,
         suffix,
@@ -1058,6 +1090,8 @@ struct PrefixSource<'a, P: PlaceholderKind, B: BindingAddress> {
     variables: &'a IndexMap<String, Value<P, B>>,
     module_source: Option<&'a ModuleSource>,
     loop_binding: Option<&'a crate::parser::ForBinding>,
+    loop_argument_iterable: Option<&'a Value<P, B>>,
+    loop_iterable_location: Option<&'a crate::parser::DeclarationLocation>,
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> PrefixSource<'_, P, B> {
@@ -1073,6 +1107,30 @@ impl<P: PlaceholderKind, B: BindingAddress> PrefixSource<'_, P, B> {
                 .map(|source| source.module_call_path().root().id.clone()),
         }
     }
+    fn loop_slot(&self, binding: &B) -> Option<LoopSlot> {
+        use crate::parser::ForBinding;
+        let matches = |name: &str| {
+            binding.as_str() == name
+                || self
+                    .module_source
+                    .and_then(ModuleSource::module_call)
+                    .is_some_and(|call| {
+                        call.identity_scope()
+                            .resolve(crate::resource::RelativeBindingName::new(name))
+                            .as_str()
+                            == binding.as_str()
+                    })
+        };
+        match self.loop_binding? {
+            ForBinding::Simple(value) if matches(value) => Some(LoopSlot::Value),
+            ForBinding::Indexed(index, _) if matches(index) => Some(LoopSlot::Index),
+            ForBinding::Indexed(_, value) if matches(value) => Some(LoopSlot::Value),
+            ForBinding::Map(key, _) if matches(key) => Some(LoopSlot::Key),
+            ForBinding::Map(_, value) if matches(value) => Some(LoopSlot::Value),
+            _ => None,
+        }
+    }
+
     fn argument_calls(&self) -> Vec<&crate::parser::ModuleCallId> {
         self.module_source
             .and_then(ModuleSource::module_call)
@@ -1088,17 +1146,17 @@ impl<P: PlaceholderKind, B: BindingAddress> PrefixSource<'_, P, B> {
 }
 
 /// Recognition owns deferred companions too. Only NotCompanion can proceed to
-/// ordinary unknown-key/required-attribute admission; Deferred rejects the owner.
+/// ordinary unknown-key/required-attribute admission. Pending companions keep
+/// their obligation while unrelated attributes still enter admission.
 enum CompanionRecognition {
     Known {
         base: String,
         prefix: ValueString,
     },
-    Deferred {
-        base: String,
-        dependencies: DeferredPrefixDependencies,
+    Pending {
+        obligation: PrefixObligation,
+        dependencies: Vec<DeferredPrefixDependencies>,
     },
-    Awaiting(AwaitingPrefix),
     NotCompanion,
 }
 
@@ -1133,17 +1191,20 @@ fn recognize_companion<P: PlaceholderKind, V: PlaceholderKind, B: BindingAddress
         };
     }
     match &*knowledge {
-        Classification::Pending(_) => match deferred_prefix_dependencies(value, key, source) {
-            DependencyRecognition::Named(dependencies) => CompanionRecognition::Deferred {
-                base: base.to_owned(),
+        Classification::Pending(_) => {
+            let dependencies = match deferred_prefix_dependencies(value, key, source) {
+                DependencyRecognition::Named(dependencies) => dependencies,
+                DependencyRecognition::Awaiting => Vec::new(),
+                DependencyRecognition::Absent => return CompanionRecognition::NotCompanion,
+            };
+            CompanionRecognition::Pending {
+                obligation: PrefixObligation {
+                    prefix: key.to_owned(),
+                    base: base.to_owned(),
+                },
                 dependencies,
-            },
-            DependencyRecognition::Awaiting => CompanionRecognition::Awaiting(AwaitingPrefix {
-                prefix: key.to_owned(),
-                base: base.to_owned(),
-            }),
-            DependencyRecognition::Absent => CompanionRecognition::NotCompanion,
-        },
+            }
+        }
         Classification::Known(_) | Classification::ShapeKnown(_) | Classification::Failed(_) => {
             CompanionRecognition::NotCompanion
         }
@@ -1169,14 +1230,11 @@ fn rewrite_prefix_values<P: PlaceholderKind, V: PlaceholderKind, B: BindingAddre
     for companion in companions {
         let (base, prefix) = match companion {
             CompanionRecognition::NotCompanion => continue,
-            CompanionRecognition::Awaiting(obligation) => {
-                judgements.awaiting.0.push(obligation);
-                continue;
-            }
-            CompanionRecognition::Deferred { base, dependencies } => {
-                judgements
-                    .errors
-                    .push(deferred_companion_error(base, dependencies, &source));
+            CompanionRecognition::Pending {
+                obligation,
+                dependencies,
+            } => {
+                judgements.pending(obligation, dependencies, &source);
                 continue;
             }
             CompanionRecognition::Known { base, prefix } => (base, prefix),
@@ -1236,12 +1294,15 @@ fn deferred_companion_error<P: PlaceholderKind, B: BindingAddress>(
         resource: source.id.clone(),
         owner,
         prefix: authored,
-        failure: AttributePrefixFailure::Deferred { base, dependencies },
+        failure: AttributePrefixFailure::Deferred {
+            base,
+            dependencies: Box::new(dependencies),
+        },
     }
 }
 
 enum DependencyRecognition {
-    Named(DeferredPrefixDependencies),
+    Named(Vec<DeferredPrefixDependencies>),
     Awaiting,
     Absent,
 }
@@ -1253,17 +1314,52 @@ enum DependencyIdentity<B: BindingAddress> {
     Loop(LoopSlot),
 }
 
+struct NamedPrefixDependency<B: BindingAddress> {
+    identity: DependencyIdentity<B>,
+    through: Option<DependencyKey<B>>,
+    dependency: PrefixDependency,
+    owner: Option<crate::parser::ModuleCallId>,
+}
+impl<B: BindingAddress> NamedPrefixDependency<B> {
+    fn key(&self) -> PrefixDependencyKey {
+        let binding = |binding: B| crate::resource::RelativeBindingName::new(binding.as_str());
+        PrefixDependencyKey {
+            path: match &self.identity {
+                DependencyIdentity::Resource(key) => PrefixDependencyPath::Resource(
+                    key.clone()
+                        .map_key(|path| path.map_bindings(&mut |name| binding(name))),
+                ),
+                DependencyIdentity::Binding(key) => {
+                    PrefixDependencyPath::Binding(key.clone().map_key(binding))
+                }
+                DependencyIdentity::Loop(slot) => PrefixDependencyPath::Loop(*slot),
+            },
+            through: self.through.clone().map(|key| key.map_key(binding)),
+        }
+    }
+}
+
+struct PrefixOwnerGroup<B: BindingAddress> {
+    owner: Option<crate::parser::ModuleCallId>,
+    first: NamedPrefixDependency<B>,
+    rest: Vec<NamedPrefixDependency<B>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefixDependencySite {
+    Value,
+    Iterable,
+}
+
 struct PrefixDependencies<'s, 'a, V: PlaceholderKind, B: BindingAddress> {
     source: &'s PrefixSource<'a, V, B>,
+    authored: &'s str,
+    site: PrefixDependencySite,
     actual: Vec<crate::resource::ScopedResourceOrigin<B>>,
-    // Attribute each occurrence first, then de-duplicate the complete typed
-    // (path, through) pair. Redaction is never an identity comparison.
-    named: Vec<(
-        DependencyIdentity<B>,
-        Option<DependencyKey<B>>,
-        PrefixDependency,
-    )>,
-    argument_call: Option<crate::parser::ModuleCallId>,
+    // Each authored occurrence has its owner before full-key de-duplication.
+    named: Vec<NamedPrefixDependency<B>>,
+    unbound_arguments: Vec<crate::resource::RelativeBindingName>,
+    awaiting: bool,
     visiting: Vec<B>,
     allow_unprojected: bool,
 }
@@ -1285,16 +1381,33 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
         owner: Option<&crate::parser::ModuleCallId>,
     ) {
         let through = through.map(|binding| DependencyKey::new(binding.clone()));
-        if !self
-            .named
-            .iter()
-            .any(|(key, alias, _)| key == &identity && alias == &through)
-        {
-            self.named.push((identity, through, dependency));
+        if !self.named.iter().any(|existing| {
+            existing.identity == identity
+                && existing.through == through
+                && existing.owner.as_ref() == owner
+        }) {
+            self.named.push(NamedPrefixDependency {
+                identity,
+                through,
+                dependency,
+                owner: owner.cloned(),
+            });
         }
-        if self.argument_call.is_none() {
-            self.argument_call = owner.cloned();
-        }
+    }
+
+    fn alias(&self, through: Option<&B>, scope: DiagnosticScope) -> Option<String> {
+        through.map(|binding| {
+            scope.path(ReferencePath::Binding(binding.clone())).render(
+                |path| {
+                    path.to_dot_string()
+                        .rsplit('.')
+                        .next()
+                        .expect("binding name")
+                        .to_owned()
+                },
+                || crate::schema::SECRET_VALUE_MASK.to_owned(),
+            )
+        })
     }
 
     fn reference(
@@ -1316,18 +1429,7 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
         let path = scope
             .path(ReferencePath::Access(authored.clone()))
             .to_dot_string();
-        let alias = through.map(|binding| {
-            scope.path(ReferencePath::Binding(binding.clone())).render(
-                |path| {
-                    path.to_dot_string()
-                        .rsplit('.')
-                        .next()
-                        .expect("binding name")
-                        .to_owned()
-                },
-                || crate::schema::SECRET_VALUE_MASK.to_owned(),
-            )
-        });
+        let alias = self.alias(through, scope);
         self.push(
             DependencyIdentity::Resource(DependencyKey::new(identity.clone())),
             through,
@@ -1346,6 +1448,31 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
         through: Option<&B>,
         owner: Option<&crate::parser::ModuleCallId>,
     ) {
+        if let Some(iterable) = self.source.loop_argument_iterable {
+            use crate::resource::knowledge::KnowledgeContext;
+            if iterable
+                .knowledge(&KnowledgeContext::validation())
+                .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
+            {
+                return;
+            }
+            if let Some(location) = self.source.loop_iterable_location
+                && let Some(slots) = self.source.slots
+                && let Ok(slot) = slots.get(self.authored)
+            {
+                // The iterable is authored outside the loop variable's scope.
+                let prior = std::mem::replace(&mut self.site, PrefixDependencySite::Iterable);
+                self.uses(
+                    slot.dependency_uses_at(location, self.source.expressions),
+                    through,
+                    scope,
+                    self.source.argument_calls().len().checked_sub(1),
+                    owner,
+                );
+                self.site = prior;
+            }
+            return;
+        }
         use crate::parser::ForBinding;
         let name = match (self.source.loop_binding, slot) {
             (Some(ForBinding::Simple(value)), LoopSlot::Value)
@@ -1360,18 +1487,7 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
                 crate::resource::RelativeBindingName::new(name.as_str()),
             ))
             .to_dot_string();
-        let alias = through.map(|binding| {
-            scope.path(ReferencePath::Binding(binding.clone())).render(
-                |path| {
-                    path.to_dot_string()
-                        .rsplit('.')
-                        .next()
-                        .expect("binding name")
-                        .to_owned()
-                },
-                || crate::schema::SECRET_VALUE_MASK.to_owned(),
-            )
-        });
+        let alias = self.alias(through, scope);
         self.push(
             DependencyIdentity::Loop(slot),
             through,
@@ -1427,6 +1543,20 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
         call_index: Option<usize>,
         owner: Option<&crate::parser::ModuleCallId>,
     ) {
+        if self.site == PrefixDependencySite::Value
+            && let Some(slot) = self.source.loop_slot(binding)
+        {
+            self.loop_variable(slot, scope, through, owner);
+            return;
+        }
+        if self
+            .unbound_arguments
+            .iter()
+            .any(|name| binding.as_str() == name.as_str())
+        {
+            self.awaiting = true;
+            return;
+        }
         if self.visiting.contains(binding) {
             return;
         }
@@ -1439,7 +1569,7 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
                 .source
                 .expressions
                 .argument_dependency_uses(binding, call);
-            if !uses.is_empty() {
+            if let Some(uses) = uses {
                 // Forwarded parameters retain no callee alias decoration. The
                 // first authored dependency, possibly in an ancestor, owns it.
                 self.uses(uses, None, scope, index.checked_sub(1), Some(call));
@@ -1498,11 +1628,7 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
             } else {
                 reference.diagnostic_path().to_dot_string()
             };
-            let alias = through.map(|binding| {
-                scope
-                    .path(ReferencePath::Binding(binding.clone()))
-                    .to_dot_string()
-            });
+            let alias = self.alias(through, scope);
             self.push(
                 DependencyIdentity::Resource(key),
                 through,
@@ -1526,31 +1652,52 @@ fn deferred_prefix_dependencies<P: PlaceholderKind, V: PlaceholderKind, B: Bindi
     authored: &str,
     source: &PrefixSource<'_, V, B>,
 ) -> DependencyRecognition {
-    let mut awaiting = false;
+    let mut unbound_arguments = Vec::new();
     let mut loops = Vec::new();
     value.visit_placeholders(&mut |placeholder, scope| {
-        awaiting |= placeholder.module_argument_name().is_some();
+        if let Some(name) = placeholder.module_argument_name() {
+            unbound_arguments.push(crate::resource::RelativeBindingName::new(name));
+        }
         if let Some(slot) = placeholder.loop_slot() {
             loops.push((slot, scope));
         }
     });
-    if awaiting {
-        return DependencyRecognition::Awaiting;
+    if let Some(iterable) = source.loop_argument_iterable {
+        iterable.visit_placeholders(&mut |placeholder, _| {
+            if let Some(name) = placeholder.module_argument_name() {
+                unbound_arguments.push(crate::resource::RelativeBindingName::new(name));
+            }
+        });
     }
+    let mut uses_loop = !loops.is_empty();
+    let mut has_binding_refs = false;
+    value.visit_binding_refs(&mut |binding| {
+        has_binding_refs = true;
+        let mut names = Vec::new();
+        binding.record_graph_key(&mut names);
+        uses_loop |= names.iter().any(|name| source.loop_slot(name).is_some());
+    });
     let mut actual = Vec::new();
     value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
         actual.push(reference.to_origin())
     });
+    if uses_loop && let Some(iterable) = source.loop_argument_iterable {
+        iterable.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+            actual.push(reference.to_origin())
+        });
+    }
     // A pending value can retain its authored selector after an upstream
     // unknown replaced the live reference. Loop substitutions instead name
     // their binding pattern, not the iterable retained beneath its syntax.
-    let mut allow_unprojected = actual.is_empty() && loops.is_empty();
-    value.visit_binding_refs(&mut |_| allow_unprojected = true);
+    let allow_unprojected = has_binding_refs || (actual.is_empty() && loops.is_empty());
     let mut dependencies = PrefixDependencies {
         source,
+        authored,
+        site: PrefixDependencySite::Value,
         actual,
         named: Vec::new(),
-        argument_call: None,
+        awaiting: !unbound_arguments.is_empty(),
+        unbound_arguments,
         visiting: Vec::new(),
         allow_unprojected,
     };
@@ -1584,7 +1731,7 @@ fn deferred_prefix_dependencies<P: PlaceholderKind, V: PlaceholderKind, B: Bindi
         if !dependencies
             .named
             .iter()
-            .any(|(identity, _, _)| identity == &DependencyIdentity::Loop(slot))
+            .any(|named| named.identity == DependencyIdentity::Loop(slot))
         {
             dependencies.loop_variable(slot, scope, None, None);
         }
@@ -1592,11 +1739,7 @@ fn deferred_prefix_dependencies<P: PlaceholderKind, V: PlaceholderKind, B: Bindi
     for reference in &dependencies.actual.clone() {
         let reference = reference.as_ref();
         let key = DependencyIdentity::Resource(reference.identity().path_key());
-        if !dependencies
-            .named
-            .iter()
-            .any(|(identity, _, _)| identity == &key)
-        {
+        if !dependencies.named.iter().any(|named| named.identity == key) {
             dependencies.push(
                 key,
                 None,
@@ -1608,17 +1751,43 @@ fn deferred_prefix_dependencies<P: PlaceholderKind, V: PlaceholderKind, B: Bindi
             );
         }
     }
-    let mut named = dependencies
-        .named
+    let mut groups: Vec<PrefixOwnerGroup<B>> = Vec::new();
+    for named in dependencies.named {
+        if let Some(group) = groups.iter_mut().find(|group| group.owner == named.owner) {
+            group.rest.push(named);
+        } else {
+            groups.push(PrefixOwnerGroup {
+                owner: named.owner.clone(),
+                first: named,
+                rest: Vec::new(),
+            });
+        }
+    }
+    let groups = groups
         .into_iter()
-        .map(|(_, _, dependency)| dependency);
-    match named.next() {
-        Some(first) => DependencyRecognition::Named(DeferredPrefixDependencies {
-            first,
-            rest: named.collect(),
-            argument_call: dependencies.argument_call,
-        }),
-        None => DependencyRecognition::Absent,
+        .map(|group| {
+            let keys = std::iter::once(&group.first)
+                .chain(&group.rest)
+                .map(NamedPrefixDependency::key)
+                .collect();
+            DeferredPrefixDependencies {
+                first: group.first.dependency,
+                rest: group
+                    .rest
+                    .into_iter()
+                    .map(|named| named.dependency)
+                    .collect(),
+                argument_call: group.owner,
+                keys,
+            }
+        })
+        .collect::<Vec<_>>();
+    if !groups.is_empty() {
+        DependencyRecognition::Named(groups)
+    } else if dependencies.awaiting {
+        DependencyRecognition::Awaiting
+    } else {
+        DependencyRecognition::Absent
     }
 }
 
@@ -1722,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_prefix_rejects_owner_before_attribute_admission() {
+    fn deferred_prefix_keeps_sibling_attribute_admission() {
         let schemas = schemas();
         let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         for (value, dependency) in [
@@ -1756,11 +1925,91 @@ mod tests {
             let owners = canonical.analysis_tree().unwrap();
             assert_eq!(
                 owners.resources().count(),
-                1,
-                "only src can enter admission"
+                2,
+                "the deferred companion must not reject sibling admission"
             );
-            assert_eq!(owners.rejected_resources().count(), 1);
+            assert_eq!(owners.rejected_resources().count(), 0);
+            let owner = owners.resources().last().unwrap();
+            assert!(owner.awaiting_prefixes().awaits_prefix("name_prefix"));
+            assert!(owner.awaiting_prefixes().awaits_base("name"));
         }
+    }
+
+    #[test]
+    fn prefix_caller_values_use_the_authored_alias_renderer() {
+        let schemas = schemas();
+        let resource = crate::parser::parse_and_resolve("mock.Sink { name = 'sink' }\n")
+            .unwrap()
+            .resources
+            .pop()
+            .unwrap();
+        let expressions: crate::parser::retained::Expressions<
+            crate::resource::RelativeBindingName,
+        > = Default::default();
+        let variables: IndexMap<
+            String,
+            Value<ParserPlaceholder, crate::resource::RelativeBindingName>,
+        > = IndexMap::from([(
+            "a.p".into(),
+            Value::Deferred(crate::resource::DeferredValue::ResourceRef {
+                path: AccessPath::from_binding("src".into(), "identifier", Vec::new()),
+            }),
+        )]);
+        let errors = canonicalize_prefix_values(
+            schemas.get_for(&resource).unwrap(),
+            PrefixSource {
+                id: &resource.id,
+                declaration: None,
+                slots: None,
+                expressions: &expressions,
+                variables: &variables,
+                module_source: None,
+                loop_binding: None,
+                loop_argument_iterable: None,
+                loop_iterable_location: None,
+            },
+            IndexMap::from([(
+                "name_prefix".into(),
+                Value::Deferred(crate::resource::DeferredValue::BindingRef {
+                    binding: "a.p".into(),
+                }),
+            )]),
+            SuffixSource::Preview,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].diagnostic_message(),
+            "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier' (through 'p'), which is known only after apply"
+        );
+    }
+
+    #[test]
+    fn prefix_caller_values_name_a_binding_without_a_definition() {
+        let context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let schemas = schemas();
+        let file = crate::parser::parse_and_resolve("mock.Sink { name = 'sink' }\n").unwrap();
+        let canonical =
+            canonicalize_file_prefixes(file, &schemas, SuffixSource::Preview).judge(&context);
+        let tree = canonical.analysis_tree().unwrap();
+        let errors = tree
+            .resources()
+            .next()
+            .unwrap()
+            .with_values(&IndexMap::from([(
+                "name_prefix".into(),
+                Value::Deferred(crate::resource::DeferredValue::BindingRef {
+                    binding: "unregistered".into(),
+                }),
+            )]))
+            .err()
+            .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].diagnostic_message(),
+            "'name_prefix' must be known at plan time to generate 'name', but it depends on 'unregistered', which is known only after apply"
+        );
     }
 
     #[test]

@@ -1205,6 +1205,15 @@ impl JudgedSlot {
 impl<B: BindingAddress> JudgedSlot<B> {
     /// Diagnostic syntax inventory, independent of the current projection/judgement.
     /// Inlining an alias or substituting a module argument must retain its authored name.
+    /// Use the parser's iterable span in this slot's concrete instance.
+    pub(crate) fn dependency_uses_at(
+        &self,
+        location: &crate::parser::DeclarationLocation,
+        expressions: &super::Expressions<B>,
+    ) -> Vec<super::AuthoredDependency<B>> {
+        expressions.dependency_uses_at(&self.root.location.instance, location)
+    }
+
     pub(crate) fn dependency_uses(&self) -> Vec<super::AuthoredDependency<B>> {
         let mut uses = Vec::new();
         self.root

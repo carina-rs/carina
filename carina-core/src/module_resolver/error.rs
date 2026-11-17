@@ -143,10 +143,6 @@ pub enum ModuleError {
     )]
     UnexpandedModuleTemplate { context: String },
 
-    /// An authored sibling of a prefix obligation failed before expansion.
-    #[error("{0}")]
-    Resource(Box<crate::validation::ResourceAdmissionFinding>),
-
     #[error("Reference type validation failed: {0}")]
     ReferenceType(crate::validation::ExpansionBoundaryReferenceErrors),
 
@@ -328,7 +324,6 @@ impl ModuleError {
             | Self::ArgumentValueAccess { .. }
             | Self::DroppedConditionalBinding { .. }
             | Self::UnexpandedModuleTemplate { .. }
-            | Self::Resource(_)
             | Self::ReferenceType(_)
             | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
@@ -385,7 +380,6 @@ impl ModuleError {
                 line: _,
             }
             | Self::UnexpandedModuleTemplate { context: _ }
-            | Self::Resource(_)
             | Self::ReferenceType(_)
             | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
@@ -457,7 +451,6 @@ impl ModuleError {
             | Self::ArgumentValueAccess { .. }
             | Self::DroppedConditionalBinding { .. }
             | Self::UnexpandedModuleTemplate { .. }
-            | Self::Resource(_)
             | Self::ReferenceType(_)
             | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)
@@ -579,7 +572,6 @@ impl ModuleError {
             | Self::CircularImport(_)
             | Self::MissingArgument { .. }
             | Self::InvalidArgumentType { .. }
-            | Self::Resource(_)
             | Self::ReferenceType(_)
             | Self::Io(_)
             | Self::UnknownArgument { .. }
@@ -615,7 +607,6 @@ impl ModuleError {
             | Self::ArgumentValueAccess { .. }
             | Self::DroppedConditionalBinding { .. }
             | Self::UnexpandedModuleTemplate { .. }
-            | Self::Resource(_)
             | Self::ReferenceType(_)
             | Self::AnalysisInvariant(_)
             | Self::TypeResolution(_)

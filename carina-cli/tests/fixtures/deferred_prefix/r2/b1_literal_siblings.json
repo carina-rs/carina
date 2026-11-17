@@ -1,0 +1,101 @@
+{
+  "text": "Validating...\nError: mock.test.resource.<pending>: Unknown attribute 'nope', did you mean 'name'?\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\n",
+  "text_exit": 1,
+  "json": {
+    "errors": [
+      {
+        "code": null,
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "end": {
+              "column": 41,
+              "line": 3
+            },
+            "start": {
+              "column": 33,
+              "line": 3
+            }
+          }
+        },
+        "message": "Unknown attribute 'nope', did you mean 'name'?",
+        "severity": "error"
+      },
+      {
+        "code": null,
+        "location": {
+          "file": "child/main.crn",
+          "range": {
+            "end": {
+              "column": 12,
+              "line": 3
+            },
+            "start": {
+              "column": 3,
+              "line": 3
+            }
+          }
+        },
+        "message": "Unknown attribute 'bogus'",
+        "severity": "error"
+      }
+    ],
+    "resource_count": 0,
+    "resources": [],
+    "status": "error"
+  },
+  "json_exit": 1,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "message": "Unknown attribute 'bogus'",
+        "range": {
+          "end": {
+            "character": 11,
+            "line": 2
+          },
+          "start": {
+            "character": 2,
+            "line": 2
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "lets.crn": [],
+    "main.crn": [
+      {
+        "message": "mock.test.resource.<pending>: Unknown attribute 'bogus'",
+        "range": {
+          "end": {
+            "character": 28,
+            "line": 1
+          },
+          "start": {
+            "character": 8,
+            "line": 1
+          }
+        },
+        "severity": 1
+      },
+      {
+        "message": "Unknown attribute 'nope', did you mean 'name'?",
+        "range": {
+          "end": {
+            "character": 40,
+            "line": 2
+          },
+          "start": {
+            "character": 32,
+            "line": 2
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "providers.crn": []
+  }
+}

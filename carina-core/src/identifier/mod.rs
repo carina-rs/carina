@@ -1510,7 +1510,7 @@ enum AttributePrefixFailure {
     Conflict(String),
     Deferred {
         base: String,
-        dependencies: DeferredPrefixDependencies,
+        dependencies: Box<DeferredPrefixDependencies>,
     },
 }
 
@@ -1518,9 +1518,27 @@ enum AttributePrefixFailure {
 /// unrecognized attribute or authorize ordinary required-attribute admission.
 #[derive(Debug, Clone, PartialEq)]
 struct DeferredPrefixDependencies {
+    keys: Vec<PrefixDependencyKey>,
     first: PrefixDependency,
     rest: Vec<PrefixDependency>,
     argument_call: Option<crate::parser::ModuleCallId>,
+}
+
+/// Opaque source identity survives diagnostic redaction and binding typestates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrefixDependencyKey {
+    path: PrefixDependencyPath,
+    through: Option<crate::resource::DependencyKey<crate::resource::RelativeBindingName>>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrefixDependencyPath {
+    Resource(
+        crate::resource::DependencyKey<
+            crate::resource::AccessPath<crate::resource::RelativeBindingName>,
+        >,
+    ),
+    Binding(crate::resource::DependencyKey<crate::resource::RelativeBindingName>),
+    Loop(crate::resource::LoopSlot),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1564,6 +1582,39 @@ impl std::fmt::Display for DeferredPrefixDependencies {
 }
 
 impl AttributePrefixError {
+    fn same_argument_finding(&self, other: &Self) -> bool {
+        use crate::finding::FindingOwner;
+        let (FindingOwner::ModuleArgument(_), FindingOwner::ModuleArgument(_)) =
+            (&self.owner, &other.owner)
+        else {
+            return false;
+        };
+        let (
+            AttributePrefixFailure::Deferred {
+                base: left_base,
+                dependencies: left,
+            },
+            AttributePrefixFailure::Deferred {
+                base: right_base,
+                dependencies: right,
+            },
+        ) = (&self.failure, &other.failure)
+        else {
+            return false;
+        };
+        self.owner == other.owner
+            && self.prefix == other.prefix
+            && left_base == right_base
+            && left.keys.len() == right.keys.len()
+            && left.keys.iter().all(|key| right.keys.contains(key))
+    }
+
+    /// Empty/conflicting companions prevent name generation. A deferred
+    /// companion instead retains its obligation while siblings are admitted.
+    pub fn blocks_name_resolution(&self) -> bool {
+        !matches!(self.failure, AttributePrefixFailure::Deferred { .. })
+    }
+
     pub fn owner(&self) -> &crate::finding::FindingOwner {
         &self.owner
     }

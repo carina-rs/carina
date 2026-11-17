@@ -1,0 +1,90 @@
+{
+  "text": "Validating...\nError: ./main.crn:2:12: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply\nError: ./mod_a/main.crn:2:13: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply\n",
+  "text_exit": 1,
+  "json": {
+    "errors": [
+      {
+        "code": null,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "severity": "error",
+        "location": {
+          "file": "main.crn",
+          "range": {
+            "start": {
+              "line": 2,
+              "column": 12
+            },
+            "end": {
+              "line": 2,
+              "column": 41
+            }
+          }
+        }
+      },
+      {
+        "code": null,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply",
+        "severity": "error",
+        "location": {
+          "file": "mod_a/main.crn",
+          "range": {
+            "start": {
+              "line": 2,
+              "column": 13
+            },
+            "end": {
+              "line": 2,
+              "column": 59
+            }
+          }
+        }
+      }
+    ],
+    "resource_count": 0,
+    "resources": [],
+    "status": "error"
+  },
+  "json_exit": 1,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "lets.crn": [],
+    "main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "severity": 1,
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 11
+          },
+          "end": {
+            "line": 1,
+            "character": 40
+          }
+        }
+      }
+    ],
+    "mod_a/arguments.crn": [],
+    "mod_a/lets.crn": [],
+    "mod_a/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply",
+        "severity": 1,
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 12
+          },
+          "end": {
+            "line": 1,
+            "character": 58
+          }
+        }
+      }
+    ],
+    "mod_a/mod_b/arguments.crn": [],
+    "mod_a/mod_b/main.crn": [],
+    "providers.crn": []
+  }
+}

@@ -5351,14 +5351,14 @@ enum ValidatableKind {
 /// A resource-admission failure retains its schema error and authored owner.
 /// Display is the execution-facing presentation; diagnostic clients consume
 /// the typed error and location without parsing that presentation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ResourceAdmissionFinding {
     human: String,
     detail: ResourceAdmissionDetail,
     location: Option<crate::parser::DeclarationLocation>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ResourceAdmissionDetail {
     Schema {
         resource: crate::resource::ResourceId,
@@ -5542,14 +5542,7 @@ impl ResourceAdmissionFindings {
     }
 }
 
-#[derive(Clone, Copy)]
-enum SchemaFindingLocations {
-    Existing,
-    Authored,
-}
-
 struct ValueAdmission<'a, B: BindingAddress> {
-    locations: SchemaFindingLocations,
     report: &'a crate::parser::retained::ExpressionReport<B>,
     coverage: &'a mut crate::schema::value_validation::WalkCoverage,
 }
@@ -5563,7 +5556,6 @@ type ResourceAdmissionValues = HashMap<
 >;
 
 struct ResourceValidationContext<'a, B: BindingAddress> {
-    locations: SchemaFindingLocations,
     report: &'a crate::parser::retained::ExpressionReport<B>,
     registry: &'a SchemaRegistry,
     known_providers: &'a HashSet<String>,
@@ -5662,9 +5654,7 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                 if !rendered_symbolically {
                     // The value-only validate_resources API keeps its existing
                     // unlocated projection. Full admission has the authored view.
-                    let location = if context.admissions.is_some()
-                        || matches!(context.locations, SchemaFindingLocations::Authored)
-                    {
+                    let location = if context.admissions.is_some() {
                         match provenance.schema_diagnostic_location(diagnostic) {
                             Ok(location) => location,
                             Err(error) => {
@@ -5772,7 +5762,6 @@ pub fn validate_resources<
                 None,
                 diagnostics,
                 ValueAdmission {
-                    locations: SchemaFindingLocations::Existing,
                     report: &report,
                     coverage,
                 },
@@ -5790,56 +5779,6 @@ pub fn validate_resources<
     }
 }
 
-/// Check siblings of a companion obligation before substituting module
-/// arguments. Only obligation-bearing owners enter this pass; ordinary module
-/// resources keep their existing validation order and diagnostics.
-pub(crate) fn awaiting_prefix_sibling_findings(
-    parsed: &crate::parser::ParsedFile,
-    schemas: &SchemaRegistry,
-    context: &ProviderContext,
-) -> Result<Vec<ResourceAdmissionFinding>, crate::parser::AnalysisTreeError> {
-    let canonical = crate::identifier::canonicalize_file_prefixes(
-        parsed.clone(),
-        schemas,
-        crate::identifier::SuffixSource::Preview,
-    );
-    if !canonical.has_awaiting_prefixes() {
-        return Ok(Vec::new());
-    }
-    let canonical = canonical.judge(context);
-    let mut inputs = canonical.schema_validation_resources()?;
-    inputs.resources.retain(|resource| {
-        let input = match resource {
-            crate::identifier::CanonicalSchemaResource::Resource(_, input)
-            | crate::identifier::CanonicalSchemaResource::DataSource(_, input)
-            | crate::identifier::CanonicalSchemaResource::Deferred(_, input) => input,
-        };
-        input
-            .as_ref()
-            .is_some_and(|(_, values)| !values.awaiting.is_empty())
-    });
-    if inputs.resources.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut run: ConversionValidation = ConversionValidation::new(canonical.report());
-    let findings = run.walk_in(FindingSubject::Root, |coverage| {
-        resource_values_report(
-            inputs,
-            schemas,
-            &HashSet::new(),
-            context,
-            None,
-            &mut Vec::new(),
-            ValueAdmission {
-                report: canonical.report(),
-                coverage,
-                locations: SchemaFindingLocations::Authored,
-            },
-        )
-    });
-    Ok(findings)
-}
-
 fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>(
     inputs: crate::identifier::CanonicalSchemaInputs<'_, P, T, B>,
     registry: &SchemaRegistry,
@@ -5850,11 +5789,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
     admission: ValueAdmission<'_, B>,
 ) -> Vec<ResourceAdmissionFinding> {
     use crate::identifier::CanonicalSchemaResource;
-    let ValueAdmission {
-        report,
-        coverage,
-        locations,
-    } = admission;
+    let ValueAdmission { report, coverage } = admission;
     let mut all_errors = ResourceAdmissionFindings::default();
     // A standalone module receives its providers from the caller, so schema
     // availability cannot be decided until its resources are expanded into a
@@ -5886,7 +5821,6 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
     // *opposite* kind exists.
     {
         let mut context = ResourceValidationContext {
-            locations,
             report,
             registry,
             known_providers,
@@ -6009,7 +5943,10 @@ pub fn resource_reference_findings_in<
         &subject,
         presentation::AdmissionBoundary::Live,
     )?;
-    run.ordinary(report.findings.0, subject);
+    run.ordinary(
+        report.prefixes.into_iter().chain(report.findings.0),
+        subject,
+    );
     Ok(())
 }
 
@@ -6042,7 +5979,10 @@ pub fn resource_reference_preflight_findings_in<F: ValidationClientError>(
         &subject,
         presentation::AdmissionBoundary::Preflight,
     )?;
-    run.ordinary(report.findings.0, subject);
+    run.ordinary(
+        report.prefixes.into_iter().chain(report.findings.0),
+        subject,
+    );
     Ok(())
 }
 
@@ -6096,7 +6036,10 @@ pub fn resource_admission_findings_in<
         run,
         &subject,
     )?;
-    run.ordinary(report.findings.0, subject);
+    run.ordinary(
+        report.prefixes.into_iter().chain(report.findings.0),
+        subject,
+    );
     Ok(())
 }
 
@@ -6134,14 +6077,15 @@ fn complete_resource_admission_report<
             Some(&report.attributes),
             diagnostics,
             ValueAdmission {
-                locations: SchemaFindingLocations::Existing,
                 report: judged.report(),
                 coverage,
             },
         )
     });
-    findings.extend(report.findings.0);
-    report.findings = ResourceAdmissionFindings(findings);
+    let mut ordered = std::mem::take(&mut report.prefixes);
+    ordered.append(&mut findings);
+    ordered.extend(report.findings.0);
+    report.findings = ResourceAdmissionFindings(ordered);
     Ok(report)
 }
 
@@ -6154,24 +6098,32 @@ fn publish_admission_diagnostics<T>(
 
 struct ResourceAdmissionReport {
     attributes: ResourceAdmissionValues,
-    // Required prefix rejections and reference findings have one consuming exit.
+    prefixes: Vec<ResourceAdmissionFinding>,
     findings: ResourceAdmissionFindings,
 }
 impl ResourceAdmissionReport {
     fn new<F>(
         file: &crate::identifier::PrefixCanonicalized<'_, F>,
         attributes: ResourceAdmissionValues,
-        mut references: ResourceAdmissionFindings,
+        references: ResourceAdmissionFindings,
+        boundary: presentation::AdmissionBoundary,
     ) -> Self {
-        let mut findings = file
+        let prefixes = file
             .prefix_errors()
             .iter()
+            // A template preflight cannot stop the caller graph's sibling
+            // admission on a deferred companion. Its obligation survives;
+            // the live pass publishes its fully attributed finding once.
+            .filter(|error| {
+                matches!(boundary, presentation::AdmissionBoundary::Live)
+                    || error.blocks_name_resolution()
+            })
             .map(ResourceAdmissionFinding::prefix)
             .collect::<Vec<_>>();
-        findings.append(&mut references.0);
         Self {
             attributes,
-            findings: ResourceAdmissionFindings(findings),
+            prefixes,
+            findings: references,
         }
     }
 }
@@ -6382,7 +6334,9 @@ fn resource_admission_report<
         ));
     }
 
-    Ok(ResourceAdmissionReport::new(judged, attributes, all_errors))
+    Ok(ResourceAdmissionReport::new(
+        judged, attributes, all_errors, boundary,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

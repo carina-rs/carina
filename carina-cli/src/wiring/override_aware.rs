@@ -123,10 +123,17 @@ impl<'s, E> ParserCanonicalResourcePair<'s, E> {
     pub(crate) fn resolve_attr_prefixes_report(
         self,
     ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixError>> {
-        if self.parsed.prefix_errors().is_empty() {
+        let errors = self
+            .parsed
+            .prefix_errors()
+            .iter()
+            .filter(|error| error.blocks_name_resolution())
+            .cloned()
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
             Ok(self)
         } else {
-            Err(self.parsed.prefix_errors().to_vec())
+            Err(errors)
         }
     }
     pub fn parsed(&self) -> carina_core::identifier::ModuleResolvedFileRead<'_, E> {

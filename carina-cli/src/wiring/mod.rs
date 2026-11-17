@@ -3811,6 +3811,7 @@ pub(crate) fn resolve_file_names_with_ctx<
         canonical
             .prefix_errors()
             .iter()
+            .filter(|error| error.blocks_name_resolution())
             .cloned()
             .map(|error| AppError::AttributePrefix(Box::new(error))),
     );

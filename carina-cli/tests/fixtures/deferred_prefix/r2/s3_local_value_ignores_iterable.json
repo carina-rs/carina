@@ -1,0 +1,70 @@
+{
+  "text": "Validating...\nError: mock.test.resource.s.children[?]: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply\n",
+  "text_exit": 1,
+  "json": {
+    "errors": [
+      {
+        "code": null,
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply",
+        "severity": "error",
+        "location": {
+          "file": "child/main.crn",
+          "range": {
+            "start": {
+              "line": 3,
+              "column": 5
+            },
+            "end": {
+              "line": 3,
+              "column": 35
+            }
+          }
+        }
+      }
+    ],
+    "resource_count": 0,
+    "resources": [],
+    "status": "error"
+  },
+  "json_exit": 1,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "child/arguments.crn": [],
+    "child/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply",
+        "range": {
+          "start": {
+            "line": 2,
+            "character": 4
+          },
+          "end": {
+            "line": 2,
+            "character": 34
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "lets.crn": [],
+    "main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply",
+        "severity": 1,
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 8
+          },
+          "end": {
+            "line": 1,
+            "character": 51
+          }
+        }
+      }
+    ],
+    "providers.crn": [],
+    "child/lets.crn": []
+  }
+}
