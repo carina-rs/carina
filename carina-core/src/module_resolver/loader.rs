@@ -28,7 +28,17 @@ pub struct ModuleTemplate {
 /// Judgement evidence for the separate module-template preflight boundary.
 /// Root configuration judgements cannot enter this boundary.
 pub struct ModuleTemplatePreflight<'a> {
-    configuration: crate::config_loader::BufferConfiguration<'a>,
+    configuration: crate::identifier::PrefixCanonicalized<
+        'a,
+        crate::parser::retained::JudgedFile<
+            'a,
+            crate::parser::ParsedExportParam,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
+        >,
+    >,
 }
 
 impl LoadedModule {
@@ -64,27 +74,31 @@ impl ModuleTemplate {
         context: &ProviderContext,
     ) -> ModuleTemplatePreflight<'a> {
         ModuleTemplatePreflight {
-            configuration: crate::config_loader::load_buffer_configuration(
-                &self.parsed,
+            configuration: crate::identifier::canonicalize_file_prefixes(
+                self.parsed.clone(),
                 schemas,
-                context,
-            ),
+                crate::identifier::SuffixSource::Preview,
+            )
+            .judge(context),
         }
     }
 }
 
-impl ModuleTemplatePreflight<'_> {
+impl<'a> ModuleTemplatePreflight<'a> {
     pub fn judged(
         &self,
-    ) -> &crate::parser::retained::JudgedFile<
-        '_,
-        crate::parser::ParsedExportParam,
-        crate::parser::ParsedDeferredForPhase<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
+    ) -> &crate::identifier::PrefixCanonicalized<
+        'a,
+        crate::parser::retained::JudgedFile<
+            'a,
+            crate::parser::ParsedExportParam,
+            crate::parser::ParsedDeferredForPhase<
+                crate::resource::ParserPlaceholder,
+                crate::resource::RelativeBindingName,
+            >,
         >,
     > {
-        self.configuration.judged()
+        &self.configuration
     }
 }
 
@@ -174,6 +188,7 @@ pub(crate) fn load_module_with_overrides(
     config: &ProviderContext,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> Option<ParsedFile> {
+    overrides.record_module_directory(path);
     if !path.is_dir() {
         return None;
     }
@@ -190,6 +205,7 @@ pub(super) fn source_paths_with_overrides(
     dir: &ResolvedPath,
     overrides: &crate::config_loader::SourceOverrides,
 ) -> std::io::Result<Vec<ResolvedPath>> {
+    overrides.record_module_directory(dir);
     crate::config_loader::DirectoryFiles::discover(dir, overrides)
         .map(crate::config_loader::DirectoryFiles::into_paths)
 }

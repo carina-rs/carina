@@ -11,7 +11,6 @@ use crate::provider::ReferenceScope;
 use crate::resource::{
     CanonicalEnumValue, ExpandedConcreteValue as ConcreteValue,
     ExpandedDeferredValue as DeferredValue, ExpandedResource as Resource, ExpandedValue as Value,
-    ValueString,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, ReferenceForm, ReferenceForms, ReferenceTemplate,
@@ -2282,33 +2281,6 @@ fn secret_in_find_changed_attributes_no_change() {
         changed.is_empty(),
         "Secret with matching hash should not show as changed, got: {:?}",
         changed
-    );
-}
-
-#[test]
-fn diagnostic_sensitive_string_matches_plain_state_without_diff() {
-    let desired = HashMap::from([(
-        "name".to_string(),
-        Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-            "hunter2SECRET",
-        ))),
-    )]);
-    let current = HashMap::from([(
-        "name".to_string(),
-        Value::Concrete(ConcreteValue::String("hunter2SECRET".into())),
-    )]);
-
-    let changed = find_changed_attributes(
-        &desired,
-        &current,
-        None,
-        &NestedWriteOnlyRecord::new(),
-        None,
-        None,
-    );
-    assert!(
-        changed.is_empty(),
-        "marker must not create diff churn: {changed:?}"
     );
 }
 

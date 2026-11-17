@@ -554,7 +554,6 @@ mod structural_consumers {
     use indexmap::IndexMap;
 
     use carina_core::parser::ProviderContext;
-    use carina_core::resource::knowledge::KnowledgeContext;
     use carina_core::resource::{
         ConcreteValue, DeferredValue, NoPlaceholder, RelativeBindingName, Value,
     };
@@ -588,13 +587,7 @@ mod structural_consumers {
                 ]))),
                 default: Box::new(Value::Concrete(ConcreteValue::List(vec![]))),
             });
-        let attributes = IndexMap::from([(
-            "values".to_owned(),
-            value
-                .knowledge(&KnowledgeContext::validation())
-                .map(|proof| proof.into_classification())
-                .unwrap(),
-        )]);
+        let attributes = IndexMap::from([("values".to_owned(), value)]);
         let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
         let mut report = carina_core::test_utils::admit_resource_attribute_report(
             schema,
@@ -604,7 +597,7 @@ mod structural_consumers {
         );
         assert_eq!(report.errors().count(), 0);
         assert_eq!(
-            report.take_attribute("values").unwrap().structure(),
+            report.take_attribute("values").unwrap().0.structure(),
             ValueStructure::List
         );
     }

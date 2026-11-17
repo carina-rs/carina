@@ -209,11 +209,10 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
                 else {
                     panic!("{failure:?}")
                 };
-                assert_eq!(errors.errors(), expected);
+                assert!(errors.errors().eq(expected.iter()), "{errors:?}");
                 assert!(
                     errors
                         .errors()
-                        .iter()
                         .all(|error| error.attribute_name() == Some("target"))
                 );
                 assert_eq!(

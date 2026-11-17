@@ -8,6 +8,24 @@ use std::sync::{Arc, Mutex};
 
 type TableResult = Result<wire::ReferenceOutcome, wire::ReferenceError>;
 
+fn parsed_secret(raw: &str) -> Value {
+    let source = format!(
+        "let result = secret({})",
+        crate::parser::display_string_literal(raw)
+    );
+    crate::parser::parse(
+        &source,
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .variables
+    .shift_remove("result")
+    .unwrap()
+    .resolve_root(&crate::resource::RootScope::new())
+    .into_expanded()
+    .unwrap()
+}
+
 #[test]
 fn reference_error_display_uses_retryability_class() {
     use crate::provider_text::Retryability;
@@ -452,7 +470,7 @@ async fn round5_ordered_list_detail_rows_record_the_pairs_the_renderer_compares(
         &plan.effects()[0],
         Some(&fixture.registry),
         crate::detail_rows::DetailLevel::Full,
-        &crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+        &crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan),
         None,
         &fixture.router,
         crate::detail_rows::DetailComparisons::Planning(&references),
@@ -592,7 +610,7 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
         .unwrap();
     preparation
         .display(
-            plan.clone(),
+            &plan,
             &prepared.references,
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, &fixture.saved),
             crate::detail_rows::DetailLevel::Full,
@@ -629,7 +647,7 @@ async fn successive_preparations_and_detail_rendering_share_a_router_without_glo
             .effects()
             .first()
             .expect("reference repoint produces an Update");
-        let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+        let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
         let rows = crate::detail_rows::build_detail_rows_by_instance(
             effect,
             Some(&fixture.registry),
@@ -931,7 +949,7 @@ async fn round9_scalar_to_list_union_enumerates_planning_and_display_operands() 
     fixture.calls.lock().unwrap().clear();
     ReferencePreparation::default()
         .display(
-            crate::input_rules::FinalizedPlan::new(plan.clone())
+            &crate::input_rules::FinalizedPlan::new(plan.clone())
                 .check_inputs(&fixture.registry, &HashMap::new())
                 .unwrap(),
             &prepare_empty_for_tests(),
@@ -1122,20 +1140,14 @@ async fn round8_whole_batch_errors_are_cached_for_each_value_and_judged_on_use()
 #[tokio::test]
 async fn round8_unused_secret_values_are_never_requested_or_rejected_by_enumeration() {
     const SECRET: &str = "alias/secret-saved";
-    for wrapped in [true, false] {
+    {
         let mut fixture = Fixture::new(
             string("alias/live"),
             string("key/a"),
             HashMap::from([("alias/live".into(), resolved("key/a"))]),
             false,
         );
-        let value = if wrapped {
-            Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET)).into()))
-        } else {
-            Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-                SECRET,
-            )))
-        };
+        let value = parsed_secret(SECRET);
         fixture.saved = crate::test_support::raw_saved_attrs(HashMap::from([(
             fixture.desired[0].id.clone(),
             HashMap::from([("key".into(), value)]),
@@ -1157,14 +1169,8 @@ async fn round8_compared_secret_reference_list_leaves_keep_typed_paths_and_redac
     use crate::schema::AttributeType;
     const SECRET: &str = "alias/private-list-secret";
     for ordered in [true, false] {
-        for wrapped in [true, false] {
-            let secret = if wrapped {
-                Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET)).into()))
-            } else {
-                Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-                    SECRET,
-                )))
-            };
+        {
+            let secret = parsed_secret(SECRET);
             let mut fixture =
                 Fixture::new(string("unused"), string("unused"), HashMap::new(), false);
             let element = AttributeType::reference(identity(), None, None);
@@ -1193,7 +1199,7 @@ async fn round8_compared_secret_reference_list_leaves_keep_typed_paths_and_redac
             );
             let error = match fixture.prepare().await {
                 Err(error) => error,
-                Ok(_) => panic!("secret list ordered={ordered}, wrapped={wrapped}"),
+                Ok(_) => panic!("secret list ordered={ordered}"),
             };
             assert!(matches!(
                 error.source,
@@ -2149,7 +2155,7 @@ async fn unordered_list_index_ignore_precedes_projection_pairing_and_saved_merge
     let Current::Present(current) = fixture.current[&fixture.desired[0].id].current() else {
         unreachable!()
     };
-    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     historical.set_update_from_provider_and_persisted(
         fixture.desired[0].id.clone(),
         &current.state().attributes,
@@ -2180,9 +2186,7 @@ async fn unordered_list_index_ignore_precedes_projection_pairing_and_saved_merge
 fn comparator_reference_errors_render_the_nested_attribute_path() {
     for sensitive in [false, true] {
         let raw = if sensitive {
-            Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
-                "alias/private",
-            )))
+            parsed_secret("alias/private")
         } else {
             string("alias/unprepared")
         };
@@ -2675,18 +2679,52 @@ async fn round2_ecr_saved_only_reference_is_collected_against_read_arn() {
 }
 
 #[tokio::test]
+async fn env_reference_resolves_and_compares_as_public_string() {
+    let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        "CARINA_4409_REFERENCE".to_string(),
+        "alias/from-env".into(),
+    )]));
+    let value = crate::builtins::evaluate_builtin_with_config_to_value(
+        "env",
+        &[string("CARINA_4409_REFERENCE")],
+        &config,
+    )
+    .unwrap();
+    let fixture = Fixture::new(
+        value,
+        string("key/a"),
+        HashMap::from([("alias/from-env".into(), resolved("key/a"))]),
+        false,
+    );
+    let unprepared = fixture.plan(&prepare_empty_for_tests());
+    let prepared = fixture.prepare().await;
+    let references = prepared.expect("ordinary env references must reach the provider");
+    assert!(matches!(
+        unprepared,
+        Err(crate::differ::PlanComparisonError::Reference(error))
+            if matches!(error.source, ReferenceFailure::MissingWitness)
+    ));
+    let plan = fixture.plan(&references).unwrap();
+    assert!(
+        plan.effects().is_empty(),
+        "the alias resolves to the current key"
+    );
+    let calls = fixture.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0]
+            .iter()
+            .any(|request| request.value == "alias/from-env")
+    );
+}
+
+#[tokio::test]
 async fn round2_secret_reference_is_rejected_before_any_guest_call() {
     const SECRET: &str = "alias/private-secret";
     for desired_side in [true, false] {
         for equal in [true, false] {
-            for wrapped in [true, false] {
-                let secret = if wrapped {
-                    Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET)).into()))
-                } else {
-                    Value::Concrete(ConcreteValue::String(
-                        crate::resource::ValueString::diagnostic_sensitive(SECRET),
-                    ))
-                };
+            {
+                let secret = parsed_secret(SECRET);
                 let ordinary = string(if equal { SECRET } else { "key/a" });
                 let (desired, current) = if desired_side {
                     (secret, ordinary)
@@ -2884,35 +2922,6 @@ async fn round2_provider_instance_batches_run_concurrently() {
     assert_eq!(fixture.calls.lock().unwrap().len(), 2);
 }
 
-#[test]
-fn reference_plan_errors_preserve_secret_redaction_without_preparation() {
-    let value = crate::resource::ValueString::diagnostic_sensitive("alias/private-secret");
-    let error = prepare_empty_for_tests()
-        .equal(
-            &ResourceId::with_identity("keys.Resource", "example"),
-            &identity(),
-            &value,
-            &"key/a".into(),
-            &[
-                ReferenceOperand {
-                    path: "key".into(),
-                    side: ReferenceSide::Desired,
-                },
-                ReferenceOperand {
-                    path: "key".into(),
-                    side: ReferenceSide::Current,
-                },
-            ],
-        )
-        .unwrap_err();
-    assert!(matches!(
-        error.source,
-        ReferenceFailure::Resolution(ReferenceError::InvalidReference(_))
-    ));
-    assert!(!error.to_string().contains("alias/private-secret"));
-    assert!(!format!("{error:?}").contains("alias/private-secret"));
-}
-
 #[tokio::test]
 async fn round4_byte_equal_current_does_not_turn_saved_pairing_into_a_desired_failure() {
     use crate::schema::AttributeType;
@@ -3074,7 +3083,7 @@ async fn round4_saved_deleted_alias_does_not_annotate_a_tag_update() {
         ResolvedResource::collect_resolved_with_schemas([target], &fixture.registry).unwrap();
     let references = fixture.prepare().await.unwrap();
     let plan = fixture.plan(&references).unwrap();
-    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     let rows = crate::detail_rows::build_detail_rows_by_instance(
         &plan.effects()[0],
         Some(&fixture.registry),
@@ -3182,7 +3191,7 @@ async fn round4_historical_list_pairing_uses_only_unmatched_reference_values() {
     let Current::Present(current) = fixture.current[&fixture.desired[0].id].current() else {
         unreachable!()
     };
-    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let mut historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     historical.set_update_from_provider_and_persisted(
         fixture.desired[0].id.clone(),
         &current.state().attributes,
@@ -3295,7 +3304,7 @@ async fn round4_dangling_note_requires_a_rendered_reference_field() {
             .is_some()
     );
     let plan = fixture.plan(&references).unwrap();
-    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     let rows = crate::detail_rows::build_detail_rows_by_instance(
         &plan.effects()[0],
         Some(&fixture.registry),
@@ -3362,7 +3371,7 @@ async fn round4_dangling_saved_value_is_labeled_saved_in_its_diff_row() {
     );
     let references = fixture.prepare().await.unwrap();
     let plan = fixture.plan(&references).unwrap();
-    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     let rows = crate::detail_rows::build_detail_rows_by_instance(
         &plan.effects()[0],
         Some(&fixture.registry),
@@ -3428,7 +3437,7 @@ async fn round4_historical_pairing_does_not_compare_unmanaged_reference_peers() 
     let references = fixture.prepare().await.unwrap();
     let plan = fixture.plan(&references).unwrap();
     assert!(fixture.calls.lock().unwrap().is_empty());
-    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
+    let historical = crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan);
     crate::detail_rows::build_detail_rows_by_instance(
         &plan.effects()[0],
         Some(&fixture.registry),
@@ -3627,7 +3636,7 @@ async fn round5_dangling_saved_leaf_does_not_annotate_a_different_list_element()
         &plan.effects()[0],
         Some(&fixture.registry),
         crate::detail_rows::DetailLevel::Full,
-        &crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+        &crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan),
         None,
         &fixture.router,
         crate::detail_rows::DetailComparisons::Planning(&references),
@@ -3686,7 +3695,7 @@ async fn round5_current_dangling_notes_keep_the_original_string_list_index() {
             &plan.effects()[0],
             Some(&fixture.registry),
             crate::detail_rows::DetailLevel::Full,
-            &crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+            &crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan),
             None,
             &fixture.router,
             crate::detail_rows::DetailComparisons::Planning(&references),
@@ -3841,7 +3850,7 @@ async fn round5_saved_map_union_grafts_retain_the_saved_side() {
         &plan.effects()[0],
         Some(&fixture.registry),
         crate::detail_rows::DetailLevel::Full,
-        &crate::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),
+        &crate::detail_rows::HistoricalDisplayAttributes::for_test_plan(&plan),
         None,
         &fixture.router,
         crate::detail_rows::DetailComparisons::Planning(&references),

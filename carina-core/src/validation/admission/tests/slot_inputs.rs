@@ -1,4 +1,5 @@
 use super::*;
+use crate::validation::admission::{kind, tests::selected_destination};
 
 #[cfg(debug_assertions)]
 #[test]
@@ -34,9 +35,10 @@ fn round1_seam_materialization_reports_unmatched_attribute_names() {
     let configuration =
         crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
     let tree = crate::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
-    let mut inputs = crate::validation::admission::attributes::ResourceAttributeInputs::new(
-        tree.resources().next().unwrap(),
-    );
+    let mut inputs =
+        crate::validation::admission::attributes::ResourceAttributeInputs::new_for_test(
+            tree.resources().next().unwrap(),
+        );
     let outcome = inputs.materialize(&indexmap::IndexMap::from([(
         "unmatched".into(),
         Value::Concrete(crate::resource::ConcreteValue::Int(1)),
@@ -88,9 +90,18 @@ fn seam_known_if_preserves_the_single_main_local_obligation() {
     let slot = resource.authored_slots.get("input").unwrap();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-    let destination = schemas
-        .resource_attribute_destination(&resource.id, "input", &catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        &resource.id,
+        "input",
+        &catalog,
+    );
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         let proof = slot
             .projection()
@@ -111,7 +122,7 @@ fn seam_known_if_preserves_the_single_main_local_obligation() {
 #[test]
 fn review_seam_producer_materialization_keeps_a_real_projection_pairing() {
     use crate::validation::admission::attributes::{
-        ResourceAttributeInputs, resource_attribute_admissions,
+        ResourceAttributeInputs, resource_attribute_admissions_for_test,
     };
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let mut schemas = SchemaRegistry::new();
@@ -136,7 +147,7 @@ fn review_seam_producer_materialization_keeps_a_real_projection_pairing() {
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
     let source = resource.authored_slot("input").unwrap();
-    let mut inputs = ResourceAttributeInputs::new(resource);
+    let mut inputs = ResourceAttributeInputs::new_for_test(resource);
     inputs
         .materialize(&indexmap::IndexMap::from([(
             "input".into(),
@@ -148,7 +159,7 @@ fn review_seam_producer_materialization_keeps_a_real_projection_pairing() {
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         let mut coverage = crate::validation::admission::WalkCoverage::default();
         let findings = {
-            let outcome = resource_attribute_admissions(
+            let outcome = resource_attribute_admissions_for_test(
                 resource,
                 judged.file(),
                 resource.schema(&schemas).unwrap(),

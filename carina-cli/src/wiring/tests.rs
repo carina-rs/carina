@@ -868,7 +868,7 @@ fn successful_validation_report_returns_the_resolved_file_as_a_result() {
     let resolved = report
         .into_result()
         .unwrap_or_else(|errors| panic!("empty configuration must validate: {errors:?}"));
-    assert!(resolved.resources.is_empty());
+    assert!(resolved.parsed().resources.is_empty());
 }
 
 #[test]
@@ -942,7 +942,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
                 normalizer: &provider,
                 provider_configs: &[],
                 remote_bindings: &HashMap::new(),
-                state_file: &state_file,
+                state_file: &carina_state::ObservedStateFile::for_test((state_file).clone()),
                 state_block_claims: &state_block_claims,
                 resolved_state_block_targets: &resolved_state_block_targets,
                 preparation_errors: Some(preparation_errors),
@@ -1184,7 +1184,7 @@ let item = test.thing {
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &state_file,
+            &carina_state::ObservedStateFile::for_test((state_file).clone()),
             refresh,
             ProgressSink::Human,
             &HashMap::new(),
@@ -1292,7 +1292,7 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
         &HashMap::new(),
@@ -1388,7 +1388,7 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
         &HashMap::new(),
@@ -1610,7 +1610,7 @@ let first = test.thing {
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &state_file,
+            &carina_state::ObservedStateFile::for_test((state_file).clone()),
             false,
             ProgressSink::Human,
             &HashMap::new(),
@@ -1737,7 +1737,7 @@ let direct = awscc.ec2.Route {
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &state_file,
+            &carina_state::ObservedStateFile::for_test((state_file).clone()),
             false,
             ProgressSink::Human,
             &HashMap::new(),
@@ -2680,6 +2680,7 @@ macro_rules! unexpected_resume_create {
 }
 
 enum ReadBehavior {
+    WrongIdentity,
     Success,
     NotFound,
     ApiError,
@@ -2766,14 +2767,15 @@ where
 {
     let mut unresolved = carina_core::parser::ParsedFile::default();
     unresolved.resources = unresolved_resources;
-    resolve_config_block_names_for_test(
+    let pair = resolve_config_block_names_for_test(
         resolve_file_for_test(evaluated.clone()),
         carina_core::config_loader::UnresolvedConfigSnapshot::from_parsed(unresolved),
         schemas,
     )
-    .expect("test block-name resolution must succeed")
-    .into_expanded_for_test()
-    .expect("test values must contain no leftover parser placeholders")
+    .expect("test block-name resolution must succeed");
+    ParserCanonicalResourcePair::from_block_pair(pair, schemas)
+        .into_expanded_for_test()
+        .expect("test values must contain no leftover parser placeholders")
 }
 
 fn canonical_pair_from_resolved<
@@ -2793,7 +2795,7 @@ fn canonical_pair_from_resolved<
     unresolved.resources = unresolved_resources;
     carina_core::schema::resolve_file_block_names_with_schemas(&mut unresolved, schemas)
         .expect("test unresolved block-name resolution must succeed");
-    ParserCanonicalResourcePair::for_test(evaluated, unresolved.resources)
+    ParserCanonicalResourcePair::for_test(evaluated, unresolved.resources, schemas)
         .into_expanded_for_test()
         .expect("test values must contain no leftover parser placeholders")
 }
@@ -3498,11 +3500,13 @@ where
         ctx.schemas(),
     )
     .expect("test block-name resolution must succeed");
-    let validated = wiring.validated_parser_pair_for_test(canonical_resources);
+    let validated = wiring.validated_parser_pair_for_test(
+        ParserCanonicalResourcePair::from_block_pair(canonical_resources, ctx.schemas()),
+    );
     create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         provider_configs,
-        state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         refresh,
         ProgressSink::Human,
         &carina_core::upstream_exports::remote_bindings_for_test(remote_bindings.clone()),
@@ -4593,7 +4597,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
     let result = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &None,
+        &carina_state::ObservedStateFile::for_test(None),
         false,
         ProgressSink::Human,
         &HashMap::new(),
@@ -4877,6 +4881,14 @@ impl Provider for ReadWithRetryProvider {
         let attempt = self.read_calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             match self.behavior {
+                ReadBehavior::WrongIdentity => Ok(ReadOutcome::found(
+                    AppliedState::new(
+                        ResourceId::with_identity("test.Resource", "unexpected"),
+                        identifier.as_str(),
+                        HashMap::new(),
+                    )
+                    .unwrap(),
+                )),
                 ReadBehavior::Success => Ok(ReadOutcome::found(
                     AppliedState::new(id, identifier.as_str(), HashMap::new())
                         .expect("typed read identifier is non-empty"),
@@ -5124,7 +5136,7 @@ let shared = read test.shared.Type {}
     let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         true,
         ProgressSink::Human,
         &HashMap::new(),
@@ -8356,7 +8368,7 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
         &HashMap::new(),
@@ -8615,7 +8627,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
         &expanded_remote_bindings,
@@ -9862,7 +9874,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
     let plan_ctx = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &Some(state_file.clone()),
+        &carina_state::ObservedStateFile::for_test(Some(state_file.clone())),
         false,
         ProgressSink::Human,
         &HashMap::new(),
@@ -10833,7 +10845,7 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
     else {
         panic!("typed schema error was erased: {error:?}");
     };
-    assert!(!errors.errors().is_empty());
+    assert!(errors.errors().next().is_some());
     assert_eq!(
         error
             .to_string()
@@ -12476,7 +12488,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
         validated,
         &provider_configs,
-        &state_file,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
         &HashMap::new(),
@@ -12547,7 +12559,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
         "deferred effects must follow state-block effects: {:#?}",
         plan.effects()
     );
-    (*plan).clone()
+    plan.as_plan().clone()
 }
 
 #[tokio::test]
@@ -15493,7 +15505,7 @@ exports { team_prefix: String = "x" }"#,
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &None,
+            &carina_state::ObservedStateFile::for_test(None),
             true,
             ProgressSink::Human,
             &remote_bindings,
@@ -15578,7 +15590,7 @@ exports { team_prefix: String = "x" }"#,
         let plan = create_plan_from_parsed_with_upstream_with_ctx(
             validated,
             &provider_configs,
-            &None,
+            &carina_state::ObservedStateFile::for_test(None),
             true,
             ProgressSink::Human,
             &HashMap::new(),
@@ -15731,6 +15743,7 @@ exports { team_prefix: String = "x" }"#,
 fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
     use carina_core::validation::deferred_types::{ProviderTypeCheckSite, TypeCheckSession};
     let catalog = carina_core::parser::LoadedProviderContext::empty_for_test();
+    let schemas = SchemaRegistry::new();
     let checks = TypeCheckSession::run(&catalog, |checks| {
         let expected = carina_core::parser::parse_type_expr_str(
             "Typo",
@@ -15758,12 +15771,15 @@ fn settlement_loaded_validation_report_cannot_hide_pending_evidence() {
             carina_core::parser::parse_file("", Path::new("/project/main.crn"), checks.catalog())
                 .unwrap();
         crate::commands::ConfigurationValidation {
-            result: Ok(Default::default()),
+            result: Ok(carina_core::identifier::canonicalize_file_prefixes(
+                Default::default(),
+                &schemas,
+                carina_core::identifier::SuffixSource::Preview,
+            )),
             authored_inputs: authored.authored_inputs().unwrap().clone(),
             warnings: Vec::new(),
         }
     });
-    let schemas = SchemaRegistry::new();
     let report: ValidationReport = ValidationReport::settle(checks, &schemas);
     let errors = report.into_errors();
     assert_eq!(errors.len(), 1);
@@ -16336,4 +16352,132 @@ fn schema_override_errors_choose_the_first_argument() {
             "provider schema override names undeclared default provider 'zulu'"
         );
     }
+}
+
+#[tokio::test]
+async fn plan_read_outcomes_retain_matching_sources_for_observation_output() {
+    use carina_core::parser::ProviderContext;
+    use carina_state::state::ResourceState;
+
+    let parsed = parse(
+        r#"
+provider test {}
+
+let shared = read test.shared.Type {}
+"#,
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .expect("parse managed-to-data-source fixture");
+    let data_source_id = parsed.data_sources[0].id.clone();
+    let identity = data_source_id
+        .identity()
+        .expect("let-bound data source identity is resolved")
+        .clone();
+    let mut prior_row = ResourceState::try_applied(
+        data_source_id.resource_type.clone(),
+        identity,
+        data_source_id.provider.clone(),
+        "managed-provider-id",
+    )
+    .expect("fixture identifier is non-empty");
+    prior_row.binding = Some(absolute_binding("shared"));
+    prior_row.set_persisted_attribute(
+        "managed_saved",
+        serde_json::json!("managed-write-only-value"),
+    );
+    let partial_read = carina_core::resource::PartialReadMarker::new(
+        carina_core::resource::PendingReRead::incomplete("managed read omitted an attribute"),
+        BTreeSet::from(["managed_missing".to_string()]),
+    )
+    .expect("fixture has a missing attribute");
+    prior_row = crate::fixture_resource_state_metadata(
+        prior_row,
+        Some(vec!["managed_saved".to_string()]),
+        Some(Some(partial_read.clone())),
+    );
+    let mut state_file = StateFile::new();
+    state_file
+        .upsert_resource(prior_row)
+        .expect("test state row is unique");
+    let state_file = Some(state_file);
+    let provider_configs = resolved_provider_configs(&parsed);
+    let wiring = ValidatedWiring::from_factories_for_test_with_provider_phase(
+        &crate::test_support::TestCommandRuntime::new(),
+        vec![Box::new(ManagedAndDataSourceFactory)],
+        provider_configs.as_provider_configs(),
+    );
+    let ctx = wiring.context();
+    let canonical_resources = canonical_pair(
+        &parsed,
+        parsed.resources.clone(), // allow: direct — plan-time reconciliation
+        ctx.schemas(),
+    );
+    let validated = ValidatedConfig::from_wiring_for_test(wiring, canonical_resources);
+
+    let plan_context = create_plan_from_parsed_with_upstream_with_ctx(
+        validated,
+        &provider_configs,
+        &carina_state::ObservedStateFile::for_test((state_file).clone()),
+        true,
+        ProgressSink::Human,
+        &HashMap::new(),
+        &StateBlockClaims::default(),
+        &crate::test_support::empty_state_block_targets(),
+        crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
+    )
+    .await
+    .expect("managed orphan and same-id data source must coexist through planning");
+    let plan_context = plan_context.resources();
+
+    let read_ids = plan_context
+        .data_source_values
+        .read_states()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        read_ids.len(),
+        1,
+        "measurement reaches a real data-source read"
+    );
+    for id in read_ids {
+        assert!(
+            plan_context
+                .data_sources
+                .iter()
+                .any(|source| &source.id == id)
+        );
+        assert!(
+            plan_context
+                .data_source_values
+                .data_sources()
+                .iter()
+                .any(|source| &source.id == id)
+        );
+    }
+    eprintln!(
+        "S5 production plan: 1 read, 0 missing ctx.data_sources entries; total read/source pairing retained"
+    );
+}
+
+// Compatibility measurement: native reads do not establish the map-key invariant.
+#[tokio::test]
+async fn native_refresh_can_return_an_embedded_id_different_from_lookup_key() {
+    let provider = ReadWithRetryProvider::new(ReadBehavior::WrongIdentity);
+    let id = ResourceId::with_identity("test.Resource", "expected");
+    let loaded = crate::test_support::refresh_current(Current::from_state(
+        State::existing(id.clone(), HashMap::new()).with_identifier("expected-id"),
+    ));
+    let current = refresh_loaded_resource_with_retry(
+        &crate::provider_text_fixtures::boundary(Box::new(provider)),
+        loaded,
+        None,
+        &SchemaRegistry::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        current.id(),
+        &ResourceId::with_identity("test.Resource", "unexpected")
+    );
+    assert_ne!(current.id(), &id);
 }

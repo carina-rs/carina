@@ -177,6 +177,11 @@ pub struct ResolvedReadBackend {
 }
 
 impl ResolvedReadBackend {
+    pub async fn read_state_with_observations(
+        &self,
+    ) -> BackendResult<(Option<crate::LoadedState>, crate::ObservationStateAuthority)> {
+        crate::ObservationStateAuthority::load(self.backend.as_ref()).await
+    }
     pub async fn read_state(&self) -> BackendResult<Option<crate::LoadedState>> {
         self.backend.read_state().await
     }
@@ -576,10 +581,7 @@ impl BackendSelection {
         requested_bucket: &str,
     ) -> Result<BucketDeleteBackendSelection, BucketDeleteSelectionError> {
         if settings.bucket() != requested_bucket {
-            let configured_bucket = match settings.bucket_diagnostic_literal() {
-                Some(bucket) => format!("'{bucket}'"),
-                None => "value from env()".to_string(),
-            };
+            let configured_bucket = carina_core::parser::display_string_literal(settings.bucket());
             return Err(BucketDeleteSelectionError {
                 message: format!(
                     "Bucket name '{requested_bucket}' does not match backend configuration bucket \

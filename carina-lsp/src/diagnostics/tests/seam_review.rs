@@ -1,5 +1,204 @@
 use super::*;
 
+fn projection_selection_case(ambiguous: bool) {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Test")
+            .attribute(AttributeSchema::optional("input", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = carina_core::parser::parse_file(
+        "mock.Test { input = 'folded' }",
+        Path::new("test.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let configuration =
+        carina_core::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
+    let owners = configuration.analysis_tree().unwrap();
+    let owner = owners.resources().next().unwrap();
+    let mut source = if ambiguous {
+        parsed.clone()
+    } else {
+        carina_core::parser::parse_file(
+            "mock.Test { input = 'foreign' }",
+            Path::new("other.crn"),
+            &catalog,
+        )
+        .unwrap()
+    };
+    if ambiguous {
+        let duplicate = source.resources[0].clone();
+        source.resources.push(duplicate); // allow: direct — fixture test inspection
+    }
+    let source = carina_core::parser::AnalysisTree::try_from_file(&source).unwrap();
+    let authored = carina_core::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let result = select_resource_projection(
+        owner,
+        Some(&source),
+        if ambiguous { &authored } else { &source },
+    )
+    .0;
+    if ambiguous {
+        assert!(
+            matches!(result, ResourceProjection::Ambiguous),
+            "ambiguity must not choose the first or use a different view"
+        );
+    } else {
+        assert!(
+            matches!(result, ResourceProjection::NoMatch),
+            "a missing per-file owner must not become folded merged values"
+        );
+    }
+}
+
+#[test]
+fn semantic_projection_miss_never_uses_merged_values() {
+    projection_selection_case(false);
+}
+
+#[test]
+fn semantic_projection_ambiguity_never_uses_first_source() {
+    projection_selection_case(true);
+}
+
+#[test]
+fn semantic_projection_missing_owner_publishes_evidence_failure() {
+    projection_failure_is_visible(false);
+}
+
+#[test]
+fn semantic_projection_ambiguous_owner_publishes_evidence_failure() {
+    projection_failure_is_visible(true);
+}
+
+fn projection_failure_is_visible(ambiguous: bool) {
+    let doc = create_document("mock.Test { input = 'authored' }");
+    let public = doc.for_diagnostics().unwrap();
+    let tree = carina_core::parser::AnalysisTree::try_from_file(doc.parsed().unwrap()).unwrap();
+    let owner = tree.resources().next().unwrap();
+    let projection = if ambiguous {
+        ResourceProjection::<RelativeBindingName>::Ambiguous
+    } else {
+        ResourceProjection::NoMatch
+    };
+    let mut diagnostics = Vec::new();
+    assert!(
+        projection_or_diagnostic(
+            &public,
+            owner.id(),
+            owner.type_location(),
+            projection,
+            &mut diagnostics,
+        )
+        .is_none()
+    );
+    assert_eq!(
+        diagnostics.len(),
+        1,
+        "missing correspondence must fail closed"
+    );
+    assert_eq!(
+        diagnostics[0].message,
+        carina_core::parser::retained::MissingEvidence::for_resource(owner.id()).to_string()
+    );
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 0), Position::new(0, 9))
+    );
+}
+
+#[test]
+fn semantic_projection_analysis_failure_keeps_main_silence() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Test")
+            .attribute(AttributeSchema::optional("input", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    let authored = carina_core::parser::parse_file(
+        "mock.Test { input = 'authored' }",
+        Path::new("test.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let primary = carina_core::parser::parse_file(
+        "mock.Test { input = 'folded' }",
+        Path::new("test.crn"),
+        &catalog,
+    )
+    .unwrap();
+    let configuration =
+        carina_core::test_utils::load_canonical_buffer_configuration(&primary, &schemas, &catalog);
+    let owners = configuration.analysis_tree().unwrap();
+    let owner = owners.resources().next().unwrap();
+    let mut invalid = authored.clone();
+    invalid.resources[0].declaration = Default::default();
+    // The optional helper takes no document or diagnostic sink, so failure
+    // cannot publish the extra invariant diagnostic seen in the red test.
+    let semantic = semantic_tree_for_values(&invalid);
+    assert!(semantic.is_none());
+    let authored = carina_core::parser::AnalysisTree::try_from_file(&authored).unwrap();
+    match select_resource_projection(owner, semantic.as_ref(), &authored).0 {
+        ResourceProjection::Matched(projection) => assert_eq!(
+            projection.values()["input"],
+            carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(
+                "authored".into()
+            ))
+        ),
+        ResourceProjection::NoMatch | ResourceProjection::Ambiguous => {
+            panic!("main uses the valid authored view when the per-file semantic view fails")
+        }
+    }
+}
+
+#[test]
+fn second_file_resource_function_call_keeps_main_guidance() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Widget")
+            .attribute(AttributeSchema::optional("value", AttributeType::bool()).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("a.crn"),
+        "provider test {}\nlet input = 'BAD'\nlet first = test.Widget { value = true }\n",
+    )
+    .unwrap();
+    let source = "let second = test.Widget { value = lower(input) }\n";
+    let path = directory.path().join("z.crn");
+    std::fs::write(&path, source).unwrap();
+    let doc = create_document_at(source, path.clone());
+    let diagnostics = engine.analyze(&doc, Some(&path));
+    let guidance = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.message.contains("Use true or false"))
+        .collect::<Vec<_>>();
+    assert_eq!(guidance.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        guidance[0].message,
+        "Type mismatch: expected Bool, got string 'bad'. Use true or false."
+    );
+    assert_eq!(
+        guidance[0].range,
+        Range::new(Position::new(0, 27), Position::new(0, 32))
+    );
+}
+
 #[test]
 fn review_seam_loop_lookup_preserves_every_instance() {
     let catalog = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
@@ -11,10 +210,12 @@ fn review_seam_loop_lookup_preserves_every_instance() {
     .unwrap();
     let schemas = SchemaRegistry::new();
     let configuration =
-        carina_core::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
-    let tree =
-        carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file()).unwrap();
-    let resources = authored_validation_resources(&tree);
+        carina_core::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
+    let tree = configuration.parsed().analysis_tree().unwrap();
+    let resources: HashMap<_, _> = tree
+        .resources()
+        .filter_map(|resource| resource.authored_instance_key().map(|key| (key, resource)))
+        .collect();
     assert_eq!(
         resources.len(),
         2,
@@ -80,27 +281,23 @@ fn review_seam_expanded_admission_retains_instantiated_judgements() {
             root, &path, session, &schemas,
         )
         .unwrap();
-        let configuration =
-            carina_core::config_loader::load_buffer_configuration(&graph, &schemas, &catalog);
+        let configuration = carina_core::test_utils::load_canonical_buffer_configuration(
+            &graph, &schemas, &catalog,
+        );
         let judged = configuration.judged();
-        let instances = judged.file().clone();
-        let tree = carina_core::parser::AnalysisTree::try_from_file(&instances).unwrap();
+        let instances = &graph;
+        let tree = judged.analysis_tree().unwrap();
         let mut inputs = ExpandedDiagnosticValidationInputs {
             configuration: judged,
-            resources: tree
-                .resources()
-                .map(|resource| (resource.id(), resource))
-                .collect(),
-            coverage: Default::default(),
-            binding_index: carina_core::binding_index::BindingIndex::from_parsed(
-                judged.file(),
-                &schemas,
-                &catalog,
-            ),
+            resources: tree.resources().collect(),
+            binding_index: judged.parsed().binding_index(&catalog),
         };
         assert_eq!(instances.resources.len(), 2);
         for resource in &instances.resources {
-            let findings = inputs.resource_admissions(&resource.id, session).unwrap();
+            let findings = inputs
+                .resource_admissions(&resource.id, session)
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 findings.errors().count(),
                 0,

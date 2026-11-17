@@ -280,7 +280,9 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 
 Reads an environment variable. Returns an error if the variable is not set.
 
-Environment values behave like ordinary strings in expressions, plans, providers, and state. To prevent accidental disclosure, diagnostics identify an environment-derived value only by type (for example, `got string`) and never include its contents. Use `secret(env(...))` when the value must also be masked in plans and hashed in state.
+`env()` returns an ordinary string that can appear in diagnostics and plan output
+and is stored as plaintext in state. An environment variable that must stay hidden
+is written `secret(env('NAME'))`; this masks the value and hashes it in state.
 
 ```
 env(name: String) -> String
@@ -289,6 +291,7 @@ env(name: String) -> String
 ```crn
 let home = env('HOME')
 let db_host = env('DB_HOST')
+let password = secret(env('DB_PASSWORD'))
 ```
 
 ## Security Functions
@@ -310,6 +313,10 @@ Values derived from `secret()` or `decrypt()` cannot be published through `expor
 Backend attributes also cannot use secret-derived values. Backends accept only
 ordinary configuration values, so validation rejects `secret()` and
 `decrypt()` results in a `backend` block.
+
+Carina decides whether a value is secret from the configuration as written: it follows references, operands, interpolation, user-function results and module outputs back to a `secret()` or `decrypt()` call. Values returned by a provider or exported from an upstream configuration are public values; wrap them with `secret()` where you use them if they must be protected. The alternatives of `??`, and the candidates and default of a `lookup()` whose map is known from the configuration, must be all secret or all public. Mixing them is a validation error, because the plan could not tell whether the selected value is a secret. Wrap the public alternatives in `secret()` to fix it. An empty list or map agrees with either kind.
+
+To make that decision, Carina follows at most 127 references in a chain from an attribute and at most 4096 reference lookups per attribute. The same limits apply to each let binding, module argument, output, export and function body. A longer chain, or one that needs more lookups, is a validation error. Only references count toward the chain: functions, lists, maps, `??`, `if` and interpolation around a reference do not. Passing a value through a module output counts two references for each module, its argument and its output, so a chain of modules reaches the limit at 64 modules.
 
 ```
 secret(value: Any) -> Secret

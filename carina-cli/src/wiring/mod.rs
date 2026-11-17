@@ -217,23 +217,71 @@ pub(crate) enum RowRequest {
 
 /// A successful plan either owns its requested display or has no rows at all.
 /// Diagnostics never inhabit this type.
-#[derive(Debug)]
+///
+/// Raw admitted observations are private to execution and recording.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::PlannedPlan;
+/// use carina_core::plan::AdmittedPlan;
+/// fn raw_output(plan: &PlannedPlan) -> &AdmittedPlan { plan }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::PlannedPlan;
+/// use carina_core::plan::AdmittedPlan;
+/// fn raw_output(plan: &PlannedPlan) -> &AdmittedPlan {
+///     match plan {
+///         PlannedPlan::Rendered { plan, .. } | PlannedPlan::Unrendered { plan, .. } => plan,
+///     }
+/// }
+/// ```
 pub enum PlannedPlan {
     Rendered {
+        plan: PlannedExecutionPlan,
         display: Box<carina_core::detail_rows::PreparedPlanDisplay>,
         references: carina_core::references::ResolvedReferences,
     },
     Unrendered {
-        plan: Box<carina_core::input_rules::InputCheckedPlan>,
+        plan: PlannedExecutionPlan,
         references: carina_core::references::ResolvedReferences,
     },
 }
 
+impl fmt::Debug for PlannedPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Rendered { .. } => "PlannedPlan::Rendered(<protected>)",
+            Self::Unrendered { .. } => "PlannedPlan::Unrendered(<execution>)",
+        })
+    }
+}
+
+/// Opaque execution evidence retained by a planned outcome. Output consumers
+/// can extract this wrapper but cannot reach raw Update observations through it.
+pub struct PlannedExecutionPlan(Box<carina_core::input_rules::InputCheckedPlan>);
+impl fmt::Debug for PlannedExecutionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PlannedExecutionPlan(<execution>)")
+    }
+}
+impl PlannedExecutionPlan {
+    pub(crate) fn checked(&self) -> &carina_core::input_rules::InputCheckedPlan {
+        &self.0
+    }
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn into_checked(self) -> carina_core::input_rules::InputCheckedPlan {
+        *self.0
+    }
+}
+impl From<Box<carina_core::input_rules::InputCheckedPlan>> for PlannedExecutionPlan {
+    fn from(plan: Box<carina_core::input_rules::InputCheckedPlan>) -> Self {
+        Self(plan)
+    }
+}
 impl PlannedPlan {
     pub(crate) fn checked(&self) -> &carina_core::input_rules::InputCheckedPlan {
         match self {
-            Self::Rendered { display, .. } => display.checked_plan(),
-            Self::Unrendered { plan, .. } => plan,
+            Self::Rendered { plan, .. } | Self::Unrendered { plan, .. } => plan.checked(),
         }
     }
     pub(crate) fn references(&self) -> &carina_core::references::ResolvedReferences {
@@ -243,19 +291,29 @@ impl PlannedPlan {
     }
 }
 
-impl std::ops::Deref for PlannedPlan {
-    type Target = carina_core::plan::AdmittedPlan;
-
-    fn deref(&self) -> &carina_core::plan::AdmittedPlan {
-        match self {
-            Self::Rendered { display, .. } => display.plan(),
-            Self::Unrendered { plan, .. } => plan,
-        }
-    }
-}
-
 /// Command planning keeps diagnostics separate from every display-capable plan.
 #[derive(Debug)]
+///
+/// A public outcome cannot coerce to a raw observation-bearing plan either.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::PlanOutcome;
+/// use carina_core::plan::Plan;
+/// fn raw_output(outcome: &PlanOutcome) -> &Plan { outcome }
+/// ```
+///
+/// The diagnostics arm cannot expose its raw plan either.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::PlanOutcome;
+/// use carina_core::plan::Plan;
+/// fn diagnostic_plan(outcome: &PlanOutcome) -> Option<&Plan> {
+///     match outcome {
+///         PlanOutcome::Diagnostics(diagnostics) => Some(diagnostics),
+///         PlanOutcome::Planned(_) => None,
+///     }
+/// }
+/// ```
 pub enum PlanOutcome {
     Planned(PlannedPlan),
     Diagnostics(DiagnosticPlan),
@@ -263,25 +321,49 @@ pub enum PlanOutcome {
 
 #[derive(Debug)]
 pub struct DiagnosticPlan {
-    plan: Plan,
+    plan: Box<Plan>,
     pub(crate) errors: NonEmptyPlanErrors,
 }
 
-impl std::ops::Deref for DiagnosticPlan {
-    type Target = Plan;
-    fn deref(&self) -> &Plan {
+impl DiagnosticPlan {
+    pub(crate) fn plan(&self) -> &Plan {
         &self.plan
+    }
+    #[cfg(test)]
+    pub(crate) fn errors(&self) -> &[carina_core::plan::PlanError] {
+        self.plan().errors()
     }
 }
 
-impl std::ops::Deref for PlanOutcome {
-    type Target = Plan;
-
-    fn deref(&self) -> &Plan {
+impl PlanOutcome {
+    pub(crate) fn as_plan(&self) -> &Plan {
         match self {
-            Self::Planned(plan) => plan,
-            Self::Diagnostics(plan) => plan,
+            Self::Planned(plan) => plan.checked(),
+            Self::Diagnostics(plan) => plan.plan(),
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn effects(&self) -> &[Effect] {
+        self.as_plan().effects()
+    }
+    #[cfg(test)]
+    pub(crate) fn summary(&self) -> carina_core::plan::PlanSummary {
+        self.as_plan().summary()
+    }
+    pub(crate) fn mutation_count(&self) -> usize {
+        self.as_plan().mutation_count()
+    }
+    #[cfg(test)]
+    pub(crate) fn errors(&self) -> &[carina_core::plan::PlanError] {
+        self.as_plan().errors()
+    }
+    #[cfg(test)]
+    pub(crate) fn has_errors(&self) -> bool {
+        self.as_plan().has_errors()
+    }
+    #[cfg(test)]
+    pub(crate) fn has_mutations(&self) -> bool {
+        self.as_plan().has_mutations()
     }
 }
 
@@ -294,7 +376,7 @@ pub(crate) async fn prepare_plan_outcome(
     preparation: &mut carina_core::references::ReferencePreparation,
     row_request: RowRequest,
     managed_current: &HashMap<ResourceId, Current>,
-    state_file: Option<&StateFile>,
+    state_file: &carina_state::ObservedStateFile,
     schemas: &SchemaRegistry,
     input_types: &carina_core::input_rules::InputTypeContext,
     explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -306,7 +388,10 @@ pub(crate) async fn prepare_plan_outcome(
             let plan = plan.into_plan();
             let errors = NonEmptyPlanErrors::try_from(plan.errors().to_vec())
                 .expect("input rejection contains diagnostics");
-            return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
+            return Ok(PlanOutcome::Diagnostics(DiagnosticPlan {
+                plan: Box::new(plan),
+                errors,
+            }));
         }
     };
     let planned = match row_request {
@@ -315,28 +400,46 @@ pub(crate) async fn prepare_plan_outcome(
                 &plan,
                 managed_current,
                 state_file,
-            );
+            )?;
             let display = preparation
                 .display(
-                    plan, &planning, historical, detail, schemas, explicit, provider,
+                    &plan, &planning, historical, detail, schemas, explicit, provider,
                 )
                 .await?;
             PlannedPlan::Rendered {
+                plan: Box::new(plan).into(),
                 display: Box::new(display.value),
                 references: display.references,
             }
         }
         RowRequest::None => PlannedPlan::Unrendered {
-            plan: Box::new(plan),
+            plan: Box::new(plan).into(),
             references: planning,
         },
     };
     Ok(PlanOutcome::Planned(planned))
 }
 
-/// Result of creating a plan, with context needed for saving
+/// Result of creating a plan, with context needed for saving.
+/// Raw observations are internal to comparison and execution.
+/// Each boundary check below is Previously: the raw access compiled.
+///
+/// ```compile_fail,E0616
+/// use carina_cli::wiring::PlanContext;
+/// fn raw(ctx: &PlanContext) { let _ = &ctx.managed_current; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use carina_cli::wiring::PlanContext;
+/// fn raw(ctx: &PlanContext) { let _ = &ctx.data_source_values; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use carina_cli::wiring::PlanContext;
+/// fn raw(ctx: &PlanContext) { let _ = &ctx.plan; }
+/// ```
 pub struct PlanContext {
-    pub plan: PlanOutcome,
+    pub(crate) plan: PlanOutcome,
     pub provider: ProviderRouter,
     /// Evaluated desired resources after the identity-resolution boundary.
     pub sorted_resources: Vec<ResolvedResource>,
@@ -356,8 +459,9 @@ pub struct PlanContext {
     /// have concrete inputs; apply-time deferred reads keep structural refs so
     /// saved-plan apply can reconstruct the same deferred-read set.
     pub data_sources: Vec<DataSource>,
-    pub managed_current: HashMap<ResourceId, Current>,
-    pub data_source_values: DataSourceValues,
+    pub(crate) managed_current: HashMap<ResourceId, Current>,
+    pub(crate) data_source_values: DataSourceValues,
+    pub(crate) observation_authority: carina_state::ObservationStateAuthority,
     /// Maps moved-to resource IDs to their original (moved-from) IDs.
     /// Used by display to show "(moved from: ...)" annotations on Update/Replace effects.
     pub moved_origins: HashMap<ResourceId, ResourceId>,
@@ -383,6 +487,21 @@ pub struct PlanContext {
     /// that produced them (#3306, #3307). Forwarded to the display
     /// layer so the rendered tree folds leaves under composition rows.
     pub expansion_trace: carina_core::resource::ExpansionTrace,
+}
+
+impl PlanContext {
+    pub(crate) fn protected_observations(
+        &self,
+    ) -> Result<carina_core::value::ProtectedObservations, carina_core::value::SerializationError>
+    {
+        self.observation_authority
+            .protect(carina_core::value::ObservationInputs::Plan {
+                deleted: &std::collections::HashMap::new(),
+                plan: self.plan.as_plan(),
+                current: &self.managed_current,
+                reads: &self.data_source_values,
+            })
+    }
 }
 
 /// A completed plan together with the exact canonical resources consumed by
@@ -631,12 +750,12 @@ impl ValidationPipelineAccess {
     /// Resolve both configuration snapshots inside the sealed validation
     /// pipeline. The capability cannot be constructed outside this module, so
     /// no other crate path can obtain an unowned canonical pair from this API.
-    pub(crate) fn resolve_config_names<E>(
+    pub(crate) fn resolve_config_names<'s, E>(
         &self,
-        ctx: &WiringContext,
+        ctx: &'s WiringContext,
         parsed: carina_core::parser::ModuleResolvedFile<E>,
         unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-    ) -> Result<ParserCanonicalResourcePair<E>, Vec<AppError>> {
+    ) -> Result<ParserCanonicalResourcePair<'s, E>, Vec<AppError>> {
         resolve_config_names_with_ctx(self, ctx, parsed, unresolved)
     }
 }
@@ -1140,7 +1259,13 @@ impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
 }
 
 /// Terminal validation output, constructed only from a scoped settlement.
-pub(crate) struct ValidationReport<'a, T = carina_core::parser::ModuleResolvedInferredFile> {
+pub(crate) struct ValidationReport<
+    'a,
+    T = carina_core::identifier::PrefixCanonicalized<
+        'a,
+        carina_core::parser::ModuleResolvedInferredFile,
+    >,
+> {
     result: Result<T, NonEmptyValidationErrors>,
     authored_inputs: carina_core::input_rules::AuthoredInputs,
     warnings: Vec<carina_core::parser::ParseWarning>,
@@ -1363,7 +1488,10 @@ fn validation_report_with<'a, T>(
     duplicate_declarations: &[carina_core::config_loader::DuplicateDeclaration],
     name_resolution: crate::commands::ConfigNameResolution,
     finish: impl FnOnce(
-        carina_core::parser::ModuleResolvedInferredFile,
+        carina_core::identifier::PrefixCanonicalized<
+            'a,
+            carina_core::parser::ModuleResolvedInferredFile,
+        >,
         &ValidationProviderCatalog<'_>,
     ) -> Result<T, AppError>,
 ) -> ValidationReport<'a, T> {
@@ -1599,6 +1727,7 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
         carina_core::validation::ResolveFileError::Unjudged(error) => {
             AppError::Config(error.to_string())
         }
+        carina_core::validation::ResolveFileError::Secrecy(finding) => AppError::Secrecy(finding),
         carina_core::validation::ResolveFileError::Expression(finding) => {
             AppError::ExpressionType(finding)
         }
@@ -1613,35 +1742,32 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
 }
 
 fn require_expanded_config<E>(
-    file: &carina_core::parser::ModuleResolvedFile<E>,
+    file: carina_core::identifier::ModuleResolvedFileRead<'_, E>,
     base_dir: &ResolvedPath,
 ) -> Result<(), AppError>
 where
     E: carina_core::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress>,
 {
-    module_resolver::ensure_expanded_root_graph(file)
+    file.ensure_expanded_root_graph()
         .map_err(|error| AppError::Config(error.display_relative_to(&base_dir.source_label())))
 }
 
 fn resolve_file_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>(
-    file: carina_core::parser::ModuleResolvedFile<E>,
+    file: carina_core::identifier::PrefixCanonicalized<
+        '_,
+        carina_core::parser::ModuleResolvedFile<E>,
+    >,
     base_dir: &ResolvedPath,
     context: &WiringContext,
     catalog: &ValidationProviderCatalog<'_>,
 ) -> Result<carina_core::validation::ResolvedFile<E::Expanded>, AppError> {
-    let module_signatures =
-        module_resolver::load_resolved_module_signatures(&file, base_dir, catalog.catalog());
-    carina_core::validation::resolve_bare_binding_uses_in_session(
-        file,
-        context.schemas(),
-        catalog,
-        &module_signatures,
-    )
-    .map_err(resolve_file_error)
+    let module_signatures = file.parsed().module_signatures(base_dir, catalog.catalog());
+    file.resolve_binding_uses(context.schemas(), catalog, &module_signatures)
+        .map_err(resolve_file_error)
 }
 
 fn resolve_pair_binding_uses<E: IntoExpandedExportParam<AbsoluteBindingAddress>>(
-    pair: ParserCanonicalResourcePair<E>,
+    pair: ParserCanonicalResourcePair<'_, E>,
     base_dir: &ResolvedPath,
     context: &WiringContext,
     catalog: &ValidationProviderCatalog<'_>,
@@ -1835,7 +1961,7 @@ impl ProviderLoad {
             duplicate_declarations,
             name_resolution,
             |parsed, catalog| {
-                require_expanded_config(&parsed, base_dir)?;
+                require_expanded_config(parsed.parsed(), base_dir)?;
                 resolve_file_binding_uses(parsed, base_dir, &self.context, catalog)
             },
         );
@@ -2205,7 +2331,7 @@ impl ValidatedWiring {
         E: IntoExpandedExportParam<AbsoluteBindingAddress>,
     >(
         &self,
-        resources: ParserCanonicalResourcePair<E>,
+        resources: ParserCanonicalResourcePair<'_, E>,
     ) -> ValidatedConfig<CanonicalResourcePair<E::Expanded>> {
         let (parsed, unresolved) = carina_core::validation::deferred_types::with_session_for_test(
             self.context().provider_context(),
@@ -3520,11 +3646,11 @@ fn block_name_errors<T: fmt::Display>(conflicts: impl IntoIterator<Item = T>) ->
 
 #[cfg(test)]
 pub fn validate_resources_with_ctx<
-    E,
+    E: Clone,
     P: PlaceholderKind,
     T: PlaceholderKind,
     B: BindingAddress,
-    D: carina_core::parser::DeferredForPhaseTraversal<P, T, B>,
+    D: carina_core::parser::DeferredForPhaseTraversal<P, T, B> + Clone,
 >(
     ctx: &WiringContext,
     parsed: &carina_core::parser::File<E, P, T, D, B>,
@@ -3549,7 +3675,10 @@ pub fn validate_resource_admissions_with_ctx<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &carina_core::identifier::PrefixCanonicalized<
+        '_,
+        carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
 ) -> Vec<crate::error::PresentedAppError> {
     let (errors, warnings) = resource_admission_report_with_ctx(ctx, judged, bindings);
@@ -3565,7 +3694,10 @@ pub(crate) fn resource_admission_report_with_ctx<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &carina_core::identifier::PrefixCanonicalized<
+        '_,
+        carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
 ) -> (
     Vec<crate::error::PresentedAppError>,
@@ -3601,7 +3733,10 @@ pub(crate) fn resource_admission_report_in_run<
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     ctx: &WiringContext,
-    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    judged: &carina_core::identifier::PrefixCanonicalized<
+        '_,
+        carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    >,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
     run: &mut validation::ConversionValidation<AppError>,
 ) -> Vec<carina_core::parser::ParseWarning> {
@@ -3684,20 +3819,24 @@ pub fn validate_deferred_populate_refs_with_ctx<
 
 #[cfg(test)]
 pub fn validate_resource_ref_types_with_ctx<
-    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
+    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B> + Clone,
     B: BindingAddress,
-    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B> + Clone,
 >(
     ctx: &WiringContext,
     judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
     argument_names: &HashSet<String>,
 ) -> Vec<AppError> {
-    let parsed = judged.file();
-    let bindings = carina_core::binding_index::BindingIndex::from_parsed(
-        parsed,
+    // A raw fixture enters the same canonicalization step as production.
+    let canonical = carina_core::test_utils::load_canonical_buffer_configuration(
+        judged.file(),
         ctx.schemas(),
         ctx.provider_context().as_provider_context(),
     );
+    let judged = &canonical;
+    let bindings = judged
+        .parsed()
+        .binding_index(ctx.provider_context().as_provider_context());
     let mut sink = CliTypeCheckSink { errors: Vec::new() };
     let mut errors =
         match validation::validate_resource_ref_types(judged, argument_names, &bindings, &mut sink)
@@ -3764,33 +3903,52 @@ pub fn validate_attribute_param_ref_types_with_ctx<
 }
 
 /// File-level name resolution also covers residual deferred-for templates.
+type PrefixCanonicalFile<'s, E, P, T, D, B> =
+    carina_core::identifier::PrefixCanonicalized<'s, carina_core::parser::File<E, P, T, D, B>>;
+
 pub(crate) fn resolve_file_names_with_ctx<
+    's,
     E,
     P: PlaceholderKind,
     T: PlaceholderKind,
     B: BindingAddress,
     D: carina_core::parser::DeferredForPhaseTraversal<P, T, B>,
 >(
-    ctx: &WiringContext,
-    parsed: &mut carina_core::parser::File<E, P, T, D, B>,
-) -> Vec<AppError> {
-    let mut errors = resolve_file_block_names_with_schemas(parsed, ctx.schemas())
+    ctx: &'s WiringContext,
+    mut parsed: carina_core::parser::File<E, P, T, D, B>,
+) -> Result<PrefixCanonicalFile<'s, E, P, T, D, B>, Vec<AppError>> {
+    let mut errors = resolve_file_block_names_with_schemas(&mut parsed, ctx.schemas())
         .err()
         .map(block_name_errors)
         .unwrap_or_default();
-    errors.extend(resolve_attr_prefixes_with_ctx(ctx, &mut parsed.resources));
-    errors
+    let canonical = carina_core::identifier::canonicalize_file_prefixes(
+        parsed,
+        ctx.schemas(),
+        carina_core::identifier::SuffixSource::Random,
+    );
+    errors.extend(
+        canonical
+            .prefix_errors()
+            .iter()
+            .cloned()
+            .map(|error| AppError::AttributePrefix(Box::new(error))),
+    );
+    if errors.is_empty() {
+        Ok(canonical)
+    } else {
+        Err(errors)
+    }
 }
 
-fn resolve_config_names_with_ctx<E>(
+fn resolve_config_names_with_ctx<'s, E>(
     access: &ValidationPipelineAccess,
-    ctx: &WiringContext,
+    ctx: &'s WiringContext,
     parsed: carina_core::parser::ModuleResolvedFile<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
-) -> Result<ParserCanonicalResourcePair<E>, Vec<AppError>> {
+) -> Result<ParserCanonicalResourcePair<'s, E>, Vec<AppError>> {
     ParserCanonicalResourcePair::resolve_block_names(access, parsed, unresolved, ctx.schemas())
         .map_err(block_name_errors)?
-        .resolve_attr_prefixes_report(ctx.schemas())
+        .resolve_attr_prefixes_report()
         .map_err(|errors| {
             errors
                 .into_iter()
@@ -3806,8 +3964,11 @@ pub fn resolve_config_block_names_for_test<E>(
     parsed: carina_core::parser::ModuleResolvedFile<E>,
     unresolved: carina_core::config_loader::UnresolvedConfigSnapshot,
     registry: &SchemaRegistry,
-) -> Result<ParserCanonicalResourcePair<E>, Vec<carina_core::schema::BlockNameConflict>> {
-    ParserCanonicalResourcePair::resolve_block_names(
+) -> Result<
+    CanonicalResourcePair<E, ParserPlaceholder, ParserPlaceholder>,
+    Vec<carina_core::schema::BlockNameConflict>,
+> {
+    CanonicalResourcePair::<E, ParserPlaceholder, ParserPlaceholder>::resolve_block_names(
         &ValidationPipelineAccess::new(),
         parsed,
         unresolved,
@@ -4552,12 +4713,32 @@ pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx<
     providers: &[ProviderConfig<P, AbsoluteBindingAddress>],
     conflict_policy: identifier::AnonymousIdentityConflictPolicy,
 ) -> Result<Vec<AppError>, AppError> {
-    match resources.canonicalize_and_compute_anonymous_identifiers(
+    canonical_identity_errors(resources.canonicalize_and_compute_anonymous_identifiers(
         ctx.schemas(),
         providers,
         ctx.factories(),
         conflict_policy,
-    ) {
+    ))
+}
+
+pub(crate) fn compute_parser_pair_anonymous_identifiers_with_policy_with_ctx<E>(
+    ctx: &WiringContext,
+    resources: &mut ParserCanonicalResourcePair<'_, E>,
+    providers: &[ProviderConfig<ParserPlaceholder, AbsoluteBindingAddress>],
+    conflict_policy: identifier::AnonymousIdentityConflictPolicy,
+) -> Result<Vec<AppError>, AppError> {
+    canonical_identity_errors(resources.canonicalize_and_compute_anonymous_identifiers(
+        ctx.schemas(),
+        providers,
+        ctx.factories(),
+        conflict_policy,
+    ))
+}
+
+fn canonical_identity_errors(
+    result: Result<(), CanonicalResourceIdentityError>,
+) -> Result<Vec<AppError>, AppError> {
+    match result {
         Ok(()) => Ok(Vec::new()),
         Err(CanonicalResourceIdentityError::EnumCanonicalization(error)) => Err(error.into()),
         Err(CanonicalResourceIdentityError::ProviderConfig(error)) => Ok(vec![error.into()]),
@@ -5245,16 +5426,10 @@ pub(crate) fn validate_module_internal_ref_types(
             continue;
         }
 
-        let parsed = template.parsed();
-        let imported = module_resolver::load_resolved_module_signatures(
-            parsed,
-            module.module_path(),
-            config.catalog(),
-        );
-        let bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-            parsed, ctx.schemas(), None, &imported, config,
-        );
         let configuration = template.judge(ctx.schemas(), config.catalog());
+        let parsed = configuration.judged().parsed();
+        let imported = parsed.module_signatures(module.module_path(), config.catalog());
+        let bindings = parsed.binding_index_in_session(None, &imported, config);
         let mut sink = ValidationReportSink {
             errors: Vec::new(),
             warnings: Vec::new(),
@@ -5270,7 +5445,7 @@ pub(crate) fn validate_module_internal_ref_types(
         }
         errors.extend(sink.errors);
         warnings.extend(sink.warnings);
-        for parameter in &configuration.judged().file().attribute_params {
+        for parameter in configuration.judged().parsed().attribute_params {
             let parameters = std::slice::from_ref(parameter);
             let values = validation::query_attribute_value_findings(parameters, config);
             let references = validation::attribute_param_ref_findings(parameters, &bindings);
@@ -7239,7 +7414,7 @@ pub(crate) struct PostExpansionPlanEnvironment<'a> {
     pub normalizer: &'a dyn HostNormalizer,
     pub provider_configs: &'a [ExpandedProviderConfig],
     pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
-    pub state_file: &'a Option<StateFile>,
+    pub state_file: &'a carina_state::ObservedStateFile,
     pub state_block_claims: &'a StateBlockClaims,
     pub resolved_state_block_targets: &'a ResolvedStateBlockTargets,
     pub preparation_errors: Option<NonEmptyPlanErrors>,
@@ -7395,12 +7570,16 @@ pub(crate) struct PostExpansionPlan<M: PostExpansionMode, R> {
 /// need to construct their command-specific error context.
 pub(crate) struct PostExpansionDiagnostics<R> {
     artifacts: PostExpansionArtifacts<R>,
-    plan: Plan,
+    plan: Box<Plan>,
     errors: NonEmptyPlanErrors,
 }
 
 impl<R> PostExpansionDiagnostics<R> {
-    fn new(artifacts: PostExpansionArtifacts<R>, plan: Plan, errors: NonEmptyPlanErrors) -> Self {
+    fn new(
+        artifacts: PostExpansionArtifacts<R>,
+        plan: Box<Plan>,
+        errors: NonEmptyPlanErrors,
+    ) -> Self {
         Self {
             artifacts,
             plan,
@@ -7414,7 +7593,7 @@ impl<R> PostExpansionDiagnostics<R> {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_parts(self) -> (PostExpansionArtifacts<R>, Plan) {
-        (self.artifacts, self.plan)
+        (self.artifacts, *self.plan)
     }
 }
 
@@ -7620,7 +7799,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         migrated_legacy_state: None,
                     };
                     return Ok(PostExpansionOutcome::Diagnostics(
-                        PostExpansionDiagnostics::new(artifacts, plan, errors),
+                        PostExpansionDiagnostics::new(artifacts, Box::new(plan), errors),
                     ));
                 }
 
@@ -7666,6 +7845,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 if let Some(migrated) = migrated_legacy_state.as_ref() {
                     addressed.refresh_destroy_metadata_from_state(migrated);
                 }
+                let observed_state_file = state_file;
                 let state_file = if migrated_legacy_state.is_some() {
                     &migrated_legacy_state
                 } else {
@@ -7847,7 +8027,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     &mut reference_preparation,
                     row_request,
                     &managed_current,
-                    state_file.as_ref(),
+                    observed_state_file,
                     context.schemas(),
                     &input_types,
                     &prev_explicit,
@@ -8963,7 +9143,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<
 >(
     validated: ValidatedConfig<CanonicalResourcePair<E>>,
     provider_configs: &C,
-    state_file: &Option<StateFile>,
+    state_file: &carina_state::ObservedStateFile,
     refresh: bool,
     progress_sink: ProgressSink,
     remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
@@ -9014,7 +9194,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<
     canonical_resources: CanonicalResourcePair<E>,
     provider_configs: &C,
     provider_plan: &provider_mod::ProviderPlan,
-    state_file: &Option<StateFile>,
+    state_file: &carina_state::ObservedStateFile,
     refresh: bool,
     progress_sink: ProgressSink,
     remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
@@ -9308,6 +9488,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<
         PlanContext {
             plan,
             provider,
+            observation_authority: state_file.authority().clone(),
             // Keep the evaluated desired view distinct from the authored
             // pre-resolution snapshot. Before carina#3861 this field was filled
             // with `paired_unresolved_resources`; for let-bound resources that
@@ -11150,9 +11331,13 @@ pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
         WiringContext::new_for_test(&crate::test_support::TestCommandRuntime::new(), vec![], &[]);
     let mut parsed = carina_core::parser::ExpandedParsedFile::default();
     parsed.resources = resources.to_vec();
-    let errors = resolve_file_names_with_ctx(&ctx, &mut parsed);
-    resources.clone_from_slice(&parsed.resources);
-    errors_to_legacy_result(errors)
+    match resolve_file_names_with_ctx(&ctx, parsed) {
+        Ok(canonical) => {
+            resources.clone_from_slice(canonical.parsed().resources);
+            Ok(())
+        }
+        Err(errors) => errors_to_legacy_result(errors),
+    }
 }
 
 #[cfg(test)]

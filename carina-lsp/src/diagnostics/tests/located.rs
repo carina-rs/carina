@@ -268,6 +268,20 @@ fn resource_location_schema_engine() -> DiagnosticEngine {
     use carina_core::schema::{
         AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
     };
+    let entry = || {
+        AttributeType::struct_(
+            "Entry",
+            vec![
+                StructField::optional("enabled", AttributeType::bool()).build(),
+                StructField::optional(
+                    "children",
+                    AttributeType::list(AttributeType::struct_("Child", vec![])),
+                )
+                .with_block_name("child")
+                .build(),
+            ],
+        )
+    };
     let schema = ResourceSchema::new("test.Thing")
         .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
         .attribute(AttributeSchema::optional("enabled", AttributeType::bool()).build())
@@ -291,6 +305,28 @@ fn resource_location_schema_engine() -> DiagnosticEngine {
                     "Config",
                     vec![StructField::optional("enabled", AttributeType::bool()).build()],
                 ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional("items", AttributeType::list(entry()))
+                .with_block_name("item")
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("mapping", AttributeType::map(entry())).build())
+        .attribute(
+            AttributeSchema::optional(
+                "variant",
+                AttributeType::union(vec![
+                    AttributeType::struct_(
+                        "Enabled",
+                        vec![StructField::required("enabled", AttributeType::bool()).build()],
+                    ),
+                    AttributeType::struct_(
+                        "Other",
+                        vec![StructField::required("other", AttributeType::bool()).build()],
+                    ),
+                ]),
             )
             .build(),
         );
@@ -391,6 +427,68 @@ fn nested_schema_uses_parser_field() {
         "mock.test.Thing { config = { typo = true } }",
         "Unknown field",
         &[("typo", 1)],
+    );
+}
+
+#[test]
+fn nested_unknown_keys_keep_their_parser_key() {
+    for body in [
+        "mock.test.Thing { items = [{ enabled = true }, { typo = true }] }",
+        "mock.test.Thing { mapping = { 'a.b' = { typo = true } } }",
+        "mock.test.Thing { item { enabled = true } item { typo = true } }",
+        "mock.test.Thing { item { child {} child { typo = true } } }",
+    ] {
+        assert_resource_location(body, "Unknown field", &[("typo", 1)]);
+    }
+}
+
+#[test]
+fn unknown_key_keeps_its_selected_union_arm_location_in_the_lsp() {
+    assert_resource_location(
+        "mock.test.Thing { variant = { enabled = true typo = true } }",
+        "Unknown field",
+        &[("typo", 1)],
+    );
+}
+
+#[test]
+fn missing_unknown_child_keeps_the_nearest_authored_parent_in_the_lsp() {
+    use carina_core::schema::{AttributeType, ValidatedConfigSchema};
+    let source = create_document_at(
+        "mock.test.Thing { config = {} }",
+        "/project/sibling.crn".into(),
+    );
+    let value = create_document_at(
+        "mock.test.Thing { config = { typo = true } }",
+        "/project/sibling.crn".into(),
+    );
+    let schema = ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+        "config".to_string(),
+        AttributeType::struct_("Config", vec![]),
+    )]))
+    .unwrap();
+    let resource = value.parsed().unwrap().iter_all_resources().next().unwrap();
+    let findings = schema
+        .effective_type("config")
+        .unwrap()
+        .validate_findings(&resource.attributes()["config"])
+        .into_diagnostic_findings("config");
+    let tree = carina_core::parser::AnalysisTree::try_from_file(source.parsed().unwrap()).unwrap();
+    let (diagnostics, _) = resource_location_schema_engine().render_container_findings(
+        &source.for_diagnostics().expect("public fixture"),
+        tree.project_resources().next().unwrap(),
+        "config",
+        findings,
+    );
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert!(
+        diagnostics[0].message.contains("Unknown field"),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 18), Position::new(0, 24))
     );
 }
 

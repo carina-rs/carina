@@ -120,9 +120,9 @@ fn conversion_unrendered_no_as_walk_cannot_emit_or_add_shared_sink_findings() {
         .unwrap()
         .resolve_root_for_test();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
-    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let _tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     let expected = crate::parser::parse_type_expr_str("missing.Type", &catalog).unwrap();
@@ -137,13 +137,14 @@ fn conversion_unrendered_no_as_walk_cannot_emit_or_add_shared_sink_findings() {
                 crate::validation::ConversionValidation::new(judged.report());
             if walk_siblings {
                 // The production sibling driver has no ordinary findings output.
-                let (): () = run.admit_remaining_resources(
-                    &tree,
-                    judged,
-                    &bindings,
-                    session,
-                    crate::validation::admission::attributes::SlotPrechecks::Unreported,
-                );
+                let (): () = run
+                    .admit_remaining_resources(
+                        judged,
+                        &bindings,
+                        session,
+                        crate::validation::admission::attributes::SlotPrechecks::Unreported,
+                    )
+                    .unwrap();
             }
             assert!(run.complete().into_presented().is_empty());
         });
@@ -176,9 +177,9 @@ fn r5b_no_as_sibling_driver_does_no_extra_walks() {
     .into_parsed()
     .resolve_root_for_test();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
-    let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+    let _tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
@@ -188,12 +189,12 @@ fn r5b_no_as_sibling_driver_does_no_extra_walks() {
             coverage.work()
         });
         run.admit_remaining_resources(
-            &tree,
             judged,
             &bindings,
             session,
             crate::validation::admission::attributes::SlotPrechecks::Unreported,
-        );
+        )
+        .unwrap();
         let after = run.walk_in(crate::validation::FindingSubject::Root, |coverage| {
             coverage.work()
         });
@@ -250,29 +251,28 @@ fn r5b_sibling_driver_does_not_repeat_a_completed_conversion_validator() {
     .unwrap()
     .resolve_root_for_test();
     let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+        crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
     let bindings =
         crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-    let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+    let inputs = ResourceAttributeInputs::for_resource_for_test(resource, judged.report()).unwrap();
     let mut run: crate::validation::ConversionValidation =
         crate::validation::ConversionValidation::new(judged.report());
     crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
         let report = run
-            .admit_resource(ResourceAdmissionRequest {
+            .admit_resource(ResourceAdmissionRequest::for_test(
                 resource,
-                parsed: judged.file(),
-                schema: resource.schema(&schemas).unwrap(),
-
-                quoted: resource.quoted_string_attrs(),
+                judged.file(),
+                resource.schema(&schemas).unwrap(),
+                resource.quoted_string_attrs(),
                 inputs,
-                evaluation: crate::validation::admission::attributes::ValidationEvaluation::None,
-                bindings: &bindings,
+                crate::validation::admission::attributes::ValidationEvaluation::None,
+                &bindings,
                 session,
-                schemas: &schemas,
-            })
+                &schemas,
+            ))
             .values;
         assert_eq!(report.errors().count(), 0, "{report:?}");
         let after = calls.load(Ordering::SeqCst);
@@ -284,12 +284,12 @@ fn r5b_sibling_driver_does_not_repeat_a_completed_conversion_validator() {
             coverage.work()
         });
         run.admit_remaining_resources(
-            &tree,
             judged,
             &bindings,
             session,
             crate::validation::admission::attributes::SlotPrechecks::Unreported,
-        );
+        )
+        .unwrap();
         assert_eq!(
             calls.load(Ordering::SeqCst),
             after,

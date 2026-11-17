@@ -145,7 +145,10 @@ fn operational_provider_configuration_never_omits_unresolved_fields() {
             let ProviderConfigPreparationError::InvalidAttribute { error, .. } = error else {
                 panic!("typed attribute error")
             };
-            assert!(matches!(error.errors()[0], TypeError::Knowledge { .. }));
+            assert!(matches!(
+                error.errors().next().unwrap(),
+                TypeError::Knowledge { .. }
+            ));
             assert!(analyze(&factory, "owner", attributes).unwrap().is_empty());
         } else {
             assert!(matches!(
@@ -554,9 +557,9 @@ fn provider_classification_preserves_knowledge_category_and_text() {
         let ProviderConfigPreparationError::InvalidAttribute { error, .. } = diagnostic else {
             panic!("attribute error")
         };
-        assert_eq!(error.errors()[0].to_string(), expected);
+        assert_eq!(error.errors().next().unwrap().to_string(), expected);
         assert!(matches!(
-            error.errors()[0],
+            error.errors().next().unwrap(),
             TypeError::Knowledge {
                 attribute: None,
                 ..

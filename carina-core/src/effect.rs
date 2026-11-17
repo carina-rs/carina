@@ -494,6 +494,18 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
         self.preview = None;
         &mut self.request
     }
+    /// Project only history in a display-only draft, preserving its scheduling preview.
+    pub(crate) fn protect_history_for_display(
+        &mut self,
+        protect: impl Fn(
+            &DeletedInstanceKey,
+            &HashMap<String, crate::resource::SnapshotValue>,
+        ) -> HashMap<String, crate::resource::SnapshotValue>,
+    ) {
+        for old in self.request.deletes.iter_mut() {
+            old.previous_attributes = protect(&old.instance_key(), &old.previous_attributes);
+        }
+    }
     pub(crate) fn require_create_first_with_lineage(
         &mut self,
         requirements: &crate::replacement::CreateFirstRequirements,

@@ -251,7 +251,9 @@ async fn removed_no_refresh_saved_plan_apply() {
             )]),
         );
     snapshot.identifier = Some("old-id".into());
-    let snapshot = carina_core::value::redact_secrets_in_state(&snapshot).unwrap();
+    let snapshot = super::protected_observation(&snapshot.to_snapshot())
+        .snapshot()
+        .unwrap();
     let entry = plan::CurrentStateEntry::Managed {
         id,
         current: plan::SavedManagedCurrent::for_test(

@@ -256,6 +256,8 @@ expression = { coalesce_expr }
 
 // Null coalescing: expr ?? default (returns left if resolved, right if unresolved reference)
 coalesce_expr = { pipe_expr ~ ("??" ~ pipe_expr)* }
+coalesce_separator = { SOI ~ coalesce_token ~ EOI }
+coalesce_token = { "??" }
 
 // Pipe operator: value |> func |> func
 pipe_expr = { compose_expr ~ pipe_step* }

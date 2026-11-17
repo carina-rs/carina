@@ -240,6 +240,9 @@ fn format_value(value: &Value) -> String {
         Value::Deferred(DeferredValue::Secret(_)) => crate::schema::SECRET_VALUE_MASK.to_string(),
         Value::Deferred(DeferredValue::Unknown(reason)) => crate::value::render_unknown(reason),
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -740,6 +743,8 @@ impl RootConfigSignature {
             }
 
             Value::Deferred(DeferredValue::Placeholder(_)) => {}
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         }
     }
 
@@ -1160,6 +1165,12 @@ impl ModuleSignature {
                             crate::parser::BoundaryExpression::Value(
                                 Value::Concrete(_) | Value::Deferred(_),
                             ) => None,
+                            crate::parser::BoundaryExpression::Value(
+                                crate::resource::Value::Reference(never),
+                            ) => match *never {},
+                            crate::parser::BoundaryExpression::Value(
+                                crate::resource::Value::Conversion(never),
+                            ) => match *never {},
                         });
 
                 TypedAttributeParam {
@@ -1428,6 +1439,8 @@ impl ModuleSignature {
                 // Other unknowns are upstream-deferred and carry no
                 // resource-binding edge.
             }
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         }
     }
 

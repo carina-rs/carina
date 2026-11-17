@@ -1,0 +1,40 @@
+let secret_coalesce_pending = mock.test.resource {
+  name = "secret-coalesce-pending"
+  comment = other.comment ?? known.comment
+}
+let secret_coalesce_selected = mock.test.resource {
+  name = "secret-coalesce-selected"
+  comment = known.comment ?? other.comment
+}
+let public_coalesce_pending = mock.test.resource {
+  name = "public-coalesce-pending"
+  comment = public.comment ?? "default"
+}
+let public_coalesce_selected = mock.test.resource {
+  name = "public-coalesce-selected"
+  comment = "selected" ?? public.comment
+}
+let secret_lookup_known = mock.test.resource {
+  name = "secret-lookup-known"
+  comment = lookup({ a = other.comment, b = known.comment }, "a", known.comment)
+}
+let secret_lookup_pending = mock.test.resource {
+  name = "secret-lookup-pending"
+  comment = lookup({ a = other.comment, b = known.comment }, seed.identifier, known.comment)
+}
+let public_lookup_known = mock.test.resource {
+  name = "public-lookup-known"
+  comment = lookup({ a = "visible", b = public.comment }, "a", "default")
+}
+let public_lookup_pending = mock.test.resource {
+  name = "public-lookup-pending"
+  comment = lookup({ a = "visible", b = public.comment }, seed.identifier, "default")
+}
+let secret_if = mock.test.resource {
+  name = "secret-if"
+  comment = if true { other.comment } else { known.comment }
+}
+let public_if = mock.test.resource {
+  name = "public-if"
+  comment = if true { public.comment } else { "default" }
+}

@@ -360,8 +360,16 @@ async fn r10_prefix_missing_value_reports_p3_on_cli_and_lsp() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(messages(&result["lsp"]), messages(&plain["lsp"]));
-    assert_eq!(lsp_conversion_count(&result["lsp"]), 0, "{result}");
+    // #4429 consumes the companion key while retaining its authored slot:
+    // the plain prefix is accepted, and the converted prefix keeps CLI's P3.
+    let mut expected = messages(&plain["lsp"]);
+    expected.push((
+        json!("conversion cannot be checked here"),
+        json!(1),
+        json!("conversion_unsupported_position"),
+    ));
+    assert_eq!(messages(&result["lsp"]), expected);
+    assert_eq!(lsp_conversion_count(&result["lsp"]), 1, "{result}");
     assert_eq!(result["plan"]["ok"], false, "{result}");
 }
 
@@ -415,8 +423,16 @@ async fn reinstanced_prefix(module: bool) {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(messages(&result["lsp"]), messages(&plain["lsp"]));
-        assert_eq!(lsp_conversion_count(&result["lsp"]), 0, "{result}");
+        // Preserve the ordinary loop warning and the retained companion's P3;
+        // #4429 removes the plain twin's old unknown-attribute false positive.
+        let mut expected = messages(&plain["lsp"]);
+        expected.push((
+            json!("conversion cannot be checked here"),
+            json!(1),
+            json!("conversion_unsupported_position"),
+        ));
+        assert_eq!(messages(&result["lsp"]), expected);
+        assert_eq!(lsp_conversion_count(&result["lsp"]), 1, "{result}");
     }
 }
 #[tokio::test]
@@ -658,14 +674,8 @@ async fn r10_prefix_plain_twin_matches_main_prefix_resolution() {
     assert_eq!(result["validate"]["status"], "ok", "{result}");
     assert_eq!(result["plan"]["ok"], true, "{result}");
     assert_eq!(lsp_conversion_count(&result["lsp"]), 0);
-    assert!(
-        result["lsp"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|diagnostic| diagnostic["message"] == "Unknown attribute 'attr_prefix'"),
-        "{result}"
-    );
+    // #4429 closes the main-branch validate/LSP gap for plain companions.
+    assert_eq!(result["lsp"], json!([]), "{result}");
 }
 
 #[tokio::test]

@@ -32,11 +32,11 @@ SCRIPT_JOBS = {
 ALL_JOBS = CODE_JOBS | SCRIPT_JOBS | TEST_JOBS | {"changes", "test-result"}
 
 
-def jobs_from_workflow():
+def jobs_from_workflow(source):
     # Read only the job blocks/one-line conditions used in ci.yml. This is not
     # a general YAML parser: actionlint validates YAML; unexpected condition
     # syntax must fail these tests rather than silently omit a job or gate.
-    source = WORKFLOW.read_text().split("\njobs:\n", 1)[1]
+    source = source.split("\njobs:\n", 1)[1]
     headers = list(re.finditer(r"^  ([a-z][a-z0-9-]*):$", source, re.MULTILINE))
     return {
         header[1]: source[header.end():headers[index + 1].start() if index + 1 < len(headers) else len(source)]
@@ -86,7 +86,51 @@ def selected(condition, event, code, version_only, changes_result="success", cac
 class WorkflowConditionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.jobs = jobs_from_workflow()
+        cls.workflow = WORKFLOW.read_text()
+        cls.jobs = jobs_from_workflow(cls.workflow)
+
+    def test_every_job_has_a_timeout(self):
+        for name, block in self.jobs.items():
+            with self.subTest(job=name):
+                timeout = field(block, "timeout-minutes")
+                self.assertIsNotNone(timeout, "job needs its own timeout-minutes")
+                self.assertRegex(timeout, r"^[1-9][0-9]*$")
+
+    def assert_artifact_download_step_timeouts(self, source):
+        prefix = r"(?:      - |        )"
+        for name, block in jobs_from_workflow(source).items():
+            for index, step in enumerate(re.split(r"(?m)(?=^      - )", block)[1:], 1):
+                action = (field(step, "uses", prefix) or "").strip().strip("'\"")
+                if not action.startswith("actions/download-artifact@"):
+                    continue
+                context = f"{name} step {index}"
+                timeout = field(step, "timeout-minutes", prefix)
+                self.assertIsNotNone(timeout, f"{context}: download step needs its own timeout-minutes")
+                self.assertRegex(timeout, r"^[1-9][0-9]*$", context)
+                job_timeout = field(block, "timeout-minutes")
+                self.assertIsNotNone(job_timeout, f"{context}: job needs its own timeout-minutes")
+                self.assertLess(int(timeout), int(job_timeout), context)
+
+    def test_every_artifact_download_has_a_shorter_step_timeout(self):
+        self.assert_artifact_download_step_timeouts(self.workflow)
+
+    def test_artifact_download_timeout_check_rejects_missing_timeouts(self):
+        for quote in ("", "'", '"'):
+            with self.subTest(quote=quote):
+                uses = f"      - uses: {quote}actions/download-artifact@v4{quote}\n"
+                quoted, count = re.subn(
+                    r"(?m)^      - uses: actions/download-artifact@[^\n]+\n",
+                    uses, self.workflow, count=1,
+                )
+                self.assertEqual(count, 1, "self-check must mutate one download step")
+                self.assert_artifact_download_step_timeouts(quoted)
+                without_timeout, count = re.subn(
+                    re.escape(uses) + r"        timeout-minutes: [1-9][0-9]*\n",
+                    uses, quoted, count=1,
+                )
+                self.assertEqual(count, 1, "self-check must remove one step timeout")
+                with self.assertRaisesRegex(AssertionError, "download step needs its own timeout-minutes"):
+                    self.assert_artifact_download_step_timeouts(without_timeout)
 
     def test_gating_matrix(self):
         self.assertEqual(set(self.jobs), ALL_JOBS)

@@ -61,6 +61,9 @@ mod nested_reference;
 #[path = "e2e_typecheck_parity/recovered_composition.rs"]
 mod recovered_composition;
 
+#[path = "e2e_typecheck_parity/unknown_key_locations.rs"]
+mod unknown_key_locations;
+
 // ============================================================================
 // Fixture + helpers (mirror carina-lsp/tests/e2e_typecheck.rs)
 // ============================================================================
@@ -5723,17 +5726,9 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
     core_registry.insert("test", validated_schema);
     let core_factories = Arc::new(factories_for(&core_registry));
     let core_resolver = carina_core::provider::provider_custom_types_from_factories(core_factories);
-    let classified_attributes = attributes
+    let value_attributes = attributes
         .iter()
-        .map(|(name, value)| {
-            (
-                name.clone(),
-                value
-                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .unwrap(),
-            )
-        })
+        .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
     let core_errors = carina_core::test_utils::admit_resource_attributes(
         core_registry
@@ -5743,7 +5738,7 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
                 carina_core::schema::SchemaKind::Resource,
             )
             .expect("test schema must be owner-bound"),
-        &classified_attributes,
+        &value_attributes,
         &|name| name == "hosted_zone_id",
         &core_resolver,
     )

@@ -859,6 +859,12 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
                         )
                     }
                     Value::Deferred(_) => deferred_provider_check(expected, value),
+                    crate::resource::Value::Reference(never) => {
+                        match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+                    }
+                    crate::resource::Value::Conversion(never) => {
+                        match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+                    }
                 }
             }
             Ok(resolved) => check(&resolved, value),
@@ -923,6 +929,12 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
             unreachable!("secret values are checked at the boundary")
         }
         Value::Concrete(_) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
     let matches_scalar = match (expected, value) {
         (
@@ -1238,6 +1250,12 @@ pub(crate) fn value_kind_name<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Secret(_)) => "secret value",
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown value",
         Value::Deferred(DeferredValue::Placeholder(_)) => "module argument value",
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -1250,8 +1268,7 @@ fn validation_mismatch<P: PlaceholderKind, B: BindingAddress>(
         path: Vec::new(),
         expected: Box::new(expected.clone()),
         actual: Box::new(ValueDescription::of(value)),
-        validator_message: (!value.contains_diagnostic_sensitive_string())
-            .then(|| message.into_boxed_str()),
+        validator_message: Some(message.into_boxed_str()),
         hint: None,
     }
 }

@@ -29,6 +29,9 @@ use carina_state::{ResourceState, StateFile};
 mod fixture;
 use fixture::{EchoFactory, EchoMock, Failure, MASK, PUBLIC, SECRET};
 
+#[path = "provider_text_secret_redaction_e2e/observed_graft.rs"]
+mod observed_graft;
+
 const CHILD: &str = "CARINA_4305_PROVIDER_TEXT_CHILD";
 
 #[path = "provider_text_secret_redaction_e2e/round5.rs"]
@@ -36,6 +39,9 @@ mod round5;
 
 #[path = "provider_text_secret_redaction_e2e/update_partial.rs"]
 mod update_partial;
+
+#[path = "provider_text_secret_redaction_e2e/flag_observability.rs"]
+mod flag_observability;
 
 #[test]
 fn review_round7_bound_error_relay_through_state_only_boundary_masks_cli_display() {
@@ -356,6 +362,10 @@ fn non_secret_provider_text_is_shown_verbatim() {
 }
 
 fn plan_failure(failure: Failure) {
+    plan_failure_using(failure, false);
+}
+
+fn plan_failure_using(failure: Failure, json: bool) {
     let directory = tempfile::tempdir().unwrap();
     let state_path = directory.path().join("carina.state.json");
     std::fs::write(
@@ -376,15 +386,23 @@ fn plan_failure(failure: Failure) {
     .unwrap();
     std::fs::write(
         directory.path().join("providers.crn"),
-        if matches!(failure, Failure::RefreshDesired | Failure::MovedRefresh) {
+        if matches!(
+            failure,
+            Failure::RefreshDesired
+                | Failure::MovedRefresh
+                | Failure::DataSource
+                | Failure::DataSourceEvents
+        ) {
             "provider mock {}\n".to_owned()
         } else {
             format!("provider mock {{ password = secret(\"{SECRET}\") }}\n")
         },
     )
     .unwrap();
-    let source = if failure == Failure::DataSource {
-        format!("let probe = read mock.test.lookup {{ password = secret(\"{SECRET}\") }}\n")
+    let source = if matches!(failure, Failure::DataSource | Failure::DataSourceEvents) {
+        format!(
+            "let probe = read mock.test.lookup {{ password = secret(\"{SECRET}\") strings = split(',', secret(\"{SECRET}\")) }}\n"
+        )
     } else {
         format!(
             "let probe = mock.test.resource {{ name = \"probe\" password = secret(\"{SECRET}\") }}\n"
@@ -421,12 +439,25 @@ fn plan_failure(failure: Failure) {
     let runtime = TestCommandRuntime::new();
     let error = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(run_refreshing_plan_with_factories(
-            &runtime,
-            directory.path(),
-            LoadedProviderFactory::for_test(vec![Box::new(EchoFactory(failure))]),
-        ))
+        .block_on(async {
+            let factories = LoadedProviderFactory::for_test(vec![Box::new(EchoFactory(failure))]);
+            if json {
+                carina_cli::test_support::run_saved_json_plan_with_factories(
+                    &runtime,
+                    directory.path(),
+                    &directory.path().join("plan.json"),
+                    factories,
+                )
+                .await
+            } else {
+                run_refreshing_plan_with_factories(&runtime, directory.path(), factories).await
+            }
+        })
         .expect_err("plan must fail at the provider read boundary");
+    assert!(!directory.path().join("plan.json").exists());
+    if matches!(failure, Failure::DataSource | Failure::DataSourceEvents) {
+        assert!(!state_path.exists());
+    }
     assert!(
         matches!(error, carina_cli::error::AppError::Provider(_)),
         "expected provider read failure, got {error:?}"

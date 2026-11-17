@@ -645,6 +645,8 @@ pub(crate) fn visit_deferred_user_function_calls<P: ValueKind, B: BindingAddress
     visit: &mut impl FnMut(&UserFunction<B>),
 ) {
     match value {
+        Value::Reference(payload) => match *P::no_reference_payload(payload) {},
+        Value::Conversion(payload) => match *P::no_conversion_payload(payload) {},
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             for value in deferred.values() {
                 visit_deferred_user_function_calls(value, visit);

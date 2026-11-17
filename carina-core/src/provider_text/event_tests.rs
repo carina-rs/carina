@@ -452,6 +452,103 @@ fn value_session(
 }
 
 #[test]
+fn env_event_values_are_public_until_wrapped_in_secret() {
+    use crate::resource::{ConcreteValue, Resource, Value};
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
+
+    let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+        "CARINA_4409_EVENT".to_string(),
+        "env-event-value".into(),
+    )]));
+    let value = crate::builtins::evaluate_builtin_with_config_to_value(
+        "env",
+        &[Value::Concrete(ConcreteValue::String(
+            "CARINA_4409_EVENT".into(),
+        ))],
+        &config,
+    )
+    .unwrap();
+    let Value::Concrete(ConcreteValue::String(text)) = &value else {
+        panic!("env must return a string");
+    };
+    let mut actual = Vec::new();
+    for hidden in [true, false] {
+        let strings = Value::Concrete(ConcreteValue::StringList(vec![text.clone()]));
+        let public = if hidden {
+            value.clone().into_secret()
+        } else {
+            value.clone()
+        };
+        let strings = if hidden {
+            strings.into_secret()
+        } else {
+            strings
+        };
+        let resource: Resource = Resource::with_provider("mock", "Widget", "event-fixture", None)
+            .with_attribute("public", public)
+            .with_attribute("strings", strings);
+        let plan = ProviderPlan::from_desired(&[resource], &[]);
+        let (session, events) = captured_session(plan.test_session_builder("mock", None, None));
+        let schema = ResourceSchema::new("Widget")
+            .attribute(AttributeSchema::optional("public", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("strings", AttributeType::list(AttributeType::string()))
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("mock", schema);
+        session.diagnostics().set_schemas(schemas);
+        let id = carina_provider_protocol::types::ResourceId {
+            provider: "mock".into(),
+            resource_type: "Widget".into(),
+            identity: "event-fixture".into(),
+        };
+        for (attribute, candidate) in [
+            ("public", serde_json::json!("observed-public-value")),
+            ("strings", serde_json::json!(["observed-public-value"])),
+        ] {
+            session.diagnostics().emit(ProviderEvent::value(
+                EventLevel::Warn,
+                ProviderValueDiagnostic::json(
+                    Some(&id),
+                    &[attribute.into()],
+                    ValueOrigin::Observed,
+                    &candidate,
+                ),
+            ));
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for event in &*events {
+            actual.push((hidden, present_event(event).to_string()));
+        }
+    }
+    assert_eq!(
+        actual,
+        [
+            (
+                true,
+                "warn [mock] mock.Widget.event-fixture public: (secret)".into()
+            ),
+            (
+                true,
+                "warn [mock] mock.Widget.event-fixture strings: (secret)".into()
+            ),
+            (
+                false,
+                "warn [mock] mock.Widget.event-fixture public: \"observed-public-value\"".into()
+            ),
+            (
+                false,
+                "warn [mock] mock.Widget.event-fixture strings: [\"observed-public-value\"]".into()
+            ),
+        ]
+    );
+}
+
+#[test]
 fn observed_origin_never_downgrades_host_secret_classification() {
     let (session, events, id) = value_session(true);
     let candidate = serde_json::json!({"password": "new-observed-secret-canary", "visible": "ordinary-sibling"});
@@ -631,4 +728,124 @@ fn presenter_redacts_a_secret_assembled_across_bound_segments() {
     let text = present_event(&events[0]).to_string();
     assert!(!text.contains("cross-boundary: secret-value"));
     assert!(text.contains("(secret)"));
+}
+
+#[test]
+fn prepared_secret_data_source_events_protect_scalar_and_list_paths() {
+    use crate::executor::{
+        ModuleConstraintGate, ProviderPreparationContext, prepare_provider_ready_data_source,
+    };
+    use crate::resource::{ConcreteValue, DataSource, RootScope, Value};
+    let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let mut parsed = crate::parser::parse("let scalar = secret('private-event-token')\nlet strings = split(',', secret('private-event-token'))", &context).unwrap();
+    crate::parser::resolve_resource_refs_with_config(&mut parsed, &context).unwrap();
+    let mut source = DataSource::with_provider("mock", "test.lookup", "event-input", None);
+    for name in ["scalar", "strings"] {
+        source.attributes.insert(
+            name.into(),
+            parsed.variables[name]
+                .clone()
+                .resolve_root(&RootScope::new())
+                .into_expanded()
+                .unwrap(),
+        );
+    }
+    let mut schemas = crate::schema::SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        crate::schema::ResourceSchema::new("test.lookup")
+            .as_data_source()
+            .attribute(
+                crate::schema::AttributeSchema::required(
+                    "scalar",
+                    crate::schema::AttributeType::string(),
+                )
+                .build(),
+            )
+            .attribute(
+                crate::schema::AttributeSchema::required(
+                    "strings",
+                    crate::schema::AttributeType::union(vec![
+                        crate::schema::AttributeType::string(),
+                        crate::schema::AttributeType::list(crate::schema::AttributeType::string()),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().test_session_builder("mock", None, None));
+    session.diagnostics().set_schemas(schemas.clone());
+    crate::validation::deferred_types::with_session_for_test(&context, |type_checks| {
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let preparation = ProviderPreparationContext::for_test(
+            &bindings,
+            &gate,
+            &[],
+            &crate::provider::NoopNormalizer,
+            &schemas,
+            type_checks,
+        );
+        let ready = prepare_provider_ready_data_source(source, &preparation).unwrap();
+        assert!(matches!(
+            &ready.attributes["strings"],
+            Value::Concrete(ConcreteValue::StringList(_))
+        ));
+        assert_eq!(
+            ["scalar", "strings"].map(|name| {
+                let inventory = RedactionSet::collect([&ready.attributes[name]]);
+                ProviderDiagnostic::message("provider saw private-event-token".into())
+                    .with_secrets(&inventory)
+                    .to_string()
+            }),
+            ["provider saw (secret)", "provider saw (secret)"]
+        );
+        session.diagnostics().include_ready_data_source(&ready);
+        let id = carina_provider_protocol::types::ResourceId {
+            provider: "mock".into(),
+            resource_type: "test.lookup".into(),
+            identity: "event-input".into(),
+        };
+        // These observations have different bytes from the input. They need
+        // path protection even when a byte redactor knows the original token.
+        for (name, candidate) in [
+            (
+                "scalar",
+                carina_provider_protocol::types::Value::String(
+                    "changed-private-event-token".into(),
+                ),
+            ),
+            (
+                "strings",
+                carina_provider_protocol::types::Value::StringList(vec![
+                    "changed-private-event-token".into(),
+                ]),
+            ),
+        ] {
+            session.diagnostics().emit(ProviderEvent::value(
+                EventLevel::Warn,
+                ProviderValueDiagnostic::typed(
+                    Some(&id),
+                    &[name.into()],
+                    ValueOrigin::Observed,
+                    &candidate,
+                ),
+            ));
+        }
+    });
+    let events = events.lock().unwrap();
+    let actual = events
+        .iter()
+        .map(|event| present_event(event).to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            "warn [mock] mock.test.lookup.event-input scalar: (secret)",
+            "warn [mock] mock.test.lookup.event-input strings: [(secret)]",
+        ]
+    );
 }

@@ -4,13 +4,13 @@ use super::{DiagnosticEngine, render_merged, render_schema_diagnostic};
 use crate::document::DiagnosticDocument as Document;
 use carina_core::parser::{AnalysisResourceRef, Located};
 use carina_core::schema::{
-    FieldPath, FieldPathStep, LeafPath, LeafPathSegment, MismatchTypeNames, TypeError,
-    ValidatedResourceSchema,
+    FieldPath, FieldPathStep, LeafPath, LeafPathSegment, MismatchTypeNames, SchemaDiagnostic,
+    TypeError, ValidatedResourceSchema,
 };
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-pub(super) fn reference_mismatch_message(
-    value: &super::Value,
+pub(super) fn reference_mismatch_message<B: carina_core::resource::BindingAddress>(
+    value: &carina_core::resource::Value<carina_core::resource::ParserPlaceholder, B>,
     path: &LeafPath,
     attribute: &str,
     types: &MismatchTypeNames,
@@ -28,7 +28,7 @@ pub(super) fn covered_by_symbolic_findings(
 ) -> bool {
     if symbolic.iter().any(|finding| {
         let (symbolic_path, symbolic_error) = finding.diagnostic();
-        error == symbolic_error
+        error == symbolic_error.error()
             && path.steps().len() == symbolic_path.segments().len()
             && path
                 .steps()
@@ -69,16 +69,30 @@ pub(super) fn covered_by_symbolic_findings(
 impl DiagnosticEngine {
     /// Attach each cached path-tagged error to the
     /// authored key, list element, or nearest authored computed parent.
-    pub(super) fn render_container_findings(
+    pub(super) fn render_container_findings<D, B: carina_core::resource::BindingAddress>(
         &self,
         doc: &Document,
-        resource: &AnalysisResourceRef<'_>,
+        resource: &AnalysisResourceRef<
+            '_,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::ParserPlaceholder,
+            D,
+            B,
+        >,
         attr_name: &str,
-        findings: Vec<(FieldPath, TypeError)>,
-    ) -> (Vec<Diagnostic>, bool) {
+        findings: Vec<(FieldPath, SchemaDiagnostic)>,
+    ) -> (Vec<Diagnostic>, bool)
+    where
+        D: carina_core::parser::DeferredForPhaseTraversal<
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::ParserPlaceholder,
+                B,
+            >,
+    {
         let mut diagnostics = Vec::new();
         let mut reported_duplicate = false;
-        for (path, error) in findings {
+        for (path, diagnostic) in findings {
+            let error = diagnostic.error().clone();
             let is_duplicate = super::is_duplicate_list_error(&error);
             let is_item_error = path
                 .steps()
@@ -108,12 +122,21 @@ impl DiagnosticEngine {
             let use_value_location = path.is_empty()
                 && (is_duplicate
                     || crate::code_action::enum_diagnostic_data_for_error(&error).is_some());
-            let location = if is_duplicate || use_value_location {
-                resource.attribute_value_location(attr_name, &path)
-            } else {
-                resource.attribute_path_location(attr_name, &path)
+            let location = match resource.locate_schema_diagnostic(&diagnostic, |_ordinary| {
+                let location = if is_duplicate || use_value_location {
+                    resource.attribute_value_location(attr_name, &path)
+                } else {
+                    resource.attribute_path_location(attr_name, &path)
+                };
+                location.clone()
+            }) {
+                Ok(finding) => finding.into_parts().0,
+                Err(error) => {
+                    diagnostics.extend(super::render_analysis_invariant(doc, &error));
+                    continue;
+                }
             };
-            let finding = Located::new(location.clone(), error);
+            let finding = Located::new(location, error);
             let diagnostic = if use_value_location {
                 render_schema_diagnostic(
                     doc,
@@ -136,12 +159,25 @@ impl DiagnosticEngine {
         (diagnostics, reported_duplicate)
     }
 
-    pub(super) fn check_list_struct_syntax(
+    pub(super) fn check_list_struct_syntax<D, B: carina_core::resource::BindingAddress>(
         &self,
         doc: &Document,
-        resource: &AnalysisResourceRef<'_>,
+        resource: &AnalysisResourceRef<
+            '_,
+            carina_core::resource::ParserPlaceholder,
+            carina_core::resource::ParserPlaceholder,
+            D,
+            B,
+        >,
         schema: &ValidatedResourceSchema,
-    ) -> Vec<Diagnostic> {
+    ) -> Vec<Diagnostic>
+    where
+        D: carina_core::parser::DeferredForPhaseTraversal<
+                carina_core::resource::ParserPlaceholder,
+                carina_core::resource::ParserPlaceholder,
+                B,
+            >,
+    {
         use carina_core::schema::Shape;
         let mut diagnostics = Vec::new();
         for attribute in schema.effective_attributes() {

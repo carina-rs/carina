@@ -77,6 +77,8 @@ pub(super) struct Diagnostic {
     pub warning_type: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<Location>,
 }
 
 #[derive(Serialize)]
@@ -141,6 +143,7 @@ impl Diagnostic {
             location: None,
             warning_type: None,
             file: None,
+            related: Vec::new(),
         }
     }
     fn located(message: String, location: &DeclarationLocation) -> Self {
@@ -309,6 +312,14 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
                 })
                 .collect();
         }
+        AppError::Secrecy(finding) => Diagnostic {
+            related: finding
+                .call_site()
+                .map(|call| Location::authored(&call.location))
+                .into_iter()
+                .collect(),
+            ..Diagnostic::located(finding.message(), finding.location())
+        },
         AppError::ExpressionType(finding) => {
             Diagnostic::located(finding.detail().to_string(), finding.location())
         }
@@ -352,15 +363,32 @@ fn error_diagnostics(error: &AppError) -> Vec<Diagnostic> {
             location: Some(Location::file(file)),
             ..Diagnostic::new(format_error_with_source_chain(error), "error")
         },
+        AppError::AnalysisInvariant(error) => analysis_invariant_diagnostic(error),
         AppError::AnalysisResolution(error) => match error.as_ref() {
             carina_core::parser::AnalysisResolutionError::Diagnostic(finding) => {
                 Diagnostic::located(finding.detail().diagnostic_message(), finding.location())
             }
-            _ => Diagnostic::new(format_error_with_source_chain(error.as_ref()), "error"),
+            carina_core::parser::AnalysisResolutionError::Invariant(error) => {
+                analysis_invariant_diagnostic(error)
+            }
         },
         _ => Diagnostic::new(format_error_with_source_chain(error), "error"),
     };
     vec![diagnostic]
+}
+
+fn analysis_invariant_diagnostic(error: &carina_core::parser::AnalysisTreeError) -> Diagnostic {
+    use carina_core::parser::AnalysisTreeDiagnostic;
+    match error.diagnostic() {
+        AnalysisTreeDiagnostic::Located(finding) => {
+            Diagnostic::located(error.to_string(), finding.location())
+        }
+        AnalysisTreeDiagnostic::File(finding) => Diagnostic {
+            location: Some(Location::file(finding.file().path())),
+            ..Diagnostic::new(error.to_string(), "error")
+        },
+        AnalysisTreeDiagnostic::Directory(_) => Diagnostic::new(error.to_string(), "error"),
+    }
 }
 
 fn module_error_diagnostics(
@@ -393,6 +421,7 @@ fn module_error_diagnostics(
                     .iter()
                     .map(|error| Diagnostic::new(error.to_string(), "error"))
                     .collect(),
+                ModuleError::AnalysisInvariant(error) => vec![analysis_invariant_diagnostic(error)],
                 error => vec![Diagnostic::new(error.to_string(), "error")],
             };
             for diagnostic in &mut diagnostics {
@@ -830,7 +859,7 @@ fn collect_configuration(
         return ValidateReport::finish(Vec::new(), errors, warnings, events);
     }
     ValidateReport::finish(
-        super::validated_entries(&parsed)
+        super::validated_entries(parsed.parsed().iter_all_resources())
             .iter()
             .map(ToString::to_string)
             .collect(),

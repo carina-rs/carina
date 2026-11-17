@@ -1,0 +1,72 @@
+// Positive counterparts of every rejected form in mixed_coalesce.
+let rewritten_secret_left = mock.test.resource {
+  name = "rewritten-secret-left"
+  comment = other.comment ?? secret("default")
+}
+let rewritten_public_left = mock.test.resource {
+  name = "rewritten-public-left"
+  comment = secret(public.comment) ?? other.comment
+}
+let rewritten_secret_selected = mock.test.resource {
+  name = "rewritten-secret-selected"
+  comment = secret("STRUCTURAL_SECRECY_4470_CANARY") ?? secret("default")
+}
+let rewritten_public_selected = mock.test.resource {
+  name = "rewritten-public-selected"
+  comment = secret("public") ?? known.comment
+}
+let rewritten_wrapped = mock.test.resource {
+  name = "rewritten-wrapped"
+  comment = secret(other.tags.token ?? secret("default"))
+}
+let rewritten_discarded = mock.test.resource {
+  name = "rewritten-discarded"
+  comment = known.comment ?? secret(other.comment ?? secret("default"))
+}
+let rewritten_unicode = mock.test.resource {
+  name = "rewritten-unicode"
+  comment = secret("🔒") ?? known.comment
+}
+
+// Positive counterparts of every rejected form in mixed_lookup. The
+// candidates and the default agree even when the key is known or pending.
+let rewritten_lookup_secret_key = mock.test.resource {
+  name = "rewritten-lookup-secret-key"
+  comment = lookup({ private = other.comment, public = secret("visible") }, "private", other.comment)
+}
+let rewritten_lookup_public_key = mock.test.resource {
+  name = "rewritten-lookup-public-key"
+  comment = lookup({ public = secret("visible"), private = other.comment }, "public", secret("default"))
+}
+let rewritten_lookup_pending_key = mock.test.resource {
+  name = "rewritten-lookup-pending-key"
+  comment = lookup({ private = other.comment, public = secret("visible") }, seed.identifier, secret("default"))
+}
+let rewritten_lookup_public_default = mock.test.resource {
+  name = "rewritten-lookup-public-default"
+  comment = lookup({ private = other.comment }, "private", secret("default"))
+}
+let rewritten_lookup_secret_default = mock.test.resource {
+  name = "rewritten-lookup-secret-default"
+  comment = lookup({ public = secret("visible") }, "public", other.comment)
+}
+let up = upstream_state { source = "./up" }
+let rewritten_lookup_upstream = mock.test.resource {
+  name = "rewritten-lookup-upstream"
+  comment = secret(lookup(up.values, "chosen", "default"))
+}
+let rewritten_lookup_wrapped = mock.test.resource {
+  name = "rewritten-lookup-wrapped"
+  comment = secret(lookup({ private = other.comment, public = secret("visible") }, "public", secret("default")))
+}
+
+// A use-site wrapper can also protect a homogeneous Public coalesce.
+let rewritten_use_site = mock.test.resource {
+  name = "rewritten-use-site"
+  comment = secret(public.comment ?? "default")
+}
+let rewritten_template = use { source = "./rewritten_module" }
+let rewritten_secret_instance = rewritten_template {
+  name = "rewritten-secret-instance"
+  value = secret("STRUCTURAL_SECRECY_4470_CANARY")
+}

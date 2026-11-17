@@ -844,7 +844,7 @@ validated_config.provider_plan())
         destroy_graph.resolve_wait_binding(wait)?;
     }
     if let Some(migrated) = validated.migrated_state {
-        state_file = Some(migrated);
+        *state_file = Some(migrated);
         if let Some(state) = state_file.as_ref() {
             #[allow(clippy::iter_over_hash_type)] // keyed rebuild: dependency metadata is copied independently by resource ID
             for (id, current) in &mut managed_current {
@@ -1031,7 +1031,7 @@ validated_config.provider_plan())
     destroy_plan.record_unresolved_delete_ordering_analysis(delete_scheduler.analysis());
     let destroy_plan = destroy_plan.admit(ctx.schemas())?;
     let historical_display =
-        collect_historical_display_attributes(&destroy_plan, &managed_current, state_file.as_ref());
+        collect_historical_display_attributes(&destroy_plan, &managed_current, &state_file)?;
 
     // Display destroy plan as a dependency tree
     print!(
@@ -1183,7 +1183,7 @@ validated_config.provider_plan())
     let mut skip_count = 0;
     let mut unknown_count = 0;
     let saver = IncrementalStateSaver::start(
-        state_file.unwrap_or_default(),
+        state_file.into_file().unwrap_or_default(),
         mid_run_writer,
         |mut state, checkpoint: &Vec<DestroyedInstance>| {
             apply_destroy_to_state(

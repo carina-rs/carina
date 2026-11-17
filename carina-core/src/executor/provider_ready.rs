@@ -134,47 +134,18 @@ impl<T: ResourceWirePayload, K: RechecksResolved> ProviderReady<T, K> {
         self.diagnostic_attributes().values()
     }
     pub(crate) fn diagnostic_value(&self, key: &str, sent: &Value) -> Value {
-        fn annotate(sent: &Value, source: &Value) -> Value {
-            use crate::resource::{ConcreteValue, DeferredValue};
-            match (sent, source) {
-                (_, Value::Deferred(DeferredValue::Secret(_))) => sent.clone().into_secret(),
-                (
-                    Value::Concrete(ConcreteValue::Map(values)),
-                    Value::Concrete(ConcreteValue::Map(source)),
-                ) => Value::Concrete(ConcreteValue::Map(
-                    values
-                        .iter()
-                        .map(|(key, value)| {
-                            (
-                                key.clone(),
-                                source.get(key).map_or_else(
-                                    || value.clone(),
-                                    |source| annotate(value, source),
-                                ),
-                            )
-                        })
-                        .collect(),
-                )),
-                (
-                    Value::Concrete(ConcreteValue::List(values)),
-                    Value::Concrete(ConcreteValue::List(source)),
-                ) => Value::Concrete(ConcreteValue::List(
-                    values
-                        .iter()
-                        .enumerate()
-                        .map(|(index, value)| {
-                            source
-                                .get(index)
-                                .map_or_else(|| value.clone(), |source| annotate(value, source))
-                        })
-                        .collect(),
-                )),
-                _ => sent.clone(),
-            }
-        }
-        self.diagnostic_attributes()
+        self.admission
+            .payload()
+            .diagnostic_protection
             .get(key)
-            .map_or_else(|| sent.clone(), |source| annotate(sent, source))
+            .map_or_else(|| sent.clone(), |protection| protection.mask(sent))
+    }
+
+    pub(crate) fn rule_input_value(&self, key: &str, sent: &Value) -> Value {
+        self.diagnostic_attributes().get(key).map_or_else(
+            || sent.clone(),
+            |source| crate::value::SecretProtection::for_dispatch_rule_input(source).mask(sent),
+        )
     }
 
     /// Borrow the checked payload.
@@ -208,14 +179,29 @@ impl<T: ResourceWirePayload, K: RechecksResolved> Deref for ProviderReady<T, K> 
 pub(crate) struct DispatchPayload<T> {
     payload: T,
     diagnostic_attributes: IndexMap<String, Value>,
+    diagnostic_protection: IndexMap<String, crate::value::SecretProtection>,
 }
 
 impl<T> DispatchPayload<T> {
+    fn new(payload: T, diagnostic_attributes: IndexMap<String, Value>) -> Self {
+        let diagnostic_protection =
+            crate::value::SecretProtection::attributes(&diagnostic_attributes);
+        Self {
+            payload,
+            diagnostic_attributes,
+            diagnostic_protection,
+        }
+    }
     pub(crate) fn payload(&self) -> &T {
         &self.payload
     }
     pub(crate) fn diagnostic_attributes(&self) -> &IndexMap<String, Value> {
         &self.diagnostic_attributes
+    }
+    pub(crate) fn diagnostic_protection(
+        &self,
+    ) -> &IndexMap<String, crate::value::SecretProtection> {
+        &self.diagnostic_protection
     }
 }
 
@@ -228,10 +214,10 @@ impl DispatchPayload<ResolvedResource<ProviderModuleSource>> {
         let diagnostic_attributes = resource.as_resource().attributes.clone();
         let mut resource = resource.into_inner();
         restored.remove(&mut resource.attributes);
-        Ok(Self {
-            payload: ResolvedResource::resolve_with_schemas(resource, schemas)?,
+        Ok(Self::new(
+            ResolvedResource::resolve_with_schemas(resource, schemas)?,
             diagnostic_attributes,
-        })
+        ))
     }
 }
 
@@ -242,10 +228,7 @@ impl DispatchPayload<ResolvedDataSource<ProviderModuleSource>> {
         for attribute in value.attributes.values_mut() {
             *attribute = unwrap_secret(attribute);
         }
-        Self {
-            payload: ResolvedDataSource::new(value),
-            diagnostic_attributes,
-        }
+        Self::new(ResolvedDataSource::new(value), diagnostic_attributes)
     }
 }
 
@@ -260,6 +243,7 @@ impl<T: ResourceWirePayload> DispatchPayload<T> {
                 }
             })?,
             diagnostic_attributes: self.diagnostic_attributes,
+            diagnostic_protection: self.diagnostic_protection,
         })
     }
 }
@@ -1034,8 +1018,8 @@ pub use crate::validation::admission::configuration::provider::{
 pub struct ProviderValueConstraintErrors(Box<crate::schema::ResourceValueValidation>);
 
 impl ProviderValueConstraintErrors {
-    pub fn errors(&self) -> &[TypeError] {
-        self.0.error_slice()
+    pub fn errors(&self) -> impl Iterator<Item = &TypeError> {
+        self.0.errors()
     }
 
     fn from_admission(report: crate::schema::ResourceValueValidation) -> Self {
@@ -1075,7 +1059,78 @@ fn review_r10_constraint_display_uses_the_structured_errors() {
         crate::schema::ResourceValueValidation::from_errors(vec![TypeError::MissingRequired {
             name: "current".into(),
         }]);
-    assert_eq!(errors.to_string(), errors.errors()[0].to_string());
+    assert_eq!(
+        errors.to_string(),
+        errors.errors().next().unwrap().to_string()
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn union_unknown_key_keeps_provider_constraint_message() {
+    use crate::schema::{
+        AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, StructField,
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Thing")
+            .attribute(
+                AttributeSchema::optional(
+                    "variant",
+                    AttributeType::union(vec![
+                        AttributeType::struct_(
+                            "Enabled",
+                            vec![StructField::required("enabled", AttributeType::bool()).build()],
+                        ),
+                        AttributeType::struct_(
+                            "Other",
+                            vec![StructField::required("other", AttributeType::bool()).build()],
+                        ),
+                    ]),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let resource: Resource = Resource::with_provider("mock", "Thing", "test", None).with_attribute(
+        "variant",
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+            indexmap::IndexMap::from([
+                (
+                    "enabled".into(),
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::Bool(true)),
+                ),
+                (
+                    "typo".into(),
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::Bool(true)),
+                ),
+            ]),
+        )),
+    );
+    let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let result = crate::validation::admission::attributes::admit_apply_resource(
+            &resource,
+            None,
+            schemas.get_for(&resource).unwrap(),
+            &Default::default(),
+            session,
+        );
+        let Err(crate::validation::admission::attributes::ApplyAdmissionErrors::Constraints(
+            report,
+        )) = result
+        else {
+            panic!("unknown field must fail");
+        };
+        let expected = "Unknown field 'typo' in Enabled";
+        assert_eq!(report.errors().next().unwrap().to_string(), expected);
+        assert_eq!(
+            ProviderValueConstraintErrors::from_admission(*report).to_string(),
+            expected
+        );
+    });
 }
 
 /// Validate and prepare a resource for provider dispatch.
@@ -1463,10 +1518,7 @@ mod provider_config_tests {
                 )
                 .unwrap();
                 assert_final_wire_shape(
-                    DispatchPayload {
-                        payload,
-                        diagnostic_attributes,
-                    },
+                    DispatchPayload::new(payload, diagnostic_attributes),
                     schema,
                     session,
                 );
@@ -2163,7 +2215,6 @@ mod provider_config_tests {
                 assert_eq!(
                     errors
                         .errors()
-                        .iter()
                         .map(ToString::to_string)
                         .collect::<Vec<_>>(),
                     vec!["owner rejected `VpcId`: owner accepts `vpc-good`, not `bad`"]

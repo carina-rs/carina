@@ -2,6 +2,7 @@ use super::*;
 use crate::parser::retained::{AuthoredCursor, CursorKind, EdgeRole, NodeId, UseId};
 use crate::resource::{ParserPlaceholder, RelativeBindingName};
 use crate::schema::value_validation::{AssignmentFindings, CheckValue, visit_discarded};
+use crate::validation::admission::{kind, tests::selected_destination};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
@@ -63,9 +64,18 @@ fn trace_materialized(
         .unwrap()
         .into_classification();
     let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
-    let destination = schemas
-        .resource_attribute_destination(resource.id(), "input", &catalog)
-        .unwrap();
+    let destination = selected_destination::<kind::ResourceAttribute>(
+        schemas
+            .get(
+                &resource.id().provider,
+                &resource.id().resource_type,
+                crate::schema::SchemaKind::Resource,
+            )
+            .unwrap(),
+        resource.id(),
+        "input",
+        &catalog,
+    );
     let live = RefCell::new(Vec::new());
     let discarded = RefCell::new(Vec::new());
     let control = Cell::new(false);
@@ -386,10 +396,11 @@ fn round5_module_body_slots_keep_per_instance_authored_roots() {
         {
             let slot = resource.authored_slot("input").unwrap();
             let root = slot.cursor().unwrap().canonical().unwrap();
-            let inputs = ResourceAttributeInputs::for_resource(resource, judged.report()).unwrap();
+            let inputs =
+                ResourceAttributeInputs::for_resource_for_test(resource, judged.report()).unwrap();
             let mut coverage = Default::default();
             let report = {
-                let outcome = attributes::resource_attribute_admissions(
+                let outcome = attributes::resource_attribute_admissions_for_test(
                     resource,
                     judged.file(),
                     resource.schema(&schemas).unwrap(),
@@ -441,9 +452,18 @@ fn round5_module_body_slots_keep_per_instance_authored_roots() {
                 },
                 &untyped,
             );
-            let destination = schemas
-                .resource_attribute_destination(resource.id(), "input", &catalog)
-                .unwrap();
+            let destination = selected_destination::<kind::ResourceAttribute>(
+                schemas
+                    .get(
+                        &resource.id().provider,
+                        &resource.id().resource_type,
+                        crate::schema::SchemaKind::Resource,
+                    )
+                    .unwrap(),
+                resource.id(),
+                "input",
+                &catalog,
+            );
             assert!(admit(&destination, candidate, &context).is_ok());
             assert!(
                 visits

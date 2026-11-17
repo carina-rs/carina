@@ -252,3 +252,45 @@ fn private_artifact_requires_the_expected_file() {
         ArtifactPresence::Required,
     );
 }
+
+#[test]
+fn stale_state_value_checks_match_at_root_and_in_module() {
+    for module in [false, true] {
+        let source = "let src = mock.test.read_back { present = 'before' create_read_back_pending_polls = 1 }\n";
+        let project = typed_project(source, module);
+        project.success(&["apply", "--auto-approve"]);
+        let body = "let src = mock.test.read_back { present = 'after' create_read_back_pending_polls = 1 }\nfn checked(x: mock.test.sdk_validator.Guarded | 'ready'): String { x }\nlet sink = mock.test.read_back { present = checked(src.computed) }\n";
+        std::fs::write(
+            project
+                .path()
+                .join(if module { "child/main.crn" } else { "main.crn" }),
+            if module {
+                format!("arguments {{ label: String }}\n{body}")
+            } else {
+                body.into()
+            },
+        )
+        .unwrap();
+        project.success(&["plan", "--refresh=false"]);
+        let path = project.path().join("carina.state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let rows = state["resources"].as_array_mut().unwrap();
+        assert_eq!(rows.len(), 1);
+        rows[0]["current"]["attributes"]["computed"] = "bad-name".into();
+        let before = serde_json::to_vec(&state).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        let output = project.run(&["plan", "--refresh=false"]);
+        assert_eq!(output.status.code(), Some(1));
+        let line = if module { 4 } else { 3 };
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!(
+                "Warning: using cached managed-resource state (--refresh=false). Data sources are still read, but the plan may not reflect actual managed infrastructure.\nError: Invalid expression at line {line}: function 'checked': parameter 'x': expected mock.test.sdk_validator.Guarded | 'ready', got string 'bad-name'\n"
+            )
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        project.success(&["state", "refresh"]);
+        project.success(&["plan", "--refresh=false"]);
+    }
+}

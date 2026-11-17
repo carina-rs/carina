@@ -632,10 +632,7 @@ impl StateBucketSeedError {
     }
 
     pub fn identifier_literal(&self) -> carina_core::value::RenderedValue {
-        let value: carina_core::resource::Value = carina_core::resource::Value::Concrete(
-            carina_core::resource::ConcreteValue::String(self.identifier.as_str().into()),
-        );
-        carina_core::value::render_value(&value)
+        carina_core::value::render_identifier_literal(self.identifier.as_str())
     }
 
     pub fn resource_address(&self) -> &str {
@@ -1616,6 +1613,9 @@ pub enum AppError {
     #[error("{} at line {}\n{}", .0.location().file().path().display(), .0.location().span().start_line(), .0.detail())]
     ExpressionType(Box<carina_core::parser::Located<carina_core::static_type::InferenceError>>),
 
+    #[error(transparent)]
+    Secrecy(Box<carina_core::secrecy::Finding>),
+
     #[error("{0}")]
     DependsOn(
         Box<carina_core::parser::Located<carina_core::validation::depends_on::DependsOnDiagnostic>>,
@@ -1917,6 +1917,9 @@ impl AppError {
 /// boundary. Keeping traversal here also lets collected validation errors
 /// retain the same source detail as directly returned command errors.
 pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(AppError::AnalysisInvariant(error)) = error.downcast_ref::<AppError>() {
+        return error.diagnostic().to_string();
+    }
     let mut messages = Vec::new();
     let mut source = Some(error);
     let mut replan_command = None;
@@ -2021,6 +2024,28 @@ mod tests {
     use super::*;
     use crate::provider_text_fixtures::BindProviderText;
     use carina_core::provider::HostError as ProviderError;
+
+    #[test]
+    fn resource_analysis_invariant_cli_text_is_rendered_once() {
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let mut parsed = carina_core::parser::parse_file(
+            "mock.test.Thing {}",
+            std::path::Path::new("sibling.crn"),
+            &context,
+        )
+        .unwrap();
+        parsed.resources[0].declaration = Default::default();
+        let invariant = carina_core::parser::AnalysisTree::try_from_file(&parsed)
+            .err()
+            .expect("missing parser provenance");
+        let finding = carina_core::test_utils::resource_analysis_finding_for_test(invariant);
+        let error = AppError::ResourceAdmission(Box::new(finding));
+        assert_eq!(
+            format_error_with_source_chain(&error),
+            "missing declaration provenance for Resource mock.test.Thing.<pending>",
+        );
+    }
 
     #[test]
     fn issue_4304_3a_review5_saved_provider_findings_precede_one_final_replan_hint() {
@@ -2933,6 +2958,7 @@ impl PresentedAppError {
             Self::Conversion(error) => error.to_string(),
         }
     }
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_rendered(self) -> AppError {
         match self {
             Self::Ordinary(error) => error,

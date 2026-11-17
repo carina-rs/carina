@@ -840,6 +840,16 @@ impl DirectoryBufferSnapshot {
         })
     }
 
+    /// Retain this snapshot's require scope without judging or admitting raw keys.
+    pub fn into_scoped_file(self) -> parser::ParsedFile {
+        let scope = self.require_scope();
+        let member = &self.sources[self.member.index];
+        debug_assert!(member.text.as_deref() == Some(self.member.buffer.text.as_ref()));
+        let mut parsed = self.member.buffer.parsed().clone();
+        crate::parser::retained::set_require_scope(&mut parsed, scope);
+        parsed
+    }
+
     fn require_scope(&self) -> crate::parser::retained::RequireScope {
         let inventories = self
             .sources
@@ -879,11 +889,7 @@ pub fn load_buffer_configuration_in_directory<'a>(
     schemas: &'a SchemaRegistry,
     config: &ProviderContext,
 ) -> BufferConfiguration<'a> {
-    let scope = snapshot.require_scope();
-    let member = &snapshot.sources[snapshot.member.index];
-    debug_assert!(member.text.as_deref() == Some(snapshot.member.buffer.text.as_ref()));
-    let mut parsed = snapshot.member.buffer.parsed().clone();
-    crate::parser::retained::set_require_scope(&mut parsed, scope);
+    let parsed = snapshot.into_scoped_file();
     BufferConfiguration {
         judged: crate::parser::retained::JudgedFile::new(parsed, schemas, config),
     }
@@ -1013,6 +1019,13 @@ pub fn find_duplicate_declarations_in_analysis(
 #[derive(Clone, Default)]
 pub struct SourceOverrides {
     entries: IndexMap<CanonicalPath, (ResolvedPath, String)>,
+    reads: Option<std::sync::Arc<std::sync::Mutex<AnalysisSourceReads>>>,
+}
+
+#[derive(Default)]
+struct AnalysisSourceReads {
+    sources: HashMap<CanonicalPath, std::sync::Arc<str>>,
+    modules: BTreeSet<crate::paths::PathIdentity>,
 }
 
 /// Two spellings of one file supplied different source text.
@@ -1026,6 +1039,58 @@ pub struct SourceOverrideConflict {
 impl SourceOverrides {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Pin disk reads for one analysis. Clones share that analysis's inputs;
+    /// open-buffer overrides remain explicit and retain their precedence.
+    pub fn tracking_reads(mut self) -> Self {
+        self.reads = Some(Default::default());
+        self
+    }
+
+    /// Discover one directory, including unsaved siblings, and read all sources
+    /// through this analysis snapshot. Catalog discovery and merged parsing
+    /// can then share the same buffers and pinned disk reads.
+    pub fn directory_sources(
+        &self,
+        directory: &ResolvedPath,
+    ) -> std::io::Result<Vec<(ResolvedPath, String)>> {
+        DirectoryFiles::discover(directory, self)?
+            .paths
+            .into_iter()
+            .map(|path| read_source_with_overrides(&path, self).map(|source| (path, source)))
+            .collect()
+    }
+
+    pub fn analyzed_source(&self, file: &Path) -> Option<std::sync::Arc<str>> {
+        let identity = ResolvedPath::new(file).ok()?.identity();
+        if let Some(source) = self.get(&identity) {
+            return Some(std::sync::Arc::from(source));
+        }
+        self.reads
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .sources
+            .get(&identity)
+            .cloned()
+    }
+
+    pub fn imported_directories(&self) -> BTreeSet<crate::paths::PathIdentity> {
+        self.reads
+            .as_ref()
+            .map(|reads| reads.lock().unwrap().modules.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn record_module_directory(&self, directory: &ResolvedPath) {
+        if let Some(reads) = &self.reads {
+            reads
+                .lock()
+                .unwrap()
+                .modules
+                .insert(crate::paths::PathIdentity::new(directory.source_label()));
+        }
     }
 
     pub fn single(path: ResolvedPath, text: String) -> Self {
@@ -1179,6 +1244,18 @@ pub(crate) fn read_source_with_overrides(
     if let Some(text) = overrides.get(&path.identity()) {
         return Ok(text.to_string());
     }
+    if let Some(reads) = &overrides.reads {
+        let mut reads = reads.lock().unwrap();
+        let identity = path.identity();
+        if let Some(source) = reads.sources.get(&identity) {
+            return Ok(source.to_string());
+        }
+        let source = path.read_to_string()?;
+        reads
+            .sources
+            .insert(identity, std::sync::Arc::from(source.as_str()));
+        return Ok(source);
+    }
     path.read_to_string()
 }
 
@@ -1261,13 +1338,12 @@ impl LoadedConfig {
         &self,
         catalog: &ProviderContext,
         schemas: &SchemaRegistry,
-    ) -> Result<ParsedRootDirectory, String> {
+    ) -> Option<ParsedRootDirectory> {
         let resolution = ResolutionContext::issue(ResolutionPhase::Bootstrap).metadata_only();
         let mut parsed = self.unresolved_parsed.parsed.clone();
-        parser::resolve_resource_refs_in_context(&mut parsed, catalog, None, resolution)
-            .map_err(|error| error.to_string())?;
+        parser::resolve_resource_refs_in_context(&mut parsed, catalog, None, resolution).ok()?;
         crate::parser::retained::judge_configuration(&mut parsed, schemas, catalog);
-        Ok(RootDirectoryParse::with_resolution(parsed, resolution))
+        Some(RootDirectoryParse::with_resolution(parsed, resolution))
     }
 }
 
@@ -2801,9 +2877,10 @@ mod tests {
         )
         .unwrap();
         let schemas = SchemaRegistry::new();
-        let configuration = load_buffer_configuration(&parsed, &schemas, &catalog);
+        let configuration =
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let judged = configuration.judged();
-        let tree = parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+        let _tree = parser::AnalysisTree::try_from_file(judged.file()).unwrap();
         let bindings =
             crate::binding_index::BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
         let mut validation =
@@ -2813,12 +2890,12 @@ mod tests {
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             validation
                 .admitted_resources(
-                    &tree,
                     judged,
                     &bindings,
                     session,
                     crate::validation::FindingSubject::Root,
                 )
+                .unwrap()
                 .for_each(drop);
         });
         let presented = validation.complete().into_presented();

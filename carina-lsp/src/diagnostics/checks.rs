@@ -71,127 +71,81 @@ impl ExpansionBoundaryScope {
     }
 }
 
-fn value_depends_on_module_output(
-    value: &Value,
+fn value_depends_on_module_output<'a>(
+    value: &'a Value,
     module_bindings: &HashSet<RelativeBindingName>,
-    variables: &indexmap::IndexMap<String, Value>,
+    variables: &'a indexmap::IndexMap<String, Value>,
     visiting_variables: &mut HashSet<RelativeBindingName>,
 ) -> bool {
-    match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            deferred.values().into_iter().any(|value| {
-                value_depends_on_module_output(
-                    value,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
-            })
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            if module_bindings.contains(path.binding()) {
-                return true;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+                pending.extend(deferred.values().into_iter().rev());
             }
-            let binding = path.binding_address();
-            visiting_variables.insert(binding.clone())
-                && variables.get(binding.as_str()).is_some_and(|value| {
-                    value_depends_on_module_output(
-                        value,
-                        module_bindings,
-                        variables,
-                        visiting_variables,
-                    )
-                })
-        }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            if module_bindings.contains(binding) {
-                return true;
+            Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                if module_bindings.contains(path.binding()) {
+                    return true;
+                }
+                let binding = path.binding_address();
+                if visiting_variables.insert(binding.clone())
+                    && let Some(value) = variables.get(binding.as_str())
+                {
+                    pending.push(value);
+                }
             }
-            visiting_variables.insert(binding.clone())
-                && variables.get(binding.as_str()).is_some_and(|value| {
-                    value_depends_on_module_output(
-                        value,
-                        module_bindings,
-                        variables,
-                        visiting_variables,
-                    )
-                })
-        }
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }),
-        Value::Concrete(ConcreteValue::Map(entries)) => entries.values().any(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(
-                part,
-                carina_core::resource::InterpolationPart::Expr(value)
-                    if value_depends_on_module_output(
-                        value,
-                        module_bindings,
-                        variables,
-                        visiting_variables,
-                    )
+            Value::Deferred(DeferredValue::BindingRef { binding }) => {
+                if module_bindings.contains(binding) {
+                    return true;
+                }
+                if visiting_variables.insert(binding.clone())
+                    && let Some(value) = variables.get(binding.as_str())
+                {
+                    pending.push(value);
+                }
+            }
+            Value::Concrete(ConcreteValue::List(items)) => pending.extend(items.iter().rev()),
+            Value::Concrete(ConcreteValue::Map(entries)) => pending.extend(entries.values().rev()),
+            Value::Deferred(DeferredValue::Interpolation(parts)) => {
+                pending.extend(parts.iter().rev().filter_map(|part| match part {
+                    carina_core::resource::InterpolationPart::Expr(value) => Some(value),
+                    carina_core::resource::InterpolationPart::Literal(_) => None,
+                }));
+            }
+            Value::Deferred(
+                DeferredValue::FunctionCall { args, .. }
+                | DeferredValue::Unavailable { args, .. }
+                | DeferredValue::ResolvedFunctionCall { args, .. },
+            ) => {
+                pending.extend(args.iter().rev().filter_map(|argument| argument.value()));
+            }
+            Value::Deferred(DeferredValue::Access(access)) => pending.push(access.base()),
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                inner.visit(|value| pending.push(value))
+            }
+            Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+                pending.push(default);
+                pending.push(value);
+            }
+            Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+                pending.push(expression.rhs());
+                pending.push(expression.lhs());
+            }
+            Value::Concrete(
+                ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
             )
-        }),
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
-        ) => args.iter().any(|argument| {
-            argument.value().is_some_and(|value| {
-                value_depends_on_module_output(
-                    value,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
-            })
-        }),
-        Value::Deferred(DeferredValue::Access(access)) => value_depends_on_module_output(
-            access.base(),
-            module_bindings,
-            variables,
-            visiting_variables,
-        ),
-        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(|value| {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-        }),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            value_depends_on_module_output(value, module_bindings, variables, visiting_variables)
-                || value_depends_on_module_output(
-                    default,
-                    module_bindings,
-                    variables,
-                    visiting_variables,
-                )
+            | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::Placeholder(_)) => {}
+            Value::Reference(never) | Value::Conversion(never) => match *never {},
         }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            value_depends_on_module_output(
-                expression.lhs(),
-                module_bindings,
-                variables,
-                visiting_variables,
-            ) || value_depends_on_module_output(
-                expression.rhs(),
-                module_bindings,
-                variables,
-                visiting_variables,
-            )
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::Placeholder(_)) => false,
     }
+    false
 }
 
 /// Semantic values available to source-local diagnostics.
@@ -201,19 +155,15 @@ fn value_depends_on_module_output(
 /// if that parse or the current file identity is unavailable, only values
 /// proven independent of sibling names may fall back to the buffer parse.
 pub(super) enum SemanticView<'a> {
-    Standalone(&'a ParsedFile),
+    Standalone,
     DirectoryParsed { merged: &'a ParsedFile },
     DirectoryUnavailable,
 }
 
 impl<'a> SemanticView<'a> {
-    pub(super) fn for_analysis(
-        authored: &'a ParsedFile,
-        merged: Option<&'a ParsedFile>,
-        directory_backed: bool,
-    ) -> Self {
+    pub(super) fn for_analysis(merged: Option<&'a ParsedFile>, directory_backed: bool) -> Self {
         if !directory_backed {
-            return Self::Standalone(authored);
+            return Self::Standalone;
         }
         match merged {
             Some(merged) => Self::DirectoryParsed { merged },
@@ -226,7 +176,7 @@ impl<'a> SemanticView<'a> {
         T: SemanticLookup,
     {
         match self {
-            Self::Standalone(_) => Some(authored),
+            Self::Standalone => Some(authored),
             Self::DirectoryParsed { merged } => authored.lookup_in(merged),
             Self::DirectoryUnavailable => None,
         }
@@ -242,7 +192,7 @@ impl<'a> SemanticView<'a> {
         T: SemanticLookup,
     {
         match self {
-            Self::Standalone(_parsed) => authored.value(),
+            Self::Standalone => authored.value(),
             Self::DirectoryParsed { merged } => {
                 authored.lookup_in(merged).and_then(SemanticLookup::value)
             }
@@ -301,6 +251,7 @@ impl<'a> ContextFreeValue<'a> {
                 Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
                     is_context_free(expression.lhs()) && is_context_free(expression.rhs())
                 }
+                Value::Reference(never) | Value::Conversion(never) => match *never {},
             }
         }
 
@@ -895,6 +846,8 @@ impl DiagnosticRun<'_> {
                 return;
             }
         };
+        // The core diagnostic/import/expansion drivers use heap worklists for
+        // nested modules; editor loading shares their cycle guard and errors.
         // Module expansion is a no-op for configs without `module_call`.
         // Failures retain the authored parse for source-level checks; only the
         // successful outcome can replace it with the expanded graph.
@@ -1107,13 +1060,13 @@ impl DiagnosticRun<'_> {
                 .iter()
                 .filter_map(|call| call.binding_name.clone())
                 .collect::<HashSet<_>>();
-            let variables = merged.variables.clone();
+            let variables = &merged.variables;
             for provider in &mut merged.providers {
                 provider.unresolved_attributes.retain(|_, value| {
                     !value_depends_on_module_output(
                         value,
                         &module_bindings,
-                        &variables,
+                        variables,
                         &mut HashSet::new(),
                     )
                 });
@@ -1243,7 +1196,6 @@ impl DiagnosticRun<'_> {
         diagnostics.extend(
             carina_core::validation::validate_deferred_for_iterable_types(
                 tree,
-                &self.schemas,
                 self.provider_context.catalog(),
             )
             .iter()
@@ -1769,11 +1721,14 @@ impl DiagnosticRun<'_> {
     pub(super) fn check_inferred_export_types<D, B: BindingAddress>(
         &self,
         doc: &Document,
-        configuration: &carina_core::parser::retained::JudgedFile<
+        configuration: &carina_core::identifier::PrefixCanonicalized<
             '_,
-            ParsedExportParam<ParserPlaceholder, B>,
-            D,
-            B,
+            carina_core::parser::retained::JudgedFile<
+                '_,
+                ParsedExportParam<ParserPlaceholder, B>,
+                D,
+                B,
+            >,
         >,
         tree: &carina_core::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B>,
     ) -> Vec<Diagnostic>
@@ -1781,7 +1736,7 @@ impl DiagnosticRun<'_> {
         D: Clone
             + carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
-        let inference_input = configuration.file();
+        let inference_input = configuration.parsed();
         let mut diagnostics = Vec::new();
         let inferred_export_params = if let Some(loaded_providers) = &self.loaded_providers {
             let provider_inferred = carina_core::validation::inference::
@@ -1813,12 +1768,11 @@ impl DiagnosticRun<'_> {
             }
             provider_inferred.into_inferred_export_params()
         } else {
-            carina_core::validation::inference::infer_export_params(configuration)
+            configuration.inferred_export_params()
         };
         let signatures = carina_core::module_resolver::ResolvedModuleSignatures::default();
-        let export_bindings = carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
-            inference_input, &self.schemas, None, &signatures, self.provider_context,
-        );
+        let export_bindings =
+            inference_input.binding_index_in_session(None, &signatures, self.provider_context);
         let mut boundary_export_params = inferred_export_params.parameters().to_vec();
         for parameter in &mut boundary_export_params {
             let Some(type_expr) = parameter.type_expr_opt_mut() else {

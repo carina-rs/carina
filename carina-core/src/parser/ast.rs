@@ -1092,6 +1092,8 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                     DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
                 }
                 Value::Deferred(_) => DeferredForIterableResolution::StillDeferred,
+                crate::resource::Value::Reference(never)
+                | crate::resource::Value::Conversion(never) => match *never {},
             }
         };
         let phase_detail = iterable
@@ -7696,6 +7698,72 @@ where
         } = self;
     }
 
+    /// Clone saved resolver input without requiring its export representation to be Clone.
+    /// The observer supplies a storage-only export view; no source facts are minted.
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn clone_for_resolver_observer<'a, F>(
+        &'a self,
+        mut export: impl FnMut(&'a E) -> F,
+    ) -> File<F, P, T, D, B>
+    where
+        D: Clone,
+    {
+        let Self {
+            providers,
+            resources,
+            data_sources,
+            compositions,
+            variables,
+            uses,
+            module_calls,
+            arguments,
+            attribute_params,
+            export_params,
+            backend,
+            state_blocks,
+            user_functions,
+            upstream_states,
+            wait_bindings,
+            requires,
+            structural_bindings,
+            parser_binding_metadata,
+            parsed_binding_uses,
+            warnings,
+            deferred_for_phase,
+            template_placeholder,
+            deferred_module_ifs,
+            expansion_trace,
+            authored_inputs,
+        } = self;
+        File {
+            providers: providers.clone(),
+            resources: resources.clone(),
+            data_sources: data_sources.clone(),
+            compositions: compositions.clone(),
+            variables: variables.clone(),
+            uses: uses.clone(),
+            module_calls: module_calls.clone(),
+            arguments: arguments.clone(),
+            attribute_params: attribute_params.clone(),
+            export_params: export_params.iter().map(&mut export).collect(),
+            backend: backend.clone(),
+            state_blocks: state_blocks.clone(),
+            user_functions: user_functions.clone(),
+            upstream_states: upstream_states.clone(),
+            wait_bindings: wait_bindings.clone(),
+            requires: requires.clone(),
+            structural_bindings: structural_bindings.clone(),
+            parser_binding_metadata: parser_binding_metadata.clone(),
+            parsed_binding_uses: parsed_binding_uses.clone(),
+            warnings: warnings.clone(),
+            deferred_for_phase: deferred_for_phase.clone(),
+            template_placeholder: *template_placeholder,
+            deferred_module_ifs: deferred_module_ifs.clone(),
+            expansion_trace: expansion_trace.clone(),
+            authored_inputs: authored_inputs.clone(),
+        }
+    }
+
     pub fn map_export_params<F>(self, f: impl FnOnce(Vec<E>) -> Vec<F>) -> File<F, P, T, D, B> {
         let File {
             providers,
@@ -9102,6 +9170,9 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
         Value::Deferred(DeferredValue::Secret(_)) => "secret",
         Value::Deferred(DeferredValue::Unknown(_)) => "unknown",
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -9497,6 +9568,9 @@ fn normalize_substituted_value<B: BindingAddress>(
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unknown(_),
         ) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
     Ok(())
 }
@@ -9602,6 +9676,9 @@ fn normalize_substituted_lazily<B: BindingAddress>(
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unknown(_),
         ) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
     Ok(())
 }

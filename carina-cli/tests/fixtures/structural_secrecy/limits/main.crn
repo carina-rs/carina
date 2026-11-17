@@ -1,0 +1,2 @@
+# The tests generate depth and visit boundary consumers in their temporary copy.
+let shallow = mock.test.resource { name = "shallow" comment = r0.comment }

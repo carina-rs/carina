@@ -205,6 +205,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             Ok(wit::Value::SecretVal(json_str))
         }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        CoreValue::Reference(never) | CoreValue::Conversion(never) => match *never {},
     }
 }
 
@@ -583,6 +584,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             inner.project_plaintext_json_for_transport(core_value_to_json)
         }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        CoreValue::Reference(never) | CoreValue::Conversion(never) => match *never {},
     }
 }
 
@@ -6608,7 +6610,7 @@ mod tests {
             registry
                 .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
                 .expect("decoded fixture must be owner-bound"),
-            &indexmap::IndexMap::<String, carina_core::resource::knowledge::Classification<'_>>::new(),
+            &indexmap::IndexMap::<String, carina_core::resource::Value>::new(),
             &|_| false,
             &resolver,
         )
@@ -7581,15 +7583,7 @@ mod tests {
                 bound_schema,
                 &attrs
                     .iter()
-                    .map(|(name, value)| (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation()
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap()
-                    ))
+                    .map(|(name, value)| (name.clone(), value.clone()))
                     .collect(),
                 &|_| false,
                 &resolver
@@ -7615,15 +7609,7 @@ mod tests {
                 bound_schema,
                 &attrs
                     .iter()
-                    .map(|(name, value)| (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation()
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap()
-                    ))
+                    .map(|(name, value)| (name.clone(), value.clone()))
                     .collect(),
                 &|_| false,
                 &resolver

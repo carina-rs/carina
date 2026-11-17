@@ -53,7 +53,7 @@ use carina_core::value::PersistedExportValue;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
 use carina_state::{
-    LegacyDependencyClassification, ResolvedReadBackend, ResourceState, S3BootstrapInfo, StateFile,
+    LegacyDependencyClassification, ResolvedReadBackend, S3BootstrapInfo, StateFile,
     StorageReadinessStatus,
 };
 
@@ -3094,71 +3094,35 @@ mod schema_fingerprint_tests {
     }
 }
 
-pub(crate) fn collect_historical_display_attributes<S>(
+pub(crate) fn collect_historical_display_attributes<S: Clone>(
     plan: &Plan<S>,
     managed_current: &HashMap<ResourceId, Current>,
-    state_file: Option<&StateFile>,
-) -> HistoricalDisplayAttributes {
-    let mut display = HistoricalDisplayAttributes::for_plan(plan);
-    let moved_origins = MovedOrigins::from_plan(plan);
-
+    state_file: &carina_state::ObservedStateFile,
+) -> Result<HistoricalDisplayAttributes, carina_core::value::SerializationError> {
+    let mut deleted = HashMap::new();
     for effect in plan.effects() {
         for key in effect.deleted_resource_attribute_keys() {
-            match key.generation() {
-                carina_core::effect::EffectGeneration::Current => {
-                    if let Some(current) = managed_current.get(key.id()) {
-                        let state = match current {
-                            Current::Absent(state) => state.state(),
-                            Current::Present(present) => present.state(),
-                            Current::CreateInFlight(_pending) => continue,
-                            Current::CreateOutcomeUnknown(_unknown) => continue,
-                            Current::MissingIdentifier(state) => state.state(),
-                        };
-                        let persisted_id = moved_origins.origin_for(key.id());
-                        let persisted_row =
-                            state_file.and_then(|file| file.find_resource_for_id(persisted_id));
-                        let persisted = persisted_row.and_then(ResourceState::persisted_attributes);
-                        let empty_nested_write_only =
-                            carina_core::provider::NestedWriteOnlyRecord::new();
-                        let nested_write_only = persisted_row
-                            .map(ResourceState::nested_write_only)
-                            .unwrap_or(&empty_nested_write_only);
-                        display.set_delete_from_provider_and_persisted(
-                            key,
-                            &state.attributes,
-                            persisted,
-                            nested_write_only,
-                        );
-                    }
-                }
-                carina_core::effect::EffectGeneration::Deposed(deposed_key) => {
-                    if let Some(attrs) = state_file.and_then(|sf| {
-                        deposed_attributes_for_display(sf, key.id(), key.identifier(), deposed_key)
-                    }) {
-                        display.set_delete_from_persisted(key, &attrs);
-                    }
-                }
+            if let carina_core::effect::EffectGeneration::Deposed(deposed_key) = key.generation()
+                && let Some(attrs) = state_file.as_ref().and_then(|sf| {
+                    deposed_attributes_for_display(sf, key.id(), key.identifier(), deposed_key)
+                })
+            {
+                deleted.insert(
+                    key.clone(),
+                    SnapshotState::existing(key.id().clone(), attrs.to_values()),
+                );
             }
         }
-
-        // Update::from has already crossed the plan-input canonicalization
-        // boundary (including reconstruction of partial-read Unknown values).
-        // Mask that shape in place instead of replacing it with the raw
-        // refreshed state used by Delete effects.
-        if let Effect::Update { from, .. } = effect {
-            let persisted_id = moved_origins.origin_for(&from.id);
-            let persisted = state_file
-                .and_then(|file| file.find_resource_for_id(persisted_id))
-                .and_then(ResourceState::persisted_attributes);
-            display.set_update_from_provider_and_persisted(
-                from.id.clone(),
-                &from.attributes,
-                persisted,
-            );
-        }
     }
-
-    display
+    let observations =
+        state_file
+            .authority()
+            .protect(carina_core::value::ObservationInputs::Display {
+                plan,
+                current: managed_current,
+                deleted: &deleted,
+            })?;
+    HistoricalDisplayAttributes::from_observations(plan, &observations)
 }
 
 /// Resolves a plan address to the state row that owns its persisted history.
@@ -3517,7 +3481,7 @@ mod historical_display_tests {
                 &mut carina_core::references::ReferencePreparation::default(),
                 request,
                 &self.managed,
-                None,
+                &carina_state::ObservedStateFile::for_test(None),
                 &self.schemas,
                 &carina_core::input_rules::InputTypeContext::empty(),
                 &HashMap::new(),
@@ -3704,16 +3668,22 @@ mod historical_display_tests {
         let mut persisted = StateFile::new();
         persisted
             .upsert_resource(
-                ResourceState::try_applied("test.reference", "old", "mock", "reference-123")
-                    .unwrap()
-                    .with_attribute("key", serde_json::json!("key/display")),
+                carina_state::ResourceState::try_applied(
+                    "test.reference",
+                    "old",
+                    "mock",
+                    "reference-123",
+                )
+                .unwrap()
+                .with_attribute("key", serde_json::json!("key/display")),
             )
             .unwrap();
         let historical = collect_historical_display_attributes(
             &plan,
             &HashMap::from([(id.clone(), Current::from_state(refreshed))]),
-            Some(&persisted),
-        );
+            &carina_state::ObservedStateFile::for_test((Some(&persisted)).cloned()),
+        )
+        .expect("fixture historical identities are valid");
         // Neither frontend may compare again: this router has no provider.
         let no_provider = ProviderRouter::new();
         let summary = crate::plan_summary::PlanChangeSummary::new(
@@ -3725,7 +3695,7 @@ mod historical_display_tests {
         for detail in [crate::DetailLevel::Full, crate::DetailLevel::Explicit] {
             let display = preparation
                 .display(
-                    crate::test_support::creation_fixture::checked(plan.clone(), &schemas),
+                    &crate::test_support::creation_fixture::checked(plan.clone(), &schemas),
                     &references,
                     historical.clone(),
                     detail.to_core(),
@@ -3791,7 +3761,12 @@ mod historical_display_tests {
         // Exercise the same collector and row builder used by CLI and TUI
         // production paths. There is deliberately no persisted state shape:
         // the desired Secret shape must still mask the provider plaintext.
-        let historical = collect_historical_display_attributes(&plan, &current_states, None);
+        let historical = collect_historical_display_attributes(
+            &plan,
+            &current_states,
+            &carina_state::ObservedStateFile::for_test(None),
+        )
+        .expect("fixture historical identities are valid");
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "",
@@ -4306,6 +4281,9 @@ impl ReloadedPlanFile<SnapshotLeaf> {
             data_source_origins: _,
             upstream_snapshot: _,
         } = contents;
+        let observation_plan = values
+            .provider_configuration
+            .bind_observation_plan(values.plan);
         ReloadedPlanFile {
             provider_configuration: values.provider_configuration.clone(),
             refresh_rows,
@@ -4329,7 +4307,7 @@ impl ReloadedPlanFile<SnapshotLeaf> {
                 current_states: saved_current_states,
                 upstream_sources,
                 wait_bindings,
-                plan: values.plan,
+                plan: observation_plan,
                 sorted_resources: values.provider_configuration.resources().to_vec(),
                 unresolved_resources: values.unresolved_resources,
                 compositions: values.compositions,
@@ -5180,8 +5158,11 @@ where
             carina_core::resource::AbsoluteBindingAddress,
         >,
 {
-    let directive_changes =
-        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
+    let directive_changes = persisted_directive_changes(
+        state_file.as_ref(),
+        &ctx.sorted_resources,
+        ctx.plan.as_plan(),
+    );
     CheckedPlanFileContents::new(
         path,
         parsed,
@@ -5268,19 +5249,6 @@ impl CheckedPlanFileContents {
             let mut composition_source_identities =
                 CompositionSourceIdentityResolver::new(&source)?;
 
-            let desired_resources: HashMap<
-                ResourceId,
-                Resource<
-                    ModuleSource,
-                    carina_core::resource::NoPlaceholder,
-                    carina_core::resource::AbsoluteBindingAddress,
-                    (),
-                >,
-            > = ctx
-                .sorted_resources
-                .iter()
-                .map(|resource| (resource.id.clone(), resource.as_inner().clone()))
-                .collect();
             let provider_configs = provider_snapshot.redact_secrets(conversion)?;
             #[allow(clippy::iter_over_hash_type)]
             // order reaches output; migration tracked in #4414
@@ -5327,78 +5295,38 @@ impl CheckedPlanFileContents {
                     })
                     .collect::<PersistedResourceLookup<'_>>()
             });
-            let moved_origins = MovedOrigins::from_plan(&ctx.plan);
-            let redact_current_state = |id: &ResourceId,
-                                        state: &SnapshotState|
-             -> Result<
-                carina_core::value::Saved<SnapshotState>,
-                carina_core::value::SerializationError,
-            > {
-                let persisted = persisted_resource_for_plan_address(
-                    persisted_resources.as_ref(),
-                    &moved_origins,
-                    id,
-                );
-                // A moved resource's previous state row still lives at its source
-                // address until execution writes the destination row.
-                let redacted = match persisted.and_then(ResourceState::persisted_attributes) {
-                    Some(persisted_attributes) => conversion
-                        .redact_secrets_in_state_using_persisted(state, persisted_attributes)?,
-                    None => conversion.snapshot(state.to_snapshot())?,
-                };
-                let redacted = match desired_resources.get(id) {
-                    Some(desired) => {
-                        conversion.redact_secrets_in_state_using_resource(&redacted, desired)?
-                    }
-                    None if persisted.is_some() => redacted,
-                    None => conversion.redact_secrets_in_state(&redacted)?,
-                };
-                Ok(redacted)
-            };
-            let mut redacted_managed_states = ctx
-                .managed_current
+            let moved_origins = MovedOrigins::from_plan(ctx.plan.as_plan());
+            let observations = ctx.protected_observations()?;
+            let redacted_managed_states = observations
+                .managed()
                 .iter()
-                .filter_map(|(id, current)| {
-                    let state = match current {
-                        Current::Absent(state) => Some(state.state()),
-                        Current::Present(present) => Some(present.state()),
-                        Current::CreateInFlight(_pending) => None,
-                        Current::CreateOutcomeUnknown(_unknown) => None,
-                        Current::MissingIdentifier(state) => Some(state.state()),
-                    };
-                    state.map(|state| {
-                        redact_current_state(id, state).map(|state| (id.clone(), state))
-                    })
+                .map(|(id, observation)| {
+                    conversion
+                        .snapshot(observation.snapshot()?)
+                        .map(|state| (id.clone(), state))
                 })
                 .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
-            for effect in ctx.plan.effects() {
-                if let Effect::DeferredReplace(payload) = effect {
-                    for old in payload.deletes.iter() {
-                        let state = SnapshotState::existing(
-                            old.id.as_inner().clone(),
-                            old.previous_attributes.clone(),
-                        );
-                        redacted_managed_states
-                            .entry(old.id.as_inner().clone())
-                            .or_insert(redact_current_state(old.id.as_inner(), &state)?);
-                    }
-                }
-            }
             let redacted_managed_current = ctx
                 .managed_current
                 .iter()
                 .map(|(id, current)| {
                     let mut current = current.clone();
-                    if let Some(attributes) = current.attributes_mut() {
-                        *attributes = redacted_managed_states[id].attributes.clone();
+                    if let Some(state) = redacted_managed_states.get(id)
+                        && let Some(attributes) = current.attributes_mut()
+                    {
+                        *attributes = state.attributes.clone();
                     }
                     (id.clone(), current)
                 })
                 .collect::<HashMap<_, _>>();
-            let redacted_data_source_states = ctx
-                .data_source_values
-                .read_states()
-                .map(|(id, state)| Ok((id.clone(), redact_current_state(id, state)?)))
+            let redacted_data_source_states = observations
+                .reads()
+                .iter()
+                .map(|(id, observation)| {
+                    conversion
+                        .snapshot(observation.snapshot()?)
+                        .map(|state| (id.clone(), state))
+                })
                 .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
             let redacted_sorted_resources = ctx
                 .sorted_resources
@@ -5436,11 +5364,8 @@ impl CheckedPlanFileContents {
                 .map(|resource| (resource.id.clone(), resource.clone()))
                 .collect();
 
-            let recorded = checked.record_snapshot(
-                conversion,
-                &redacted_desired_resources,
-                &redacted_managed_states,
-            )?;
+            let recorded =
+                checked.record_snapshot(conversion, &redacted_desired_resources, &observations)?;
             let wire_plan = conversion.snapshot(recorded.into_wire())?;
 
             let contents = saved_document::Parts::<ModuleSource> {
@@ -5856,21 +5781,23 @@ fn plan_s3_storage_bootstrap(
 async fn load_plan_storage(
     readiness: StorageReadinessStatus,
     read_state: impl std::future::Future<
-        Output = carina_state::BackendResult<Option<carina_state::LoadedState>>,
+        Output = carina_state::BackendResult<(
+            Option<carina_state::LoadedState>,
+            carina_state::ObservationStateAuthority,
+        )>,
     >,
     resources: &[Resource],
     use_locked_backend: bool,
-) -> Result<(Option<StateFile>, Option<S3BootstrapInfo>), AppError> {
-    let mut state_file: Option<StateFile> = None;
-    let state_bucket_bootstrap = match readiness {
+) -> Result<(carina_state::ObservedStateFile, Option<S3BootstrapInfo>), AppError> {
+    let (state_file, state_bucket_bootstrap) = match readiness {
         StorageReadinessStatus::Ready => {
             // Plan keeps schema migrations in memory; mutation paths persist
             // them under the state lock.
-            state_file = read_state
-                .await
-                .map_err(AppError::Backend)?
-                .map(|loaded| loaded.into_state());
-            None
+            let (loaded, authority) = read_state.await.map_err(AppError::Backend)?;
+            (
+                authority.bind(loaded.map(|loaded| loaded.into_state())),
+                None,
+            )
         }
         StorageReadinessStatus::Provisionable(storage) => {
             let bucket_name = storage.settings().bucket();
@@ -5882,7 +5809,11 @@ async fn load_plan_storage(
                         .get("bucket")
                         .is_some_and(|v| matches!(v, Value::Concrete(ConcreteValue::String(s)) if s.expose_plaintext() == bucket_name))
             });
-            plan_s3_storage_bootstrap(storage, has_bucket_resource, use_locked_backend)?
+            let authority =
+                carina_state::ObservationStateAuthority::for_provisionable_storage(&storage)?;
+            let bootstrap =
+                plan_s3_storage_bootstrap(storage, has_bucket_resource, use_locked_backend)?;
+            (authority.bind(None), bootstrap)
         }
         StorageReadinessStatus::Unavailable(unavailable) => {
             return Err(AppError::Backend(unavailable.into_error()));
@@ -5908,7 +5839,7 @@ mod storage_readiness_tests {
             // resolution; the read future panics if it is polled.
             let error = load_plan_storage(
                 backend.storage_readiness().await.unwrap().into_status(),
-                backend.read_state(),
+                carina_state::ObservationStateAuthority::load(&backend),
                 &[],
                 migration_pending,
             )
@@ -5987,7 +5918,7 @@ mod storage_readiness_tests {
         assert!(matches!(&policy_error, AppError::Config(_)));
         assert_eq!(
             policy_error.to_string(),
-            "Backend bucket value from env() not found and auto_create is disabled"
+            "Backend bucket 'private-bucket-name' not found and auto_create is disabled"
         );
         assert!(
             plan_s3_storage_bootstrap(storage.clone(), true, false)
@@ -6219,7 +6150,7 @@ pub(crate) async fn run_plan_using(
             .storage_readiness()
             .await
             .map_err(AppError::Backend)?,
-        plan_backend.read_state(),
+        plan_backend.read_state_with_observations(),
         &parsed.resources,
         use_locked_backend,
     )
@@ -6329,7 +6260,7 @@ pub(crate) async fn run_plan_using(
     if let Some(migrated) = ctx.migrated_legacy_state.clone() {
         // Planning remains read-only, but every post-expansion consumer must
         // see the same graph-classified v21 projection the differ used.
-        state_file = Some(migrated);
+        *state_file = Some(migrated);
     }
     let parsed = ctx.parsed();
     // TOCTOU drift detection (#3111). `plan` took no state lock, so a
@@ -6376,7 +6307,7 @@ pub(crate) async fn run_plan_using(
 
     let iam_preflight_result = if check_iam {
         let result = crate::commands::iam_preflight::run_iam_preflight(
-            &ctx.plan,
+            ctx.plan.as_plan(),
             &ctx.provider,
             ctx_wiring.schemas(),
             strict_iam,
@@ -6418,7 +6349,7 @@ pub(crate) async fn run_plan_using(
         managed_current: &ctx.managed_current,
         data_source_values: &ctx.data_source_values,
         state_file: state_file.as_ref(),
-        plan: &ctx.plan,
+        plan: ctx.plan.as_plan(),
         schemas: ctx_wiring.schemas(),
         wait_aliases: &export_wait_aliases,
         provider_context: ctx_wiring.provider_context(),
@@ -6429,10 +6360,13 @@ pub(crate) async fn run_plan_using(
         .map(|state| state.exports.clone())
         .unwrap_or_default();
     let export_changes = compute_export_diffs(&checked_exports, &current_exports);
-    let directive_changes =
-        persisted_directive_changes(state_file.as_ref(), &ctx.sorted_resources, &ctx.plan);
+    let directive_changes = persisted_directive_changes(
+        state_file.as_ref(),
+        &ctx.sorted_resources,
+        ctx.plan.as_plan(),
+    );
     let summary = PlanChangeSummary::new(
-        &ctx.plan,
+        ctx.plan.as_plan(),
         &export_changes,
         &ctx.residual_deferred_for,
         &directive_changes,
@@ -6442,7 +6376,7 @@ pub(crate) async fn run_plan_using(
     // displayable work such as reads, waits, exports, or deferred loops.
     let has_changes = ctx.plan.mutation_count() > 0;
     let moved_hints = crate::moved_hint::detect_moved_block_hints(
-        &ctx.plan,
+        ctx.plan.as_plan(),
         &ctx.managed_current,
         ctx_wiring.schemas(),
         &ctx.provider,
@@ -6577,7 +6511,7 @@ pub(crate) async fn run_plan_using(
             file: image,
             inline: inline_image,
             input: PlanImageInput {
-                scheduled: &planned.schedule(&ctx.managed_current),
+                scheduled: &planned.checked().schedule(&ctx.managed_current),
                 desired_resources: &ctx.sorted_resources,
                 unresolved_resources: &ctx.unresolved_resources,
                 compositions: &ctx.compositions,
@@ -6731,54 +6665,22 @@ pub(crate) fn check_exports_pre_apply<D>(
                 // carina#3248: build the unified pre-apply bindings view so an
                 // export referencing `<module_instance>.<attr>` chains through the
                 // composition to the managed sibling literal (carina#3246).
-                let mut secret_aware_current = input.managed_current.clone();
-                if let Some(state_file) = input.state_file {
-                    let moved_origins = MovedOrigins::from_plan(input.plan);
-                    #[allow(clippy::iter_over_hash_type)]
-                    // keyed rebuild: secret masking operates independently per resource
-                    for (id, current) in &mut secret_aware_current {
-                        let Some(persisted) = moved_origins.find_persisted_row(state_file, id)
-                        else {
-                            continue;
-                        };
-                        let persisted_attributes = persisted.persisted_attributes();
-                        if let (Some(persisted_attributes), Some(attributes)) =
-                            (persisted_attributes, current.attributes_mut())
-                        {
-                            #[allow(clippy::iter_over_hash_type)]
-                            // keyed rebuild: each attribute uses its own persisted secret shape without fallible callbacks
-                            for (key, value) in attributes {
-                                *value =
-                                    carina_core::value::mask_plaintext_using_persisted_attribute(
-                                        value,
-                                        persisted_attributes,
-                                        key,
-                                    );
-                            }
-                        }
-                    }
-                }
-                let plan_input_current = carina_core::resource::into_plan_input_current_map(
-                    secret_aware_current,
-                    input.schemas,
-                    input.resources,
-                );
-                let mut bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
-                    carina_core::binding_index::LivePreApplyInputs {
-                        managed: input.resources,
-                        compositions: input.compositions,
-                        managed_current: &plan_input_current,
-                        data_source_values: input.data_source_values,
-                        remote_bindings: &HashMap::new(),
-                        wait_aliases: input.wait_aliases,
-                    },
-                );
-                bindings.apply_plan_stability(
-                    input.resources,
-                    &plan_input_current,
-                    input.plan,
-                    input.schemas,
-                );
+                let bindings =
+                    carina_core::binding_index::ResolvedBindings::pre_apply_live_from_state(
+                        carina_core::binding_index::LivePreApplyStateInputs {
+                            managed: input.resources,
+                            compositions: input.compositions,
+                            managed_current: input.managed_current,
+                            data_source_values: input.data_source_values,
+                            remote_bindings: &HashMap::new(),
+                            wait_aliases: input.wait_aliases,
+                        },
+                        input.plan,
+                        input.schemas,
+                        input
+                            .state_file
+                            .map(|file| file as &dyn carina_core::value::BindingState),
+                    );
 
                 carina_core::validation::check_export_values_pre_apply(
                     input.export_params,
@@ -6800,13 +6702,13 @@ pub enum ExportChange {
     Added {
         name: String,
         type_expr: Option<carina_core::parser::TypeExpr>,
-        new_value: Value,
+        new_value: carina_core::value::RenderedValue,
     },
     Modified {
         name: String,
         type_expr: Option<carina_core::parser::TypeExpr>,
         old_json: PersistedExportValue,
-        new_value: Value,
+        new_value: carina_core::value::RenderedValue,
     },
     Removed {
         name: String,
@@ -6839,7 +6741,11 @@ pub fn compute_export_diffs(
     let mut changes = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for param in checked_exports.display_values() {
+    for (param, rendered) in checked_exports
+        .display_values()
+        .iter()
+        .zip(checked_exports.rendered_display_values())
+    {
         seen.insert(param.name.clone());
         let Some(ref value) = param.value else {
             continue;
@@ -6854,7 +6760,9 @@ pub fn compute_export_diffs(
             (None, _) => changes.push(ExportChange::Added {
                 name: param.name.clone(),
                 type_expr: type_expr.clone(),
-                new_value: value.clone(),
+                new_value: rendered
+                    .clone()
+                    .expect("present export has a rendered value"),
             }),
             (Some(old), Some(new)) if old == &new => {
                 // unchanged — skip
@@ -6863,7 +6771,9 @@ pub fn compute_export_diffs(
                 name: param.name.clone(),
                 type_expr,
                 old_json: old.clone(),
-                new_value: value.clone(),
+                new_value: rendered
+                    .clone()
+                    .expect("present export has a rendered value"),
             }),
         }
     }
@@ -9777,7 +9687,8 @@ mod run_plan_out_tests {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
                 plan: Box::new(
                     crate::test_support::creation_fixture::checked_with_derived_schemas(plan),
-                ),
+                )
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -9800,6 +9711,9 @@ mod run_plan_out_tests {
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(Some(
+                &state_file,
+            )),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
@@ -10204,7 +10118,8 @@ mod run_plan_out_tests {
                 plan: Box::new(crate::test_support::creation_fixture::checked(
                     Plan::new(),
                     &carina_core::schema::SchemaRegistry::new(),
-                )),
+                ))
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -10220,6 +10135,7 @@ mod run_plan_out_tests {
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
 
@@ -10263,6 +10179,347 @@ mod run_plan_out_tests {
                 carina_core::resource::ConcreteValue::String("^target$".into())
             )),
             "saved plans must separately preserve the authored pre-normalization input"
+        );
+    }
+
+    #[test]
+    fn saved_plan_data_source_read_secret_input_does_not_taint_ordinary_attributes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+
+        let mut parsed_data_source: DataSource =
+            DataSource::with_provider("mock", "iam.Roles", "roles", None);
+        parsed_data_source.binding = Some(absolute_binding("roles"));
+        parsed_data_source.set_attr(
+            "name_regex".to_string(),
+            Value::Concrete(carina_core::resource::ConcreteValue::String(
+                "^target$".into(),
+            )),
+        );
+
+        // R6 PIN on the previous behavior; RED on the initial observation owner.
+        parsed_data_source.set_attr(
+            "name_regex",
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "authored-private".into(),
+                )))
+                .into(),
+            )),
+        );
+        let deferred_data_source = parsed_data_source.clone();
+        let observed = carina_core::resource::SnapshotState::existing(
+            deferred_data_source.id.clone(),
+            HashMap::from([(
+                "name_regex".into(),
+                Value::Concrete(ConcreteValue::String("ordinary-read-result".into())),
+            )]),
+        );
+        let data_source_values =
+            carina_core::data_source_value::DataSourceValues::from_data_sources(
+                std::slice::from_ref(&deferred_data_source),
+                |_| carina_core::data_source_value::DataSourceValue::read(observed.clone()),
+            );
+
+        let mut parsed = carina_core::parser::ExpandedParsedFile::default();
+        parsed.data_sources = vec![parsed_data_source];
+        let parsed = resolve_file_for_test(parsed, tmp.path());
+        let ctx = crate::wiring::PlanContext {
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Box::new(crate::test_support::creation_fixture::checked(
+                    Plan::new(),
+                    &carina_core::schema::SchemaRegistry::new(),
+                ))
+                .into(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
+            provider: ProviderRouter::new(),
+            sorted_resources: Vec::new(),
+            legacy_dependency_classification: Default::default(),
+            migrated_legacy_state: None,
+            unresolved_resources: Vec::new(),
+            compositions: Vec::new(),
+            data_sources: vec![deferred_data_source],
+            managed_current: HashMap::new(),
+            data_source_values,
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::new(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
+        )
+        .unwrap();
+        let plan_file = build_plan_file_from_parts(
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
+            &parsed,
+            &provider_configs,
+            SavedBackendConfig::default(),
+            &None,
+            &ctx,
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
+        )
+        .expect("saved plan should serialize");
+
+        let carina_core::data_source_value::DataSourceValue::Read(read) =
+            &plan_file.data_source_values[0].value
+        else {
+            panic!("expected read")
+        };
+        assert_eq!(
+            read.as_ref(),
+            &observed,
+            "data-source read attributes stay ordinary regardless of input secrecy"
+        );
+        let json = serde_json::to_string(&plan_file).unwrap();
+        assert!(json.contains("ordinary-read-result"));
+        assert!(!json.contains("authored-private"));
+    }
+
+    // S1: execution evidence must remain opaque even when an output consumer uses Debug.
+    #[test]
+    fn planned_output_debug_does_not_expose_raw_update_history() {
+        let desired = Resource::with_provider("mock", "test.resource", "item", None)
+            .with_attribute(
+                "comment",
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "authored-debug-private".into(),
+                    )))
+                    .into(),
+                )),
+            );
+        let from = carina_core::resource::SnapshotState::existing(
+            desired.id.clone(),
+            HashMap::from([(
+                "comment".into(),
+                Value::Concrete(ConcreteValue::String("observed-debug-private".into())),
+            )]),
+        )
+        .with_identifier("item-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from),
+            identifier: carina_core::provider::AppliedIdentifier::new("item-id").unwrap(),
+            to: ResolvedResource::new(desired.into_value_snapshot()),
+            changed_attributes: vec!["comment".into()],
+        });
+        let planned = crate::wiring::PlannedPlan::Unrendered {
+            plan: Box::new(
+                crate::test_support::creation_fixture::checked_with_derived_schemas(plan),
+            )
+            .into(),
+            references: carina_core::references::prepare_empty_for_tests(),
+        };
+        let debug = format!("{planned:?}");
+        assert!(
+            !debug.contains("observed-debug-private"),
+            "output Debug exposed raw history: {debug}"
+        );
+    }
+
+    // Legitimate moves use the same rekey transition as production before output.
+    #[test]
+    fn saved_plan_moved_observation_uses_destination_secret_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+        let desired = Resource::with_provider("mock", "test.resource", "new", None).with_attribute(
+            "comment",
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "authored-private".into(),
+                )))
+                .into(),
+            )),
+        );
+        let origin = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
+        let observed = State::existing(
+            origin.clone(),
+            HashMap::from([(
+                "comment".into(),
+                Value::Concrete(ConcreteValue::String("observed-private".into())),
+            )]),
+        )
+        .with_identifier("item-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Move {
+            from: carina_core::resource::ResolvedResourceId::new(origin.clone()),
+            to: carina_core::resource::ResolvedResourceId::new(desired.id.clone()),
+            origin: None,
+        });
+        let mut moved_current = HashMap::from([(origin.clone(), Current::from_state(observed))]);
+        carina_core::differ::rekey_current_for_move(
+            &mut moved_current,
+            &plan.move_authority(&origin, &desired.id).unwrap(),
+        )
+        .unwrap();
+        plan.retain_observation_desired_for_test([(&desired.id, &desired.attributes)]);
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
+        let ctx = crate::wiring::PlanContext {
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Box::new(
+                    crate::test_support::creation_fixture::checked_with_derived_schemas(plan),
+                )
+                .into(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
+            provider: ProviderRouter::new(),
+            sorted_resources: ResolvedResource::collect_resolved([desired.clone()]).unwrap(),
+            legacy_dependency_classification: None,
+            migrated_legacy_state: None,
+            unresolved_resources: vec![
+                carina_core::executor::UnresolvedResource::from_pre_resolve(desired.clone()),
+            ],
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            managed_current: moved_current,
+            data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::new(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
+        )
+        .unwrap();
+        let saved = build_plan_file_from_parts(
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
+            &parsed,
+            &provider_configs,
+            SavedBackendConfig::default(),
+            &None,
+            &ctx,
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
+        )
+        .expect("a moved observation must project at its destination without panicking");
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(!json.contains("observed-private") && !json.contains("authored-private"));
+        let CurrentStateEntry::Managed { id, .. } = &saved.current_states[0];
+        assert_eq!(id, &desired.id);
+        let encoded = serde_json::to_value(&saved).unwrap();
+        assert_eq!(
+            encoded["current_states"][0]["current"]["state"]["id"],
+            serde_json::to_value(&desired.id).unwrap()
+        );
+    }
+
+    #[test]
+    fn saved_plan_rejects_origin_id_at_destination_instead_of_rewriting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("main.crn");
+        fs::write(&path, "provider mock {}\n").unwrap();
+        let desired = Resource::with_provider("mock", "test.resource", "new", None).with_attribute(
+            "comment",
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "authored-private".into(),
+                )))
+                .into(),
+            )),
+        );
+        let origin = ResourceId::with_provider_identity("mock", "test.resource", "old", None);
+        let observed = State::existing(
+            origin.clone(),
+            HashMap::from([(
+                "comment".into(),
+                Value::Concrete(ConcreteValue::String("observed-private".into())),
+            )]),
+        )
+        .with_identifier("item-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Move {
+            from: carina_core::resource::ResolvedResourceId::new(origin),
+            to: carina_core::resource::ResolvedResourceId::new(desired.id.clone()),
+            origin: None,
+        });
+        let parsed = carina_core::parser::ExpandedParsedFile::default();
+        let ctx = crate::wiring::PlanContext {
+            plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
+                plan: Box::new(
+                    crate::test_support::creation_fixture::checked_with_derived_schemas(plan),
+                )
+                .into(),
+                references: carina_core::references::prepare_empty_for_tests(),
+            }),
+            provider: ProviderRouter::new(),
+            sorted_resources: ResolvedResource::collect_resolved([desired.clone()]).unwrap(),
+            legacy_dependency_classification: None,
+            migrated_legacy_state: None,
+            unresolved_resources: vec![
+                carina_core::executor::UnresolvedResource::from_pre_resolve(desired.clone()),
+            ],
+            compositions: Vec::new(),
+            data_sources: Vec::new(),
+            managed_current: HashMap::from([(desired.id.clone(), Current::from_state(observed))]),
+            data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
+            moved_origins: HashMap::new(),
+            upstream_snapshot: HashMap::new(),
+            prev_explicit: HashMap::new(),
+            residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
+            expansion_trace: carina_core::resource::ExpansionTrace::new(),
+        };
+        let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            |session| {
+                carina_core::parser::resolve_provider_attributes_with_remote(
+                    &parsed,
+                    &HashMap::new(),
+                    session,
+                )
+            },
+        )
+        .unwrap();
+        let saved = build_plan_file_from_parts(
+            &carina_core::paths::ResolvedPath::new(&path).unwrap(),
+            &parsed,
+            &provider_configs,
+            SavedBackendConfig::default(),
+            &None,
+            &ctx,
+            &ValidatedConfig::from_factories_for_test(
+                &crate::test_support::TestCommandRuntime::new(),
+                (),
+                Vec::new(),
+                &[],
+            ),
+        );
+        assert!(
+            saved.is_err(),
+            "malformed moved current must return a typed identity error"
         );
     }
 
@@ -10311,7 +10568,8 @@ mod run_plan_out_tests {
                 plan: Box::new(crate::test_support::creation_fixture::checked(
                     Plan::new(),
                     &carina_core::schema::SchemaRegistry::new(),
-                )),
+                ))
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -10327,6 +10585,7 @@ mod run_plan_out_tests {
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
 
@@ -10387,7 +10646,8 @@ mod run_plan_out_tests {
                 plan: Box::new(crate::test_support::creation_fixture::checked(
                     Plan::new(),
                     &carina_core::schema::SchemaRegistry::new(),
-                )),
+                ))
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -10406,6 +10666,7 @@ mod run_plan_out_tests {
             ),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let provider_configs = carina_core::validation::deferred_types::with_session_for_test(
@@ -10478,7 +10739,8 @@ mod run_plan_out_tests {
                 plan: Box::new(crate::test_support::creation_fixture::checked(
                     Plan::new(),
                     &carina_core::schema::SchemaRegistry::new(),
-                )),
+                ))
+                .into(),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -10492,6 +10754,7 @@ mod run_plan_out_tests {
             upstream_snapshot: HashMap::new(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
+            observation_authority: crate::test_support::observation_authority_for_test(None),
             expansion_trace: carina_core::resource::ExpansionTrace::new(),
         };
         let wiring = ValidatedConfig::from_factories_for_test_with_provider_phase(
@@ -10786,8 +11049,12 @@ mod plan_serialization_error_tests {
     #[test]
     fn plan_save_serialization_preserves_unavailable_secret_at_cli_boundary() {
         use crate::error::AppError;
+        use carina_core::effect::Effect;
+        use carina_core::plan::Plan;
         use carina_core::resource::SnapshotValue;
-        use carina_core::value::{redact_plaintext_using_secret_shape, redact_secrets_in_value};
+        use carina_core::resource::{ResolvedResource, SnapshotState};
+        use carina_core::value::redact_secrets_in_value;
+        use std::collections::HashMap;
 
         let secret = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String(
@@ -10805,7 +11072,33 @@ mod plan_serialization_error_tests {
             .into(),
         ));
         for flag in [None, Some("--out"), Some("--json")] {
-            let error = redact_plaintext_using_secret_shape(&historical, &whole_secret)
+            let desired = ResolvedResource::new(
+                Resource::with_provider("mock", "test.resource", "whole", None)
+                    .with_attribute("payload", whole_secret.clone())
+                    .into_value_snapshot(),
+            );
+            let state = SnapshotState::existing(
+                desired.id.clone(),
+                HashMap::from([("payload".into(), historical.clone())]),
+            );
+            let mut plan = Plan::new();
+            plan.add(Effect::Update {
+                from: Box::new(state),
+                to: desired.clone(),
+                identifier: crate::fixture_applied_identifier("whole"),
+                changed_attributes: vec!["payload".into()],
+            });
+            let observations = crate::test_support::observation_authority_for_test(None)
+                .protect(carina_core::value::ObservationInputs::Display {
+                    deleted: &std::collections::HashMap::new(),
+                    plan: &plan,
+                    current: &HashMap::new(),
+                })
+                .unwrap();
+            let error = observations
+                .update_from(&desired.id)
+                .unwrap()
+                .snapshot()
                 .expect_err("whole-container redaction cannot recover a nested historical hash");
             let expected = match &error {
                 SerializationError::UnavailableSecret(error) => error.clone(),

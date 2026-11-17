@@ -220,10 +220,6 @@ impl ResolvedUpstreamSource {
     pub fn upstream_states(&self) -> &[UpstreamState<RelativeBindingName>] {
         &self.upstream_states
     }
-    pub fn unavailable_reason(&self) -> Option<&str> {
-        self.surface.entries.as_ref().err().map(String::as_str)
-    }
-
     #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(binding: impl Into<String>, entries: Option<&UpstreamExportEntries>) -> Self {
         Self {
@@ -234,9 +230,7 @@ impl ResolvedUpstreamSource {
             backend: None,
             upstream_states: vec![],
             surface: SourceSurface {
-                entries: entries
-                    .cloned()
-                    .ok_or_else(|| "test fixture has no source surface".into()),
+                entries: entries.cloned(),
             },
         }
     }
@@ -244,7 +238,7 @@ impl ResolvedUpstreamSource {
 
 #[derive(Debug, Clone)]
 struct SourceSurface {
-    entries: Result<UpstreamExportEntries, String>,
+    entries: Option<UpstreamExportEntries>,
 }
 
 /// Discover admission authority from an actual loader-owned source snapshot.
@@ -255,19 +249,18 @@ fn resolve_upstream_source_surface(
     context: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &crate::schema::SchemaRegistry,
 ) -> Result<SourceSurface, crate::parser::AnalysisTreeError> {
-    let entries = match loaded.upstream_export_source(context.catalog(), schemas) {
-        Ok(parsed) => match resolve_upstream_exports_from_parsed(
-            parsed,
-            source,
-            context,
-            Some(schemas),
-            &Default::default(),
-        ) {
-            Ok(entries) => Ok(entries),
-            Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
-            Err(reason) => Err(reason.to_string()),
-        },
-        Err(reason) => Err(reason),
+    let Some(parsed) = loaded.upstream_export_source(context.catalog(), schemas) else {
+        return Ok(SourceSurface { entries: None });
+    };
+    let entries = match resolve_upstream_exports_from_parsed(
+        parsed,
+        source,
+        context,
+        Some(schemas),
+        &Default::default(),
+    ) {
+        Err(UpstreamExportSourceError::Invariant(error)) => return Err(error),
+        result => result.ok(),
     };
     Ok(SourceSurface { entries })
 }
@@ -3394,7 +3387,7 @@ mod tests {
             |session| {
                 let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
                 let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(parsed, schemas, Some(exports), &signatures, session);
-                let configuration = crate::config_loader::load_buffer_configuration(
+                let configuration = crate::test_utils::load_canonical_buffer_configuration(
                     parsed,
                     schemas,
                     session.as_provider_context(),
@@ -3840,7 +3833,7 @@ mod tests {
         let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
         let bindings = crate::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures(&parsed, &schemas, &exports, &signatures, &catalog);
         let configuration =
-            crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            crate::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &catalog);
         let errs = crate::validation::validate_resource_ref_types(
             configuration.judged(),
             &std::collections::HashSet::new(),

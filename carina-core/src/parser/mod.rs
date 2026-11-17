@@ -223,3 +223,6 @@ mod tests;
 pub(crate) use ast::resolve_loop_directive_value;
 #[cfg(test)]
 pub(crate) use types::bare_type_for_test;
+
+#[cfg(feature = "test-utils")]
+pub(crate) use resolve::{RESOLUTION_EVENTS, STORAGE_EVENTS, SecretStorageOperand};

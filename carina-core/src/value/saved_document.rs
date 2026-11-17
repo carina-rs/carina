@@ -227,30 +227,7 @@ impl SavedDocumentConversion {
         &self,
         state: &crate::resource::State<P>,
     ) -> Result<Saved<crate::resource::SnapshotState>, SerializationError> {
-        self.convert(state, redact_secrets_in_state)
-    }
-    pub fn redact_secrets_in_state_using_resource<D, P: StateValueLeaf>(
-        &self,
-        state: &crate::resource::State<P>,
-        desired: &crate::resource::Resource<
-            crate::resource::ModuleSource,
-            crate::resource::NoPlaceholder,
-            AbsoluteBindingAddress,
-            D,
-        >,
-    ) -> Result<Saved<crate::resource::SnapshotState>, SerializationError> {
-        self.convert(state, |state| {
-            redact_secrets_in_state_using_resource(state, desired)
-        })
-    }
-    pub fn redact_secrets_in_state_using_persisted<P: StateValueLeaf>(
-        &self,
-        state: &crate::resource::State<P>,
-        persisted: &crate::provider::PersistedAttributes,
-    ) -> Result<Saved<crate::resource::SnapshotState>, SerializationError> {
-        self.convert(state, |state| {
-            redact_secrets_in_state_using_persisted(state, persisted)
-        })
+        self.convert(state, redact_secrets_in_state_impl)
     }
     pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
         &self,

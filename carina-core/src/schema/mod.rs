@@ -256,11 +256,13 @@ use crate::value::{
 
 pub(crate) mod assignability;
 mod assignability_edges;
+pub(crate) mod diagnostic;
 mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 pub(crate) mod value_validation;
+pub use diagnostic::{KeyedSchemaFinding, OtherSchemaFinding, SchemaDiagnostic};
 pub use value_validation::{
     LocallyValidatedCustomType, ResourceValueValidation, ValidatedCustomTypeLookup, ValueStructure,
     ValueValidationFindings,
@@ -278,10 +280,12 @@ pub use carina_provider_protocol::types::{
 
 /// Count and element policies enforced together when walking a list.
 ///
-/// Elements containing secrets or diagnostic-sensitive strings are skipped for
-/// uniqueness, like unresolved elements, to avoid revealing equality. The
-/// same applies when a secret encloses the list. Provider output and persisted
-/// state skip uniqueness as well; length constraints always apply.
+/// Elements containing Secret wrappers or diagnostic-sensitive strings are
+/// skipped for uniqueness to avoid revealing equality. This includes flagged
+/// strings after dispatch removes their wrappers, and a secret enclosing the list.
+/// Unresolved elements are skipped as well.
+/// `Desired(ProviderOutput)` and `State` purposes skip uniqueness; length
+/// constraints always apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListConstraints {
     length: Option<(Option<u64>, Option<u64>)>,
@@ -1182,8 +1186,8 @@ impl<R: PatternForm> ProviderPopulatedStructFieldBuilder<R> {
 pub enum LeafPathSegment {
     StructField(String),
     ListIndex(usize),
-    // Preserve producer sensitivity through every diagnostic rendering of a
-    // selected key; serde and key identity retain their existing string form.
+    // Keep string metadata alongside the key's runtime and serde spelling.
+    // Diagnostic callers choose the visibility of the path.
     MapKey(crate::resource::ValueString),
 }
 
@@ -2282,7 +2286,10 @@ impl Schema {
             FieldAncestry::WRITABLE,
             None,
         )
-        .into_local_findings()
+        .local
+        .into_iter()
+        .map(|finding| (finding.path.clone(), finding.into_error()))
+        .collect()
     }
 
     /// Validate one recursive child against this rootless schema's definitions.
@@ -2716,10 +2723,9 @@ impl FieldPath {
             let step = match &canonical {
                 LeafPathSegment::StructField(name) => FieldPathStep::Field(name.clone()),
                 LeafPathSegment::ListIndex(index) => FieldPathStep::Index(*index),
-                LeafPathSegment::MapKey(key) => match key.diagnostic_literal() {
-                    Some(key) => FieldPathStep::Field(key.to_owned()),
-                    None => FieldPathStep::Redacted(RedactedPathField::MapKey),
-                },
+                LeafPathSegment::MapKey(key) => {
+                    FieldPathStep::Field(key.expose_plaintext().to_owned())
+                }
             };
             path = path.pushed(step, canonical, FieldPathDirection::After);
         }
@@ -4052,7 +4058,7 @@ impl PatternAttributeType<Compiled> {
                     // produces a clear error for the common bare form.
                     let user_form = user_input
                         .map(DiagnosticValue::from)
-                        .unwrap_or_else(|| DiagnosticValue::from(s));
+                        .unwrap_or_else(|| DiagnosticValue::from(s.expose_plaintext()));
                     validate_enum_namespace(s.expose_plaintext(), identity).map_err(|message| {
                         TypeError::ValidationFailed {
                             message: format!(
@@ -4095,7 +4101,7 @@ impl PatternAttributeType<Compiled> {
                 Err(TypeError::InvalidEnumVariant {
                     value: user_input
                         .map(DiagnosticValue::from)
-                        .unwrap_or_else(|| DiagnosticValue::from(s)),
+                        .unwrap_or_else(|| DiagnosticValue::from(s.expose_plaintext())),
                     value_kind: InvalidEnumValueKind::Identifier,
                     attribute: None,
                     type_name: Some(name.to_string()),
@@ -5323,9 +5329,10 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
 }
 
 /// Compare the ordinary JSON of a value canonicalized with its successful fit
-/// for the active purpose. Unresolved elements and elements containing secrets
-/// or diagnostic-sensitive strings are not comparable: even a masked duplicate
-/// would reveal equality. The provider remains the final authority for them.
+/// for the active purpose. Unresolved elements, elements containing Secret
+/// wrappers, and dispatch-unwrapped diagnostic-sensitive strings are not
+/// comparable: even a masked duplicate would reveal equality. The provider
+/// remains the final authority for them.
 /// Canonicalization preserves integer/float spellings and struct block aliases,
 /// so those spellings remain distinct keys: uniqueness can miss duplicates but
 /// must never invent them (including by rounding large integers to floats).
@@ -6646,7 +6653,7 @@ fn union_member_judgement_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
 }
 
 struct UnionMemberFailure {
-    error: TypeError,
+    primary: diagnostic::PrimaryValueFinding,
     diagnostic_identity: UnionDiagnosticIdentity,
 }
 
@@ -6671,12 +6678,13 @@ impl BestUnionMemberFailures {
         }
     }
 
-    fn into_error<P: PlaceholderKind, B: BindingAddress>(
+    fn into_finding<P: PlaceholderKind, B: BindingAddress>(
         self,
+        path: &FieldPath,
         value: ConcreteValueRef<'_, P, B>,
         members: UnionMembers<'_, Compiled>,
         ancestry: FieldAncestry,
-    ) -> TypeError {
+    ) -> diagnostic::PrimaryValueFinding {
         let BestUnionMemberFailures {
             failure_rank: _,
             first,
@@ -6698,7 +6706,8 @@ impl BestUnionMemberFailures {
         };
 
         let Some((map, alternatives)) = struct_context else {
-            return TypeError::from_union_member_failures(first, tied);
+            let primary = first.primary.clone();
+            return primary.union_error(path, TypeError::from_union_member_failures(first, tied));
         };
         let mut failures = Vec::with_capacity(tied.len() + 1);
         failures.push(first);
@@ -6714,15 +6723,21 @@ impl BestUnionMemberFailures {
             .iter()
             .enumerate()
             .filter_map(|(index, failure)| {
-                matches!(failure.error, TypeError::FieldGroupViolation { .. }).then_some(index)
+                matches!(
+                    failure.primary.error(),
+                    TypeError::FieldGroupViolation { .. }
+                )
+                .then_some(index)
             })
             .collect::<Vec<_>>();
         if let [index] = group_failure_indices.as_slice() {
-            return failures.swap_remove(*index).error;
+            return failures.swap_remove(*index).primary.in_container(path);
         }
         if !group_failure_indices.is_empty() {
             let first = failures.remove(0);
-            return TypeError::from_union_member_failures(first, failures);
+            let primary = first.primary.clone();
+            return primary
+                .union_error(path, TypeError::from_union_member_failures(first, failures));
         }
 
         // One non-empty recognized-field identity is a unique relevant arm,
@@ -6744,7 +6759,8 @@ impl BestUnionMemberFailures {
         if non_empty_count == 1 {
             return failures
                 .swap_remove(sole_non_empty.expect("one non-empty identity has an index"))
-                .error;
+                .primary
+                .in_container(path);
         }
 
         let recognizable_fields = RecognizedStructFields::union(failures.iter().map(|failure| {
@@ -6774,11 +6790,14 @@ impl BestUnionMemberFailures {
             }
         };
 
-        TypeError::UnionStructMismatch {
-            reason,
-            supplied_fields: map.keys().cloned().collect(),
-            alternatives,
-        }
+        diagnostic::PrimaryValueFinding::new(
+            path.clone(),
+            TypeError::UnionStructMismatch {
+                reason,
+                supplied_fields: map.keys().cloned().collect(),
+                alternatives,
+            },
+        )
     }
 }
 
@@ -7623,7 +7642,6 @@ pub enum InvalidEnumValueKind {
 pub enum DiagnosticValue {
     Plain(String),
     Masked,
-    TypeOnlyString,
 }
 
 /// Numeric diagnostic payload, preserving its representation until rendering.
@@ -7670,7 +7688,7 @@ impl DiagnosticValue {
     pub fn as_plain(&self) -> Option<&str> {
         match self {
             Self::Plain(value) => Some(value),
-            Self::Masked | Self::TypeOnlyString => None,
+            Self::Masked => None,
         }
     }
 
@@ -7685,7 +7703,6 @@ impl DiagnosticValue {
                 InvalidEnumValueKind::Identifier => value.clone(),
             },
             Self::Masked => SECRET_VALUE_MASK.to_string(),
-            Self::TypeOnlyString => "string".to_string(),
         };
         DiagnosticText::new(text).to_string()
     }
@@ -7711,10 +7728,7 @@ impl From<ValueString> for DiagnosticValue {
 
 impl From<&ValueString> for DiagnosticValue {
     fn from(value: &ValueString) -> Self {
-        match value.diagnostic_literal() {
-            Some(value) => Self::Plain(value.to_owned()),
-            None => Self::TypeOnlyString,
-        }
+        Self::Plain(value.expose_plaintext().to_owned())
     }
 }
 
@@ -7828,6 +7842,7 @@ fn format_union_alternatives_mismatch(failures: &UnionArmFailures) -> String {
 
 fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
     match error {
+        TypeError::AttributePrefix(_error) => false,
         TypeError::UnionAlternativesMismatch { .. } => true,
         TypeError::ListItemError { inner, .. }
         | TypeError::MapKeyError { inner, .. }
@@ -7887,6 +7902,9 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 /// Type error
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
+    #[error(transparent)]
+    AttributePrefix(Box<crate::identifier::AttributePrefixError>),
+
     #[error("Type mismatch: {types}")]
     TypeMismatch { types: MismatchTypeNames },
 
@@ -8244,7 +8262,10 @@ impl TypeError {
         first: UnionMemberFailure,
         rest: impl IntoIterator<Item = UnionMemberFailure>,
     ) -> Self {
-        Self::from_union_arm_errors(first.error, rest.into_iter().map(|failure| failure.error))
+        Self::from_union_arm_errors(
+            first.primary.into_error(),
+            rest.into_iter().map(|failure| failure.primary.into_error()),
+        )
     }
 
     fn from_union_arm_errors(first: TypeError, rest: impl IntoIterator<Item = TypeError>) -> Self {
@@ -8297,6 +8318,7 @@ impl TypeError {
     /// New TypeError variants must choose a shape here before they compile.
     pub(crate) fn diagnostic_shape(&self) -> ValidationDiagnostic<'_> {
         match self {
+            Self::AttributePrefix(_error) => ValidationDiagnostic::Plain(self),
             Self::ValidationFailed { message } => ValidationDiagnostic::Reason {
                 prefix: "Validation failed: ".into(),
                 reason: message,
@@ -8383,6 +8405,7 @@ impl TypeError {
     /// consumers do not need variant-specific position recovery.
     pub fn attribute_name(&self) -> Option<&str> {
         match self {
+            TypeError::AttributePrefix(_error) => None,
             TypeError::InvalidEnumVariant { attribute, .. }
             | TypeError::PatternMismatch { attribute, .. }
             | TypeError::LengthOutOfRange { attribute, .. }
@@ -8637,6 +8660,12 @@ impl<P: crate::resource::ValueKind, B: BindingAddress> Value<P, B> {
 
             Value::Deferred(DeferredValue::Unknown(_)) => "Unknown".to_string(),
             Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 }
@@ -9980,7 +10009,11 @@ impl<'a> EffectiveType<'a> {
         &self,
         value: &Value<P, B>,
     ) -> Vec<(FieldPath, TypeError)> {
-        self.validate_findings(value).into_local_findings()
+        self.validate_findings(value)
+            .local
+            .into_iter()
+            .map(|finding| (finding.path.clone(), finding.into_error()))
+            .collect()
     }
 
     /// Canonicalize provider or persisted state without discarding the
@@ -12043,6 +12076,9 @@ fn validate_portable_default(
             | ConcreteValue::Bool(_)
             | ConcreteValue::StringList(_),
         ) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -16498,7 +16534,9 @@ impl PatternResourceSchema<Compiled> {
             if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
                 report
                     .errors
-                    .push(TypeError::MissingRequired { name: name.clone() });
+                    .push(SchemaDiagnostic::unlocated(TypeError::MissingRequired {
+                        name: name.clone(),
+                    }));
             }
         }
 
@@ -16518,10 +16556,12 @@ impl PatternResourceSchema<Compiled> {
                 .filter(|name| attributes.contains_key(name.as_str()))
                 .count();
             if !group.is_satisfied_by_count(present) {
-                report.errors.push(TypeError::FieldGroupViolation {
-                    path: FieldPath::new(),
-                    group: group.clone(),
-                });
+                report.errors.push(SchemaDiagnostic::unlocated(
+                    TypeError::FieldGroupViolation {
+                        path: FieldPath::new(),
+                        group: group.clone(),
+                    },
+                ));
             }
         }
 
@@ -16538,9 +16578,13 @@ impl PatternResourceSchema<Compiled> {
                     })
                     .collect(),
             )
-            && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
+            && let Err(validation_errors) = run_resource_validator(validator, &attributes)
         {
-            report.errors.append(&mut validation_errors);
+            report.errors.extend(
+                validation_errors
+                    .into_iter()
+                    .map(SchemaDiagnostic::unlocated),
+            );
         }
 
         report
@@ -16586,7 +16630,7 @@ impl PatternResourceSchema<Compiled> {
         );
         if selected.is_none_or(|names| !names.is_empty())
             && let Some(validator) = self.validator()
-            && let Err(mut errors) = run_resource_validator(
+            && let Err(errors) = run_resource_validator(
                 validator,
                 &attributes
                     .iter()
@@ -16599,7 +16643,9 @@ impl PatternResourceSchema<Compiled> {
                     .collect(),
             )
         {
-            report.errors.append(&mut errors);
+            report
+                .errors
+                .extend(errors.into_iter().map(SchemaDiagnostic::unlocated));
         }
         report
     }
@@ -16652,7 +16698,9 @@ impl PatternResourceSchema<Compiled> {
                 if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
                     report
                         .errors
-                        .push(TypeError::ReadOnlyAttribute { name: name.clone() });
+                        .push(SchemaDiagnostic::unlocated(TypeError::ReadOnlyAttribute {
+                            name: name.clone(),
+                        }));
                     continue;
                 }
 
@@ -16664,7 +16712,8 @@ impl PatternResourceSchema<Compiled> {
                     },
                     value,
                 );
-                for (index, error) in findings.local_errors().enumerate() {
+                for (index, primary) in findings.primary_findings().enumerate() {
+                    let error = primary.error();
                     let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
                         && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
@@ -16673,27 +16722,28 @@ impl PatternResourceSchema<Compiled> {
                     } else {
                         tagged
                     };
-                    if let Some((path, _)) = findings.located.get(index) {
-                        report
-                            .error_paths
-                            .insert(report.errors.len(), (name.clone(), path.clone()));
-                    }
-                    report.errors.push(reshaped);
+                    let diagnostic = primary
+                        .diagnostic(name, reshaped)
+                        .with_coverage(findings.located.get(index).map(|(path, _)| path));
+                    report.errors.push(diagnostic);
                 }
                 for (path, error) in &findings.provider {
-                    report
-                        .error_paths
-                        .insert(report.errors.len(), (name.clone(), path.canonical()));
-                    report.errors.push(error.clone().with_attribute(name));
+                    report.errors.push(SchemaDiagnostic::from_value(
+                        name,
+                        path.canonical(),
+                        error.clone().with_attribute(name),
+                    ));
                 }
-                report.attributes.insert(name.clone(), findings);
+                report.insert_attribute(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
                 if let Some(admit) = admission.unknown {
-                    report.attributes.insert(name.clone(), admit(name, value));
+                    report.insert_attribute(name.clone(), admit(name, value));
                 }
-                report
-                    .errors
-                    .push(TypeError::unknown_attribute(name, &known, &aliases));
+                report.errors.push(SchemaDiagnostic::from_value(
+                    name,
+                    LeafPath::from_segments([]),
+                    TypeError::unknown_attribute(name, &known, &aliases),
+                ));
             }
         }
 
@@ -16762,6 +16812,7 @@ impl crate::resource::InsideSecret for FieldPath {
 impl crate::resource::InsideSecret for TypeError {
     fn inside_secret(self) -> Self {
         match self {
+            TypeError::AttributePrefix(error) => TypeError::AttributePrefix(error),
             TypeError::InvalidEnumVariant {
                 value_kind,
                 attribute,

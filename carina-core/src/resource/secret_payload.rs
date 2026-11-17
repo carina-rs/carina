@@ -1,5 +1,5 @@
 //! The only access boundary for a secret's value.
-use super::{BindingAddress, DiagnosticScope, InsideSecret, Value, ValueKind};
+use super::{BindingAddress, DiagnosticScope, InsideSecret, Value, ValueKind, ValueShape};
 
 mod scalar_read {
     pub trait Sealed {}
@@ -43,8 +43,8 @@ impl SecretReadResult for super::RedactedSecretHash {}
 ///         payload.try_map(|value| Err(UnprotectedError(format!("{value:?}"))));
 /// }
 /// ```
-#[derive(Clone, PartialEq)]
-pub struct SecretPayload<P: ValueKind, B: BindingAddress> {
+#[derive(Clone)]
+pub struct SecretPayload<P: ValueShape, B: BindingAddress> {
     value: Box<Value<P, B>>,
 }
 
@@ -62,7 +62,8 @@ impl<P: ValueKind, B: BindingAddress> From<Box<Value<P, B>>> for SecretPayload<P
     }
 }
 
-/// Attach diagnostic provenance once, without evaluating or changing value shapes.
+/// Attach the secret mechanism's diagnostic marking once, without evaluating or
+/// changing value shapes.
 fn mark_strings<P: ValueKind, B: BindingAddress>(value: &mut Value<P, B>) {
     use super::{ConcreteValue, DeferredValue, InterpolationPart, PathSegment, Subscript};
     fn mark_step(step: &mut PathSegment) {
@@ -157,6 +158,12 @@ fn mark_strings<P: ValueKind, B: BindingAddress>(value: &mut Value<P, B>) {
             | ConcreteValue::Bool(_)
             | ConcreteValue::Duration(_),
         ) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -313,9 +320,55 @@ impl<P: super::PlaceholderKind> SecretPayload<P, super::AbsoluteBindingAddress> 
     }
 }
 
-impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for SecretPayload<P, B> {
+impl<P: ValueShape, B: BindingAddress> std::fmt::Debug for SecretPayload<P, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(crate::schema::SECRET_VALUE_MASK)
+    }
+}
+
+impl<P: ValueKind, B: BindingAddress> PartialEq for SecretPayload<P, B> {
+    fn eq(&self, other: &Self) -> bool {
+        let Self { value: a } = self;
+        let Self { value: b } = other;
+        a == b
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl<P: ValueShape, B: BindingAddress> SecretPayload<P, B> {
+    pub(super) fn visit_storage<'a>(&'a self, mut visit: impl FnMut(&'a Value<P, B>)) {
+        let Self { value } = self;
+        visit(value);
+    }
+
+    pub(super) fn copy_storage<Q: ValueShape>(
+        &self,
+        map: &mut impl FnMut(&Value<P, B>) -> Value<Q, B>,
+    ) -> SecretPayload<Q, B> {
+        let Self { value } = self;
+        SecretPayload {
+            value: Box::new(map(value)),
+        }
+    }
+
+    pub(crate) fn same_storage(
+        &self,
+        other: &Self,
+        compare: impl FnOnce(&Value<P, B>, &Value<P, B>) -> bool,
+    ) -> bool {
+        let Self { value: a } = self;
+        let Self { value: b } = other;
+        compare(a, b)
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl<P: ValueShape, B: BindingAddress> SecretPayload<P, B> {
+    // The operand's constructor is private to the resolver's enriched output module.
+    pub(crate) fn wrap_storage(value: crate::parser::SecretStorageOperand<P, B>) -> Self {
+        Self {
+            value: Box::new(value.into_value()),
+        }
     }
 }
 

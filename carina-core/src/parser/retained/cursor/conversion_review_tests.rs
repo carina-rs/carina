@@ -44,10 +44,10 @@ fn conversion_missing_operand_judgement_uses_only_the_conversion_channel() {
         .node
         .children[0]
         .node_id();
-    let mut snapshot = slot.snapshot.as_ref().clone();
+    let mut snapshot = slot.snapshot.as_deref().unwrap().clone();
     let instance = snapshot.instance.clone();
     Arc::make_mut(&mut snapshot.nodes).remove(&(instance, operand));
-    slot.snapshot = Arc::new(snapshot);
+    slot.snapshot = Some(Arc::new(snapshot));
     let cursor = AuthoredCursor::authored(slot.cursor().unwrap().canonical().unwrap());
     let schema = resource.schema(&schemas).unwrap();
     let declaration = &schema.schema().as_schema().attributes()["input"].attr_type;
@@ -120,12 +120,12 @@ fn ordinary_if_and_coalesce_missing_children_do_not_claim_a_conversion() {
             .node
             .node
             .clone();
-        let mut snapshot = slot.snapshot.as_ref().clone();
+        let mut snapshot = slot.snapshot.as_deref().unwrap().clone();
         for child in &node.children {
             Arc::make_mut(&mut snapshot.nodes)
                 .remove(&(snapshot.instance.clone(), child.node_id()));
         }
-        slot.snapshot = Arc::new(snapshot);
+        slot.snapshot = Some(Arc::new(snapshot));
         let cursor = AuthoredCursor::authored(slot.cursor().unwrap().canonical().unwrap());
         let schema = resource.schema(&schemas).unwrap();
         let declaration = &schema.schema().as_schema().attributes()["input"].attr_type;

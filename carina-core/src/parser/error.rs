@@ -321,14 +321,8 @@ pub enum ParseError {
         error: crate::resource::ResourceIdentityError,
     },
 
-    #[error("Undefined variable: {0}")]
-    UndefinedVariable(String),
-
     #[error("Invalid resource type: {0}")]
     InvalidResourceType(String),
-
-    #[error("Duplicate module definition: {0}")]
-    DuplicateModule(String),
 
     #[error("Duplicate binding at line {line}: {name}")]
     DuplicateBinding { name: String, line: usize },
@@ -362,9 +356,6 @@ pub enum ParseError {
         suggestion: Option<String>,
         in_scope: Vec<String>,
     },
-
-    #[error("Module not found: {0}")]
-    ModuleNotFound(String),
 
     #[error("Internal parser error: expected {expected} in {context}")]
     InternalError { expected: String, context: String },

@@ -963,10 +963,9 @@ fn constraint_actuals_for_expression<P: PlaceholderKind, B: BindingAddress>(
 
 fn format_constraint_actual<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> String {
     match value {
-        Value::Concrete(ConcreteValue::String(value)) => value
-            .diagnostic_literal()
-            .map(display_string_literal)
-            .unwrap_or_else(|| "string".to_string()),
+        Value::Concrete(ConcreteValue::String(value)) => {
+            display_string_literal(value.expose_plaintext())
+        }
         Value::Concrete(ConcreteValue::List(values)) => format!(
             "[{}]",
             values
@@ -979,12 +978,7 @@ fn format_constraint_actual<P: PlaceholderKind, B: BindingAddress>(value: &Value
             "[{}]",
             values
                 .iter()
-                .map(|value| {
-                    value
-                        .diagnostic_literal()
-                        .map(display_string_literal)
-                        .unwrap_or_else(|| "string".to_string())
-                })
+                .map(|value| display_string_literal(value.expose_plaintext()))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -1043,6 +1037,12 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
             Self::Value(Value::Deferred(DeferredValue::Access(_))) => "access expression",
             Self::Value(Value::Deferred(DeferredValue::Unknown(_))) => "unknown",
             Self::Value(Value::Deferred(DeferredValue::Placeholder(_))) => "placeholder",
+            Self::Value(crate::resource::Value::Reference(never)) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            Self::Value(crate::resource::Value::Conversion(never)) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 
@@ -1686,6 +1686,42 @@ mod tests {
                 "length() rejected {name}"
             );
         }
+    }
+
+    #[test]
+    fn env_constraint_actuals_show_public_strings_and_mask_secrets() {
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "CARINA_4409_ACTUAL".to_string(),
+            "env-constraint-value".into(),
+        )]));
+        let value: crate::resource::ExpandedValue =
+            crate::builtins::evaluate_builtin_with_config_to_value(
+                "env",
+                &[Value::Concrete(ConcreteValue::String(
+                    "CARINA_4409_ACTUAL".into(),
+                ))],
+                &config,
+            )
+            .unwrap();
+        let Value::Concrete(ConcreteValue::String(text)) = &value else {
+            panic!("env must return a string");
+        };
+        let strings: crate::resource::ExpandedValue =
+            Value::Concrete(ConcreteValue::StringList(vec![text.clone()]));
+        let hidden = value.clone().into_secret();
+        let actuals = [
+            format_constraint_actual(&value),
+            format_constraint_actual(&strings),
+            format_constraint_actual(&hidden),
+        ];
+        assert_eq!(
+            actuals,
+            [
+                "'env-constraint-value'",
+                "['env-constraint-value']",
+                "(secret)"
+            ]
+        );
     }
 
     #[test]

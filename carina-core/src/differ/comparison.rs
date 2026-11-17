@@ -420,7 +420,7 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
     ) {
         if let Some(ty) = ty {
             for (value, operand) in [a, b].into_iter().zip(self.reference_operands()) {
-                if contains_secret(value) || value.contains_diagnostic_sensitive_string() {
+                if contains_secret(value) {
                     self.references.validate_secret(&operand, value, ty, defs);
                 }
             }
@@ -771,9 +771,7 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
                 crate::schema::LeafPathSegment::MapKey(key) => {
                     format!(
                         "{path}[{}]",
-                        key.diagnostic_literal()
-                            .map(crate::parser::display_string_literal)
-                            .unwrap_or_else(|| "<sensitive string>".to_owned())
+                        crate::parser::display_string_literal(key.expose_plaintext())
                     )
                 }
                 crate::schema::LeafPathSegment::ListIndex(index) => format!("{path}[{index}]"),
@@ -1463,6 +1461,9 @@ fn contains_pending_reread(value: &Value) -> bool {
             | DeferredValue::Unknown(_),
         ) => false,
         Value::Deferred(DeferredValue::Placeholder(_)) => false,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -1704,6 +1705,9 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Unavailable { .. }) => true,
         Value::Deferred(DeferredValue::Placeholder(_)) => true,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 

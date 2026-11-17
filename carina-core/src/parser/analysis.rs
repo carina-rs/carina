@@ -97,6 +97,21 @@ impl DeclarationLocation {
         }
     }
 
+    pub(in crate::parser) fn coalesce_operator(
+        left: &pest::iterators::Pair<'_, Rule>,
+        right: &pest::iterators::Pair<'_, Rule>,
+        file: &PreprocessedFile,
+        source_file: &Path,
+    ) -> Self {
+        let start = left.as_span().end();
+        let gap = &left.as_span().get_input()[start..right.as_span().start()];
+        let offset = super::grammar::coalesce_operator_offset(gap);
+        Self {
+            file: SourceFileId::new(source_file.to_path_buf()),
+            span: SourceSpan::from_preprocessed_range(start + offset, start + offset + 2, file),
+        }
+    }
+
     pub(in crate::parser) fn conversion_expression(
         expression: &pest::iterators::Pair<'_, Rule>,
         target: &pest::iterators::Pair<'_, Rule>,
@@ -299,6 +314,15 @@ impl AttributeLocationIndex {
 }
 
 impl AttributeLocationNode {
+    fn root_key<'a>(
+        &self,
+        elements: &'a super::elements::ElementLocations,
+    ) -> Option<&'a super::AttributeKeyLocation> {
+        self.first_block
+            .map(|index| &elements.keys()[index])
+            .or_else(|| self.key(elements))
+    }
+
     fn child(&self, step: &crate::schema::FieldPathStep) -> Option<&Self> {
         #[cfg(test)]
         record_attribute_location_work(1);
@@ -410,7 +434,83 @@ impl<'a> AttributeDiagnosticLocations<'a> {
     }
 }
 
+fn locate_unknown_key(
+    elements: &super::elements::ElementLocations,
+    declaration: &DeclarationLocation,
+    finding: &crate::schema::KeyedSchemaFinding,
+) -> Result<Located<crate::schema::TypeError>, AnalysisTreeError> {
+    use crate::schema::diagnostic::SchemaDiagnosticKey;
+    let authored_root = |name: &str| {
+        elements
+            .diagnostic_index()
+            .attribute(name)
+            .and_then(|node| node.root_key(elements))
+            .ok_or_else(|| {
+                AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
+                    declaration: declaration.clone(),
+                    element: "unknown attribute key".into(),
+                })
+            })
+    };
+    let location = match &finding.key {
+        // Value-only producers claim no authored key. Preserve their existing
+        // type projection without treating an authored lookup miss as one.
+        SchemaDiagnosticKey::Unlocated => elements
+            .get(super::elements::ElementKind::ResourceType)
+            .unwrap_or(declaration),
+        SchemaDiagnosticKey::Attribute { name } => {
+            let root = authored_root(name)?;
+            let assignment = root.assignment_location();
+            if assignment.span().start_line() == assignment.span().end_line() {
+                assignment
+            } else {
+                root.location()
+            }
+        }
+        SchemaDiagnosticKey::Value {
+            root: name,
+            relative,
+            ..
+        } => AttributeDiagnosticLocations {
+            elements,
+            root: authored_root(name)?.location(),
+        }
+        .attribute_path_location(name, relative.path()),
+    };
+    Ok(Located::new(location.clone(), finding.error().clone()))
+}
+
 impl DeclarationProvenance {
+    /// Locate a schema finding while its declaration is still in hand. Unauthored
+    /// programmatic resources have no source span; an authored missing root is an invariant.
+    pub(crate) fn schema_diagnostic_location(
+        &self,
+        diagnostic: &crate::schema::SchemaDiagnostic,
+    ) -> Result<Option<DeclarationLocation>, AnalysisTreeError> {
+        let Some(declaration) = self.location() else {
+            return Ok(None);
+        };
+        match diagnostic {
+            crate::schema::SchemaDiagnostic::UnknownKey(key) => {
+                locate_unknown_key(self.elements(), declaration, key)
+                    .map(|finding| Some(finding.into_parts().0))
+            }
+            crate::schema::SchemaDiagnostic::Other(_) => Ok(Some(
+                diagnostic
+                    .path()
+                    .and_then(|(name, _)| self.elements().diagnostic_index().attribute(name))
+                    .and_then(|node| node.root_key(self.elements()))
+                    .map(|key| key.location())
+                    .or_else(|| {
+                        self.elements()
+                            .get(super::elements::ElementKind::ResourceType)
+                    })
+                    .unwrap_or(declaration)
+                    .clone(),
+            )),
+        }
+    }
+
     /// Canonical lookup paths retain their original parser-owned spans after
     /// schema block aliases are resolved. Programmatic resources have no span.
     pub(crate) fn attribute_diagnostic_location(
@@ -715,6 +815,11 @@ pub enum AnalysisTreeErrorKind {
         kind: AnalysisItemKind,
         id: ResourceId,
     },
+    #[error("resource {id} has a schema but was not visited by prefix canonicalization")]
+    UncanonicalizedResource {
+        id: Box<ResourceId>,
+        declaration: Option<DeclarationLocation>,
+    },
     #[error("missing declaration provenance for wait {binding}")]
     MissingWaitProvenance { binding: String },
     #[error("missing {element} provenance in {}", declaration.file().path().display())]
@@ -731,8 +836,19 @@ impl crate::resource::InsideSecret for AnalysisTreeError {
 }
 
 pub enum AnalysisTreeDiagnostic<'a> {
+    Located(Located<&'a AnalysisTreeError>),
     File(FileScoped<&'a AnalysisTreeError>),
     Directory(DirectoryScoped<&'a AnalysisTreeError>),
+}
+
+impl std::fmt::Display for AnalysisTreeDiagnostic<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Located(finding) => std::fmt::Display::fmt(finding, f),
+            Self::File(finding) => std::fmt::Display::fmt(finding.detail(), f),
+            Self::Directory(finding) => std::fmt::Display::fmt(finding.detail(), f),
+        }
+    }
 }
 
 impl AnalysisTreeError {
@@ -746,10 +862,22 @@ impl AnalysisTreeError {
 
     pub fn diagnostic(&self) -> AnalysisTreeDiagnostic<'_> {
         match &self.kind {
+            AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: Some(declaration),
+                ..
+            } => AnalysisTreeDiagnostic::Located(Located::new(declaration.clone(), self)),
             AnalysisTreeErrorKind::MissingElementProvenance { declaration, .. } => {
                 AnalysisTreeDiagnostic::File(FileScoped::new(declaration.file().path(), self))
             }
-            _ => AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self }),
+            AnalysisTreeErrorKind::InsideSecret
+            | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }
+            | AnalysisTreeErrorKind::MissingResourceProvenance { .. }
+            | AnalysisTreeErrorKind::UncanonicalizedResource {
+                declaration: None, ..
+            }
+            | AnalysisTreeErrorKind::MissingWaitProvenance { .. } => {
+                AnalysisTreeDiagnostic::Directory(DirectoryScoped { detail: self })
+            }
         }
     }
 }
@@ -993,6 +1121,12 @@ fn require_integer_operator_provenance<P: ValueKind, B: BindingAddress>(
             | DeferredValue::Placeholder(_)
             | DeferredValue::Unknown(_),
         ) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
     Ok(())
 }
@@ -1045,6 +1179,12 @@ where
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
     Ok(())
 }
@@ -1227,11 +1367,7 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
         // Blocks are collected after assignments; otherwise the parser keeps
         // the final authored assignment. Both facts are indexed once.
         let key_location = node
-            .and_then(|node| {
-                node.first_block
-                    .map(|index| &provenance.elements().keys()[index])
-                    .or_else(|| node.key(provenance.elements()))
-            })
+            .and_then(|node| node.root_key(provenance.elements()))
             .ok_or_else(|| {
                 AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
                     declaration: location.clone(),
@@ -1387,6 +1523,24 @@ pub struct AuthoredResourceInstanceKey<'a, B: BindingAddress = RelativeBindingNa
     binding: Option<&'a B>,
     element: Option<&'a crate::resource::LoopOriginKind>,
     module_scope: Option<&'a str>,
+}
+
+impl<B: BindingAddress> AuthoredResourceInstanceKey<'_, B> {
+    /// Match the same source instance across relative/absolute binding phases.
+    /// This is an address comparison, not admission authority.
+    pub fn same_source_instance<C: BindingAddress>(
+        &self,
+        other: &AuthoredResourceInstanceKey<'_, C>,
+    ) -> bool {
+        self.same_source_declaration(other) && self.element == other.element
+    }
+
+    pub(crate) fn same_source_declaration<C: BindingAddress>(
+        &self,
+        other: &AuthoredResourceInstanceKey<'_, C>,
+    ) -> bool {
+        self.declaration == other.declaration && self.module_scope == other.module_scope
+    }
 }
 
 impl<'a, P, T, D, B> AnalysisResourceRef<'a, P, T, D, B>
@@ -1554,6 +1708,29 @@ where
         self.attribute_locations[name].location()
     }
 
+    /// Resolve an unknown input key using the shared parser-owned range policy.
+    /// Root single-line assignments retain #4220's width; nested findings use keys.
+    fn locate_unknown_key(
+        &self,
+        finding: &crate::schema::KeyedSchemaFinding,
+    ) -> Result<Located<crate::schema::TypeError>, AnalysisTreeError> {
+        locate_unknown_key(self.elements, self.location, finding)
+    }
+
+    /// Resolve a schema diagnostic; ordinary adapters receive only Other.
+    pub fn locate_schema_diagnostic(
+        &self,
+        diagnostic: &crate::schema::SchemaDiagnostic,
+        other: impl FnOnce(&crate::schema::OtherSchemaFinding) -> DeclarationLocation,
+    ) -> Result<Located<crate::schema::TypeError>, AnalysisTreeError> {
+        match diagnostic {
+            crate::schema::SchemaDiagnostic::UnknownKey(key) => self.locate_unknown_key(key),
+            crate::schema::SchemaDiagnostic::Other(finding) => {
+                Ok(Located::new(other(finding), finding.error().clone()))
+            }
+        }
+    }
+
     pub fn attribute_assignment_location(&self, name: &str) -> &'a DeclarationLocation {
         self.attribute_locations[name].assignment_location()
     }
@@ -1671,6 +1848,10 @@ where
     B: BindingAddress,
     D: DeferredForPhaseTraversal<P, P, B>,
 {
+    pub(crate) fn is_project_resource(&self) -> bool {
+        self.in_project_walk
+    }
+
     pub fn attributes(&self) -> std::borrow::Cow<'a, indexmap::IndexMap<String, Value<P, B>>> {
         self.resource.attributes()
     }
@@ -1808,7 +1989,6 @@ pub struct AnalysisTree<
     value_references: Vec<AnalysisValueReference<B>>,
     validation_values: Vec<Located<FunctionValidationValue<'a, P, B>>>,
     iterables: Vec<AnalysisForRef<'a, P, B>>,
-    arguments: &'a [super::ArgumentParameter<super::TypeExpr, P, B>],
     functions: &'a indexmap::IndexMap<String, super::UserFunction<B>>,
     module_calls: &'a [super::ModuleCall<P, B>],
     binding_names: std::collections::HashSet<String>,
@@ -2518,7 +2698,15 @@ where
                     .declarations()
                     .iter()
                     .find(|record| record.kind() == kind && record.name() == name)
-                    .map(|record| record.value_location().unwrap_or(record.location()))
+                    .map(|record| {
+                        // Let evaluation/type backstops keep their declaration
+                        // anchor even when secrecy retains a separate RHS span.
+                        if kind == DeclarationKind::Binding {
+                            record.location()
+                        } else {
+                            record.value_location().unwrap_or(record.location())
+                        }
+                    })
                     .ok_or_else(|| {
                         AnalysisTreeError::new(AnalysisTreeErrorKind::MissingSyntaxProvenance {
                             element: format!("{kind:?} {name} value"),
@@ -2655,7 +2843,6 @@ where
             value_references,
             validation_values,
             iterables,
-            arguments: &file.arguments,
             functions: &file.user_functions,
             module_calls: &file.module_calls,
             module_definition: !file.arguments.is_empty() || !file.attribute_params.is_empty(),
@@ -2859,12 +3046,8 @@ where
         &self.iterables
     }
 
-    pub(crate) fn admission_report(&self) -> &super::retained::ExpressionReport<B> {
-        self.file
-            .parser_binding_metadata
-            .syntax()
-            .expressions()
-            .admission_report()
+    pub(crate) fn into_resources(self) -> Vec<AnalysisResourceRef<'a, P, T, D, B>> {
+        self.resources
     }
 
     pub fn resources(&self) -> impl Iterator<Item = &AnalysisResourceRef<'a, P, T, D, B>> {
@@ -2994,56 +3177,6 @@ where
             ));
         }
     }
-
-    pub fn inference_bindings(
-        &self,
-    ) -> crate::validation::inference::InferenceBindings<ParserPlaceholder, B> {
-        use crate::validation::inference::InferenceBinding;
-        let mut bindings = std::collections::HashMap::new();
-        for upstream in self.upstream_states() {
-            bindings.insert(
-                upstream.binding.to_string(),
-                InferenceBinding::UpstreamState,
-            );
-        }
-        for resource in self.resources() {
-            if let Some(binding) = resource.binding_address() {
-                let kind = if resource.kind() == AnalysisItemKind::Composition {
-                    InferenceBinding::Virtual {
-                        attributes: resource.attributes().into_owned(),
-                    }
-                } else {
-                    InferenceBinding::Resource {
-                        provider: resource.id().provider.clone(),
-                        resource_type: resource.id().resource_type.clone(),
-                    }
-                };
-                bindings.insert(binding.to_string(), kind);
-            }
-        }
-        for call in self.module_calls {
-            if let Some(binding) = &call.binding_name {
-                bindings
-                    .entry(binding.to_string())
-                    .or_insert(InferenceBinding::ModuleCall);
-            }
-        }
-        for argument in self.arguments {
-            bindings
-                .entry(argument.name.clone())
-                .or_insert_with(|| InferenceBinding::Argument {
-                    type_expr: argument.static_type.clone(),
-                });
-        }
-        for function in self.functions.values() {
-            bindings.entry(function.name.clone()).or_insert_with(|| {
-                InferenceBinding::UserFunction {
-                    return_type: function.return_type.clone(),
-                }
-            });
-        }
-        bindings
-    }
 }
 
 #[cfg(test)]
@@ -3063,6 +3196,240 @@ pub(super) fn record_attribute_location_work(steps: usize) {
 #[cfg(test)]
 mod location_tests {
     use super::*;
+
+    #[test]
+    fn inaccessible_unknown_child_uses_the_shared_parent_walk() {
+        use crate::resource::InsideSecret;
+        use crate::schema::diagnostic::SchemaDiagnosticKey;
+        use crate::schema::{FieldPath, FieldPathStep, SchemaDiagnostic, TypeError};
+        let source = "mock.test.Thing { config = { inner = {} allow = { typo = true } } }";
+        let parsed = super::super::parse_file(
+            source,
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let mut misses = Vec::new();
+        for (case, path) in [
+            FieldPath::new().push_field("inner").push_field("missing"),
+            FieldPath::new()
+                .push_protected_map_key()
+                .push_field("missing"),
+            FieldPath::new().push_map_key("Allow").push_field("typo"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let diagnostic = SchemaDiagnostic::from_value(
+                "config",
+                path.canonical(),
+                TypeError::UnknownStructField {
+                    struct_name: "Config".into(),
+                    field: "missing".into(),
+                    suggestion: None,
+                },
+            );
+            // Canonical paths do not encode protection. Use the secret boundary
+            // for the diagnostic, as the value walk does for a secret map.
+            let diagnostic = if case == 1 {
+                assert!(matches!(path.steps()[0], FieldPathStep::Redacted(_)));
+                diagnostic.inside_secret()
+            } else {
+                diagnostic
+            };
+            let SchemaDiagnostic::UnknownKey(key) = diagnostic else {
+                panic!("keyed finding")
+            };
+            if case == 1 {
+                assert!(matches!(
+                    &key.key,
+                    SchemaDiagnosticKey::Value { relative, .. }
+                        if relative.path().steps().iter().any(|step| matches!(step, FieldPathStep::Redacted(_)))
+                ));
+            }
+            match resource.locate_unknown_key(&key) {
+                Ok(finding) => assert_eq!(
+                    finding.location(),
+                    resource.attribute_path_location("config", &path)
+                ),
+                Err(_) => misses.push(case),
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "missing-child, protected-key, enum-alias lookup aborted in cases {misses:?}"
+        );
+    }
+
+    #[test]
+    fn symbolic_unknown_key_cannot_use_the_ordinary_location_adapter() {
+        use crate::schema::{LeafPath, LeafPathSegment, SchemaDiagnostic, TypeError};
+        let source = "mock.PendingSink { direct = { unknown = true } }";
+        let parsed = super::super::parse_file(
+            source,
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let diagnostic = SchemaDiagnostic::from_value(
+            "direct",
+            LeafPath::from_segments([LeafPathSegment::StructField("unknown".into())]),
+            TypeError::UnknownStructField {
+                struct_name: "B".into(),
+                field: "unknown".into(),
+                suggestion: None,
+            },
+        );
+        let located = resource
+            .locate_schema_diagnostic(&diagnostic, |_ordinary| {
+                panic!("UnknownKey must not reach the ordinary location adapter")
+            })
+            .unwrap();
+        let start = source.find("unknown").unwrap();
+        let span = located.location().span();
+        assert_eq!(
+            (
+                span.start_line(),
+                span.start_column(),
+                span.end_line(),
+                span.end_column()
+            ),
+            (1, start + 1, 1, start + "unknown".len() + 1),
+        );
+        assert_eq!(located.detail().to_string(), "Unknown field 'unknown' in B");
+    }
+
+    #[test]
+    fn unlocated_unknown_key_keeps_the_type_projection_with_the_owner() {
+        use crate::schema::{SchemaDiagnostic, TypeError};
+        let parsed = super::super::parse_file(
+            "mock.test.Thing { config = {} }",
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let diagnostic = SchemaDiagnostic::unlocated(TypeError::StructFieldError {
+            field: "config".into(),
+            inner: Box::new(TypeError::UnknownStructField {
+                struct_name: "Config".into(),
+                field: "typo".into(),
+                suggestion: None,
+            }),
+        });
+        let finding = resource
+            .locate_schema_diagnostic(&diagnostic, |_ordinary| {
+                panic!("unlocated unknown key reached an ordinary adapter")
+            })
+            .unwrap();
+        assert_eq!(finding.location(), resource.type_location());
+        assert_eq!(finding.detail(), diagnostic.error());
+    }
+
+    #[test]
+    fn unlocated_top_level_unknown_uses_type_projection() {
+        use crate::schema::{ResourceValueValidation, TypeError};
+        let parsed = super::super::parse_file(
+            "mock.test.Thing { typo = true }",
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let mut failures = Vec::new();
+        for name in ["typo", "missing"] {
+            let report = ResourceValueValidation::from_errors(vec![TypeError::UnknownAttribute {
+                name: name.into(),
+                suggestion: None,
+            }]);
+            let (diagnostic, _) = report.diagnostic_errors().next().unwrap();
+            match resource.locate_schema_diagnostic(diagnostic, |_| {
+                panic!("unknown key used ordinary adapter")
+            }) {
+                Ok(finding) if finding.location() == resource.type_location() => {}
+                Ok(finding) => failures.push(format!(
+                    "{name}: authored key {:?}",
+                    finding.location().span()
+                )),
+                Err(error) => failures.push(format!("{name}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "unlocated top-level unknowns claimed authored keys: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_lookup_miss_is_an_analysis_invariant() {
+        use crate::schema::{SchemaDiagnostic, TypeError};
+        let source = "mock.test.Thing { config = {} }";
+        let parsed = super::super::parse_file(
+            source,
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let diagnostic = SchemaDiagnostic::from_value(
+            "missing",
+            crate::schema::LeafPath::from_segments([]),
+            TypeError::UnknownAttribute {
+                name: "missing".into(),
+                suggestion: None,
+            },
+        );
+        {
+            let SchemaDiagnostic::UnknownKey(key) = diagnostic else {
+                panic!("keyed diagnostic")
+            };
+            let error = resource
+                .locate_unknown_key(&key)
+                .expect_err("missing authored key");
+            assert!(matches!(
+                error.kind(),
+                AnalysisTreeErrorKind::MissingElementProvenance { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn computed_unknown_key_keeps_the_nearest_authored_parent() {
+        use crate::schema::{LeafPath, LeafPathSegment, SchemaDiagnostic, TypeError};
+        let source = "let value = { typo = true }\nmock.test.Thing { config = value }";
+        let parsed = super::super::parse_file(
+            source,
+            Path::new("sibling.crn"),
+            &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let resource = tree.resources().next().unwrap();
+        let diagnostic = SchemaDiagnostic::from_value(
+            "config",
+            LeafPath::from_segments([LeafPathSegment::StructField("typo".into())]),
+            TypeError::UnknownStructField {
+                struct_name: "Config".into(),
+                field: "typo".into(),
+                suggestion: None,
+            },
+        );
+        let SchemaDiagnostic::UnknownKey(key) = diagnostic else {
+            panic!("keyed diagnostic")
+        };
+        let finding = resource.locate_unknown_key(&key).unwrap();
+        assert_eq!(
+            finding.location(),
+            resource.attribute_key_location("config")
+        );
+    }
 
     #[test]
     fn aliased_collection_input_construction_updates_locations_in_one_pass() {

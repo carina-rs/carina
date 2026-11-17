@@ -1443,7 +1443,7 @@ fn saved_plan_rehydrates_secret_inside_builtin_with_deferred_coalesce() {
     const PLAINTEXT: &str = "coalesce_secret_plaintext_3974";
     let scenario = issue_3974_scenario(
         "coalesce",
-        r#"upper(origin.comment ?? secret(env("SAVED_PLAN_BUILTIN_SECRET_3974")))"#,
+        r#"upper(secret(origin.comment ?? env("SAVED_PLAN_BUILTIN_SECRET_3974")))"#,
         PLAINTEXT,
     );
 
@@ -1481,7 +1481,7 @@ fn saved_plan_builtin_wrapped_deferred_secrets_reject_changed_values() {
         ),
         (
             "changed-coalesce",
-            r#"upper(origin.comment ?? secret(env("SAVED_PLAN_BUILTIN_SECRET_3974")))"#,
+            r#"upper(secret(origin.comment ?? env("SAVED_PLAN_BUILTIN_SECRET_3974")))"#,
         ),
     ] {
         let scenario = issue_3974_scenario(label, expression, PLANNED);
@@ -1515,7 +1515,7 @@ fn saved_plan_builtin_wrapped_deferred_secrets_reject_unavailable_values() {
         ),
         (
             "unavailable-coalesce",
-            r#"upper(origin.comment ?? secret(env("SAVED_PLAN_BUILTIN_SECRET_3974")))"#,
+            r#"upper(secret(origin.comment ?? env("SAVED_PLAN_BUILTIN_SECRET_3974")))"#,
             "current secret could not be evaluated",
             "current configuration could not be evaluated",
         ),
@@ -1558,7 +1558,7 @@ provider mock {}
 let r = mock.test.resource { name = "unselected-coalesce-origin" }
 let dependent = mock.test.resource {
   name    = "unselected-coalesce-dependent"
-  comment = upper(r.comment ?? secret(env("SAVED_PLAN_BUILTIN_SECRET_3974")))
+  comment = upper(secret(r.comment ?? env("SAVED_PLAN_BUILTIN_SECRET_3974")))
 }
 "#,
         &[(ISSUE_3974_ENV, PLANNED)],
@@ -1570,9 +1570,9 @@ let dependent = mock.test.resource {
     let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
     let provider_before = fs::read(&scenario.mock_state).ok();
 
-    // `r.comment` is still unknown while the saved-plan candidate is built,
-    // so the fallback is retained without being selected. Its explicit
-    // Unavailable leaf must still win over hash comparison.
+    // The homogeneous Public coalesce is protected at its use site. Its
+    // pending source retains the unavailable fallback inside the protected
+    // expression, which must fail verification before hash comparison.
     let apply = scenario
         .command(&["apply", "--auto-approve", "--lock=false", "plan.json"])
         .env_remove(ISSUE_3974_ENV)

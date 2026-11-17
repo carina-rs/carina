@@ -151,11 +151,11 @@ impl AdmittedUpstreamExports {
         let mut admitted = HashMap::new();
         for (key, supplied) in values {
             let declaration = match &surface.entries {
-                Ok(entries) => match entries.get(&key) {
+                Some(entries) => match entries.get(&key) {
                     Some(declaration) => Some(declaration),
                     None => continue,
                 },
-                Err(_) => None,
+                None => None,
             };
             let Some(value) =
                 decode(supplied).map_err(|error| UpstreamExportAdmissionError::Decode {
@@ -434,11 +434,6 @@ mod tests {
             ConsumerInferredUncheckedReason::NotInferable(NotInferableReason::SchemaUnavailable {
                 binding: "producer".into(),
             }),
-            ConsumerInferredUncheckedReason::NotInferable(
-                NotInferableReason::PlaceholderTypeUnavailable {
-                    placeholder: "pending".into(),
-                },
-            ),
             ConsumerInferredUncheckedReason::NotInferable(
                 NotInferableReason::CustomTypeSchemaUnavailable {
                     identity: crate::schema::TypeIdentity::from_schema_type(

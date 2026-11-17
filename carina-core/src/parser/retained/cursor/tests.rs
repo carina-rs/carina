@@ -335,10 +335,13 @@ fn round6_parent_hook_errors_preserve_ordinary_child_diagnostics() {
         let mut actual = validate(Some(&hook));
         assert_eq!(ordinary_calls.replace(Vec::new()), expected_calls);
         assert_eq!(actual.local_error(), expected.local_error());
+        let expected_findings = expected.clone().into_diagnostic_findings("input");
+        let actual_findings = actual.clone().into_diagnostic_findings("input");
         assert!(
-            actual
-                .local_findings()
-                .starts_with(expected.local_findings())
+            actual_findings
+                .iter()
+                .take(expected_findings.len())
+                .eq(expected_findings.iter())
         );
         assert_eq!(actual.take_assignment().errors.len(), 1);
     }
@@ -559,8 +562,9 @@ fn round1_seam_children_are_fallible_instead_of_panicking() {
         .unwrap()
         .unwrap()
         .node_id();
-    let instance = slot.snapshot.instance.clone();
-    Arc::make_mut(&mut Arc::make_mut(&mut slot.snapshot).nodes).remove(&(instance, child));
+    let snapshot = Arc::make_mut(slot.snapshot.as_mut().unwrap());
+    let instance = snapshot.instance.clone();
+    Arc::make_mut(&mut snapshot.nodes).remove(&(instance, child));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         slot.cursor().unwrap().node().children().collect::<Vec<_>>()
     }));
@@ -577,9 +581,9 @@ fn round1_seam_expansion_records_a_decision_without_a_parse_projection() {
     }
     let condition = usage.node.node.children[0].node_id();
     let instance = usage.node.environment.clone();
-    let mut snapshot = (*slot.snapshot).clone();
+    let mut snapshot = slot.snapshot.as_deref().unwrap().clone();
     Arc::make_mut(&mut snapshot.projections).shift_remove(&(instance, condition));
-    slot.snapshot = Arc::new(snapshot);
+    slot.snapshot = Some(Arc::new(snapshot));
     slot.conditions = ConditionSnapshot::default();
     // Model an unavailable parse-time projection and the value already
     // selected by module expansion. Main admits this String without findings.
@@ -672,7 +676,7 @@ fn cursor_api_children_and_edges_share_the_judged_snapshot() {
 #[test]
 fn cursor_api_rebuilding_a_projection_advances_its_generation() {
     let mut slot = slot("let input = 'before'");
-    let snapshot = slot.snapshot.clone();
+    let snapshot = slot.snapshot.clone().unwrap();
     let generation = slot.generation();
     let node = slot.cursor().unwrap().node().node_id();
     slot.replace_projection(slot.projection().unwrap().clone());
@@ -972,7 +976,7 @@ where
     B: BindingAddress,
 {
     use crate::validation::admission::attributes::{
-        ResourceAttributeInputs, resource_attribute_admissions,
+        ResourceAttributeInputs, resource_attribute_admissions_for_test,
     };
     let tree = crate::parser::AnalysisTree::try_from_file(source.file()).unwrap();
     let bindings =
@@ -982,9 +986,9 @@ where
         let rows = tree
             .project_resources()
             .map(|resource| {
-                let inputs = ResourceAttributeInputs::new(resource);
+                let inputs = ResourceAttributeInputs::new_for_test(resource);
                 let findings = {
-                    let outcome = resource_attribute_admissions(
+                    let outcome = resource_attribute_admissions_for_test(
                         resource,
                         source.file(),
                         schema,
@@ -1650,18 +1654,25 @@ fn seam_generated_prefix_result_has_explicit_projection_authority() {
             .validate()
             .unwrap(),
     );
-    let mut parsed =
+    let parsed =
         crate::parser::parse_and_resolve("let target = mock.Test { name_prefix = 'test-' }")
             .unwrap();
-    crate::identifier::resolve_attr_prefixes(&mut parsed.resources, &schemas).unwrap();
-    let configuration =
-        crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+    let parsed = crate::identifier::canonicalize_file_prefixes(
+        parsed,
+        &schemas,
+        crate::identifier::SuffixSource::Preview,
+    );
+    let configuration = parsed.judge(&catalog);
     let judged = configuration.judged();
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.project_resources().next().unwrap();
     assert!(resource.projected_phase("name").is_some());
     assert!(resource.projected_phase("missing").is_none());
-    let (rows, _) = admit_all(judged, resource.schema(&schemas).unwrap(), &catalog);
+    let (rows, _) = admit_all(
+        &crate::parser::retained::JudgedFile::new(judged.file().clone(), &schemas, &catalog),
+        resource.schema(&schemas).unwrap(),
+        &catalog,
+    );
     for (findings, _) in rows {
         assert_eq!(findings.errors().count(), 0, "{findings:?}");
     }
@@ -2156,7 +2167,11 @@ fn review_seam_composition_computed_values_keep_main_checks() {
             assert!(
                 findings
                     .errors()
-                    .chain(findings.symbolic_errors().map(|(_, _, error)| error))
+                    .chain(
+                        findings
+                            .symbolic_errors()
+                            .map(|(_, _, diagnostic)| diagnostic.error())
+                    )
                     .any(|error| error.to_string().contains("expected String, got Int")),
                 "{expression}: {findings:?}"
             );
@@ -2167,7 +2182,7 @@ fn review_seam_composition_computed_values_keep_main_checks() {
 #[test]
 fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
     use crate::validation::admission::attributes::{
-        ResourceAttributeInputs, resource_attribute_admissions,
+        ResourceAttributeInputs, resource_attribute_admissions_for_test,
     };
     let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
     let mut schemas = SchemaRegistry::new();
@@ -2192,7 +2207,7 @@ fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
     let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
     let resource = tree.resources().next().unwrap();
     for instantiate in [false, true] {
-        let inputs = ResourceAttributeInputs::new(resource);
+        let inputs = ResourceAttributeInputs::new_for_test(resource);
         let mut changed = judged.file().clone();
         if instantiate {
             changed.resources[0] = changed.resources[0].instantiate();
@@ -2208,7 +2223,7 @@ fn review_seam_prepared_inputs_reject_other_instances_and_stale_generations() {
             crate::binding_index::BindingIndex::from_parsed(&changed, &schemas, &catalog);
         crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
             let findings = {
-                let outcome = resource_attribute_admissions(
+                let outcome = resource_attribute_admissions_for_test(
                     changed_resource,
                     &changed,
                     changed_resource.schema(&schemas).unwrap(),

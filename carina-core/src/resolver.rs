@@ -195,13 +195,10 @@ impl From<crate::parser::ParseError> for ResolutionError {
                 ..
             }
             | crate::parser::ParseError::InvalidResourceIdentity { .. }
-            | crate::parser::ParseError::UndefinedVariable(..)
             | crate::parser::ParseError::InvalidResourceType(..)
-            | crate::parser::ParseError::DuplicateModule(..)
             | crate::parser::ParseError::DuplicateBinding { .. }
             | crate::parser::ParseError::UndefinedIdentifier { .. }
             | crate::parser::ParseError::UndefinedDeferredIterable { .. }
-            | crate::parser::ParseError::ModuleNotFound(..)
             | crate::parser::ParseError::InternalError { .. }
             | crate::parser::ParseError::RecursiveFunction(..)
             | crate::parser::ParseError::CyclicLetBinding { .. }
@@ -1154,6 +1151,16 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                             | DeferredValue::Coalesce { .. }
                             | DeferredValue::ResourceRef { .. },
                         ) => None,
+                        crate::resource::Value::Reference(never) => {
+                            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(
+                                never,
+                            ) {}
+                        }
+                        crate::resource::Value::Conversion(never) => {
+                            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(
+                                never,
+                            ) {}
+                        }
                     };
                     Ok(ValueResolution::Unknown(match shape {
                         Some(shape) => Value::Deferred(DeferredValue::Coalesce {
@@ -1230,6 +1237,12 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
         }
         Value::Deferred(DeferredValue::Placeholder(_)) => {
             Ok(ValueResolution::Unknown(value.clone()))
+        }
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
         }
     }
 }
@@ -1721,6 +1734,12 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             | ConcreteValue::StringList(_),
         ) => Ok(value.clone()),
         Value::Deferred(DeferredValue::Placeholder(_)) => Ok(value.clone()),
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 

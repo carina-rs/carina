@@ -1,0 +1,11 @@
+let item = if enabled {
+  mock.test.resource {
+    name = name
+    comment = value ?? secret("default")
+  }
+} else {
+  mock.test.resource {
+    name = name
+    comment = value ?? secret("disabled")
+  }
+}

@@ -596,6 +596,16 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
     }
 }
 

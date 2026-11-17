@@ -3,6 +3,7 @@
 
 use crate::resource::ValueKind;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
@@ -111,6 +112,7 @@ struct ModuleExpansionSource<'a> {
     source: Option<&'a str>,
     directory: Option<&'a crate::paths::ResolvedPath>,
     scope: Option<&'a ModuleInstanceScope>,
+    caller_scope: Option<&'a ModuleInstanceScope>,
     parent_call_path: Option<&'a crate::resource::ExpandedCompositionCallPath>,
     caller_judgements:
         &'a HashMap<crate::parser::DeclarationLocation, crate::parser::retained::JudgedExpr>,
@@ -128,10 +130,82 @@ impl<'a> ModuleExpansionSource<'a> {
             source: None,
             directory: None,
             scope: None,
+            caller_scope: None,
             parent_call_path: None,
             caller_judgements,
         }
     }
+}
+
+type CallerJudgements =
+    HashMap<crate::parser::DeclarationLocation, crate::parser::retained::JudgedExpr>;
+
+enum ExpansionBindings<'a> {
+    Borrowed(&'a BindingIndex<'a>),
+    Shared(Arc<BindingIndex<'a>>),
+}
+impl<'a> ExpansionBindings<'a> {
+    fn get(&self) -> &BindingIndex<'a> {
+        match self {
+            Self::Borrowed(index) => index,
+            Self::Shared(index) => index,
+        }
+    }
+}
+
+enum ExpansionJudgements<'a> {
+    Borrowed(&'a CallerJudgements),
+    Shared(Arc<CallerJudgements>),
+}
+impl ExpansionJudgements<'_> {
+    fn get(&self) -> &CallerJudgements {
+        match self {
+            Self::Borrowed(judgements) => judgements,
+            Self::Shared(judgements) => judgements,
+        }
+    }
+}
+
+/// All addresses borrowed by a frame refer to the resolver's template cache,
+/// never to another frame on the Vec. The instance state itself is owned.
+struct ExpansionInput<'a> {
+    authored_call: ModuleCall,
+    call: crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
+    instance_prefix: String,
+    module: &'a ParsedFile,
+    source: Option<String>,
+    directory: Option<crate::paths::ResolvedPath>,
+    scope: ModuleInstanceScope,
+    caller_scope: Option<ModuleInstanceScope>,
+    parent_call_path: Option<crate::resource::ExpandedCompositionCallPath>,
+    caller_judgements: ExpansionJudgements<'a>,
+    binding_index: Option<ExpansionBindings<'a>>,
+}
+
+struct PreparedExpansion<'a> {
+    resolved_arguments: HashMap<String, ResolvedArgument>,
+    argument_values: HashMap<String, ModuleResolvedValue>,
+    pending_constraints: Vec<crate::resource::PendingModuleConstraint<ParserPlaceholder>>,
+    module_source: Option<String>,
+    module_directory: Option<crate::paths::ResolvedPath>,
+    expanded_call: crate::resource::ExpandedCompositionCall,
+    expanded_call_path: crate::resource::ExpandedCompositionCallPath,
+    intra_module_bindings: HashSet<RelativeBindingName>,
+    argument_placeholders: HashMap<String, ResolvedArgument<RelativeBindingName>>,
+    condition_selections: crate::parser::retained::ConditionRecorder,
+    selected_module_ifs: SelectedDeferredIfs,
+    instance: crate::parser::RootBindingResolvedParsedFile,
+    instance_judgements: Arc<CallerJudgements>,
+    nested_binding_index: Arc<BindingIndex<'a>>,
+}
+
+struct ExpansionFrame<'a> {
+    input: ExpansionInput<'a>,
+    prepared: PreparedExpansion<'a>,
+    next_child: usize,
+    contributions: Vec<crate::parser::RootBindingResolvedParsedFile>,
+    #[cfg(feature = "test-utils")]
+    _recording_module: crate::identity_recording::ContextGuard,
 }
 
 impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
@@ -163,8 +237,8 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
     /// `E = ParsedExportParam`, making that a same-phase no-op;
     /// module loading rejects `export_params` before expansion, so the
     /// empty contribution and its relabel are enforced by the module
-    /// boundary). The recursive parser-phase caller
-    /// (`resolve_nested_modules`) merges directly.
+    /// boundary). Nested calls use the same merger when their heap frames
+    /// finish, preserving child-before-parent order.
     pub(super) fn expand_module_call_checked(
         &self,
         authored_call: &ModuleCall,
@@ -222,17 +296,15 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         }
     }
 
-    fn expand_module_call_inner(
-        &self,
+    fn expand_module_call_inner<'a>(
+        &'a self,
         authored_call: &ModuleCall,
         call: &crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
         instance_prefix: &str,
-        binding_index: Option<&BindingIndex<'_>>,
+        binding_index: Option<&'a BindingIndex<'a>>,
         resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
-        expansion_source: ModuleExpansionSource<'_>,
+        expansion_source: ModuleExpansionSource<'a>,
     ) -> Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> {
-        #[cfg(feature = "test-utils")]
-        let _recording_module = crate::identity_recording::enter_module(call.id());
         let module = match expansion_source.module {
             Some(module) => module,
             None => self
@@ -240,8 +312,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .get(&call.module_name)
                 .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?,
         };
-        let call_source_file = call.source_file();
-        let module_instance_scope = expansion_source.scope.cloned().unwrap_or_else(|| {
+        let scope = expansion_source.scope.cloned().unwrap_or_else(|| {
             ModuleInstanceScope::for_call(
                 &call.module_name,
                 call.binding_name
@@ -250,44 +321,153 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 instance_prefix,
             )
         });
-        let call_source_path = crate::utils::normalize_source_path(call_source_file)
-            .display()
-            .to_string();
-        let contextualize_access_error = |error: ArgumentSubstitutionError| {
-            let (
-                location,
-                ArgumentSubstitutionDetails {
-                    source_file,
-                    line,
-                    message,
-                    parse_error,
-                },
-            ) = error
-                .into_diagnostic(call.id().module_name_location())
-                .into_parts();
-            if let Some(error) = parse_error {
-                return ModuleError::Parse(*error);
+        let input = ExpansionInput {
+            authored_call: authored_call.clone(),
+            call: call.clone(),
+            instance_prefix: instance_prefix.to_string(),
+            module,
+            source: expansion_source.source.map(str::to_string),
+            directory: expansion_source.directory.cloned(),
+            scope,
+            caller_scope: expansion_source.caller_scope.cloned(),
+            parent_call_path: expansion_source.parent_call_path.cloned(),
+            caller_judgements: ExpansionJudgements::Borrowed(expansion_source.caller_judgements),
+            binding_index: binding_index.map(ExpansionBindings::Borrowed),
+        };
+        #[cfg(feature = "test-utils")]
+        let _recording_module = crate::identity_recording::enter_module(input.call.id());
+        let prepared = self.prepare_module_expansion(&input, resolved_bindings)?;
+        let mut frames = vec![ExpansionFrame {
+            input,
+            prepared,
+            next_child: 0,
+            contributions: Vec::new(),
+            #[cfg(feature = "test-utils")]
+            _recording_module,
+        }];
+        let mut failing_calls = Vec::new();
+        let result: Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> = (|| {
+            loop {
+                let frame = frames.last_mut().expect("active module expansion");
+                let child_count = frame.input.module.module_calls.len()
+                    + frame
+                        .prepared
+                        .selected_module_ifs
+                        .contribution
+                        .module_calls
+                        .len();
+                if frame.next_child < child_count {
+                    let input = self.nested_expansion_input(
+                        &frame.input,
+                        &frame.prepared,
+                        frame.next_child,
+                    )?;
+                    frame.next_child += 1;
+                    failing_calls.push(input.authored_call.id().clone());
+                    #[cfg(feature = "test-utils")]
+                    let _recording_module =
+                        crate::identity_recording::enter_module(input.call.id());
+                    let prepared = self.prepare_module_expansion(&input, resolved_bindings)?;
+                    frames.push(ExpansionFrame {
+                        input,
+                        prepared,
+                        next_child: 0,
+                        contributions: Vec::new(),
+                        #[cfg(feature = "test-utils")]
+                        _recording_module,
+                    });
+                    continue;
+                }
+                let frame = frames.pop().expect("completed module expansion");
+                let expanded = self.finish_module_expansion(
+                    &frame.input,
+                    frame.prepared,
+                    frame.contributions,
+                )?;
+                if let Some(parent) = frames.last_mut() {
+                    failing_calls.pop();
+                    parent.contributions.push(expanded);
+                } else {
+                    return Ok(expanded);
+                }
             }
-            ModuleError::ArgumentValueAccess {
-                module: call.module_name.clone(),
-                source_path: source_file
-                    .map(|path| {
-                        crate::utils::normalize_source_path(&path)
+        })(
+        );
+        result.map_err(|mut error| {
+            for call in failing_calls.into_iter().rev() {
+                error = error.with_failing_call(call);
+            }
+            error
+        })
+    }
+
+    fn expansion_access_error(
+        &self,
+        call: &crate::parser::ModuleCall<ParserPlaceholder, AbsoluteBindingAddress>,
+        call_source_path: &str,
+        error: ArgumentSubstitutionError,
+    ) -> ModuleError {
+        let (
+            location,
+            ArgumentSubstitutionDetails {
+                source_file,
+                line,
+                message,
+                parse_error,
+            },
+        ) = error
+            .into_diagnostic(call.id().module_name_location())
+            .into_parts();
+        if let Some(error) = parse_error {
+            return ModuleError::Parse(*error);
+        }
+        ModuleError::ArgumentValueAccess {
+            module: call.module_name.clone(),
+            source_path: source_file
+                .map(|path| {
+                    crate::utils::normalize_source_path(&path)
+                        .display()
+                        .to_string()
+                })
+                .or_else(|| {
+                    self.module_paths.get(&call.module_name).map(|path| {
+                        crate::utils::normalize_source_path(std::path::Path::new(path))
                             .display()
                             .to_string()
                     })
-                    .or_else(|| {
-                        self.module_paths.get(&call.module_name).map(|path| {
-                            crate::utils::normalize_source_path(std::path::Path::new(path))
-                                .display()
-                                .to_string()
-                        })
-                    })
-                    .unwrap_or_else(|| call_source_path.clone()),
-                line,
-                diagnostic: Box::new(crate::parser::Located::new(location, message)),
-            }
+                })
+                .unwrap_or_else(|| call_source_path.to_string()),
+            line,
+            diagnostic: Box::new(crate::parser::Located::new(location, message)),
+        }
+    }
+
+    fn prepare_module_expansion<'a>(
+        &'a self,
+        input: &ExpansionInput<'a>,
+        resolved_bindings: Option<&crate::binding_index::ResolvedBindings<ParserPlaceholder>>,
+    ) -> Result<PreparedExpansion<'a>, ModuleError> {
+        let authored_call = &input.authored_call;
+        let call = &input.call;
+        let module = input.module;
+        let instance_prefix = input.instance_prefix.as_str();
+        let binding_index = input.binding_index.as_ref().map(ExpansionBindings::get);
+        let module_instance_scope = input.scope.clone();
+        let expansion_source = ModuleExpansionSource {
+            module: Some(module),
+            source: input.source.as_deref(),
+            directory: input.directory.as_ref(),
+            scope: Some(&input.scope),
+            caller_scope: input.caller_scope.as_ref(),
+            parent_call_path: input.parent_call_path.as_ref(),
+            caller_judgements: input.caller_judgements.get(),
         };
+        let call_source_file = call.source_file();
+        let call_source_path = crate::utils::normalize_source_path(call_source_file)
+            .display()
+            .to_string();
+        let contextualize_access_error =
+            |error| self.expansion_access_error(call, &call_source_path, error);
 
         // Validate required arguments
         for arg in &module.arguments {
@@ -808,7 +988,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let selected_module_ifs =
             select_deferred_module_ifs(module, &expanded_call, &module_scope_resolver)
                 .map_err(contextualize_access_error)?;
-        let selected = &selected_module_ifs.contribution;
 
         let mut instance = module
             .clone()
@@ -832,55 +1011,181 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             .syntax
             .expressions_mut()
             .substitute_projections(module_scope_resolver.arguments);
+        instance
+            .parser_binding_metadata
+            .syntax
+            .expressions_mut()
+            .retain_secrecy_arguments(
+                &module_instance_scope,
+                authored_call,
+                expansion_source.caller_scope,
+                module
+                    .arguments
+                    .iter()
+                    .map(|argument| (argument.name.as_str(), argument.default.as_ref())),
+            );
+        instance
+            .parser_binding_metadata
+            .syntax
+            .expressions_mut()
+            .retain_secrecy_call(
+                call.binding_name
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| call.module_name.clone()),
+                call.id().declaration_location().clone(),
+            );
         crate::parser::retained::judge_configuration(&mut instance, self.schemas, self.config());
-        let instance_judgements = instance.expression_report().locations();
 
-        let nested_signatures = crate::module_resolver::ResolvedModuleSignatures::default();
-        let nested_binding_index =
+        let ModuleScopeResolver {
+            argument_placeholders,
+            condition_selections,
+            ..
+        } = module_scope_resolver;
+        static NESTED_SIGNATURES: std::sync::LazyLock<
+            crate::module_resolver::ResolvedModuleSignatures,
+        > = std::sync::LazyLock::new(crate::module_resolver::ResolvedModuleSignatures::default);
+        let nested_binding_index = Arc::new(
             BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
                 module,
                 self.schemas,
                 None,
-                &nested_signatures,
+                &NESTED_SIGNATURES,
                 self.session,
-            );
-        let mut nested_contributions = Vec::new();
-        for nested_call in module.module_calls.iter().chain(&selected.module_calls) {
-            let local_prefix = instance_prefix_for_call(nested_call);
-            let local_scope = ModuleInstanceScope::for_call(
-                &nested_call.module_name,
-                nested_call
-                    .binding_name
-                    .as_ref()
-                    .map(RelativeBindingName::as_str),
-                &local_prefix,
-            );
-            let child_scope = module_instance_scope.with_child(&local_scope);
-            let expanded_nested_call =
-                resolve_nested_module_call(nested_call, &module_scope_resolver)
-                    .map_err(contextualize_access_error)?;
-            let (child_module, child_source, child_directory) =
-                self.nested_module_definition(module, module_directory.as_ref(), nested_call)?;
-            let expanded = self
-                .expand_module_call_inner(
-                    nested_call,
-                    &expanded_nested_call,
-                    child_scope.key(),
-                    Some(&nested_binding_index),
-                    resolved_bindings,
-                    ModuleExpansionSource {
-                        module: Some(child_module),
-                        source: Some(&child_source),
-                        directory: Some(&child_directory),
-                        scope: Some(&child_scope),
-                        parent_call_path: Some(&expanded_call_path),
-                        caller_judgements: &instance_judgements,
-                    },
-                )
-                .map_err(|error| error.with_failing_call(nested_call.id().clone()))?;
-            nested_contributions.push(expanded);
-        }
+            ),
+        );
+        Ok(PreparedExpansion {
+            instance_judgements: Arc::new(instance.expression_report().locations()),
+            resolved_arguments,
+            argument_values,
+            pending_constraints,
+            module_source,
+            module_directory,
+            expanded_call,
+            expanded_call_path,
+            intra_module_bindings,
+            argument_placeholders,
+            condition_selections,
+            selected_module_ifs,
+            instance,
+            nested_binding_index,
+        })
+    }
 
+    fn nested_expansion_input<'a>(
+        &'a self,
+        input: &ExpansionInput<'_>,
+        prepared: &PreparedExpansion<'a>,
+        index: usize,
+    ) -> Result<ExpansionInput<'a>, ModuleError> {
+        let module = input.module;
+        let call = &input.call;
+        let nested_call = if index < module.module_calls.len() {
+            &module.module_calls[index]
+        } else {
+            &prepared.selected_module_ifs.contribution.module_calls
+                [index - module.module_calls.len()]
+        };
+        let local_prefix = instance_prefix_for_call(nested_call);
+        let local_scope = ModuleInstanceScope::for_call(
+            &nested_call.module_name,
+            nested_call
+                .binding_name
+                .as_ref()
+                .map(RelativeBindingName::as_str),
+            &local_prefix,
+        );
+        let child_scope = input.scope.with_child(&local_scope);
+        let scope_resolver = ModuleScopeResolver {
+            scope: &input.scope,
+            local_bindings: &prepared.intra_module_bindings,
+            arguments: ArgumentSubstitutions {
+                arguments: &prepared.resolved_arguments,
+                default_line: call.source_span().start_line(),
+                caller_source_file: call.source_file(),
+                binding_index: input.binding_index.as_ref().map(ExpansionBindings::get),
+                config: self.session,
+            },
+            call_path: &prepared.expanded_call_path,
+            argument_placeholders: prepared.argument_placeholders.clone(),
+            condition_selections: prepared.condition_selections.clone(),
+        };
+        let expanded_nested_call = resolve_nested_module_call(nested_call, &scope_resolver)
+            .map_err(|error| {
+                self.expansion_access_error(
+                    call,
+                    &crate::utils::normalize_source_path(call.source_file())
+                        .display()
+                        .to_string(),
+                    error,
+                )
+            })?;
+        let (child_module, child_source, child_directory) =
+            self.nested_module_definition(module, prepared.module_directory.as_ref(), nested_call)?;
+        Ok(ExpansionInput {
+            authored_call: nested_call.clone(),
+            call: expanded_nested_call,
+            instance_prefix: child_scope.key().to_string(),
+            module: child_module,
+            source: Some(child_source),
+            directory: Some(child_directory),
+            scope: child_scope,
+            caller_scope: Some(input.scope.clone()),
+            parent_call_path: Some(prepared.expanded_call_path.clone()),
+            caller_judgements: ExpansionJudgements::Shared(prepared.instance_judgements.clone()),
+            binding_index: Some(ExpansionBindings::Shared(
+                prepared.nested_binding_index.clone(),
+            )),
+        })
+    }
+
+    fn finish_module_expansion(
+        &self,
+        input: &ExpansionInput<'_>,
+        prepared: PreparedExpansion<'_>,
+        nested_contributions: Vec<crate::parser::RootBindingResolvedParsedFile>,
+    ) -> Result<crate::parser::RootBindingResolvedParsedFile, ModuleError> {
+        let PreparedExpansion {
+            resolved_arguments,
+            argument_values,
+            pending_constraints,
+            module_source,
+            module_directory: _,
+            expanded_call,
+            expanded_call_path,
+            intra_module_bindings,
+            argument_placeholders,
+            condition_selections,
+            selected_module_ifs,
+            instance,
+            instance_judgements: _,
+            nested_binding_index: _,
+        } = prepared;
+        let module = input.module;
+        let call = &input.call;
+        let instance_prefix = input.instance_prefix.as_str();
+        let module_instance_scope = &input.scope;
+        let call_source_file = call.source_file();
+        let call_source_path = crate::utils::normalize_source_path(call_source_file)
+            .display()
+            .to_string();
+        let contextualize_access_error =
+            |error| self.expansion_access_error(call, &call_source_path, error);
+        let module_scope_resolver = ModuleScopeResolver {
+            scope: module_instance_scope,
+            local_bindings: &intra_module_bindings,
+            arguments: ArgumentSubstitutions {
+                arguments: &resolved_arguments,
+                default_line: call.source_span().start_line(),
+                caller_source_file: call_source_file,
+                binding_index: input.binding_index.as_ref().map(ExpansionBindings::get),
+                config: self.session,
+            },
+            call_path: &expanded_call_path,
+            argument_placeholders,
+            condition_selections,
+        };
+        let selected = &selected_module_ifs.contribution;
         // Expand managed resources with substituted values.
         let mut resources: Vec<ModuleResolvedResource> = Vec::new();
         let mut expanded_parser_metadata: crate::parser::ParserBindingMetadata<
@@ -892,7 +1197,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let mut expanded_binding_uses =
             resolve_module_binding_uses::<P>(module, &module_scope_resolver)
                 .map_err(contextualize_access_error)?;
-        expanded_binding_uses.in_instance(&module_instance_scope);
+        expanded_binding_uses.in_instance(module_instance_scope);
         for resource in module.resources.iter().chain(&selected.resources) {
             let source_file = module
                 .parser_binding_metadata
@@ -1234,7 +1539,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         let mut instance_report = instance.expression_report().clone();
         instance_report.record_instance(&contribution, call.binding_name.as_ref());
         crate::parser::retained::attach_report(&mut contribution, instance_report);
-        // Recursive expansion materializes child contributions separately.
+        // The worklist materializes child contributions separately.
         // Prefix them in authored order so the flattened runtime graph keeps
         // origin/main's child-before-parent traversal order. Reversing here is
         // only an assembly detail: each `merge_from` appends its source.
@@ -1383,6 +1688,8 @@ fn source_argument_name<B: BindingAddress, C: BindingAddress>(
                     | ParserPlaceholder::EmptyInterpolation { source: _ },
                 ),
             ) => None,
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         })?;
     argument_values
         .contains_key(&candidate)
@@ -1741,6 +2048,9 @@ fn authored_value_reference_path(value: &Value) -> Option<crate::resource::Autho
                 | ParserPlaceholder::EmptyInterpolation { source: _ },
             ),
         ) => crate::resource::module_argument_reference_path(value),
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -1882,6 +2192,8 @@ pub(crate) fn module_parameter_postfix<B: BindingAddress>(
                     | ParserPlaceholder::EmptyInterpolation { source: _ },
                 ),
             ) => None,
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         }
     }
 
@@ -3405,6 +3717,8 @@ fn expand_module_composition(
                                 | ParserPlaceholder::EmptyInterpolation { source: _ },
                             ),
                         ) => None,
+                        crate::resource::Value::Reference(never)
+                        | crate::resource::Value::Conversion(never) => match *never {},
                     };
                     let forwarded_handle = parameter
                         .and_then(|parameter| {

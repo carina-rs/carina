@@ -587,6 +587,35 @@ A struct type represents a nested object with typed fields.
   (carina#3981, carina#3984). Accepted write-only values, including nested
   leaves, are recorded in state (since state v18; secrets as hashes) so plans
   converge.
+- **Observed secret protection** (carina#4479): `value::SecretProtection` owns
+  projection of authored/persisted secret paths onto observations. A kind mismatch
+  on a path to an authored secret or a changed length of a secret-bearing list hides
+  the observed subtree at the first divergence (`StringList` matches `List`). Maps
+  match keys one to one: missing keys, including write-only secrets, and extra
+  observed keys never widen protection. Matching keys retain descendant protection;
+  unmatched observed keys stay ordinary. JSON/saved plans hash the observed masking
+  unit; a newly promoted unit gets a fresh salt on every plan.
+  The carina-state wrapper `ObservationStateAuthority` has private constructors
+  and fields. Its core authority is minted only by decoding a complete state
+  document through the shared state/version decoder, including the empty document
+  for a backend-confirmed absence. Any crate may decode such a document; this
+  does not authenticate its bytes or backend origin. `ObservedStateFile` pairs this
+  authority alongside mutable state. Plan contexts retain it for output, so a
+  serializer cannot replace history with `None`. Desired protection is retained by
+  the plan at planning/replay, including unchanged resources and deferred templates;
+  observation inputs accept no independent desired slice. The authority's `protect`
+  method is the output entry; the core batch constructor is private. Saved-plan
+  recording requires the complete `ProtectedObservations` batch. Core selects
+  desired/persisted/moved-origin authority and keeps the selected persisted row in
+  each product. Raw execution plans and generic value rendering remain unavailable
+  through the public planned-output API.
+  Dispatch rules consume the separate `RuleUpdatePatch` with the existing lenient
+  kind and positional annotation. Diagnostics and `RedactionSet` consume
+  `DiagnosticUpdatePatch` with output protection: enroll every string classified
+  secret in the actual sent patch, including matching leaves and Whole units.
+  Output promotion must not affect reference bindings or ordinary data-source read
+  attributes. Preserve state merge policy and structured event coverage
+  (`Unclassified` for updates).
 - **Provider input wire checks**: `WireReady<T>::try_new` checks and caches the
   transport projection of complete desired resources, data sources, final update
   patches and admitted provider configuration. It does not mint declaration admission. It caches the checked projection after

@@ -13,10 +13,10 @@ use crate::config_loader::{
     ResolutionContext, diagnostics_resolution_context, strict_resolution_context,
 };
 use crate::resource::{
-    AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue,
+    AbsoluteBindingAddress, AccessMissPolicy, AccessPath, BindingAddress, ConcreteValue,
     ConcreteValue as GenericConcreteValue, DeferredValue, DiagnosticSourceLine, InterpolationPart,
     LoopSlot, NoPlaceholder, ParserPlaceholder, RelativeBindingName, UnavailableReason,
-    Value as GenericValue,
+    Value as GenericValue, ValueShape,
 };
 use crate::resource::{DiagnosticPath, DiagnosticScope, ReferencePath};
 use indexmap::IndexMap;
@@ -27,6 +27,102 @@ use thiserror::Error;
 
 type RuntimeValue = GenericValue<NoPlaceholder, AbsoluteBindingAddress>;
 type RuntimeProviderConfig = ProviderConfig<NoPlaceholder, AbsoluteBindingAddress>;
+
+type S<B> = GenericValue<ParserPlaceholder, B>;
+type V<P, B> = GenericValue<P, B>;
+type Bindings<B> = HashMap<String, HashMap<String, S<B>>>;
+
+// Packaging is private to this resolver. Reader kinds never gain these operations.
+trait ResolveKind: ValueShape {
+    type Operand<B: BindingAddress>;
+    fn embed_plain<B: BindingAddress>(value: S<B>) -> V<Self, B>;
+    fn project<B: BindingAddress>(value: &V<Self, B>) -> Cow<'_, S<B>>;
+    fn split_operand<B: BindingAddress>(value: V<Self, B>) -> (S<B>, Self::Operand<B>);
+    fn protect_operand<B: BindingAddress>(operand: Self::Operand<B>) -> Self::Operand<B>;
+    fn read<B: BindingAddress>(path: &AccessPath<B>, plain_result: S<B>) -> V<Self, B>;
+    fn computed<B: BindingAddress>(
+        operands: Vec<Self::Operand<B>>,
+        plain_result: S<B>,
+    ) -> V<Self, B>;
+}
+
+impl ResolveKind for ParserPlaceholder {
+    type Operand<B: BindingAddress> = ();
+    fn embed_plain<B: BindingAddress>(value: S<B>) -> S<B> {
+        value
+    }
+    fn project<B: BindingAddress>(value: &S<B>) -> Cow<'_, S<B>> {
+        Cow::Borrowed(value)
+    }
+    fn split_operand<B: BindingAddress>(value: S<B>) -> (S<B>, ()) {
+        (value, ())
+    }
+    fn protect_operand<B: BindingAddress>((): ()) {}
+    fn read<B: BindingAddress>(_: &AccessPath<B>, plain_result: S<B>) -> S<B> {
+        plain_result
+    }
+    fn computed<B: BindingAddress>(_: Vec<()>, plain_result: S<B>) -> S<B> {
+        plain_result
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RootKind {
+    Full,
+    CallsOnly,
+}
+
+macro_rules! resolver_events {
+    (resolution { $($resolution:ident => $name:literal),* $(,)? }
+     storage { $($storage:ident => $storage_name:literal),* $(,)? }) => {
+        #[derive(Clone, Copy)]
+        pub(crate) enum Event {
+            $($resolution,)*
+            $(#[cfg(feature = "test-utils")] $storage,)*
+        }
+        #[cfg(feature = "test-utils")]
+        pub(crate) const RESOLUTION_EVENTS: &[&str] = &[$($name,)*];
+        #[cfg(feature = "test-utils")]
+        pub(crate) const STORAGE_EVENTS: &[&str] = &[$($storage_name,)*];
+    };
+}
+resolver_events! {
+    resolution {
+        Lookup => "lookup",
+        IntegerArithmetic => "integer_arithmetic",
+        Interpolation => "interpolation",
+        UserFunction => "user_function",
+        Builtin => "builtin",
+        BuiltinSuccess => "builtin_success",
+        Access => "access",
+        TakePresent => "take_present",
+        LookupHit => "lookup_hit",
+        KernelVisit => "kernel_visit",
+        CallsOnlyVisit => "calls_only_visit",
+        Canonicalize => "canonicalize",
+    }
+    storage {
+        ReferenceEnvelope => "reference_envelope",
+        ConversionEnvelope => "conversion_envelope",
+        ProjectionVisit => "projection_visit",
+    }
+}
+
+pub(crate) fn count(event: Event) {
+    #[cfg(feature = "test-utils")]
+    crate::test_utils::resolver_kind::count(event as usize);
+    #[cfg(not(feature = "test-utils"))]
+    let _ = event;
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod kind_tests;
+#[cfg(feature = "test-utils")]
+mod oracle;
+#[cfg(feature = "test-utils")]
+mod output_kind;
+#[cfg(feature = "test-utils")]
+pub(crate) use output_kind::SecretStorageOperand;
 
 /// Authored provider attribute holding defaults for desired resource tags.
 pub const DEFAULT_TAGS_ATTRIBUTE: &str = "default_tags";
@@ -1427,8 +1523,13 @@ pub(crate) fn resolve_snapshot_function_calls_in_context(
     }
     for resource in iter_pre_apply_resources_mut(parsed) {
         for value in resource.attributes_mut().values_mut() {
-            *value =
-                resolve_function_calls_only(value, &binding_map, fn_ctx.config, None, resolution)?;
+            *value = resolve_function_calls_only::<ParserPlaceholder, _>(
+                value,
+                &binding_map,
+                fn_ctx.config,
+                None,
+                resolution,
+            )?;
         }
     }
     Ok(())
@@ -1462,6 +1563,10 @@ pub(crate) fn resolve_resource_refs_for_diagnostics(
     parsed: &mut ParsedFile,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
+    // The diagnostic loader uses this facade for its per-file semantic copies;
+    // unlike strict snapshots, their context also demands available values.
+    #[cfg(feature = "test-utils")]
+    let _per_file = crate::test_utils::resolver_kind::PerFileGuard::enter();
     resolve_resource_refs_in_context(parsed, config, None, diagnostics_resolution_context())
 }
 
@@ -1502,6 +1607,38 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
 ) -> Result<(), RootInputFailure> {
+    #[cfg(feature = "test-utils")]
+    if crate::test_utils::resolver_kind::is_observing() {
+        assert!(
+            session.is_none(),
+            "resolver-kind observation requires a None session; live session checks must not be replayed"
+        );
+        if crate::test_utils::resolver_kind::is_plain_capture() {
+            return oracle::collect_plain_invocation(parsed, config, resolution);
+        }
+        return oracle::compare_invocation(parsed, config, session, resolution);
+    }
+    resolve_resource_refs_output::<ParserPlaceholder, E>(
+        parsed,
+        config,
+        session,
+        resolution,
+        &mut |_, _, _, value| value,
+    )
+}
+
+fn resolve_resource_refs_output<P: ResolveKind, E: ExportParamLike>(
+    parsed: &mut File<E>,
+    config: &ProviderContext,
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    resolution: ResolutionContext,
+    publish: &mut impl FnMut(
+        &S<RelativeBindingName>,
+        RootKind,
+        &Bindings<RelativeBindingName>,
+        V<P, RelativeBindingName>,
+    ) -> S<RelativeBindingName>,
+) -> Result<(), RootInputFailure> {
     let syntax = parsed.parser_binding_metadata.syntax().clone();
     let locate_named = |kind, name: &str, error: ParseError| match syntax
         .declarations()
@@ -1509,6 +1646,12 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
         .rev()
         .find(|record| record.kind() == kind && record.name() == name)
     {
+        // Retaining a let's RHS for structural secrecy must not move ordinary
+        // evaluation errors off the binding name. In the LSP that would also
+        // make this backstop suppress the authored call's type diagnostic.
+        Some(record) if kind == crate::config_loader::DeclarationKind::Binding => {
+            error.at(record.location())
+        }
         Some(record) => error.at(record.value_location().unwrap_or(record.location())),
         None => error,
     };
@@ -1621,7 +1764,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
     // secret-derived result before validate/plan/apply can resolve a backend.
     if let Some(backend) = &mut parsed.backend {
         for (key, value) in &mut backend.attributes {
-            let evaluated = resolve_function_calls_only(
+            let evaluated = resolve_function_calls_only::<ParserPlaceholder, _>(
                 value,
                 &binding_map,
                 fn_ctx.config,
@@ -1681,16 +1824,24 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
 
         for (key, expr) in resource.attributes().iter() {
-            let resolved =
-                resolve_value_with_config(expr, &binding_map, fn_ctx.config, session, resolution)
-                    .map_err(|error| match resource.declaration().location() {
-                    Some(location) => error.at(location),
-                    None => match &source_file {
-                        Some(path) => error.in_file(path.clone()),
-                        None => error,
-                    },
-                })?;
-            resolved_attrs.insert(key.clone(), resolved);
+            let resolved = resolve_value_with_config::<P, _>(
+                expr,
+                &binding_map,
+                fn_ctx.config,
+                session,
+                resolution,
+            )
+            .map_err(|error| match resource.declaration().location() {
+                Some(location) => error.at(location),
+                None => match &source_file {
+                    Some(path) => error.in_file(path.clone()),
+                    None => error,
+                },
+            })?;
+            resolved_attrs.insert(
+                key.clone(),
+                publish(expr, RootKind::Full, &binding_map, resolved),
+            );
         }
 
         resource
@@ -1746,7 +1897,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
             continue;
         };
         for value in attributes.values_mut() {
-            *value = resolve_function_calls_only(
+            let lowered = resolve_function_calls_only::<P, _>(
                 value,
                 &binding_map,
                 fn_ctx.config,
@@ -1757,6 +1908,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
                 Some(location) => error.at(location),
                 None => error,
             })?;
+            *value = publish(value, RootKind::CallsOnly, &binding_map, lowered);
         }
     }
 
@@ -1797,12 +1949,17 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
     let var_keys: Vec<String> = parsed.variables.keys().cloned().collect();
     for key in var_keys {
         let expr = parsed.variables[&key].clone();
-        let resolved =
-            resolve_function_calls_only(&expr, &binding_map, fn_ctx.config, session, resolution)
-                .map_err(|error| {
-                    locate_named(crate::config_loader::DeclarationKind::Binding, &key, error)
-                })?;
-        parsed.variables[&key] = resolved;
+        let resolved = resolve_function_calls_only::<P, _>(
+            &expr,
+            &binding_map,
+            fn_ctx.config,
+            session,
+            resolution,
+        )
+        .map_err(|error| {
+            locate_named(crate::config_loader::DeclarationKind::Binding, &key, error)
+        })?;
+        parsed.variables[&key] = publish(&expr, RootKind::CallsOnly, &binding_map, resolved);
     }
 
     // Resolve calls in every other value-bearing declaration as well. These
@@ -1814,14 +1971,21 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
         let location = call.id().declaration_location().clone();
         for argument in call.arguments_mut() {
             argument.try_rewrite(|value| {
-                resolve_function_calls_only(value, &binding_map, fn_ctx.config, session, resolution)
-                    .map_err(|error| error.at(&location))
+                let lowered = resolve_function_calls_only::<P, _>(
+                    value,
+                    &binding_map,
+                    fn_ctx.config,
+                    session,
+                    resolution,
+                )
+                .map_err(|error| error.at(&location))?;
+                Ok::<_, ParseError>(publish(value, RootKind::CallsOnly, &binding_map, lowered))
             })?;
         }
     }
     for argument in &mut parsed.arguments {
         if let Some(default) = &mut argument.default {
-            *default = resolve_function_calls_only(
+            let lowered = resolve_function_calls_only::<P, _>(
                 default,
                 &binding_map,
                 fn_ctx.config,
@@ -1835,6 +1999,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
                     error,
                 )
             })?;
+            *default = publish(default, RootKind::CallsOnly, &binding_map, lowered);
         }
     }
     for attribute in &mut parsed.attribute_params {
@@ -1845,7 +2010,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
         if attribute.static_type.is_some()
             && let Some(crate::parser::BoundaryExpression::Value(value)) = &mut attribute.value
         {
-            *value = resolve_function_calls_only(
+            let lowered = resolve_function_calls_only::<P, _>(
                 value,
                 &binding_map,
                 fn_ctx.config,
@@ -1859,6 +2024,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
                     error,
                 )
             })?;
+            *value = publish(value, RootKind::CallsOnly, &binding_map, lowered);
         }
     }
     for export in &mut parsed.export_params {
@@ -1867,7 +2033,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
         // exports must retain the expression for return-type inference.
         let has_static_type = export.type_expr_opt().is_some();
         if has_static_type && let Some(value) = export.value() {
-            let resolved = resolve_function_calls_only(
+            let resolved = resolve_function_calls_only::<P, _>(
                 value,
                 &binding_map,
                 fn_ctx.config,
@@ -1881,6 +2047,7 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
                     error,
                 )
             })?;
+            let resolved = publish(value, RootKind::CallsOnly, &binding_map, resolved);
             export.replace_value(resolved);
         }
     }
@@ -2010,83 +2177,64 @@ fn find_let_binding_cycle(
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
 ) -> Option<Vec<DiagnosticPath<RelativeBindingName>>> {
-    let mut visited = HashSet::new();
-    let mut visiting = Vec::new();
-
-    for name in variables.keys() {
-        if structural.contains(name.as_str()) {
+    enum Work {
+        Enter(usize, DiagnosticPath<RelativeBindingName>),
+        Finish(usize),
+    }
+    let mut visited = vec![false; variables.len()];
+    let mut visiting: Vec<DiagnosticPath<RelativeBindingName>> = Vec::new();
+    let mut positions = vec![None; variables.len()];
+    let mut work = Vec::new();
+    let mut roots = IndexMap::new();
+    for (index, name) in variables.keys().enumerate() {
+        if structural.contains(name.as_str()) || visited[index] {
             continue;
         }
-        if let Some(chain) = visit_let_binding(
-            name,
-            crate::resource::DiagnosticScope::Public
-                .path(ReferencePath::Binding(name.as_str().into())),
-            variables,
-            structural,
-            &mut visited,
-            &mut visiting,
-        ) {
-            return Some(chain);
+        work.push(Work::Enter(
+            index,
+            DiagnosticScope::Public.path(ReferencePath::Binding(name.as_str().into())),
+        ));
+        while let Some(item) = work.pop() {
+            match item {
+                Work::Enter(index, diagnostic_path) => {
+                    if visited[index] {
+                        continue;
+                    }
+                    if let Some(pos) = positions[index] {
+                        let mut cycle = visiting[pos..].to_vec();
+                        cycle.push(diagnostic_path);
+                        if cycle.iter().any(DiagnosticPath::is_secret) {
+                            cycle.fill(DiagnosticScope::Secret.path(None));
+                        }
+                        return Some(cycle);
+                    }
+                    let (_, value) = variables.get_index(index).expect("indexed cycle binding");
+                    positions[index] = Some(visiting.len());
+                    visiting.push(diagnostic_path);
+                    collect_reference_roots(
+                        value,
+                        variables,
+                        structural,
+                        DiagnosticScope::Public,
+                        &mut roots,
+                    );
+                    work.push(Work::Finish(index));
+                    work.extend(
+                        roots
+                            .drain(..)
+                            .rev()
+                            .map(|(root, path)| Work::Enter(root, path)),
+                    );
+                }
+                Work::Finish(index) => {
+                    visiting.pop();
+                    positions[index] = None;
+                    visited[index] = true;
+                }
+            }
         }
     }
-
     None
-}
-
-fn visit_let_binding(
-    name: &str,
-    diagnostic_path: DiagnosticPath<RelativeBindingName>,
-    variables: &IndexMap<String, Value>,
-    structural: &HashSet<&str>,
-    visited: &mut HashSet<String>,
-    visiting: &mut Vec<(String, DiagnosticPath<RelativeBindingName>)>,
-) -> Option<Vec<DiagnosticPath<RelativeBindingName>>> {
-    if visited.contains(name) {
-        return None;
-    }
-    if let Some(pos) = visiting.iter().position(|(candidate, _)| candidate == name) {
-        let mut cycle = visiting[pos..]
-            .iter()
-            .map(|(_, path)| path.clone())
-            .collect::<Vec<_>>();
-        cycle.push(diagnostic_path);
-        if cycle.iter().any(DiagnosticPath::is_secret) {
-            cycle.fill(crate::resource::DiagnosticScope::Secret.path(None));
-        }
-        return Some(cycle);
-    }
-
-    let value = variables.get(name)?;
-    visiting.push((name.to_string(), diagnostic_path));
-
-    let roots = reference_roots_in_value(value, variables, structural);
-    for (root, path) in roots {
-        if let Some(chain) =
-            visit_let_binding(&root, path, variables, structural, visited, visiting)
-        {
-            return Some(chain);
-        }
-    }
-
-    visiting.pop();
-    visited.insert(name.to_string());
-    None
-}
-
-fn reference_roots_in_value(
-    value: &Value,
-    variables: &IndexMap<String, Value>,
-    structural: &HashSet<&str>,
-) -> Vec<(String, DiagnosticPath<RelativeBindingName>)> {
-    let mut roots = Vec::new();
-    collect_reference_roots(
-        value,
-        variables,
-        structural,
-        DiagnosticScope::Public,
-        &mut roots,
-    );
-    roots
 }
 
 fn collect_reference_roots(
@@ -2094,7 +2242,7 @@ fn collect_reference_roots(
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
     scope: DiagnosticScope,
-    roots: &mut Vec<(String, DiagnosticPath<RelativeBindingName>)>,
+    roots: &mut IndexMap<usize, DiagnosticPath<RelativeBindingName>>,
 ) {
     match value {
         GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
@@ -2170,6 +2318,9 @@ fn collect_reference_roots(
         )
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Placeholder(_)) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -2178,18 +2329,17 @@ fn push_root(
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
     scope: DiagnosticScope,
-    roots: &mut Vec<(String, DiagnosticPath<RelativeBindingName>)>,
+    roots: &mut IndexMap<usize, DiagnosticPath<RelativeBindingName>>,
 ) {
-    if variables.contains_key(root) && !structural.contains(root) {
-        if let Some((_, path)) = roots.iter_mut().find(|(name, _)| name == root) {
+    if let Some(index) = variables.get_index_of(root)
+        && !structural.contains(root)
+    {
+        if let Some(path) = roots.get_mut(&index) {
             if scope.is_secret() {
                 *path = crate::resource::DiagnosticScope::Secret.path(None);
             }
         } else {
-            roots.push((
-                root.to_string(),
-                scope.path(ReferencePath::Binding(root.into())),
-            ));
+            roots.insert(index, scope.path(ReferencePath::Binding(root.into())));
         }
     }
 }
@@ -2322,14 +2472,14 @@ fn accumulate_deferred_iterable_errors(
     }
 }
 
-fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
+fn resolve_value_with_config<P: ResolveKind, B: ProviderAttributeBindingPhase>(
     value: &GenericValue<ParserPlaceholder, B>,
     binding_map: &HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
-) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
-    resolve_value_with_binding_lookup(
+) -> Result<V<P, B>, ParseError> {
+    resolve_value_with_binding_lookup::<P, _>(
         value,
         &|binding: &B, attribute: &str| {
             binding_map
@@ -2344,169 +2494,428 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
     )
 }
 
-fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
-    value: &GenericValue<ParserPlaceholder, B>,
-    binding_lookup: &impl Fn(&B, &str) -> Option<GenericValue<ParserPlaceholder, B>>,
+// Referenced values can contain more expressions and references. Keep their
+// dependencies and continuations on the heap; node policy never re-enters this
+// traversal. The authored secrecy pass owns the unchanged validation budgets.
+fn resolve_value_with_binding_lookup<P: ResolveKind, B: ProviderAttributeBindingPhase>(
+    value: &S<B>,
+    binding_lookup: &impl Fn(&B, &str) -> Option<S<B>>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
     scope: DiagnosticScope,
-) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
-    match value {
-        GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            // HEAD validates known failures in both retained module-if branches.
-            // Argument substitution still owns branch selection at runtime.
-            let deferred = deferred.try_map(|value| {
-                resolve_value_with_binding_lookup(
-                    value,
-                    binding_lookup,
-                    config,
-                    session,
-                    resolution,
-                    scope,
-                )
-            })?;
-            Ok(GenericValue::Deferred(DeferredValue::ModuleIf(Box::new(
-                deferred,
-            ))))
-        }
-        GenericValue::Deferred(DeferredValue::Coalesce {
-            value: left,
-            default,
-        }) => {
-            let left = resolve_value_with_binding_lookup(
-                left,
-                binding_lookup,
-                config,
-                session,
-                resolution,
-                scope,
-            )?;
-            if let Ok(crate::resource::knowledge::Classification::Known(known)) =
-                left.knowledge(&crate::resource::knowledge::KnowledgeContext::validation()).map(|proof| proof.into_classification())
-                // Keep protected authored alternatives for type diagnostics;
-                // the runtime presence owner selects their known value later.
-                && !known.is_secret()
-            {
-                Ok(crate::resource::knowledge::take_present(known))
-            } else {
-                // Carry the fallback through the same directory fixed point as
-                // the left operand, while preserving failures as deferred calls
-                // until absence actually selects it.
-                let default = resolve_value_with_binding_lookup(
-                    default,
-                    binding_lookup,
-                    config,
-                    session,
-                    resolution.retained(),
-                    scope,
-                )?;
-                Ok(GenericValue::Deferred(DeferredValue::Coalesce {
-                    value: Box::new(left),
-                    default: Box::new(default),
-                }))
+) -> Result<V<P, B>, ParseError> {
+    // Ordinary scalar attributes have no work to schedule. In particular,
+    // avoid cloning each string into a frame only to clone it again at finish.
+    if resolution_leaf(value) {
+        count(Event::KernelVisit);
+        return Ok(P::embed_plain(value.clone()));
+    }
+    // Lookup targets use the same traversal and node policy at the plain kind.
+    // Their completed result is wrapped only at Read; no enriched target is
+    // built and discarded, and a lookup chain never re-enters this function.
+    enum Resolved<P: ResolveKind, B: BindingAddress> {
+        Output(V<P, B>),
+        Plain(S<B>),
+    }
+    enum Work<'a, P: ResolveKind, B: BindingAddress> {
+        Enter(Cow<'a, S<B>>, ResolutionContext, DiagnosticScope, bool),
+        Finish(
+            Cow<'a, S<B>>,
+            usize,
+            ResolutionContext,
+            DiagnosticScope,
+            bool,
+        ),
+        Coalesce(Cow<'a, S<B>>, ResolutionContext, DiagnosticScope),
+        Default(Resolved<P, B>),
+        Read(Cow<'a, S<B>>),
+    }
+    let mut work = vec![Work::Enter(Cow::Borrowed(value), resolution, scope, false)];
+    let mut values: Vec<Resolved<P, B>> = Vec::new();
+    while let Some(item) = work.pop() {
+        match item {
+            Work::Enter(value, resolution, scope, plain) => {
+                count(Event::KernelVisit);
+                if resolution_leaf(&value) {
+                    values.push(if plain {
+                        Resolved::Plain(value.into_owned())
+                    } else {
+                        Resolved::Output(P::embed_plain(value.into_owned()))
+                    });
+                    continue;
+                }
+                match value.as_ref() {
+                    GenericValue::Deferred(DeferredValue::ResourceRef { path }) => {
+                        // Preserve suffixes for BindingIndex and runtime selection.
+                        let target = if path.segments().is_empty() {
+                            count(Event::Lookup);
+                            binding_lookup(path.binding_address(), path.attribute())
+                        } else {
+                            None
+                        };
+                        if let Some(target) = target {
+                            count(Event::LookupHit);
+                            if !plain {
+                                work.push(Work::Read(value));
+                            }
+                            work.push(Work::Enter(Cow::Owned(target), resolution, scope, true));
+                        } else if plain {
+                            values.push(Resolved::Plain(value.into_owned()));
+                        } else {
+                            values.push(Resolved::Output(P::read(path, value.as_ref().clone())));
+                        }
+                        continue;
+                    }
+                    GenericValue::Deferred(DeferredValue::Coalesce { .. }) => {
+                        let (left, default) = match value {
+                            Cow::Borrowed(GenericValue::Deferred(DeferredValue::Coalesce {
+                                value: left,
+                                default,
+                            })) => (
+                                Cow::Borrowed(left.as_ref()),
+                                Cow::Borrowed(default.as_ref()),
+                            ),
+                            Cow::Owned(GenericValue::Deferred(DeferredValue::Coalesce {
+                                value: left,
+                                default,
+                            })) => (Cow::Owned(*left), Cow::Owned(*default)),
+                            _ => unreachable!("matched coalesce"),
+                        };
+                        work.push(Work::Coalesce(default, resolution, scope));
+                        work.push(Work::Enter(left, resolution, scope, plain));
+                        continue;
+                    }
+                    GenericValue::Concrete(_)
+                    | GenericValue::Deferred(
+                        DeferredValue::ModuleIf(_)
+                        | DeferredValue::IntegerArithmetic(_)
+                        | DeferredValue::Interpolation(_)
+                        | DeferredValue::Unavailable { .. }
+                        | DeferredValue::ResolvedFunctionCall { .. }
+                        | DeferredValue::FunctionCall { .. }
+                        | DeferredValue::Access(_)
+                        | DeferredValue::Secret(_)
+                        | DeferredValue::BindingRef { .. }
+                        | DeferredValue::Unknown(_)
+                        | DeferredValue::Placeholder(_),
+                    ) => {}
+                    GenericValue::Reference(never) | GenericValue::Conversion(never) => {
+                        match *never {}
+                    }
+                }
+                let start = work.len();
+                match &value {
+                    Cow::Borrowed(value) => {
+                        for_each_resolution_child(*value, scope, |child, child_scope| {
+                            work.push(Work::Enter(
+                                Cow::Borrowed(child),
+                                resolution,
+                                child_scope,
+                                plain,
+                            ));
+                        });
+                    }
+                    Cow::Owned(value) => {
+                        for_each_resolution_child(value, scope, |child, child_scope| {
+                            work.push(Work::Enter(
+                                Cow::Owned(child.clone()),
+                                resolution,
+                                child_scope,
+                                plain,
+                            ));
+                        });
+                    }
+                }
+                let count = work.len() - start;
+                work.push(Work::Finish(value, count, resolution, scope, plain));
+                // Finish stays below its children, which execute in source order.
+                work[start..].reverse();
             }
-        }
-        GenericValue::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = resolve_value_with_binding_lookup(
-                expression.lhs(),
-                binding_lookup,
-                config,
-                session,
-                resolution,
-                scope,
-            )?;
-            let rhs = resolve_value_with_binding_lookup(
-                expression.rhs(),
-                binding_lookup,
-                config,
-                session,
-                resolution,
-                scope,
-            )?;
-            let span = expression.operator_span();
-            expression
-                .evaluate_with_operands(lhs, rhs)
-                .map_err(|error| ParseError::integer_arithmetic(span, 0, error))
-        }
-        GenericValue::Deferred(DeferredValue::ResourceRef { path }) => {
-            // A suffix is part of the authored reference, not decoration on
-            // its base attribute. Resolving only `binding.attribute` would
-            // erase the suffix (`q.name[0]` became the whole `q.name`
-            // string), preventing static validation and changing runtime
-            // semantics. Segmented references stay canonical ResourceRefs;
-            // BindingIndex checks their shape and the apply resolver performs
-            // the value navigation with the binding-source miss policy.
-            if !path.segments().is_empty() {
-                return Ok(value.clone());
-            }
-            match binding_lookup(path.binding_address(), path.attribute()) {
-                Some(attribute_value) => resolve_value_with_binding_lookup(
-                    &attribute_value,
-                    binding_lookup,
-                    config,
-                    session,
-                    resolution,
-                    scope,
-                ),
-                // A missing binding or attribute may become available later.
-                // The directory-wide scope check owns undefined identifiers.
-                None => Ok(value.clone()),
-            }
-        }
-        GenericValue::Concrete(ConcreteValue::List(items)) => {
-            let resolved: Result<Vec<_>, ParseError> = items
-                .iter()
-                .map(|item| {
-                    resolve_value_with_binding_lookup(
-                        item,
-                        binding_lookup,
+            Work::Finish(value, count, resolution, scope, plain) => {
+                let start = values.len() - count;
+                let mut children = values.drain(start..);
+                let resolved = if plain {
+                    resolve_value_node::<ParserPlaceholder, _>(
+                        &value,
                         config,
                         session,
                         resolution,
                         scope,
+                        &mut |_| match children.next().expect("scheduled resolver child") {
+                            Resolved::Plain(value) => Ok(value),
+                            Resolved::Output(_) => unreachable!("plain lookup target child"),
+                        },
                     )
-                })
-                .collect();
+                    .map(Resolved::Plain)
+                } else {
+                    resolve_value_node::<P, _>(
+                        &value,
+                        config,
+                        session,
+                        resolution,
+                        scope,
+                        &mut |_| match children.next().expect("scheduled resolver child") {
+                            Resolved::Output(value) => Ok(value),
+                            Resolved::Plain(_) => unreachable!("output resolver child"),
+                        },
+                    )
+                    .map(Resolved::Output)
+                }
+                .map_err(|error| {
+                    if scope.is_secret() {
+                        crate::resource::InsideSecret::inside_secret(error)
+                    } else {
+                        error
+                    }
+                })?;
+                debug_assert!(children.next().is_none());
+                drop(children);
+                values.push(resolved);
+            }
+            Work::Coalesce(default, resolution, scope) => {
+                let left = values.pop().expect("scheduled coalesce left operand");
+                let rebuilt = match &left {
+                    Resolved::Output(left) => resolved_present::<P, _>(left),
+                    Resolved::Plain(left) => resolved_present::<ParserPlaceholder, _>(left),
+                };
+                if let Some(rebuilt) = rebuilt {
+                    values.push(match left {
+                        Resolved::Output(left) => {
+                            let (_, operand) = P::split_operand(left);
+                            Resolved::Output(P::computed(vec![operand], rebuilt))
+                        }
+                        Resolved::Plain(_) => Resolved::Plain(rebuilt),
+                    });
+                } else {
+                    let plain = match &left {
+                        Resolved::Plain(_) => true,
+                        Resolved::Output(_) => false,
+                    };
+                    work.push(Work::Default(left));
+                    work.push(Work::Enter(default, resolution.retained(), scope, plain));
+                }
+            }
+            Work::Default(left) => {
+                let default = values.pop().expect("scheduled coalesce default");
+                values.push(match (left, default) {
+                    (Resolved::Output(left), Resolved::Output(default)) => {
+                        Resolved::Output(GenericValue::Deferred(DeferredValue::Coalesce {
+                            value: Box::new(left),
+                            default: Box::new(default),
+                        }))
+                    }
+                    (Resolved::Plain(left), Resolved::Plain(default)) => {
+                        Resolved::Plain(GenericValue::Deferred(DeferredValue::Coalesce {
+                            value: Box::new(left),
+                            default: Box::new(default),
+                        }))
+                    }
+                    (Resolved::Output(_), Resolved::Plain(_))
+                    | (Resolved::Plain(_), Resolved::Output(_)) => {
+                        unreachable!("coalesce operands use the same output kind")
+                    }
+                });
+            }
+            Work::Read(value) => {
+                let result = match values.pop().expect("scheduled lookup target") {
+                    Resolved::Plain(result) => result,
+                    Resolved::Output(_) => {
+                        unreachable!("lookup targets are resolved at the plain kind")
+                    }
+                };
+                let GenericValue::Deferred(DeferredValue::ResourceRef { path }) = value.as_ref()
+                else {
+                    unreachable!("read continuation retains its reference")
+                };
+                values.push(Resolved::Output(P::read(path, result)));
+            }
+        }
+    }
+    match values.pop().expect("scheduled resolver root") {
+        Resolved::Output(value) => Ok(value),
+        Resolved::Plain(_) => unreachable!("resolver root uses the requested output kind"),
+    }
+}
+
+fn resolved_present<P: ResolveKind, B: BindingAddress>(left: &V<P, B>) -> Option<S<B>> {
+    let projected = P::project(left);
+    if let Ok(crate::resource::knowledge::Classification::Known(known)) = projected
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        && !known.is_secret()
+    {
+        count(Event::TakePresent);
+        Some(crate::resource::knowledge::take_present(known))
+    } else {
+        None
+    }
+}
+
+fn resolution_leaf<B: BindingAddress>(value: &GenericValue<ParserPlaceholder, B>) -> bool {
+    matches!(
+        value,
+        GenericValue::Concrete(
+            ConcreteValue::String(_)
+                | ConcreteValue::EnumIdentifier(_)
+                | ConcreteValue::CanonicalEnum(_)
+                | ConcreteValue::Int(_)
+                | ConcreteValue::Float(_)
+                | ConcreteValue::Bool(_)
+                | ConcreteValue::Duration(_)
+                | ConcreteValue::StringList(_),
+        ) | GenericValue::Deferred(
+            DeferredValue::BindingRef { .. }
+                | DeferredValue::Unknown(_)
+                | DeferredValue::Placeholder(_),
+        )
+    )
+}
+
+fn for_each_resolution_child<'a, B: BindingAddress>(
+    value: &'a GenericValue<ParserPlaceholder, B>,
+    scope: DiagnosticScope,
+    mut enqueue: impl FnMut(&'a GenericValue<ParserPlaceholder, B>, DiagnosticScope),
+) {
+    match value {
+        GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            for child in deferred.values() {
+                enqueue(child, scope);
+            }
+        }
+        GenericValue::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            enqueue(expression.lhs(), scope);
+            enqueue(expression.rhs(), scope);
+        }
+        GenericValue::Concrete(ConcreteValue::List(items)) => {
+            for child in items {
+                enqueue(child, scope);
+            }
+        }
+        GenericValue::Concrete(ConcreteValue::Map(map)) => {
+            for child in map.values() {
+                enqueue(child, scope);
+            }
+        }
+        GenericValue::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                if let InterpolationPart::Expr(child) = part {
+                    enqueue(child, scope);
+                }
+            }
+        }
+        GenericValue::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
+            for argument in args {
+                enqueue(argument.walker_value(), scope);
+            }
+        }
+        GenericValue::Deferred(DeferredValue::Access(access)) => {
+            enqueue(access.base(), scope);
+        }
+        GenericValue::Deferred(DeferredValue::Secret(secret)) => {
+            // Protection travels with every queued descendant.
+            // Mask errors even if a child fails before Secret finishes.
+            secret.visit(|child| enqueue(child, DiagnosticScope::Secret));
+        }
+        GenericValue::Concrete(
+            ConcreteValue::String(_)
+            | ConcreteValue::EnumIdentifier(_)
+            | ConcreteValue::CanonicalEnum(_)
+            | ConcreteValue::Int(_)
+            | ConcreteValue::Float(_)
+            | ConcreteValue::Bool(_)
+            | ConcreteValue::Duration(_)
+            | ConcreteValue::StringList(_),
+        )
+        | GenericValue::Deferred(
+            DeferredValue::Coalesce { .. }
+            | DeferredValue::ResourceRef { .. }
+            | DeferredValue::Unavailable { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
+        ) => {}
+        GenericValue::Reference(never) | GenericValue::Conversion(never) => match *never {},
+    }
+}
+
+fn resolve_value_node<P: ResolveKind, B: ProviderAttributeBindingPhase>(
+    value: &GenericValue<ParserPlaceholder, B>,
+    config: &ProviderContext,
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    resolution: ResolutionContext,
+    scope: DiagnosticScope,
+    resolve: &mut impl FnMut(&S<B>) -> Result<V<P, B>, ParseError>,
+) -> Result<V<P, B>, ParseError> {
+    match value {
+        GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            // HEAD validates known failures in both retained module-if branches.
+            // Argument substitution still owns branch selection at runtime.
+            let mut operands = Vec::new();
+            let deferred = deferred.try_map(|value| {
+                let lowered = resolve(value)?;
+                let (plain, operand) = P::split_operand(lowered);
+                operands.push(operand);
+                Ok::<_, ParseError>(plain)
+            })?;
+            Ok(P::computed(
+                operands,
+                GenericValue::Deferred(DeferredValue::ModuleIf(Box::new(deferred))),
+            ))
+        }
+        GenericValue::Deferred(
+            DeferredValue::Coalesce { .. } | DeferredValue::ResourceRef { .. },
+        ) => {
+            unreachable!("reference and coalesce continuations are scheduled by the resolver")
+        }
+        GenericValue::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = resolve(expression.lhs())?;
+            let rhs = resolve(expression.rhs())?;
+            let (lhs, lhs_p) = P::split_operand(lhs);
+            let (rhs, rhs_p) = P::split_operand(rhs);
+            let span = expression.operator_span();
+            count(Event::IntegerArithmetic);
+            let plain = expression
+                .evaluate_with_operands(lhs, rhs)
+                .map_err(|error| ParseError::integer_arithmetic(span, 0, error))?;
+            Ok(P::computed(vec![lhs_p, rhs_p], plain))
+        }
+        GenericValue::Concrete(ConcreteValue::List(items)) => {
+            let resolved: Result<Vec<_>, ParseError> = items.iter().map(resolve).collect();
             Ok(GenericValue::Concrete(ConcreteValue::List(resolved?)))
         }
         GenericValue::Concrete(ConcreteValue::Map(map)) => {
             let mut resolved = IndexMap::new();
             for (k, v) in map {
-                resolved.insert(
-                    k.clone(),
-                    resolve_value_with_binding_lookup(
-                        v,
-                        binding_lookup,
-                        config,
-                        session,
-                        resolution,
-                        scope,
-                    )?,
-                );
+                resolved.insert(k.clone(), resolve(v)?);
             }
             Ok(GenericValue::Concrete(ConcreteValue::Map(resolved)))
         }
         GenericValue::Deferred(DeferredValue::Interpolation(parts)) => {
-            let resolved: Result<Vec<_>, ParseError> = parts
+            let mut operands = Vec::new();
+            let resolved = parts
                 .iter()
-                .map(|p| match p {
-                    InterpolationPart::Expr(v) => {
-                        Ok(InterpolationPart::Expr(resolve_value_with_binding_lookup(
-                            v,
-                            binding_lookup,
-                            config,
-                            session,
-                            resolution,
-                            scope,
-                        )?))
+                .map(|part| match part {
+                    InterpolationPart::Literal(text) => {
+                        Ok(InterpolationPart::Literal(text.clone()))
                     }
-                    other => Ok(other.clone()),
+                    InterpolationPart::Expr(value) => {
+                        let lowered = resolve(value)?;
+                        let (plain, operand) = P::split_operand(lowered);
+                        operands.push(operand);
+                        Ok::<_, ParseError>(InterpolationPart::Expr(plain))
+                    }
                 })
-                .collect();
-            let resolved = resolved?;
+                .collect::<Result<Vec<_>, _>>()?;
             reject_required_interpolation_unavailable(&resolved, resolution)?;
-            Ok(GenericValue::Deferred(DeferredValue::Interpolation(resolved)).canonicalize())
+            count(Event::Interpolation);
+            count(Event::Canonicalize);
+            let plain =
+                GenericValue::Deferred(DeferredValue::Interpolation(resolved)).canonicalize();
+            Ok(P::computed(operands, plain))
         }
         GenericValue::Deferred(DeferredValue::Unavailable {
             name,
@@ -2515,7 +2924,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             ..
         }) => {
             if !resolution.requires_available() {
-                Ok(value.clone())
+                Ok(P::embed_plain(value.clone()))
             } else {
                 Err(unavailable_builtin_error(*name, reason, *source_line))
             }
@@ -2527,21 +2936,19 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             source_line,
         }) => {
             let evaluation_line = source_line.get().unwrap_or(function.body.source_line);
+            let mut operands = Vec::new();
             let resolved_args = args
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
-                        resolve_value_with_binding_lookup(
-                            value,
-                            binding_lookup,
-                            config,
-                            session,
-                            resolution,
-                            scope,
-                        )
+                        let lowered = resolve(value)?;
+                        let (plain, operand) = P::split_operand(lowered);
+                        operands.push(operand);
+                        Ok::<_, ParseError>(plain)
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            count(Event::UserFunction);
             let evaluated = B::evaluate_resolved_user_function(
                 function,
                 functions,
@@ -2551,9 +2958,9 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 evaluation_line,
             );
             if resolution.retains_failed_calls() && evaluated.is_err() {
-                return Ok(value.clone());
+                return Ok(P::computed(operands, value.clone()));
             }
-            evaluated.map(crate::function_evaluation::FunctionEvaluation::into_value)
+            evaluated.map(|evaluation| P::computed(operands, evaluation.into_value()))
         }
         GenericValue::Deferred(DeferredValue::FunctionCall {
             name,
@@ -2561,18 +2968,15 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             source_line,
         }) => {
             let authored_line = source_line.get();
+            let mut operands = Vec::new();
             let resolved_args: Result<Vec<_>, ParseError> = args
                 .iter()
                 .map(|argument| {
                     argument.try_map_value(|value| {
-                        resolve_value_with_binding_lookup(
-                            value,
-                            binding_lookup,
-                            config,
-                            session,
-                            resolution,
-                            scope,
-                        )
+                        let lowered = resolve(value)?;
+                        let (plain, operand) = P::split_operand(lowered);
+                        operands.push(operand);
+                        Ok::<_, ParseError>(plain)
                     })
                 })
                 .collect();
@@ -2592,16 +2996,20 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 .iter()
                 .map(super::functions::function_argument_as_eval)
                 .collect();
-            match crate::builtins::evaluate_builtin_with_config(
+            count(Event::Builtin);
+            let plain = match crate::builtins::evaluate_builtin_with_config(
                 name.as_str(),
                 &eval_args,
                 config,
                 *source_line,
             ) {
-                Ok(result) => result.into_value().map_err(|error| match authored_line {
-                    Some(line) => ParseError::from_eval_value(error, line),
-                    None => ParseError::UserFunctionError(error.to_string()),
-                }),
+                Ok(result) => {
+                    count(Event::BuiltinSuccess);
+                    result.into_value().map_err(|error| match authored_line {
+                        Some(line) => ParseError::from_eval_value(error, line),
+                        None => ParseError::UserFunctionError(error.to_string()),
+                    })
+                }
                 Err(e) => {
                     if all_args_resolved {
                         let reason = if scope.is_secret() {
@@ -2628,36 +3036,34 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                         }))
                     }
                 }
-            }
+            }?;
+            Ok(P::computed(operands, plain))
         }
         GenericValue::Deferred(DeferredValue::Access(access)) => {
-            let resolved_base = resolve_value_with_binding_lookup(
-                access.base(),
-                binding_lookup,
-                config,
-                session,
-                resolution,
-                scope,
-            )?;
-            access
+            let resolved_base = resolve(access.base())?;
+            let (resolved_base, operand) = P::split_operand(resolved_base);
+            count(Event::Access);
+            let plain = access
                 .rebuild_with_base(resolved_base, AccessMissPolicy::Error)
                 .map_err(|error| ParseError::InvalidExpression {
                     line: access.source_line(),
                     message: error.to_string(),
-                })
+                })?;
+            Ok(P::computed(vec![operand], plain))
         }
-        GenericValue::Deferred(DeferredValue::Secret(inner)) => inner
-            .try_map(|value| {
-                resolve_value_with_binding_lookup(
-                    value,
-                    binding_lookup,
-                    config,
-                    session,
-                    resolution,
-                    DiagnosticScope::Secret,
-                )
-            })
-            .map(|inner| GenericValue::Deferred(DeferredValue::Secret(inner))),
+        GenericValue::Deferred(DeferredValue::Secret(inner)) => {
+            let mut operands = Vec::new();
+            let plain = inner.try_map(|value| {
+                let lowered = resolve(value)?;
+                let (plain, operand) = P::split_operand(lowered);
+                operands.push(P::protect_operand(operand));
+                Ok::<_, ParseError>(plain)
+            })?;
+            Ok(P::computed(
+                operands,
+                GenericValue::Deferred(DeferredValue::Secret(plain)),
+            ))
+        }
         GenericValue::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -2672,7 +3078,10 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             DeferredValue::BindingRef { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
-        ) => Ok(value.clone()),
+        ) => Ok(P::embed_plain(value.clone())),
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -2715,7 +3124,7 @@ fn resolve_directive_function_calls(
     resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
     directives.try_update_expressions(|_, expression| {
-        expression.value = resolve_function_calls_only(
+        expression.value = resolve_function_calls_only::<ParserPlaceholder, _>(
             &expression.value,
             binding_map,
             config,
@@ -2737,13 +3146,14 @@ fn resolve_directive_function_calls(
 /// too. Non-FunctionCall arms (`String`, `ResourceRef`,
 /// `Interpolation` literals, etc.) pass through unchanged so earlier
 /// passes that read raw forms keep working.
-fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
+fn resolve_function_calls_only<P: ResolveKind, B: ProviderAttributeBindingPhase>(
     value: &GenericValue<ParserPlaceholder, B>,
     binding_map: &HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
-) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
+) -> Result<V<P, B>, ParseError> {
+    count(Event::CallsOnlyVisit);
     match value {
         GenericValue::Deferred(
             DeferredValue::ModuleIf(_)
@@ -2754,11 +3164,13 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
             | DeferredValue::Coalesce { .. }
             | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Secret(_),
-        ) => resolve_value_with_config(value, binding_map, config, session, resolution),
+        ) => resolve_value_with_config::<P, _>(value, binding_map, config, session, resolution),
         GenericValue::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<_>, ParseError> = items
                 .iter()
-                .map(|v| resolve_function_calls_only(v, binding_map, config, session, resolution))
+                .map(|v| {
+                    resolve_function_calls_only::<P, _>(v, binding_map, config, session, resolution)
+                })
                 .collect();
             Ok(GenericValue::Concrete(ConcreteValue::List(resolved?)))
         }
@@ -2767,24 +3179,45 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
             for (k, v) in map {
                 resolved.insert(
                     k.clone(),
-                    resolve_function_calls_only(v, binding_map, config, session, resolution)?,
+                    resolve_function_calls_only::<P, _>(
+                        v,
+                        binding_map,
+                        config,
+                        session,
+                        resolution,
+                    )?,
                 );
             }
             Ok(GenericValue::Concrete(ConcreteValue::Map(resolved)))
         }
         GenericValue::Deferred(DeferredValue::Interpolation(parts)) => {
-            let resolved: Result<Vec<_>, ParseError> = parts
+            let mut operands = Vec::new();
+            let resolved = parts
                 .iter()
-                .map(|p| match p {
-                    InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
-                        resolve_function_calls_only(v, binding_map, config, session, resolution)?,
-                    )),
-                    other => Ok(other.clone()),
+                .map(|part| match part {
+                    InterpolationPart::Literal(text) => {
+                        Ok(InterpolationPart::Literal(text.clone()))
+                    }
+                    InterpolationPart::Expr(value) => {
+                        let lowered = resolve_function_calls_only::<P, _>(
+                            value,
+                            binding_map,
+                            config,
+                            session,
+                            resolution,
+                        )?;
+                        let (plain, operand) = P::split_operand(lowered);
+                        operands.push(operand);
+                        Ok::<_, ParseError>(InterpolationPart::Expr(plain))
+                    }
                 })
-                .collect();
-            let resolved = resolved?;
+                .collect::<Result<Vec<_>, _>>()?;
             reject_required_interpolation_unavailable(&resolved, resolution)?;
-            Ok(GenericValue::Deferred(DeferredValue::Interpolation(resolved)).canonicalize())
+            count(Event::Interpolation);
+            count(Event::Canonicalize);
+            let plain =
+                GenericValue::Deferred(DeferredValue::Interpolation(resolved)).canonicalize();
+            Ok(P::computed(operands, plain))
         }
         GenericValue::Concrete(
             ConcreteValue::String(_)
@@ -2801,7 +3234,10 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
-        ) => Ok(value.clone()),
+        ) => Ok(P::embed_plain(value.clone())),
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -2972,7 +3408,7 @@ where
     for (index, provider) in parsed.providers.iter_mut().enumerate() {
         let mut resolved = IndexMap::new();
         for (key, expr) in &provider.unresolved_attributes {
-            let r = match resolve_value_with_config(
+            let r = match resolve_value_with_config::<ParserPlaceholder, _>(
                 expr,
                 &binding_map,
                 config,
@@ -3074,7 +3510,7 @@ impl ProviderAttributeBindings {
         session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Result<RuntimeValue, ProviderConfigResolutionError> {
         let parser_expr = expr.clone().into_placeholder_type::<ParserPlaceholder>();
-        let parser_resolved = resolve_value_with_binding_lookup(
+        let parser_resolved = resolve_value_with_binding_lookup::<ParserPlaceholder, _>(
             &parser_expr,
             &|binding: &AbsoluteBindingAddress, attribute: &str| {
                 self.parser
@@ -3593,12 +4029,12 @@ let item = mock.test.resource {
     }
 
     #[test]
-    fn unavailable_reason_does_not_expose_an_env_derived_variable_name() {
+    fn unavailable_reason_shows_an_env_derived_variable_name() {
         const NAME_SOURCE: &str = "CARINA_TEST_UNAVAILABLE_NAME_SOURCE_3974";
-        const SENSITIVE_NAME: &str = "CARINA_TEST_SENSITIVE_VARIABLE_NAME_3974";
+        const MISSING_NAME: &str = "CARINA_TEST_MISSING_VARIABLE_NAME_3974";
         let config = ProviderContext::new(crate::EnvironmentSnapshot::new([(
             NAME_SOURCE.to_string(),
-            SENSITIVE_NAME.into(),
+            MISSING_NAME.into(),
         )]));
         let mut parsed =
             parsed_with_comment_and_config(&format!(r#"env(env("{NAME_SOURCE}"))"#), &config);
@@ -3613,9 +4049,9 @@ let item = mock.test.resource {
         };
         assert_eq!(
             reason.as_str(),
-            "environment variable named by a sensitive value is not set"
+            format!("environment variable '{MISSING_NAME}' is not set")
         );
-        assert!(!format!("{reason:?}").contains(SENSITIVE_NAME));
+        assert!(format!("{reason:?}").contains(MISSING_NAME));
     }
 }
 
@@ -3735,6 +4171,33 @@ for item in source.arn {
 #[cfg(test)]
 mod review2_cycle_tests {
     use super::*;
+
+    #[test]
+    fn long_value_binding_cycle_checks_preserve_the_existing_cycle_diagnostic() {
+        for last in [127, 128, 256, 5000] {
+            let mut variables = IndexMap::new();
+            for index in (1..=last).rev() {
+                variables.insert(
+                    format!("r{index}"),
+                    Value::Deferred(DeferredValue::BindingRef {
+                        binding: format!("r{}", index - 1).into(),
+                    }),
+                );
+            }
+            variables.insert("r0".into(), Value::Concrete(ConcreteValue::Int(0)));
+            let structural = HashSet::new();
+            assert!(find_let_binding_cycle(&variables, &structural).is_none());
+            variables.insert(
+                "r0".into(),
+                Value::Deferred(DeferredValue::BindingRef {
+                    binding: format!("r{last}").into(),
+                }),
+            );
+            let cycle = find_let_binding_cycle(&variables, &structural).unwrap();
+            assert_eq!(cycle.len(), last + 2);
+            assert!(cycle.iter().all(|path| !path.is_secret()));
+        }
+    }
     #[test]
     fn review2_f8_let_cycle_keeps_public_chain_and_protects_secret_roots() {
         let reference = |name: &str| {
