@@ -39,6 +39,8 @@ pub(crate) use substitution::{
     select_expanded_module_ifs_with_conditions, substitute_function_call_argument,
     substitute_function_parameters, substitute_module_arguments, value_argument,
 };
+mod planning;
+pub(crate) use planning::expand_planned_functions;
 mod unavailable;
 pub(crate) use unavailable::{
     UnavailableSearchPolicy, contains_unavailable, find_required_unavailable,

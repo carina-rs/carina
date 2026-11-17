@@ -1924,6 +1924,33 @@ impl<S, V: PlanValueKind> crate::value::saved_document::sealed::Tree for Plan<S,
     }
 }
 
+impl crate::value::saved_document::expand::Expand for UnresolvedSavedPlan {
+    fn expand(
+        &mut self,
+        evaluation: &crate::resolver::PlanningEvaluation,
+    ) -> Result<(), crate::value::SerializationError> {
+        self.effects.expand(evaluation)?;
+        self.replacement_inputs.expand(evaluation)?;
+        for display in &mut self.replace_display {
+            display.previous_attributes.expand(evaluation)?;
+        }
+        Ok(())
+    }
+}
+impl<S: Clone, P: PlanValueKind> crate::value::saved_document::expand::Expand for Plan<S, P> {
+    fn expand(
+        &mut self,
+        evaluation: &crate::resolver::PlanningEvaluation,
+    ) -> Result<(), crate::value::SerializationError> {
+        self.effects.expand(evaluation)?;
+        self.replacement_inputs.expand(evaluation)?;
+        for display in &mut self.replace_display {
+            display.previous_attributes.expand(evaluation)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

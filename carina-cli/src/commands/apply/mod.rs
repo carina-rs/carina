@@ -3558,6 +3558,8 @@ async fn prepare_saved_plan_secret_candidates(
     )?;
     let data_source_values = pending_plan.data_source_values(&parsed.data_sources)?;
     pending_plan.verify_provider_scopes(&provider, apply_target)?;
+    let planning_current = prior_states.managed.clone();
+    let planning_data_sources = data_source_values.clone();
     let prepared_expansion = expansion_prelude
         .bind_projected_phase1_state(
             prior_states.managed,
@@ -3593,10 +3595,37 @@ async fn prepare_saved_plan_secret_candidates(
         .await
         .map_err(AppError::Provider)?;
 
+    let parsed = validated_expansion.resources().parsed();
+    let current = carina_core::resource::into_plan_input_current_map(
+        planning_current,
+        validated_expansion.context().schemas(),
+        &parsed.resources,
+    );
+    let aliases = parsed
+        .wait_bindings
+        .iter()
+        .map(carina_core::binding_index::WaitAliasSpec::from)
+        .collect::<Vec<_>>();
+    let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
+        carina_core::binding_index::LivePreApplyInputs {
+            managed: &parsed.resources,
+            compositions: &parsed.compositions,
+            managed_current: &current,
+            data_source_values: &planning_data_sources,
+            remote_bindings: &remote_bindings,
+            wait_aliases: &aliases,
+        },
+    );
+    let evaluation = carina_core::resolver::PlanningEvaluation::new(
+        &bindings,
+        validated_expansion.context().provider_context(),
+    );
+
     let candidates = SavedPlanSecretCandidates::from_expansion(
         validated_expansion,
         verified_inputs,
         base_dir.clone(),
+        evaluation,
     );
 
     Ok(PreparedSavedPlanSecretCandidates {
@@ -3634,6 +3663,7 @@ fn rehydrate_desired_plan_file_from_parts(
         source,
         apply_target,
         provider_context,
+        None,
     )
     .map(|(plan_file, _provider_inputs)| plan_file)
 }
@@ -3645,6 +3675,7 @@ fn rehydrate_desired_plan_file_with_verified_configs(
     source: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
     provider_context: &carina_core::parser::LoadedProviderContext,
+    evaluation: Option<&carina_core::resolver::PlanningEvaluation>,
 ) -> Result<
     (
         ReloadedPlanFile,
@@ -3652,6 +3683,10 @@ fn rehydrate_desired_plan_file_with_verified_configs(
     ),
     AppError,
 > {
+    let rehydration = match evaluation {
+        Some(evaluation) => carina_core::value::SecretRehydration::planned(evaluation),
+        None => carina_core::value::SecretRehydration::evaluated(),
+    };
     let (provider_configs, provider_inputs) = provider_inputs.into_rehydrated();
     crate::wiring::settle_type_checks(
         carina_core::validation::deferred_types::TypeCheckSession::run(
@@ -3674,7 +3709,8 @@ fn rehydrate_desired_plan_file_with_verified_configs(
 
                 let rehydrated_plan = plan_file
                     .plan()
-                    .rehydrate_desired(
+                    .rehydrate_desired_using(
+                        &rehydration,
                         &resource_candidates,
                         &data_source_candidates,
                         &import_identifiers,
@@ -3683,13 +3719,13 @@ fn rehydrate_desired_plan_file_with_verified_configs(
                     .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
 
                 let provider_configuration = plan_file
-                    .rehydrate_provider_configuration(&resource_candidates, &data_source_candidates)
+                    .rehydrate_provider_configuration_using(&resource_candidates, &data_source_candidates, &rehydration)
                     .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
                 let unresolved_resources = rehydrate_saved_resource_like(
                     plan_file.unresolved_resources(),
                     &resource_candidates,
                     apply_target,
-                    carina_core::value::rehydrate_resource_secrets,
+                    |saved,candidate| rehydration.resource(saved,candidate),
                     Resource::to_value_resource,
                 )?;
 
@@ -3722,7 +3758,7 @@ fn rehydrate_desired_plan_file_with_verified_configs(
                         return Err(saved_plan_secret_shape_error(
                             format!("composition call id chain {call_chain} disagreed with the saved plan"), apply_target));
                     }
-                    carina_core::value::rehydrate_saved_composition_with_candidate(saved, candidate)
+                    rehydration.composition(saved, candidate)
                         .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))
                 }).collect::<Result<_, _>>()?;
 
@@ -3730,7 +3766,7 @@ fn rehydrate_desired_plan_file_with_verified_configs(
                     plan_file.data_source_origins(),
                     &data_source_candidates,
                     apply_target,
-                    carina_core::value::rehydrate_data_source_secrets,
+                    |saved,candidate| rehydration.data_source(saved,candidate),
                     carina_core::resource::DataSource::to_value_data_source,
                 )?;
 

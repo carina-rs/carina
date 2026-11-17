@@ -523,7 +523,10 @@ fn late_rejection(case: &Case) -> bool {
     case.name.ends_with("invalid") && !static_rejection(case) && !known_handle_rejection(case)
 }
 fn savable(case: &Case) -> bool {
-    !static_rejection(case) && (case.name.contains("literal") || case.name.contains("return-const"))
+    !static_rejection(case)
+        && (case.name.contains("literal")
+            || case.name.contains("return-const")
+            || case.name == "c1-handle-known-valid")
 }
 const SUFFIX: &str = "expected test.Name, got string 'bad-name': test rejected `test.Name`: Invalid Name value 'bad-name': does not match required pattern /allowed/ (Full)";
 fn assert_declared_error(text: &str, prefix: &str) {
@@ -1181,12 +1184,8 @@ async fn declared_checks_authored_and_state_valid_plan_out() {
         }
         let saved = directory.path().join("saved.plan.json");
         let result = directory.plan(Some(&saved)).await;
-        assert!(result.is_err());
-        assert_eq!(
-            rendered(&result),
-            expected_retained_plan_refusal(directory.path(), "g")
-        );
-        assert!(!saved.exists());
+        result.unwrap();
+        assert!(saved.is_file());
     }
 }
 

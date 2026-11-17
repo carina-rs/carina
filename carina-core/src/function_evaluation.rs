@@ -249,10 +249,26 @@ pub(crate) fn check_parameter_annotation<P: PlaceholderKind, B: BindingAddress>(
 }
 
 #[derive(Debug)]
-pub(crate) struct CheckedValue<P: PlaceholderKind, B: BindingAddress>(Value<P, B>);
+pub(crate) struct CheckedValue<P: PlaceholderKind, B: BindingAddress> {
+    value: Value<P, B>,
+    source: InlinedFunctionSource<B>,
+}
+#[derive(Debug)]
+struct InlinedFunctionSource<B: BindingAddress> {
+    function: Arc<UserFunction<B>>,
+    substitutions: HashMap<String, FunctionArgument<crate::resource::ParserPlaceholder, B>>,
+}
 impl<P: PlaceholderKind, B: BindingAddress> CheckedValue<P, B> {
     pub(crate) fn into_value(self) -> Value<P, B> {
-        self.0
+        self.value
+    }
+    pub(crate) fn source_for_expansion(
+        &self,
+    ) -> (
+        &UserFunction<B>,
+        HashMap<String, FunctionArgument<crate::resource::ParserPlaceholder, B>>,
+    ) {
+        (&self.source.function, self.source.substitutions.clone())
     }
 }
 #[derive(Debug)]
@@ -351,6 +367,7 @@ pub(crate) struct FunctionCompletion<'a, P: PlaceholderKind, B: BindingAddress> 
     function: &'a UserFunction<B>,
     arguments: std::vec::IntoIter<(&'a FnParam<B>, ArgumentSource<P, B>)>,
     checked_arguments: Vec<FunctionArgument<P, B>>,
+    source: InlinedFunctionSource<B>,
     pending_check: bool,
     observations: CallObservations,
     retained: RetainedCall<P, B>,
@@ -408,12 +425,28 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionCompletion<'a, P, B> {
             .zip(args.iter().cloned())
             .map(|(parameter, argument)| (parameter, ArgumentSource::Provided(argument)))
             .chain(defaults)
-            .collect::<Vec<_>>()
-            .into_iter();
+            .collect::<Vec<_>>();
+        let source = InlinedFunctionSource {
+            function: Arc::clone(function),
+            substitutions: arguments
+                .iter()
+                .map(|(parameter, source)| {
+                    let argument = match source {
+                        ArgumentSource::Provided(argument) => argument.clone().into_parser_stage(),
+                        ArgumentSource::Default(value) => {
+                            FunctionArgument::from_value(value.clone())
+                        }
+                    };
+                    (parameter.name.clone(), argument)
+                })
+                .collect(),
+        };
+        let arguments = arguments.into_iter();
         Ok(Self {
             function,
             arguments,
             checked_arguments: Vec::new(),
+            source,
             pending_check: false,
             observations: CallObservations::default(),
             retained: RetainedCall::new(
@@ -454,6 +487,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionCompletion<'a, P, B> {
                             completion: FunctionBodyCompletion {
                                 function: self.function,
                                 retained: self.retained,
+                                source: self.source,
                                 observations: self.observations,
                                 substitutions,
                             },
@@ -564,6 +598,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> LocalSlot<'a, P, B> {
 pub(crate) struct FunctionBodyCompletion<'a, P: PlaceholderKind, B: BindingAddress> {
     function: &'a UserFunction<B>,
     retained: RetainedCall<P, B>,
+    source: InlinedFunctionSource<B>,
     observations: CallObservations,
     substitutions: HashMap<String, FunctionArgument<crate::resource::ParserPlaceholder, B>>,
 }
@@ -592,7 +627,10 @@ impl<P: PlaceholderKind, B: BindingAddress> FunctionBodyCompletion<'_, P, B> {
                 if self.observations.surviving_call {
                     FunctionEvaluation::Retain(self.retained)
                 } else {
-                    FunctionEvaluation::Inline(CheckedValue(witness.value))
+                    FunctionEvaluation::Inline(CheckedValue {
+                        value: witness.value,
+                        source: self.source,
+                    })
                 }
             }
             AnnotationCheck::AwaitingValue(_) => FunctionEvaluation::Retain(self.retained),

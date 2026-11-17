@@ -447,6 +447,19 @@ impl<S: PartialEq, V: PlanValueKind> PartialEq for DeferredReplacePayload<S, V> 
             && self.required_children == other.required_children
     }
 }
+impl<S: Clone, V: PlanValueKind> DeferredReplacePayload<S, V> {
+    pub(crate) fn expand_saved_values(
+        &mut self,
+        evaluation: &crate::resolver::PlanningEvaluation,
+    ) -> Result<(), crate::value::SerializationError> {
+        use crate::value::saved_document::expand::Expand;
+        self.request.template.expand(evaluation)?;
+        for old in self.request.deletes.iter_mut() {
+            old.previous_attributes.expand(evaluation)?;
+        }
+        Ok(())
+    }
+}
 impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
     pub fn new(
         deletes: NonEmptyDeletes,
@@ -792,6 +805,17 @@ pub enum InvalidReleasedListKeys {
 pub struct ReleasedListKeys(NonEmptyVec<ReleasedListKey>);
 
 impl ReleasedListKeys {
+    pub(crate) fn expand_saved_values(
+        &mut self,
+        evaluation: &crate::resolver::PlanningEvaluation,
+    ) -> Result<(), crate::value::SerializationError> {
+        use crate::value::saved_document::expand::Expand;
+        for key in self.0.as_mut_slice() {
+            key.retained_value.expand(evaluation)?;
+        }
+        Ok(())
+    }
+
     pub fn try_new(keys: Vec<ReleasedListKey>) -> Result<Self, InvalidReleasedListKeys> {
         let mut seen = HashSet::new();
         for key in &keys {

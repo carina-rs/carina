@@ -541,6 +541,7 @@ pub(super) struct SavedPlanSecretCandidates {
         ExpandedCanonicalResources<carina_core::parser::ExpandedInferredExportParam>,
     >,
     provider_inputs: VerifiedSavedPlanProviderInputs,
+    evaluation: carina_core::resolver::PlanningEvaluation,
 }
 
 /// Current source values are candidates for hash verification, never
@@ -671,11 +672,13 @@ impl SavedPlanSecretCandidates {
         >,
         provider_inputs: VerifiedSavedPlanProviderInputs,
         source: carina_core::paths::ResolvedPath,
+        evaluation: carina_core::resolver::PlanningEvaluation,
     ) -> Self {
         Self {
             source,
             validated,
             provider_inputs,
+            evaluation,
         }
     }
 
@@ -832,6 +835,7 @@ impl SchemaCheckedPendingPlanFile {
             source,
             validated,
             provider_inputs,
+            evaluation,
         } = candidates;
         let (plan_file, provider_inputs) =
             super::rehydrate_desired_plan_file_with_verified_configs(
@@ -841,6 +845,7 @@ impl SchemaCheckedPendingPlanFile {
                 &source,
                 apply_target,
                 validated.context().provider_context(),
+                Some(&evaluation),
             )?;
         Ok((
             ValidatedDesiredPlan::with_current_config(
@@ -2453,6 +2458,7 @@ mod tests {
                 contents.provider_configs = carina_core::value::SavedDocumentConversion::document(
                     &carina_core::parser::ExpandedInferredFile::default(),
                     &[],
+                    None,
                     |conversion| contents.provider_configs.redact_secrets(conversion),
                 )
                 .unwrap()

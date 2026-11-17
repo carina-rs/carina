@@ -931,7 +931,7 @@ pub(super) fn test_diagnostics(report: ValidateReport) -> super::ValidateDiagnos
         Outcome::Failure(errors) => errors
             .into_vec()
             .into_iter()
-            .map(crate::error::PresentedAppError::into_rendered)
+            .map(crate::test_support::render_presented_error)
             .collect(),
     };
     let mut diagnostics = super::ValidateDiagnostics {

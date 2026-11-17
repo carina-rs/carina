@@ -1283,7 +1283,7 @@ impl<'a, T> ValidationReport<'a, T> {
             Err(errors) => errors
                 .into_vec()
                 .into_iter()
-                .map(crate::error::PresentedAppError::into_rendered)
+                .map(crate::test_support::render_presented_error)
                 .collect(),
         }
     }

@@ -406,7 +406,7 @@ fn make_tags(env: String, service: String, team: String = 'platform') {
 }
 ```
 
-A plan cannot be saved with `carina plan --out` or `carina plan --json` while the project retains a call to a user-defined function with declared non-primitive types on a resource value, including calls in resource attributes and exports. This also applies when the value is already known from state. The error names the functions whose calls the saved-plan format cannot carry. Run `carina apply` directly on the project, without a saved plan.
+A plan cannot be saved with `carina plan --out` or `carina plan --json` when a call to a user-defined function could not be evaluated during planning and remains in the plan, including calls in module bodies and root exports. Calls that were evaluated and passed their declared-type checks are saved as their result expression. If a call remains, run `carina apply` directly on the project, without a saved plan.
 
 ### Local Bindings in Functions
 

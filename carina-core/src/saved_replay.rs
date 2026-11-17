@@ -44,8 +44,24 @@ impl SavedPlanReplay<SnapshotLeaf> {
         import_identifiers: &HashMap<ResourceId, Value>,
         templates: &crate::parser::ResolvedDeferredForExpressions,
     ) -> Result<SavedPlanReplay, SecretRehydrationSiteError> {
+        self.rehydrate_desired_using(
+            &crate::value::SecretRehydration::evaluated(),
+            resources,
+            data_sources,
+            import_identifiers,
+            templates,
+        )
+    }
+    pub fn rehydrate_desired_using(
+        &self,
+        rehydration: &crate::value::SecretRehydration<'_>,
+        resources: &HashMap<ResourceId, Resource>,
+        data_sources: &HashMap<ResourceId, DataSource>,
+        import_identifiers: &HashMap<ResourceId, Value>,
+        templates: &crate::parser::ResolvedDeferredForExpressions,
+    ) -> Result<SavedPlanReplay, SecretRehydrationSiteError> {
         Ok(SavedPlanReplay {
-            plan: crate::value::rehydrate_plan_desired_secrets(
+            plan: rehydration.plan(
                 &self.plan,
                 resources,
                 data_sources,

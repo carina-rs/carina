@@ -11399,3 +11399,41 @@ impl<S, P: crate::resource::PlanValueKind, D> crate::value::saved_document::seal
         });
     }
 }
+
+impl<S, P: crate::resource::PlanValueKind, D> crate::value::saved_document::expand::Expand
+    for DeferredForExpression<S, P, P::Template, AbsoluteBindingAddress, D>
+{
+    fn expand(
+        &mut self,
+        evaluation: &crate::resolver::PlanningEvaluation,
+    ) -> Result<(), crate::value::SerializationError> {
+        self.iterable.expand(evaluation)?;
+        self.template_resource
+            .resource
+            .attributes
+            .expand(evaluation)?;
+        self.template_resource
+            .resource
+            .directives
+            .try_transform_values(&mut |value| {
+                evaluation
+                    .expression(value)
+                    .map(|pair| pair.into_expression())
+                    .map_err(crate::value::SerializationError::from)
+            })
+    }
+}
+
+impl crate::value::saved_document::sealed::Tree for ResolvedDeferredForExpressions {
+    fn visit(&self, names: &mut crate::value::saved_document::FunctionNames) {
+        names.tree(&self.0);
+    }
+}
+impl crate::value::saved_document::expand::Expand for ResolvedDeferredForExpressions {
+    fn expand(
+        &mut self,
+        evaluation: &crate::resolver::PlanningEvaluation,
+    ) -> Result<(), crate::value::SerializationError> {
+        crate::value::saved_document::expand::Expand::expand(&mut self.0, evaluation)
+    }
+}

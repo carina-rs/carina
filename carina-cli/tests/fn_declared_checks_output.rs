@@ -243,6 +243,211 @@ fn retained_calls_refuse_saved_output_through_the_binary_plan_out() {
     assert_binary_retained_refusal(false);
 }
 
+fn assert_state_known_call_saves(json: bool, module: bool) {
+    let source =
+        "let src = mock.test.read_back { present = 'source' create_read_back_pending_polls = 1 }\n";
+    let project = typed_project(source, module);
+    project.success(&["apply", "--auto-approve"]);
+    let body = format!(
+        "{source}fn checked(x: mock.RecoveryProbe): String {{ x }}\nlet sink = mock.test.read_back {{ present = checked(src.computed) }}\n"
+    );
+    let file = if module { "child/main.crn" } else { "main.crn" };
+    std::fs::write(
+        project.path().join(file),
+        if module {
+            format!("arguments {{ label: String }}\n{body}")
+        } else {
+            body
+        },
+    )
+    .unwrap();
+    let saved = project.path().join("saved.plan.json");
+    let output = if json {
+        project.success(&["plan", "--json"])
+    } else {
+        project.success(&["plan", "--out", saved.to_str().unwrap()])
+    };
+    let document: serde_json::Value = if json {
+        serde_json::from_slice(&output.stdout).unwrap()
+    } else {
+        project.assert_private_artifact(&saved, ArtifactPresence::Required);
+        serde_json::from_slice(&std::fs::read(saved).unwrap()).unwrap()
+    };
+    assert_eq!(document["version"], 46);
+    let expression = serde_json::to_string(&document).unwrap();
+    assert!(!expression.contains("ResolvedFunctionCall"));
+    assert!(expression.contains("ResourceRef"));
+}
+
+#[test]
+fn state_known_root_call_saves_plan_out() {
+    assert_state_known_call_saves(false, false);
+}
+#[test]
+fn state_known_root_call_saves_json() {
+    assert_state_known_call_saves(true, false);
+}
+#[test]
+fn state_known_module_call_saves_plan_out() {
+    assert_state_known_call_saves(false, true);
+}
+#[test]
+fn state_known_module_call_saves_json() {
+    assert_state_known_call_saves(true, true);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CallPosition {
+    ModuleArgument,
+    ModuleOutput,
+    Require,
+    RootExport,
+}
+
+fn assert_saved_call_position(position: CallPosition, known: bool, json: bool) {
+    let source =
+        "let src = mock.test.read_back { present = 'source' create_read_back_pending_polls = 1 }\n";
+    let project = typed_project(source, matches!(position, CallPosition::ModuleOutput));
+    if known {
+        project.success(&["apply", "--auto-approve"]);
+    }
+    let function = "fn checked(x: mock.RecoveryProbe): String { x }\n";
+    let call = "checked(src.computed)";
+    let (root, child) = match position {
+        CallPosition::ModuleArgument => (
+            format!("{source}{function}let child = use {{ source = './child' }}\nlet instance = child {{ input = {call} }}\nlet sink = mock.test.read_back {{ present = instance.output }}\n"),
+            Some("arguments { input: String }\nattributes { output: String = input }\n".into()),
+        ),
+        CallPosition::ModuleOutput => (
+            "let child = use { source = './child' }\nlet instance = child { label = 'module' }\nlet sink = mock.test.read_back { present = instance.output }\n".into(),
+            Some(format!("arguments {{ label: String }}\n{source}{function}attributes {{ output: String = checked(src.computed) }}\n")),
+        ),
+        CallPosition::Require => (
+            format!("{source}{function}let child = use {{ source = './child' }}\nlet instance = child {{ input = {call} }}\n"),
+            Some("arguments { input: String }\nrequire input != 'rejected', 'required'\n".into()),
+        ),
+        CallPosition::RootExport => (
+            format!("{source}{function}exports {{ output: String = {call} }}\n"),
+            None,
+        ),
+    };
+    std::fs::write(project.path().join("main.crn"), root).unwrap();
+    if let Some(child) = child {
+        std::fs::create_dir_all(project.path().join("child")).unwrap();
+        std::fs::write(project.path().join("child/main.crn"), child).unwrap();
+    }
+    if !known {
+        assert_binary_refusal(
+            &project,
+            json,
+            "the plan contains an unevaluated call to the user-defined function 'checked'. A saved plan cannot carry this call.",
+        );
+        return;
+    }
+    let saved = project.path().join("saved.plan.json");
+    let output = if json {
+        project.success(&["plan", "--json"])
+    } else {
+        project.success(&["plan", "--out", saved.to_str().unwrap()])
+    };
+    let document: serde_json::Value = if json {
+        serde_json::from_slice(&output.stdout).unwrap()
+    } else {
+        project.assert_private_artifact(&saved, ArtifactPresence::Required);
+        serde_json::from_slice(&std::fs::read(saved).unwrap()).unwrap()
+    };
+    assert_eq!(document["version"], 46);
+}
+
+#[test]
+fn evaluated_calls_in_module_and_export_positions_save_plan_out() {
+    for position in [
+        CallPosition::ModuleArgument,
+        CallPosition::ModuleOutput,
+        CallPosition::Require,
+        CallPosition::RootExport,
+    ] {
+        assert_saved_call_position(position, true, false);
+    }
+}
+#[test]
+fn evaluated_calls_in_module_and_export_positions_save_json() {
+    for position in [
+        CallPosition::ModuleArgument,
+        CallPosition::ModuleOutput,
+        CallPosition::Require,
+        CallPosition::RootExport,
+    ] {
+        assert_saved_call_position(position, true, true);
+    }
+}
+#[test]
+fn retained_calls_in_module_and_export_positions_refuse_plan_out() {
+    for position in [
+        CallPosition::ModuleArgument,
+        CallPosition::ModuleOutput,
+        CallPosition::Require,
+        CallPosition::RootExport,
+    ] {
+        assert_saved_call_position(position, false, false);
+    }
+}
+#[test]
+fn retained_calls_in_module_and_export_positions_refuse_json() {
+    for position in [
+        CallPosition::ModuleArgument,
+        CallPosition::ModuleOutput,
+        CallPosition::Require,
+        CallPosition::RootExport,
+    ] {
+        assert_saved_call_position(position, false, true);
+    }
+}
+
+#[test]
+fn stale_state_value_checks_match_at_root_and_in_module() {
+    for module in [false, true] {
+        let source = "let src = mock.test.read_back { present = 'before' create_read_back_pending_polls = 1 }\n";
+        let project = typed_project(source, module);
+        project.success(&["apply", "--auto-approve"]);
+        // The literal alternative admits the provider's 'ready' output;
+        // neither alternative admits the stale 'bad-name'.
+        let body = "let src = mock.test.read_back { present = 'after' create_read_back_pending_polls = 1 }\nfn checked(x: mock.test.sdk_validator.Guarded | 'ready'): String { x }\nlet sink = mock.test.read_back { present = checked(src.computed) }\n";
+        std::fs::write(
+            project
+                .path()
+                .join(if module { "child/main.crn" } else { "main.crn" }),
+            if module {
+                format!("arguments {{ label: String }}\n{body}")
+            } else {
+                body.into()
+            },
+        )
+        .unwrap();
+        project.success(&["plan", "--refresh=false"]);
+        let path = project.path().join("carina.state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let rows = state["resources"].as_array_mut().unwrap();
+        assert_eq!(rows.len(), 1);
+        rows[0]["current"]["attributes"]["computed"] = "bad-name".into();
+        let before = serde_json::to_vec(&state).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        let output = project.run(&["plan", "--refresh=false"]);
+        assert_eq!(output.status.code(), Some(1));
+        let line = if module { 4 } else { 3 };
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!(
+                "Warning: using cached managed-resource state (--refresh=false). Data sources are still read, but the plan may not reflect actual managed infrastructure.\nError: Invalid expression at line {line}: function 'checked': parameter 'x': expected mock.test.sdk_validator.Guarded | 'ready', got string 'bad-name'\n"
+            )
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        project.success(&["state", "refresh"]);
+        project.success(&["plan", "--refresh=false"]);
+    }
+}
+
 #[test]
 #[should_panic(expected = "missing required artifact")]
 fn private_artifact_requires_the_expected_file() {

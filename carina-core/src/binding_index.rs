@@ -2507,6 +2507,54 @@ impl ResolvedBindings<ParserPlaceholder, RelativeBindingName> {
 }
 
 impl ResolvedBindings {
+    pub(crate) fn parser_stage(&self) -> ResolvedBindings<ParserPlaceholder> {
+        ResolvedBindings {
+            by_name: self
+                .by_name
+                .iter()
+                .map(|(name, binding)| {
+                    let attributes = binding
+                        .attributes
+                        .iter()
+                        .map(|(key, value)| {
+                            let value = value
+                                .clone()
+                                .try_map_placeholder(&mut |leaf| match leaf {
+                                    crate::resource::SnapshotLeaf::Expression(never) => {
+                                        match never {}
+                                    }
+                                    crate::resource::SnapshotLeaf::RedactedSecret { hash } => {
+                                        Ok::<_, std::convert::Infallible>(Value::Deferred(
+                                            crate::resource::DeferredValue::Placeholder(
+                                                crate::resource::SnapshotLeaf::RedactedSecret {
+                                                    hash,
+                                                },
+                                            ),
+                                        ))
+                                    }
+                                })
+                                .unwrap_or_else(|never| match never {});
+                            (key.clone(), value)
+                        })
+                        .collect();
+                    (
+                        name.clone(),
+                        ResolvedBinding {
+                            attributes,
+                            source: binding.source.clone(),
+                            completeness: binding.completeness.clone(),
+                            definitive_attributes: binding.definitive_attributes.clone(),
+                            changed_attributes: binding.changed_attributes.clone(),
+                            refreshable_attributes: binding.refreshable_attributes.clone(),
+                            removed_sensitive_attributes: binding
+                                .removed_sensitive_attributes
+                                .clone(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
     /// Build the explicitly incomplete value view used to resolve query
     /// inputs before provider reads run.
     pub fn pre_data_source_read_live(inputs: LivePreDataSourceReadInputs<'_>) -> Self {

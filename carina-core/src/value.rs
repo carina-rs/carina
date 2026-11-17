@@ -1,7 +1,7 @@
 //! Value conversion and formatting utilities
 
 pub(crate) mod saved_document;
-pub use saved_document::{DocumentTree, Saved, SavedDocumentConversion};
+pub use saved_document::{DocumentTree, ExpandableDocumentTree, Saved, SavedDocumentConversion};
 
 use crate::resource::DiagnosticScope;
 use crate::resource::InsideSecret;
@@ -145,6 +145,8 @@ impl std::error::Error for RetainedUserFunctionCallError {}
 pub enum SerializationError {
     #[error(transparent)]
     RetainedUserFunctionCall(#[from] RetainedUserFunctionCallError),
+    #[error(transparent)]
+    PlanningEvaluation(Box<crate::resolver::ResolutionError>),
 
     #[error("cannot serialize: {}", crate::resource::INSIDE_SECRET_MESSAGE)]
     InsideSecret { kind: SecretSerializationErrorKind },
@@ -254,10 +256,18 @@ pub enum SecretSerializationErrorKind {
     SavedPlanFieldSecretNotAllowed,
 }
 
+impl From<crate::resolver::ResolutionError> for SerializationError {
+    fn from(error: crate::resolver::ResolutionError) -> Self {
+        Self::PlanningEvaluation(Box::new(error))
+    }
+}
 impl crate::resource::InsideSecret for SerializationError {
     /// Protect value-bearing diagnostics while preserving public upstream reasons.
     fn inside_secret(self) -> Self {
         let kind = match self {
+            Self::PlanningEvaluation(error) => {
+                return Self::PlanningEvaluation(Box::new((*error).inside_secret()));
+            }
             Self::InsideSecret { kind } => kind,
             Self::NullProviderSecret => SecretSerializationErrorKind::NullProviderSecret,
             Self::UnavailableSecret(error) => {
@@ -3675,10 +3685,42 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
     saved: &SnapshotValue<P>,
     candidate: &Value<P>,
     input: SecretRehydrationInput,
+    planning: Option<&crate::resolver::PlanningEvaluation>,
 ) -> Result<Value<P>, SecretRehydrationError> {
     if !contains_redacted_secret(saved) {
         return Ok(saved.to_value_at("saved plan")?);
     }
+
+    let evaluated;
+    let candidate = if input == SecretRehydrationInput::Evaluated {
+        match planning {
+            Some(planning)
+                if !matches!(
+                    (saved, candidate),
+                    (
+                        Value::Concrete(ConcreteValue::Map(_)),
+                        Value::Concrete(ConcreteValue::Map(_))
+                    ) | (
+                        Value::Concrete(ConcreteValue::List(_)),
+                        Value::Concrete(ConcreteValue::List(_))
+                    )
+                ) =>
+            {
+                evaluated = planning
+                    .replay_value(candidate)
+                    .map_err(|error| {
+                        SecretRehydrationError::Serialization(
+                            crate::resource::InsideSecret::inside_secret(error).into(),
+                        )
+                    })?
+                    .into_expression();
+                &evaluated
+            }
+            Some(_) | None => candidate,
+        }
+    } else {
+        candidate
+    };
 
     // A secret interpolation/function may have been saved as a redacted
     // structural template because its final value depended on an apply-time
@@ -3698,6 +3740,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                 saved,
                 value,
                 SecretRehydrationInput::EvaluatedHashMaterial,
+                planning,
             )
             .map(|_| ())
         })?;
@@ -3715,6 +3758,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                         saved,
                         value,
                         SecretRehydrationInput::EvaluatedHashMaterial,
+                        planning,
                     )
                     .map(|_| ())
                 })?;
@@ -3739,7 +3783,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                         let candidate = candidate
                             .get(key)
                             .ok_or(SecretRehydrationError::ShapeMismatch)?;
-                        rehydrate_redacted_secrets_impl(value, candidate, input)?
+                        rehydrate_redacted_secrets_impl(value, candidate, input, planning)?
                     } else {
                         value.to_value_at("saved plan")?
                     };
@@ -3762,7 +3806,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                     let candidate = candidate
                         .get(index)
                         .ok_or(SecretRehydrationError::ShapeMismatch)?;
-                    rehydrate_redacted_secrets_impl(saved, candidate, input)
+                    rehydrate_redacted_secrets_impl(saved, candidate, input, planning)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Value::Concrete(ConcreteValue::List(values)))
@@ -3783,7 +3827,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                     }
                     InterpolationPart::Expr(saved) => match candidate.get(index) {
                         Some(InterpolationPart::Expr(candidate)) => {
-                            rehydrate_redacted_secrets_impl(saved, candidate, input)
+                            rehydrate_redacted_secrets_impl(saved, candidate, input, planning)
                                 .map(InterpolationPart::Expr)
                         }
                         Some(InterpolationPart::Literal(candidate)) => {
@@ -3798,7 +3842,9 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                                     SecretRehydrationInput::EvaluatedHashMaterial
                                 }
                             };
-                            let value = rehydrate_redacted_secrets_impl(saved, &candidate, input)?;
+                            let value = rehydrate_redacted_secrets_impl(
+                                saved, &candidate, input, planning,
+                            )?;
                             match value {
                                 Value::Concrete(ConcreteValue::String(value)) => {
                                     Ok(InterpolationPart::Literal(value))
@@ -3853,7 +3899,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                     let (Some(saved), Some(candidate)) = (saved.value(), candidate.value()) else {
                         return Err(SecretRehydrationError::ShapeMismatch);
                     };
-                    rehydrate_redacted_secrets_impl(saved, candidate, input)
+                    rehydrate_redacted_secrets_impl(saved, candidate, input, planning)
                         .map(crate::resource::FunctionArgument::from_value)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3874,6 +3920,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                 saved_access.base(),
                 candidate_access.base(),
                 input,
+                planning,
             )?;
             saved_access
                 .with_stage_base(base.clone())
@@ -3891,8 +3938,10 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
             else {
                 return Err(SecretRehydrationError::ShapeMismatch);
             };
-            let value = rehydrate_redacted_secrets_impl(saved_value, candidate_value, input)?;
-            let default = rehydrate_redacted_secrets_impl(saved_default, candidate_default, input)?;
+            let value =
+                rehydrate_redacted_secrets_impl(saved_value, candidate_value, input, planning)?;
+            let default =
+                rehydrate_redacted_secrets_impl(saved_default, candidate_default, input, planning)?;
             Ok(Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(value),
                 default: Box::new(default),
@@ -3911,6 +3960,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                     saved_expression.lhs(),
                     candidate_expression.lhs(),
                     input,
+                    planning,
                 )?
             } else {
                 saved_expression.lhs().to_value_at("saved plan.lhs")?
@@ -3920,6 +3970,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                     saved_expression.rhs(),
                     candidate_expression.rhs(),
                     input,
+                    planning,
                 )?
             } else {
                 saved_expression.rhs().to_value_at("saved plan.rhs")?
@@ -3949,7 +4000,7 @@ pub fn rehydrate_redacted_secrets<P: PlaceholderKind>(
     {
         return Err(SecretRehydrationError::EvaluationUnavailable);
     }
-    rehydrate_redacted_secrets_impl(saved, evaluated, SecretRehydrationInput::Evaluated)
+    rehydrate_redacted_secrets_impl(saved, evaluated, SecretRehydrationInput::Evaluated, None)
 }
 
 /// Restore historical saved-plan placeholders from a fresh provider read,
@@ -3958,7 +4009,7 @@ pub fn rehydrate_redacted_secrets_from_plaintext<P: PlaceholderKind>(
     saved: &SnapshotValue<P>,
     plaintext: &Value<P>,
 ) -> Result<Value<P>, SecretRehydrationError> {
-    rehydrate_redacted_secrets_impl(saved, plaintext, SecretRehydrationInput::Plaintext)
+    rehydrate_redacted_secrets_impl(saved, plaintext, SecretRehydrationInput::Plaintext, None)
 }
 
 /// Whether a saved-plan placeholder candidate is still wrapped as a typed
@@ -3979,22 +4030,7 @@ pub fn rehydrate_secret_entry<P: PlaceholderKind>(
     location: impl Into<String>,
     candidate_kind: SecretRehydrationCandidate,
 ) -> Result<Option<Value<P>>, SecretRehydrationSiteError> {
-    if !contains_redacted_secret(saved) {
-        return Ok(None);
-    }
-
-    let location = location.into();
-    let candidate = candidate.ok_or_else(|| {
-        SecretRehydrationSiteError::new(location.clone(), SecretRehydrationError::ShapeMismatch)
-    })?;
-    let value = match candidate_kind {
-        SecretRehydrationCandidate::Evaluated => rehydrate_redacted_secrets(saved, candidate),
-        SecretRehydrationCandidate::Plaintext => {
-            rehydrate_redacted_secrets_from_plaintext(saved, candidate)
-        }
-    }
-    .map_err(|source| SecretRehydrationSiteError::new(location, source))?;
-    Ok(Some(value))
+    SecretRehydration::evaluated().entry(saved, candidate, location, candidate_kind)
 }
 
 pub fn redact_secrets_in_value(value: &Value) -> Result<SnapshotValue, SerializationError> {
@@ -4221,11 +4257,31 @@ pub fn rehydrate_resource_secrets<S: Clone, D: Clone, T, E>(
     >,
     SecretRehydrationSiteError,
 > {
+    rehydrate_resource_secrets_using(saved, evaluated, &SecretRehydration::evaluated())
+}
+fn rehydrate_resource_secrets_using<S: Clone, D: Clone, T, E>(
+    saved: &crate::resource::Resource<S, SnapshotLeaf, crate::resource::AbsoluteBindingAddress, D>,
+    evaluated: &crate::resource::Resource<
+        T,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        E,
+    >,
+    rehydration: &SecretRehydration<'_>,
+) -> Result<
+    crate::resource::Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SecretRehydrationSiteError,
+> {
     let attributes = saved
         .attributes
         .iter()
         .map(|(key, value)| {
-            let restored = rehydrate_secret_entry(
+            let restored = rehydration.entry(
                 value,
                 evaluated.attributes.get(key),
                 format!("{}.{}", saved.id, key),
@@ -4350,11 +4406,36 @@ pub fn rehydrate_data_source_secrets<S: Clone, D: Clone, T, E>(
     >,
     SecretRehydrationSiteError,
 > {
+    rehydrate_data_source_secrets_using(saved, evaluated, &SecretRehydration::evaluated())
+}
+fn rehydrate_data_source_secrets_using<S: Clone, D: Clone, T, E>(
+    saved: &crate::resource::DataSource<
+        S,
+        SnapshotLeaf,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    evaluated: &crate::resource::DataSource<
+        T,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        E,
+    >,
+    rehydration: &SecretRehydration<'_>,
+) -> Result<
+    crate::resource::DataSource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    SecretRehydrationSiteError,
+> {
     let attributes = saved
         .attributes
         .iter()
         .map(|(key, value)| {
-            let restored = rehydrate_secret_entry(
+            let restored = rehydration.entry(
                 value,
                 evaluated.attributes.get(key),
                 format!("{}.{}", saved.id, key),
@@ -4474,9 +4555,23 @@ pub fn rehydrate_saved_composition_with_candidate(
     crate::resource::SavedComposition<crate::resource::NoPlaceholder>,
     SecretRehydrationSiteError,
 > {
+    rehydrate_saved_composition_with_candidate_using(
+        saved,
+        evaluated,
+        &SecretRehydration::evaluated(),
+    )
+}
+fn rehydrate_saved_composition_with_candidate_using(
+    saved: &crate::resource::SavedComposition,
+    evaluated: Option<&crate::resource::LiveComposition>,
+    rehydration: &SecretRehydration<'_>,
+) -> Result<
+    crate::resource::SavedComposition<crate::resource::NoPlaceholder>,
+    SecretRehydrationSiteError,
+> {
     let restore = |value: &SnapshotValue, candidate: Option<&Value>, location: String| {
         if evaluated.is_some() {
-            restore_snapshot_entry(value, candidate, location)
+            rehydration.restore(value, candidate, location)
         } else {
             value
                 .to_value_at(location)
@@ -5006,28 +5101,29 @@ fn redact_secrets_in_plan_with_desired_and_historical_impl<D>(
 /// resources/data sources. Historical state is restored separately from the
 /// single verified provider-read pass by
 /// [`rehydrate_plan_historical_secrets_from_verified_states`].
-fn restore_snapshot_entry<P: PlaceholderKind>(
-    saved: &SnapshotValue<P>,
-    candidate: Option<&Value<P>>,
-    location: String,
-) -> Result<Value<P>, SecretRehydrationSiteError> {
-    match rehydrate_secret_entry(
-        saved,
-        candidate,
-        location.clone(),
-        SecretRehydrationCandidate::Evaluated,
-    )? {
-        Some(value) => Ok(value),
-        None => saved.to_value_at(location).map_err(Into::into),
-    }
-}
-
 pub fn rehydrate_plan_desired_secrets<S: Clone>(
     plan: &crate::plan::SnapshotPlan<S>,
     resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
     data_sources: &HashMap<crate::resource::ResourceId, crate::resource::DataSource>,
     import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
     deferred_templates: &crate::parser::ResolvedDeferredForExpressions,
+) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
+    rehydrate_plan_desired_secrets_using(
+        plan,
+        resources,
+        data_sources,
+        import_identifiers,
+        deferred_templates,
+        &SecretRehydration::evaluated(),
+    )
+}
+fn rehydrate_plan_desired_secrets_using<S: Clone>(
+    plan: &crate::plan::SnapshotPlan<S>,
+    resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
+    data_sources: &HashMap<crate::resource::ResourceId, crate::resource::DataSource>,
+    import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
+    deferred_templates: &crate::parser::ResolvedDeferredForExpressions,
+    rehydration: &SecretRehydration<'_>,
 ) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
     let effects = plan
         .effects()
@@ -5045,52 +5141,20 @@ pub fn rehydrate_plan_desired_secrets<S: Clone>(
             };
             effect.try_map_value_stage(
                 |id, key, saved| {
-                    restore_snapshot_entry(
+                    rehydration.restore(
                         saved,
                         attributes.and_then(|values| values.get(key)),
                         format!("{id}.{key}"),
                     )
                 },
                 |id, saved| {
-                    restore_snapshot_entry(
-                        saved,
-                        import_identifiers.get(id),
-                        format!("import {id}"),
-                    )
+                    rehydration.restore(saved, import_identifiers.get(id), format!("import {id}"))
                 },
-                |saved| rehydrate_deferred_template(saved, deferred_templates),
+                |saved| rehydration.template(saved, deferred_templates),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(plan.clone().with_value_stage(effects))
-}
-
-fn rehydrate_deferred_template<S: Clone, T>(
-    saved: &crate::parser::CompiledDeferredForExpression<S, SnapshotLeaf, SnapshotLeaf<LoopSlot>>,
-    candidates: &[crate::parser::DeferredForExpression<T>],
-) -> Result<crate::parser::CompiledDeferredForExpression<S>, SecretRehydrationSiteError> {
-    let candidate = candidates.iter().find(|candidate| {
-        candidate.target().same_system_target(saved.target())
-            && candidate.resource_type() == saved.resource_type()
-            && candidate.root_bindings() == saved.root_bindings()
-    });
-    crate::effect::value_stage::map_template::<S, SnapshotLeaf, crate::resource::NoPlaceholder, _>(
-        saved,
-        |value| {
-            restore_snapshot_entry(
-                value,
-                candidate.map(|candidate| &candidate.iterable),
-                format!("deferred iterable {}", saved.target().display_name()),
-            )
-        },
-        |key, value| {
-            restore_snapshot_entry(
-                value,
-                candidate.and_then(|candidate| candidate.attributes().get(key)),
-                format!("deferred resource {}.{key}", saved.target().display_name()),
-            )
-        },
-    )
 }
 
 /// Restore plan-history placeholders from states whose hashes were already
@@ -16107,6 +16171,7 @@ mod unknown_secret_diagnostic_tests {
             &saved,
             &invalid_secret(),
             SecretRehydrationInput::Evaluated,
+            None,
         )
         .unwrap_err();
         let SecretRehydrationError::Serialization(error) = error else {
@@ -16127,9 +16192,13 @@ mod unknown_secret_diagnostic_tests {
             ])))
             .into(),
         ));
-        let error =
-            rehydrate_redacted_secrets_impl(&saved, &candidate, SecretRehydrationInput::Evaluated)
-                .unwrap_err();
+        let error = rehydrate_redacted_secrets_impl(
+            &saved,
+            &candidate,
+            SecretRehydrationInput::Evaluated,
+            None,
+        )
+        .unwrap_err();
         let SecretRehydrationError::Serialization(error) = error else {
             panic!("{error:?}")
         };
@@ -16407,6 +16476,7 @@ pub(crate) mod retained_call_snapshot_tests {
             SavedDocumentConversion::document(
                 &crate::parser::ExpandedInferredFile::default(),
                 &[&value],
+                None,
                 |_conversion| Ok::<_, SerializationError>(())
             )
             .is_ok()
@@ -16446,5 +16516,183 @@ mod retained_secret_hash_regressions {
 pub(crate) fn with_saved_document<T>(
     build: impl FnOnce(&SavedDocumentConversion) -> Result<T, SerializationError>,
 ) -> Result<T, SerializationError> {
-    SavedDocumentConversion::document(&crate::parser::ExpandedInferredFile::default(), &[], build)
+    SavedDocumentConversion::document(
+        &crate::parser::ExpandedInferredFile::default(),
+        &[],
+        None,
+        build,
+    )
+}
+
+/// Secret verification uses the evaluator only at protected saved positions.
+/// Ordinary recorded values do not depend on the current source expression.
+pub struct SecretRehydration<'a> {
+    planning: Option<&'a crate::resolver::PlanningEvaluation>,
+}
+impl<'a> SecretRehydration<'a> {
+    pub fn evaluated() -> Self {
+        Self { planning: None }
+    }
+    pub fn planned(planning: &'a crate::resolver::PlanningEvaluation) -> Self {
+        Self {
+            planning: Some(planning),
+        }
+    }
+    fn entry<P: PlaceholderKind>(
+        &self,
+        saved: &SnapshotValue<P>,
+        candidate: Option<&Value<P>>,
+        location: impl Into<String>,
+        candidate_kind: SecretRehydrationCandidate,
+    ) -> Result<Option<Value<P>>, SecretRehydrationSiteError> {
+        if !contains_redacted_secret(saved) {
+            return Ok(None);
+        }
+
+        let location = location.into();
+        let candidate = candidate.ok_or_else(|| {
+            SecretRehydrationSiteError::new(location.clone(), SecretRehydrationError::ShapeMismatch)
+        })?;
+        let value = match candidate_kind {
+            SecretRehydrationCandidate::Evaluated => match self.planning {
+                Some(planning) => rehydrate_redacted_secrets_impl(
+                    saved,
+                    candidate,
+                    SecretRehydrationInput::Evaluated,
+                    Some(planning),
+                ),
+                None => rehydrate_redacted_secrets(saved, candidate),
+            },
+            SecretRehydrationCandidate::Plaintext => {
+                rehydrate_redacted_secrets_from_plaintext(saved, candidate)
+            }
+        }
+        .map_err(|source| SecretRehydrationSiteError::new(location, source))?;
+        Ok(Some(value))
+    }
+    fn restore<P: PlaceholderKind>(
+        &self,
+        saved: &SnapshotValue<P>,
+        candidate: Option<&Value<P>>,
+        location: String,
+    ) -> Result<Value<P>, SecretRehydrationSiteError> {
+        match self.entry(
+            saved,
+            candidate,
+            location.clone(),
+            SecretRehydrationCandidate::Evaluated,
+        )? {
+            Some(value) => Ok(value),
+            None => saved.to_value_at(location).map_err(Into::into),
+        }
+    }
+    fn template<S: Clone, T>(
+        &self,
+        saved: &crate::parser::CompiledDeferredForExpression<
+            S,
+            SnapshotLeaf,
+            SnapshotLeaf<LoopSlot>,
+        >,
+        candidates: &[crate::parser::DeferredForExpression<T>],
+    ) -> Result<crate::parser::CompiledDeferredForExpression<S>, SecretRehydrationSiteError> {
+        let candidate = candidates.iter().find(|candidate| {
+            candidate.target().same_system_target(saved.target())
+                && candidate.resource_type() == saved.resource_type()
+                && candidate.root_bindings() == saved.root_bindings()
+        });
+        crate::effect::value_stage::map_template::<S, SnapshotLeaf, crate::resource::NoPlaceholder, _>(
+            saved,
+            |value| {
+                self.restore(
+                    value,
+                    candidate.map(|candidate| &candidate.iterable),
+                    format!("deferred iterable {}", saved.target().display_name()),
+                )
+            },
+            |key, value| {
+                self.restore(
+                    value,
+                    candidate.and_then(|candidate| candidate.attributes().get(key)),
+                    format!("deferred resource {}.{key}", saved.target().display_name()),
+                )
+            },
+        )
+    }
+    pub fn resource<S: Clone, D: Clone, T, E>(
+        &self,
+        saved: &crate::resource::Resource<
+            S,
+            SnapshotLeaf,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+        evaluated: &crate::resource::Resource<
+            T,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            E,
+        >,
+    ) -> Result<
+        crate::resource::Resource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+        SecretRehydrationSiteError,
+    > {
+        rehydrate_resource_secrets_using(saved, evaluated, self)
+    }
+    pub fn data_source<S: Clone, D: Clone, T, E>(
+        &self,
+        saved: &crate::resource::DataSource<
+            S,
+            SnapshotLeaf,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+        evaluated: &crate::resource::DataSource<
+            T,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            E,
+        >,
+    ) -> Result<
+        crate::resource::DataSource<
+            S,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            D,
+        >,
+        SecretRehydrationSiteError,
+    > {
+        rehydrate_data_source_secrets_using(saved, evaluated, self)
+    }
+    pub fn composition(
+        &self,
+        saved: &crate::resource::SavedComposition,
+        evaluated: Option<&crate::resource::LiveComposition>,
+    ) -> Result<
+        crate::resource::SavedComposition<crate::resource::NoPlaceholder>,
+        SecretRehydrationSiteError,
+    > {
+        rehydrate_saved_composition_with_candidate_using(saved, evaluated, self)
+    }
+    pub fn plan<S: Clone>(
+        &self,
+        plan: &crate::plan::SnapshotPlan<S>,
+        resources: &HashMap<crate::resource::ResourceId, crate::resource::Resource>,
+        data_sources: &HashMap<crate::resource::ResourceId, crate::resource::DataSource>,
+        import_identifiers: &HashMap<crate::resource::ResourceId, Value>,
+        deferred_templates: &crate::parser::ResolvedDeferredForExpressions,
+    ) -> Result<crate::plan::Plan<S>, SecretRehydrationSiteError> {
+        rehydrate_plan_desired_secrets_using(
+            plan,
+            resources,
+            data_sources,
+            import_identifiers,
+            deferred_templates,
+            self,
+        )
+    }
 }

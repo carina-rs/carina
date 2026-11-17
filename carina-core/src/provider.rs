@@ -6927,6 +6927,7 @@ pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::Pla
                 | SerializationError::RetainedUserFunctionCall(_)
                 | SerializationError::UnresolvedAccess { .. }
                 | SerializationError::Knowledge { .. }
+                | SerializationError::PlanningEvaluation(_)
                 | SerializationError::SecretNotAllowed { .. }
                 | SerializationError::SavedPlanFieldSecretNotAllowed { .. }),
             ) => {

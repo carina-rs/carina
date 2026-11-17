@@ -1074,6 +1074,15 @@ impl<S, P: ValueKind> From<ResolvedResource<S, P>> for SchemaUnresolvedResource<
     }
 }
 
+impl<S, P: crate::resource::PlanValueKind> SchemaUnresolvedResource<S, P> {
+    pub(crate) fn expand_saved_values(
+        &mut self,
+        evaluation: &crate::resolver::PlanningEvaluation,
+    ) -> Result<(), crate::value::SerializationError> {
+        use crate::value::saved_document::expand::Expand;
+        self.resource.expand(evaluation)
+    }
+}
 impl<S, P: ValueKind> SchemaUnresolvedResource<S, P> {
     pub fn id(&self) -> &ResourceId {
         &self.resource.id
@@ -3496,6 +3505,15 @@ impl<P: ValueKind, B: BindingAddress> FunctionArgument<P, B> {
         visit: &mut impl FnMut(&Value<P, B>) -> Result<(), E>,
     ) -> Result<(), E> {
         self.operand.try_visit_values(visit)
+    }
+
+    pub(crate) fn try_map_stage<Q: ValueKind, E>(
+        self,
+        mut map: impl FnMut(Value<P, B>) -> Result<Value<Q, B>, E>,
+    ) -> Result<FunctionArgument<Q, B>, E> {
+        Ok(FunctionArgument {
+            operand: self.operand.try_map_stage(&mut map)?,
+        })
     }
 
     pub(crate) fn try_map_values<E>(

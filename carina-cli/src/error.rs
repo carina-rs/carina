@@ -2933,12 +2933,6 @@ impl PresentedAppError {
             Self::Conversion(error) => error.to_string(),
         }
     }
-    pub(crate) fn into_rendered(self) -> AppError {
-        match self {
-            Self::Ordinary(error) => error,
-            Self::Conversion(error) => AppError::Validation(error.to_string()),
-        }
-    }
     pub(crate) fn from_presented<E: carina_core::validation::ValidationClientError>(
         finding: carina_core::validation::PresentedFinding<E>,
         client: impl FnOnce(E) -> AppError,

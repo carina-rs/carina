@@ -3,6 +3,9 @@
 //! Resolves `Value::ResourceRef` references by looking up bound resource attributes
 //! from both the DSL definition and current infrastructure state.
 
+pub(crate) mod planning_value;
+pub use planning_value::{PlannedDocumentTree, PlannedExpression, PlanningEvaluation};
+
 use crate::function_evaluation::{
     ArgumentStep, FunctionCompletion, FunctionEvaluation, LocalStep, PreparedFunction,
 };

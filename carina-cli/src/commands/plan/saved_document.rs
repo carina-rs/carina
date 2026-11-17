@@ -190,6 +190,7 @@ impl PlanFileContents {
     pub(super) fn build<E, S, Error>(
         parsed: &carina_core::parser::ExpandedFile<E>,
         sources: &[&dyn carina_core::value::DocumentTree],
+        evaluation: Option<&carina_core::resolver::PlanningEvaluation>,
         build: impl FnOnce(&SavedDocumentConversion) -> Result<Parts<S>, Error>,
     ) -> Result<Self, Error>
     where
@@ -206,7 +207,7 @@ impl PlanFileContents {
             >,
         >,
     {
-        SavedDocumentConversion::document(parsed, sources, |conversion| {
+        SavedDocumentConversion::document(parsed, sources, evaluation, |conversion| {
             let parts = build(conversion)?;
             Ok(Self {
                 transport: parts.into_transport(),
@@ -265,7 +266,7 @@ pub(super) fn admit_fixture(
     raw: UnresolvedPlanFileTransport,
 ) -> Result<PlanFileContents, carina_core::value::SerializationError> {
     let parsed = carina_core::parser::ExpandedInferredFile::default();
-    PlanFileContents::build(&parsed, &[], |conversion| {
+    PlanFileContents::build(&parsed, &[], None, |conversion| {
         let PlanFileTransport {
             version,
             carina_version,

@@ -1,6 +1,8 @@
 use super::*;
 use crate::resource::{AbsoluteBindingAddress, PlanValueKind, StateValueLeaf};
 use std::ops::Deref;
+pub(crate) mod expand;
+use crate::resolver::PlanningEvaluation;
 
 /// A saved-document tree whose values passed retained-call admission.
 /// No mutable view or unchecked constructor is available.
@@ -45,25 +47,46 @@ pub(crate) mod sealed {
 }
 /// Closed inventory of value-bearing saved-document trees.
 pub trait DocumentTree: sealed::Tree {}
+/// The owned value trees on which document admission can carry evaluator expansions.
+pub trait ExpandableDocumentTree: DocumentTree + expand::Expand {}
+impl<T: DocumentTree + expand::Expand> ExpandableDocumentTree for T {}
 impl<T: sealed::Tree + ?Sized> DocumentTree for T {}
 #[derive(Default)]
-pub struct FunctionNames(std::collections::BTreeMap<crate::parser::DeclarationLocation, String>);
+pub struct FunctionNames {
+    functions: std::collections::BTreeMap<crate::parser::DeclarationLocation, String>,
+    evaluation: Option<PlanningEvaluation>,
+    error: Option<SerializationError>,
+}
 impl FunctionNames {
     pub(crate) fn tree<T: DocumentTree + ?Sized>(&mut self, value: &T) {
         value.visit(self);
     }
-    pub(crate) fn value<P: ValueKind, B: crate::resource::BindingAddress>(
-        &mut self,
-        value: &Value<P, B>,
-    ) {
+    pub(crate) fn value<P: ValueKind>(&mut self, value: &Value<P>) {
+        let expanded;
+        let value = match &self.evaluation {
+            Some(evaluation) => match evaluation.expression(value) {
+                Ok(pair) => {
+                    expanded = pair.into_expression();
+                    &expanded
+                }
+                Err(error) => {
+                    self.error = Some(error.into());
+                    return;
+                }
+            },
+            None => value,
+        };
         crate::function_evaluation::visit_deferred_user_function_calls(value, &mut |function| {
-            self.0
+            self.functions
                 .entry(function.body.location.clone())
                 .or_insert_with(|| function.name.clone());
         });
     }
     fn finish(self) -> Result<(), SerializationError> {
-        match RetainedUserFunctionCallError::from_functions(self.0) {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        match RetainedUserFunctionCallError::from_functions(self.functions) {
             Some(error) => Err(error.into()),
             None => Ok(()),
         }
@@ -71,10 +94,20 @@ impl FunctionNames {
 }
 
 fn admit<T: DocumentTree>(value: T) -> Result<Saved<T>, SerializationError> {
-    let mut names = FunctionNames::default();
-    value.visit(&mut names);
-    names.finish()?;
+    check(&value, None)?;
     Ok(Saved(value))
+}
+
+fn check<T: DocumentTree + ?Sized>(
+    value: &T,
+    evaluation: Option<&PlanningEvaluation>,
+) -> Result<(), SerializationError> {
+    let mut names = FunctionNames {
+        evaluation: evaluation.cloned(),
+        ..FunctionNames::default()
+    };
+    value.visit(&mut names);
+    names.finish()
 }
 
 /// Borrowed conversion authority minted by the document constructor after exports.
@@ -83,12 +116,13 @@ fn admit<T: DocumentTree>(value: T) -> Result<Saved<T>, SerializationError> {
 /// let conversion = carina_core::value::SavedDocumentConversion;
 /// ```
 pub struct SavedDocumentConversion {
-    _private: (),
+    evaluation: Option<PlanningEvaluation>,
 }
 impl SavedDocumentConversion {
     pub fn document<E, T, Error>(
         parsed: &crate::parser::ExpandedFile<E>,
         sources: &[&dyn DocumentTree],
+        evaluation: Option<&PlanningEvaluation>,
         build: impl FnOnce(&Self) -> Result<T, Error>,
     ) -> Result<T, Error>
     where
@@ -103,18 +137,27 @@ impl SavedDocumentConversion {
                 .collect(),
             sources,
         };
-        admit(roots)?;
-        build(&Self { _private: () })
+        check(&roots, evaluation)?;
+        build(&Self {
+            evaluation: evaluation.cloned(),
+        })
     }
-    pub fn snapshot<T: DocumentTree>(&self, value: T) -> Result<Saved<T>, SerializationError> {
+    pub fn snapshot<T: ExpandableDocumentTree + Clone>(
+        &self,
+        value: T,
+    ) -> Result<Saved<T>, SerializationError> {
+        let value = match &self.evaluation {
+            Some(evaluation) => evaluation.prepare(&value)?.into_expanded(),
+            None => value,
+        };
         admit(value)
     }
-    fn convert<T: DocumentTree, U: DocumentTree>(
+    fn convert<T: ExpandableDocumentTree + Clone, U: DocumentTree>(
         &self,
         value: &T,
         convert: impl FnOnce(&T) -> Result<U, SerializationError>,
     ) -> Result<Saved<U>, SerializationError> {
-        let source = admit(value)?;
+        let source = self.snapshot(value.clone())?;
         admit(convert(source.as_inner())?)
     }
     pub fn value(&self, value: &Value) -> Result<Saved<SnapshotValue>, SerializationError> {
@@ -317,7 +360,7 @@ impl sealed::Tree for DocumentRoots<'_> {
         }
     }
 }
-impl<P: ValueKind, B: crate::resource::BindingAddress> sealed::Tree for Value<P, B> {
+impl<P: ValueKind> sealed::Tree for Value<P> {
     fn visit(&self, names: &mut FunctionNames) {
         names.value(self);
     }
@@ -604,6 +647,86 @@ mod tests {
         assert_eq!(
             refusal(values),
             "the plan contains unevaluated calls to the user-defined functions 'f00', 'f01', 'f02', 'f03', 'f04', 'f05', 'f06', 'f07' (and 2 more). A saved plan cannot carry these calls."
+        );
+    }
+}
+
+#[cfg(test)]
+mod evaluated_history_tests {
+    use super::*;
+    use crate::effect::{Effect, ReleasedListKey, ReleasedListKeys};
+    use crate::resource::{AuthoredValue, FunctionArgument, ResolvedResourceId, ResourceId};
+
+    fn history(known: bool) -> Effect {
+        let catalog = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "fn checked(x: 'allowed'): String { x }",
+            std::path::Path::new("history-functions.crn"),
+            &catalog,
+        )
+        .unwrap();
+        let argument = if known {
+            AuthoredValue::Concrete(ConcreteValue::String("allowed".into()))
+        } else {
+            AuthoredValue::resource_ref("src", "emitted", vec![])
+        };
+        let call: AuthoredValue = Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: std::sync::Arc::new(parsed.user_functions["checked"].clone()),
+            functions: std::sync::Arc::new(parsed.user_functions),
+            args: vec![FunctionArgument::from_value(argument)],
+            source_line: 1.into(),
+        });
+        let call = call.into_expanded().unwrap().resolve_root_for_test();
+        Effect::ReleaseListKeys {
+            id: ResolvedResourceId::new(ResourceId::with_provider_identity(
+                "mock", "Secret", "example", None,
+            )),
+            attribute: "settings".into(),
+            key_field: crate::schema::FieldName::declared("name"),
+            keys: ReleasedListKeys::try_new(vec![ReleasedListKey::new(
+                "entry",
+                call.to_snapshot(),
+            )])
+            .unwrap(),
+        }
+    }
+
+    fn save(effect: Effect) -> Result<Saved<Effect>, SerializationError> {
+        let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+        let evaluation = crate::resolver::PlanningEvaluation::new(
+            &crate::binding_index::ResolvedBindings::default(),
+            &catalog,
+        );
+        SavedDocumentConversion::document(
+            &crate::parser::ExpandedInferredFile::default(),
+            &[&effect],
+            Some(&evaluation),
+            |conversion| conversion.snapshot(effect.clone()),
+        )
+    }
+
+    #[test]
+    fn evaluated_call_in_released_list_history_saves_its_expansion() {
+        let saved = save(history(true)).unwrap().into_inner();
+        let Effect::ReleaseListKeys { keys, .. } = saved else {
+            panic!("release effect")
+        };
+        assert_eq!(
+            keys[0].retained_value(),
+            &Value::Concrete(ConcreteValue::String("allowed".into())).to_snapshot()
+        );
+    }
+
+    #[test]
+    fn retained_call_in_released_list_history_has_the_typed_refusal() {
+        let error = save(history(false)).unwrap_err();
+        assert!(matches!(
+            error,
+            SerializationError::RetainedUserFunctionCall(_)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "the plan contains an unevaluated call to the user-defined function 'checked'. A saved plan cannot carry this call."
         );
     }
 }

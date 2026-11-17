@@ -68,7 +68,7 @@ async fn retained_data_source_argument_refuses_saved_documents_plan_out() {
 }
 
 #[tokio::test]
-async fn state_known_valid_calls_refuse_saved_documents_plan_out() {
+async fn state_known_valid_calls_save_expanded_expressions_plan_out() {
     for module in [false, true] {
         let body = "let src = test.Thing { name = 'src' }\nfn checked(x: test.Name): String { x }\ntest.Sink { name = 'sink' value = checked(src.emitted) }\n";
         let directory = Directory::new(&Case {
@@ -88,15 +88,12 @@ async fn state_known_valid_calls_refuse_saved_documents_plan_out() {
             let result = directory
                 .plan_output(if json { None } else { Some(&saved) }, json)
                 .await;
-            assert!(matches!(
-                &result,
-                Err(AppError::RetainedUserFunctionCall { .. })
-            ));
-            assert_eq!(
-                rendered(&result),
-                expected_retained_plan_refusal(directory.path(), "checked")
-            );
-            assert!(!saved.exists());
+            result.unwrap();
+            if !json {
+                assert!(saved.is_file());
+                let document = std::fs::read_to_string(&saved).unwrap();
+                assert!(document.contains("ResourceRef"));
+            }
         }
         assert_eq!(directory.fixture.count("create", "Sink"), 1);
         directory.assert_unlocked().await;

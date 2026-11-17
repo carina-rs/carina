@@ -2967,3 +2967,79 @@ mod saved_document_tree {
         }
     }
 }
+
+mod saved_expression_expansion {
+    use super::*;
+    use crate::resolver::PlanningEvaluation;
+    use crate::value::{SerializationError, saved_document::expand::Expand};
+    impl<P: PlanValueKind> Expand for LiveComposition<P> {
+        fn expand(&mut self, evaluation: &PlanningEvaluation) -> Result<(), SerializationError> {
+            self.signature.expand(evaluation)
+        }
+    }
+    impl<P: PlanValueKind> Expand for SavedComposition<P> {
+        fn expand(&mut self, evaluation: &PlanningEvaluation) -> Result<(), SerializationError> {
+            self.signature.expand(evaluation)
+        }
+    }
+    impl<P: PlanValueKind> Expand for LiveCompositionSignature<P> {
+        fn expand(&mut self, evaluation: &PlanningEvaluation) -> Result<(), SerializationError> {
+            self.arguments.expand(evaluation)?;
+            self.attributes.expand(evaluation)?;
+            self.pending_constraints.expand(evaluation)
+        }
+    }
+    impl<P: PlanValueKind> Expand for SavedCompositionSignature<P> {
+        fn expand(&mut self, evaluation: &PlanningEvaluation) -> Result<(), SerializationError> {
+            self.arguments.expand(evaluation)?;
+            self.attributes.expand(evaluation)?;
+            self.pending_constraints.expand(evaluation)
+        }
+    }
+    impl<P: PlanValueKind> Expand for LiveCompositionArgument<P> {
+        fn expand(&mut self, evaluation: &PlanningEvaluation) -> Result<(), SerializationError> {
+            self.operand = self.operand.clone().try_map_stage(&mut |value| {
+                evaluation
+                    .expression(&value)
+                    .map(|pair| pair.into_expression())
+                    .map_err(SerializationError::from)
+            })?;
+            Ok(())
+        }
+    }
+    impl<P: PlanValueKind> Expand for SavedCompositionArgument<P> {
+        fn expand(&mut self, evaluation: &PlanningEvaluation) -> Result<(), SerializationError> {
+            self.value.expand(evaluation)
+        }
+    }
+    impl<P: PlanValueKind> Expand for LiveCompositionAttribute<P> {
+        fn expand(&mut self, evaluation: &PlanningEvaluation) -> Result<(), SerializationError> {
+            *self = self.try_map_value(|value| {
+                evaluation
+                    .expression(value)
+                    .map(|pair| pair.into_expression())
+                    .map_err(SerializationError::from)
+            })?;
+            Ok(())
+        }
+    }
+    impl<P: PlanValueKind> Expand for SavedCompositionAttribute<P> {
+        fn expand(&mut self, evaluation: &PlanningEvaluation) -> Result<(), SerializationError> {
+            match &mut self.value {
+                SavedCompositionAttributeValue::Derived(value) => value.expand(evaluation),
+                SavedCompositionAttributeValue::Forwarded(_path) => Ok(()),
+            }
+        }
+    }
+    impl<P: PlanValueKind> Expand for PendingModuleConstraint<P> {
+        fn expand(&mut self, evaluation: &PlanningEvaluation) -> Result<(), SerializationError> {
+            self.expression = self.expression.try_map_stage(&mut |value| {
+                evaluation
+                    .expression(value)
+                    .map(|pair| pair.into_expression())
+                    .map_err(SerializationError::from)
+            })?;
+            Ok(())
+        }
+    }
+}

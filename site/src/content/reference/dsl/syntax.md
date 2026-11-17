@@ -174,6 +174,17 @@ awscc.ec2.Vpc {
 
 If the schema declares identity paths, Carina generates the resource's state identity from only those values; paths may name top-level attributes or nested struct fields whose leaf is a scalar or enum. Other create-only values can force replacement without changing the address. Written values are schema-canonicalized. References and composite expressions over references and literals are hashed by their deterministic authored spelling, so their addresses stay stable after apply-time resolution; generated names hash a separately typed prefix. A missing required identity value or a written expression containing an unknown or unavailable leaf is an error: write the value or bind the resource with `let`. An omitted optional `identity_when_present()` value contributes an absence marker. A schema with no declared identity falls back to configured top-level create-only attributes and, when none are configured, to the resource's other attributes. Multiple resources using that attribute-derived fallback are rejected as ambiguous. Equal declared identity values, including equal expression spellings plus equal written values, are also rejected.
 
+When upgrading a module-body anonymous resource whose declared identity attribute contains a user-defined function call retained for declared value checks, its address changes to use the call's authored spelling, as at the root. Planning stops and asks for a `moved` block. Copy the old and new addresses from that diagnostic:
+
+```crn
+moved {
+  from = awscc.ec2.Vpc 'module_instance.old_address'
+  to   = awscc.ec2.Vpc 'module_instance.new_address'
+}
+```
+
+Resources whose schemas use mutable attributes or create-only attributes without a declared identity move automatically. Named resources and root-level resources keep their addresses.
+
 ### Named Resources (Let Bindings)
 
 Use `let` to bind a name to a resource so you can reference its attributes:

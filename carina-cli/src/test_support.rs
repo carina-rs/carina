@@ -632,3 +632,16 @@ pub(crate) fn install_mock_wasm(directory: &std::path::Path) {
     std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
     std::fs::copy(source, installed).unwrap();
 }
+
+// The legacy error projection is used only by test adapters. Production keeps
+// PresentedAppError intact through its renderer.
+pub(crate) fn render_presented_error(
+    error: crate::error::PresentedAppError,
+) -> crate::error::AppError {
+    match error {
+        crate::error::PresentedAppError::Ordinary(error) => error,
+        crate::error::PresentedAppError::Conversion(error) => {
+            crate::error::AppError::Validation(error.to_string())
+        }
+    }
+}

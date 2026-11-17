@@ -1490,6 +1490,26 @@ where
             >,
         >,
 {
+    pub(crate) fn try_transform_values<E>(
+        &mut self,
+        transform: &mut impl FnMut(&Value<LoopSlot>) -> Result<Value<LoopSlot>, E>,
+    ) -> Result<(), E> {
+        fn setting<T, E>(
+            value: &mut LoopDirective<T, AbsoluteBindingAddress>,
+            transform: &mut impl FnMut(&Value<LoopSlot>) -> Result<Value<LoopSlot>, E>,
+        ) -> Result<(), E> {
+            match value {
+                LoopDirective::Resolved(_value) => Ok(()),
+                LoopDirective::PerElement(expression) => {
+                    expression.value = transform(&expression.value)?;
+                    Ok(())
+                }
+            }
+        }
+        setting(&mut self.force_delete, transform)?;
+        setting(&mut self.create_before_destroy, transform)?;
+        setting(&mut self.prevent_destroy, transform)
+    }
     pub(crate) fn try_visit_values<E>(
         &self,
         visit: &mut impl FnMut(&Value<LoopSlot>) -> Result<(), E>,

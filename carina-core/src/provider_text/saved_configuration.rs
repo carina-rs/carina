@@ -97,11 +97,26 @@ impl SavedProviderConfiguration<SnapshotLeaf, SavedInputsResolved> {
         SavedProviderConfiguration<NoPlaceholder, SavedInputsResolved>,
         crate::value::SecretRehydrationSiteError,
     > {
+        self.rehydrate_using(
+            resources,
+            data_sources,
+            &crate::value::SecretRehydration::evaluated(),
+        )
+    }
+    pub fn rehydrate_using(
+        &self,
+        resources: &HashMap<ResourceId, Resource>,
+        data_sources: &HashMap<ResourceId, DataSource>,
+        rehydration: &crate::value::SecretRehydration<'_>,
+    ) -> Result<
+        SavedProviderConfiguration<NoPlaceholder, SavedInputsResolved>,
+        crate::value::SecretRehydrationSiteError,
+    > {
         let resources = self
             .resources
             .iter()
             .map(|saved| match resources.get(&saved.id) {
-                Some(fresh) => crate::value::rehydrate_resource_secrets(saved, fresh),
+                Some(fresh) => rehydration.resource(saved, fresh),
                 None => saved.to_value_resource().map_err(Into::into),
             })
             .collect::<Result<_, _>>()?;
@@ -109,7 +124,7 @@ impl SavedProviderConfiguration<SnapshotLeaf, SavedInputsResolved> {
             .data_sources
             .iter()
             .map(|saved| match data_sources.get(&saved.id) {
-                Some(fresh) => crate::value::rehydrate_data_source_secrets(saved, fresh),
+                Some(fresh) => rehydration.data_source(saved, fresh),
                 None => saved.to_value_data_source().map_err(Into::into),
             })
             .collect::<Result<_, _>>()?;
