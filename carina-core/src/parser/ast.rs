@@ -3737,11 +3737,28 @@ pub struct UserFunction<B: BindingAddress = RelativeBindingName> {
     pub body: UserFunctionBody<B>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static USER_FUNCTION_BINDING_MAP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_user_function_binding_map_count<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    USER_FUNCTION_BINDING_MAP_COUNT.with(|count| {
+        count.set(0);
+        let result = f();
+        (result, count.replace(0))
+    })
+}
+
 impl<B: BindingAddress> UserFunction<B> {
     pub(crate) fn map_bindings<T: BindingAddress>(
         self,
         map: &mut impl FnMut(B) -> T,
     ) -> UserFunction<T> {
+        #[cfg(test)]
+        USER_FUNCTION_BINDING_MAP_COUNT.with(|count| count.set(count.get() + 1));
+
         UserFunction {
             type_annotations: self.type_annotations,
             name: self.name,
