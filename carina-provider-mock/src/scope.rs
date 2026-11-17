@@ -33,7 +33,7 @@ pub(crate) struct ScopeLock<'a> {
 
 impl MockScope {
     pub fn memory() -> Self {
-        Self::new(Store::Memory(Mutex::new(MockStates::new())))
+        Self::new(Store::Memory(Mutex::new(MockStates::default())))
     }
 
     pub fn file(path: PathBuf) -> io::Result<Self> {
@@ -111,7 +111,7 @@ impl ScopeLock<'_> {
                 .clone()),
             Store::File(path) => match path.read_to_string() {
                 Ok(content) => crate::MockProvider::decode_state_file(&content),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(MockStates::new()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(MockStates::default()),
                 Err(error) => Err(error),
             },
         }
@@ -131,7 +131,8 @@ impl ScopeLock<'_> {
                 }
                 let content = carina_core::utils::pretty_with_newline(&crate::MockStateFileRef {
                     version: crate::MOCK_STATE_VERSION,
-                    states,
+                    states: &states.states,
+                    data_sources: &states.data_sources,
                 })?;
                 path.atomic_replace(content.as_bytes())
             }
@@ -243,14 +244,18 @@ mod tests {
                     for item in 0..32 {
                         let transaction = scope.lock().unwrap();
                         let mut states = transaction.load().unwrap();
-                        states.insert(format!("worker-{worker}-{item}"), HashMap::new());
+                        states.states.insert(
+                            crate::AppliedIdentifier::new(format!("worker-{worker}-{item}"))
+                                .unwrap(),
+                            HashMap::new(),
+                        );
                         std::thread::yield_now();
                         transaction.save(&states).unwrap();
                     }
                 });
             }
         });
-        assert_eq!(first.lock().unwrap().load().unwrap().len(), 64);
+        assert_eq!(first.lock().unwrap().load().unwrap().states.len(), 64);
     }
 
     #[test]
@@ -293,7 +298,7 @@ mod tests {
         let alias = MockScope::file(project.join("jump/../missing/../state.json")).unwrap();
         assert!(Arc::ptr_eq(&scope.0, &alias.0));
         assert!(!private.join("missing").exists());
-        alias.lock().unwrap().save(&MockStates::new()).unwrap();
+        alias.lock().unwrap().save(&MockStates::default()).unwrap();
         assert!(private.join("state.json").is_file());
         assert!(!project.join("state.json").exists());
     }

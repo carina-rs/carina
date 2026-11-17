@@ -209,17 +209,17 @@ provider mock {}
     }
 
     fn seed_mock_provider_state(&self) {
-        let provider_state = serde_json::json!({
-            "test.resource.validation_records[0]": {
+        let provider_state = serde_json::json!({"version": 3, "states": {
+            "old-validation-id": {
                 "name": "old-validation-token",
                 "identifier": "old-validation-id"
             },
-            "test.resource.consumer": {
+            "mock-id": {
                 "name": "consumer",
                 "identifier": "consumer-id",
                 "web_acl_arn": "old-validation-id"
             }
-        });
+        }});
         fs::write(
             &self.mock_state_path,
             carina_core::utils::pretty_with_newline(&provider_state).unwrap(),

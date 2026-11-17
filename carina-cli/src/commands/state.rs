@@ -5159,10 +5159,10 @@ mod tests {
         fixture.write_state(&initial_state);
 
         let provider_state_path = fixture.readiness_path("mock-provider-state.json");
-        let provider_state = std::collections::HashMap::from([(
-            "test.resource.managed".to_string(),
-            serde_json::json!({ "name": "managed" }),
-        )]);
+        let provider_state = serde_json::json!({
+            "version": 3,
+            "states": {"mock-id": serde_json::json!({ "name": "managed" })},
+        });
         std::fs::write(
             &provider_state_path,
             carina_core::utils::pretty_with_newline(&provider_state)

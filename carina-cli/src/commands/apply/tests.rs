@@ -1294,7 +1294,8 @@ async fn run_saved_plan_schema_fingerprint_case(
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     let op_log_path = tmp.path().join("provider-operations.log");
-    std::fs::write(&mock_state_path, "{}").expect("empty mock provider state");
+    std::fs::write(&mock_state_path, r#"{"version":3,"states":{}}"#)
+        .expect("empty mock provider state");
     fixture.configure_mock(
         carina_provider_mock::MockBehavior {
             observations: carina_provider_mock::MockObservations {
@@ -1397,7 +1398,10 @@ async fn run_saved_plan_schema_fingerprint_case(
     .await;
     assert_eq!(fixture.runtime().provider_load_count(), 1);
     if matches!(result, Err(AppError::SavedPlanSchemaMismatch(_))) {
-        assert_eq!(std::fs::read_to_string(&mock_state_path).unwrap(), "{}");
+        assert_eq!(
+            std::fs::read_to_string(&mock_state_path).unwrap(),
+            r#"{"version":3,"states":{}}"#
+        );
     }
     let operations = std::fs::read_to_string(op_log_path).unwrap_or_default();
     (result, operations)
@@ -1448,7 +1452,7 @@ fn concurrent_cli_invocations_keep_mock_runtime_separate() {
                 orphan.set_persisted_attribute("name".to_owned(), serde_json::json!("scope-b"));
                 state.upsert_resource(orphan).unwrap();
                 fixture.write_state(&state);
-                let encoded = serde_json::json!({"test.resource.orphan": {"name": "scope-b"}}).to_string();
+                let encoded = serde_json::json!({"version": 3, "states": {"mock-id": {"name": "scope-b"}}}).to_string();
                 std::fs::write(&provider_state, &encoded).unwrap();
                 fixture.configure_mock(carina_provider_mock::MockBehavior {
                     observations: carina_provider_mock::MockObservations { operation_log: Some(log.clone()), ..Default::default() },
@@ -2176,7 +2180,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
     std::fs::write(
         &mock_state_path,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "test.resource.example": { "name": "drifted" }
+            "version": 3, "states": {"mock-id": { "name": "drifted" }}
         }))
         .expect("serialize provider state"),
     )
@@ -2334,7 +2338,7 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
     std::fs::write(
         &mock_state_path,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "test.resource.example": { "name": "drifted" }
+            "version": 3, "states": {"example-id": { "name": "drifted" }}
         }))
         .expect("serialize provider state"),
     )
@@ -4763,9 +4767,9 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
     std::fs::write(
         &mock_state_path,
         serde_json::json!({
-            "iam.Roles.lookup": {
+            "version": 3, "states": {}, "data_sources": {"iam.Roles.lookup": {
                 "names": ["target"]
-            }
+            }}
         })
         .to_string(),
     )
@@ -4966,7 +4970,8 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
     let tmp = tempfile::tempdir().expect("tempdir");
     let mock_state_path = tmp.path().join("mock-provider-state.json");
     let op_log_path = tmp.path().join("op.log");
-    std::fs::write(&mock_state_path, "{}").expect("empty mock provider state");
+    std::fs::write(&mock_state_path, r#"{"version":3,"states":{}}"#)
+        .expect("empty mock provider state");
 
     fixture.configure_mock(
         carina_provider_mock::MockBehavior {

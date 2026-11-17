@@ -2874,9 +2874,12 @@ import {
     fs::write(
         &scenario.mock_state,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "test.resource.imported-secret": {
-                "name": "imported-secret",
-                "comment": "provider-existing"
+            "version": 3,
+            "states": {
+                format!("{PLAINTEXT}|tail"): {
+                    "name": "imported-secret",
+                    "comment": "provider-existing"
+                }
             }
         }))
         .expect("serialize import provider state"),

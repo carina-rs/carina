@@ -1,3 +1,6 @@
+#[path = "support/mock_state.rs"]
+mod mock_state;
+
 use std::{
     fs,
     process::{Command, Output},
@@ -298,7 +301,7 @@ fn pending_inputs_saves_without_certificates_and_live_apply_discharges_before_cr
         serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
             .unwrap();
     assert_eq!(
-        provider_state["states"]["test.creation_constrained.pending"]["name"],
+        provider_state["states"][&mock_state::identifier(fixture.0.path(), "pending")]["name"],
         "suffix-id"
     );
     assert!(fixture.0.path().join("carina.state.json").exists());
@@ -489,7 +492,7 @@ fn saved_input_discharge_applies_valid_runtime_value() {
         serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
             .unwrap();
     assert_eq!(
-        state["states"]["test.estimated_input.consumer"]["name"],
+        state["states"][&mock_state::identifier(fixture.0.path(), "consumer")]["name"],
         "short-id"
     );
     assert_eq!(
@@ -575,8 +578,8 @@ fn saved_input_discharge_runtime_violation_preserves_replaced_resource() {
         serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
             .unwrap();
     assert_eq!(
-        after["states"]["test.estimated_input.consumer"],
-        before["states"]["test.estimated_input.consumer"]
+        after["states"][&mock_state::identifier(fixture.0.path(), "consumer")],
+        before["states"][&mock_state::identifier(fixture.0.path(), "consumer")]
     );
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(fixture.0.path().join("carina.state.json")).unwrap())
