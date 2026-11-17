@@ -576,6 +576,9 @@ fn unresolved_attribute_diagnostic(
         | Value::Concrete(ConcreteValue::Bool(_))
         | Value::Concrete(ConcreteValue::Duration(_))
         | Value::Concrete(ConcreteValue::StringList(_)) => None,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -741,6 +744,9 @@ fn collect_unresolved_bindings<'a>(
         | Value::Concrete(ConcreteValue::Bool(_))
         | Value::Concrete(ConcreteValue::Duration(_))
         | Value::Concrete(ConcreteValue::StringList(_)) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 

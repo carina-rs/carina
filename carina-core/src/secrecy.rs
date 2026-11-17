@@ -961,6 +961,7 @@ impl<B: BindingAddress> Owner<'_, B> {
                         | DeferredValue::Placeholder(_)
                         | DeferredValue::Unknown(_),
                     ) => {}
+                    Value::Reference(never) | Value::Conversion(never) => match *never {},
                 }
             }
             graph.insert(owner, dependencies);
@@ -3413,6 +3414,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                 }
                 DeferredValue::Unknown(_) => values.push(None),
             },
+            Value::Reference(never) | Value::Conversion(never) => match *never {},
         }
     }
     fn begin_value_function(

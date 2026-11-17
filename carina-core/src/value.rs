@@ -962,6 +962,16 @@ fn value_to_json_inner<P: crate::resource::StateValueLeaf>(
             SnapshotLeaf::RedactedSecret { hash } => Ok(persisted_secret_json(&hash)),
             SnapshotLeaf::Expression(never) => match never {},
         },
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
     }
 }
 
@@ -1992,6 +2002,12 @@ fn format_value_into_context<P: ValueKind, B: BindingAddress>(
                 sink.write_token(ValueSpanKind::Other, &placeholder.render())
             }
         }
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -2270,6 +2286,12 @@ pub fn contains_secret<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> 
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -2332,6 +2354,7 @@ pub fn contains_unredacted_secret(value: &Value) -> bool {
             | DeferredValue::Unknown(_),
         ) => false,
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Reference(never) | Value::Conversion(never) => match *never {},
     }
 }
 
@@ -2598,6 +2621,9 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
             | ConcreteValue::StringList(_),
         ) => false,
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -2892,6 +2918,16 @@ fn canonical_secret_template<P: PlaceholderKind>(
                 }
             })?,
         ),
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
     })
 }
 
@@ -5842,6 +5878,12 @@ fn canonical_map_key_text<H: ValueKind, B: BindingAddress>(
             "String or Enum map key".to_string(),
             unexpected.type_name(),
         )),
+        crate::resource::Value::Reference(never) => {
+            match *<H as crate::resource::ValueKind>::no_reference_payload::<B>(&never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<H as crate::resource::ValueKind>::no_conversion_payload::<B>(&never) {}
+        }
     }
 }
 
@@ -6346,6 +6388,12 @@ fn first_enum_identifier_inner<H: ValueKind, B: BindingAddress>(
             | DeferredValue::BindingRef { .. },
         ) => None,
         Value::Deferred(DeferredValue::Placeholder(_)) => None,
+        crate::resource::Value::Reference(never) => {
+            match *<H as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<H as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 

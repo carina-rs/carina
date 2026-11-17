@@ -173,6 +173,9 @@ fn visit_unknowns(
         | Value::Deferred(DeferredValue::ResourceRef { .. })
         | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 

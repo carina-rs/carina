@@ -1029,6 +1029,8 @@ fn typed_resource_attribute_admissions<
                 | DeferredValue::Unknown(_)
                 | DeferredValue::Placeholder(_),
             ) => return Ok(Default::default()),
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         }
         enum Evidence<'a, B: BindingAddress> {
             Node(crate::parser::retained::JudgedNodeRef<'a, B>),
@@ -1139,6 +1141,8 @@ fn typed_resource_attribute_admissions<
                             }
                         }
                         Value::Concrete(_) | Value::Deferred(_) => expression,
+                        crate::resource::Value::Reference(never)
+                        | crate::resource::Value::Conversion(never) => match *never {},
                     };
                     crate::validation::check_deferred_access_type(
                         access,
@@ -1234,6 +1238,8 @@ fn typed_resource_attribute_admissions<
                 | DeferredValue::Unknown(_)
                 | DeferredValue::Placeholder(_),
             ) => {}
+            crate::resource::Value::Reference(never)
+            | crate::resource::Value::Conversion(never) => match *never {},
         }
         Ok(Default::default())
     };

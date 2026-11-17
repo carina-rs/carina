@@ -25,6 +25,12 @@ impl SourceKnowledge {
                     Self::Deferred
                 }
             }
+            CheckValue::Current(crate::resource::Value::Reference(never)) => {
+                match *P::no_reference_payload::<B>(never) {}
+            }
+            CheckValue::Current(crate::resource::Value::Conversion(never)) => {
+                match *P::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 }

@@ -2734,6 +2734,9 @@ pub fn try_core_to_protocol_persisted_value(
         Value::Deferred(deferred) => Err(ProtocolConvertError::NonWireValue {
             variant: deferred_value_variant(deferred),
         }),
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 

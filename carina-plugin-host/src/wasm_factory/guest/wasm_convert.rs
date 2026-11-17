@@ -205,6 +205,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             Ok(wit::Value::SecretVal(json_str))
         }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        CoreValue::Reference(never) | CoreValue::Conversion(never) => match *never {},
     }
 }
 
@@ -583,6 +584,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             inner.project_plaintext_json_for_transport(core_value_to_json)
         }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        CoreValue::Reference(never) | CoreValue::Conversion(never) => match *never {},
     }
 }
 

@@ -1256,6 +1256,16 @@ pub(super) fn protected_paths<P: crate::resource::ValueKind>(
         Value::Concrete(ConcreteValue::Float(_value)) => {}
         Value::Concrete(ConcreteValue::Bool(_value)) => {}
         Value::Concrete(ConcreteValue::Duration(_value)) => {}
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
     }
 }
 

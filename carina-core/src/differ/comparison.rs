@@ -1461,6 +1461,9 @@ fn contains_pending_reread(value: &Value) -> bool {
             | DeferredValue::Unknown(_),
         ) => false,
         Value::Deferred(DeferredValue::Placeholder(_)) => false,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 
@@ -1702,6 +1705,9 @@ fn has_observable_content(value: &Value) -> bool {
         | Value::Deferred(DeferredValue::Unknown(_))
         | Value::Deferred(DeferredValue::Unavailable { .. }) => true,
         Value::Deferred(DeferredValue::Placeholder(_)) => true,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 

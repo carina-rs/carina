@@ -307,6 +307,7 @@ fn public_json_value(value: &SnapshotValue) -> Result<serde_json::Value, &'stati
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::Expression(never))) => {
             match *never {}
         }
+        Value::Reference(never) | Value::Conversion(never) => match *never {},
     }
 }
 

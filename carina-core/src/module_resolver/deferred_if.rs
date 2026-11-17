@@ -159,6 +159,12 @@ fn value_contains_module_if_inner<P: ModuleIfAuditPlaceholder, B: BindingAddress
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
             placeholder.contains_module_if()
         }
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 

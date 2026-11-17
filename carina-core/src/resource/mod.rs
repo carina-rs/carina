@@ -2801,6 +2801,12 @@ fn select_classified_segment<P: PlaceholderKind, B: BindingAddress>(
                     | DeferredValue::Placeholder(_),
                 ) => deferred_access(base.diagnostic_value().clone(), step, source_line),
                 Value::Concrete(_) => unreachable!("concrete roots carry classified structure"),
+                crate::resource::Value::Reference(never) => {
+                    match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+                }
+                crate::resource::Value::Conversion(never) => {
+                    match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+                }
             };
             Ok(ValuePathSegmentResult::Deferred(value))
         }
@@ -2958,10 +2964,14 @@ pub(crate) mod duration_secs {
 /// inner enums' externally-tagged defaults — exactly the legacy
 /// JSON shape.
 #[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum Value<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
+#[serde(untagged, bound(serialize = "P: ValueKind, B: Serialize"))]
+pub enum Value<P: ValueShape = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     Concrete(ConcreteValue<P, B>),
     Deferred(DeferredValue<P, B>),
+    #[serde(skip)]
+    Reference(P::ReferencePayload<B>),
+    #[serde(skip)]
+    Conversion(P::ConversionPayload<B>),
 }
 
 /// Value tree in the authored, pre-expansion binding phase.
@@ -3137,7 +3147,11 @@ impl<'de> Deserialize<'de> for ValueString {
 /// let _: carina_core::resource::ExpandedConcreteValue = carina_core::resource::ConcreteValue::Float(f64::NAN);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ConcreteValue<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
+#[serde(bound(
+    serialize = "P: ValueKind, B: Serialize",
+    deserialize = "P: ValueKind + Deserialize<'de>, B: Deserialize<'de>"
+))]
+pub enum ConcreteValue<P: ValueShape = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     String(ValueString),
     /// An enum identifier — a value written in the DSL as a bare
     /// identifier (`tcp`) or namespaced identifier
@@ -3178,9 +3192,9 @@ pub type ExpandedConcreteValue = ConcreteValue<NoPlaceholder, AbsoluteBindingAdd
 /// [`crate::eval_value::UnexpandedStructuralHandleMetadata`] is intentionally separate:
 /// it is a pre-classification tree for directory fixed-point parsing, whereas
 /// this enum represents one already-classified argument operand.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) enum StructuralOperand<
-    P: ValueKind = NoPlaceholder,
+    P: ValueShape = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
     Value {
@@ -3204,7 +3218,7 @@ pub(crate) enum StructuralOperand<
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StructuralOperandRef<
     'a,
-    P: ValueKind = NoPlaceholder,
+    P: ValueShape = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
     Value(&'a Value<P, B>),
@@ -3423,9 +3437,9 @@ impl<'a, P: ValueKind, B: BindingAddress> StructuralOperandRef<'a, P, B> {
 /// parsing can carry a structural argument across a sibling/forward function
 /// lookup without lowering it into the public value model. It is consumed by
 /// function resolution before plans or state are serialized.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct FunctionArgument<
-    P: ValueKind = NoPlaceholder,
+    P: ValueShape = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
     operand: StructuralOperand<P, B>,
@@ -3541,15 +3555,24 @@ impl<P: ValueKind, B: BindingAddress> From<Value<P, B>> for FunctionArgument<P, 
     }
 }
 
-impl<P: ValueKind + fmt::Debug, B: BindingAddress> fmt::Debug for FunctionArgument<P, B> {
+impl<P: ValueShape, B: BindingAddress> fmt::Debug for FunctionArgument<P, B> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self.operand.value_ref() {
-            StructuralOperandRef::Value(value) => value.fmt(f),
-            StructuralOperandRef::Handle { handle, .. } => f
+        match &self.operand {
+            StructuralOperand::Value {
+                value,
+                access_base: _,
+            } => value.fmt(f),
+            StructuralOperand::Handle {
+                handle,
+                access_base: _,
+            } => f
                 .debug_tuple("StructuralHandleArgument")
                 .field(handle)
                 .finish(),
-            StructuralOperandRef::Parameter { name, .. } => f
+            StructuralOperand::Parameter {
+                name,
+                access_base: _,
+            } => f
                 .debug_tuple("ForwardedParameterArgument")
                 .field(&name)
                 .finish(),
@@ -3976,7 +3999,7 @@ impl fmt::Display for UnavailableReason {
 /// Deferred-axis variants: placeholders that resolve later
 /// (apply time, upstream load, function evaluation).
 #[derive(Clone)]
-pub enum DeferredValue<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
+pub enum DeferredValue<P: ValueShape = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     /// A value-level `if` whose condition depends on a reusable module
     /// argument. Module expansion selects a branch after call-site
     /// substitution; it cannot cross the expansion boundary.
@@ -4084,7 +4107,7 @@ enum LoopAccessDisplayRoot {
 }
 
 #[derive(Clone)]
-pub struct AccessExpr<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
+pub struct AccessExpr<P: ValueShape = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     base: Box<Value<P, B>>,
     step: PathSegment,
     source_line: usize,
@@ -4574,6 +4597,12 @@ where
                     Value::Concrete(_) => Err(serde::de::Error::custom(
                         "serialized deferred access resolved to a concrete value",
                     )),
+                    crate::resource::Value::Reference(never) => {
+                        match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(&never) {}
+                    }
+                    crate::resource::Value::Conversion(never) => {
+                        match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(&never) {}
+                    }
                 }
             }
             DeserializableDeferredValue::Secret(inner) => {
@@ -4740,7 +4769,7 @@ where
     }
 }
 
-impl<P: ValueKind + fmt::Debug, B: BindingAddress> fmt::Debug for DeferredValue<P, B> {
+impl<P: ValueShape, B: BindingAddress> fmt::Debug for DeferredValue<P, B> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::ModuleIf(deferred) => f.debug_tuple("ModuleIf").field(deferred).finish(),
@@ -4787,7 +4816,7 @@ impl<P: ValueKind + fmt::Debug, B: BindingAddress> fmt::Debug for DeferredValue<
                 function,
                 args,
                 source_line,
-                ..
+                functions: _,
             } => f
                 .debug_struct("ResolvedFunctionCall")
                 .field("name", &function.name)
@@ -4796,10 +4825,16 @@ impl<P: ValueKind + fmt::Debug, B: BindingAddress> fmt::Debug for DeferredValue<
                 .finish(),
             Self::Access(access) => f
                 .debug_struct("Access")
-                .field("base", access.base())
-                .field("step", access.step())
-                .field("source_line", &access.source_line())
-                .field("display_root", &access.display_root())
+                .field("base", &access.base)
+                .field("step", &access.step)
+                .field("source_line", &access.source_line)
+                .field(
+                    "display_root",
+                    &access.display_root.as_ref().and_then(|root| match root {
+                        LoopAccessDisplayRoot::Rooted(text) => Some(text.as_str()),
+                        LoopAccessDisplayRoot::DeferredMiss(_) => None,
+                    }),
+                )
                 .finish(),
             Self::Secret(_) => write!(f, "Secret({})", crate::schema::SECRET_VALUE_MASK),
             Self::Unknown(reason) => f.debug_tuple("Unknown").field(reason).finish(),
@@ -5694,6 +5729,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 | DeferredValue::Unknown(_),
             ) => false,
             Value::Deferred(DeferredValue::Placeholder(_)) => false,
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 
@@ -5724,6 +5765,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 ConcreteValue::Map(map) => ConcreteValueRef::Map(map),
             }),
             Value::Deferred(_) => None,
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 
@@ -5785,6 +5832,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 }
             }),
             Value::Concrete(_) => None,
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 }
@@ -6293,9 +6346,29 @@ impl std::fmt::Display for ParserPlaceholder {
     }
 }
 
-/// Internal behavior shared by the three stage marker types.
+// Storage kinds are externally sealed. Only reader kinds implement ValueKind.
+mod value_shape {
+    pub trait Sealed {}
+    pub trait ValueShape: Sealed + Clone + std::fmt::Debug {
+        type ReferencePayload<B: super::BindingAddress>: Clone + std::fmt::Debug;
+        type ConversionPayload<B: super::BindingAddress>: Clone + std::fmt::Debug;
+    }
+    #[derive(Clone, Debug)]
+    pub enum NoReferencePayload {}
+}
+pub(crate) use value_shape::Sealed as ValueShapeSealed;
 #[doc(hidden)]
-pub trait ValueKind: Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize {
+pub use value_shape::{NoReferencePayload, ValueShape};
+
+/// Internal reader behavior shared by value stage marker types.
+#[doc(hidden)]
+pub trait ValueKind: ValueShape + PartialEq + fmt::Display + serde::Serialize {
+    fn no_reference_payload<B: BindingAddress>(
+        payload: &Self::ReferencePayload<B>,
+    ) -> &NoReferencePayload;
+    fn no_conversion_payload<B: BindingAddress>(
+        payload: &Self::ConversionPayload<B>,
+    ) -> &NoReferencePayload;
     fn construct_access<B: BindingAddress>(
         base: Value<Self, B>,
         step: PathSegment,
@@ -6396,7 +6469,23 @@ impl PlaceholderKind for NoPlaceholder {}
 impl PlaceholderKind for ParserPlaceholder {}
 impl PlaceholderKind for LoopSlot {}
 
+impl ValueShapeSealed for NoPlaceholder {}
+impl ValueShape for NoPlaceholder {
+    type ReferencePayload<B: BindingAddress> = NoReferencePayload;
+    type ConversionPayload<B: BindingAddress> = NoReferencePayload;
+}
 impl ValueKind for NoPlaceholder {
+    fn no_reference_payload<B: BindingAddress>(
+        payload: &Self::ReferencePayload<B>,
+    ) -> &NoReferencePayload {
+        payload
+    }
+    fn no_conversion_payload<B: BindingAddress>(
+        payload: &Self::ConversionPayload<B>,
+    ) -> &NoReferencePayload {
+        payload
+    }
+
     fn construct_access<B: BindingAddress>(
         base: Value<Self, B>,
         step: PathSegment,
@@ -6446,7 +6535,23 @@ impl fmt::Display for LoopSlot {
     }
 }
 
+impl ValueShapeSealed for LoopSlot {}
+impl ValueShape for LoopSlot {
+    type ReferencePayload<B: BindingAddress> = NoReferencePayload;
+    type ConversionPayload<B: BindingAddress> = NoReferencePayload;
+}
 impl ValueKind for LoopSlot {
+    fn no_reference_payload<B: BindingAddress>(
+        payload: &Self::ReferencePayload<B>,
+    ) -> &NoReferencePayload {
+        payload
+    }
+    fn no_conversion_payload<B: BindingAddress>(
+        payload: &Self::ConversionPayload<B>,
+    ) -> &NoReferencePayload {
+        payload
+    }
+
     fn construct_access<B: BindingAddress>(
         base: Value<Self, B>,
         step: PathSegment,
@@ -6503,7 +6608,23 @@ impl ValueKind for LoopSlot {
     }
 }
 
+impl ValueShapeSealed for ParserPlaceholder {}
+impl ValueShape for ParserPlaceholder {
+    type ReferencePayload<B: BindingAddress> = NoReferencePayload;
+    type ConversionPayload<B: BindingAddress> = NoReferencePayload;
+}
 impl ValueKind for ParserPlaceholder {
+    fn no_reference_payload<B: BindingAddress>(
+        payload: &Self::ReferencePayload<B>,
+    ) -> &NoReferencePayload {
+        payload
+    }
+    fn no_conversion_payload<B: BindingAddress>(
+        payload: &Self::ConversionPayload<B>,
+    ) -> &NoReferencePayload {
+        payload
+    }
+
     fn construct_access<B: BindingAddress>(
         base: Value<Self, B>,
         step: PathSegment,
@@ -6659,6 +6780,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 | DeferredValue::Unknown(_)
                 | DeferredValue::Placeholder(_),
             ) => None,
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(&never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(&never) {}
+            }
         }
     }
 
@@ -6743,6 +6870,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 | DeferredValue::BindingRef { .. }
                 | DeferredValue::Unknown(_),
             ) => {}
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 
@@ -6887,6 +7020,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 Value::Deferred(DeferredValue::Unknown(reason))
             }
             Self::Deferred(DeferredValue::Placeholder(placeholder)) => map(placeholder)?,
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(&never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(&never) {}
+            }
         })
     }
 }
@@ -6973,9 +7112,15 @@ where
 }
 
 /// A part of a string interpolation expression
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum InterpolationPart<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress>
-{
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "P: ValueKind, B: Serialize",
+    deserialize = "P: ValueKind + Deserialize<'de>, B: Deserialize<'de>"
+))]
+pub enum InterpolationPart<
+    P: ValueShape = NoPlaceholder,
+    B: BindingAddress = AbsoluteBindingAddress,
+> {
     /// Literal text segment
     Literal(ValueString),
     /// An expression to be evaluated and converted to string
@@ -7055,6 +7200,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         match self {
             Value::Concrete(value) => Value::Concrete(value.map_bindings(map)),
             Value::Deferred(value) => Value::Deferred(value.map_bindings(map)),
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(&never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(&never) {}
+            }
         }
     }
 }
@@ -7388,13 +7539,13 @@ impl<P: ValueKind + PartialEq, B: BindingAddress> PartialEq for Value<P, B> {
                     function: af,
                     args: aa,
                     source_line: al,
-                    ..
+                    functions: _,
                 }),
                 Value::Deferred(DeferredValue::ResolvedFunctionCall {
                     function: bf,
                     args: ba,
                     source_line: bl,
-                    ..
+                    functions: _,
                 }),
             ) => af.name == bf.name && aa == ba && al == bl,
             (
@@ -7775,6 +7926,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             // upstream of the stamping pass.
             Value::Deferred(DeferredValue::Unknown(_)) => {}
             Value::Deferred(DeferredValue::Placeholder(_)) => {}
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 
@@ -7872,6 +8029,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             // reference to walk.
             Value::Deferred(DeferredValue::Unknown(_)) => {}
             Value::Deferred(DeferredValue::Placeholder(_)) => {}
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 }
@@ -8116,6 +8279,12 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 } else {
                     leaf.to_string().hash(hasher);
                 }
+            }
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
             }
         }
     }
@@ -10846,6 +11015,16 @@ fn unresolved_value_error<P: PlaceholderKind>(
                 operation: "known-value projection",
             },
         )),
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<
+                crate::resource::AbsoluteBindingAddress,
+            >(never) {}
+        }
     }
 }
 
@@ -11705,3 +11884,84 @@ pub(crate) mod known_value_gate_tests {
         }
     }
 }
+
+impl<P: ValueKind, B: BindingAddress> PartialEq for StructuralOperand<P, B> {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            Self::Value {
+                value: a,
+                access_base: ab,
+            } => {
+                if let Self::Value {
+                    value: b,
+                    access_base: bb,
+                } = other
+                {
+                    a == b && ab == bb
+                } else {
+                    false
+                }
+            }
+            Self::Handle {
+                handle: a,
+                access_base: ab,
+            } => {
+                if let Self::Handle {
+                    handle: b,
+                    access_base: bb,
+                } = other
+                {
+                    a == b && ab == bb
+                } else {
+                    false
+                }
+            }
+            Self::Parameter {
+                name: a,
+                access_base: ab,
+            } => {
+                if let Self::Parameter {
+                    name: b,
+                    access_base: bb,
+                } = other
+                {
+                    a == b && ab == bb
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+impl<P: ValueKind, B: BindingAddress> PartialEq for FunctionArgument<P, B> {
+    fn eq(&self, other: &Self) -> bool {
+        let Self { operand: a } = self;
+        let Self { operand: b } = other;
+        a == b
+    }
+}
+impl<P: ValueKind, B: BindingAddress> PartialEq for InterpolationPart<P, B> {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            Self::Literal(a) => {
+                if let Self::Literal(b) = other {
+                    a == b
+                } else {
+                    false
+                }
+            }
+            Self::Expr(a) => {
+                if let Self::Expr(b) = other {
+                    a == b
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+mod storage;
+#[cfg(feature = "test-utils")]
+pub(crate) use storage::{copy_storage, same_plain_representation};

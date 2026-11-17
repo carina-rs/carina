@@ -57,6 +57,7 @@ fn record_projection_copy(value: &Value<ParserPlaceholder, RelativeBindingName>)
                 values.values().map(size).sum()
             }
             Value::Concrete(_) | Value::Deferred(_) => 0,
+            Value::Reference(never) | Value::Conversion(never) => match *never {},
         }
     }
     PROJECTION_COPY_WORK.update(|work| work + size(value));

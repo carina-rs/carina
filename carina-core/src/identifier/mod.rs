@@ -314,6 +314,12 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -443,6 +449,14 @@ fn complete_identity_value<S, P: PlaceholderKind, B: BindingAddress, D>(
             )
             | Value::Deferred(_),
         ) => None,
+        IdentityPathInput::AuthoredPrefix(crate::resource::Value::Reference(never))
+        | IdentityPathInput::Value(crate::resource::Value::Reference(never)) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        IdentityPathInput::AuthoredPrefix(crate::resource::Value::Conversion(never))
+        | IdentityPathInput::Value(crate::resource::Value::Conversion(never)) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -1783,6 +1797,12 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
         }
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
             format!("Placeholder({placeholder})")
+        }
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
         }
     }
 }
