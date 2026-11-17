@@ -7,13 +7,15 @@ Example (run separately from the Rust tests):
 
 Only validate is measured: plan can open state backends and contact providers.
 The closure follows literal local source/import paths, preserving their relative
-layout. Each directory entry includes every .crn beneath it, excluding artifact
-and build directories. Only .crn files and provider/backend lock files are copied.
-Absolute local sources and interpolated
-local paths are refused rather than letting a subprocess use the original tree.
-Installed trust/plugin directories are shared through explicit directory overrides;
-no .carina or state files are copied. Credentials are removed from the inherited
-environment; HOME/cache and temporary files are placed under --out. Other
+layout. Each directory entry includes every .crn beneath it. Copies contain these
+.crn files, carina-providers.lock, carina-backend.lock, and each copied directory's
+.carina/providers/** and .carina/provider-install.lock when present. No other
+.carina content is copied; .git, target and __pycache__ directories are excluded.
+Absolute local sources, interpolated local paths and local sources into .carina
+are refused rather than letting a subprocess use the original tree.
+Installed trust/plugin directories are shared through explicit directory overrides.
+Credentials are removed from the inherited environment; HOME/cache and temporary
+files are placed under --out. Other
 environment variables are retained. No init or download runs.
 Build/toolchain/features may be described in CARINA_RESOLVER_KIND_BUILD_INFO.
 Subprocess logs and generated output live under --out.
@@ -73,6 +75,19 @@ LOCK_FILES = ("carina-providers.lock", "carina-backend.lock")
 EXCLUDED_DIRECTORIES = {".git", ".carina", "target", "__pycache__"}
 
 
+def installed_provider_files(directory):
+    installation = directory / ".carina"
+    lock = installation / "provider-install.lock"
+    if lock.is_file():
+        yield lock
+    for root, children, names in os.walk(installation / "providers"):
+        children[:] = [name for name in children if name not in EXCLUDED_DIRECTORIES - {".carina"}]
+        for name in names:
+            path = Path(root) / name
+            if path.is_file():
+                yield path
+
+
 def closure(config):
     pending, visited, directories, files = [config], set(), set(), set()
     while pending:
@@ -82,12 +97,17 @@ def closure(config):
         visited.add(entry)
         if entry.is_dir():
             directories.add(entry)
-            sources = (source for source in entry.rglob("*.crn")
-                       if not any(part in EXCLUDED_DIRECTORIES for part in source.relative_to(entry).parts))
+            sources = []
+            for root, children, names in os.walk(entry):
+                children[:] = [name for name in children if name not in EXCLUDED_DIRECTORIES]
+                directory = Path(root)
+                files.update(installed_provider_files(directory))
+                sources.extend(directory / name for name in names if name.endswith(".crn"))
         else:
             if entry.suffix != ".crn":
                 raise Unavailable("a local source is not a .crn file")
             directories.add(entry.parent)
+            files.update(installed_provider_files(entry.parent))
             sources = [entry]
         for source in sources:
             if source in files:
@@ -120,6 +140,7 @@ def closure(config):
                 lock = parent / name
                 if lock.is_file():
                     files.add(lock)
+                    files.update(installed_provider_files(parent))
             if parent == boundary:
                 break
     return directories, files, checkout
@@ -293,6 +314,7 @@ def markdown(result):
                   "Regression: paired median >5% and >5 ms, or paired p95 >10% and >10 ms; percentages use the main lane's median.",
                   "Main/main noise uses the same paired statistics; a summary magnitude exceeding a threshold makes the result inconclusive.",
                   "5 warmup pairs and 30 measured pairs per experiment, interleaved main/main then main/head; lane order reverses each pair; p95 uses nearest rank.",
+                  "Copied files: .crn files, carina-providers.lock, carina-backend.lock, and each directory's .carina/providers/** and .carina/provider-install.lock; other .carina content excluded; .git, target and __pycache__ directories excluded.",
                   "Credentials removed; other environment is inherited, with temporary HOME/cache and shared installed trust/plugin directories."])
     if "reason" in result:
         lines.extend(["", result["reason"]])
@@ -307,7 +329,10 @@ def main():
     config, out = args.config.resolve(), args.out.resolve()
     result = {"command": "validate --json", "plan": "excluded: providers/state backends may require network or AWS",
               "warmups_per_lane": WARMUPS, "alternating_pairs": PAIRS, "experiments": {},
-              "cache_mode": "temporary compiled cache; shared installed trust/plugins; credentials removed",
+              "cache_mode": ("temporary HOME/cache; copied .crn files, carina-providers.lock, carina-backend.lock, "
+                             ".carina/providers/** and .carina/provider-install.lock per directory; "
+                             "other .carina content excluded; .git, target and __pycache__ directories excluded; "
+                             "shared installed trust/plugins; credentials removed"),
               "sampling": "interleaved main/main and main/head pairs",
               "build_info": os.environ.get("CARINA_RESOLVER_KIND_BUILD_INFO", "not supplied; binary hashes recorded")}
     writable_output = False
