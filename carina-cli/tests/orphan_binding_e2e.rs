@@ -1,4 +1,7 @@
 use std::fs;
+#[path = "support/mock_state.rs"]
+mod mock_state;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -239,7 +242,7 @@ fn configured_binding_wins_over_same_binding_orphan_for_data_source_reads() {
     );
     fs::write(
         &scenario.mock_state,
-        r#"{"version":2,"states":{"iam.Roles.lookup":{"name_regex":"old-bucket","names":["old"]}}}"#,
+        r#"{"version":3,"states":{},"data_sources":{"iam.Roles.lookup":{"name_regex":"old-bucket","names":["old"]}}}"#,
     )
     .expect("seed mock data source");
 
@@ -251,7 +254,7 @@ fn configured_binding_wins_over_same_binding_orphan_for_data_source_reads() {
     let mut mock_state: serde_json::Value =
         serde_json::from_slice(&fs::read(&scenario.mock_state).expect("read mock-provider state"))
             .expect("parse mock-provider state");
-    mock_state["states"]["test.resource.bucket"]["generated_rules"] =
+    mock_state["states"][&mock_state::identifier(&scenario.project, "bucket")]["generated_rules"] =
         serde_json::json!([{ "action": "old-action" }]);
     fs::write(
         &scenario.mock_state,

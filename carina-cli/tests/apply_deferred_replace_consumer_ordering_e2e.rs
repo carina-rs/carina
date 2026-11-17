@@ -176,7 +176,7 @@ provider mock {}
             .expect("test state setup must be valid");
 
         let mut consumer =
-            ResourceState::try_applied("test.resource", "consumer", "mock", "mock-id")
+            ResourceState::try_applied("test.resource", "consumer", "mock", "consumer-id")
                 .expect("fixture identifier is non-empty")
                 .with_attribute("name", serde_json::json!("consumer"))
                 .with_attribute("identifier", serde_json::json!("consumer-id"))
@@ -209,17 +209,17 @@ provider mock {}
     }
 
     fn seed_mock_provider_state(&self) {
-        let provider_state = serde_json::json!({
-            "test.resource.validation_records[0]": {
+        let provider_state = serde_json::json!({"version": 3, "states": {
+            "old-validation-id": {
                 "name": "old-validation-token",
                 "identifier": "old-validation-id"
             },
-            "test.resource.consumer": {
+            "consumer-id": {
                 "name": "consumer",
                 "identifier": "consumer-id",
                 "web_acl_arn": "old-validation-id"
             }
-        });
+        }});
         fs::write(
             &self.mock_state_path,
             carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
@@ -291,7 +291,7 @@ fn consumer_current_state(id: &ResourceId) -> State {
             ("web_acl_arn".to_string(), string("old-validation-id")),
         ]),
     )
-    .with_identifier("mock-id")
+    .with_identifier("consumer-id")
 }
 
 fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFile) -> PlanFile {

@@ -328,6 +328,27 @@ async fn read_only_operand(target: &str) {
         )
         .unwrap()
         .into_state();
+        let q_identifier = baseline
+            .find_resource("mock", "iam.Roles", "q")
+            .unwrap()
+            .identifier()
+            .unwrap()
+            .to_string();
+        let mut provider_state: Json = serde_json::from_slice(
+            &std::fs::read(fixture.path().join("provider-state.json")).unwrap(),
+        )
+        .unwrap();
+        // Data-source responses use addresses, separately from managed identifiers.
+        let q = provider_state["states"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&q_identifier)
+            .unwrap();
+        provider_state["data_sources"]["iam.Roles.q"] = q;
+        fixture.write(
+            "provider-state.json",
+            &serde_json::to_string(&provider_state).unwrap(),
+        );
         assert!(baseline.remove_resource("mock", "iam.Roles", "q").is_some());
         fixture.write(
             "carina.state.json",
