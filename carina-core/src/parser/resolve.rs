@@ -4,6 +4,7 @@
 
 use super::ProviderContext;
 use super::ast::{ExportParamLike, File, ParsedFile, ProviderConfig};
+use super::context::FunctionEvaluationSession;
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::{ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value};
@@ -119,7 +120,7 @@ trait ProviderAttributeBindingPhase: BindingAddress {
         functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         config: &ProviderContext,
-        session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+        session: Option<FunctionEvaluationSession<'_>>,
         call_line: usize,
     ) -> Result<GenericValue<ParserPlaceholder, Self>, ParseError>;
 }
@@ -130,7 +131,7 @@ impl ProviderAttributeBindingPhase for RelativeBindingName {
         functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         config: &ProviderContext,
-        session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+        session: Option<FunctionEvaluationSession<'_>>,
         call_line: usize,
     ) -> Result<GenericValue<ParserPlaceholder, Self>, ParseError> {
         super::functions::evaluate_resolved_user_function(
@@ -145,12 +146,15 @@ impl ProviderAttributeBindingPhase for AbsoluteBindingAddress {
         functions: &std::sync::Arc<IndexMap<String, super::UserFunction<Self>>>,
         arguments: &[crate::resource::FunctionArgument<ParserPlaceholder, Self>],
         _config: &ProviderContext,
-        session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+        session: Option<FunctionEvaluationSession<'_>>,
         call_line: usize,
     ) -> Result<GenericValue<ParserPlaceholder, Self>, ParseError> {
         match session {
             Some(session) => crate::resolver::evaluate_module_resolved_user_function(
-                function, arguments, session, call_line,
+                function,
+                arguments,
+                session.provider(),
+                call_line,
             ),
             None => Ok(GenericValue::Deferred(
                 DeferredValue::ResolvedFunctionCall {
@@ -1332,14 +1336,41 @@ pub(crate) fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
     >,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<File<E>, AnalysisResolutionError> {
-    let mut parsed = tree.file().clone();
-    resolve_resource_refs_in_context(
+    resolve_analysis_copy(tree.file(), FunctionEvaluationSession::ordinary(session))
+}
+
+/// The editor judgement always supplies its concrete recorder. A provider
+/// context cannot silently discard body receipts by omitting a trait hook.
+pub(crate) fn resolve_editor_resource_refs_from_analysis<E: ExportParamLike + Clone>(
+    tree: &super::AnalysisTree<
+        '_,
+        ParserPlaceholder,
+        ParserPlaceholder,
+        super::ParsedDeferredForPhase<ParserPlaceholder, RelativeBindingName>,
+        RelativeBindingName,
+        E,
+    >,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    recorder: &crate::validation::deferred_types::EditorFunctionBodyRecorder<'_>,
+) -> Result<File<E>, AnalysisResolutionError> {
+    resolve_analysis_copy(
+        tree.file(),
+        FunctionEvaluationSession::recording(session, recorder),
+    )
+}
+
+fn resolve_analysis_copy<E: ExportParamLike + Clone>(
+    file: &File<E>,
+    session: FunctionEvaluationSession<'_>,
+) -> Result<File<E>, AnalysisResolutionError> {
+    let mut parsed = file.clone();
+    resolve_resource_refs_with_evaluation_session(
         &mut parsed,
-        session.catalog(),
+        session.provider().catalog(),
         Some(session),
         strict_resolution_context(),
     )
-    .map_err(AnalysisResolutionError::from_parse_failure)?;
+    .map_err(|error| AnalysisResolutionError::from_parse_failure(error.into_parse_error()))?;
     Ok(parsed)
 }
 
@@ -1367,8 +1398,7 @@ pub(crate) fn editor_provider_value_uses_owned_body(
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     owned: &crate::validation::deferred_types::EditorFunctionBodyJudgements,
 ) -> bool {
-    let context = crate::validation::deferred_types::EditorFunctionBodyContext::new(
-        session,
+    let recorder = crate::validation::deferred_types::EditorFunctionBodyRecorder::new(
         parsed.expression_report(),
     );
     let mut bindings = HashMap::new();
@@ -1381,11 +1411,11 @@ pub(crate) fn editor_provider_value_uses_owned_body(
         value,
         &bindings,
         session.catalog(),
-        Some(&context),
+        Some(FunctionEvaluationSession::recording(session, &recorder)),
         diagnostics_resolution_context(),
     )
     .ok();
-    owned.owns_rejection_from(&context.into_judgements())
+    owned.owns_rejection_from(&recorder.into_judgements())
 }
 
 /// Parser/module-loader evaluation before the analysis boundary is sealed.
@@ -1504,6 +1534,20 @@ pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
     parsed: &mut File<E>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    resolution: ResolutionContext,
+) -> Result<(), RootInputFailure> {
+    resolve_resource_refs_with_evaluation_session(
+        parsed,
+        config,
+        session.map(FunctionEvaluationSession::ordinary),
+        resolution,
+    )
+}
+
+fn resolve_resource_refs_with_evaluation_session<E: ExportParamLike>(
+    parsed: &mut File<E>,
+    config: &ProviderContext,
+    session: Option<FunctionEvaluationSession<'_>>,
     resolution: ResolutionContext,
 ) -> Result<(), RootInputFailure> {
     let syntax = parsed.parser_binding_metadata.syntax().clone();
@@ -2330,7 +2374,7 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
     value: &GenericValue<ParserPlaceholder, B>,
     binding_map: &HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>>,
     config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    session: Option<FunctionEvaluationSession<'_>>,
     resolution: ResolutionContext,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
     resolve_value_with_binding_lookup(
@@ -2352,7 +2396,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
     value: &GenericValue<ParserPlaceholder, B>,
     binding_lookup: &impl Fn(&B, &str) -> Option<GenericValue<ParserPlaceholder, B>>,
     config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    session: Option<FunctionEvaluationSession<'_>>,
     resolution: ResolutionContext,
     scope: DiagnosticScope,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
@@ -2715,7 +2759,7 @@ fn resolve_directive_function_calls(
     directives: &mut crate::resource::AuthoredDirectives,
     binding_map: &HashMap<String, HashMap<String, Value>>,
     config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    session: Option<FunctionEvaluationSession<'_>>,
     resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
     directives.try_update_expressions(|_, expression| {
@@ -2745,7 +2789,7 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
     value: &GenericValue<ParserPlaceholder, B>,
     binding_map: &HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>>,
     config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    session: Option<FunctionEvaluationSession<'_>>,
     resolution: ResolutionContext,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
     match value {
@@ -3088,7 +3132,7 @@ impl ProviderAttributeBindings {
                     .map(RuntimeValue::into_placeholder_type)
             },
             session.catalog(),
-            Some(session),
+            Some(FunctionEvaluationSession::ordinary(session)),
             strict_resolution_context(),
             DiagnosticScope::Public,
         )?;

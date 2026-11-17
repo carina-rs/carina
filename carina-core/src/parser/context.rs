@@ -36,6 +36,47 @@ pub(crate) struct AuthoredDiagnosticSource {
 #[derive(Clone)]
 pub(super) struct EvaluationOnly;
 
+/// Parser evaluation carries an explicit recording channel. Provider type
+/// contexts cannot opt out of an editor recorder through dynamic dispatch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FunctionEvaluationSession<'a> {
+    provider: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    recorder: Option<&'a crate::validation::deferred_types::EditorFunctionBodyRecorder<'a>>,
+}
+impl<'a> FunctionEvaluationSession<'a> {
+    pub(crate) fn ordinary(
+        provider: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Self {
+        Self {
+            provider,
+            recorder: None,
+        }
+    }
+    pub(crate) fn recording(
+        provider: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+        recorder: &'a crate::validation::deferred_types::EditorFunctionBodyRecorder<'a>,
+    ) -> Self {
+        Self {
+            provider,
+            recorder: Some(recorder),
+        }
+    }
+    pub(super) fn provider(
+        self,
+    ) -> &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext {
+        self.provider
+    }
+    pub(super) fn rejected_body(
+        self,
+        function: &UserFunction,
+        arguments: &[super::ParsedFunctionArgument],
+    ) {
+        if let Some(recorder) = self.recorder {
+            recorder.rejected_body(function, arguments);
+        }
+    }
+}
+
 pub(crate) trait EvaluationSource: Clone {
     fn evaluation_site_at(
         &self,
@@ -127,8 +168,7 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
     pub(super) evaluating_functions: Vec<String>,
     /// Parser configuration (decryptor, custom validators)
     pub(super) config: &'cfg ProviderContext,
-    pub(super) session:
-        Option<&'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    pub(super) session: Option<FunctionEvaluationSession<'cfg>>,
     /// Binding names from structurally-required expressions (if/for/read)
     pub(super) structural_bindings: HashSet<String>,
     /// Upstream state bindings (binding_name -> UpstreamState)
@@ -458,10 +498,8 @@ impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
 }
 
 impl<'cfg> ParseContext<'cfg, EvaluationOnly> {
-    pub(super) fn for_evaluation_in_session(
-        session: &'cfg dyn crate::validation::deferred_types::ProviderTypeCheckContext,
-    ) -> Self {
-        let mut context = Self::for_evaluation(session.catalog());
+    pub(super) fn for_evaluation_in_session(session: FunctionEvaluationSession<'cfg>) -> Self {
+        let mut context = Self::for_evaluation(session.provider().catalog());
         context.session = Some(session);
         context
     }
@@ -491,9 +529,9 @@ impl<'cfg, Source: EvaluationSource> ParseContext<'cfg, Source> {
         &self,
     ) -> crate::validation::typecheck::TypecheckProviderContext<'cfg> {
         match self.session {
-            Some(session) => {
-                crate::validation::typecheck::TypecheckProviderContext::for_session(session)
-            }
+            Some(session) => crate::validation::typecheck::TypecheckProviderContext::for_session(
+                session.provider(),
+            ),
             None => crate::validation::typecheck::TypecheckProviderContext::for_parser(self.config),
         }
     }

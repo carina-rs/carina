@@ -117,8 +117,8 @@ mod sealed {
     pub trait SessionEvidence {}
 }
 
-/// A borrowed view of a scoped session or its editor judgement recorder.
-/// Borrowing this sealed interface never transfers ownership of evidence.
+/// A borrowed view of a scoped provider-type validation session.
+/// Function-body recording belongs to the concrete parser evaluation channel.
 pub trait ProviderTypeCheckContext:
     sealed::SessionEvidence + std::fmt::Debug + Send + Sync
 {
@@ -129,17 +129,6 @@ pub trait ProviderTypeCheckContext:
     /// the authored expression while unrelated function checks still run.
     fn fail_function_declaration(&self, source: &Path, name: &str);
     fn has_failed_function_declaration(&self, source: &Path, name: &str) -> bool;
-    /// Record a rejected body in the editor's judgement owner.
-    fn rejected_function_body(
-        &self,
-        _function: &UserFunction,
-        _arguments: &[crate::resource::FunctionArgument<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >],
-    ) {
-    }
-
     fn record(&self, expected: &TypeExpr, site: ProviderTypeCheckSite);
     fn record_type(&self, expected: &TypeExpr, context: &str);
     fn publish_checks(
@@ -245,58 +234,26 @@ fn effective_function_arguments(
     arguments
 }
 
-/// The editor owner records body judgements. Provider value projections use
-/// the same recorder to identify unavailable inputs without exporting errors.
+/// Concrete recorder owned by the editor judgement, independent of the
+/// provider-type context supplied by the caller.
 #[derive(Debug)]
-pub(crate) struct EditorFunctionBodyContext<'a> {
-    session: &'a dyn ProviderTypeCheckContext,
+pub(crate) struct EditorFunctionBodyRecorder<'a> {
     report: &'a crate::parser::retained::ExpressionReport<crate::resource::RelativeBindingName>,
     rejected: Mutex<Vec<RejectedFunctionBody>>,
 }
-impl<'a> EditorFunctionBodyContext<'a> {
+impl<'a> EditorFunctionBodyRecorder<'a> {
     pub(crate) fn new(
-        session: &'a dyn ProviderTypeCheckContext,
         report: &'a crate::parser::retained::ExpressionReport<crate::resource::RelativeBindingName>,
     ) -> Self {
         Self {
-            session,
             report,
             rejected: Mutex::new(Vec::new()),
         }
     }
-    pub(crate) fn into_judgements(self) -> EditorFunctionBodyJudgements {
-        EditorFunctionBodyJudgements {
-            rejected: self
-                .rejected
-                .into_inner()
-                .expect("editor function body lock"),
-        }
-    }
-}
-impl sealed::SessionEvidence for EditorFunctionBodyContext<'_> {}
-impl ProviderTypeCheckContext for EditorFunctionBodyContext<'_> {
-    fn catalog(&self) -> &ProviderContext {
-        self.session.catalog()
-    }
-    fn loaded_context(&self) -> Option<&crate::parser::LoadedProviderContext> {
-        self.session.loaded_context()
-    }
-    fn declaration(&self, expected: &TypeExpr, site: ProviderTypeCheckSite) {
-        self.session.declaration(expected, site);
-    }
-    fn fail_function_declaration(&self, source: &Path, name: &str) {
-        self.session.fail_function_declaration(source, name);
-    }
-    fn has_failed_function_declaration(&self, source: &Path, name: &str) -> bool {
-        self.session.has_failed_function_declaration(source, name)
-    }
-    fn rejected_function_body(
+    pub(crate) fn rejected_body(
         &self,
         function: &UserFunction,
-        arguments: &[crate::resource::FunctionArgument<
-            crate::resource::ParserPlaceholder,
-            crate::resource::RelativeBindingName,
-        >],
+        arguments: &[crate::parser::ParsedFunctionArgument],
     ) {
         let definition = function.params.is_empty() || self.report.rejects_function_body(function);
         self.rejected
@@ -309,17 +266,13 @@ impl ProviderTypeCheckContext for EditorFunctionBodyContext<'_> {
                 arguments: effective_function_arguments(function, arguments),
             });
     }
-    fn record(&self, expected: &TypeExpr, site: ProviderTypeCheckSite) {
-        self.session.record(expected, site);
-    }
-    fn record_type(&self, expected: &TypeExpr, context: &str) {
-        self.session.record_type(expected, context);
-    }
-    fn publish_checks(
-        &self,
-        sink: &mut dyn ProviderTypeCheckSink,
-    ) -> Result<(), ProviderTypeCheckFailure> {
-        self.session.publish_checks(sink)
+    pub(crate) fn into_judgements(self) -> EditorFunctionBodyJudgements {
+        EditorFunctionBodyJudgements {
+            rejected: self
+                .rejected
+                .into_inner()
+                .expect("editor function body lock"),
+        }
     }
 }
 

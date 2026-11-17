@@ -61,8 +61,8 @@ pub use resolve::{
     resolve_provider_unresolved_attributes_for_analysis,
 };
 pub(crate) use resolve::{
-    editor_provider_value_uses_owned_body, resolve_resource_refs_from_analysis,
-    resolve_resource_refs_in_session_unsealed,
+    editor_provider_value_uses_owned_body, resolve_editor_resource_refs_from_analysis,
+    resolve_resource_refs_from_analysis, resolve_resource_refs_in_session_unsealed,
 };
 
 mod resource_body;

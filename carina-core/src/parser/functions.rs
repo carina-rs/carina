@@ -3,7 +3,7 @@
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
 use super::ast::{FnParam, PendingFunctionTypeCheck, TypeExpr, UserFunction, UserFunctionBody};
-use super::context::{ParseContext, next_pair};
+use super::context::{FunctionEvaluationSession, ParseContext, next_pair};
 use super::error::{ParseError, ParseWarning};
 use super::types::parse_type_expr;
 use super::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
@@ -243,7 +243,7 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
 
     if ctx
         .session
-        .is_some_and(|session| session.function_declaration_failed(func))
+        .is_some_and(|session| session.provider().function_declaration_failed(func))
     {
         return Ok(PreparedUserFunctionCall::Deferred(args.to_vec()));
     }
@@ -926,8 +926,8 @@ fn check_fn_arg_type<Source: super::context::EvaluationSource>(
         Ok(None) => {
             if let Some(session) = ctx.session {
                 match site {
-                    Some(site) => session.record(type_expr, site),
-                    None => session.record_type(
+                    Some(site) => session.provider().record(type_expr, site),
+                    None => session.provider().record_type(
                         type_expr,
                         &format!("function '{fn_name}' parameter '{param_name}'"),
                     ),
@@ -1203,7 +1203,7 @@ fn function_argument_type_error(
 pub(crate) fn validate_pending_function_type_check(
     check: &PendingFunctionTypeCheck,
     functions: &IndexMap<String, UserFunction>,
-    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    session: FunctionEvaluationSession<'_>,
 ) -> Result<(), ParseError> {
     let ctx = ParseContext::for_evaluation_in_session(session);
     ctx.resume_evaluation(&check.evaluation)
@@ -1211,7 +1211,7 @@ pub(crate) fn validate_pending_function_type_check(
             let Some(function) = functions.get(&check.function_name) else {
                 return Ok(());
             };
-            if session.function_declaration_failed(function) {
+            if session.provider().function_declaration_failed(function) {
                 return Ok(());
             }
             for (parameter, argument) in function.params.iter().zip(&check.arguments) {
@@ -1403,7 +1403,7 @@ pub(crate) fn evaluate_resolved_user_function(
     functions: &Arc<IndexMap<String, UserFunction>>,
     arguments: &[FunctionArgument],
     config: &ProviderContext,
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    session: Option<FunctionEvaluationSession<'_>>,
     call_line: usize,
 ) -> Result<Value, ParseError> {
     let mut context = match session {
@@ -1420,11 +1420,11 @@ pub(crate) fn evaluate_resolved_user_function(
 fn locate_function_body_error(
     func: &UserFunction,
     args: &[FunctionArgument],
-    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    session: Option<FunctionEvaluationSession<'_>>,
     error: ParseError,
 ) -> ParseError {
     if let Some(session) = session {
-        session.rejected_function_body(func, args);
+        session.rejected_body(func, args);
     }
     error.at(&func.body.location)
 }

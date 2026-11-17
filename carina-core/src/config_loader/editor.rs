@@ -7,7 +7,7 @@ use super::{
 use crate::parser::{self, AnalysisResolutionError, ParsedFile, ProviderContext};
 use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart};
 pub use crate::validation::deferred_types::EditorFunctionBodyJudgements;
-use crate::validation::deferred_types::{EditorFunctionBodyContext, ProviderTypeCheckContext};
+use crate::validation::deferred_types::{EditorFunctionBodyRecorder, ProviderTypeCheckContext};
 use std::{path::Path, sync::Arc};
 
 mod provider;
@@ -132,11 +132,12 @@ impl EditorResolutionRequest {
 fn finish_file(file: &ParsedFile, session: &dyn ProviderTypeCheckContext) -> EditorResolution {
     match parser::AnalysisTree::try_from_file(file) {
         Ok(tree) => {
-            let context = EditorFunctionBodyContext::new(session, file.expression_report());
-            let error = parser::resolve_resource_refs_from_analysis(&tree, &context).err();
+            let recorder = EditorFunctionBodyRecorder::new(file.expression_report());
+            let error =
+                parser::resolve_editor_resource_refs_from_analysis(&tree, session, &recorder).err();
             EditorResolution {
                 finding: error.map(|error| OwnedResolutionFinding { error }),
-                bodies: context.into_judgements(),
+                bodies: recorder.into_judgements(),
             }
         }
         Err(error) => EditorResolution {
@@ -335,4 +336,45 @@ fn function_uses_rejected_definition(
         || uses_rejected_definition(owned, &function.body.value, file, visiting);
     visiting.pop();
     rejected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_recording_survives_nested_function_evaluation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("main.crn"), "let result = outer(1)\n").unwrap();
+        std::fs::write(
+            directory.path().join("providers.crn"),
+            "provider mock { default_tags = outer(1) }\nfn inner(value) { upper(value) }\nfn outer(value) {\n let local = value\n inner(local)\n}\n",
+        ).unwrap();
+        let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let schemas = crate::schema::SchemaRegistry::new();
+        let overrides = SourceOverrides::default();
+        let attempt = parse_editor_directory_with_overrides_and_schemas(
+            &base, &catalog, &overrides, &schemas,
+        );
+        let (_, request) = attempt.into_parts(&directory.path().join("main.crn"), None);
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            let (finding, bodies) = request.finish(session).into_parts();
+            let finding = finding
+                .expect("nested body failure has one owner")
+                .into_error();
+            assert!(
+                finding
+                    .to_string()
+                    .contains("upper() argument must be a string"),
+                "{finding}"
+            );
+            assert!(
+                bodies
+                    .finalize_providers(&base, &overrides, session, &schemas)
+                    .is_none(),
+                "the provider query must retain the nested body's ownership receipt",
+            );
+        });
+    }
 }
