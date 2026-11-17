@@ -80,21 +80,12 @@ impl Scenario {
         resource["binding"] = Value::String(LEGACY_IDENTITY.to_string());
         write_json(&state_path, &state);
 
-        let mut provider_state = read_json(&self.mock_state);
-        let states = provider_state["states"]
-            .as_object_mut()
-            .expect("mock provider states");
-        assert_eq!(
-            states.len(),
-            1,
-            "seed apply must create exactly one mock provider row: {states:#?}"
-        );
-        let old_key = states.keys().next().expect("one provider row").clone();
-        let attributes = states
-            .remove(&old_key)
-            .expect("seed mock provider row remains present");
-        states.insert(format!("test.resource.{LEGACY_IDENTITY}"), attributes);
-        write_json(&self.mock_state, &provider_state);
+        let provider_state = read_json(&self.mock_state);
+        assert_eq!(provider_state["states"].as_object().unwrap().len(), 1);
+        for row in state["resources"].as_array().expect("applied resources") {
+            let identifier = row["current"]["identifier"].as_str().unwrap();
+            assert!(provider_state["states"][identifier].is_object());
+        }
     }
 
     fn clear_operation_log(&self) {

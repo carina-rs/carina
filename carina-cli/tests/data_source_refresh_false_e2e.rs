@@ -103,7 +103,7 @@ impl Scenario {
         let mut state: Value =
             serde_json::from_slice(&fs::read(&self.mock_state).expect("read mock-provider state"))
                 .expect("parse mock-provider state");
-        state["states"][key]["names"] = Value::Array(
+        state["data_sources"][key]["names"] = Value::Array(
             names
                 .iter()
                 .map(|name| Value::String((*name).into()))

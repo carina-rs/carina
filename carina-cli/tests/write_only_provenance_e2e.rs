@@ -1,4 +1,7 @@
 use std::fs;
+#[path = "support/mock_state.rs"]
+mod mock_state;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -148,7 +151,7 @@ impl Scenario {
             &fs::read_to_string(&self.mock_state).expect("read mock provider state"),
         )
         .expect("parse mock provider state");
-        provider["states"]["test.resource.r1"][attribute] = value;
+        provider["states"][&mock_state::identifier(&self.project, "r1")][attribute] = value;
         fs::write(
             &self.mock_state,
             serde_json::to_vec_pretty(&provider).expect("serialize mock provider state"),
@@ -453,12 +456,12 @@ fn normal_update_reasserts_unchanged_write_only_value_and_converges() {
     .expect("parse mock provider state");
     // This pins Reassert: the mock applies the patch over `from` and omits `password` on read, so plaintext can only arrive through the patch.
     assert_eq!(
-        provider["states"]["test.resource.r1"]["password"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["password"],
         serde_json::json!("reasserted-secret"),
         "the unchanged write-only secret must be reasserted as provider plaintext, not copied from the redacted current state"
     );
     assert_eq!(
-        provider["states"]["test.resource.r1"]["comment"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["comment"],
         serde_json::json!("after")
     );
 
@@ -542,12 +545,12 @@ fn nested_write_only_secret_rotates_reasserts_and_converges() {
     )
     .expect("parse mock provider state");
     assert_eq!(
-        provider["states"]["test.resource.r1"]["oidc_config"]["client_secret"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["oidc_config"]["client_secret"],
         serde_json::json!("secret-b"),
         "an unrelated update must reassert the whole write-only-bearing attribute"
     );
     assert_eq!(
-        provider["states"]["test.resource.r1"]["comment"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["comment"],
         serde_json::json!("after")
     );
 
@@ -726,7 +729,7 @@ fn secret_write_only_refresh_and_saved_plan_apply_converge_without_sending_hash(
     )
     .expect("parse mock provider state");
     assert_eq!(
-        provider["states"]["test.resource.r1"]["password"],
+        provider["states"][&mock_state::identifier(&scenario.project, "r1")]["password"],
         serde_json::json!("secret-after"),
         "the mock applies the request patch directly, so a structural hash here would mean the hash reached the provider patch"
     );
@@ -763,7 +766,8 @@ fn nested_write_only_without_ignore_changes_reasserts_and_rolls_back_external_va
     );
 
     assert_eq!(
-        scenario.provider_state()["states"]["test.resource.r1"]["oidc_config"]["client_secret"],
+        scenario.provider_state()["states"][&mock_state::identifier(&scenario.project, "r1")]["oidc_config"]
+            ["client_secret"],
         serde_json::json!("infra-recorded"),
         "the existing Reassert behavior must pin the rollback that ignore_changes prevents"
     );
@@ -811,7 +815,8 @@ fn nested_write_only_ignore_changes_preserves_external_value_and_omits_parent_pa
     assert_success("ignored update apply", &scenario.apply_plan("update.json"));
 
     assert_eq!(
-        scenario.provider_state()["states"]["test.resource.r1"]["oidc_config"]["client_secret"],
+        scenario.provider_state()["states"][&mock_state::identifier(&scenario.project, "r1")]["oidc_config"]
+            ["client_secret"],
         serde_json::json!("externally-deployed"),
         "omitting the write-only-bearing parent must preserve the external deployment"
     );
@@ -869,7 +874,7 @@ fn readable_ignore_changes_hides_drift_and_omits_it_from_an_unrelated_update() {
         &scenario.apply_plan("update.json"),
     );
     assert_eq!(
-        scenario.provider_state()["states"]["test.resource.r1"]["comment"],
+        scenario.provider_state()["states"][&mock_state::identifier(&scenario.project, "r1")]["comment"],
         serde_json::json!("external")
     );
     let patches = scenario.update_patch_operations();
@@ -927,7 +932,7 @@ fn saved_plan_apply_refills_ignored_readable_leaf_from_apply_time_read() {
         output_text(&apply)
     );
     assert_eq!(
-        scenario.provider_state()["states"]["test.resource.r1"]["comment"],
+        scenario.provider_state()["states"][&mock_state::identifier(&scenario.project, "r1")]["comment"],
         serde_json::json!("between-plan-and-apply"),
         "apply must refill the sent value from its fresh read"
     );
