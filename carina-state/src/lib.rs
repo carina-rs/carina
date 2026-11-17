@@ -109,11 +109,11 @@ pub use state::{
     ImportTargetDisposition, LegacyClassificationOutcome, LegacyDependencyClassification,
     LegacyDependencyMigrationError, LegacyDependencyNames, LegacyDestroyOrderingWarning,
     LegacyReadRequiredRow, LegacyReadRequiredRows, LoadedOrphans, LoadedState, MigratedStateFile,
-    MigrationInfo, NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind, OutcomeUnknownRow,
-    PreviousSecretHashAuthority, PublishedExports, ResourceState, ResourceStateEncodingError,
-    RowBasis, StateFile, UnreportedMigratedState, UnvalidatedLegacyMigration,
-    ValidatedLegacyMigration, check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
-    should_apply_override,
+    MigrationInfo, NameOverride, NotOutcomeUnknown, NotOutcomeUnknownKind,
+    ObservationStateAuthority, ObservedStateFile, OutcomeUnknownRow, PreviousSecretHashAuthority,
+    PublishedExports, ResourceState, ResourceStateEncodingError, RowBasis, StateFile,
+    UnreportedMigratedState, UnvalidatedLegacyMigration, ValidatedLegacyMigration,
+    check_and_migrate, check_and_migrate_bytes, log_state_migration_once, should_apply_override,
 };
 
 #[cfg(any(test, feature = "test-utils"))]

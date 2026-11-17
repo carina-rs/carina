@@ -422,6 +422,37 @@ pub async fn run_saved_json_plan_with_factories(
     .await
 }
 
+/// The real plan command, with refresh and output selected by the fixture.
+pub async fn run_observed_plan_with_factories(
+    runtime: &CommandRuntime,
+    path: &std::path::Path,
+    out: Option<&std::path::Path>,
+    refresh: bool,
+    json: bool,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+) -> Result<bool, crate::error::AppError> {
+    crate::commands::plan::run_plan_using(
+        runtime,
+        path,
+        out,
+        None,
+        None,
+        crate::DetailLevel::Full,
+        false,
+        refresh,
+        json,
+        false,
+        false,
+        &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+        |runtime, providers, _| {
+            Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                runtime, factories, providers,
+            ))
+        },
+    )
+    .await
+}
+
 pub async fn run_detailed_plan_with_factories(
     runtime: &CommandRuntime,
     path: &std::path::Path,
@@ -631,4 +662,41 @@ pub(crate) fn install_mock_wasm(directory: &std::path::Path) {
     let installed = directory.join(".carina/providers/file/mock/mock.wasm");
     std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
     std::fs::copy(source, installed).unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn protected_observation(
+    state: &carina_core::resource::SnapshotState,
+) -> carina_core::value::ProtectedObservation {
+    use carina_core::value::ObservationInputs;
+    let mut observations = carina_state::ObservedStateFile::for_test(None)
+        .authority()
+        .protect(ObservationInputs::Plan {
+            deleted: &std::collections::HashMap::new(),
+            plan: &carina_core::plan::Plan::new(),
+            current: &std::collections::HashMap::from([(
+                state.id.clone(),
+                carina_core::resource::Current::from_snapshot(state.clone()),
+            )]),
+            reads: &carina_core::data_source_value::DataSourceValues::empty(),
+        })
+        .unwrap()
+        .into_managed();
+    observations.remove(&state.id).unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn render_value<P: carina_core::resource::ValueKind>(
+    value: &carina_core::resource::Value<P>,
+) -> carina_core::value::RenderedValue {
+    carina_core::value::render_fixture_value(value)
+}
+
+#[cfg(test)]
+pub(crate) fn observation_authority_for_test(
+    state_file: Option<&carina_state::StateFile>,
+) -> carina_state::ObservationStateAuthority {
+    carina_state::ObservedStateFile::for_test(state_file.cloned())
+        .authority()
+        .clone()
 }

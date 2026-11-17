@@ -985,6 +985,9 @@ pub(super) struct ScopeCheckedDesiredPlan {
 }
 
 impl ScopeCheckedDesiredPlan {
+    pub(super) fn observation_plan(&self) -> &carina_core::plan::Plan<SavedModuleSource> {
+        self.plan.plan.observation_plan()
+    }
     pub(super) fn refresh_rows(&self) -> &RefreshRows {
         match &self.plan.plan {
             DesiredPlanFile::Verified(plan) => plan.plan_file.refresh_rows(),
@@ -1100,6 +1103,13 @@ impl DesiredPlanFile {
             Self::NeedsHistoricalVerification(plan) => plan.plan_file.plan(),
         };
         MovedOrigins::from_plan(plan)
+    }
+
+    pub(super) fn observation_plan(&self) -> &carina_core::plan::Plan<SavedModuleSource> {
+        match self {
+            Self::Verified(plan) => plan.plan(),
+            Self::NeedsHistoricalVerification(plan) => plan.plan_file.plan(),
+        }
     }
 
     /// Complete historical secret verification and mint the sole executable
@@ -2243,8 +2253,9 @@ mod tests {
                 Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone()).into())),
             )]),
         );
-        let redacted = carina_core::value::redact_secrets_in_state(&state_with_secret)
-            .expect("redact data-source output");
+        let redacted = crate::test_support::protected_observation(&state_with_secret.to_snapshot())
+            .snapshot()
+            .unwrap();
         let actual = State::<carina_core::resource::NoPlaceholder>::existing(
             data_source.id.clone(),
             HashMap::from([("token".to_string(), plaintext.clone())]),

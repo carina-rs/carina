@@ -5787,16 +5787,31 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
     };
     let mut delete_plan = carina_core::plan::Plan::new();
     delete_plan.add(delete.clone());
-    let mut historical =
-        carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&delete_plan);
-    historical.set_delete_from_persisted(
-        carina_core::effect::DeletedInstanceKey::new(
-            id.clone(),
-            generation,
-            "resource-old".to_string(),
-        ),
-        row.deposed[0].persisted_attributes(),
+    let key = carina_core::effect::DeletedInstanceKey::new(
+        id.clone(),
+        generation,
+        "resource-old".to_string(),
     );
+    let deleted = HashMap::from([(
+        key,
+        carina_core::resource::SnapshotState::existing(
+            id.clone(),
+            row.deposed[0].persisted_attributes().to_values(),
+        ),
+    )]);
+    let observations = ObservedStateFile::for_test(Some(state.clone()))
+        .authority()
+        .protect(carina_core::value::ObservationInputs::Display {
+            plan: &delete_plan,
+            current: &HashMap::new(),
+            deleted: &deleted,
+        })
+        .unwrap();
+    let historical = carina_core::detail_rows::HistoricalDisplayAttributes::from_observations(
+        &delete_plan,
+        &observations,
+    )
+    .unwrap();
     let (schemas, provider) = carina_core::provider::comparison_fixture_for_test(
         &carina_core::schema::SchemaRegistry::new(),
         std::iter::once(&id),
@@ -5815,7 +5830,7 @@ fn v10_reserved_attributes_are_removed_at_load_before_they_reach_consumers() {
         delete_rows,
         vec![carina_core::detail_rows::DetailRow::Attribute {
             key: "name".to_string(),
-            value: carina_core::value::render_value(
+            value: carina_core::value::render_fixture_value(
                 &carina_core::resource::ExpandedValue::Concrete(
                     carina_core::resource::ExpandedConcreteValue::String("old".into()),
                 ),
@@ -10791,4 +10806,273 @@ fn assert_moved_legacy_row_scope(
     assert_eq!(row.dependency_bindings, expected);
     assert_eq!(row.directives.depends_on, expected);
     assert_eq!(row.deposed[0].dependency_bindings, expected);
+}
+
+#[tokio::test]
+async fn loaded_observation_authority_survives_an_omitted_mutable_file_view() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = crate::local_backend_for_test(temp.path().join("state.json"));
+    let authored: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+        "original".into(),
+        Value::Deferred(carina_core::resource::DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("authored".into()))).into(),
+        )),
+    )])));
+    let persisted = PersistedValue::encode_provider_value(&authored, None).unwrap();
+    let mut state = StateFile::new();
+    state
+        .upsert_resource(
+            ResourceState::try_applied("test.Item", "item", "mock", "item-id")
+                .unwrap()
+                .with_attribute("payload", persisted.as_json().clone()),
+        )
+        .unwrap();
+    backend.write_state(&state).await.unwrap();
+    let (_, authority) = ObservationStateAuthority::load(backend.as_ref())
+        .await
+        .unwrap();
+    let loaded = authority.bind(None);
+    let observed: Value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+        ConcreteValue::String("x".into()),
+    )]));
+    let id = ResourceId::with_provider_identity("mock", "test.Item", "item", None);
+    let current = HashMap::from([(
+        id.clone(),
+        Current::from_state(
+            State::existing(
+                id.clone(),
+                HashMap::from([("payload".into(), observed.clone())]),
+            )
+            .with_identifier("item-id"),
+        ),
+    )]);
+    let plan = carina_core::plan::Plan::new();
+    let products = loaded
+        .authority()
+        .protect(carina_core::value::ObservationInputs::Display {
+            deleted: &std::collections::HashMap::new(),
+            plan: &plan,
+            current: &current,
+        })
+        .unwrap();
+    let saved = products.managed_for(&id).unwrap().snapshot().unwrap();
+    assert!(
+        saved.attributes["payload"]
+            .verify_secret(&observed)
+            .unwrap()
+    );
+    assert!(saved.attributes["payload"].secret_hash().is_some());
+}
+
+#[tokio::test]
+async fn legacy_observation_authority_loads_all_dependency_arrays_and_plans_normally() {
+    let secret: Value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
+    ));
+    let persisted = PersistedValue::encode_provider_value(&secret, None).unwrap();
+    for version in [19, 20] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let mut document = serde_json::json!({
+            "version": version,
+            "serial": 17,
+            "lineage": "legacy-observation-lineage",
+            "carina_version": "legacy",
+            "exports": {},
+            "resources": [{
+                "provider": "mock", "resource_type": "test.Resource", "identity": "target",
+                "binding": "target",
+                "current": {
+                    "kind": "applied", "identifier": "target-id",
+                    "attributes": {}, "nested_write_only": {}
+                }
+            }, {
+                "provider": "mock", "resource_type": "test.Resource",
+                "identity": "items[\"west\"]", "binding": "consumer",
+                "current": {
+                    "kind": "applied", "identifier": "consumer-id",
+                    "attributes": {"payload": persisted.as_json()}, "nested_write_only": {}
+                },
+                "dependency_bindings": ["target"],
+                "directives": {"depends_on": ["target"]},
+                "deposed": [{
+                    "key": "old", "identifier": "old-id",
+                    "attributes": {"payload": persisted.as_json()},
+                    "dependency_bindings": ["target"]
+                }]
+            }]
+        });
+        if version >= StateFile::EXPORTS_VERSION_INTRODUCED {
+            document["exports_version"] = serde_json::json!(PublishedExports::CURRENT_VERSION);
+        }
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let backend = crate::local_backend_for_test(path);
+        let (loaded, authority) = ObservationStateAuthority::load(backend.as_ref())
+            .await
+            .unwrap();
+        let Some(LoadedState::Migrated { state, info }) = loaded else {
+            panic!("v{version} must retain its pending migration");
+        };
+        assert_eq!(
+            info,
+            MigrationInfo {
+                from: version,
+                to: StateFile::CURRENT_VERSION
+            }
+        );
+        assert_eq!(state.serial, 17);
+        assert_eq!(state.lineage, "legacy-observation-lineage");
+        let id = ResourceId::with_provider_identity("mock", "test.Resource", "items.west", None);
+        let legacy = &state.legacy_dependencies[&ResolvedResourceId::new(id.clone())];
+        assert_eq!(
+            legacy.value_dependencies.iter().collect::<Vec<_>>(),
+            ["target"]
+        );
+        assert_eq!(
+            legacy.explicit_dependencies.iter().collect::<Vec<_>>(),
+            ["target"]
+        );
+        assert_eq!(
+            legacy.deposed_dependencies
+                [&serde_json::from_value::<DeposedKey>(serde_json::json!("old")).unwrap()]
+                .iter()
+                .collect::<Vec<_>>(),
+            ["target"]
+        );
+
+        let desired = [
+            Resource::with_provider("mock", "test.Resource", "target", None)
+                .with_absolute_binding(absolute_binding("target")),
+            Resource::with_provider("mock", "test.Resource", "items.west", None)
+                .with_absolute_binding(absolute_binding("consumer"))
+                .with_attribute("payload", secret.clone()),
+        ];
+        let (state, report) = migrate_legacy_with_config(state, &desired).unwrap();
+        assert!(report.warnings().is_empty());
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            PatternResourceSchema::new("test.Resource")
+                .attribute(
+                    PatternAttributeSchema::optional("payload", PatternAttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let desired = desired.iter().map(resolved).collect::<Vec<_>>();
+        let current = desired
+            .iter()
+            .map(|resource| {
+                (
+                    resource.id.clone(),
+                    state.build_state_for_resource(&resource.id),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let plan_inputs = carina_core::resource::into_plan_input_current_map::<
+            carina_core::resource::ModuleSource,
+            carina_core::resource::UnexpandedDependencyFields,
+        >(current, &schemas, &[]);
+        let plan = carina_core::differ::create_plan_for_test(
+            &desired,
+            &[],
+            &carina_core::provider::ProviderRouter::new(),
+            carina_core::differ::PlanPriorStates::new(
+                &plan_inputs,
+                &carina_core::differ::Orphans::new(),
+            ),
+            &state.build_directives(),
+            &schemas,
+            &state.build_saved_attrs().lift(&schemas),
+            &state.build_explicit(),
+            &[],
+        )
+        .unwrap();
+        assert!(!plan.has_errors(), "v{version}: {:?}", plan.errors());
+        assert!(!plan.has_mutations(), "v{version}: {:?}", plan.effects());
+
+        let observed: Value = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::String("observed-private".into()),
+        )]));
+        let current = HashMap::from([(
+            id.clone(),
+            Current::from_state(
+                State::existing(
+                    id.clone(),
+                    HashMap::from([("payload".into(), observed.clone())]),
+                )
+                .with_identifier("consumer-id"),
+            ),
+        )]);
+        let products = authority
+            .protect(carina_core::value::ObservationInputs::Display {
+                plan: &carina_core::plan::Plan::new(),
+                current: &current,
+                deleted: &HashMap::new(),
+            })
+            .unwrap();
+        let snapshot = products.managed_for(&id).unwrap().snapshot().unwrap();
+        assert!(
+            snapshot.attributes["payload"]
+                .verify_secret(&observed)
+                .unwrap(),
+            "v{version} must retain first-decoded secret evidence at the canonical identity"
+        );
+    }
+}
+
+#[tokio::test]
+async fn observation_load_reuses_first_decode_and_its_field_order() {
+    for version in [20, StateFile::CURRENT_VERSION] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        let mut document = serde_json::to_value(StateFile::new()).unwrap();
+        document["version"] = serde_json::json!(version);
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let backend = crate::local_backend_for_test(path);
+        let (loaded, authority) = ObservationStateAuthority::load(backend.as_ref())
+            .await
+            .unwrap();
+        let state = loaded.unwrap().into_state();
+        assert!(std::sync::Arc::ptr_eq(
+            &state.loaded_observation.as_ref().unwrap().state,
+            &authority.state,
+        ));
+        let document = authority.state.as_ref().clone().into_document();
+        assert!(std::sync::Arc::ptr_eq(
+            state.wire_order.as_ref().unwrap(),
+            &document.wire_order
+        ));
+    }
+}
+
+#[tokio::test]
+async fn observation_load_keeps_the_state_json_error_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.json");
+    let document = serde_json::json!({
+        "version": StateFile::CURRENT_VERSION,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": "invalid", "lineage": "invalid-state", "carina_version": "test",
+        "resources": [], "exports": {}
+    });
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let backend = crate::local_backend_for_test(path);
+    let error = ObservationStateAuthority::load(backend.as_ref())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, BackendError::InvalidStateJson(_)),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("JSON location serial"),
+        "{error}"
+    );
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<serde_json::Error>()
+    );
 }

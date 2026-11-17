@@ -89,6 +89,7 @@ pub mod saved_replay;
 pub mod schema;
 pub mod secrecy;
 pub mod shutdown;
+pub mod state_document;
 pub mod static_type;
 pub mod upstream_exports;
 pub mod utils;

@@ -630,13 +630,13 @@ impl ReferencePreparation {
         .await
     }
 
-    /// Consume the finalized plan and render only the requested detail level.
+    /// Render only the requested detail level of the finalized plan.
     /// Each recording pass constructs its rows together with that immutable
     /// plan; only a clean pass can release the owning display value.
     #[allow(clippy::too_many_arguments)]
     pub async fn display(
         &mut self,
-        plan: crate::input_rules::InputCheckedPlan,
+        plan: &crate::input_rules::InputCheckedPlan,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
         detail: crate::detail_rows::DetailLevel,
@@ -645,7 +645,7 @@ impl ReferencePreparation {
         provider: &ProviderRouter,
     ) -> crate::provider::HostResult<PreparedComparison<crate::detail_rows::PreparedPlanDisplay>>
     {
-        let plan = Arc::new(plan);
+        let plan = Arc::new(plan.clone());
         self.run(
             provider,
             || {
@@ -786,7 +786,7 @@ impl ReferencePreparation {
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, saved);
         let display = self
             .display(
-                plan.clone(),
+                &plan,
                 &prepared.references,
                 historical,
                 crate::detail_rows::DetailLevel::Full,

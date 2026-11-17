@@ -10,7 +10,120 @@ use carina_core::resource::{
     ModuleSource, PathSegment, ResolvedDependencies, ResolvedResource, ResolvedResourceId,
     Resource, ResourceId, State, Value, apply_postfix_access,
 };
-use carina_core::value::{PrettyLayout, PrettyValue, render_value};
+use carina_core::value::{PrettyLayout, PrettyValue};
+
+// R7: raw comparison verdicts and protected nested rows must agree.
+#[test]
+fn observed_secret_nested_divergence_renders_changed_and_unchanged_marks() {
+    let string = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let map = |entries: Vec<(&str, Value)>| {
+        Value::Concrete(ConcreteValue::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect(),
+        ))
+    };
+    let desired = Resource::with_provider("mock", "test.resource", "item", None).with_attribute(
+        "config",
+        map(vec![
+            (
+                "payload",
+                map(vec![(
+                    "original",
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(string("authored-private")).into(),
+                    )),
+                )]),
+            ),
+            ("env", string("new-public")),
+            ("stable", string("unchanged-public")),
+        ]),
+    );
+    let observed = State::existing(
+        desired.id.clone(),
+        HashMap::from([(
+            "config".into(),
+            map(vec![
+                (
+                    "payload",
+                    Value::Concrete(ConcreteValue::List(vec![string("observed-private")])),
+                ),
+                ("env", string("old-public")),
+                ("stable", string("unchanged-public")),
+            ]),
+        )]),
+    );
+    use carina_core::schema::{
+        PatternAttributeSchema, PatternAttributeType as AT, PatternResourceSchema,
+        PatternStructField,
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.resource")
+            .attribute(
+                PatternAttributeSchema::required(
+                    "config",
+                    AT::struct_(
+                        "Config",
+                        vec![
+                            PatternStructField::required(
+                                "payload",
+                                AT::union(vec![AT::map(AT::string()), AT::list(AT::string())]),
+                            )
+                            .build(),
+                            PatternStructField::required("env", AT::string()).build(),
+                            PatternStructField::required("stable", AT::string()).build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        identifier: crate::fixture_applied_identifier("item-id"),
+        from: Box::new(observed.to_snapshot()),
+        to: resolved(desired),
+        changed_attributes: vec!["config".into()],
+    });
+    let output = strip_ansi(&format_plan_for_test(
+        crate::output_style::ColorMode::Plain,
+        &plan,
+        &PlanChangeSummary::new(
+            &plan,
+            &[],
+            &crate::plan_summary::resolved_deferred_for_for_test([]),
+            &[],
+        ),
+        DetailLevel::Full,
+        &HistoricalDisplayAttributes::for_test_plan(&plan),
+        Some(&schemas),
+        &HashMap::new(),
+        None,
+        None,
+    ));
+    assert!(
+        !output.contains("observed-private") && !output.contains("authored-private"),
+        "{output}"
+    );
+    assert!(
+        output.contains("~ env: 'old-public' → 'new-public'"),
+        "{output}"
+    );
+    assert!(
+        output.contains("~ payload: (secret) → {original: (secret)}"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("unchanged-public"),
+        "unchanged nested entries stay omitted: {output}"
+    );
+    assert!(!output.contains("~ stable:"), "{output}");
+}
 
 fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress {
     carina_core::resource::absolute_binding_address_for_test(name)
@@ -1839,7 +1952,7 @@ fn plan_export_values_use_the_core_value_formatter() {
     let change = ExportChange::Added {
         name: "settings".to_string(),
         type_expr: None,
-        new_value: value,
+        new_value: render_value(&value),
     };
 
     assert_eq!(
@@ -1857,7 +1970,9 @@ fn plan_summary_carries_the_exact_export_changes_rendered_by_text_output() {
     let export_changes = vec![ExportChange::Added {
         name: "region".to_string(),
         type_expr: None,
-        new_value: Value::Concrete(ConcreteValue::String("ap-northeast-1".into())),
+        new_value: render_value(&Value::<carina_core::resource::NoPlaceholder>::Concrete(
+            ConcreteValue::String("ap-northeast-1".into()),
+        )),
     }];
     let summary = PlanChangeSummary::new(
         &plan,
@@ -1920,7 +2035,9 @@ fn modified_plan_export_formats_old_and_new_floats_identically() {
             name: "ratio".to_string(),
             type_expr: None,
             old_json: serde_json::from_value(serde_json::json!(value)).unwrap(),
-            new_value: Value::Concrete(ConcreteValue::Float(crate::finite(value))),
+            new_value: render_value(&Value::<carina_core::resource::NoPlaceholder>::Concrete(
+                ConcreteValue::Float(crate::finite(value)),
+            )),
         };
 
         assert_eq!(
@@ -2395,7 +2512,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
     });
 
     let moved_origins = HashMap::new();
-    let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
+    let historical_display = HistoricalDisplayAttributes::for_test_plan(&plan);
     let provider = crate::fixture_plan::provider_router_for_plan(
         &crate::test_support::TestCommandRuntime::new(),
         &plan,
@@ -2412,7 +2529,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
             ))
         ),
         printed: HashSet::new(),
-        display: PlanDisplay::unprepared(
+        display: &PlanDisplay::unprepared(
             &admitted_plan,
             &historical_display,
             carina_core::detail_rows::DetailComparisons::RecordedEffects,
@@ -2495,7 +2612,7 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     });
 
     let moved_origins = HashMap::new();
-    let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
+    let historical_display = HistoricalDisplayAttributes::for_test_plan(&plan);
     let provider = crate::fixture_plan::provider_router_for_plan(
         &crate::test_support::TestCommandRuntime::new(),
         &plan,
@@ -2505,7 +2622,7 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
     let mut ctx = TreeRenderContext {
         out: String::new(),
         printed: HashSet::new(),
-        display: PlanDisplay::unprepared(
+        display: &PlanDisplay::unprepared(
             &admitted_plan,
             &historical_display,
             carina_core::detail_rows::DetailComparisons::RecordedEffects,

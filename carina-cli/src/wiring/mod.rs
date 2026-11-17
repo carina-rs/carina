@@ -217,23 +217,71 @@ pub(crate) enum RowRequest {
 
 /// A successful plan either owns its requested display or has no rows at all.
 /// Diagnostics never inhabit this type.
-#[derive(Debug)]
+///
+/// Raw admitted observations are private to execution and recording.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::PlannedPlan;
+/// use carina_core::plan::AdmittedPlan;
+/// fn raw_output(plan: &PlannedPlan) -> &AdmittedPlan { plan }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::PlannedPlan;
+/// use carina_core::plan::AdmittedPlan;
+/// fn raw_output(plan: &PlannedPlan) -> &AdmittedPlan {
+///     match plan {
+///         PlannedPlan::Rendered { plan, .. } | PlannedPlan::Unrendered { plan, .. } => plan,
+///     }
+/// }
+/// ```
 pub enum PlannedPlan {
     Rendered {
+        plan: PlannedExecutionPlan,
         display: Box<carina_core::detail_rows::PreparedPlanDisplay>,
         references: carina_core::references::ResolvedReferences,
     },
     Unrendered {
-        plan: Box<carina_core::input_rules::InputCheckedPlan>,
+        plan: PlannedExecutionPlan,
         references: carina_core::references::ResolvedReferences,
     },
 }
 
+impl fmt::Debug for PlannedPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Rendered { .. } => "PlannedPlan::Rendered(<protected>)",
+            Self::Unrendered { .. } => "PlannedPlan::Unrendered(<execution>)",
+        })
+    }
+}
+
+/// Opaque execution evidence retained by a planned outcome. Output consumers
+/// can extract this wrapper but cannot reach raw Update observations through it.
+pub struct PlannedExecutionPlan(Box<carina_core::input_rules::InputCheckedPlan>);
+impl fmt::Debug for PlannedExecutionPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PlannedExecutionPlan(<execution>)")
+    }
+}
+impl PlannedExecutionPlan {
+    pub(crate) fn checked(&self) -> &carina_core::input_rules::InputCheckedPlan {
+        &self.0
+    }
+    #[cfg(feature = "test-utils")]
+    pub(crate) fn into_checked(self) -> carina_core::input_rules::InputCheckedPlan {
+        *self.0
+    }
+}
+impl From<Box<carina_core::input_rules::InputCheckedPlan>> for PlannedExecutionPlan {
+    fn from(plan: Box<carina_core::input_rules::InputCheckedPlan>) -> Self {
+        Self(plan)
+    }
+}
 impl PlannedPlan {
     pub(crate) fn checked(&self) -> &carina_core::input_rules::InputCheckedPlan {
         match self {
-            Self::Rendered { display, .. } => display.checked_plan(),
-            Self::Unrendered { plan, .. } => plan,
+            Self::Rendered { plan, .. } | Self::Unrendered { plan, .. } => plan.checked(),
         }
     }
     pub(crate) fn references(&self) -> &carina_core::references::ResolvedReferences {
@@ -243,19 +291,29 @@ impl PlannedPlan {
     }
 }
 
-impl std::ops::Deref for PlannedPlan {
-    type Target = carina_core::plan::AdmittedPlan;
-
-    fn deref(&self) -> &carina_core::plan::AdmittedPlan {
-        match self {
-            Self::Rendered { display, .. } => display.plan(),
-            Self::Unrendered { plan, .. } => plan,
-        }
-    }
-}
-
 /// Command planning keeps diagnostics separate from every display-capable plan.
 #[derive(Debug)]
+///
+/// A public outcome cannot coerce to a raw observation-bearing plan either.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::PlanOutcome;
+/// use carina_core::plan::Plan;
+/// fn raw_output(outcome: &PlanOutcome) -> &Plan { outcome }
+/// ```
+///
+/// The diagnostics arm cannot expose its raw plan either.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::wiring::PlanOutcome;
+/// use carina_core::plan::Plan;
+/// fn diagnostic_plan(outcome: &PlanOutcome) -> Option<&Plan> {
+///     match outcome {
+///         PlanOutcome::Diagnostics(diagnostics) => Some(diagnostics),
+///         PlanOutcome::Planned(_) => None,
+///     }
+/// }
+/// ```
 pub enum PlanOutcome {
     Planned(PlannedPlan),
     Diagnostics(DiagnosticPlan),
@@ -263,25 +321,49 @@ pub enum PlanOutcome {
 
 #[derive(Debug)]
 pub struct DiagnosticPlan {
-    plan: Plan,
+    plan: Box<Plan>,
     pub(crate) errors: NonEmptyPlanErrors,
 }
 
-impl std::ops::Deref for DiagnosticPlan {
-    type Target = Plan;
-    fn deref(&self) -> &Plan {
+impl DiagnosticPlan {
+    pub(crate) fn plan(&self) -> &Plan {
         &self.plan
+    }
+    #[cfg(test)]
+    pub(crate) fn errors(&self) -> &[carina_core::plan::PlanError] {
+        self.plan().errors()
     }
 }
 
-impl std::ops::Deref for PlanOutcome {
-    type Target = Plan;
-
-    fn deref(&self) -> &Plan {
+impl PlanOutcome {
+    pub(crate) fn as_plan(&self) -> &Plan {
         match self {
-            Self::Planned(plan) => plan,
-            Self::Diagnostics(plan) => plan,
+            Self::Planned(plan) => plan.checked(),
+            Self::Diagnostics(plan) => plan.plan(),
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn effects(&self) -> &[Effect] {
+        self.as_plan().effects()
+    }
+    #[cfg(test)]
+    pub(crate) fn summary(&self) -> carina_core::plan::PlanSummary {
+        self.as_plan().summary()
+    }
+    pub(crate) fn mutation_count(&self) -> usize {
+        self.as_plan().mutation_count()
+    }
+    #[cfg(test)]
+    pub(crate) fn errors(&self) -> &[carina_core::plan::PlanError] {
+        self.as_plan().errors()
+    }
+    #[cfg(test)]
+    pub(crate) fn has_errors(&self) -> bool {
+        self.as_plan().has_errors()
+    }
+    #[cfg(test)]
+    pub(crate) fn has_mutations(&self) -> bool {
+        self.as_plan().has_mutations()
     }
 }
 
@@ -294,7 +376,7 @@ pub(crate) async fn prepare_plan_outcome(
     preparation: &mut carina_core::references::ReferencePreparation,
     row_request: RowRequest,
     managed_current: &HashMap<ResourceId, Current>,
-    state_file: Option<&StateFile>,
+    state_file: &carina_state::ObservedStateFile,
     schemas: &SchemaRegistry,
     input_types: &carina_core::input_rules::InputTypeContext,
     explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
@@ -306,7 +388,10 @@ pub(crate) async fn prepare_plan_outcome(
             let plan = plan.into_plan();
             let errors = NonEmptyPlanErrors::try_from(plan.errors().to_vec())
                 .expect("input rejection contains diagnostics");
-            return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
+            return Ok(PlanOutcome::Diagnostics(DiagnosticPlan {
+                plan: Box::new(plan),
+                errors,
+            }));
         }
     };
     let planned = match row_request {
@@ -315,28 +400,46 @@ pub(crate) async fn prepare_plan_outcome(
                 &plan,
                 managed_current,
                 state_file,
-            );
+            )?;
             let display = preparation
                 .display(
-                    plan, &planning, historical, detail, schemas, explicit, provider,
+                    &plan, &planning, historical, detail, schemas, explicit, provider,
                 )
                 .await?;
             PlannedPlan::Rendered {
+                plan: Box::new(plan).into(),
                 display: Box::new(display.value),
                 references: display.references,
             }
         }
         RowRequest::None => PlannedPlan::Unrendered {
-            plan: Box::new(plan),
+            plan: Box::new(plan).into(),
             references: planning,
         },
     };
     Ok(PlanOutcome::Planned(planned))
 }
 
-/// Result of creating a plan, with context needed for saving
+/// Result of creating a plan, with context needed for saving.
+/// Raw observations are internal to comparison and execution.
+/// Each boundary check below is Previously: the raw access compiled.
+///
+/// ```compile_fail,E0616
+/// use carina_cli::wiring::PlanContext;
+/// fn raw(ctx: &PlanContext) { let _ = &ctx.managed_current; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use carina_cli::wiring::PlanContext;
+/// fn raw(ctx: &PlanContext) { let _ = &ctx.data_source_values; }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use carina_cli::wiring::PlanContext;
+/// fn raw(ctx: &PlanContext) { let _ = &ctx.plan; }
+/// ```
 pub struct PlanContext {
-    pub plan: PlanOutcome,
+    pub(crate) plan: PlanOutcome,
     pub provider: ProviderRouter,
     /// Evaluated desired resources after the identity-resolution boundary.
     pub sorted_resources: Vec<ResolvedResource>,
@@ -356,8 +459,9 @@ pub struct PlanContext {
     /// have concrete inputs; apply-time deferred reads keep structural refs so
     /// saved-plan apply can reconstruct the same deferred-read set.
     pub data_sources: Vec<DataSource>,
-    pub managed_current: HashMap<ResourceId, Current>,
-    pub data_source_values: DataSourceValues,
+    pub(crate) managed_current: HashMap<ResourceId, Current>,
+    pub(crate) data_source_values: DataSourceValues,
+    pub(crate) observation_authority: carina_state::ObservationStateAuthority,
     /// Maps moved-to resource IDs to their original (moved-from) IDs.
     /// Used by display to show "(moved from: ...)" annotations on Update/Replace effects.
     pub moved_origins: HashMap<ResourceId, ResourceId>,
@@ -383,6 +487,21 @@ pub struct PlanContext {
     /// that produced them (#3306, #3307). Forwarded to the display
     /// layer so the rendered tree folds leaves under composition rows.
     pub expansion_trace: carina_core::resource::ExpansionTrace,
+}
+
+impl PlanContext {
+    pub(crate) fn protected_observations(
+        &self,
+    ) -> Result<carina_core::value::ProtectedObservations, carina_core::value::SerializationError>
+    {
+        self.observation_authority
+            .protect(carina_core::value::ObservationInputs::Plan {
+                deleted: &std::collections::HashMap::new(),
+                plan: self.plan.as_plan(),
+                current: &self.managed_current,
+                reads: &self.data_source_values,
+            })
+    }
 }
 
 /// A completed plan together with the exact canonical resources consumed by
@@ -7295,7 +7414,7 @@ pub(crate) struct PostExpansionPlanEnvironment<'a> {
     pub normalizer: &'a dyn HostNormalizer,
     pub provider_configs: &'a [ExpandedProviderConfig],
     pub remote_bindings: &'a carina_core::upstream_exports::AdmittedRemoteBindings,
-    pub state_file: &'a Option<StateFile>,
+    pub state_file: &'a carina_state::ObservedStateFile,
     pub state_block_claims: &'a StateBlockClaims,
     pub resolved_state_block_targets: &'a ResolvedStateBlockTargets,
     pub preparation_errors: Option<NonEmptyPlanErrors>,
@@ -7451,12 +7570,16 @@ pub(crate) struct PostExpansionPlan<M: PostExpansionMode, R> {
 /// need to construct their command-specific error context.
 pub(crate) struct PostExpansionDiagnostics<R> {
     artifacts: PostExpansionArtifacts<R>,
-    plan: Plan,
+    plan: Box<Plan>,
     errors: NonEmptyPlanErrors,
 }
 
 impl<R> PostExpansionDiagnostics<R> {
-    fn new(artifacts: PostExpansionArtifacts<R>, plan: Plan, errors: NonEmptyPlanErrors) -> Self {
+    fn new(
+        artifacts: PostExpansionArtifacts<R>,
+        plan: Box<Plan>,
+        errors: NonEmptyPlanErrors,
+    ) -> Self {
         Self {
             artifacts,
             plan,
@@ -7470,7 +7593,7 @@ impl<R> PostExpansionDiagnostics<R> {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_parts(self) -> (PostExpansionArtifacts<R>, Plan) {
-        (self.artifacts, self.plan)
+        (self.artifacts, *self.plan)
     }
 }
 
@@ -7676,7 +7799,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         migrated_legacy_state: None,
                     };
                     return Ok(PostExpansionOutcome::Diagnostics(
-                        PostExpansionDiagnostics::new(artifacts, plan, errors),
+                        PostExpansionDiagnostics::new(artifacts, Box::new(plan), errors),
                     ));
                 }
 
@@ -7722,6 +7845,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 if let Some(migrated) = migrated_legacy_state.as_ref() {
                     addressed.refresh_destroy_metadata_from_state(migrated);
                 }
+                let observed_state_file = state_file;
                 let state_file = if migrated_legacy_state.is_some() {
                     &migrated_legacy_state
                 } else {
@@ -7903,7 +8027,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     &mut reference_preparation,
                     row_request,
                     &managed_current,
-                    state_file.as_ref(),
+                    observed_state_file,
                     context.schemas(),
                     &input_types,
                     &prev_explicit,
@@ -9019,7 +9143,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<
 >(
     validated: ValidatedConfig<CanonicalResourcePair<E>>,
     provider_configs: &C,
-    state_file: &Option<StateFile>,
+    state_file: &carina_state::ObservedStateFile,
     refresh: bool,
     progress_sink: ProgressSink,
     remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
@@ -9070,7 +9194,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<
     canonical_resources: CanonicalResourcePair<E>,
     provider_configs: &C,
     provider_plan: &provider_mod::ProviderPlan,
-    state_file: &Option<StateFile>,
+    state_file: &carina_state::ObservedStateFile,
     refresh: bool,
     progress_sink: ProgressSink,
     remote_bindings: &carina_core::upstream_exports::AdmittedRemoteBindings,
@@ -9364,6 +9488,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<
         PlanContext {
             plan,
             provider,
+            observation_authority: state_file.authority().clone(),
             // Keep the evaluated desired view distinct from the authored
             // pre-resolution snapshot. Before carina#3861 this field was filled
             // with `paired_unresolved_resources`; for let-bound resources that

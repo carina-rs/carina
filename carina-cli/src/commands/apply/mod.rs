@@ -37,7 +37,7 @@ use carina_core::resource::{
 use carina_core::resource::{ConcreteValue, State};
 use carina_core::shutdown::ShutdownToken;
 use carina_core::upstream_exports::AdmittedRemoteBindings;
-use carina_core::value::{RenderedKey, render_value};
+use carina_core::value::RenderedKey;
 use carina_state::{
     LockInfo, RowBasis, S3AutoCreate, S3Bootstrap, StateBackend, StateFile, StorageReadiness,
 };
@@ -1435,17 +1435,18 @@ pub(crate) async fn save_state_unlocked_after_execute(
 pub(crate) async fn load_state_persist_if_migrated(
     backend: &dyn StateBackend,
     lock: StateLockRef<'_>,
-) -> Result<Option<StateFile>, AppError> {
-    match backend.read_state().await.map_err(AppError::Backend)? {
-        None => Ok(None),
-        Some(carina_state::LoadedState::Pristine(state)) => Ok(Some(state)),
+) -> Result<carina_state::ObservedStateFile, AppError> {
+    let (loaded, authority) = carina_state::ObservationStateAuthority::load(backend).await?;
+    let file = match loaded {
+        None => None,
+        Some(carina_state::LoadedState::Pristine(state)) => Some(state),
         Some(carina_state::LoadedState::Migrated { mut state, .. }) => {
             state.finish_rowless_dependency_migration();
             if state.requires_legacy_dependency_migration() {
                 // v20 dependency names are an intentionally unwritable
                 // typestate. The expanded graph later classifies them before
                 // any state mutation or persistence is allowed.
-                return Ok(Some(state));
+                return Ok(authority.bind(Some(state)));
             }
             match lock {
                 StateLockRef::Held(lock) => save_state_locked(backend, lock, &mut state).await?,
@@ -1453,9 +1454,10 @@ pub(crate) async fn load_state_persist_if_migrated(
                     save_state_unlocked(backend, disabled, &mut state).await?
                 }
             }
-            Ok(Some(state))
+            Some(state)
         }
-    }
+    };
+    Ok(authority.bind(file))
 }
 
 /// Remove pre-#3181 identifier-less data-source rows identified by the
@@ -1641,15 +1643,23 @@ pub(crate) async fn detect_drift<S: Clone>(
         carina_core::resource::AbsoluteBindingAddress,
         (),
     >],
+    observation_plan: &carina_core::plan::Plan<S>,
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     refresh_rows: &carina_state::RefreshRows,
     historical_addresses: &HistoricalResourceAddresses,
     operation_provider: &dyn HostProvider,
     comparison_provider: &ProviderRouter,
     state_file: Option<&StateFile>,
+    observation_authority: &carina_state::ObservationStateAuthority,
     schemas: &carina_core::schema::SchemaRegistry,
     apply_target: ApplyTarget<'_>,
 ) -> Result<DriftCheckResult, AppError> {
+    enum DriftedAttribute<'a> {
+        Changed(&'a str),
+        Removed(&'a str),
+        Added(&'a str),
+    }
+
     let mut drift_detected = false;
     let mut drift_messages: Vec<String> = Vec::new();
     let mut actual_states = HashMap::new();
@@ -1663,6 +1673,13 @@ pub(crate) async fn detect_drift<S: Clone>(
         })
         .collect();
 
+    let observation_history = planned_state_entries
+        .iter()
+        .map(|entry| {
+            let crate::commands::plan::ReloadedCurrentStateEntry::Managed { id, current } = entry;
+            (id.clone(), *current.clone())
+        })
+        .collect::<HashMap<_, _>>();
     for resource in sorted_resources {
         let resolved_resource = ResolvedResource::resolve_with_schemas(resource.clone(), schemas)?;
         // carina#3181: `sorted_resources` is managed-only — drift
@@ -1672,18 +1689,11 @@ pub(crate) async fn detect_drift<S: Clone>(
         let planned_snapshot = planned_states.get(&resource.id).copied();
         let planned_current = planned_snapshot.map(|snapshot| snapshot.as_ref());
         let planned_state = planned_current.and_then(|current| match current {
-            Current::Absent(state) => Some(state.state()),
-            Current::Present(present) => Some(present.state()),
+            Current::Absent(state) => Some((state.state(), false)),
+            Current::Present(present) => Some((present.state(), true)),
             Current::CreateInFlight(_pending) => None,
             Current::CreateOutcomeUnknown(_unknown) => None,
-            Current::MissingIdentifier(state) => Some(state.state()),
-        });
-        let planned_exists = planned_current.and_then(|current| match current {
-            Current::Absent(_absent) => Some(false),
-            Current::Present(_present) => Some(true),
-            Current::CreateInFlight(_pending) => None,
-            Current::CreateOutcomeUnknown(_unknown) => None,
-            Current::MissingIdentifier(_unidentified) => Some(true),
+            Current::MissingIdentifier(state) => Some((state.state(), true)),
         });
         let historical_id = planned_current
             .map(|_| historical_addresses.origin_for(&resource.id))
@@ -1721,8 +1731,7 @@ pub(crate) async fn detect_drift<S: Clone>(
         actual_state.id = resource.id.clone();
         actual_states.insert(resource.id.clone(), actual_state.clone());
 
-        if let Some(planned) = planned_state {
-            let planned_exists = planned_exists.expect("planned state and variant are paired");
+        if let Some((planned, planned_exists)) = planned_state {
             if planned_exists != actual_state.exists {
                 drift_detected = true;
                 if planned_exists {
@@ -1763,29 +1772,15 @@ pub(crate) async fn detect_drift<S: Clone>(
                     actual_state.attributes.clone(),
                     schema,
                 );
-                // Compare attributes for existing resources
-                let attr_diffs = typed_comparison.context().with_observation(|comparison| {
-                    let mut attr_diffs: Vec<String> = Vec::new();
-                    for (key, planned_val) in &planned_comparison {
-                        let historical_shape = planned_state
-                            .and_then(|state| state.attributes.get(key))
-                            .unwrap_or(planned_val);
-                        let masked_planned = carina_core::value::mask_plaintext_using_secret_shape(
-                            planned_val,
-                            historical_shape,
-                        );
-                        match actual_comparison.get(key) {
-                            Some(actual_val) if secret_drift.contains(key) => {
-                                let masked = carina_core::value::mask_plaintext_using_secret_shape(
-                                    actual_val,
-                                    historical_shape,
-                                );
-                                attr_diffs.push(format!(
-                                    "      {}: {} → {}",
-                                    RenderedKey::from_raw(key),
-                                    render_value(&masked_planned),
-                                    render_value(&masked)
-                                ));
+                // Equality needs raw operands, but output protection is needed
+                // only when a comparison produces a diagnostic to render.
+                let drifted_attributes =
+                    typed_comparison.context().with_observation(|comparison| {
+                        let mut drifted_attributes = Vec::new();
+                        for (key, planned_val) in &planned_comparison {
+                            match actual_comparison.get(key) {
+                            Some(_) if secret_drift.contains(key) => {
+                                drifted_attributes.push(DriftedAttribute::Changed(key));
                             }
                             Some(actual_val)
                                 if !carina_core::diff_helpers::resource_attribute_values_equal(
@@ -1796,39 +1791,60 @@ pub(crate) async fn detect_drift<S: Clone>(
                                     comparison,
                                 ) =>
                             {
-                                let masked = carina_core::value::mask_plaintext_using_secret_shape(
-                                    actual_val,
-                                    historical_shape,
-                                );
-                                attr_diffs.push(format!(
-                                    "      {}: {} → {}",
-                                    RenderedKey::from_raw(key),
-                                    render_value(&masked_planned),
-                                    render_value(&masked)
-                                ));
+                                drifted_attributes.push(DriftedAttribute::Changed(key));
                             }
                             None => {
-                                attr_diffs.push(format!(
-                                    "      {}: {} → (removed)",
-                                    RenderedKey::from_raw(key),
-                                    render_value(&masked_planned)
-                                ));
+                                drifted_attributes.push(DriftedAttribute::Removed(key));
                             }
                             _ => {}
                         }
-                    }
-                    for (key, actual_val) in &actual_comparison {
-                        if !planned_comparison.contains_key(key) {
-                            attr_diffs.push(format!(
+                        }
+                        for key in actual_comparison.keys() {
+                            if !planned_comparison.contains_key(key) {
+                                drifted_attributes.push(DriftedAttribute::Added(key));
+                            }
+                        }
+                        drifted_attributes
+                    })?;
+                if !drifted_attributes.is_empty() {
+                    let [planned_snapshot, actual_snapshot] =
+                        [&planned_comparison, &actual_comparison].map(|attributes| SnapshotState {
+                            attributes: attributes
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect(),
+                            ..actual_state.clone()
+                        });
+                    let observations = observation_authority.protect(
+                        carina_core::value::ObservationInputs::SavedApply {
+                            plan: observation_plan,
+                            history: &observation_history,
+                            planned: &planned_snapshot,
+                            actual: &actual_snapshot,
+                        },
+                    )?;
+                    let comparisons = observations.comparisons()?;
+                    let mut attr_diffs = Vec::new();
+                    for attribute in drifted_attributes {
+                        attr_diffs.push(match attribute {
+                            DriftedAttribute::Changed(key) => format!(
+                                "      {}: {} → {}",
+                                RenderedKey::from_raw(key),
+                                comparisons.planned.rendered_attribute(key)?,
+                                comparisons.actual.rendered_attribute(key)?
+                            ),
+                            DriftedAttribute::Removed(key) => format!(
+                                "      {}: {} → (removed)",
+                                RenderedKey::from_raw(key),
+                                comparisons.planned.rendered_attribute(key)?
+                            ),
+                            DriftedAttribute::Added(key) => format!(
                                 "      {}: (none) → {}",
                                 RenderedKey::from_raw(key),
-                                render_value(actual_val)
-                            ));
-                        }
+                                comparisons.actual.rendered_attribute(key)?
+                            ),
+                        });
                     }
-                    attr_diffs
-                })?;
-                if !attr_diffs.is_empty() {
                     drift_detected = true;
                     drift_messages.push(format!(
                         "  {} {}: attributes have changed since plan was created:",
@@ -1898,15 +1914,23 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
         }),
         &carina_state::ResolvedRemovedClaims::resolve(&[], None),
     );
+    let mut plan = carina_core::plan::Plan::<S>::default();
+    plan.retain_observation_desired_for_test(
+        sorted_resources
+            .iter()
+            .map(|resource| (&resource.id, &resource.attributes)),
+    );
     detect_drift(
         color_mode,
         &sorted_resources,
+        &plan,
         planned_state_entries,
         &rows.refreshable,
         historical_addresses,
         operation_provider,
         &comparison_provider,
         state_file,
+        &crate::test_support::observation_authority_for_test(state_file),
         &schemas,
         apply_target,
     )
@@ -2794,10 +2818,11 @@ async fn run_apply_locked_owned(
             } = artifacts;
             let legacy_state_migrated = migrated_legacy_state.is_some();
             if let Some(migrated) = migrated_legacy_state {
-                state_file = Some(migrated);
+                *state_file = Some(migrated);
             }
+            let execution_plan = plan.checked();
             #[cfg(any(test, feature = "test-utils"))]
-            capture_live_apply_plan_for_test(&runtime, &plan)?;
+            capture_live_apply_plan_for_test(&runtime, execution_plan)?;
             let crate::wiring::PostExpansionApplyResources {
                 resolved: resolved_resources,
                 paired_unresolved: paired_unresolved_resources,
@@ -2812,7 +2837,7 @@ async fn run_apply_locked_owned(
                 .into_executable()
                 .map_err(|error| AppError::Config(error.to_string()))?;
 
-            if can_use_export_only_fast_path(&plan, &executable_data_source_values) {
+            if can_use_export_only_fast_path(execution_plan, &executable_data_source_values) {
                 // No mutating effects — the plan only holds `Read` (data-source
                 // reads) or `Wait` effects, or is entirely empty. Either way no
                 // resource apply pipeline needs to run; route through the
@@ -2835,7 +2860,7 @@ async fn run_apply_locked_owned(
                         managed_current: &managed_current,
                         data_source_values: &data_source_values,
                         state_file: state_file.as_ref(),
-                        plan: &plan,
+                        plan: execution_plan,
                         schemas: ctx.schemas(),
                         wait_aliases: &wait_aliases,
                         provider_context: ctx.provider_context(),
@@ -2850,8 +2875,11 @@ async fn run_apply_locked_owned(
                     &checked_exports_pre_apply,
                     current_exports,
                 );
-                let directive_changes =
-                    persisted_directive_changes(state_file.as_ref(), &resolved_resources, &plan);
+                let directive_changes = persisted_directive_changes(
+                    state_file.as_ref(),
+                    &resolved_resources,
+                    execution_plan,
+                );
                 let directive_change_count = directive_changes.len();
 
                 if export_changes.is_empty() && directive_change_count == 0 {
@@ -2865,7 +2893,7 @@ async fn run_apply_locked_owned(
                         return Ok(SourceApplyAfterHeartbeat::PersistExports(Box::new(
                             SourceApplyPersistExports {
                                 validated_config: validated_expansion,
-                                state_file,
+                                state_file: state_file.into_file(),
                                 resources: paired_unresolved_resources,
                                 compositions: pre_resolve_compositions_noop,
                                 checked_exports: checked_exports_pre_apply,
@@ -2882,7 +2910,7 @@ async fn run_apply_locked_owned(
                 }
 
                 let summary = PlanChangeSummary::new(
-                    &plan,
+                    execution_plan,
                     &export_changes,
                     &residual_deferred_for,
                     &directive_changes,
@@ -2929,7 +2957,7 @@ async fn run_apply_locked_owned(
                     );
                 }
                 let state_file = if directive_change_count > 0 {
-                    let mut state = state_file.unwrap_or_default();
+                    let mut state = state_file.into_file().unwrap_or_default();
                     apply_persisted_directive_changes(
                         &mut state,
                         &resolved_resources,
@@ -2937,7 +2965,7 @@ async fn run_apply_locked_owned(
                     )?;
                     Some(state)
                 } else {
-                    state_file
+                    state_file.into_file()
                 };
                 // No-op apply path: compositions were never resolved (no head-of-
                 // pipeline pass ran). carina#3181: compositions live in
@@ -2970,7 +2998,7 @@ async fn run_apply_locked_owned(
                     managed_current: &managed_current,
                     data_source_values: &data_source_values,
                     state_file: state_file.as_ref(),
-                    plan: &plan,
+                    plan: execution_plan,
                     schemas: ctx.schemas(),
                     wait_aliases: &wait_aliases,
                     provider_context: ctx.provider_context(),
@@ -2984,10 +3012,13 @@ async fn run_apply_locked_owned(
                 &checked_exports_pre_apply,
                 &current_exports,
             );
-            let directive_changes =
-                persisted_directive_changes(state_file.as_ref(), &resolved_resources, &plan);
+            let directive_changes = persisted_directive_changes(
+                state_file.as_ref(),
+                &resolved_resources,
+                execution_plan,
+            );
             let summary = PlanChangeSummary::new(
-                &plan,
+                execution_plan,
                 &export_changes,
                 &residual_deferred_for,
                 &directive_changes,
@@ -3003,7 +3034,7 @@ async fn run_apply_locked_owned(
                 &provider,
             )?;
             let moved_hints = crate::moved_hint::detect_moved_block_hints(
-                &plan,
+                execution_plan,
                 &managed_current,
                 ctx.schemas(),
                 &provider,
@@ -3032,20 +3063,23 @@ async fn run_apply_locked_owned(
             // `ProviderNormalizer`; the same object is passed in both positions
             // so apply re-normalizes with exactly the plan-time normalizer
             // (carina#3060). They must stay the same object.
-            let observer = observer_factory(color_mode, &plan, project_display);
+            let observer = observer_factory(color_mode, execution_plan, project_display);
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(
                 ApplyStateSaveInputs::new(
                     resolved_resources.clone(),
-                    plan.clone().into_unadmitted(),
+                    execution_plan.plan().clone().into_unadmitted(),
                     ctx.schemas().clone(),
                     None,
                     provider.as_ref(),
                 )?
                 .with_reference_evidence(Some(plan.references().clone())),
             );
-            let saver =
-                start_apply_state_saver(state_file, mid_run_writer, Arc::clone(&state_save_inputs));
+            let saver = start_apply_state_saver(
+                state_file.into_file(),
+                mid_run_writer,
+                Arc::clone(&state_save_inputs),
+            );
             let publisher = saver.publisher();
             let checkpoint_sink = ExecutionCheckpointSink::new(move |snapshot| {
                 publisher.send_replace(Some(snapshot));
@@ -3053,7 +3087,7 @@ async fn run_apply_locked_owned(
             // Remove, Move, and keyed-list release need no provider call.
             // Report them now; every checkpoint's state writeback materializes
             // them from the plan.
-            let state_only_success_count = execute_state_only_effects(color_mode, &plan);
+            let state_only_success_count = execute_state_only_effects(color_mode, execution_plan);
             let outcome = execute_effects_with_observer(
                 plan.checked(),
                 &pre_resolve_compositions,
@@ -3087,7 +3121,7 @@ async fn run_apply_locked_owned(
             // Execute import effects: read imported resources from the provider
             execute_import_effects(
                 color_mode,
-                &plan,
+                execution_plan,
                 provider.as_ref(),
                 &mut result,
                 &cancel,
@@ -3812,6 +3846,79 @@ async fn run_apply_from_plan_with_observer_factory(
     cancel: ShutdownToken,
     observer_factory: &ObserverFactory<'_, SavedModuleSource>,
 ) -> Result<(), AppError> {
+    run_apply_from_plan_using(
+        runtime,
+        plan,
+        plan_argument,
+        auto_approve,
+        lock,
+        parallelism,
+        accept_legacy_name_overrides,
+        provider_context,
+        cancel,
+        observer_factory,
+        |runtime, providers, directory| {
+            ProviderLoad::load(
+                runtime,
+                providers,
+                directory,
+                &mut crate::commands::human_provider_notices(runtime.color_mode()),
+            )
+        },
+    )
+    .await
+}
+
+/// Exercise saved apply, including drift verification, with native factories.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn run_saved_apply_with_factories_for_test(
+    runtime: &crate::runtime::CommandRuntime,
+    path: &Path,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+) -> Result<(), AppError> {
+    let plan = ResolvedPath::new(path).unwrap();
+    let context = ProviderContext::new(runtime.environment().clone());
+    run_apply_from_plan_using(
+        runtime,
+        &plan,
+        path,
+        true,
+        true,
+        crate::DEFAULT_PARALLELISM,
+        false,
+        &context,
+        ShutdownToken::running(),
+        &cli_observer_factory,
+        |runtime, providers, _| {
+            Ok(ProviderLoad::for_test_with_provider_phase(
+                runtime, factories, providers,
+            ))
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_apply_from_plan_using(
+    runtime: &crate::runtime::CommandRuntime,
+    plan: &ResolvedPath,
+    plan_argument: &Path,
+    auto_approve: bool,
+    lock: bool,
+    parallelism: NonZeroUsize,
+    accept_legacy_name_overrides: bool,
+    provider_context: &ProviderContext,
+    cancel: ShutdownToken,
+    observer_factory: &ObserverFactory<'_, SavedModuleSource>,
+    load_providers: impl FnOnce(
+        &crate::runtime::CommandRuntime,
+        &[carina_core::parser::ProviderConfig<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+        >],
+        &ResolvedPath,
+    ) -> Result<ProviderLoad, AppError>,
+) -> Result<(), AppError> {
     let color_mode = runtime.color_mode();
     let plan_path = plan_argument;
     let bytes = plan.read().map_err(|error| AppError::PlanFileRead {
@@ -4027,13 +4134,7 @@ async fn run_apply_from_plan_with_observer_factory(
         .iter()
         .map(carina_core::parser::ProviderConfig::loading_projection)
         .collect::<Vec<_>>();
-    let providers = ProviderLoad::load(
-        runtime,
-        &loading_configs,
-        base_dir,
-        &mut crate::commands::human_provider_notices(runtime.color_mode()),
-    )?
-    .into_complete()?;
+    let providers = load_providers(runtime, &loading_configs, base_dir)?.into_complete()?;
     // Backend drift remains a mutation-safety gate even when the saved plan
     // has no secrets. Loading the syntax tree is deliberately separate from
     // validation and provider-config resolution: placeholder-free plans may
@@ -4192,12 +4293,16 @@ async fn run_apply_from_plan_locked_owned(
     // lineage/serial check first, so the operator sees the original
     // on-disk serial (the one the saved plan was diffed against)
     // rather than a +1 bump caused by our own migration persist.
-    let (mut state_file, pending_migration) =
-        match try_with_lock!(backend.read_state().await.map_err(AppError::Backend)) {
-            None => (None, None),
-            Some(carina_state::LoadedState::Pristine(state)) => (Some(state), None),
-            Some(carina_state::LoadedState::Migrated { state, info }) => (Some(state), Some(info)),
-        };
+    let (loaded_state, observation_authority) = try_with_lock!(
+        carina_state::ObservationStateAuthority::load(backend.as_ref())
+            .await
+            .map_err(AppError::Backend)
+    );
+    let (mut state_file, pending_migration) = match loaded_state {
+        None => (None, None),
+        Some(carina_state::LoadedState::Pristine(state)) => (Some(state), None),
+        Some(carina_state::LoadedState::Migrated { state, info }) => (Some(state), Some(info)),
+    };
     if let Some(state) = state_file.as_ref() {
         try_with_lock!(check_legacy_name_overrides(
             state,
@@ -4325,12 +4430,14 @@ async fn run_apply_from_plan_locked_owned(
             let drift_check = detect_drift(
                 color_mode,
                 validated_plan.sorted_resources(),
+                validated_plan.observation_plan(),
                 validated_plan.current_states(),
                 validated_plan.refresh_rows(),
                 &historical_addresses,
                 validated_plan.provider(),
                 validated_plan.provider(),
                 state_file.as_ref(),
+                &observation_authority,
                 wiring.schemas(),
                 apply_target,
             )
@@ -4527,8 +4634,8 @@ async fn run_apply_from_plan_locked_owned(
                 let historical_display = collect_historical_display_attributes(
                     plan,
                     &managed_current,
-                    state_file.as_ref(),
-                );
+                    &observation_authority.clone().bind(state_file.clone()),
+                )?;
                 let summary = PlanChangeSummary::from_reloaded_plan(
                     rehydrated_plan_file.reloaded_plan_file(),
                 );
@@ -4575,7 +4682,7 @@ async fn run_apply_from_plan_locked_owned(
 
             // Build display-safe historical attributes from current and persisted state.
             let historical_display =
-                collect_historical_display_attributes(plan, &managed_current, state_file.as_ref());
+                collect_historical_display_attributes(plan, &managed_current, &observation_authority.clone().bind(state_file.clone()))?;
 
             let summary =
                 PlanChangeSummary::from_reloaded_plan(rehydrated_plan_file.reloaded_plan_file());

@@ -14,8 +14,8 @@ use carina_core::provider::{
     AppliedIdentifier, EmptyAppliedIdentifier, HostCreateObservation, HostIdentifiedCreate,
     InFlightCreate, InFlightPersistence, NestedWriteOnlyRecord, PersistedAttributes,
     PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
-    StateRowInFlightCreate, StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
-    merge_previous_secret_hashes_into_provider_value, previous_hash,
+    StateTransformMap, UnknownCreateOutcome, merge_previous_secret_hashes_into_provider_value,
+    previous_hash,
 };
 use carina_core::resolved_graph::{
     ConfiguredResources, ExpandedBindingIndex, ExpandedGraphResolutionError,
@@ -39,12 +39,18 @@ use carina_core::value::{
     merge_secrets_into_observation_json, merge_secrets_into_provider_json,
     union_secret_shapes_after_resolution,
 };
-use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::backend::{BackendError, InvalidResourceIdentityError, InvalidStateJsonError};
+pub use carina_core::state_document::{CurrentInstance, LegacyDependencyNames};
+use carina_core::state_document::{
+    ExportsVersionClassification, LegacyRowDependencies,
+    StateDocumentDecodeError as StateFileDecodeError, StateDocumentVersion,
+    classify_exports_version, decode_persisted_exports, validate_deposed_identities,
+    validate_resource_identities,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
 fn persisted_attributes_from_test_json(
@@ -444,7 +450,7 @@ impl PublishedExports {
     /// Bump this only when [`PersistedExportValue`]'s encoding changes. The
     /// state-format changes in v12, v13, and v14 would each have required an
     /// exports-version bump if this independent contract had existed then.
-    pub const CURRENT_VERSION: u32 = 1;
+    pub const CURRENT_VERSION: u32 = carina_core::state_document::CURRENT_EXPORTS_VERSION;
 
     /// Read the published-exports envelope from raw state-file bytes.
     ///
@@ -524,7 +530,17 @@ pub struct StateFile {
     legacy_dependencies: BTreeMap<ResolvedResourceId, LegacyRowDependencies>,
     dependency_encoding: DependencyEncoding,
     /// Loaded field order; typed values and lifecycle state remain authoritative.
-    wire_order: Option<carina_core::json_field_order::JsonFieldOrder>,
+    wire_order: Option<std::sync::Arc<carina_core::json_field_order::JsonFieldOrder>>,
+    /// Immutable evidence produced by the original decode, before mutations
+    /// of this working state. New, unwritten files have no backend evidence.
+    loaded_observation: Option<ObservationStateAuthority>,
+}
+
+impl carina_core::value::BindingState for StateFile {
+    fn observation_attributes(&self, id: &ResourceId) -> Option<&PersistedAttributes> {
+        self.find_resource_for_id(id)
+            .and_then(ResourceState::persisted_attributes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -742,140 +758,6 @@ impl FromIterator<Orphan> for LoadedOrphans {
     }
 }
 
-#[derive(Deserialize)]
-struct UncheckedStateFile {
-    version: u32,
-    exports_version: Option<u32>,
-    serial: u64,
-    lineage: String,
-    carina_version: String,
-    resources: Vec<serde_json::Value>,
-    #[serde(default)]
-    exports: HashMap<String, serde_json::Value>,
-}
-
-struct ErrorSourceChain<'a>(&'a (dyn std::error::Error + 'static));
-
-impl std::fmt::Display for ErrorSourceChain<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)?;
-        let mut source = self.0.source();
-        while let Some(error) = source {
-            write!(f, ": {error}")?;
-            source = error.source();
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum StateFileDecodeError {
-    Json {
-        json_path: String,
-        source: serde_json::Error,
-    },
-    ExportsVersionTooNew {
-        found: u32,
-        supported: u32,
-    },
-    InvalidResourceIdentity(InvalidResourceIdentityError),
-    Validation(String),
-}
-
-impl StateFileDecodeError {
-    fn json_at_root(source: serde_json::Error) -> Self {
-        Self::Json {
-            json_path: "<root>".to_string(),
-            source,
-        }
-    }
-
-    fn json_at_path(path: &serde_path_to_error::Path, source: serde_json::Error) -> Self {
-        let path = path.to_string();
-        Self::Json {
-            json_path: if path == "." {
-                "<root>".to_string()
-            } else {
-                path
-            },
-            source,
-        }
-    }
-
-    fn json_in_resource(
-        index: usize,
-        path: &serde_path_to_error::Path,
-        source: serde_json::Error,
-    ) -> Self {
-        let path = path.to_string();
-        let json_path = if path == "." {
-            format!("resources[{index}]")
-        } else if path.starts_with('[') {
-            format!("resources[{index}]{path}")
-        } else {
-            format!("resources[{index}].{path}")
-        };
-        Self::Json { json_path, source }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExportsVersionClassification {
-    Current,
-    Legacy,
-}
-
-fn classify_exports_version(
-    state_version: u32,
-    exports_version: Option<u32>,
-) -> Result<ExportsVersionClassification, StateFileDecodeError> {
-    match exports_version {
-        Some(_) if state_version < StateFile::EXPORTS_VERSION_INTRODUCED => {
-            Err(StateFileDecodeError::Validation(format!(
-                "top-level exports_version is invalid before state version {}",
-                StateFile::EXPORTS_VERSION_INTRODUCED
-            )))
-        }
-        Some(found) if found > PublishedExports::CURRENT_VERSION => {
-            Err(StateFileDecodeError::ExportsVersionTooNew {
-                found,
-                supported: PublishedExports::CURRENT_VERSION,
-            })
-        }
-        Some(found) if found < PublishedExports::CURRENT_VERSION => {
-            Err(StateFileDecodeError::Validation(format!(
-                "exports version {found} is older than supported version {}; no exports migration exists",
-                PublishedExports::CURRENT_VERSION
-            )))
-        }
-        Some(_) => Ok(ExportsVersionClassification::Current),
-        None if state_version >= StateFile::EXPORTS_VERSION_INTRODUCED => {
-            Err(StateFileDecodeError::Validation(
-                "missing required top-level exports_version".to_string(),
-            ))
-        }
-        None => Ok(ExportsVersionClassification::Legacy),
-    }
-}
-
-/// Validate persisted JSON without applying remote-binding value semantics.
-fn decode_persisted_exports(
-    exports: HashMap<String, serde_json::Value>,
-) -> Result<HashMap<String, PersistedExportValue>, StateFileDecodeError> {
-    exports
-        .into_iter()
-        .map(|(name, value)| {
-            serde_json::from_value(value)
-                .map(|value| (name.clone(), value))
-                .map_err(|error| {
-                    StateFileDecodeError::Validation(format!(
-                        "persisted export {name:?} is not valid persisted JSON: {error}"
-                    ))
-                })
-        })
-        .collect()
-}
-
 fn map_state_file_decode_error(
     error: StateFileDecodeError,
     migration_from: Option<u32>,
@@ -884,7 +766,23 @@ fn map_state_file_decode_error(
         StateFileDecodeError::ExportsVersionTooNew { found, supported } => {
             BackendError::ExportsVersionTooNew { found, supported }
         }
-        StateFileDecodeError::InvalidResourceIdentity(error) => error.into(),
+        StateFileDecodeError::InvalidResourceIdentity {
+            resource_index,
+            provider,
+            resource_type,
+            identifier,
+            source,
+        } => InvalidResourceIdentityError::new(
+            resource_index,
+            provider,
+            resource_type,
+            identifier,
+            source,
+        )
+        .into(),
+        StateFileDecodeError::StateVersionTooNew { found, supported } => {
+            BackendError::StateVersionTooNew { found, supported }
+        }
         StateFileDecodeError::Json { json_path, source } => {
             let context = match migration_from {
                 Some(version) => format!("Failed to migrate state file from v{version}"),
@@ -901,96 +799,41 @@ fn map_state_file_decode_error(
     }
 }
 
-fn take_legacy_dependency_names(
-    owner: &mut serde_json::Value,
-    field: &str,
-    location: &str,
-) -> Result<LegacyDependencyNames, StateFileDecodeError> {
-    use carina_core::utils::canonicalize_map_key_address;
-
-    let Some(object) = owner.as_object_mut() else {
-        return Err(StateFileDecodeError::Validation(format!(
-            "{location} owner must be an object"
-        )));
-    };
-    let Some(value) = object.remove(field) else {
-        return Ok(LegacyDependencyNames::default());
-    };
-    let values = value
-        .as_array()
-        .ok_or_else(|| StateFileDecodeError::Validation(format!("{location} must be an array")))?;
-    let names = values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            value
-                .as_str()
-                .map(canonicalize_map_key_address)
-                .ok_or_else(|| {
-                    StateFileDecodeError::Validation(format!(
-                        "{location}[{index}] must be a string in pre-v21 state"
-                    ))
-                })
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    Ok(LegacyDependencyNames(names))
-}
-
-fn extract_legacy_row_dependencies(
-    row: &mut serde_json::Value,
-    row_index: usize,
-) -> Result<LegacyRowDependencies, StateFileDecodeError> {
-    let value_dependencies = take_legacy_dependency_names(
-        row,
-        "dependency_bindings",
-        &format!("resources[{row_index}].dependency_bindings"),
-    )?;
-    let explicit_dependencies = match row.get_mut("directives") {
-        Some(directives) => take_legacy_dependency_names(
-            directives,
-            "depends_on",
-            &format!("resources[{row_index}].directives.depends_on"),
-        )?,
-        None => LegacyDependencyNames::default(),
-    };
-    let mut deposed_dependencies = HashMap::new();
-    if let Some(deposed) = row.get_mut("deposed") {
-        let deposed = deposed.as_array_mut().ok_or_else(|| {
-            StateFileDecodeError::Validation(format!(
-                "resources[{row_index}].deposed must be an array"
-            ))
-        })?;
-        for (generation_index, generation) in deposed.iter_mut().enumerate() {
-            let names = take_legacy_dependency_names(
-                generation,
-                "dependency_bindings",
-                &format!("resources[{row_index}].deposed[{generation_index}].dependency_bindings"),
-            )?;
-            if !names.is_empty() {
-                let key = generation
-                    .get("key")
-                    .cloned()
-                    .ok_or_else(|| {
-                        StateFileDecodeError::Validation(format!(
-                            "resources[{row_index}].deposed[{generation_index}].key is missing"
-                        ))
-                    })
-                    .and_then(|value| {
-                        serde_json::from_value::<DeposedKey>(value)
-                            .map_err(StateFileDecodeError::json_at_root)
-                    })?;
-                deposed_dependencies.insert(key, names);
-            }
-        }
-    }
-    Ok(LegacyRowDependencies {
-        value_dependencies,
-        explicit_dependencies,
-        deposed_dependencies,
-    })
-}
-
 impl StateFile {
+    #[cfg(any(test, feature = "test-utils"))]
+    fn fixture_observation_authority(
+        &self,
+    ) -> Result<ObservationStateAuthority, StateFileDecodeError> {
+        // Synthetic fixtures can mutate or construct their entire history.
+        // Their rows already use current dependency types, even if the fixture
+        // retains a pending legacy migration outside those rows.
+        #[derive(Serialize)]
+        struct ObservationFile<'a> {
+            version: u32,
+            serial: u64,
+            lineage: &'a str,
+            carina_version: &'a str,
+            exports_version: u32,
+            exports: &'a HashMap<String, PersistedExportValue>,
+            resources: &'a [ResourceState],
+        }
+        let document = ObservationFile {
+            version: Self::CURRENT_VERSION,
+            serial: self.serial,
+            lineage: &self.lineage,
+            carina_version: &self.carina_version,
+            exports_version: PublishedExports::CURRENT_VERSION,
+            exports: &self.exports,
+            resources: &self.resources,
+        };
+        let bytes = serde_json::to_vec(&document).map_err(StateFileDecodeError::json_at_root)?;
+        Ok(ObservationStateAuthority {
+            state: std::sync::Arc::new(carina_core::value::ObservationState::read_state_file(
+                &bytes,
+            )?),
+        })
+    }
+
     /// Crate-private validated parse seam. `StateFile` intentionally has no
     /// public `Deserialize` impl: every external parse must go through the
     /// version gate ([`check_and_migrate`] or [`check_and_migrate_bytes`]), so
@@ -998,112 +841,32 @@ impl StateFile {
     /// (carina#3731). Parsing here still validates duplicate identities on
     /// every parse (carina#2858).
     pub(crate) fn from_json_str(content: &str) -> Result<Self, StateFileDecodeError> {
-        let mut deserializer = serde_json::Deserializer::from_str(content);
-        let mut unchecked: UncheckedStateFile = serde_path_to_error::deserialize(&mut deserializer)
-            .map_err(|error| {
-                let path = error.path().clone();
-                StateFileDecodeError::json_at_path(&path, error.into_inner())
-            })?;
-        deserializer
-            .end()
-            .map_err(StateFileDecodeError::json_at_root)?;
-        classify_exports_version(unchecked.version, unchecked.exports_version)?;
-        let legacy_rows = if unchecked.version <= 20 {
-            unchecked
-                .resources
-                .iter_mut()
-                .enumerate()
-                .map(|(index, row)| extract_legacy_row_dependencies(row, index))
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            vec![LegacyRowDependencies::default(); unchecked.resources.len()]
-        };
-        let resources = unchecked
-            .resources
-            .into_iter()
-            .enumerate()
-            .map(|(index, value)| {
-                let identity = value
-                    .get("identity")
-                    .or_else(|| value.get("name"))
-                    .and_then(serde_json::Value::as_str);
-                if let Some(identity) = identity
-                    && let Err(source) = ResourceIdentity::try_from(identity.to_owned())
-                {
-                    let provider = value
-                        .get("provider")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("<missing>")
-                        .to_owned();
-                    let resource_type = value
-                        .get("resource_type")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("<missing>")
-                        .to_owned();
-                    let identifier = value
-                        .get("current")
-                        .and_then(|current| current.get("identifier"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned);
-                    return Err(StateFileDecodeError::InvalidResourceIdentity(
-                        InvalidResourceIdentityError::new(
-                            index,
-                            provider,
-                            resource_type,
-                            identifier,
-                            source,
-                        ),
-                    ));
-                }
-                let _: EncodedResourceState = serde_path_to_error::deserialize(
-                    value.clone().into_deserializer(),
-                )
-                .map_err(|error| {
-                    let path = error.path().clone();
-                    StateFileDecodeError::json_in_resource(index, &path, error.into_inner())
-                })?;
-                serde_path_to_error::deserialize(value.into_deserializer()).map_err(|error| {
-                    let path = error.path().clone();
-                    StateFileDecodeError::json_in_resource(index, &path, error.into_inner())
-                })
-            })
-            .collect::<Result<Vec<ResourceState>, StateFileDecodeError>>()?;
-        let exports = decode_persisted_exports(unchecked.exports)?;
-        let legacy_dependencies = resources
-            .iter()
-            .zip(legacy_rows)
-            .filter_map(|(row, dependencies)| {
-                (!dependencies.is_empty()).then(|| {
-                    (
-                        ResolvedResourceId::new(Self::id_for_resource_state(row)),
-                        dependencies,
-                    )
-                })
-            })
-            .collect();
-        let state = Self {
-            version: unchecked.version,
-            wire_order: Some(
-                carina_core::json_field_order::JsonFieldOrder::from_json_str(content)
-                    .map_err(StateFileDecodeError::json_at_root)?,
-            ),
+        let (document, authority) =
+            carina_core::value::ObservationState::read_state_file(content.as_bytes())?
+                .into_document_and_authority();
+        Ok(Self {
+            version: document.version,
             exports_version_marker: CurrentExportsVersion,
-            serial: unchecked.serial,
-            lineage: unchecked.lineage,
-            carina_version: unchecked.carina_version,
-            resources,
-            exports,
-            legacy_dependencies,
-            dependency_encoding: if unchecked.version < Self::CURRENT_VERSION {
+            serial: document.serial,
+            lineage: document.lineage,
+            carina_version: document.carina_version,
+            resources: document
+                .resources
+                .into_iter()
+                .map(ResourceState::from_decoded)
+                .collect(),
+            exports: document.exports,
+            legacy_dependencies: document.legacy_dependencies,
+            dependency_encoding: if document.version < Self::CURRENT_VERSION {
                 DependencyEncoding::PendingLegacy
             } else {
                 DependencyEncoding::Current
             },
-        };
-        state
-            .validate_unique_identities()
-            .map_err(StateFileDecodeError::Validation)?;
-        Ok(state)
+            wire_order: Some(document.wire_order),
+            loaded_observation: Some(ObservationStateAuthority {
+                state: std::sync::Arc::new(authority),
+            }),
+        })
     }
 
     /// Current state file format version
@@ -1151,11 +914,12 @@ impl StateFile {
     ///      distinct from an unspecified schema-defaulted value.
     /// v21: Replaced binding-text dependency records on current/deposed
     ///      instances and persisted directives with complete resolved IDs.
-    pub const CURRENT_VERSION: u32 = 21;
+    pub const CURRENT_VERSION: u32 = carina_core::state_document::CURRENT_STATE_VERSION;
 
     /// State file version that introduced the independent exports version.
     /// This value is fixed forever.
-    pub const EXPORTS_VERSION_INTRODUCED: u32 = 17;
+    pub const EXPORTS_VERSION_INTRODUCED: u32 =
+        carina_core::state_document::EXPORTS_VERSION_INTRODUCED;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -1170,6 +934,7 @@ impl StateFile {
             legacy_dependencies: BTreeMap::new(),
             dependency_encoding: DependencyEncoding::Current,
             wire_order: None,
+            loaded_observation: None,
         }
     }
 
@@ -1228,6 +993,7 @@ impl StateFile {
             legacy_dependencies: BTreeMap::new(),
             dependency_encoding: DependencyEncoding::Current,
             wire_order: None,
+            loaded_observation: None,
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
             resources: Vec::new(),
             exports: HashMap::new(),
@@ -1241,7 +1007,12 @@ impl StateFile {
     }
 
     pub(crate) fn validate_unique_identities(&self) -> Result<(), String> {
-        validate_resource_identities(&self.resources)
+        validate_resource_identities(self.resources.iter().map(|row| {
+            (
+                row.identity_fields(),
+                row.deposed.iter().map(DeposedInstance::identity_fields),
+            )
+        }))
     }
 
     /// Copy typed stored rows into core's immutable planning source.
@@ -1353,7 +1124,6 @@ impl StateFile {
             .get(&id)
             .map(LegacyRowDependencies::all_names)
             .filter(|names| !names.is_empty())
-            .map(LegacyDependencyNames)
     }
 
     /// Classify pre-v21 dependency names without mutating the loaded state.
@@ -1748,7 +1518,14 @@ impl StateFile {
     /// any entry matching the current identifier is removed so the live current
     /// instance cannot also be scheduled as deposed.
     pub fn upsert_resource(&mut self, mut resource: ResourceState) -> Result<(), BackendError> {
-        validate_deposed_identities(&resource).map_err(BackendError::InvalidState)?;
+        validate_deposed_identities(
+            resource.identity_fields(),
+            resource
+                .deposed
+                .iter()
+                .map(DeposedInstance::identity_fields),
+        )
+        .map_err(BackendError::InvalidState)?;
         if let Some(pos) = self.resources.iter().position(|existing| {
             existing.provider == resource.provider
                 && existing.resource_type == resource.resource_type
@@ -2465,54 +2242,6 @@ impl Default for StateFile {
     }
 }
 
-fn validate_resource_identities(resources: &[ResourceState]) -> Result<(), String> {
-    let mut resource_identities = HashSet::new();
-    for resource in resources {
-        if !resource_identities.insert((
-            resource.provider.as_str(),
-            resource.resource_type.as_str(),
-            resource.identity.as_str(),
-        )) {
-            return Err(format!(
-                "duplicate resource identity (provider={:?}, resource_type={:?}, identity={:?})",
-                resource.provider, resource.resource_type, resource.identity
-            ));
-        }
-        validate_deposed_identities(resource)?;
-    }
-    Ok(())
-}
-
-fn validate_deposed_identities(resource: &ResourceState) -> Result<(), String> {
-    let mut keys = HashSet::new();
-    let mut instance_identities = HashSet::new();
-    for instance in &resource.deposed {
-        if !keys.insert(instance.key.as_str()) {
-            return Err(format!(
-                "duplicate deposed generation key {:?} in resource \
-                 (provider={:?}, resource_type={:?}, identity={:?})",
-                instance.key, resource.provider, resource.resource_type, resource.identity
-            ));
-        }
-        if !instance_identities.insert((
-            instance.identifier.as_str(),
-            instance.provider_instance.as_deref(),
-        )) {
-            return Err(format!(
-                "duplicate deposed generation identity \
-                 (identifier={:?}, provider_instance={:?}) in resource \
-                 (provider={:?}, resource_type={:?}, identity={:?})",
-                instance.identifier,
-                instance.provider_instance,
-                resource.provider,
-                resource.resource_type,
-                resource.identity
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn merge_deposed_generations(
     resource: &mut ResourceState,
     existing_deposed: Vec<DeposedInstance>,
@@ -2589,12 +2318,6 @@ impl NameOverrideSource for StateFile {
 }
 
 /// Minimal struct for extracting the compatibility markers from a state file.
-#[derive(Deserialize)]
-struct VersionCheck {
-    version: u32,
-    exports_version: Option<u32>,
-}
-
 /// Reports an in-memory schema upgrade applied to a state file by
 /// [`check_and_migrate`]. The function itself never writes to stderr —
 /// the caller (a backend impl) decides whether and how often to log,
@@ -2658,53 +2381,6 @@ pub enum LegacyDependencyMigrationError {
 impl From<ExpandedGraphResolutionError> for LegacyDependencyMigrationError {
     fn from(error: ExpandedGraphResolutionError) -> Self {
         Self::GraphValidation(Box::new(error))
-    }
-}
-
-/// Binding texts retained from the kind-blind dependency snapshot written by
-/// state v20 and older.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyDependencyNames(BTreeSet<String>);
-
-impl LegacyDependencyNames {
-    pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().map(String::as_str)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-struct LegacyRowDependencies {
-    value_dependencies: LegacyDependencyNames,
-    explicit_dependencies: LegacyDependencyNames,
-    deposed_dependencies: HashMap<DeposedKey, LegacyDependencyNames>,
-}
-
-impl LegacyRowDependencies {
-    fn is_empty(&self) -> bool {
-        self.value_dependencies.is_empty()
-            && self.explicit_dependencies.is_empty()
-            && self
-                .deposed_dependencies
-                .values()
-                .all(LegacyDependencyNames::is_empty)
-    }
-
-    fn all_names(&self) -> BTreeSet<String> {
-        self.value_dependencies
-            .0
-            .iter()
-            .chain(self.explicit_dependencies.0.iter())
-            .chain(
-                self.deposed_dependencies
-                    .values()
-                    .flat_map(|names| names.0.iter()),
-            )
-            .cloned()
-            .collect()
     }
 }
 
@@ -3210,22 +2886,18 @@ pub(crate) fn log_state_migration(info: MigrationInfo, display_target: &str) {
 ///   [`MigrationInfo`] so the caller can log the event (carina#3283).
 /// - Invalid JSON: returns a parse error.
 pub fn check_and_migrate(content: &str) -> Result<MigratedStateFile, BackendError> {
-    let check: VersionCheck = serde_json::from_str(content)
-        .map_err(|e| BackendError::InvalidState(format!("Failed to parse state version: {}", e)))?;
+    let check = StateDocumentVersion::read(content.as_bytes()).map_err(|error| match error {
+        StateFileDecodeError::Json { source, .. } => {
+            BackendError::InvalidState(format!("Failed to parse state version: {source}"))
+        }
+        other => map_state_file_decode_error(other, None),
+    })?;
 
     let mut migration: Option<MigrationInfo> = None;
     let mut state: StateFile = match check.version {
         v if v == StateFile::CURRENT_VERSION => StateFile::from_json_str(content)
             .map_err(|error| map_state_file_decode_error(error, None))?,
-        v if v > StateFile::CURRENT_VERSION => {
-            return Err(BackendError::StateVersionTooNew {
-                found: v,
-                supported: StateFile::CURRENT_VERSION,
-            });
-        }
         v => {
-            classify_exports_version(v, check.exports_version)
-                .map_err(|error| map_state_file_decode_error(error, None))?;
             migration = Some(MigrationInfo {
                 from: v,
                 to: StateFile::CURRENT_VERSION,
@@ -3412,6 +3084,14 @@ impl DeposedAttributes {
 }
 
 impl DeposedInstance {
+    fn identity_fields(&self) -> carina_core::state_document::DeposedIdentity<'_> {
+        (
+            &self.key,
+            &self.identifier,
+            self.provider_instance.as_deref(),
+        )
+    }
+
     /// Construct a deposed generation from the opaque output of the state
     /// writeback encoder.
     pub fn from_persisted_attributes(
@@ -3481,77 +3161,6 @@ impl DeposedInstance {
         self.attributes = attributes.0;
         self
     }
-}
-
-/// The mutually exclusive state of a row's current resource instance.
-///
-/// The tagged shape is the persistence invariant for state v15: an applied
-/// identifier and provider continuation token cannot be represented together.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CurrentInstance {
-    /// The row retains only deposed generations.
-    None,
-    /// A completed resource instance.
-    Applied {
-        identifier: AppliedIdentifier,
-        attributes: PersistedAttributes,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        write_only_attributes: Vec<String>,
-        nested_write_only: NestedWriteOnlyRecord,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        partial_read: Option<PartialReadMarker>,
-    },
-    /// A create operation accepted by the provider but not yet ended.
-    CreateInFlight {
-        #[serde(flatten)]
-        pending: InFlightCreate,
-    },
-    /// A create may have reached the cloud, but yielded neither an identifier
-    /// nor a resumable continuation.
-    CreateOutcomeUnknown {
-        #[serde(flatten)]
-        unknown: UnknownCreateOutcome,
-    },
-    /// A legacy current instance whose provider identifier is absent.
-    MissingIdentifier {
-        attributes: PersistedAttributes,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        write_only_attributes: Vec<String>,
-        nested_write_only: NestedWriteOnlyRecord,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        partial_read: Option<PartialReadMarker>,
-    },
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum EncodedCurrentInstance {
-    None,
-    Applied {
-        identifier: AppliedIdentifier,
-        attributes: HashMap<String, serde_json::Value>,
-        #[serde(default)]
-        write_only_attributes: Vec<String>,
-        nested_write_only: NestedWriteOnlyRecord,
-        #[serde(default)]
-        partial_read: Option<PartialReadMarker>,
-    },
-    CreateInFlight {
-        envelope: serde_json::Value,
-        started_at: serde_json::Value,
-    },
-    CreateOutcomeUnknown {
-        started_at: serde_json::Value,
-    },
-    MissingIdentifier {
-        attributes: HashMap<String, serde_json::Value>,
-        #[serde(default)]
-        write_only_attributes: Vec<String>,
-        nested_write_only: NestedWriteOnlyRecord,
-        #[serde(default)]
-        partial_read: Option<PartialReadMarker>,
-    },
 }
 
 /// State of a single managed resource.
@@ -3646,133 +3255,42 @@ impl NonWritableResourceState {
 /// Borrowed resource row proven not to contain a create continuation.
 pub struct RefreshableResourceState<'a>(&'a ResourceState);
 
-#[derive(Deserialize)]
-struct EncodedDeposedInstance {
-    key: DeposedKey,
-    identifier: String,
-    #[serde(default)]
-    provider_instance: Option<String>,
-    attributes: HashMap<String, serde_json::Value>,
-    #[serde(default)]
-    dependency_bindings: BTreeSet<ResolvedResourceId>,
-}
-
-#[derive(Deserialize)]
-struct EncodedResourceState {
-    resource_type: String,
-    #[serde(alias = "name")]
-    identity: ResourceIdentity,
-    provider: String,
-    current: EncodedCurrentInstance,
-    #[serde(default)]
-    deposed: Vec<EncodedDeposedInstance>,
-    #[serde(default)]
-    protected: bool,
-    #[serde(default)]
-    directives: PersistedDirectives,
-    #[serde(default)]
-    prefixes: HashMap<String, String>,
-    #[serde(default)]
-    name_overrides: HashMap<String, NameOverride>,
-    #[serde(default)]
-    explicit: ExplicitFields,
-    #[serde(default)]
-    binding: Option<AbsoluteBindingAddress>,
-    #[serde(default)]
-    dependency_bindings: BTreeSet<ResolvedResourceId>,
-}
-
 impl<'de> Deserialize<'de> for ResourceState {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let row = serde_json::Value::deserialize(deserializer)?;
-        let encoded = serde_json::from_value::<EncodedResourceState>(row.clone())
-            .map_err(serde::de::Error::custom)?;
-        let current = match encoded.current {
-            EncodedCurrentInstance::None => CurrentInstance::None,
-            EncodedCurrentInstance::Applied {
-                identifier,
-                attributes,
-                write_only_attributes,
-                nested_write_only,
-                partial_read,
-            } => CurrentInstance::Applied {
-                identifier,
-                attributes: PersistedAttributes::from_encoded(attributes)
-                    .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?,
-                write_only_attributes,
-                nested_write_only,
-                partial_read,
-            },
-            EncodedCurrentInstance::CreateInFlight {
-                envelope: _envelope,
-                started_at: _started_at,
-            } => {
-                let pending = serde_json::from_value::<StateRowInFlightCreate>(row)
-                    .map_err(serde::de::Error::custom)?
-                    .into_inner();
-                CurrentInstance::CreateInFlight { pending }
-            }
-            EncodedCurrentInstance::CreateOutcomeUnknown {
-                started_at: _started_at,
-            } => {
-                let unknown = serde_json::from_value::<StateRowUnknownCreateOutcome>(row)
-                    .map_err(serde::de::Error::custom)?
-                    .into_inner();
-                CurrentInstance::CreateOutcomeUnknown { unknown }
-            }
-            EncodedCurrentInstance::MissingIdentifier {
-                attributes,
-                write_only_attributes,
-                nested_write_only,
-                partial_read,
-            } => CurrentInstance::MissingIdentifier {
-                attributes: PersistedAttributes::from_encoded(attributes)
-                    .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?,
-                write_only_attributes,
-                nested_write_only,
-                partial_read,
-            },
-        };
-        let deposed = encoded
-            .deposed
-            .into_iter()
-            .enumerate()
-            .map(|(index, instance)| {
-                Ok(DeposedInstance {
-                    key: instance.key,
-                    identifier: instance.identifier,
-                    provider_instance: instance.provider_instance,
-                    attributes: PersistedAttributes::from_encoded(instance.attributes)
-                        .map_err(|error| serde::de::Error::custom(ErrorSourceChain(&error)))?,
-                    dependency_bindings: PersistedDestroyDependencies::decode_persisted(
-                        instance.dependency_bindings,
-                    )
-                    .map_err(|error| {
-                        serde::de::Error::custom(format!(
-                            "deposed[{index}].dependency_bindings: {error}"
-                        ))
-                    })?,
+        carina_core::state_document::DecodedResourceState::deserialize(deserializer)
+            .map(Self::from_decoded)
+    }
+}
+impl ResourceState {
+    fn identity_fields(&self) -> carina_core::state_document::StateRowIdentity<'_> {
+        (&self.provider, &self.resource_type, &self.identity)
+    }
+
+    fn from_decoded(row: carina_core::state_document::DecodedResourceState) -> Self {
+        Self {
+            resource_type: row.resource_type,
+            identity: row.identity,
+            provider: row.provider,
+            current: row.current,
+            protected: row.protected,
+            directives: row.directives,
+            prefixes: row.prefixes,
+            name_overrides: row.name_overrides,
+            explicit: row.explicit,
+            binding: row.binding,
+            dependency_bindings: row.dependency_bindings,
+            deposed: row
+                .deposed
+                .into_iter()
+                .map(|old| DeposedInstance {
+                    key: old.key,
+                    identifier: old.identifier,
+                    provider_instance: old.provider_instance,
+                    attributes: old.attributes,
+                    dependency_bindings: old.dependency_bindings,
                 })
-            })
-            .collect::<Result<Vec<_>, D::Error>>()?;
-        let dependency_bindings = PersistedDestroyDependencies::decode_persisted(
-            encoded.dependency_bindings,
-        )
-        .map_err(|error| serde::de::Error::custom(format!("dependency_bindings: {error}")))?;
-        Ok(Self {
-            resource_type: encoded.resource_type,
-            identity: encoded.identity,
-            provider: encoded.provider,
-            current,
-            deposed,
-            protected: encoded.protected,
-            directives: encoded.directives,
-            prefixes: encoded.prefixes,
-            name_overrides: encoded.name_overrides,
-            explicit: encoded.explicit,
-            binding: encoded.binding,
-            dependency_bindings,
-        })
+                .collect(),
+        }
     }
 }
 
@@ -5653,5 +5171,121 @@ impl UnvalidatedLegacyMigration<LegacyDependencyClassification> {
             }
             Ok(graph)
         })
+    }
+}
+
+/// State-load wrapper retaining immutable core authority, including a
+/// backend-confirmed absence. Its fields and raw constructors are private.
+///
+/// ```compile_fail,E0599
+/// use carina_state::ObservationStateAuthority;
+/// let forged = ObservationStateAuthority::default();
+/// ```
+/// ```compile_fail,E0308
+/// use carina_state::ObservedStateFile;
+/// let omitted: ObservedStateFile = None;
+/// ```
+#[derive(Debug, Clone)]
+pub struct ObservationStateAuthority {
+    state: std::sync::Arc<carina_core::value::ObservationState>,
+}
+impl ObservationStateAuthority {
+    pub async fn load(
+        backend: &dyn crate::backend::StateBackend,
+    ) -> crate::backend::BackendResult<(Option<LoadedState>, Self)> {
+        let loaded = backend.read_state().await?;
+        Self::from_backend_load(loaded)
+    }
+    pub fn for_provisionable_storage(
+        _storage: &crate::backends::S3BootstrapInfo,
+    ) -> crate::backend::BackendResult<Self> {
+        Self::from_backend_load(None).map(|(_, authority)| authority)
+    }
+    fn from_backend_load(
+        loaded: Option<LoadedState>,
+    ) -> crate::backend::BackendResult<(Option<LoadedState>, Self)> {
+        let authority = match loaded.as_ref() {
+            Some(LoadedState::Pristine(state) | LoadedState::Migrated { state, .. }) => {
+                match &state.loaded_observation {
+                    Some(authority) => authority.clone(),
+                    #[cfg(any(test, feature = "test-utils"))]
+                    None => state
+                        .fixture_observation_authority()
+                        .map_err(|error| map_state_file_decode_error(error, None))?,
+                    #[cfg(not(any(test, feature = "test-utils")))]
+                    None => {
+                        return Err(BackendError::InvalidState(
+                            "cannot load observation authority from state file".into(),
+                        ));
+                    }
+                }
+            }
+            None => {
+                let bytes = format!(
+                    "{{\"version\":{},\"exports_version\":{},\"serial\":0,\"lineage\":\"absent\",\"carina_version\":\"absent\",\"resources\":[],\"exports\":{{}}}}",
+                    StateFile::CURRENT_VERSION,
+                    PublishedExports::CURRENT_VERSION,
+                );
+                Self {
+                    state: std::sync::Arc::new(
+                        carina_core::value::ObservationState::read_state_file(bytes.as_bytes())
+                            .map_err(|error| map_state_file_decode_error(error, None))?,
+                    ),
+                }
+            }
+        };
+        Ok((loaded, authority))
+    }
+    /// Pair the immutable load snapshot with mutable working state. This does
+    /// not assert that `file` still equals the document originally loaded.
+    pub fn bind(self, file: Option<StateFile>) -> ObservedStateFile {
+        ObservedStateFile {
+            file,
+            authority: self,
+        }
+    }
+    pub fn protect<S: Clone, V: carina_core::resource::PlanValueKind>(
+        &self,
+        inputs: carina_core::value::ObservationInputs<'_, S, V>,
+    ) -> Result<carina_core::value::ProtectedObservations, SerializationError> {
+        self.state.protect(inputs)
+    }
+}
+/// Mutable working state paired with immutable observation evidence from a
+/// backend load. The working file may be migrated, updated, or replaced after
+/// loading; this wrapper does not authenticate its contents against that snapshot.
+#[derive(Debug, Clone)]
+pub struct ObservedStateFile {
+    file: Option<StateFile>,
+    authority: ObservationStateAuthority,
+}
+impl ObservedStateFile {
+    pub fn authority(&self) -> &ObservationStateAuthority {
+        &self.authority
+    }
+    pub fn into_file(self) -> Option<StateFile> {
+        self.file
+    }
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(file: Option<StateFile>) -> Self {
+        let authority = file
+            .as_ref()
+            .map_or_else(
+                || StateFile::new().fixture_observation_authority(),
+                StateFile::fixture_observation_authority,
+            )
+            .expect("fixture state has valid observation authority");
+        Self { file, authority }
+    }
+}
+impl std::ops::Deref for ObservedStateFile {
+    type Target = Option<StateFile>;
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+impl std::ops::DerefMut for ObservedStateFile {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.file
     }
 }
