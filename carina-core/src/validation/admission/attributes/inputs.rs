@@ -74,6 +74,7 @@ where
 ///
 /// Admission consumes this product and classifies its stored projections.
 pub struct ResourceAttributeInputs<B: BindingAddress> {
+    awaiting: crate::identifier::PrefixObligations,
     owner: ResourceId,
     pub(super) declaration: Option<DeclarationIdentity>,
     precheck: Option<crate::parser::ResourcePrecheckIdentity>,
@@ -154,12 +155,16 @@ impl<B: BindingAddress> StoredInput<B> {
 }
 
 impl<B: BindingAddress> ResourceAttributeInputs<B> {
+    pub(super) fn awaiting_prefixes(&self) -> &crate::identifier::PrefixObligations {
+        &self.awaiting
+    }
     pub fn new<X, D>(owner: &CanonicalResource<'_, X, D, B>) -> Self
     where
         D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
     {
         let mut result = Self::new_raw(owner);
         result.declaration = Some(super::declaration_identity(owner.resource_schema()));
+        result.awaiting = owner.awaiting_prefixes().clone();
         result
     }
     pub fn for_resource<X, D>(
@@ -171,6 +176,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     {
         let mut result = Self::for_resource_raw(owner, report)?;
         result.declaration = Some(super::declaration_identity(owner.resource_schema()));
+        result.awaiting = owner.awaiting_prefixes().clone();
         Ok(result)
     }
     pub fn from_resolved<X, D>(
@@ -183,6 +189,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     {
         let mut result = Self::from_resolved_raw(owner, values, report)?;
         result.declaration = Some(values.declaration.clone());
+        result.awaiting = values.awaiting.clone();
         Ok(result)
     }
     pub fn from_report<X, D>(
@@ -195,6 +202,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     {
         let mut result = Self::from_report_raw(owner, values, report);
         result.declaration = Some(values.declaration.clone());
+        result.awaiting = values.awaiting.clone();
         result
     }
     pub fn from_report_with_evidence<X, D>(
@@ -208,6 +216,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
     {
         let mut result = Self::from_report_with_evidence_raw(owner, values, report, unchecked);
         result.declaration = Some(values.declaration.clone());
+        result.awaiting = values.awaiting.clone();
         result
     }
 
@@ -360,6 +369,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         let mut prepared = Self {
             owner: resource.id().clone(),
             declaration: None,
+            awaiting: Default::default(),
             precheck: unchecked.precheck_identity(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             evidence: ResourceEvidence::NoAuthoredEvidence(Arc::new(unchecked)),
@@ -503,6 +513,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         let mut prepared = Self {
             owner: resource.id().clone(),
             declaration: None,
+            awaiting: Default::default(),
             precheck: resource.precheck_identity(),
             scope: crate::schema::value_validation::AssignmentScope::Full,
             report: None,
@@ -654,6 +665,7 @@ impl<B: BindingAddress> ResourceAttributeInputs<B> {
         Self {
             owner: self.owner.clone(),
             declaration: self.declaration.clone(),
+            awaiting: self.awaiting.clone(),
             precheck: self.precheck.clone(),
             scope: self.scope,
             report: self.report.clone(),

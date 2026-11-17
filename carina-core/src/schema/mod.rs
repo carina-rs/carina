@@ -16505,6 +16505,7 @@ impl PatternResourceSchema<Compiled> {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_admission_report<
         'a,
         'v: 'a,
@@ -16518,11 +16519,38 @@ impl PatternResourceSchema<Compiled> {
         is_string_literal: &dyn Fn(&str) -> bool,
         admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
+        self.validate_admission_report_with_obligations(
+            attributes,
+            entries,
+            is_string_literal,
+            admission,
+            &Default::default(),
+        )
+    }
+
+    pub(crate) fn validate_admission_report_with_obligations<
+        'a,
+        'v: 'a,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
+        &self,
+        attributes: &'a indexmap::IndexMap<String, Classification<'v, P, B, T>>,
+        entries: impl IntoIterator<Item = (&'a String, &'a Classification<'v, P, B, T>)>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
+        awaiting: &crate::identifier::PrefixObligations,
+    ) -> ResourceValueValidation {
         let mut report = ResourceValueValidation::default();
 
         // Check required attributes
         for (name, schema) in &self.attributes {
-            if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
+            if schema.is_required()
+                && !attributes.contains_key(name)
+                && !awaiting.awaits_base(name)
+                && schema.default.is_none()
+            {
                 report
                     .errors
                     .push(SchemaDiagnostic::unlocated(TypeError::MissingRequired {
@@ -16532,7 +16560,9 @@ impl PatternResourceSchema<Compiled> {
         }
 
         let values = self.validate_value_entries(
-            entries,
+            entries
+                .into_iter()
+                .filter(|(name, _)| !awaiting.awaits_prefix(name)),
             is_string_literal,
             ValueEntryValidation::FullInput,
             None,
@@ -16544,7 +16574,7 @@ impl PatternResourceSchema<Compiled> {
             let present = group
                 .fields()
                 .iter()
-                .filter(|name| attributes.contains_key(name.as_str()))
+                .filter(|name| attributes.contains_key(name.as_str()) || awaiting.awaits_base(name))
                 .count();
             if !group.is_satisfied_by_count(present) {
                 report.errors.push(SchemaDiagnostic::unlocated(
@@ -16557,7 +16587,8 @@ impl PatternResourceSchema<Compiled> {
         }
 
         // Run custom validator if present
-        if let Some(validator) = self.validator()
+        if awaiting.is_empty()
+            && let Some(validator) = self.validator()
             && let Some(attributes) = attributes_without_placeholders(
                 &attributes
                     .iter()

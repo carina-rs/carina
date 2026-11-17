@@ -7,8 +7,7 @@ use crate::parser::{DeclarationLocation, ModuleCallId};
 /// The source that owns a finding, including the identity of a concrete call.
 /// Argument-dependent findings belong to that call, while declaration findings
 /// retain their authored location and existing module-call presentation context.
-/// carina#4461 case d selects ModuleArgument; #4492 can use the same owner for
-/// argument-dependent empty/conflict findings without changing literal findings.
+/// carina#4461 case d selects the call whose argument authors the dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FindingOwner {
     Declaration {
@@ -16,8 +15,6 @@ pub enum FindingOwner {
         module_call: Option<ModuleCallId>,
     },
     ModuleArgument(ModuleCallId),
-    /// A template has no concrete caller yet and cannot publish this obligation.
-    AwaitingModuleArguments,
 }
 
 impl FindingOwner {
@@ -25,7 +22,6 @@ impl FindingOwner {
         match self {
             Self::Declaration { authored, .. } => authored.as_ref(),
             Self::ModuleArgument(call) => Some(call.declaration_location()),
-            Self::AwaitingModuleArguments => None,
         }
     }
 
@@ -43,10 +39,6 @@ impl FindingOwner {
                 }
                 _ => None,
             })
-    }
-
-    pub(crate) fn awaiting_arguments(&self) -> bool {
-        matches!(self, Self::AwaitingModuleArguments)
     }
 }
 
@@ -72,7 +64,6 @@ mod tests {
         );
         assert_eq!(first.location_in(Path::new("main.crn")), first.location());
         assert!(first.location_in(Path::new("child/main.crn")).is_none());
-        assert!(FindingOwner::AwaitingModuleArguments.location().is_none());
     }
 
     #[test]

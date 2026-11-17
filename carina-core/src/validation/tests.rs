@@ -245,6 +245,7 @@ fn missing_authored_root_keeps_the_resource_invariant_and_other_findings() {
             Some(&admissions),
             &mut Vec::new(),
             ValueAdmission {
+                locations: SchemaFindingLocations::Existing,
                 report: judged.report(),
                 coverage,
             },

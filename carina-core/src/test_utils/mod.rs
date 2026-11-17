@@ -78,7 +78,7 @@ pub fn admit_resource_attribute_report<
         schema.schema().parts().resource_type,
         None,
     );
-    let attributes = match crate::identifier::canonicalize_prefix_values(
+    let attributes = match crate::identifier::canonicalize_fixture_prefix_values(
         schema,
         &id,
         attributes.clone(),

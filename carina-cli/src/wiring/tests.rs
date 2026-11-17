@@ -10885,7 +10885,8 @@ fn dependency_chain_wrappers_return_vec_app_error() {
     let mut resources: Vec<Resource> = Vec::new();
     let providers: Vec<carina_core::parser::ExpandedProviderConfig> = Vec::new();
 
-    let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut resources);
+    let mut file = carina_core::parser::ExpandedParsedFile::default();
+    let errors = resolve_attr_prefixes_with_ctx(&ctx, &mut file);
     assert!(errors.is_empty(), "resolve_attr_prefixes: got {errors:?}");
 
     let canonical_resources =

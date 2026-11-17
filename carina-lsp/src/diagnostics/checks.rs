@@ -928,6 +928,17 @@ impl DiagnosticRun<'_> {
         if let Some(error) = residual.analysis_invariant() {
             return render_analysis_invariant(doc, error).into_iter().collect();
         }
+        if let Some(resources) = residual.resource_findings() {
+            return residual
+                .call_diagnostics(tree)
+                .iter()
+                .flat_map(|anchor| {
+                    resources.iter().filter_map(|resource| {
+                        render_merged(doc, anchor, DiagnosticSeverity::ERROR, resource.to_string())
+                    })
+                })
+                .collect();
+        }
         let message = residual.display_relative_to(&base.source_label());
         let element = residual.element_diagnostic();
         let mut diagnostics = element

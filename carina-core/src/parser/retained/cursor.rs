@@ -1048,6 +1048,7 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
                 binding,
                 attribute,
                 segments,
+                ..
             } => Some(SourceReference {
                 binding,
                 attribute,
@@ -1204,12 +1205,11 @@ impl JudgedSlot {
 impl<B: BindingAddress> JudgedSlot<B> {
     /// Diagnostic syntax inventory, independent of the current projection/judgement.
     /// Inlining an alias or substituting a module argument must retain its authored name.
-    pub(crate) fn visit_authored_bindings(
-        &self,
-        visitor: &mut impl FnMut(&B, crate::resource::DiagnosticScope),
-    ) {
+    pub(crate) fn dependency_uses(&self) -> Vec<super::AuthoredDependency<B>> {
+        let mut uses = Vec::new();
         self.root
-            .visit_bindings(crate::resource::DiagnosticScope::Public, visitor);
+            .dependency_uses(crate::resource::DiagnosticScope::Public, &mut uses);
+        uses
     }
 
     pub(crate) fn secrecy_conditions(&self) -> ConditionSnapshot {

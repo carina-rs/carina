@@ -1586,6 +1586,22 @@ where
         }
     }
 
+    pub(crate) fn prefix_declaration(&self) -> Option<&'a super::DeclarationProvenance> {
+        match self.resource {
+            ResourceRef::Resource(resource) => Some(&resource.declaration),
+            ResourceRef::DataSource(resource) => Some(&resource.declaration),
+            ResourceRef::Deferred { resource, .. } => Some(&resource.as_resource().declaration),
+            ResourceRef::LiveComposition(_) => None,
+        }
+    }
+
+    pub(crate) fn loop_binding(&self) -> Option<&'a super::ForBinding> {
+        match self.resource {
+            ResourceRef::Deferred { deferred, .. } => Some(D::deferred_binding(deferred)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn authored_slots(&self) -> Option<&'a super::retained::AuthoredSlots<B>> {
         match self.resource {
             ResourceRef::Resource(resource) => Some(&resource.authored_slots),

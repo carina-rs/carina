@@ -388,22 +388,78 @@ enum ParseOwnership {
     Covered,
     Ordinary,
 }
-impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
-    fn visit_bindings(
-        &self,
+/// Source dependency occurrences, before alias substitution and redaction.
+/// Identity and diagnostic spelling remain separate across module expansion.
+pub(crate) enum AuthoredDependency<B: BindingAddress> {
+    Binding {
+        binding: B,
         scope: DiagnosticScope,
-        visitor: &mut impl FnMut(&B, DiagnosticScope),
-    ) {
+    },
+    Reference {
+        identity: crate::resource::AccessPath<B>,
+        authored: crate::resource::AccessPath<RelativeBindingName>,
+        scope: DiagnosticScope,
+    },
+}
+
+impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
+    fn dependency_reference(
+        &self,
+    ) -> Option<(
+        crate::resource::AccessPath<B>,
+        crate::resource::AccessPath<RelativeBindingName>,
+    )> {
+        match &self.kind {
+            ExprKind::Reference {
+                binding,
+                authored_binding,
+                attribute,
+                segments,
+            } => Some((
+                crate::resource::AccessPath::from_binding(
+                    binding.clone(),
+                    attribute.clone(),
+                    segments.clone(),
+                ),
+                crate::resource::AccessPath::from_binding(
+                    authored_binding.clone(),
+                    attribute.clone(),
+                    segments.clone(),
+                ),
+            )),
+            ExprKind::Access(step) => {
+                let (identity, authored) =
+                    self.children.first()?.authored.dependency_reference()?;
+                Some((
+                    identity.with_appended_segment(step.clone()),
+                    authored.with_appended_segment(step.clone()),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn dependency_uses(&self, scope: DiagnosticScope, output: &mut Vec<AuthoredDependency<B>>) {
         let scope = if matches!(self.kind, ExprKind::Secret) {
             DiagnosticScope::Secret
         } else {
             scope
         };
-        if let ExprKind::Binding(binding) = &self.kind {
-            visitor(binding, scope);
-        }
-        for child in &self.children {
-            child.authored.visit_bindings(scope, visitor);
+        if let Some((identity, authored)) = self.dependency_reference() {
+            output.push(AuthoredDependency::Reference {
+                identity,
+                authored,
+                scope,
+            });
+        } else if let ExprKind::Binding(binding) = &self.kind {
+            output.push(AuthoredDependency::Binding {
+                binding: binding.clone(),
+                scope,
+            });
+        } else {
+            for child in &self.children {
+                child.authored.dependency_uses(scope, output);
+            }
         }
     }
 
@@ -614,6 +670,7 @@ pub(crate) enum ExprKind<B: BindingAddress> {
     Binding(B),
     Reference {
         binding: B,
+        authored_binding: RelativeBindingName,
         attribute: String,
         segments: Vec<PathSegment>,
     },
@@ -797,10 +854,12 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             ExprKind::Binding(binding) => ExprKind::Binding(map(binding)),
             ExprKind::Reference {
                 binding,
+                authored_binding,
                 attribute,
                 segments,
             } => ExprKind::Reference {
                 binding: map(binding),
+                authored_binding,
                 attribute,
                 segments,
             },
@@ -1210,21 +1269,45 @@ impl<B: BindingAddress> Expressions<B> {
         &self.roots
     }
 
-    /// Retained caller-side syntax at an argument's parser-owned location.
-    /// Substituting its value never replaces the authored alias/use inventory.
-    pub(crate) fn bindings_at(&self, location: &DeclarationLocation) -> Vec<(B, DiagnosticScope)> {
+    pub(crate) fn dependency_uses(&self, binding: &B) -> Vec<AuthoredDependency<B>> {
+        let mut uses = Vec::new();
+        if let Some(definition) = self.definitions.get(binding) {
+            definition
+                .authored
+                .dependency_uses(DiagnosticScope::Public, &mut uses);
+        }
+        uses
+    }
+
+    /// Select the concrete caller environment as well as the authored span.
+    /// Two expanded instances may share that span and have different arguments.
+    pub(crate) fn argument_dependency_uses(
+        &self,
+        binding: &B,
+        call: &super::ModuleCallId,
+    ) -> Vec<AuthoredDependency<B>> {
+        let name = binding.as_str().rsplit('.').next().expect("binding name");
+        let Some(location) = call.argument_value_location(name) else {
+            return Vec::new();
+        };
+        let caller = self.secrecy_argument_modules.get(binding).map(B::as_str);
         let mut pending = self
             .roots
             .iter()
             .map(|root| root.authored.as_ref())
             .collect::<Vec<_>>();
         while let Some(node) = pending.pop() {
-            if &node.location.authored == location {
-                let mut bindings = Vec::new();
-                node.visit_bindings(DiagnosticScope::Public, &mut |binding, scope| {
-                    bindings.push((binding.clone(), scope))
-                });
-                return bindings;
+            let owns_instance = match (&node.location.instance, caller) {
+                (ExpressionInstance::Root, None) => true,
+                (ExpressionInstance::Module(instance), Some(caller)) => {
+                    instance.scope.as_ref() == caller
+                }
+                _ => false,
+            };
+            if owns_instance && &node.location.authored == location {
+                let mut uses = Vec::new();
+                node.dependency_uses(DiagnosticScope::Public, &mut uses);
+                return uses;
             }
             pending.extend(node.children.iter().map(|child| child.authored.as_ref()));
         }
@@ -2709,6 +2792,7 @@ fn compile_remaining_form(
                     &pair,
                     ExprKind::Reference {
                         binding: RelativeBindingName::new(name.as_str()),
+                        authored_binding: RelativeBindingName::new(name.as_str()),
                         attribute,
                         segments: Vec::new(),
                     },
@@ -2788,6 +2872,7 @@ fn compile_remaining_form(
             node(
                 &pair,
                 ExprKind::Reference {
+                    authored_binding: binding.clone(),
                     binding,
                     attribute,
                     segments,
@@ -6141,9 +6226,7 @@ mod judgement {
                 // Push dependencies directly in reverse execution order;
                 // a temporary Vec for every parent adds no traversal state.
                 if let ExprKind::Reference {
-                    binding,
-                    attribute,
-                    segments: _,
+                    binding, attribute, ..
                 } = &item.node.kind
                     && let Some(output) = self
                         .module_attributes
@@ -6159,12 +6242,8 @@ mod judgement {
                         finish: false,
                     });
                 }
-                if let ExprKind::Reference {
-                    binding,
-                    attribute: _,
-                    segments: _,
-                }
-                | ExprKind::Binding(binding) = &item.node.kind
+                if let ExprKind::Reference { binding, .. } | ExprKind::Binding(binding) =
+                    &item.node.kind
                     && self.parameter_type(binding).is_none()
                     && let Some(definition) = self.expressions.definitions.get(binding)
                 {
@@ -6811,6 +6890,7 @@ mod judgement {
                     binding,
                     attribute,
                     segments,
+                    ..
                 } => {
                     let steps = std::iter::once(PathSegment::Field {
                         name: attribute.clone(),

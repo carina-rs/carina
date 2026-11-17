@@ -1,0 +1,19 @@
+{
+  "json": {
+    "resource_count": 1,
+    "resources": [
+      "mock.test.resource.mock_test_resource_02151de0"
+    ],
+    "status": "ok"
+  },
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "lets.crn": [],
+    "main.crn": [],
+    "providers.crn": []
+  },
+  "text": "Validating...\n\u2713 1 resources validated successfully.\n  \u2022 mock.test.resource.mock_test_resource_02151de0\n",
+  "text_exit": 0,
+  "json_exit": 0
+}

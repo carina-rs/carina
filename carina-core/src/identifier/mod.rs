@@ -14,9 +14,10 @@ pub use prefix::{
     ModuleResolvedFileRead, PrefixCanonicalized, PrefixFileRead, ResourceProjection, SuffixSource,
     canonicalize_file_prefixes,
 };
-pub(crate) use prefix::{
-    CanonicalSchemaInputs, CanonicalSchemaResource, canonicalize_prefix_values,
-};
+pub(crate) use prefix::{CanonicalSchemaInputs, CanonicalSchemaResource, PrefixObligations};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) use prefix::canonicalize_fixture_prefix_values;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1528,24 +1529,26 @@ enum PrefixDependency {
         path: String,
         through: Option<String>,
     },
-    UnboundModuleArgument(String),
-    Expression,
+    LoopVariable {
+        name: String,
+        through: Option<String>,
+    },
 }
 
 impl std::fmt::Display for PrefixDependency {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Reference { path, through } => {
+            Self::Reference { path, through }
+            | Self::LoopVariable {
+                name: path,
+                through,
+            } => {
                 write!(formatter, "'{path}'")?;
                 if let Some(alias) = through {
                     write!(formatter, " (through '{alias}')")?;
                 }
                 Ok(())
             }
-            Self::UnboundModuleArgument(name) => {
-                write!(formatter, "module argument '{name}'")
-            }
-            Self::Expression => formatter.write_str("an apply-time value"),
         }
     }
 }
@@ -1585,13 +1588,12 @@ impl AttributePrefixError {
         }
     }
 
-    /// All argument-owned failure kinds share their semantic message and owner.
-    /// Existing declaration-owned empty/conflict messages retain their decoration.
+    /// Deferred findings share one semantic message across CLI JSON and LSP.
+    /// Existing empty/conflict messages retain their decoration.
     pub fn diagnostic_message(&self) -> String {
-        match (&self.failure, &self.owner) {
-            (AttributePrefixFailure::Deferred { .. }, _)
-            | (_, crate::finding::FindingOwner::ModuleArgument(_)) => self.semantic_message(),
-            _ => self.to_string(),
+        match &self.failure {
+            AttributePrefixFailure::Deferred { .. } => self.semantic_message(),
+            AttributePrefixFailure::Empty | AttributePrefixFailure::Conflict(_) => self.to_string(),
         }
     }
 }
@@ -1618,11 +1620,17 @@ impl std::error::Error for AttributePrefixError {}
 /// - Generates a temporary name: `prefix + random_suffix`
 ///
 /// Errors if both `<attr>_prefix` and `<attr>` are specified, or if prefix is empty.
-pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
-    resources: &mut [Resource<crate::resource::ModuleSource, P, B>],
+pub fn resolve_attr_prefixes<
+    X,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    B: BindingAddress,
+>(
+    file: &mut crate::parser::File<X, P, T, D, B>,
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
-    let errors = resolve_attr_prefix_findings(resources, registry);
+    let errors = resolve_attr_prefix_findings(file, registry);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1634,11 +1642,19 @@ pub fn resolve_attr_prefixes<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-pub fn resolve_attr_prefix_findings<P: PlaceholderKind, B: BindingAddress>(
-    resources: &mut [Resource<crate::resource::ModuleSource, P, B>],
+/// All entry points require the retained file environment; a resource slice
+/// alone cannot attribute aliases or module-argument dependencies.
+pub fn resolve_attr_prefix_findings<
+    X,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    B: BindingAddress,
+>(
+    file: &mut crate::parser::File<X, P, T, D, B>,
     registry: &SchemaRegistry,
 ) -> Vec<AttributePrefixError> {
-    prefix::resolve_resources(resources, registry, SuffixSource::Random)
+    prefix::resolve_file(file, registry, SuffixSource::Random)
 }
 
 /// State information needed for prefix reconciliation.

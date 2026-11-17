@@ -384,6 +384,7 @@ pub(crate) fn admit_validation_attributes<
                 &attributes,
                 quoted,
                 session,
+                &values.awaiting,
             ),
             classification_diagnostics,
         };
@@ -430,6 +431,7 @@ pub(crate) fn admit_validation_attributes<
         session,
         check,
         declarations,
+        &values.awaiting,
         ValidationInput::Resource {
             candidate: &candidate,
             coverage: &visits,
@@ -461,8 +463,14 @@ pub(crate) fn admit_value_only_attributes<
         &crate::resource::knowledge::KnowledgeContext::validation(),
         |name, error| classification_errors.push((name.to_owned(), TypeError::from(error))),
     );
-    let mut report =
-        admit_classified_value_only_attributes::<K, P, B>(schema, id, &attributes, quoted, session);
+    let mut report = admit_classified_value_only_attributes::<K, P, B>(
+        schema,
+        id,
+        &attributes,
+        quoted,
+        session,
+        &values.awaiting,
+    );
     for (name, error) in classification_errors {
         report.push_attribute_error(&name, error);
     }
@@ -480,29 +488,38 @@ fn admit_classified_value_only_attributes<
     attributes: &indexmap::IndexMap<String, crate::resource::knowledge::Classification<'_, P, B>>,
     quoted: &std::collections::HashSet<String>,
     session: &dyn ProviderTypeCheckContext,
+    awaiting: &crate::identifier::PrefixObligations,
 ) -> crate::schema::ResourceValueValidation {
-    schema.schema().as_schema().validate_admission_report(
-        attributes,
-        attributes.iter(),
-        &|name| quoted.contains(name),
-        &crate::schema::value_validation::AttributeAdmission {
-            known: &|name, selected, proof| {
-                let destination =
-                    schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
-                match destination.contract.as_deref() {
-                    Some(contract) => crate::schema::value_validation::validate_value_locally(
-                        contract.attr(),
-                        proof,
-                        contract.defs(),
-                        contract.ancestry,
-                        Some(&contract.lookup(session.catalog())),
-                    ),
-                    None => Default::default(),
-                }
+    schema
+        .schema()
+        .as_schema()
+        .validate_admission_report_with_obligations(
+            attributes,
+            attributes.iter(),
+            &|name| quoted.contains(name),
+            &crate::schema::value_validation::AttributeAdmission {
+                known: &|name, selected, proof| {
+                    let destination = schema.admission_selected_attribute::<K>(
+                        id,
+                        name,
+                        selected,
+                        session.catalog(),
+                    );
+                    match destination.contract.as_deref() {
+                        Some(contract) => crate::schema::value_validation::validate_value_locally(
+                            contract.attr(),
+                            proof,
+                            contract.defs(),
+                            contract.ancestry,
+                            Some(&contract.lookup(session.catalog())),
+                        ),
+                        None => Default::default(),
+                    }
+                },
+                unknown: None,
             },
-            unknown: None,
-        },
-    )
+            awaiting,
+        )
 }
 
 type ValidationCandidateFactory<'a, P, B> =
@@ -550,6 +567,7 @@ fn admit_validation_attributes_with_input<
     declarations: Option<
         &std::collections::HashMap<String, (String, crate::binding_index::DeclaredValueSource)>,
     >,
+    awaiting: &crate::identifier::PrefixObligations,
     input: ValidationInput<'v, P, B>,
 ) -> crate::schema::ResourceValueValidation {
     let admit_attribute = |name: &str,
@@ -640,22 +658,30 @@ fn admit_validation_attributes_with_input<
             findings
         }
     };
-    schema.schema().as_schema().validate_admission_report(
-        attributes,
-        entries,
-        &|name| quoted.contains(name),
-        &crate::schema::value_validation::AttributeAdmission {
-            known: &|name, selected, proof| {
-                let destination =
-                    schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
-                admit_attribute(name, proof, &destination)
+    schema
+        .schema()
+        .as_schema()
+        .validate_admission_report_with_obligations(
+            attributes,
+            entries,
+            &|name| quoted.contains(name),
+            &crate::schema::value_validation::AttributeAdmission {
+                known: &|name, selected, proof| {
+                    let destination = schema.admission_selected_attribute::<K>(
+                        id,
+                        name,
+                        selected,
+                        session.catalog(),
+                    );
+                    admit_attribute(name, proof, &destination)
+                },
+                unknown: Some(&|name, proof| {
+                    let destination = schema.untyped_attribute::<K>(id, name, session.catalog());
+                    admit_attribute(name, proof, &destination)
+                }),
             },
-            unknown: Some(&|name, proof| {
-                let destination = schema.untyped_attribute::<K>(id, name, session.catalog());
-                admit_attribute(name, proof, &destination)
-            }),
-        },
-    )
+            awaiting,
+        )
 }
 
 /// Exhaustive resource/data-source policy shared by all analysis adapters.
@@ -1275,6 +1301,7 @@ fn typed_resource_attribute_admissions<
         session,
         Some(&check),
         Some(&declarations),
+        inputs.awaiting_prefixes(),
         input,
     )
 }

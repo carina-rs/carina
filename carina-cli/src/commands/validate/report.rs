@@ -417,6 +417,11 @@ fn module_error_diagnostics(
                 ModuleError::ParseInFile { path, error } => {
                     vec![parse_diagnostic(error, Some(path))]
                 }
+                ModuleError::Resource(finding) => vec![Diagnostic {
+                    code: finding.code().map(str::to_owned),
+                    location: finding.location().map(Location::authored),
+                    ..Diagnostic::new(finding.message(), "error")
+                }],
                 ModuleError::ReferenceType(errors) => errors
                     .iter()
                     .map(|error| Diagnostic::new(error.to_string(), "error"))

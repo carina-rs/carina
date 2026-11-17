@@ -309,10 +309,8 @@ impl<E, P: PlaceholderKind, T: PlaceholderKind> CanonicalResourcePair<E, P, T> {
         mut self,
         registry: &carina_core::schema::SchemaRegistry,
     ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixError>> {
-        let errors = carina_core::identifier::resolve_attr_prefix_findings(
-            &mut self.parsed.resources,
-            registry,
-        );
+        let errors =
+            carina_core::identifier::resolve_attr_prefix_findings(&mut self.parsed, registry);
         if errors.is_empty() {
             Ok(self)
         } else {

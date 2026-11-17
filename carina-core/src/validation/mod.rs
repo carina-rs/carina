@@ -5351,14 +5351,14 @@ enum ValidatableKind {
 /// A resource-admission failure retains its schema error and authored owner.
 /// Display is the execution-facing presentation; diagnostic clients consume
 /// the typed error and location without parsing that presentation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResourceAdmissionFinding {
     human: String,
     detail: ResourceAdmissionDetail,
     location: Option<crate::parser::DeclarationLocation>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ResourceAdmissionDetail {
     Schema {
         resource: crate::resource::ResourceId,
@@ -5542,7 +5542,14 @@ impl ResourceAdmissionFindings {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SchemaFindingLocations {
+    Existing,
+    Authored,
+}
+
 struct ValueAdmission<'a, B: BindingAddress> {
+    locations: SchemaFindingLocations,
     report: &'a crate::parser::retained::ExpressionReport<B>,
     coverage: &'a mut crate::schema::value_validation::WalkCoverage,
 }
@@ -5556,6 +5563,7 @@ type ResourceAdmissionValues = HashMap<
 >;
 
 struct ResourceValidationContext<'a, B: BindingAddress> {
+    locations: SchemaFindingLocations,
     report: &'a crate::parser::retained::ExpressionReport<B>,
     registry: &'a SchemaRegistry,
     known_providers: &'a HashSet<String>,
@@ -5654,7 +5662,9 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                 if !rendered_symbolically {
                     // The value-only validate_resources API keeps its existing
                     // unlocated projection. Full admission has the authored view.
-                    let location = if context.admissions.is_some() {
+                    let location = if context.admissions.is_some()
+                        || matches!(context.locations, SchemaFindingLocations::Authored)
+                    {
                         match provenance.schema_diagnostic_location(diagnostic) {
                             Ok(location) => location,
                             Err(error) => {
@@ -5762,6 +5772,7 @@ pub fn validate_resources<
                 None,
                 diagnostics,
                 ValueAdmission {
+                    locations: SchemaFindingLocations::Existing,
                     report: &report,
                     coverage,
                 },
@@ -5779,6 +5790,56 @@ pub fn validate_resources<
     }
 }
 
+/// Check siblings of a companion obligation before substituting module
+/// arguments. Only obligation-bearing owners enter this pass; ordinary module
+/// resources keep their existing validation order and diagnostics.
+pub(crate) fn awaiting_prefix_sibling_findings(
+    parsed: &crate::parser::ParsedFile,
+    schemas: &SchemaRegistry,
+    context: &ProviderContext,
+) -> Result<Vec<ResourceAdmissionFinding>, crate::parser::AnalysisTreeError> {
+    let canonical = crate::identifier::canonicalize_file_prefixes(
+        parsed.clone(),
+        schemas,
+        crate::identifier::SuffixSource::Preview,
+    );
+    if !canonical.has_awaiting_prefixes() {
+        return Ok(Vec::new());
+    }
+    let canonical = canonical.judge(context);
+    let mut inputs = canonical.schema_validation_resources()?;
+    inputs.resources.retain(|resource| {
+        let input = match resource {
+            crate::identifier::CanonicalSchemaResource::Resource(_, input)
+            | crate::identifier::CanonicalSchemaResource::DataSource(_, input)
+            | crate::identifier::CanonicalSchemaResource::Deferred(_, input) => input,
+        };
+        input
+            .as_ref()
+            .is_some_and(|(_, values)| !values.awaiting.is_empty())
+    });
+    if inputs.resources.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut run: ConversionValidation = ConversionValidation::new(canonical.report());
+    let findings = run.walk_in(FindingSubject::Root, |coverage| {
+        resource_values_report(
+            inputs,
+            schemas,
+            &HashSet::new(),
+            context,
+            None,
+            &mut Vec::new(),
+            ValueAdmission {
+                report: canonical.report(),
+                coverage,
+                locations: SchemaFindingLocations::Authored,
+            },
+        )
+    });
+    Ok(findings)
+}
+
 fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddress>(
     inputs: crate::identifier::CanonicalSchemaInputs<'_, P, T, B>,
     registry: &SchemaRegistry,
@@ -5789,7 +5850,11 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
     admission: ValueAdmission<'_, B>,
 ) -> Vec<ResourceAdmissionFinding> {
     use crate::identifier::CanonicalSchemaResource;
-    let ValueAdmission { report, coverage } = admission;
+    let ValueAdmission {
+        report,
+        coverage,
+        locations,
+    } = admission;
     let mut all_errors = ResourceAdmissionFindings::default();
     // A standalone module receives its providers from the caller, so schema
     // availability cannot be decided until its resources are expanded into a
@@ -5821,6 +5886,7 @@ fn resource_values_report<P: PlaceholderKind, T: PlaceholderKind, B: BindingAddr
     // *opposite* kind exists.
     {
         let mut context = ResourceValidationContext {
+            locations,
             report,
             registry,
             known_providers,
@@ -6068,6 +6134,7 @@ fn complete_resource_admission_report<
             Some(&report.attributes),
             diagnostics,
             ValueAdmission {
+                locations: SchemaFindingLocations::Existing,
                 report: judged.report(),
                 coverage,
             },

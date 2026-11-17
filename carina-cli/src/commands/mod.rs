@@ -573,6 +573,15 @@ fn extend_module_resolution_errors(
     base_dir: &ResolvedPath,
 ) {
     for residual in residuals {
+        if let Some(findings) = residual.resource_findings() {
+            errors.extend(
+                findings
+                    .into_iter()
+                    .cloned()
+                    .map(|finding| AppError::ResourceAdmission(Box::new(finding))),
+            );
+            continue;
+        }
         if let Some(error) = residual.analysis_invariant() {
             errors.extend([AppError::AnalysisInvariant(error.clone())]);
             continue;

@@ -103,6 +103,9 @@ impl<'a, B: BindingAddress> DependencyResourceRef<'a, B> {
     pub(super) fn new(path: &'a AccessPath<B>) -> Self {
         Self { path }
     }
+    pub(crate) fn path_key(&self) -> DependencyKey<AccessPath<B>> {
+        DependencyKey::new(self.path.clone())
+    }
     pub fn binding_key(&self) -> DependencyKey<B> {
         DependencyKey::new(self.path.binding_address().clone())
     }

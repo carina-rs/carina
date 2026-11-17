@@ -1403,12 +1403,8 @@ where
     for condition in syntax.secrecy_conditions() {
         let mut nodes = vec![&condition];
         while let Some(node) = nodes.pop() {
-            if let ExprKind::Binding(binding)
-            | ExprKind::Reference {
-                binding,
-                attribute: _,
-                segments: _,
-            } = node.secrecy_kind()
+            if let ExprKind::Binding(binding) | ExprKind::Reference { binding, .. } =
+                node.secrecy_kind()
                 && let Some(argument) = syntax.secrecy_argument(binding)
             {
                 let walk = Walk::new(&owner, String::new(), condition.location().clone());
@@ -2265,6 +2261,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         binding,
                         attribute,
                         segments,
+                        ..
                     } => {
                         if self.local_literal(binding, &expression)
                             && self
@@ -2831,6 +2828,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                                     binding,
                                     attribute,
                                     segments,
+                                    ..
                                 } => self.argument_reference_origin(
                                     binding,
                                     std::iter::once(PathSegment::Field {
