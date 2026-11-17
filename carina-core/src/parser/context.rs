@@ -42,6 +42,7 @@ pub(super) struct EvaluationOnly;
 pub(crate) struct FunctionEvaluationSession<'a> {
     provider: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     recorder: Option<&'a crate::validation::deferred_types::EditorFunctionBodyRecorder<'a>>,
+    argument_input: Option<&'a super::DeclarationLocation>,
 }
 impl<'a> FunctionEvaluationSession<'a> {
     pub(crate) fn ordinary(
@@ -50,6 +51,7 @@ impl<'a> FunctionEvaluationSession<'a> {
         Self {
             provider,
             recorder: None,
+            argument_input: None,
         }
     }
     pub(crate) fn recording(
@@ -59,6 +61,20 @@ impl<'a> FunctionEvaluationSession<'a> {
         Self {
             provider,
             recorder: Some(recorder),
+            argument_input: None,
+        }
+    }
+    pub(super) fn for_input<'input>(
+        self,
+        input: &'input super::DeclarationLocation,
+    ) -> FunctionEvaluationSession<'input>
+    where
+        'a: 'input,
+    {
+        FunctionEvaluationSession {
+            provider: self.provider,
+            recorder: self.recorder,
+            argument_input: Some(input),
         }
     }
     pub(super) fn provider(
@@ -73,6 +89,15 @@ impl<'a> FunctionEvaluationSession<'a> {
     ) {
         if let Some(recorder) = self.recorder {
             recorder.rejected_body(function, arguments);
+        }
+    }
+    pub(super) fn rejected_arguments(
+        self,
+        function: &UserFunction,
+        arguments: &[super::ParsedFunctionArgument],
+    ) {
+        if let (Some(recorder), Some(input)) = (self.recorder, self.argument_input) {
+            recorder.rejected_arguments(function, arguments, input);
         }
     }
 }

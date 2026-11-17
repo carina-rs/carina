@@ -187,27 +187,24 @@ impl EditorFunctionBodyJudgements {
         let keep = file
             .providers
             .iter()
-            .map(|provider| {
-                let project = |value: &Value| {
+            .enumerate()
+            .map(|(index, provider)| {
+                let project = |(key, value): (&parser::AttributeKey, &Value)| {
                     !uses_rejected_definition(self, value, file, &mut Vec::new())
                         && !parser::editor_provider_value_uses_owned_body(
-                            file, value, session, self,
+                            file, index, key, value, session, self,
                         )
                 };
                 (
-                    provider
-                        .attributes
-                        .values()
-                        .map(project)
-                        .collect::<Vec<_>>(),
+                    provider.attributes.iter().map(project).collect::<Vec<_>>(),
                     provider
                         .default_tags
-                        .values()
+                        .iter()
                         .map(project)
                         .collect::<Vec<_>>(),
                     provider
                         .unresolved_attributes
-                        .values()
+                        .iter()
                         .map(project)
                         .collect::<Vec<_>>(),
                 )

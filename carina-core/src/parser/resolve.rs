@@ -1394,6 +1394,8 @@ pub fn evaluate_resource_ref_values_from_analysis<E: ExportParamLike + Clone>(
 /// resolution error cannot escape to the editor's publication path.
 pub(crate) fn editor_provider_value_uses_owned_body(
     parsed: &ParsedFile,
+    provider_index: usize,
+    key: &super::AttributeKey,
     value: &Value,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     owned: &crate::validation::deferred_types::EditorFunctionBodyJudgements,
@@ -1401,6 +1403,28 @@ pub(crate) fn editor_provider_value_uses_owned_body(
     let recorder = crate::validation::deferred_types::EditorFunctionBodyRecorder::new(
         parsed.expression_report(),
     );
+    let provider = &parsed.providers[provider_index];
+    let occurrence = parsed.providers[..provider_index]
+        .iter()
+        .filter(|other| other.name == provider.name && other.binding == provider.binding)
+        .count();
+    let input = parsed
+        .parser_binding_metadata
+        .syntax()
+        .providers()
+        .iter()
+        .filter(|record| record.name == provider.name && record.binding == provider.binding)
+        .nth(occurrence)
+        .and_then(|record| {
+            record
+                .attributes
+                .iter()
+                .rev()
+                .find(|attribute| &attribute.key == key)
+        })
+        .map(|attribute| &attribute.value_location);
+    let recording = FunctionEvaluationSession::recording(session, &recorder);
+    let recording = input.map_or(recording, |input| recording.for_input(input));
     let mut bindings = HashMap::new();
     for resource in parsed.iter_top_level_resources() {
         if let Some(binding) = resource.binding() {
@@ -1411,7 +1435,7 @@ pub(crate) fn editor_provider_value_uses_owned_body(
         value,
         &bindings,
         session.catalog(),
-        Some(FunctionEvaluationSession::recording(session, &recorder)),
+        Some(recording),
         diagnostics_resolution_context(),
     )
     .ok();

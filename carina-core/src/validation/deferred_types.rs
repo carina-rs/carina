@@ -159,26 +159,30 @@ impl dyn ProviderTypeCheckContext + '_ {
     }
 }
 
-/// Value-only receipts for function bodies already judged by editor resolution.
-/// Rejected bodies expose no error payload or publication API. Consuming these
+/// Value-only receipts for function bodies and calls judged by editor resolution.
+/// Rejections expose no error payload or publication API. Consuming these
 /// receipts permits the independent provider judgement; they cannot be cloned.
 #[derive(Debug)]
 pub struct EditorFunctionBodyJudgements {
-    rejected: Vec<RejectedFunctionBody>,
+    rejected: Vec<RejectedFunction>,
 }
 #[derive(Debug)]
-struct RejectedFunctionBody {
+struct RejectedFunction {
     source: PathBuf,
     name: String,
-    // An abstract body rejection owns the definition. A value-dependent
-    // rejection owns only this invocation; other arguments still need judgement.
-    definition: bool,
+    kind: FunctionRejection,
     arguments: Vec<
         crate::resource::FunctionArgument<
             crate::resource::ParserPlaceholder,
             crate::resource::RelativeBindingName,
         >,
     >,
+}
+#[derive(Debug)]
+enum FunctionRejection {
+    BodyDefinition,
+    BodyInvocation,
+    Arguments(crate::parser::DeclarationLocation),
 }
 impl EditorFunctionBodyJudgements {
     pub(crate) fn empty() -> Self {
@@ -190,21 +194,37 @@ impl EditorFunctionBodyJudgements {
         self.rejected.is_empty()
     }
     pub(crate) fn rejects_definition(&self, function: &UserFunction) -> bool {
-        self.rejected
-            .iter()
-            .any(|rejected| rejected.definition && rejected.matches(function))
-    }
-    pub(crate) fn owns_rejection_from(&self, query: &Self) -> bool {
-        self.rejected.iter().any(|owner| {
-            query.rejected.iter().any(|attempt| {
-                owner.source == attempt.source
-                    && owner.name == attempt.name
-                    && (owner.definition || owner.arguments == attempt.arguments)
-            })
+        self.rejected.iter().any(|rejected| {
+            matches!(rejected.kind, FunctionRejection::BodyDefinition) && rejected.matches(function)
         })
     }
+    pub(crate) fn owns_rejection_from(&self, query: &Self) -> bool {
+        self.rejected
+            .iter()
+            .any(|owner| query.rejected.iter().any(|attempt| owner.owns(attempt)))
+    }
 }
-impl RejectedFunctionBody {
+impl RejectedFunction {
+    fn owns(&self, attempt: &Self) -> bool {
+        use FunctionRejection::*;
+        self.source == attempt.source
+            && self.name == attempt.name
+            && match (&self.kind, &attempt.kind) {
+                (BodyDefinition, BodyDefinition | BodyInvocation) => true,
+                (BodyInvocation, BodyDefinition | BodyInvocation) => {
+                    self.arguments == attempt.arguments
+                }
+                (Arguments(call), Arguments(input)) => {
+                    // The parser's pending call belongs to this authored input.
+                    // Equal argument values at another call are independent.
+                    call.file() == input.file()
+                        && input.span().start_byte() <= call.span().start_byte()
+                        && call.span().end_byte() <= input.span().end_byte()
+                        && self.arguments == attempt.arguments
+                }
+                _ => false,
+            }
+    }
     fn matches(&self, function: &UserFunction) -> bool {
         self.name == function.name
             && self.source
@@ -239,7 +259,7 @@ fn effective_function_arguments(
 #[derive(Debug)]
 pub(crate) struct EditorFunctionBodyRecorder<'a> {
     report: &'a crate::parser::retained::ExpressionReport<crate::resource::RelativeBindingName>,
-    rejected: Mutex<Vec<RejectedFunctionBody>>,
+    rejected: Mutex<Vec<RejectedFunction>>,
 }
 impl<'a> EditorFunctionBodyRecorder<'a> {
     pub(crate) fn new(
@@ -255,14 +275,38 @@ impl<'a> EditorFunctionBodyRecorder<'a> {
         function: &UserFunction,
         arguments: &[crate::parser::ParsedFunctionArgument],
     ) {
-        let definition = function.params.is_empty() || self.report.rejects_function_body(function);
+        let kind = if function.params.is_empty() || self.report.rejects_function_body(function) {
+            FunctionRejection::BodyDefinition
+        } else {
+            FunctionRejection::BodyInvocation
+        };
+        self.reject(function, arguments, kind);
+    }
+    pub(crate) fn rejected_arguments(
+        &self,
+        function: &UserFunction,
+        arguments: &[crate::parser::ParsedFunctionArgument],
+        input: &crate::parser::DeclarationLocation,
+    ) {
+        self.reject(
+            function,
+            arguments,
+            FunctionRejection::Arguments(input.clone()),
+        );
+    }
+    fn reject(
+        &self,
+        function: &UserFunction,
+        arguments: &[crate::parser::ParsedFunctionArgument],
+        kind: FunctionRejection,
+    ) {
         self.rejected
             .lock()
-            .expect("editor function body lock")
-            .push(RejectedFunctionBody {
+            .expect("editor function judgement lock")
+            .push(RejectedFunction {
                 source: crate::utils::normalize_source_path(function.body.location.file().path()),
                 name: function.name.clone(),
-                definition,
+                kind,
                 arguments: effective_function_arguments(function, arguments),
             });
     }
@@ -271,7 +315,7 @@ impl<'a> EditorFunctionBodyRecorder<'a> {
             rejected: self
                 .rejected
                 .into_inner()
-                .expect("editor function body lock"),
+                .expect("editor function judgement lock"),
         }
     }
 }

@@ -631,6 +631,67 @@ fn sibling_resolution_failure_preserves_current_file_fallback() {
 }
 
 #[test]
+fn literal_provider_argument_and_broken_body_have_one_owner_each() {
+    let fixture = Fixture::new(&[
+        ("main.crn", "let root_result = broken('root')\n"),
+        (
+            "providers.crn",
+            "provider mock { default_tags = broken(1) }\nfn broken(value: String): String { true }\n",
+        ),
+    ]);
+    // Analyze both files: the provider argument is judged by root resolution,
+    // while the retained report owns the separate return-body error.
+    assert_eq!(
+        fixture.lsp(""),
+        vec![
+            Finding {
+                file: "providers.crn".into(),
+                message: "function 'broken': parameter 'value': expected String, got int (1)"
+                    .into(),
+                start: (0, 31),
+                end: (0, 40),
+            },
+            Finding {
+                file: "providers.crn".into(),
+                message: "function 'broken': return value: expected String, got Bool".into(),
+                start: (1, 35),
+                end: (1, 39),
+            },
+        ],
+    );
+}
+
+#[test]
+fn equal_arguments_at_distinct_calls_keep_independent_provider_findings() {
+    let fixture = Fixture::new(&[
+        ("main.crn", "let root_result = broken(1)\n"),
+        (
+            "providers.crn",
+            "provider mock { default_tags = broken(1) }\nfn broken(value: String): String { true }\n",
+        ),
+    ]);
+    assert_eq!(
+        fixture.lsp("function 'broken': parameter 'value': expected String, got int (1)"),
+        vec![
+            Finding {
+                file: "main.crn".into(),
+                message: "function 'broken': parameter 'value': expected String, got int (1)"
+                    .into(),
+                start: (0, 18),
+                end: (0, 27),
+            },
+            Finding {
+                file: "providers.crn".into(),
+                message: "function 'broken': parameter 'value': expected String, got int (1)"
+                    .into(),
+                start: (0, 31),
+                end: (0, 40),
+            },
+        ],
+    );
+}
+
+#[test]
 fn provider_only_and_independent_provider_errors_are_preserved() {
     let provider_only = fixture("provider_call_bad_return");
     let finding = provider_only.lsp("function 'bad_tags'");

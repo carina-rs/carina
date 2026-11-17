@@ -229,12 +229,18 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
     let required_count = func.params.iter().filter(|p| p.default.is_none()).count();
     let max_count = func.params.len();
     if args.len() < required_count {
+        if let Some(session) = ctx.session {
+            session.rejected_arguments(func, args);
+        }
         return Err(ParseError::UserFunctionError(format!(
             "function '{fn_name}' expects at least {required_count} argument(s), got {}",
             args.len()
         )));
     }
     if args.len() > max_count {
+        if let Some(session) = ctx.session {
+            session.rejected_arguments(func, args);
+        }
         return Err(ParseError::UserFunctionError(format!(
             "function '{fn_name}' expects at most {max_count} argument(s), got {}",
             args.len()
@@ -276,7 +282,13 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
         };
         // Type-check if the parameter has a type annotation
         if param.param_type.is_some() {
-            match check_fn_arg_type(func, param, &argument, ctx, call_line, None)? {
+            match check_fn_arg_type(func, param, &argument, ctx, call_line, None).inspect_err(
+                |_| {
+                    if let Some(session) = ctx.session {
+                        session.rejected_arguments(func, args);
+                    }
+                },
+            )? {
                 FunctionArgumentTypeCheck::Complete => {}
                 FunctionArgumentTypeCheck::AwaitingRuntimeValue => {
                     has_deferred_type_check = true;
@@ -1205,6 +1217,7 @@ pub(crate) fn validate_pending_function_type_check(
     functions: &IndexMap<String, UserFunction>,
     session: FunctionEvaluationSession<'_>,
 ) -> Result<(), ParseError> {
+    let session = session.for_input(&check.location);
     let ctx = ParseContext::for_evaluation_in_session(session);
     ctx.resume_evaluation(&check.evaluation)
         .evaluate(|| {
@@ -1245,6 +1258,7 @@ pub(crate) fn validate_pending_function_type_check(
                         ));
                     }
                     Err(error) => {
+                        session.rejected_arguments(function, &check.arguments);
                         let located = match error {
                             ParseError::InvalidExpression { message, .. }
                             | ParseError::UserFunctionError(message) => {
