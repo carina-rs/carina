@@ -960,6 +960,7 @@ fn local_trust_and_unwritable_cache_notices_belong_to_the_report() {
 fn validate_reports_unsupported_lock_versions_in_human_and_json() {
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    let init = carina_core::hint::ProjectCommand::new("init", fixture.path()).to_string();
     for version in 1..carina_provider_resolver::LockFile::CURRENT_VERSION {
         std::fs::write(
             fixture.path().join("carina-providers.lock"),
@@ -975,7 +976,9 @@ fn validate_reports_unsupported_lock_versions_in_human_and_json() {
             format!("uses format version {version}"),
             "reads only version 5".into(),
             "Carina v0.15.0".into(),
-            carina_core::hint::ProjectCommand::new("init", fixture.path()).to_string(),
+            format!("run `{init}` with v0.15.0"),
+            "`providers repin-discovery` or `providers repin-identity`".into(),
+            format!("then `{init}` again"),
         ] {
             assert!(stderr.contains(&expected), "{stderr}");
             assert!(message.contains(&expected), "{json}");

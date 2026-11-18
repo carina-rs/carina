@@ -42,7 +42,7 @@ Re-resolve all provider versions from the constraints in `providers.crn`, ignori
 
 Require the lock file to match `providers.crn` exactly. Errors if any declared provider or current egress declaration is missing from the lock file. The command never writes the lock or prompts. Intended for CI, similar to `cargo --locked`.
 
-Carina reads only provider lock format version 5. Versions 1–4, GitHub entries without an exact release tag and asset ID or revision artifact ID, and legacy signer pins are rejected in every mode. To rewrite an older lock, run `carina init [path]` with Carina v0.15.0. If it requires a recovery command such as `carina providers repin-discovery` or `carina providers repin-identity`, run that command with v0.15.0 first, then run `carina init` again.
+Carina reads only provider lock format version 5. Versions 1–4, GitHub entries without an exact release tag and asset ID or revision artifact ID, and legacy signer pins are rejected in every mode. To rewrite an older lock, run `carina init [path]` with Carina v0.15.0. If it requires a recovery command such as `providers repin-discovery` or `providers repin-identity`, run that command with v0.15.0 first, then run `carina init [path]` again.
 
 `--upgrade` and `--locked` are mutually exclusive. `--accept-egress` also conflicts with `--locked`.
 

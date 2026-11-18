@@ -2364,8 +2364,8 @@ define_lock_file_error! {
         found: u32,
         supported: u32,
     } => Self::UnsupportedVersion {
-        path: PathBuf::from("carina-providers.lock"),
-        project_dir: PathBuf::from("."),
+        path: PathBuf::from("project/carina-providers.lock"),
+        project_dir: PathBuf::from("project"),
         found: 4,
         supported: LockFile::CURRENT_VERSION,
     },
@@ -2473,11 +2473,11 @@ impl fmt::Display for LockFileError {
                 found,
                 supported,
             } => {
+                let init = ProjectCommand::new("init", project_dir);
                 write!(
                     f,
-                    "Lock file {} uses format version {found}, but this Carina reads only version {supported}. Rewrite it with Carina v0.15.0, the last release that converts older lock formats: run `{}` with v0.15.0, and if it reports a required recovery command (such as `carina providers repin-discovery` or `carina providers repin-identity`), run that first, then `carina init` again.",
-                    path.display(),
-                    ProjectCommand::new("init", project_dir)
+                    "Lock file {} uses format version {found}, but this Carina reads only version {supported}. Rewrite it with Carina v0.15.0, the last release that converts older lock formats: run `{init}` with v0.15.0, and if it reports a required recovery command (such as `providers repin-discovery` or `providers repin-identity`), run that first, then `{init}` again.",
+                    path.display()
                 )
             }
             Self::InvalidVersion { found } => write!(
@@ -12527,14 +12527,17 @@ sha256 = "abc"
             assert!(rendered.contains("Carina v0.15.0"), "{rendered}");
             assert!(rendered.contains("carina init project"), "{rendered}");
             assert!(
-                rendered.contains("carina providers repin-discovery"),
+                rendered.contains("`providers repin-discovery`"),
                 "{rendered}"
             );
             assert!(
-                rendered.contains("carina providers repin-identity"),
+                rendered.contains("`providers repin-identity`"),
                 "{rendered}"
             );
-            assert!(rendered.contains("then `carina init` again"), "{rendered}");
+            assert!(
+                rendered.contains("then `carina init project` again"),
+                "{rendered}"
+            );
         }
     }
 
@@ -12548,12 +12551,8 @@ sha256 = "abc"
             matches!(&error, LockFileError::UnsupportedVersion { project_dir, .. }
             if *project_dir == project.source_label())
         );
-        assert!(
-            error
-                .to_string()
-                .contains(&ProjectCommand::new("init", dir.path()).to_string()),
-            "{error}"
-        );
+        let init = ProjectCommand::new("init", dir.path()).to_string();
+        assert_eq!(error.to_string().matches(&init).count(), 2, "{error}");
         assert!(
             !error
                 .to_string()
