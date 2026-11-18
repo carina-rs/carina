@@ -18,6 +18,7 @@ hook_static_checks=(
     check-plan-fixtures
     check-provider-boundaries
     check-wit-guest-text-confinement
+    check-schema-parts-exhaustive
     check-docs-use-new-spellings
     check-rust-cache-via-local-action
 )
