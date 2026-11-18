@@ -412,7 +412,7 @@ mod tests {
                     assert_eq!(create.target(), target.as_inner());
                     assert_eq!(
                         graph.deps_of(0).unwrap(),
-                        &std::collections::HashSet::from([1])
+                        &std::collections::BTreeSet::from([1])
                     );
                 }
                 _ => panic!("continuation must carry exactly its admitted execution capability"),
@@ -477,7 +477,7 @@ mod tests {
                 dependencies: Default::default(),
                 explicit_dependencies: Default::default(),
                 blocked_by_updates: Default::default(),
-                previous_attributes: HashMap::from([(
+                previous_attributes: std::collections::BTreeMap::from([(
                     "name".into(),
                     crate::resource::SnapshotValue::Concrete(ConcreteValue::String(
                         "stable".into(),

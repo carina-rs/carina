@@ -5,7 +5,7 @@ pub use diagnostics::SchemaDecodeError;
 pub use diagnostics::{MetadataDiagnostic, MetadataLoadDiagnostic};
 use guest::{guest_stderr, guest_store};
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};

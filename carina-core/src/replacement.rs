@@ -1,7 +1,7 @@
 //! Replacement intent and the sole admission boundary for replacement order.
 //!
 //! Persisted plans and deferred templates carry requests, never admission proofs.
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -529,7 +529,11 @@ fn cycle_promotions<S: Clone, P: PlanValueKind>(
     promotions
 }
 
-fn dependency_reaches(edges: &HashMap<usize, HashSet<usize>>, start: usize, target: usize) -> bool {
+fn dependency_reaches(
+    edges: &HashMap<usize, BTreeSet<usize>>,
+    start: usize,
+    target: usize,
+) -> bool {
     let mut pending = vec![start];
     let mut visited = HashSet::new();
     while let Some(node) = pending.pop() {
@@ -620,7 +624,7 @@ pub(crate) struct ReplacementInputs {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct OldInstanceSnapshot {
     pub(crate) instance: DeletedInstanceKey,
-    pub(crate) attributes: HashMap<String, SnapshotValue>,
+    pub(crate) attributes: BTreeMap<String, SnapshotValue>,
 }
 
 impl ReplacementInputs {
@@ -641,7 +645,7 @@ impl ReplacementInputs {
     pub(crate) fn previous(
         &self,
         instance: &DeletedInstanceKey,
-    ) -> Option<HashMap<String, SnapshotValue>> {
+    ) -> Option<BTreeMap<String, SnapshotValue>> {
         self.old_instances
             .iter()
             .find(|old| &old.instance == instance)
@@ -661,7 +665,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     pub fn resolve(
         effects: &[Effect<S, P>],
         registry: &SchemaRegistry,
-        previous: impl Fn(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
+        previous: impl Fn(&DeletedInstanceKey) -> BTreeMap<String, SnapshotValue>,
     ) -> Result<Self, ReplacementAdmissionError> {
         Self::resolve_with_prepared_names(
             effects,
@@ -674,7 +678,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     pub(crate) fn resolve_with_prepared_names(
         effects: &[Effect<S, P>],
         registry: &SchemaRegistry,
-        previous: impl Fn(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
+        previous: impl Fn(&DeletedInstanceKey) -> BTreeMap<String, SnapshotValue>,
         associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
         prepared_names: &HashMap<ResolvedResourceId, TemporaryName>,
     ) -> Result<Self, ReplacementAdmissionError> {
@@ -690,7 +694,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     fn resolve_with_context(
         effects: &[Effect<S, P>],
         registry: &SchemaRegistry,
-        previous: impl Fn(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
+        previous: impl Fn(&DeletedInstanceKey) -> BTreeMap<String, SnapshotValue>,
         associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
         prepared_names: &HashMap<ResolvedResourceId, TemporaryName>,
         required: &CreateFirstRequirements,
@@ -1012,7 +1016,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     fn deferred_preflight_preview(
         &self,
         gate: usize,
-        previous: &impl Fn(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
+        previous: &impl Fn(&DeletedInstanceKey) -> BTreeMap<String, SnapshotValue>,
     ) -> Option<crate::effect::DeferredReplacePayload<S, P>> {
         match &self.effects[gate] {
             Effect::DeferredCreate(payload) => {
@@ -1144,7 +1148,7 @@ impl<'plan, S: Clone, P: PlanValueKind> EffectGraph<'plan, S, P> {
     }
     pub(crate) fn order_edges(
         &self,
-        deps: &mut HashMap<usize, HashSet<usize>>,
+        deps: &mut HashMap<usize, BTreeSet<usize>>,
     ) -> HashSet<(usize, usize)> {
         let pairs = self.scheduling.order_edges(self.effects, deps);
         for gate in 0..self.effects.len() {
@@ -1300,7 +1304,7 @@ struct BoundReplacement {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ReplacementScheduling {
     replacements: Vec<BoundReplacement>,
-    gate_barriers: HashMap<usize, HashSet<usize>>,
+    gate_barriers: HashMap<usize, BTreeSet<usize>>,
 }
 impl ReplacementScheduling {
     pub(crate) fn is_create_first(&self, target: &crate::resource::ResourceId) -> bool {
@@ -1392,7 +1396,7 @@ impl ReplacementScheduling {
     pub(crate) fn order_edges<S, P: PlanValueKind>(
         &self,
         effects: &[impl AsRef<Effect<S, P>>],
-        deps: &mut HashMap<usize, HashSet<usize>>,
+        deps: &mut HashMap<usize, BTreeSet<usize>>,
     ) -> HashSet<(usize, usize)> {
         #[allow(clippy::iter_over_hash_type)]
         // keyed rebuild: each gate independently unions its prerequisite set
@@ -1469,7 +1473,10 @@ mod tests {
             dependencies: Default::default(),
             explicit_dependencies: Default::default(),
             blocked_by_updates: Default::default(),
-            previous_attributes: HashMap::from([("name".into(), string("stable"))]),
+            previous_attributes: std::collections::BTreeMap::from([(
+                "name".into(),
+                string("stable"),
+            )]),
         };
         ReplacementRequest::new(target, NonEmptyDeletes::try_new(vec![old]).unwrap())
     }
@@ -1614,15 +1621,16 @@ mod tests {
         let context_error = AdmittedReplacementEffects::resolve_with_context(
             &effects,
             &schemas,
-            |_| HashMap::new(),
+            |_| std::collections::BTreeMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &required,
         )
         .unwrap_err();
-        let existing =
-            AdmittedReplacementEffects::resolve(&effects[..1], &schemas, |_| HashMap::new())
-                .unwrap();
+        let existing = AdmittedReplacementEffects::resolve(&effects[..1], &schemas, |_| {
+            std::collections::BTreeMap::new()
+        })
+        .unwrap();
         let materialized_error = existing
             .with_materialized(
                 effects[1..].to_vec(),
@@ -1703,8 +1711,8 @@ mod tests {
         let checked = resolve_replacement(request, &registry(UniqueNameSpec::Coexisting)).unwrap();
         let mut scheduling = ReplacementScheduling::default();
         scheduling.insert(checked.into_scheduling(), &effects, 0);
-        scheduling.gate_barriers.insert(1, HashSet::from([2, 3]));
-        scheduling.gate_barriers.insert(4, HashSet::from([2, 3]));
+        scheduling.gate_barriers.insert(1, BTreeSet::from([2, 3]));
+        scheduling.gate_barriers.insert(4, BTreeSet::from([2, 3]));
         let mut admitted = AdmittedReplacementEffects {
             effects,
             scheduling,
@@ -1726,11 +1734,11 @@ mod tests {
         admitted
             .scheduling
             .gate_barriers
-            .insert(1, HashSet::from([0]));
+            .insert(1, BTreeSet::from([0]));
         admitted
             .scheduling
             .gate_barriers
-            .insert(4, HashSet::from([0]));
+            .insert(4, BTreeSet::from([0]));
         assert_eq!(
             cycle_promotions(&admitted),
             vec![(target.clone(), Dependent::new(target.clone()).into())],
@@ -1739,7 +1747,7 @@ mod tests {
         admitted
             .scheduling
             .gate_barriers
-            .insert(1, HashSet::from([2, 3]));
+            .insert(1, BTreeSet::from([2, 3]));
         assert_eq!(
             cycle_promotions(&admitted),
             vec![(
@@ -1983,7 +1991,8 @@ mod tests {
             .iter_mut()
             .next()
             .unwrap()
-            .previous_attributes = HashMap::from([("name".into(), string("current-B"))]);
+            .previous_attributes =
+            std::collections::BTreeMap::from([("name".into(), string("current-B"))]);
         let mut deposed = request.deletes[0].clone();
         deposed.id = ResolvedResourceId::with_provider_identity(
             "",
@@ -1993,7 +2002,8 @@ mod tests {
         );
         deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
         deposed.identifier = crate::effect::fixture_applied_identifier("source-deposed-A");
-        deposed.previous_attributes = HashMap::from([("name".into(), string("stable"))]);
+        deposed.previous_attributes =
+            std::collections::BTreeMap::from([("name".into(), string("stable"))]);
         let mut plan = crate::plan::Plan::new();
         plan.add(Effect::Move {
             from: deposed.id.clone(),
@@ -2068,8 +2078,9 @@ mod tests {
                     Effect::Create(conflicting.target().clone()),
                 ];
                 for _ in 0..2 {
-                    let result =
-                        AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new());
+                    let result = AdmittedReplacementEffects::resolve(&effects, &schemas, |_| {
+                        std::collections::BTreeMap::new()
+                    });
                     if matches!(class, UniqueNameSpec::Conflicting) {
                         let error = result
                             .expect_err("a cycle with only Conflicting pairs must be rejected");
@@ -2124,7 +2135,7 @@ mod tests {
         let error = AdmittedReplacementEffects::resolve(
             &effects,
             &registry(UniqueNameSpec::Conflicting),
-            |_| HashMap::new(),
+            |_| std::collections::BTreeMap::new(),
         )
         .unwrap_err();
         let rendered = crate::executor::render_error_chain(&error);
@@ -2172,11 +2183,13 @@ mod tests {
             .iter_mut()
             .next()
             .unwrap()
-            .previous_attributes = HashMap::from([("name".into(), string("current-B"))]);
+            .previous_attributes =
+            std::collections::BTreeMap::from([("name".into(), string("current-B"))]);
         let mut deposed = request.deletes[0].clone();
         deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
         deposed.identifier = crate::effect::fixture_applied_identifier("deposed-A");
-        deposed.previous_attributes = HashMap::from([("name".into(), string("stable"))]);
+        deposed.previous_attributes =
+            std::collections::BTreeMap::from([("name".into(), string("stable"))]);
         request.deletes =
             NonEmptyDeletes::try_new(vec![request.deletes[0].clone(), deposed]).unwrap();
         let effects: Vec<Effect> = request
@@ -2184,8 +2197,10 @@ mod tests {
             .iter()
             .map(|old| old.to_delete_effect())
             .collect();
-        let existing =
-            AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new()).unwrap();
+        let existing = AdmittedReplacementEffects::resolve(&effects, &schemas, |_| {
+            std::collections::BTreeMap::new()
+        })
+        .unwrap();
         let admitted = existing
             .with_materialized(
                 vec![Effect::Create(request.target().clone())],
@@ -2259,11 +2274,13 @@ mod tests {
             .iter_mut()
             .next()
             .unwrap()
-            .previous_attributes = HashMap::from([("name".into(), string("current-B"))]);
+            .previous_attributes =
+            std::collections::BTreeMap::from([("name".into(), string("current-B"))]);
         let mut deposed = request.deletes[0].clone();
         deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
         deposed.identifier = crate::effect::fixture_applied_identifier("deposed-A");
-        deposed.previous_attributes = HashMap::from([("name".into(), string("stable"))]);
+        deposed.previous_attributes =
+            std::collections::BTreeMap::from([("name".into(), string("stable"))]);
         let checked = resolve_replacement(request, &schemas).unwrap();
         assert!(
             checked.temporary_name().is_none(),
@@ -2397,7 +2414,8 @@ mod tests {
                 Box::new(string(text)).into(),
             ))
         };
-        old.previous_attributes = HashMap::from([("secret".into(), secret("current-secret"))]);
+        old.previous_attributes =
+            std::collections::BTreeMap::from([("secret".into(), secret("current-secret"))]);
         let current = crate::resource::SnapshotState::existing(
             old.id.as_inner().clone(),
             old.previous_attributes.clone(),
@@ -2541,7 +2559,7 @@ mod tests {
                 let analysis = AdmittedReplacementEffects::resolve(
                     &effects,
                     &registry(UniqueNameSpec::Coexisting),
-                    |_| HashMap::new(),
+                    |_| std::collections::BTreeMap::new(),
                 )
                 .unwrap()
                 .dependency_analysis(std::iter::empty())
@@ -2698,10 +2716,12 @@ mod tests {
                 .position(|effect| matches!(effect, Effect::Delete { id: old, .. } if old == id))
                 .unwrap()
         };
-        let graph = AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new())
-            .unwrap()
-            .dependency_analysis(std::iter::empty())
-            .unwrap();
+        let graph = AdmittedReplacementEffects::resolve(&effects, &schemas, |_| {
+            std::collections::BTreeMap::new()
+        })
+        .unwrap()
+        .dependency_analysis(std::iter::empty())
+        .unwrap();
         assert!(
             graph
                 .deps_of(delete(&child_id))
@@ -2981,8 +3001,9 @@ mod tests {
                 Effect::Create(b.target().clone()),
                 b.deletes[0].to_delete_effect(),
             ];
-            let admission =
-                AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new());
+            let admission = AdmittedReplacementEffects::resolve(&effects, &schemas, |_| {
+                std::collections::BTreeMap::new()
+            });
             if !reversed {
                 let (_, scheduling, _) = admission.unwrap().into_parts();
                 assert!(
@@ -3160,7 +3181,7 @@ mod tests {
             AdmittedReplacementEffects::resolve(
                 &effects,
                 &registry(UniqueNameSpec::Conflicting),
-                |_| HashMap::new()
+                |_| std::collections::BTreeMap::new()
             )
             .is_err(),
             "a recovery generation still requires the target's coexistence admission"
@@ -3189,13 +3210,14 @@ mod tests {
             let delete = effects.len();
             effects.push(old.to_delete_effect());
             let schemas = registry(UniqueNameSpec::Conflicting);
-            let admitted =
-                AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new())
-                    .expect("resuming an issued create must retain its cleanup barrier")
-                    .specialize_for_test(&HashMap::from([(
-                        request.target().id.clone(),
-                        persisted_identified_create(request.target()),
-                    )]));
+            let admitted = AdmittedReplacementEffects::resolve(&effects, &schemas, |_| {
+                std::collections::BTreeMap::new()
+            })
+            .expect("resuming an issued create must retain its cleanup barrier")
+            .specialize_for_test(&HashMap::from([(
+                request.target().id.clone(),
+                persisted_identified_create(request.target()),
+            )]));
             assert_eq!(admitted.effects()[0], effects[0]);
             assert_eq!(admitted.writeback()[0].old_instances().len(), 1);
             let graph = admitted.dependency_analysis(std::iter::empty()).unwrap();
@@ -3236,8 +3258,10 @@ mod tests {
             delete,
         ];
         let schemas = registry(UniqueNameSpec::Attribute("name".into()));
-        let admitted =
-            AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new()).unwrap();
+        let admitted = AdmittedReplacementEffects::resolve(&effects, &schemas, |_| {
+            std::collections::BTreeMap::new()
+        })
+        .unwrap();
         let Effect::ResumeCreate { resource, .. } = &admitted.effects()[0] else {
             panic!("admission must retain the continuation");
         };
@@ -3279,7 +3303,7 @@ mod tests {
                 AdmittedReplacementEffects::resolve(
                     &effects,
                     &registry(UniqueNameSpec::Conflicting),
-                    |_| HashMap::new()
+                    |_| std::collections::BTreeMap::new()
                 )
                 .is_err(),
                 "a continuation still requires replacement admission"
@@ -3381,7 +3405,7 @@ mod tests {
                 let admitted = AdmittedReplacementEffects::resolve(
                     &effects,
                     &registry(UniqueNameSpec::Coexisting),
-                    |_| HashMap::new(),
+                    |_| std::collections::BTreeMap::new(),
                 )
                 .unwrap()
                 .specialize_for_test(&if resume {

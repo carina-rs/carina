@@ -653,3 +653,9 @@ pub fn conversion_validation<E: crate::validation::ValidationClientError>()
 -> crate::validation::ConversionValidation<E> {
     crate::validation::ConversionValidation::for_test()
 }
+
+/// Record a synchronous fixture with fixed secret-hash entropy on this thread.
+/// Restores the prior source on return or panic. Ordinary hashing uses OsRng.
+pub fn with_secret_hash_salt_for_test<T>(salt: [u8; 16], record: impl FnOnce() -> T) -> T {
+    crate::resource::secret_hash_test_entropy::with_salt(salt, record)
+}

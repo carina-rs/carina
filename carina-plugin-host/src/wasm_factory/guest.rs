@@ -3692,7 +3692,7 @@ impl StateValueAccess for HashMap<ResourceId, SnapshotState> {
 
 fn validate_wit_state_result_keys(
     operation: &'static str,
-    expected_ids_by_key: &HashMap<String, ResourceId>,
+    expected_ids_by_key: &BTreeMap<String, ResourceId>,
     results: Vec<(String, wit_types::PersistedState)>,
 ) -> ProviderResult<Vec<WitStateAttributeUpdate>> {
     let expected_keys = expected_ids_by_key.keys().cloned().collect::<BTreeSet<_>>();
@@ -3859,7 +3859,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         current_states: &'a mut carina_core::provider::StateTransformMap,
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
-            let mut resolved_by_key = HashMap::new();
+            let mut resolved_by_key = BTreeMap::new();
             let mut colliding_keys = HashSet::new();
             let mut single_wit_states = Vec::new();
             let mut updates = Vec::new();
@@ -3888,7 +3888,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 }
             }
 
-            let mut resolved_ids_by_key = HashMap::with_capacity(resolved_by_key.len());
+            let mut resolved_ids_by_key = BTreeMap::new();
             let mut resolved_wit_states = Vec::with_capacity(resolved_by_key.len());
             for (key, (id, state)) in resolved_by_key {
                 resolved_ids_by_key.insert(key.clone(), id);
@@ -3947,7 +3947,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
         saved_attrs: &'a SavedAttrs,
     ) -> carina_core::provider::BoxFuture<'a, ProviderResult<()>> {
         Box::pin(async move {
-            let mut resolved_by_key = HashMap::new();
+            let mut resolved_by_key = BTreeMap::new();
             let mut colliding_keys = HashSet::new();
             let mut single_batches = Vec::new();
             let mut updates = Vec::new();
@@ -3991,7 +3991,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                 }
             }
 
-            let mut resolved_ids_by_key = HashMap::with_capacity(resolved_by_key.len());
+            let mut resolved_ids_by_key = BTreeMap::new();
             let mut resolved_wit_states = Vec::with_capacity(resolved_by_key.len());
             let mut resolved_wit_saved = Vec::new();
             for (key, (id, state, saved)) in resolved_by_key {
@@ -4610,7 +4610,7 @@ pub(super) mod tests {
                 }];
                 let configs = carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     type_checks,
                 )
                 .expect("test configuration resolves");
@@ -7138,7 +7138,7 @@ pub(super) mod tests {
                 .source_is::<std::io::Error>()
         );
 
-        let expected = HashMap::from([("expected".to_string(), id)]);
+        let expected = BTreeMap::from([("expected".to_string(), id)]);
         let state = wit_types::PersistedState {
             identifier: None,
             attributes: Vec::new(),
@@ -7153,9 +7153,58 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn issue_4491_normalizer_result_updates_follow_canonical_wire_key_order() {
+        let names = [
+            "zulu", "alpha", "theta", "beta", "gamma", "delta", "epsilon", "eta",
+        ];
+        for _ in 0..8 {
+            let expected = names
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.to_owned(),
+                        Resource::<ModuleSource>::with_provider(
+                            "mock",
+                            "test.resource",
+                            name,
+                            None,
+                        )
+                        .id,
+                    )
+                })
+                .collect();
+            let results = names
+                .into_iter()
+                .rev()
+                .map(|name| {
+                    (
+                        name.to_owned(),
+                        wit_types::PersistedState {
+                            identifier: None,
+                            attributes: Vec::new(),
+                            exists: true,
+                        },
+                    )
+                })
+                .collect();
+            let updates =
+                validate_wit_state_result_keys("normalize_state", &expected, results).unwrap();
+            assert_eq!(
+                updates
+                    .iter()
+                    .map(|(id, _)| id.identity_str().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "alpha", "beta", "delta", "epsilon", "eta", "gamma", "theta", "zulu"
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn normalizer_result_rejects_empty_unexpected_key() {
         let id = Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
-        let expected = HashMap::from([("expected".to_string(), id)]);
+        let expected = BTreeMap::from([("expected".to_string(), id)]);
         let state = wit_types::PersistedState {
             identifier: None,
             attributes: Vec::new(),
@@ -7176,7 +7225,7 @@ pub(super) mod tests {
         for key in ["expected", ""] {
             let id =
                 Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
-            let expected = HashMap::from([(key.to_string(), id)]);
+            let expected = BTreeMap::from([(key.to_string(), id)]);
             let state = wit_types::PersistedState {
                 identifier: None,
                 attributes: Vec::new(),
@@ -7196,7 +7245,7 @@ pub(super) mod tests {
     #[test]
     fn invalid_state_key_error_names_the_operation_once() {
         let id = Resource::<ModuleSource>::with_provider("mock", "test.resource", "only", None).id;
-        let expected = HashMap::from([("expected".to_string(), id)]);
+        let expected = BTreeMap::from([("expected".to_string(), id)]);
 
         let error = validate_wit_state_result_keys("normalize_state", &expected, Vec::new())
             .expect_err("a missing state key must fail")

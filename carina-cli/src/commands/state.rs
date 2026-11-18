@@ -1994,7 +1994,7 @@ pub(crate) async fn run_state_refresh_locked(
             orphans,
             already_refreshed,
         });
-    let empty_remote_bindings = HashMap::new();
+    let empty_remote_bindings = std::collections::BTreeMap::new();
     let data_source_values = addressed_expansion
         .read_data_sources_phase2(AddressedDataSourceReadInputs {
             provider_context: ctx.provider_context(),
@@ -2022,7 +2022,7 @@ pub(crate) async fn run_state_refresh_locked(
             comparison_provider: &provider,
             expansion: &mut prepared_expansion,
             warning_policy: crate::wiring::DeferredForWarningPolicy::Print,
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             state_file: &state_file,
             saved_dep_bindings: &saved_dep_bindings,
             refresh_phase: &refresh_phase,
@@ -2554,7 +2554,7 @@ async fn refresh_orphans_until_cancelled(
                 }
             }
         };
-        let result: Result<(ResourceId, Orphan, bool), AppError> = match next {
+        let result: Result<(ResolvedResourceId, Orphan, bool), AppError> = match next {
             CleanupInterrupted::Completed(Some(result)) => result,
             CleanupInterrupted::Completed(None) => break,
             CleanupInterrupted::Abandoned => {
@@ -2568,9 +2568,9 @@ async fn refresh_orphans_until_cancelled(
         }
         let (id, loaded, provider_read) = result?;
         if provider_read {
-            refreshed.insert(id);
+            refreshed.insert(id.as_inner().clone());
         }
-        refreshed_orphans.insert(loaded);
+        refreshed_orphans.insert(id, loaded);
     }
 
     drop(in_flight);
@@ -5064,8 +5064,6 @@ mod tests {
                     let Some(saved) = saved_attrs.get(id) else {
                         continue;
                     };
-                    #[allow(clippy::iter_over_hash_type)]
-                    // keyed rebuild: saved keys hydrate independently; the probe fixture records one value
                     for (key, value) in saved {
                         state
                             .attributes
@@ -5352,7 +5350,7 @@ mod tests {
             &schemas,
             &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[],
             &HashSet::new(),
             &HashSet::new(),
@@ -5467,7 +5465,7 @@ mod tests {
                 comparison_provider: &comparison_provider,
                 expansion: &mut prepared_expansion,
                 warning_policy: crate::wiring::DeferredForWarningPolicy::Suppress,
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 state_file: &state_file,
                 saved_dep_bindings: &HashMap::new(),
                 refresh_phase: &refresh_phase,
@@ -6778,7 +6776,8 @@ mod tests {
                 None,
             )]),
         );
-        row.prefixes = HashMap::from([("name".to_string(), "prod-".to_string())]);
+        row.prefixes =
+            std::collections::BTreeMap::from([("name".to_string(), "prod-".to_string())]);
         row.protected = true;
         row.name_overrides.insert(
             "name".to_string(),
@@ -6875,7 +6874,7 @@ mod tests {
         );
         assert_eq!(
             refreshed.prefixes,
-            HashMap::from([("name".to_string(), "prod-".to_string())])
+            std::collections::BTreeMap::from([("name".to_string(), "prod-".to_string())])
         );
         assert!(matches!(
             &refreshed.explicit,

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
 use serde::{Deserialize, Serialize};
@@ -261,8 +261,8 @@ impl ResolvedIgnoreChanges {
     /// their current values.
     pub fn mask_observed_readable_leaves(
         &self,
-        baseline: &mut HashMap<String, super::SnapshotValue>,
-        observed: &HashMap<String, super::SnapshotValue>,
+        baseline: &mut std::collections::BTreeMap<String, super::SnapshotValue>,
+        observed: &std::collections::BTreeMap<String, super::SnapshotValue>,
     ) {
         let attributes = self
             .iter()

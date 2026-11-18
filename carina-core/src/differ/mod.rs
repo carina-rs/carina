@@ -7,8 +7,9 @@ mod comparison;
 mod plan;
 
 use crate::resource::PersistedDirectives;
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::ops::Index;
 
 use crate::binding_index::ManagedBindingStability;
 use crate::effect::{MoveAuthority, ReleasedListKey, ReleasedListKeys};
@@ -336,7 +337,6 @@ impl Orphan {
             directives,
         }
     }
-
     #[cfg(test)]
     pub(crate) fn from_state<P: crate::resource::StateValueLeaf>(
         state: crate::resource::State<P>,
@@ -349,7 +349,6 @@ impl Orphan {
             directives,
         }
     }
-
     pub fn present(
         present: PresentResourceState,
         binding: Option<AbsoluteBindingAddress>,
@@ -361,7 +360,6 @@ impl Orphan {
             directives,
         }
     }
-
     pub fn missing_identifier(
         state: UnidentifiedState,
         binding: Option<AbsoluteBindingAddress>,
@@ -373,7 +371,6 @@ impl Orphan {
             directives,
         }
     }
-
     pub fn create_in_flight(
         pending: crate::provider::InFlightCreate,
         binding: Option<AbsoluteBindingAddress>,
@@ -385,7 +382,6 @@ impl Orphan {
             directives,
         }
     }
-
     pub fn create_outcome_unknown(
         unknown: crate::provider::UnknownCreateOutcome,
         binding: Option<AbsoluteBindingAddress>,
@@ -402,8 +398,16 @@ impl Orphan {
         &self.current
     }
 
-    pub(crate) fn current_mut(&mut self) -> &mut Current {
-        &mut self.current
+    pub(super) fn attributes_mut(
+        &mut self,
+    ) -> Option<&mut std::collections::BTreeMap<String, crate::resource::SnapshotValue>> {
+        self.current.attributes_mut()
+    }
+
+    pub(super) fn state_bearing_mut(
+        &mut self,
+    ) -> Option<crate::resource::StateBearingCurrentMut<'_>> {
+        self.current.state_bearing_mut()
     }
 
     pub fn binding(&self) -> Option<&str> {
@@ -412,6 +416,16 @@ impl Orphan {
 
     pub fn binding_address(&self) -> Option<&AbsoluteBindingAddress> {
         self.binding.as_ref()
+    }
+
+    pub fn destroy_dependencies(&self) -> &crate::resource::PersistedDestroyDependencies {
+        match &self.current {
+            Current::Absent(state) => &state.state().dependency_bindings,
+            Current::Present(present) => &present.state().dependency_bindings,
+            Current::MissingIdentifier(state) => &state.state().dependency_bindings,
+            Current::CreateInFlight(pending) => &pending.dependency_bindings,
+            Current::CreateOutcomeUnknown(unknown) => &unknown.dependency_bindings,
+        }
     }
 
     pub fn directives(&self) -> &PersistedDirectives {
@@ -522,15 +536,11 @@ impl Orphan {
     }
 }
 
-/// The single owner of resources that exist in persisted/provider state but
-/// are absent from the desired configuration.
-///
-/// The map key is derived from the orphan's provider state on insertion, so a
-/// mismatched key and `State::id` cannot be represented through this API.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Orphans {
-    by_id: HashMap<ResourceId, Orphan>,
-}
+mod orphans;
+pub use orphans::{CanonicalOrphanRows, CanonicalOrphanRowsIntoIter, OrderedOrphanIter, Orphans};
+
+#[cfg(test)]
+mod ordering_tests;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("cannot move current state for {actual}; expected source route {expected}")]
@@ -602,125 +612,6 @@ pub fn rekey_current_for_move(
     value.rebind_for_move(authority);
     current.insert(authority.to().clone(), value);
     Ok(true)
-}
-
-impl Orphans {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&mut self, orphan: Orphan) {
-        let id = match &orphan.current {
-            Current::Absent(state) => state.state().id.clone(),
-            Current::Present(present) => present.state().id.clone(),
-            Current::CreateInFlight(pending) => pending.id().clone(),
-            Current::CreateOutcomeUnknown(unknown) => unknown.id().clone(),
-            Current::MissingIdentifier(state) => state.state().id.clone(),
-        };
-        self.by_id.insert(id, orphan);
-    }
-
-    pub fn remove(&mut self, id: &ResourceId) -> Option<Orphan> {
-        self.by_id.remove(id)
-    }
-
-    pub fn rekey(&mut self, authority: &MoveAuthority<'_>) -> bool {
-        let Some(orphan) = self.remove(authority.from()) else {
-            return false;
-        };
-        self.insert(orphan.rebound_for_move(authority));
-        true
-    }
-
-    /// Consume an orphan under the move's source route and return its current
-    /// instance already rebound to the destination route.
-    pub fn take_rebound(&mut self, authority: &MoveAuthority<'_>) -> Option<Current> {
-        self.remove(authority.from())
-            .map(|orphan| orphan.rebound_for_move(authority).into_current())
-    }
-
-    pub fn get(&self, id: &ResourceId) -> Option<&Orphan> {
-        self.by_id.get(id)
-    }
-
-    pub fn set_destroy_metadata(
-        &mut self,
-        id: &ResourceId,
-        dependencies: crate::resource::PersistedDestroyDependencies,
-        directives: PersistedDirectives,
-    ) -> bool {
-        let Some(orphan) = self.by_id.get_mut(id) else {
-            return false;
-        };
-        orphan.set_destroy_metadata(dependencies, directives);
-        true
-    }
-
-    pub(crate) fn get_mut(&mut self, id: &ResourceId) -> Option<&mut Orphan> {
-        self.by_id.get_mut(id)
-    }
-
-    pub fn contains_key(&self, id: &ResourceId) -> bool {
-        self.by_id.contains_key(id)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
-    }
-
-    pub fn keys(&self) -> impl Iterator<Item = &ResourceId> {
-        self.by_id.keys()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&ResourceId, &Orphan)> {
-        self.by_id.iter()
-    }
-
-    fn iter_mut(&mut self) -> impl Iterator<Item = (&ResourceId, &mut Orphan)> {
-        self.by_id.iter_mut()
-    }
-}
-
-impl FromIterator<Orphan> for Orphans {
-    fn from_iter<T: IntoIterator<Item = Orphan>>(iter: T) -> Self {
-        let mut orphans = Self::new();
-        for orphan in iter {
-            orphans.insert(orphan);
-        }
-        orphans
-    }
-}
-
-impl<const N: usize> From<[Orphan; N]> for Orphans {
-    fn from(orphans: [Orphan; N]) -> Self {
-        orphans.into_iter().collect()
-    }
-}
-
-impl IntoIterator for Orphans {
-    type Item = (ResourceId, Orphan);
-    type IntoIter = std::collections::hash_map::IntoIter<ResourceId, Orphan>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.by_id.into_iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a Orphans {
-    type Item = (&'a ResourceId, &'a Orphan);
-    type IntoIter = std::collections::hash_map::Iter<'a, ResourceId, Orphan>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.by_id.iter()
-    }
-}
-
-impl Index<&ResourceId> for Orphans {
-    type Output = Orphan;
-
-    fn index(&self, index: &ResourceId) -> &Self::Output {
-        &self.by_id[index]
-    }
 }
 
 fn extend_disjoint_states<T>(
@@ -865,13 +756,7 @@ fn install_prior_managed_transform_states(
     transformed: StateTransformMap,
 ) {
     let mut managed_states = transformed.into_states();
-    for (id, orphan) in orphans.iter_mut() {
-        if let Some(state) = managed_states.remove(id)
-            && let Some(target) = orphan.current.state_bearing_mut()
-        {
-            target.apply_transformed_state(state);
-        }
-    }
+    orphans.apply_transformed_states(&mut managed_states);
     #[allow(clippy::iter_over_hash_type)]
     // keyed rebuild: transformed attributes and metadata transfer by exact resource ID
     for (id, current) in current_states {
@@ -993,11 +878,7 @@ pub fn lift_prior_state_enum_leaves(
         let attributes = current_states
             .get_mut(&resource.id)
             .and_then(Current::attributes_mut)
-            .or_else(|| {
-                orphans
-                    .get_mut(&resource.id)
-                    .and_then(|orphan| orphan.current_mut().attributes_mut())
-            });
+            .or_else(|| orphans.attributes_mut(&resource.id));
         if let Some(attributes) = attributes {
             crate::utils::lift_state_enum_leaves(attributes, schema);
         }
@@ -1798,7 +1679,7 @@ fn diff_with_saved_parts(
 pub(crate) fn diff_test<P: crate::resource::StateValueLeaf>(
     desired: &Resource,
     current: &crate::resource::State<P>,
-    saved: Option<&HashMap<String, crate::resource::SnapshotValue>>,
+    saved: Option<&BTreeMap<String, crate::resource::SnapshotValue>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
     context_schema: &ComparisonSchema<'_>,

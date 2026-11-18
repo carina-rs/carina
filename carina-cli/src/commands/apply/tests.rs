@@ -429,7 +429,7 @@ fn mock_http_ready_config(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -645,7 +645,10 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
     let old_resource = mock_http_resource("replacement-trap", server_address, "normal");
     let old_state = State::<carina_core::resource::NoPlaceholder>::existing(
         replacement_id.clone(),
-        old_resource.attributes.into_iter().collect(),
+        old_resource
+            .attributes
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .with_identifier("old-applied-id");
     let current_states = HashMap::from([(replacement_id.clone(), old_state)]);
@@ -990,7 +993,7 @@ fn resolved_provider_configs(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -1004,7 +1007,7 @@ fn empty_resolved_provider_configs() -> carina_core::parser::ResolvedProviderCon
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &carina_core::parser::ExpandedInferredFile::default(),
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -1225,7 +1228,7 @@ for account_id in orgs.accounts {
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
         current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
@@ -1365,7 +1368,7 @@ async fn run_saved_plan_schema_fingerprint_case(
             resource_id.clone(),
             State::<carina_core::resource::NoPlaceholder>::not_found(resource_id),
         )],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
@@ -1631,7 +1634,7 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
             id.clone(),
             State::<carina_core::resource::NoPlaceholder>::not_found(id),
         )],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
@@ -1727,7 +1730,7 @@ fn saved_provider_configs(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -1938,7 +1941,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
         current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
@@ -2080,7 +2083,7 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
         current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
@@ -2262,7 +2265,7 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
             id,
             planned_state,
         )],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     };
@@ -2434,7 +2437,7 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
             ),
             crate::commands::plan::CurrentStateEntry::managed(example_id, planned_example),
         ],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     };
@@ -2605,7 +2608,7 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
         current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
@@ -2707,7 +2710,7 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
         current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
@@ -4400,7 +4403,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &expanded,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -4413,7 +4416,7 @@ async fn plan_reads_module_data_source_and_resolves_consumer_interpolation() {
         &carina_state::ObservedStateFile::for_test(None),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -4913,7 +4916,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
                 ),
             ),
         ],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     };
@@ -5073,7 +5076,7 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
                 State::<carina_core::resource::NoPlaceholder>::not_found(consumer_id),
             ),
         ],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     };
@@ -5151,7 +5154,7 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
         current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     };
@@ -5226,7 +5229,7 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
         data_source_origins: Vec::new(),
         data_source_values: Vec::new(),
         current_states: Vec::new(),
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
@@ -5802,7 +5805,7 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
             resource_id.clone(),
             State::<carina_core::resource::NoPlaceholder>::not_found(resource_id),
         )],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
 
@@ -6630,7 +6633,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
         &carina_state::ObservedStateFile::for_test((state_file).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -6748,7 +6751,7 @@ let nat = mock.ec2.NatGateway {{
         &carina_state::ObservedStateFile::for_test((step1_state).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -6808,7 +6811,7 @@ let nat = mock.ec2.NatGateway {{
         &carina_state::ObservedStateFile::for_test((step2_state).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -6937,7 +6940,7 @@ let igw = mock.ec2.InternetGateway {{{tags}
         &carina_state::ObservedStateFile::for_test((saved).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -7080,7 +7083,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &carina_state::ObservedStateFile::for_test((before_failure).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -7162,7 +7165,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &carina_state::ObservedStateFile::for_test((saved).clone()),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -7238,7 +7241,7 @@ async fn assert_failed_nested_pending_removal_is_replanned(
         &carina_state::ObservedStateFile::for_test(Some(applied)),
         true,
         crate::commands::shared::progress::ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &carina_core::identifier::StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -10118,7 +10121,7 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
                 &sorted_resources,
             ),
             data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     );
@@ -10586,7 +10589,7 @@ mod apply_deferred_for_parity {
             &schemas,
             &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -10659,7 +10662,7 @@ mod apply_deferred_for_parity {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -10735,7 +10738,7 @@ mod apply_deferred_for_parity {
             &schemas,
             &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -10779,7 +10782,7 @@ mod apply_deferred_for_parity {
             &schemas,
             &carina_core::provider::RawSavedAttrs::default().lift(&schemas),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
             &std::collections::HashSet::new(),
@@ -12027,7 +12030,7 @@ mod saved_plan_version_tests {
                 id,
                 current_state,
             )],
-            upstream_snapshot: std::collections::HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
@@ -12745,11 +12748,14 @@ async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
         unreachable!()
     };
     let mut orphans = carina_core::differ::Orphans::new();
-    orphans.insert(carina_core::differ::Orphan::absent(
-        missing,
-        Some(absolute_binding("missing")),
-        Default::default(),
-    ));
+    orphans.insert(
+        carina_core::resource::ResolvedResourceId::new(missing.state().id.clone()),
+        carina_core::differ::Orphan::absent(
+            missing,
+            Some(absolute_binding("missing")),
+            Default::default(),
+        ),
+    );
     let graph = carina_core::resolved_graph::resolve_expanded_graph(
         carina_core::resolved_graph::ConfiguredGraphInput::from(parsed).with_prior_orphans(orphans),
     )

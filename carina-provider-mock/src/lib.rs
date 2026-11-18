@@ -1,5 +1,5 @@
 pub mod references;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::PathBuf;
@@ -901,16 +901,23 @@ impl MockProvider {
         Ok(references::resolve_authoring(&table, requests))
     }
 
-    fn canonicalize_mock_reference_write<P: StateValueLeaf>(
+    fn canonicalize_mock_reference_write<P: StateValueLeaf, M>(
         &self,
         id: &ResourceId,
-        attributes: &mut HashMap<String, Value<P>>,
-    ) -> ProviderResult<()> {
+        attributes: &mut M,
+    ) -> ProviderResult<()>
+    where
+        M: Extend<(String, Value<P>)>,
+        for<'a> &'a M: IntoIterator<Item = (&'a String, &'a Value<P>)>,
+    {
         if id.resource_type != "test.reference" || self.behavior.reference_echo_alias {
             return Ok(());
         }
         for name in ["key", "fixed_key"] {
-            let Some(Value::Concrete(ConcreteValue::String(raw))) = attributes.get(name) else {
+            let Some(Value::Concrete(ConcreteValue::String(raw))) = (&*attributes)
+                .into_iter()
+                .find_map(|(key, value)| (key == name).then_some(value))
+            else {
                 continue;
             };
             let request = carina_plugin_sdk::types::ReferenceRequest {
@@ -925,10 +932,10 @@ impl MockProvider {
             if let Some(Ok(carina_plugin_sdk::types::ReferenceOutcome::Resolved(value))) =
                 results.pop()
             {
-                attributes.insert(
+                attributes.extend(std::iter::once((
                     name.into(),
                     Value::Concrete(ConcreteValue::String(value.into())),
-                );
+                )));
             }
         }
         Ok(())
@@ -1190,31 +1197,30 @@ impl MockProvider {
         }
     }
 
-    fn strip_unobservable_nested_write_only<P: StateValueLeaf>(
-        attributes: &mut HashMap<String, Value<P>>,
-    ) {
-        let Some(Value::Concrete(ConcreteValue::Map(config))) =
-            attributes.get_mut(NESTED_WRITE_ONLY_ATTRIBUTE)
-        else {
+    fn strip_unobservable_nested_write_only<P: StateValueLeaf>(nested: Option<&mut Value<P>>) {
+        let Some(Value::Concrete(ConcreteValue::Map(config))) = nested else {
             return;
         };
         config.shift_remove(NESTED_WRITE_ONLY_FIELD);
     }
 
-    fn add_server_list_defaults<P: StateValueLeaf>(
-        id: &ResourceId,
-        attributes: &mut HashMap<String, Value<P>>,
-    ) {
+    fn add_server_list_defaults<P: StateValueLeaf, M>(id: &ResourceId, attributes: &mut M)
+    where
+        M: Extend<(String, Value<P>)>,
+        for<'a> &'a M: IntoIterator<Item = (&'a String, &'a Value<P>)>,
+    {
         if id.resource_type != SERVER_ADDED_LIST_RESOURCE_TYPE
             && id.resource_type != KEYED_PARTIAL_UPDATE_RESOURCE_TYPE
         {
             return;
         }
 
-        let list = attributes
-            .entry(SERVER_ADDED_LIST_ATTRIBUTE.to_string())
-            .or_insert_with(|| Value::Concrete(ConcreteValue::List(Vec::new())));
-        let Value::Concrete(ConcreteValue::List(items)) = list else {
+        let mut list = (&*attributes)
+            .into_iter()
+            .find_map(|(key, value)| (key == SERVER_ADDED_LIST_ATTRIBUTE).then_some(value))
+            .cloned()
+            .unwrap_or_else(|| Value::Concrete(ConcreteValue::List(Vec::new())));
+        let Value::Concrete(ConcreteValue::List(items)) = &mut list else {
             return;
         };
 
@@ -1248,12 +1254,16 @@ impl MockProvider {
                 .collect(),
             )));
         }
+        attributes.extend(std::iter::once((
+            SERVER_ADDED_LIST_ATTRIBUTE.to_string(),
+            list,
+        )));
     }
 
     fn add_server_list_update_out_of_band_element(
         &self,
         id: &ResourceId,
-        attributes: &mut HashMap<String, SnapshotValue>,
+        attributes: &mut BTreeMap<String, SnapshotValue>,
     ) {
         if id.resource_type != SERVER_ADDED_LIST_RESOURCE_TYPE {
             return;
@@ -1284,7 +1294,7 @@ impl MockProvider {
 
     fn merge_keyed_partial_update_list(
         id: &ResourceId,
-        attributes: &mut HashMap<String, SnapshotValue>,
+        attributes: &mut BTreeMap<String, SnapshotValue>,
         key: &str,
         value: &Value,
     ) -> bool {
@@ -1447,7 +1457,9 @@ impl MockProvider {
 
         let mut state_attrs = persisted_values;
         Self::populate_generated_attribute_value(&id, &mut state_attrs);
-        Self::strip_unobservable_nested_write_only(&mut state_attrs);
+        Self::strip_unobservable_nested_write_only(
+            state_attrs.get_mut(NESTED_WRITE_ONLY_ATTRIBUTE),
+        );
         if let Some(config) = partial_create {
             for attr in &config.missing_attributes {
                 state_attrs.remove(attr);
@@ -1540,7 +1552,7 @@ impl MockProvider {
 
         let mut attributes = persisted_values;
         Self::populate_generated_attribute_value(id, &mut attributes);
-        Self::strip_unobservable_nested_write_only(&mut attributes);
+        Self::strip_unobservable_nested_write_only(attributes.get_mut(NESTED_WRITE_ONLY_ATTRIBUTE));
         Ok(attributes)
     }
 }
@@ -1599,7 +1611,7 @@ impl MockProvider {
         &self,
         id: &ResourceId,
         target: MockReadTarget<'_>,
-    ) -> ProviderResult<Option<HashMap<String, SnapshotValue>>> {
+    ) -> ProviderResult<Option<BTreeMap<String, SnapshotValue>>> {
         self.append_op_log_if_configured("read", id)?;
         let mut read_outcome = None;
         if let Some(delay) = self
@@ -1624,12 +1636,14 @@ impl MockProvider {
             }
         };
         let attributes = stored.map(|attrs| {
-            let mut attributes: HashMap<_, _> = attrs
+            let mut attributes: BTreeMap<_, _> = attrs
                 .iter()
                 .filter(|(key, _value)| key.as_str() != WRITE_ONLY_PASSWORD_ATTRIBUTE)
                 .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
                 .collect();
-            Self::strip_unobservable_nested_write_only(&mut attributes);
+            Self::strip_unobservable_nested_write_only(
+                attributes.get_mut(NESTED_WRITE_ONLY_ATTRIBUTE),
+            );
             attributes
         });
         if let Some(read_outcome) = &mut read_outcome {
@@ -1797,7 +1811,7 @@ impl Provider for MockProvider {
                                     .to_value_at(format!("{id}.{name}"))
                                     .map(|value| (name, value))
                             })
-                            .collect::<Result<_, _>>()
+                            .collect::<Result<BTreeMap<_, _>, _>>()
                             .map_err(|source| {
                                 ProviderError::internal_caused_by(
                                     "mock data-source output contains an unavailable secret",
@@ -2035,7 +2049,9 @@ impl Provider for MockProvider {
                 .save(&states)
                 .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
 
-            Self::strip_unobservable_nested_write_only(&mut attributes);
+            Self::strip_unobservable_nested_write_only(
+                attributes.get_mut(NESTED_WRITE_ONLY_ATTRIBUTE),
+            );
 
             if let Some(config) = partial_update {
                 for attr in &config.missing_attributes {

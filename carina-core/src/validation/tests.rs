@@ -469,7 +469,7 @@ fn single_reference_integer_interpolation_checks_resolved_string_constraints() {
                 compositions: &[],
                 managed_current: &HashMap::new(),
                 data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
         );
@@ -8217,7 +8217,7 @@ fn pre_apply_export_check_retains_expression_for_post_apply_resolution() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         })
     }
@@ -11759,7 +11759,7 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
                     compositions: &[],
                     managed_current: &HashMap::new(),
                     data_source_values: &crate::data_source_value::DataSourceValues::empty(),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     wait_aliases: &[],
                 },
             );

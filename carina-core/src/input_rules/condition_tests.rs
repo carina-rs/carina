@@ -167,7 +167,7 @@ fn create_only_plan_exempts_import_update_and_rejects_replacement_creates() {
             id: resource.resolved_id(),
             identifier: AppliedIdentifier::new("existing").unwrap(),
             generation: EffectGeneration::Current,
-            previous_attributes: HashMap::new(),
+            previous_attributes: std::collections::BTreeMap::new(),
             directives: Default::default(),
             binding: None,
             dependencies: Default::default(),

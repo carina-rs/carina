@@ -730,9 +730,10 @@ mod tests {
             .iter()
             .map(DeferredReplaceDelete::to_delete_effect)
             .collect::<Vec<_>>();
-        let existing =
-            AdmittedReplacementEffects::resolve(&old_effects, &schemas, |_| HashMap::new())
-                .unwrap();
+        let existing = AdmittedReplacementEffects::resolve(&old_effects, &schemas, |_| {
+            std::collections::BTreeMap::new()
+        })
+        .unwrap();
         let error = admit_materialized(
             &Effect::DeferredReplace(Box::new(payload)),
             vec![Effect::Create(child)],

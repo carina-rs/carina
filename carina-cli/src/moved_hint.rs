@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use crate::output_style::Colorize;
@@ -362,7 +362,7 @@ pub fn detect_moved_block_hints<S>(
 
 struct DestroyCandidate<'a> {
     id: &'a ResolvedResourceId,
-    attributes: &'a HashMap<String, SnapshotValue>,
+    attributes: &'a BTreeMap<String, SnapshotValue>,
 }
 
 struct CreateCandidate<'schema> {
@@ -377,7 +377,7 @@ enum GraphNode {
     Created(usize),
 }
 
-fn current_attributes(current: &Current) -> Option<&HashMap<String, SnapshotValue>> {
+fn current_attributes(current: &Current) -> Option<&BTreeMap<String, SnapshotValue>> {
     match current {
         Current::Absent(state) => Some(&state.state().attributes),
         Current::Present(present) => Some(&present.state().attributes),

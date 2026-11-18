@@ -2166,9 +2166,9 @@ pub(crate) fn find_apply_time_changed_attributes<S>(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn find_changed_attributes(
-    desired: &HashMap<String, Value>,
-    current: &HashMap<String, Value>,
-    saved: Option<&HashMap<String, Value>>,
+    desired: &BTreeMap<String, Value>,
+    current: &BTreeMap<String, Value>,
+    saved: Option<&BTreeMap<String, Value>>,
     nested_write_only: &NestedWriteOnlyRecord,
     prev_explicit: Option<&ExplicitFields>,
     schema: Option<&ResourceSchema>,

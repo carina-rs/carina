@@ -1,4 +1,5 @@
 //! Delete-only executions share apply's dependency-ready release and permits.
+use std::collections::BTreeSet;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -15,7 +16,9 @@ use crate::schema::SchemaRegistry;
 
 use super::DeletePermit;
 use super::input_discharge::ExecutionInputChecks;
-use super::scheduler::{ScheduledBasicEffect, build_scheduler_deps, release_ready_effect};
+use super::scheduler::{
+    FailureView, ScheduledBasicEffect, build_scheduler_deps, release_ready_effect,
+};
 
 /// Dispatch consumes the permit; raw ids, identifiers, and requests cannot
 /// authorize a provider delete.
@@ -58,7 +61,7 @@ pub enum DeleteScheduleError {
 pub struct DeleteScheduler<'plan, S = ModuleSource> {
     scheduled: ScheduledPlan<'plan, S>,
     analysis: DependencyAnalysis,
-    dependencies: HashMap<usize, HashSet<usize>>,
+    dependencies: HashMap<usize, BTreeSet<usize>>,
     checks: ExecutionInputChecks,
     completed: HashSet<usize>,
     failed: HashSet<usize>,
@@ -163,60 +166,88 @@ impl<'plan, S: Clone> DeleteScheduler<'plan, S> {
         &self.analysis
     }
 
-    pub fn dependencies(&self) -> &HashMap<usize, HashSet<usize>> {
+    pub fn dependencies(&self) -> &HashMap<usize, BTreeSet<usize>> {
         &self.dependencies
     }
 
-    pub fn release(&mut self, index: usize) -> Result<Option<DeleteRelease>, DeleteScheduleError> {
-        if self.completed.contains(&index) || self.released.contains(&index) {
-            return Ok(None);
-        }
-        let Some(ready) = release_ready_effect(
-            &self.scheduled,
-            index,
-            &self.dependencies,
-            &self.completed,
-            &self.failed,
-        ) else {
-            return Ok(None);
-        };
-        let ready = match ready {
-            Ok(ready) => ready,
-            Err(_) => {
-                // Keep destroy's existing diagnostic: name the lowest-index
-                // failed descendant, including one behind an already skipped
-                // delete. Readiness still uses only the scheduler's edges.
-                let mut ancestors = HashSet::new();
-                let mut pending = vec![index];
-                while let Some(node) = pending.pop() {
-                    for &dependency in self.dependencies.get(&node).into_iter().flatten() {
-                        if ancestors.insert(dependency) {
-                            pending.push(dependency);
-                        }
-                    }
-                }
-                let dependency = *ancestors
-                    .intersection(&self.failed)
-                    .min()
-                    .ok_or(DeleteScheduleError::MissingFailedDependency { index })?;
-                self.completed.insert(index);
-                self.failed.insert(index);
-                return Ok(Some(DeleteRelease::Blocked { dependency }));
+    /// Release one dispatch pass with a single failure index, including skips
+    /// discovered earlier in this same pass.
+    pub fn release_ready(
+        &mut self,
+        indices: impl IntoIterator<Item = usize>,
+        capacity: usize,
+    ) -> Result<Vec<(usize, DeleteRelease)>, DeleteScheduleError> {
+        let mut failures =
+            FailureView::new(self.scheduled.effects(), &self.dependencies, &self.failed);
+        let mut releases = Vec::new();
+        for index in indices {
+            if releases.len() == capacity {
+                break;
             }
-        };
-        let Some(ScheduledBasicEffect::Delete { permit: ready, .. }) = ready.into_basic() else {
-            return Err(DeleteScheduleError::NonDelete { index });
-        };
-        let permit = self.checks.authorize_delete(index, &ready)?;
-        self.released.insert(index);
-        Ok(Some(DeleteRelease::Ready(ScheduledDelete {
-            permit,
-            completion: DeleteCompletion {
-                run: self.run.clone(),
-                index,
-                failed: false,
-            },
-        })))
+            let release = (|| -> Result<Option<DeleteRelease>, DeleteScheduleError> {
+                if self.completed.contains(&index) || self.released.contains(&index) {
+                    return Ok(None);
+                }
+                let Some(ready) =
+                    release_ready_effect(&self.scheduled, index, &self.completed, &failures)
+                else {
+                    return Ok(None);
+                };
+                let ready = match ready {
+                    Ok(ready) => ready,
+                    Err(_) => {
+                        // Keep destroy's existing diagnostic: name the lowest-index
+                        // failed descendant, including one behind an already skipped
+                        // delete. Readiness still uses only the scheduler's edges.
+                        let mut ancestors = HashSet::new();
+                        let mut pending = vec![index];
+                        while let Some(node) = pending.pop() {
+                            for &dependency in self.dependencies.get(&node).into_iter().flatten() {
+                                if ancestors.insert(dependency) {
+                                    pending.push(dependency);
+                                }
+                            }
+                        }
+                        let dependency = *ancestors
+                            .intersection(&self.failed)
+                            .min()
+                            .ok_or(DeleteScheduleError::MissingFailedDependency { index })?;
+                        self.completed.insert(index);
+                        self.failed.insert(index);
+                        return Ok(Some(DeleteRelease::Blocked { dependency }));
+                    }
+                };
+                let Some(ScheduledBasicEffect::Delete { permit: ready, .. }) = ready.into_basic()
+                else {
+                    return Err(DeleteScheduleError::NonDelete { index });
+                };
+                let permit = self.checks.authorize_delete(index, &ready)?;
+                self.released.insert(index);
+                Ok(Some(DeleteRelease::Ready(ScheduledDelete {
+                    permit,
+                    completion: DeleteCompletion {
+                        run: self.run.clone(),
+                        index,
+                        failed: false,
+                    },
+                })))
+            })()?;
+            if self.failed.contains(&index) {
+                failures.record_failure(index);
+            }
+            if let Some(release) = release {
+                releases.push((index, release));
+            }
+        }
+        Ok(releases)
+    }
+
+    /// Fixture convenience for a dispatch pass containing one slot.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn release(&mut self, index: usize) -> Result<Option<DeleteRelease>, DeleteScheduleError> {
+        self.release_ready([index], 1)
+            .map(|mut releases| releases.pop().map(|(_, release)| release))
     }
 
     pub fn complete(&mut self, completion: DeleteCompletion) -> Result<(), DeleteScheduleError> {
@@ -273,10 +304,10 @@ impl<'plan, S: Clone> DeleteScheduler<'plan, S> {
 fn delete_dependencies(
     analysis: &DependencyAnalysis,
     count: usize,
-) -> HashMap<usize, HashSet<usize>> {
+) -> HashMap<usize, BTreeSet<usize>> {
     (0..count)
         .map(|index| {
-            let mut dependencies = HashSet::new();
+            let mut dependencies = BTreeSet::new();
             let mut seen = HashSet::new();
             let mut pending = vec![index];
             while let Some(node) = pending.pop() {
@@ -318,15 +349,10 @@ pub fn prepare_initial_delete(
     if !dependencies.unresolved.is_empty() {
         return None;
     }
-    let ready = release_ready_effect(
-        &scheduled,
-        0,
-        &dependencies.deps_of,
-        &HashSet::new(),
-        &HashSet::new(),
-    )?
-    .ok()?
-    .into_basic()?;
+    let failures = FailureView::new(scheduled.effects(), &dependencies.deps_of, &HashSet::new());
+    let ready = release_ready_effect(&scheduled, 0, &HashSet::new(), &failures)?
+        .ok()?
+        .into_basic()?;
     let ScheduledBasicEffect::Delete { permit: ready, .. } = ready else {
         return None;
     };

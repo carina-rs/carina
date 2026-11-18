@@ -5886,7 +5886,13 @@ fn resolve_provider_attributes_with_remote_uses_sibling_user_functions() {
     .expect("provider config must contain no parser placeholders");
     let resolved = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
+        |session| {
+            resolve_provider_attributes_with_remote(
+                &parsed,
+                &std::collections::BTreeMap::new(),
+                session,
+            )
+        },
     )
     .expect("provider attributes should use the merged user-function scope");
     assert_eq!(
@@ -5940,7 +5946,13 @@ fn resolve_provider_attributes_with_remote_preserves_function_call_line() {
     .expect("provider config must contain no parser placeholders");
     let error = crate::validation::deferred_types::with_session_for_test(
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        |session| resolve_provider_attributes_with_remote(&parsed, &HashMap::new(), session),
+        |session| {
+            resolve_provider_attributes_with_remote(
+                &parsed,
+                &std::collections::BTreeMap::new(),
+                session,
+            )
+        },
     )
     .expect_err("invalid sibling function should fail at the authored provider call");
     let ProviderConfigResolutionError::Parse(ParseError::Located { path, error }) = error else {

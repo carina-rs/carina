@@ -2,6 +2,7 @@ use super::{create_plan_for_tests as create_plan, *};
 use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
+use std::collections::BTreeMap;
 
 use crate::resource::{
     AbsoluteBindingAddress, ExpandedConcreteValue as ConcreteValue, ExpandedResource as Resource,
@@ -16,7 +17,7 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
 fn diff_test<P: crate::resource::StateValueLeaf>(
     desired: &Resource,
     current: &crate::resource::State<P>,
-    saved: Option<&HashMap<String, crate::resource::SnapshotValue>>,
+    saved: Option<&BTreeMap<String, crate::resource::SnapshotValue>>,
     prev_explicit: Option<&crate::explicit::ExplicitFields>,
     schema: Option<&ResourceSchema>,
 ) -> Diff {
@@ -525,11 +526,19 @@ fn create_plan_detects_typed_orphan_for_deletion() {
         Value::Concrete(ConcreteValue::String("orphaned-bucket".into())),
     );
     let orphan_id = ResourceId::with_identity("bucket", "orphaned-bucket");
-    let orphans = Orphans::from([Orphan::from_state(
-        existing_state(orphan_id, orphan_attrs),
-        None,
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = Orphans::from(
+        [Orphan::from_state(
+            existing_state(orphan_id, orphan_attrs),
+            None,
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan = create_plan(
         &desired,
@@ -1798,11 +1807,19 @@ fn orphan_delete_preserves_typed_binding_and_dependencies() {
     let dependency_id = crate::resource::ResolvedResourceId::with_identity("vpc", "my-vpc");
     let orphan_state = existing_state(orphan_id.clone(), HashMap::new())
         .with_dependency_bindings(crate::test_support::persisted([dependency_id.clone()]));
-    let orphans = crate::differ::Orphans::from([Orphan::from_state(
-        orphan_state,
-        Some(absolute_binding("my_subnet")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = crate::differ::Orphans::from(
+        [Orphan::from_state(
+            orphan_state,
+            Some(absolute_binding("my_subnet")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
 
     let plan =
         create_plan(

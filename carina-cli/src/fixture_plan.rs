@@ -424,8 +424,7 @@ where
         &project,
         &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
         &SchemaRegistry::new(),
-    )
-    .unwrap();
+    )?;
     let duplicate_declarations = loaded.duplicate_declarations;
     let unresolved_parsed = loaded.unresolved_parsed;
     let parsed = loaded.parsed;
@@ -440,15 +439,13 @@ where
         &parsed.providers,
         fixture_validation_enum_schemas(&fixture_pathbuf),
     );
-    let validation_config = validation_providers
-        .validate_config_pair(
-            parsed,
-            unresolved_parsed,
-            base_dir,
-            true,
-            &duplicate_declarations,
-        )
-        .unwrap_or_else(|error| panic!("fixture validation failed: {error}"));
+    let validation_config = validation_providers.validate_config_pair(
+        parsed,
+        unresolved_parsed,
+        base_dir,
+        true,
+        &duplicate_declarations,
+    )?;
     let canonical_resources = validation_config.into_resources_for_fixture();
     let provider_configs = canonical_resources.parsed().providers.clone();
     let mut state_file: Option<StateFile> = if state_path.exists() {
@@ -542,7 +539,8 @@ where
     // unreadable — so `resolve_refs_for_plan` knows the binding name
     // and can stamp surviving refs as `(known after upstream apply: <ref>)`
     // instead of leaving the raw dot-form (#2366).
-    let mut remote_bindings: carina_core::upstream_exports::AdmittedRemoteBindings = HashMap::new();
+    let mut remote_bindings: carina_core::upstream_exports::AdmittedRemoteBindings =
+        Default::default();
     for us in &parsed.upstream_states {
         let dir = base_dir.join(&us.source).unwrap();
         let state_path = dir
@@ -1694,17 +1692,10 @@ mod tests {
                 let fixture = build_plan_from_fixture_path(&runtime, directory.path()).unwrap();
                 assert_eq!(fixture.desired_resources.len(), 1);
             } else {
-                let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    build_plan_from_fixture_path(&runtime, directory.path())
-                }));
-                let panic = rejected
+                let error = build_plan_from_fixture_path(&runtime, directory.path())
                     .err()
                     .expect("skipping resource admission cannot skip a Judge error");
-                let message = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap();
+                let message = crate::error::format_error_with_source_chain(&error);
                 assert!(
                     message.contains("conversion target must be a loaded named scalar type"),
                     "{message}"

@@ -1,7 +1,7 @@
 //! Canonical resource pairs and resolved resources with permanent name overrides applied.
 
 use carina_core::resource::{PendingResourceIdentityError, ResolvedResourceId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use carina_core::binding_index::{LivePreApplyInputs, ManagedBindingStability, ResolvedBindings};
 use carina_core::config_loader::UnresolvedConfigSnapshot;
@@ -80,7 +80,7 @@ pub struct CanonicalResourcePair<
     /// them with a pending re-read unknown. A post-refresh reconciliation
     /// restores these fallbacks first, then overlays only the refreshed
     /// current value or refreshed marker.
-    prefix_fallbacks: Vec<HashMap<String, Value<P>>>,
+    prefix_fallbacks: Vec<BTreeMap<String, Value<P>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -419,8 +419,6 @@ impl<E> CanonicalResourcePair<E> {
     ) {
         let resources = &mut self.parsed.resources; // allow: direct — plan-time reconciliation
         for (resource, fallbacks) in resources.iter_mut().zip(&self.prefix_fallbacks) {
-            #[allow(clippy::iter_over_hash_type)]
-            // keyed rebuild: captured existing keys are restored in place before normalization
             for (attribute, value) in fallbacks {
                 resource.set_attr(attribute.clone(), value.clone());
             }

@@ -1094,8 +1094,7 @@ async fn prepare_update_request_for_dispatch<S: Clone>(
             from.attributes
                 .iter()
                 .filter(|(key, _)| candidates.contains_key(*key))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
+                .map(|(key, value)| (key.clone(), value.clone())),
             schema,
         );
         let desired =

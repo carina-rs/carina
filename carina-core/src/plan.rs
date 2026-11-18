@@ -9,7 +9,7 @@
 pub mod replacement;
 
 use crate::resource::ResolvedDependencies;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -622,7 +622,7 @@ pub(crate) struct ReplaceDisplayMetadata {
     /// Pre-replace state values. Used by display and snapshot tests;
     /// may contain secrets (the redaction walker visits this field
     /// in Phase 7).
-    pub previous_attributes: HashMap<String, SnapshotValue>,
+    pub previous_attributes: BTreeMap<String, SnapshotValue>,
 }
 
 /// Borrowed public view of replacement display metadata.
@@ -645,20 +645,20 @@ pub struct ReplaceDisplayInfo<'a> {
     /// Temporary name when CBD used a name swap. `None` for DBC.
     pub temporary_name: Option<&'a TemporaryName>,
     /// Pre-replace state values used as the "from" side of display diffs.
-    pub(crate) previous_attributes: &'a HashMap<String, SnapshotValue>,
+    pub(crate) previous_attributes: &'a BTreeMap<String, SnapshotValue>,
 }
 
 /// Opaque historical replacement values that may only be converted through
 /// the persisted-state writeback encoder.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplacementPreviousAttributesForStateWriteback<'a> {
-    attributes: &'a HashMap<String, SnapshotValue>,
+    attributes: &'a BTreeMap<String, SnapshotValue>,
 }
 
 impl<'a> ReplacementPreviousAttributesForStateWriteback<'a> {
     /// Borrow plan-time provider/history values for the state layer's sealed
     /// writeback selection step.
-    pub fn provider_attributes(self) -> &'a HashMap<String, SnapshotValue> {
+    pub fn provider_attributes(self) -> &'a BTreeMap<String, SnapshotValue> {
         self.attributes
     }
 }
@@ -1293,7 +1293,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
     pub(crate) fn previous_delete_attributes(
         &self,
         instance: &DeletedInstanceKey,
-    ) -> Option<HashMap<String, SnapshotValue>> {
+    ) -> Option<BTreeMap<String, SnapshotValue>> {
         self.replacement_inputs.previous(instance)
     }
 
@@ -2211,8 +2211,8 @@ mod tests {
         &FIXTURE
     }
 
-    fn previous_attributes() -> HashMap<String, SnapshotValue> {
-        HashMap::from([(
+    fn previous_attributes() -> BTreeMap<String, SnapshotValue> {
+        std::collections::BTreeMap::from([(
             "cidr_block".to_string(),
             Value::Concrete(crate::resource::ConcreteValue::String("10.0.0.0/16".into())),
         )])

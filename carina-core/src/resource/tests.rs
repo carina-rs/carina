@@ -4811,3 +4811,84 @@ fn review3_secret_combinator_protects_errors_and_rewraps_success() {
         Value::Deferred(DeferredValue::Secret(Box::new(plain).into()))
     );
 }
+#[test]
+fn issue_4491_state_attributes_are_alphabetical_after_hash_map_constructor_inputs() {
+    let expected = [
+        "alpha", "beta", "delta", "epsilon", "eta", "gamma", "theta", "zeta",
+    ];
+    for _ in 0..8 {
+        let attributes: std::collections::HashMap<String, crate::resource::Value> = expected
+            .iter()
+            .rev()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::Int(1)),
+                )
+            })
+            .collect();
+        let id = crate::resource::ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "example",
+            None,
+        );
+        let state = crate::resource::State::existing(id.clone(), attributes.clone());
+        assert_eq!(
+            state
+                .attributes
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let applied = crate::provider::AppliedState::new(id, "provider-id", attributes).unwrap();
+        assert_eq!(
+            applied
+                .attributes()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            state
+                .to_snapshot()
+                .attributes
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn issue_4491_secret_hash_test_entropy_is_scoped_and_restored_after_unwind() {
+    let fixed = || {
+        secret_hash_test_entropy::with_salt([42; 16], || RedactedSecretHash::generate(b"fixture"))
+    };
+    let expected = fixed();
+    assert_eq!(fixed(), expected);
+    assert!(
+        std::panic::catch_unwind(|| secret_hash_test_entropy::with_salt([42; 16], || {
+            panic!("fixture recording failed");
+        }))
+        .is_err()
+    );
+    assert_ne!(
+        RedactedSecretHash::generate(b"fixture"),
+        expected,
+        "fixed entropy must not leak into ordinary hashing after unwinding"
+    );
+    let nested = secret_hash_test_entropy::with_salt([42; 16], || {
+        secret_hash_test_entropy::with_salt([7; 16], || {
+            RedactedSecretHash::generate(b"fixture");
+        });
+        RedactedSecretHash::generate(b"fixture")
+    });
+    assert_eq!(
+        nested, expected,
+        "nested scopes restore their caller's source"
+    );
+}

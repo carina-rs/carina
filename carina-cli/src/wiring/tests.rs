@@ -547,7 +547,7 @@ fn state_block_import_propagates_unavailable_historical_secret() {
             compositions: &[],
             managed_current: &current,
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     );
@@ -713,7 +713,9 @@ fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
             message: "unrelated same-line warning".into(),
         },
     ];
-    let bindings = carina_core::binding_index::IterableBindings::from_upstream_only(HashMap::new());
+    let bindings = carina_core::binding_index::IterableBindings::from_upstream_only(
+        std::collections::BTreeMap::new(),
+    );
     let mut pair = CanonicalResourcePair::for_test(parsed.clone(), Vec::new());
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
@@ -941,7 +943,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
                 provider: &provider,
                 normalizer: &provider,
                 provider_configs: &[],
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 state_file: &carina_state::ObservedStateFile::for_test((state_file).clone()),
                 state_block_claims: &state_block_claims,
                 resolved_state_block_targets: &resolved_state_block_targets,
@@ -1187,7 +1189,7 @@ let item = test.thing {
             &carina_state::ObservedStateFile::for_test((state_file).clone()),
             refresh,
             ProgressSink::Human,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &StateBlockClaims::default(),
             &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -1295,7 +1297,7 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
         &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -1391,7 +1393,7 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
         &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -1613,7 +1615,7 @@ let first = test.thing {
             &carina_state::ObservedStateFile::for_test((state_file).clone()),
             false,
             ProgressSink::Human,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &StateBlockClaims::default(),
             &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -1740,7 +1742,7 @@ let direct = awscc.ec2.Route {
             &carina_state::ObservedStateFile::for_test((state_file).clone()),
             false,
             ProgressSink::Human,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &StateBlockClaims::default(),
             &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -3444,7 +3446,7 @@ fn validated_provider_configs(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -3637,7 +3639,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -3771,7 +3773,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -3805,11 +3807,19 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
             panic!("test orphan unexpectedly has an unknown create outcome: {unknown:?}")
         }
     };
-    let mut orphans = Orphans::from([carina_core::differ::Orphan::present(
-        present,
-        Some(absolute_binding("resource")),
-        carina_core::resource::PersistedDirectives::default(),
-    )]);
+    let mut orphans = Orphans::from(
+        [carina_core::differ::Orphan::present(
+            present,
+            Some(absolute_binding("resource")),
+            carina_core::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                carina_core::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
     let normalizer = TransformingNormalizer;
     let normalizer = std::sync::Arc::new(normalizer);
     let saved_attrs = crate::empty_lifted_saved_attrs();
@@ -3902,7 +3912,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         compositions: &[],
         managed_current: &input_states,
         data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     assert_eq!(
@@ -3977,7 +3987,10 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
     let refreshed =
         State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
             .with_identifier("resource-123");
-    orphans.insert(orphan.with_refreshed_state(refreshed.to_snapshot()));
+    orphans.insert(
+        carina_core::resource::ResolvedResourceId::new(id.clone()),
+        orphan.with_refreshed_state(refreshed.to_snapshot()),
+    );
     let state = match orphans[&id].current() {
         Current::Absent(state) => state.state(),
         Current::Present(present) => present.state(),
@@ -4600,7 +4613,7 @@ async fn plan_revalidates_resolved_upstream_provider_config_before_factory_creat
         &carina_state::ObservedStateFile::for_test(None),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -4993,8 +5006,6 @@ impl ProviderNormalizer for SavedAttrsHydratingNormalizer {
     ) -> BoxFuture<'a, ProviderResult<()>> {
         for (id, state) in states {
             if let Some(saved) = saved_attrs.get(id) {
-                #[allow(clippy::iter_over_hash_type)]
-                // keyed rebuild: test hydration fills distinct missing saved keys
                 for (attribute, value) in saved {
                     state
                         .attributes
@@ -5139,7 +5150,7 @@ let shared = read test.shared.Type {}
         &carina_state::ObservedStateFile::for_test((state_file).clone()),
         true,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -5269,7 +5280,10 @@ async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provi
         carina_core::resource::PersistedDirectives::default(),
     );
     let orphan = PreparedRows::from_snapshots(
-        [(id, orphan.into_current())],
+        [(
+            carina_core::resource::ResolvedResourceId::new(id),
+            orphan.into_current(),
+        )],
         &ResolvedRemovedClaims::resolve(&[], None),
     )
     .refreshable
@@ -8371,7 +8385,7 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -9877,7 +9891,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         &carina_state::ObservedStateFile::for_test(Some(state_file.clone())),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::empty(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -9935,7 +9949,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         compositions: &[],
         managed_current: &plan_input_states,
         data_source_values: &plan_ctx.data_source_values,
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -10166,7 +10180,7 @@ fn resolve_data_source_refs_replaces_resource_ref_with_concrete_value() {
                     managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
                         current_states.clone(),
                     )),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10224,7 +10238,7 @@ fn resolve_data_source_refs_for_refresh_defers_unresolved_apply_time_input() {
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10273,7 +10287,7 @@ fn resolve_data_source_refs_for_refresh_defers_bare_binding_ref_to_new_resource(
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10314,7 +10328,7 @@ fn resolve_data_source_refs_for_refresh_defers_unknown_input_instead_of_calling_
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10366,7 +10380,7 @@ fn resolve_data_source_refs_for_refresh_defers_resolvable_interpolation_when_tar
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10414,7 +10428,7 @@ fn resolve_data_source_refs_for_refresh_defers_folded_input_with_missing_depende
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &carina_core::schema::SchemaRegistry::new(),
                     wait_aliases: &[],
                     session,
@@ -10481,7 +10495,7 @@ fn resolve_data_source_refs_for_refresh_does_not_treat_missing_create_only_readb
                     managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
                         current_states.clone(),
                     )),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &registry,
                     wait_aliases: &[],
                     session,
@@ -10544,7 +10558,7 @@ fn resolve_data_source_refs_for_refresh_defers_when_any_input_references_new_res
                     managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
                         current_states.clone(),
                     )),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10598,7 +10612,7 @@ fn resolve_data_source_refs_for_refresh_defers_read_chain_from_new_resource() {
                 DataSourceRefreshContext {
                     compositions: &[],
                     managed_current: ManagedCurrentView::base(&HashMap::new()),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &empty_registry,
                     wait_aliases: &[],
                     session,
@@ -10682,7 +10696,7 @@ fn resolve_data_source_refs_for_refresh_reads_existing_resource_even_when_replac
                     managed_current: ManagedCurrentView::base(&crate::managed_current_from_states(
                         current_states.clone(),
                     )),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     schemas: &registry,
                     wait_aliases: &[],
                     session,
@@ -10741,7 +10755,7 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                         DataSourceRefreshContext {
                             compositions: &[],
                             managed_current: ManagedCurrentView::base(&HashMap::new()),
-                            remote_bindings: &HashMap::new(),
+                            remote_bindings: &Default::default(),
                             schemas: &schemas,
                             wait_aliases: &[],
                             session,
@@ -11557,7 +11571,7 @@ fn late_anonymous_identity_resolution_reports_all_typed_identity_errors() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -11613,7 +11627,7 @@ fn late_anonymous_identity_resolution_reports_all_unavailable_provider_schemas()
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -11693,7 +11707,7 @@ fn late_anonymous_reconciliation_sees_early_move_target_and_leaves_other_orphan(
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -11832,7 +11846,7 @@ fn late_anonymous_reconciliation_composes_from_projected_source_to_new_hash() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -11978,7 +11992,7 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
             compositions: &[],
             managed_current: &HashMap::new(),
             data_source_values: &DataSourceValues::empty(),
-            remote_bindings: &HashMap::new(),
+            remote_bindings: &Default::default(),
             wait_aliases: &[],
         },
     )
@@ -12491,7 +12505,7 @@ let records = for (_, opt) in cert.domain_validation_options {{
         &carina_state::ObservedStateFile::for_test((state_file).clone()),
         false,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &claims,
         &targets,
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -12728,7 +12742,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &HashSet::new(),
             &HashSet::new(),
@@ -12777,7 +12791,7 @@ mod expand_same_config_deferred_for_tests {
         let out = futures::executor::block_on(prepared.expand_parsed(
             &mut parsed,
             &schemas,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             DeferredForWarningPolicy::Suppress,
             &ProviderRouter::new(),
             &identity_context,
@@ -12869,11 +12883,19 @@ mod expand_same_config_deferred_for_tests {
                 panic!("test orphan unexpectedly has an unknown create outcome: {unknown:?}")
             }
         };
-        let orphan_owned = Orphans::from([carina_core::differ::Orphan::present(
-            present,
-            Some(absolute_binding("a")),
-            carina_core::resource::PersistedDirectives::default(),
-        )]);
+        let orphan_owned = Orphans::from(
+            [carina_core::differ::Orphan::present(
+                present,
+                Some(absolute_binding("a")),
+                carina_core::resource::PersistedDirectives::default(),
+            )]
+            .map(|orphan| {
+                (
+                    carina_core::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                    orphan,
+                )
+            }),
+        );
         let selected: Vec<&ResourceId> = refreshable
             .select(&resources, &orphan_owned)
             .map(|r| &r.id)
@@ -12917,7 +12939,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -12999,7 +13021,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13060,7 +13082,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13106,7 +13128,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13161,7 +13183,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13228,7 +13250,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13397,7 +13419,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13517,7 +13539,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13552,7 +13574,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
             &std::collections::HashSet::new(),
@@ -13645,7 +13667,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13674,7 +13696,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &moved_targets,
             &std::collections::HashSet::new(),
@@ -13781,7 +13803,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
@@ -13818,7 +13840,7 @@ mod expand_same_config_deferred_for_tests {
             &carina_core::provider::RawSavedAttrs::default()
                 .lift(&carina_core::schema::SchemaRegistry::new()),
             &HashMap::new(),
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &[] as &[WaitAliasSpec],
             &std::collections::HashSet::new(),
             &already_refreshed,
@@ -13957,7 +13979,7 @@ mod kind_default_source_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &std::collections::HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -15326,7 +15348,7 @@ mod resolved_value_constraint_gate {
                 compositions: &[],
                 managed_current: &HashMap::new(),
                 data_source_values: &DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
         )
@@ -15579,7 +15601,7 @@ exports { team_prefix: String = "x" }"#,
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -15593,7 +15615,7 @@ exports { team_prefix: String = "x" }"#,
             &carina_state::ObservedStateFile::for_test(None),
             true,
             ProgressSink::Human,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &StateBlockClaims::default(),
             &crate::test_support::empty_state_block_targets(),
             crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
@@ -16144,7 +16166,7 @@ async fn round2_binding_stability_reuses_normalized_inputs() {
                     schemas: &schemas,
                     saved_attrs: &saved,
                     prev_explicit: &HashMap::new(),
-                    remote_bindings: &HashMap::new(),
+                    remote_bindings: &Default::default(),
                     wait_aliases: &[],
                     provider: &provider,
                     reference_preparation:
@@ -16419,7 +16441,7 @@ let shared = read test.shared.Type {}
         &carina_state::ObservedStateFile::for_test((state_file).clone()),
         true,
         ProgressSink::Human,
-        &HashMap::new(),
+        &std::collections::BTreeMap::new(),
         &StateBlockClaims::default(),
         &crate::test_support::empty_state_block_targets(),
         crate::wiring::RowRequest::Render(carina_core::detail_rows::DetailLevel::Full),
