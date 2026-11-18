@@ -12,7 +12,7 @@ use super::blocks::attributes::{
 };
 use super::blocks::backend::parse_backend_block;
 use super::blocks::module_call::parse_module_call;
-use super::blocks::provider::{parse_provider_block, parse_require_statement};
+use super::blocks::provider::parse_provider_block;
 use super::blocks::resource::parse_anonymous_resource;
 use super::blocks::state::{parse_import_state_block, parse_moved_block, parse_removed_block};
 use super::context::{ExpressionMode, ParseBinding, ParseContext, first_inner};
@@ -1059,7 +1059,8 @@ fn parse_with_seeded_bindings_inner(
                                     ctx.restore_warnings(warnings);
                                     result?
                                 };
-                                arguments.extend(parsed_arguments_block);
+                                arguments.extend(parsed_arguments_block.arguments);
+                                requires.extend(parsed_arguments_block.requires);
                             }
                             Rule::attributes_block => {
                                 let parsed_attribute_params = {
@@ -1103,14 +1104,6 @@ fn parse_with_seeded_bindings_inner(
                             }
                             Rule::moved_block => {
                                 state_blocks.push(parse_moved_block(stmt, &preprocessed_file)?);
-                            }
-                            Rule::require_statement => {
-                                requires.push(parse_require_statement(
-                                    stmt,
-                                    &ctx,
-                                    &preprocessed_file,
-                                    source_file,
-                                )?);
                             }
                             Rule::for_expr => {
                                 let iterable_name =
@@ -1495,16 +1488,6 @@ fn parse_with_seeded_bindings_inner(
         .into_iter()
         .map(crate::resource::RelativeBindingName::new)
         .collect();
-    let module_blocks = syntax.module_declaration_blocks();
-    syntax
-        .expressions_mut()
-        .set_require_scope(super::retained::RequireScope::for_declarations(
-            parsed
-                .arguments
-                .iter()
-                .map(|argument| argument.name.clone()),
-            module_blocks,
-        ));
     syntax.expressions_mut().finish_captures();
     parser_binding_metadata.syntax = Box::new(syntax);
     parser_binding_metadata

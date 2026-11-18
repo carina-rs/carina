@@ -12,6 +12,72 @@ mod basic;
 mod extended;
 
 #[test]
+fn issue4398_arguments_default_value_preserves_after_equals_completions() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("bindings.crn"),
+        "let default_name = 'example'\n",
+    )
+    .unwrap();
+    let source = "arguments {\n  n: String = ";
+    std::fs::write(directory.path().join("main.crn"), source).unwrap();
+    let doc = Document::new_with_path(
+        source.to_string(),
+        directory.path().join("main.crn"),
+        Arc::new(ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    let position = crate::position::byte_offset_to_position(source, source.len()).unwrap();
+    let items = test_provider().complete_for_test(&doc, position, Some(directory.path()));
+
+    // The non-schema AfterEquals fallback offers bindings and arguments;
+    // builtins are suppressed when the target type is unknown.
+    let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+    assert_eq!(labels, ["default_name", "n"], "{items:?}");
+    let binding = find_completion(&items, "default_name");
+    assert_eq!(binding.kind, Some(CompletionItemKind::VARIABLE));
+    assert_eq!(binding.insert_text.as_deref(), Some("default_name"));
+}
+
+#[test]
+fn issue4398_require_completion_context() {
+    for source in [
+        "arguments {\n  |\n}",
+        "arguments {\n  req|",
+        "arguments { n: Int\n  |\n}",
+    ] {
+        let items = schema_selection_completions(source);
+        let item = items
+            .iter()
+            .find(|item| item.label == "require")
+            .unwrap_or_else(|| panic!("{source}: {items:?}"));
+        assert_eq!(
+            item.insert_text.as_deref(),
+            Some("require ${1:condition}, '${2:error message}'")
+        );
+    }
+    for source in [
+        "|",
+        "req|",
+        "arguments { n: Int {\n |\n} }",
+        "arguments { n: Int { validation {\n |\n} } }",
+        "arguments { n: Int = {\n |\n} }",
+        "provider mock {\n |\n}",
+        "arguments {\n // req|\n}",
+        "arguments {\n /* req| */\n}",
+        "arguments { n: String = 'req|' }",
+        "if true {\n |\n}",
+    ] {
+        let items = schema_selection_completions(source);
+        assert!(
+            !items.iter().any(|item| item.label == "require"),
+            "{source}: {items:?}"
+        );
+    }
+}
+
+#[test]
 fn github_admission_completion_uses_backend_declarations() {
     let items = schema_selection_completions("backend | ");
     assert!(items.iter().any(|item| item.label == "github"), "{items:?}");

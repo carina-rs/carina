@@ -3915,9 +3915,9 @@ fn reference_valued_require_rejects_undeclared_variable_during_validation() {
         r#"arguments {
   name: String
   peer: String
-}
 
-require nmae != peer, "names must differ"
+
+require nmae != peer, "names must differ" }
 "#,
     );
 

@@ -33,12 +33,12 @@ impl Formatter {
         self.format_block_body_tail(node);
     }
 
-    /// Format a state block (import, removed, moved)
+    /// Format an argument requirement.
     pub(in crate::formatter) fn format_require_statement(&mut self, node: &CstNode) {
         self.write_indent();
         self.write("require ");
 
-        // Write children: validate_expr, comma, string
+        // require_condition uses a ValidateExpr CST node, followed by comma and string.
         let mut wrote_expr = false;
         for child in &node.children {
             match child {
@@ -63,7 +63,7 @@ impl Formatter {
                         self.format_node(n);
                     }
                 }
-                CstChild::Trivia(_) => {}
+                CstChild::Trivia(trivia) => self.format_expression_trivia(trivia),
             }
         }
         self.write_newline();

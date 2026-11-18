@@ -27,7 +27,7 @@ pub fn format(source: &str, config: &FormatConfig) -> Result<String, FormatParse
             line: 0,
             column: 0,
         })?;
-    let pairs = parser::parse(preprocess_result.transformed_source())?;
+    let pairs = parser::parse_preprocessed(&preprocess_result)?;
     let cst = build_cst(preprocess_result.transformed_source(), pairs);
     let formatter = Formatter::new(config.clone());
     let formatted = formatter.format(&cst);
@@ -51,7 +51,7 @@ pub fn format_with_block_names(
             line: 0,
             column: 0,
         })?;
-    let pairs = parser::parse(preprocess_result.transformed_source())?;
+    let pairs = parser::parse_preprocessed(&preprocess_result)?;
     let cst = build_cst(preprocess_result.transformed_source(), pairs);
     let formatter = Formatter::with_block_names(config.clone(), block_names.clone());
     let formatted = formatter.format(&cst);
@@ -1707,11 +1707,98 @@ mod tests {
     }
 
     #[test]
+    fn issue4398_arguments_require_format_round_trip() {
+        let input = "arguments {\n// first\nrequire before==after, 'same'\n\nbefore:Int\n// guard\nrequire /* inside */ before==after, 'same'\nafter:Int\nrequire after==before, 'last'\n// end\n}\n";
+        let config = FormatConfig::default();
+        let formatted = format(input, &config).unwrap();
+        assert!(
+            formatted.contains("  require before == after, 'same'"),
+            "{formatted}"
+        );
+        for comment in ["// first", "// guard", "/* inside */", "// end"] {
+            assert!(formatted.contains(comment), "{formatted}");
+        }
+        assert!(formatted.contains("'same'\n\n"), "{formatted}");
+        assert_eq!(format(&formatted, &config).unwrap(), formatted);
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let original = crate::parser::parse(input, &context).unwrap();
+        let reparsed = crate::parser::parse(&formatted, &context).unwrap();
+        assert_eq!(
+            format!("{:?}", original.arguments),
+            format!("{:?}", reparsed.arguments)
+        );
+        assert_eq!(original.requires.len(), reparsed.requires.len());
+        for (a, b) in original.requires.iter().zip(&reparsed.requires) {
+            assert_eq!(a.condition, b.condition);
+            assert_eq!(a.error_message, b.error_message);
+        }
+        let names = "arguments { require:Int required:Int requirements:Int }";
+        let formatted = format(names, &config).unwrap();
+        assert_eq!(
+            crate::parser::parse(&formatted, &context)
+                .unwrap()
+                .arguments
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn misplaced_require_format_error_uses_parser_position() {
+        for (source, line, column) in [
+            ("require n == 2, 'x'\n", 1, 1),
+            ("arguments {}\n  require n == 2, 'x'\n", 2, 3),
+            ("let n = 2\nrequire n == 2, 'x'\n", 2, 1),
+            ("let text = <<EOF\nhello\nEOF\nrequire true, 'x'\n", 4, 1),
+        ] {
+            let error = format(source, &FormatConfig::default()).unwrap_err();
+            assert_eq!(
+                error.message,
+                "`require` must be written inside an `arguments` block"
+            );
+            assert_eq!((error.line, error.column), (line, column));
+        }
+        for source in ["requirements {}", "required_x.y {}"] {
+            format(source, &FormatConfig::default()).unwrap();
+        }
+        let error = format("require n == 2\n", &FormatConfig::default()).unwrap_err();
+        assert!(error.message.starts_with("expected"), "{error}");
+    }
+
+    #[test]
+    fn misplaced_require_with_other_syntax_error_keeps_formatter_position() {
+        let error = format("require true, 'a'\nlet x = \n", &FormatConfig::default()).unwrap_err();
+        assert_eq!((error.line, error.column), (3, 1));
+        assert_eq!(
+            error.message,
+            "expected trivia, identifier, primary, or kw_use"
+        );
+    }
+
+    #[test]
+    fn issue4398_format_parenthesized_require_condition() {
+        let source = "arguments { n: Int\n require(n == 3), 'x' }\n";
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let original = crate::parser::parse(source, &context).unwrap();
+        let formatted = format(source, &FormatConfig::default()).unwrap();
+        assert_eq!(
+            formatted,
+            "arguments {\n  n: Int\n  require (n == 3), 'x'\n}\n"
+        );
+        let parsed = crate::parser::parse(&formatted, &context).unwrap();
+        assert_eq!(parsed.requires[0].condition, original.requires[0].condition);
+        assert_eq!(
+            format(&formatted, &FormatConfig::default()).unwrap(),
+            formatted
+        );
+    }
+
+    #[test]
     fn test_format_require_statement() {
         let input = r#"arguments {
   port: Int
-}
-require   port >= 1 && port <= 65535  , "port must be valid"
+
+require   port >= 1 && port <= 65535  , "port must be valid" }
 "#;
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
@@ -1721,8 +1808,8 @@ require   port >= 1 && port <= 65535  , "port must be valid"
             result
         );
 
-        let compact = format("require count>=1, \"p\"\n", &config).unwrap();
-        assert_eq!(compact, "require count >= 1, 'p'\n");
+        let compact = format("arguments { require count>=1, \"p\" }\n", &config).unwrap();
+        assert_eq!(compact, "arguments {\n  require count >= 1, 'p'\n}\n");
     }
 
     #[test]
@@ -1775,8 +1862,8 @@ exports {
       error_message='invalid'
     }
   }
-}
-require limit/2%3==1,"invalid"
+
+require limit/2%3==1,"invalid" }
 "#;
         let config = FormatConfig::default();
         let formatted = format(input, &config).unwrap();

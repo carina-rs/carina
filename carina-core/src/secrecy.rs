@@ -1094,7 +1094,7 @@ impl<B: BindingAddress> Owner<'_, B> {
                 | ExprKind::For
                 | ExprKind::ModuleCall
                 | ExprKind::ProviderDeclaration
-                | ExprKind::RequireCondition(_)
+                | ExprKind::RequireCondition
                 | ExprKind::Compose
                 | ExprKind::Unsupported(_) => false,
                 ExprKind::Call(name) => {
@@ -2489,7 +2489,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                     | ExprKind::For
                     | ExprKind::ModuleCall
                     | ExprKind::ProviderDeclaration
-                    | ExprKind::RequireCondition(_)
+                    | ExprKind::RequireCondition
                     | ExprKind::Compose
                     | ExprKind::Unsupported(_) => {
                         self.schedule(Operation::Pending, children(), path, depth, work)
