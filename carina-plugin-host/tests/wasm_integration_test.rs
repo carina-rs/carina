@@ -986,11 +986,9 @@ fn explicit_test_egress(
         "version = 5\n\n[[provider]]\nname = \"ignored-consent-name\"\nsource = {source:?}\nmode = \"file\"\nsha256 = {sha256:?}\n\n[provider.egress]\nconsent = \"explicit\"\nhosts = [\n{hosts}\n]\n"
     );
     std::fs::write(lock_dir.join("carina-providers.lock"), lock).expect("write test egress lock");
-    let (lock, _migration) =
-        LockFile::load(&carina_core::paths::ResolvedPath::new(lock_dir).unwrap())
-            .expect("load test egress lock")
-            .expect("test egress lock exists")
-            .into_parts();
+    let lock = LockFile::load(&carina_core::paths::ResolvedPath::new(lock_dir).unwrap())
+        .expect("load test egress lock")
+        .expect("test egress lock exists");
     let locked = lock
         .locked_egress(
             &declaration,

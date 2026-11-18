@@ -1121,10 +1121,9 @@ fn test_explicit_egress(declaration: &VerifiedEgressDeclaration) -> LockedEgress
     .expect("write egress lock");
     let project =
         carina_core::paths::ResolvedPath::new(directory.path()).expect("pin fixture project");
-    let (lock, _migration) = carina_provider_resolver::LockFile::load(&project)
+    let lock = carina_provider_resolver::LockFile::load(&project)
         .expect("load egress lock")
-        .expect("egress lock exists")
-        .into_parts();
+        .expect("egress lock exists");
     lock.locked_egress(declaration, &project)
         .expect("lock has consent for the declaration source")
 }

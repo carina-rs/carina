@@ -20,7 +20,7 @@ const FIXTURE_ARTIFACT: &[u8] = b"registry sequence notice fixture";
 fn write_protected_lock(base_dir: &Path) {
     fs::write(
         base_dir.join("carina-providers.lock"),
-        r#"version = 3
+        r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = true
@@ -44,86 +44,53 @@ sequence_anchor_established = true
 sequence_anchor = 5
 valid_until_present = true
 yanked_versions = ["0.4.0"]
-signature_present = true
-certificate_identity = "identity-a"
-certificate_oidc_issuer = "issuer-a"
+signature_state = "required_current"
+source_oidc_issuer = "issuer-a"
+source_repository_owner_id = "owner-a"
+source_repository_id = "identity-a"
+stable_workflow = "release.yml"
 transparency_log_present = true
 "#,
     )
     .unwrap();
 }
 
-fn write_v2_protected_lock(base_dir: &Path) {
-    fs::write(
-        base_dir.join("carina-providers.lock"),
-        r#"version = 2
-
-[registry_host."registry.carina-rs.dev"]
-discovery_pin_present = true
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "legacy-discovery-sha256"
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-constraint = "^0.5"
-sha256 = "pinned-shasum"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-sequence_present = true
-sequence = 7
-sequence_anchor_established = true
-sequence_anchor = 5
-valid_until_present = true
-yanked_versions = ["0.4.0"]
-signature_present = true
-certificate_identity = "identity-a"
-certificate_oidc_issuer = "issuer-a"
-transparency_log_present = true
-"#,
-    )
-    .unwrap();
-}
-
-fn write_v1_protected_lock(base_dir: &Path) {
-    fs::write(
-        base_dir.join("carina-providers.lock"),
-        r#"version = 1
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-constraint = "^0.5"
-sha256 = "pinned-shasum"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "legacy-discovery-sha256"
-sequence_present = true
-sequence = 7
-sequence_anchor_established = true
-sequence_anchor = 5
-valid_until_present = true
-yanked_versions = ["0.4.0"]
-signature_present = true
-certificate_identity = "identity-a"
-certificate_oidc_issuer = "issuer-a"
-transparency_log_present = true
-"#,
-    )
-    .unwrap();
-}
-
-fn write_two_pin_same_host_v1_lock(base_dir: &Path) {
-    write_v1_protected_lock(base_dir);
+fn write_pending_discovery_lock(base_dir: &Path) {
+    write_protected_lock(base_dir);
     let path = base_dir.join("carina-providers.lock");
-    let mut lock = fs::read_to_string(&path).unwrap();
+    let lock = fs::read_to_string(&path).unwrap();
+    let pinned = r#"[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = true
+
+[registry_host."registry.carina-rs.dev".discovery_values]
+"providers.v1" = "https://registry.carina-rs.dev/v1/providers/"
+"#;
+    let pending = r#"[registry_host."registry.carina-rs.dev"]
+discovery_pin_present = false
+
+[[registry_host."registry.carina-rs.dev".migration_pending_discovery_pins]]
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "legacy-discovery-sha256"
+"#;
+    assert_eq!(lock.matches(pinned).count(), 1);
+    fs::write(path, lock.replacen(pinned, pending, 1)).unwrap();
+}
+
+fn write_two_pin_same_host_pending_lock(base_dir: &Path) {
+    write_pending_discovery_lock(base_dir);
+    let path = base_dir.join("carina-providers.lock");
+    let lock = fs::read_to_string(&path).unwrap();
+    let first = r#"[[registry_host."registry.carina-rs.dev".migration_pending_discovery_pins]]
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "legacy-discovery-sha256"
+"#;
+    let second = r#"
+[[registry_host."registry.carina-rs.dev".migration_pending_discovery_pins]]
+api_base_url = "https://registry.carina-rs.dev/v1/providers/"
+discovery_sha256 = "newer-discovery-sha256"
+"#;
+    assert_eq!(lock.matches(first).count(), 1);
+    let mut lock = lock.replacen(first, &format!("{first}{second}"), 1);
     lock.push_str(
         r#"
 [[provider]]
@@ -135,59 +102,14 @@ sha256 = "other-pinned-provider-sha256"
 
 [provider.registry]
 resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "newer-discovery-sha256"
 sequence_present = false
 sequence_anchor_established = false
 valid_until_present = false
-signature_present = false
+signature_state = "not_required"
 transparency_log_present = false
 "#,
     );
     fs::write(path, lock).unwrap();
-}
-
-fn write_two_host_v1_lock(base_dir: &Path) {
-    fs::write(
-        base_dir.join("carina-providers.lock"),
-        r#"version = 1
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-sha256 = "aws-sha256"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "default-host-discovery-sha256"
-sequence_present = false
-sequence_anchor_established = false
-valid_until_present = false
-signature_present = false
-transparency_log_present = false
-
-[[provider]]
-name = "random"
-source = "registry.example.test/carina-rs/random"
-mode = "version"
-version = "1.0.0"
-sha256 = "random-sha256"
-
-[provider.registry]
-resolved_hostname = "registry.example.test"
-api_base_url = "https://registry.example.test/v1/providers/"
-discovery_sha256 = "other-host-discovery-sha256"
-sequence_present = false
-sequence_anchor_established = false
-valid_until_present = false
-signature_present = false
-transparency_log_present = false
-"#,
-    )
-    .unwrap();
 }
 
 fn write_current_signer_lock(base_dir: &Path) {
@@ -356,18 +278,6 @@ fn carina(base_dir: &Path, operation: &str, force: bool, input: &str) -> Output 
     carina_target(base_dir, operation, PROVIDER, force, input)
 }
 
-fn carina_init(base_dir: &Path) -> Output {
-    let cache = tempfile::tempdir().expect("create isolated plugin cache");
-    let trust = tempfile::tempdir().expect("create isolated trust-record directory");
-    Command::new(env!("CARGO_BIN_EXE_carina"))
-        .args(["init", base_dir.to_str().unwrap()])
-        .env("NO_COLOR", "1")
-        .env("CARINA_PLUGIN_CACHE_DIR", cache.path())
-        .env("CARINA_TRUST_RECORD_DIR", trust.path())
-        .output()
-        .expect("failed to execute carina init")
-}
-
 fn carina_target(
     base_dir: &Path,
     operation: &str,
@@ -439,153 +349,9 @@ fn recovery_with_file_as_project_reports_missing_lock() {
 }
 
 #[test]
-fn v2_lock_migration_keeps_all_recovery_commands_reachable_without_authorizing_discovery() {
-    for (operation, target) in [
-        ("repin-discovery", HOST),
-        ("repin-identity", PROVIDER),
-        ("re-bootstrap", PROVIDER),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        write_v2_protected_lock(dir.path());
-
-        let output = carina_target(dir.path(), operation, target, true, "");
-        assert!(
-            output.status.success(),
-            "{operation} must remain reachable through v2 migration\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(
-            stderr.contains("Provider lock format migration: version 2 -> version 5"),
-            "{operation}: {stderr}"
-        );
-        assert_eq!(
-            stderr
-                .matches("Provider lock format migration: version 2 -> version 5")
-                .count(),
-            1,
-            "{operation} must report migration exactly once: {stderr}"
-        );
-        assert!(
-            stderr.contains("Registry host: registry.carina-rs.dev"),
-            "{operation}: {stderr}"
-        );
-        let migration_action = if operation == "repin-discovery" {
-            "Discarding"
-        } else {
-            "Retaining"
-        };
-        assert!(
-            stderr.contains(&format!("{migration_action} v2 pinned discovery API base")),
-            "{operation}: {stderr}"
-        );
-        assert!(
-            stderr.contains(&format!("{migration_action} v2 discovery document SHA-256")),
-            "{operation}: {stderr}"
-        );
-        assert!(
-            stderr.contains("All provider entries and provider security state will be retained."),
-            "{operation}: {stderr}"
-        );
-
-        let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-        assert!(saved.starts_with("version = 5\n"), "{operation}: {saved}");
-        assert!(
-            saved.contains("discovery_pin_present = false"),
-            "{operation}: {saved}"
-        );
-        assert!(
-            saved.contains("sha256 = \"pinned-shasum\""),
-            "{operation}: {saved}"
-        );
-        assert!(
-            saved.contains("yanked_versions = [\"0.4.0\"]"),
-            "{operation}: {saved}"
-        );
-        assert!(
-            saved.contains("valid_until_present = true"),
-            "{operation}: {saved}"
-        );
-        assert!(
-            saved.contains("transparency_log_present = true"),
-            "{operation}: {saved}"
-        );
-
-        match operation {
-            "repin-discovery" => {
-                assert!(!saved.contains("migration_pending_discovery_pin"));
-                assert!(!saved.contains("api_base_url"), "{saved}");
-                assert!(!saved.contains("discovery_sha256"), "{saved}");
-                assert!(saved.contains("sequence = 7"), "{saved}");
-                assert!(saved.contains("sequence_anchor = 5"), "{saved}");
-                assert!(saved.contains("signature_state = \"required_legacy\""));
-                assert!(saved.contains("legacy_certificate_identity = \"identity-a\""));
-            }
-            "repin-identity" => {
-                assert!(saved.contains("migration_pending_discovery_pins"));
-                assert!(saved.contains("api_base_url"), "{saved}");
-                assert!(saved.contains("discovery_sha256"), "{saved}");
-                assert!(saved.contains("sequence = 7"), "{saved}");
-                assert!(saved.contains("sequence_anchor = 5"), "{saved}");
-                assert!(!saved.contains("legacy_certificate_identity"), "{saved}");
-                assert!(
-                    saved.contains("signature_state = \"required_unpinned\""),
-                    "{saved}"
-                );
-            }
-            "re-bootstrap" => {
-                assert!(saved.contains("migration_pending_discovery_pins"));
-                assert!(saved.contains("api_base_url"), "{saved}");
-                assert!(saved.contains("discovery_sha256"), "{saved}");
-                assert!(saved.contains("sequence_present = false"), "{saved}");
-                assert!(
-                    saved.contains("sequence_anchor_established = false"),
-                    "{saved}"
-                );
-                assert!(
-                    saved.contains("sequence_anchor_reset_pending = true"),
-                    "{saved}"
-                );
-                assert!(saved.contains("signature_state = \"required_legacy\""));
-                assert!(saved.contains("legacy_certificate_identity = \"identity-a\""));
-            }
-            _ => unreachable!(),
-        }
-
-        if operation != "repin-discovery" {
-            let install_lock = ProviderInstallLock::acquire(
-                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
-            )
-            .unwrap();
-            let error = resolve_all(
-                &carina_core::UserDirs::under(&dir.path().join("test-user")),
-                &install_lock,
-                &[registry_provider_config()],
-                LockMode::Normal,
-                &mut |_| {},
-            )
-            .expect_err("provider-level recovery must not authorize discovery migration");
-            assert!(
-                error
-                    .to_string()
-                    .contains("lock-format migration requires operator authorization"),
-                "{operation}: {error}"
-            );
-            assert!(
-                error
-                    .to_string()
-                    .contains("carina providers repin-discovery registry.carina-rs.dev"),
-                "{operation}: {error}"
-            );
-        }
-    }
-}
-
-#[test]
-fn v1_lock_migration_keeps_discovery_repin_reachable() {
+fn pending_discovery_repin_previews_and_clears_every_pending_pin_for_the_host() {
     let dir = tempfile::tempdir().unwrap();
-    write_v1_protected_lock(dir.path());
+    write_two_pin_same_host_pending_lock(dir.path());
 
     let output = carina_target(dir.path(), "repin-discovery", HOST, true, "");
     assert!(
@@ -595,45 +361,11 @@ fn v1_lock_migration_keeps_discovery_repin_reachable() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 1 -> version 5";
-    assert_eq!(stderr.matches(header).count(), 1, "{stderr}");
-    assert!(
-        stderr.contains("Discarding v1 pinned discovery API base"),
-        "{stderr}"
-    );
-
-    let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-    assert!(saved.starts_with("version = 5\n"), "{saved}");
-    assert!(!saved.contains("migration_pending_discovery_pin"));
-    assert!(saved.contains("sequence = 7"), "{saved}");
-    assert!(saved.contains("signature_state = \"required_legacy\""));
-}
-
-#[test]
-fn v1_discovery_repin_previews_and_clears_every_pending_pin_for_the_host() {
-    let dir = tempfile::tempdir().unwrap();
-    write_two_pin_same_host_v1_lock(dir.path());
-
-    let output = carina_target(dir.path(), "repin-discovery", HOST, true, "");
-    assert!(
-        output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert_eq!(
-        stderr
-            .matches("Provider lock format migration: version 1 -> version 5")
-            .count(),
-        1,
-        "{stderr}"
-    );
     assert!(stderr.contains("legacy-discovery-sha256"), "{stderr}");
     assert!(stderr.contains("newer-discovery-sha256"), "{stderr}");
     assert_eq!(
         stderr
-            .matches("Discarding v1 discovery document SHA-256")
+            .matches("Discarding migrated legacy discovery document SHA-256")
             .count(),
         2,
         "{stderr}"
@@ -650,139 +382,129 @@ fn v1_discovery_repin_previews_and_clears_every_pending_pin_for_the_host() {
 }
 
 #[test]
-fn v1_discovery_repin_preview_folds_the_complete_migration_report() {
+fn pending_discovery_repin_preserves_other_hosts_pending_pins() {
+    const OTHER_HOST: &str = "other.registry.example.test";
     let dir = tempfile::tempdir().unwrap();
-    write_two_host_v1_lock(dir.path());
+    write_pending_discovery_lock(dir.path());
+    let path = dir.path().join("carina-providers.lock");
+    let mut fixture = fs::read_to_string(&path).unwrap();
+    fixture.push_str(
+        r#"
+[registry_host."other.registry.example.test"]
+discovery_pin_present = false
 
+[[registry_host."other.registry.example.test".migration_pending_discovery_pins]]
+api_base_url = "https://other.registry.example.test/v1/providers/"
+discovery_sha256 = "other-host-pending-sha256"
+"#,
+    );
+    fs::write(&path, &fixture).unwrap();
+    let before: toml::Value = toml::from_str(&fixture).unwrap();
     let output = carina_target(dir.path(), "repin-discovery", HOST, true, "");
-    assert!(
-        output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{output:?}");
     let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 1 -> version 5";
-    assert_eq!(stderr.matches(header).count(), 1, "{stderr}");
-    assert!(
-        stderr.contains(
-            "Discarding v1 pinned discovery API base: https://registry.carina-rs.dev/v1/providers/"
-        ),
-        "{stderr}"
+    assert!(stderr.contains("legacy-discovery-sha256"), "{stderr}");
+    assert!(!stderr.contains("other-host-pending-sha256"), "{stderr}");
+    carina_provider_resolver::LockFile::load(
+        &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let saved: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        saved["registry_host"][OTHER_HOST],
+        before["registry_host"][OTHER_HOST]
     );
     assert!(
-        stderr.contains(
-            "Retaining v1 pinned discovery API base pending authorization: https://registry.example.test/v1/providers/"
-        ),
-        "the folded report must retain the other host's pending state: {stderr}"
+        saved["registry_host"][HOST]
+            .get("migration_pending_discovery_pins")
+            .is_none()
     );
-    assert!(
-        !stderr.contains(
-            "Retaining v1 pinned discovery API base pending authorization: https://registry.carina-rs.dev/v1/providers/"
-        ),
-        "the target must be described only as discarded: {stderr}"
+    assert_eq!(
+        saved["registry_host"][HOST]["discovery_pin_present"].as_bool(),
+        Some(false)
     );
-    assert!(
-        stderr.contains(
-            "registry discovery for host registry.example.test is blocked because its legacy lock-format migration requires operator authorization"
-        ),
-        "{stderr}"
-    );
-    assert!(
-        !stderr.contains("Registry resolution remains blocked for each other migrated host"),
-        "{stderr}"
-    );
-
-    let saved = fs::read_to_string(dir.path().join("carina-providers.lock")).unwrap();
-    assert_eq!(saved.matches("migration_pending_discovery_pins").count(), 1);
-    assert!(saved.contains("other-host-discovery-sha256"), "{saved}");
-    assert!(!saved.contains("default-host-discovery-sha256"), "{saved}");
+    assert_eq!(saved["provider"], before["provider"]);
 }
 
 #[test]
-fn init_reports_v2_lock_migration_once_before_authorization_error() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(
-        dir.path().join("providers.crn"),
-        r#"provider aws {
-  source = 'carina-rs/aws'
-  version = '^0.5'
-}
-"#,
-    )
-    .unwrap();
-    write_v2_protected_lock(dir.path());
-
-    let output = carina_init(dir.path());
-    assert!(
-        !output.status.success(),
-        "migration-pending discovery must remain blocked"
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 2 -> version 5";
-    assert!(stderr.contains(header), "{stderr}");
-    let repin_command =
-        ProjectCommand::new("providers repin-discovery", dir.path()).with_argument(HOST);
-    assert!(stderr.contains(&format!("`{repin_command}`")), "{stderr}");
-    let lock_path = dir.path().join("carina-providers.lock");
-    assert!(
-        stderr.contains(&format!("Lock file: {}", lock_path.display())),
-        "{stderr}"
-    );
-    assert_eq!(
-        stderr.matches(header).count(),
-        1,
-        "carina init must report migration exactly once: {stderr}"
-    );
-    assert_eq!(
-        stderr
-            .matches("lock-format migration requires operator authorization")
-            .count(),
-        2,
-        "the migration report and the resolve-time refusal must each name the authorization gate: {stderr}"
-    );
-}
-
-#[test]
-fn init_reports_v1_lock_migration_once_before_authorization_error() {
-    let dir = tempfile::tempdir().unwrap();
-    fs::write(
-        dir.path().join("providers.crn"),
-        r#"provider aws {
-  source = 'carina-rs/aws'
-  version = '^0.5'
-}
-"#,
-    )
-    .unwrap();
-    write_v1_protected_lock(dir.path());
-
-    let output = carina_init(dir.path());
-    assert!(
-        !output.status.success(),
-        "migration-pending discovery must remain blocked"
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    let header = "Provider lock format migration: version 1 -> version 5";
-    assert!(stderr.contains(header), "{stderr}");
-    assert_eq!(
-        stderr.matches(header).count(),
-        1,
-        "carina init must report migration exactly once: {stderr}"
-    );
-    assert_eq!(
-        stderr
-            .matches("lock-format migration requires operator authorization")
-            .count(),
-        2,
-        "the migration report and the resolve-time refusal must each name the authorization gate: {stderr}"
-    );
+fn provider_recovery_on_pending_host_keeps_discovery_blocked() {
+    for operation in ["repin-identity", "re-bootstrap"] {
+        let dir = tempfile::tempdir().unwrap();
+        write_pending_discovery_lock(dir.path());
+        let path = dir.path().join("carina-providers.lock");
+        let before: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let output = carina(dir.path(), operation, true, "");
+        assert!(output.status.success(), "{operation}: {output:?}");
+        let saved: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"].as_integer(), Some(5));
+        assert_eq!(saved["registry_host"], before["registry_host"]);
+        assert_eq!(
+            saved["registry_host"][HOST]["migration_pending_discovery_pins"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut expected = before["provider"].clone();
+        let registry = expected[0]["registry"].as_table_mut().unwrap();
+        match operation {
+            "repin-identity" => {
+                registry.insert("signature_state".into(), "required_unpinned".into());
+                for key in [
+                    "source_oidc_issuer",
+                    "source_repository_owner_id",
+                    "source_repository_id",
+                    "stable_workflow",
+                ] {
+                    registry.remove(key);
+                }
+            }
+            "re-bootstrap" => {
+                registry.insert("sequence_present".into(), false.into());
+                registry.insert("sequence_anchor_established".into(), false.into());
+                registry.insert("sequence_anchor_reset_pending".into(), true.into());
+                registry.remove("sequence");
+                registry.remove("sequence_anchor");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(saved["provider"], expected, "{operation}");
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+        )
+        .unwrap();
+        let http = FixtureRegistryHttp::default();
+        let error = resolve_all_with_fixture_registry(
+            &UserDirs::under(&dir.path().join("test-user")),
+            &install_lock,
+            &[registry_provider_config()],
+            LockMode::Normal,
+            &http,
+            &mut |_| {},
+        )
+        .expect_err("provider-scoped recovery must leave discovery blocked");
+        assert!(
+            error
+                .to_string()
+                .contains("carina providers repin-discovery registry.carina-rs.dev"),
+            "{operation}: {error}"
+        );
+        assert!(
+            http.requested_urls().is_empty(),
+            "{operation}: discovery must require authorization before HTTP"
+        );
+        assert_eq!(
+            toml::from_str::<toml::Value>(&fs::read_to_string(&path).unwrap()).unwrap(),
+            saved
+        );
+    }
 }
 
 #[test]
 fn declining_migrated_discovery_repin_preserves_pin_and_resolution_block() {
     let dir = tempfile::tempdir().unwrap();
-    write_v2_protected_lock(dir.path());
+    write_pending_discovery_lock(dir.path());
     let lock_path = dir.path().join("carina-providers.lock");
     let before = fs::read(&lock_path).unwrap();
 
@@ -805,7 +527,7 @@ fn declining_migrated_discovery_repin_preserves_pin_and_resolution_block() {
     assert_eq!(
         fs::read(&lock_path).unwrap(),
         before,
-        "declining must leave the v2 pin intact on disk"
+        "declining must leave the pending pin intact on disk"
     );
 
     let install_lock =
@@ -879,11 +601,19 @@ fn repin_discovery_prints_and_clears_consumed_host_values_only() {
     assert!(saved.contains("sequence_anchor = 5"), "{saved}");
     assert!(saved.contains("yanked_versions = [\"0.4.0\"]"), "{saved}");
     assert!(
-        saved.contains("legacy_certificate_identity = \"identity-a\""),
+        saved.contains("source_repository_id = \"identity-a\""),
         "{saved}"
     );
     assert!(
-        saved.contains("legacy_certificate_oidc_issuer = \"issuer-a\""),
+        saved.contains("source_oidc_issuer = \"issuer-a\""),
+        "{saved}"
+    );
+    assert!(
+        saved.contains("source_repository_owner_id = \"owner-a\""),
+        "{saved}"
+    );
+    assert!(
+        saved.contains("stable_workflow = \"release.yml\""),
         "{saved}"
     );
     assert!(saved.contains("transparency_log_present = true"), "{saved}");
@@ -944,51 +674,6 @@ fn repin_discovery_requires_the_exact_host_confirmation() {
 }
 
 #[test]
-fn repin_identity_prints_discarded_pin_and_preserves_other_lock_state() {
-    let dir = tempfile::tempdir().unwrap();
-    write_protected_lock(dir.path());
-
-    let output = carina(dir.path(), "repin-identity", true, "");
-    assert!(
-        output.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("Discarding legacy certificate identity: identity-a"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("Discarding legacy OIDC issuer: issuer-a"),
-        "{stderr}"
-    );
-    assert!(!stdout.contains("Discarding"), "{stdout}");
-    assert!(!stdout.contains("Enter provider source"), "{stdout}");
-
-    let lock_path = dir.path().join("carina-providers.lock");
-    carina_provider_resolver::LockFile::load(
-        &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
-    )
-    .expect("repinned lock must remain parseable")
-    .expect("repinned lock must remain present");
-    let saved = fs::read_to_string(lock_path).unwrap();
-    assert!(saved.contains("sha256 = \"pinned-shasum\""), "{saved}");
-    assert!(saved.contains("sequence = 7"), "{saved}");
-    assert!(saved.contains("sequence_anchor = 5"), "{saved}");
-    assert!(saved.contains("yanked_versions = [\"0.4.0\"]"), "{saved}");
-    assert!(
-        saved.contains("signature_state = \"required_unpinned\""),
-        "{saved}"
-    );
-    assert!(!saved.contains("legacy_certificate_identity"), "{saved}");
-    assert!(!saved.contains("legacy_certificate_oidc_issuer"), "{saved}");
-    assert!(saved.contains("transparency_log_present = true"), "{saved}");
-}
-
-#[test]
 fn repin_identity_prints_and_clears_every_current_signer_pin() {
     let dir = tempfile::tempdir().unwrap();
     write_current_signer_lock(dir.path());
@@ -1000,7 +685,15 @@ fn repin_identity_prints_and_clears_every_current_signer_pin() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stdout.contains("Discarding"), "{stdout}");
+    assert!(!stdout.contains("Enter provider source"), "{stdout}");
+    carina_provider_resolver::LockFile::load(
+        &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+    )
+    .expect("repinned lock must remain parseable")
+    .expect("repinned lock must remain present");
     for expected in [
         "Discarding source OIDC issuer: https://token.actions.githubusercontent.com",
         "Discarding source repository owner ID: 260157389",
@@ -1025,6 +718,9 @@ fn repin_identity_prints_and_clears_every_current_signer_pin() {
     ] {
         assert!(!saved.contains(removed), "{removed} survived:\n{saved}");
     }
+    assert!(saved.contains("sha256 = \"pinned-shasum\""), "{saved}");
+    assert!(saved.contains("sequence_anchor = 5"), "{saved}");
+    assert!(saved.contains("valid_until_present = true"), "{saved}");
     assert!(saved.contains("sequence = 7"), "{saved}");
     assert!(saved.contains("yanked_versions = [\"0.4.0\"]"), "{saved}");
     assert!(saved.contains("transparency_log_present = true"), "{saved}");
@@ -1080,15 +776,23 @@ fn rebootstrap_prints_and_clears_both_freshness_values_only() {
     assert!(!saved.contains("sequence_anchor = "), "{saved}");
     assert!(saved.contains("yanked_versions = [\"0.4.0\"]"), "{saved}");
     assert!(
-        saved.contains("signature_state = \"required_legacy\""),
+        saved.contains("signature_state = \"required_current\""),
         "{saved}"
     );
     assert!(
-        saved.contains("legacy_certificate_identity = \"identity-a\""),
+        saved.contains("source_repository_id = \"identity-a\""),
         "{saved}"
     );
     assert!(
-        saved.contains("legacy_certificate_oidc_issuer = \"issuer-a\""),
+        saved.contains("source_oidc_issuer = \"issuer-a\""),
+        "{saved}"
+    );
+    assert!(
+        saved.contains("source_repository_owner_id = \"owner-a\""),
+        "{saved}"
+    );
+    assert!(
+        saved.contains("stable_workflow = \"release.yml\""),
         "{saved}"
     );
     assert!(saved.contains("transparency_log_present = true"), "{saved}");

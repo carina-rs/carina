@@ -55,16 +55,11 @@ enum LoaderNotice {
         path: DisplayPath,
         project: DisplayPath,
     },
-    LockMigration(Box<crate::provider_resolver::LockFileMigration>),
 }
 
 impl ProviderLoadNotice {
     pub(crate) fn changed_artifact(path: DisplayPath, project: DisplayPath) -> Self {
         Self(LoaderNotice::ChangedArtifact { path, project })
-    }
-
-    pub(crate) fn migration(migration: crate::provider_resolver::LockFileMigration) -> Self {
-        Self(LoaderNotice::LockMigration(Box::new(migration)))
     }
 }
 
@@ -84,7 +79,6 @@ impl fmt::Display for ProviderLoadNotice {
                 path,
                 carina_core::hint::ProjectCommand::for_display_path("init", project)
             ),
-            LoaderNotice::LockMigration(migration) => fmt::Display::fmt(migration, f),
         }
     }
 }
