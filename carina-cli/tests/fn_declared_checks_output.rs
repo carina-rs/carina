@@ -40,6 +40,33 @@ async fn primitive_module_identity_upgrade_can_be_selected_with_moved() {
     assert!(plan.contains("Plan: 1 to add, 0 to change, 1 to destroy."));
     assert!(plan.contains("+ test.Sink instance.test_sink_2190428c0824b060"));
     assert!(plan.contains("- test.Sink instance.test_sink_22c482a506328080"));
+
+    for kind in ["IdentitySink", "Sink"] {
+        let moved_plan = stdout
+            .split_once(&format!("{kind}_MOVED_PLAN_BEGIN\n"))
+            .unwrap()
+            .1
+            .split_once(&format!("{kind}_MOVED_PLAN_END"))
+            .unwrap()
+            .0;
+        assert_eq!(
+            moved_plan.lines().find(|line| line.starts_with("Plan:")),
+            Some("Plan: 0 to add, 0 to change, 0 to destroy, 1 to move.")
+        );
+        let converged_plan = stdout
+            .split_once(&format!("{kind}_CONVERGED_PLAN_BEGIN\n"))
+            .unwrap()
+            .1
+            .split_once(&format!("{kind}_CONVERGED_PLAN_END"))
+            .unwrap()
+            .0;
+        assert_eq!(
+            converged_plan
+                .lines()
+                .find(|line| line.starts_with("No changes.")),
+            Some("No changes. Infrastructure is up-to-date.")
+        );
+    }
 }
 
 const MARKER: &str = "declared-secret-cobalt-784531";

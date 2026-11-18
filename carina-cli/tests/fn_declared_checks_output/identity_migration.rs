@@ -302,12 +302,21 @@ pub(super) async fn check_legacy_rows() {
         );
 
         std::fs::write(path.join("moved.crn"), moved_block).unwrap();
+        println!("{kind}_MOVED_PLAN_BEGIN");
         run_observed_plan_with_factories(&runtime, path, None, true, false, factories())
             .await
             .unwrap();
+        println!("{kind}_MOVED_PLAN_END");
         run_apply_with_factories_for_test(&runtime, path, factories())
             .await
             .unwrap();
+        println!("{kind}_CONVERGED_PLAN_BEGIN");
+        assert!(
+            !run_observed_plan_with_factories(&runtime, path, None, true, false, factories())
+                .await
+                .unwrap()
+        );
+        println!("{kind}_CONVERGED_PLAN_END");
         let state: Json = serde_json::from_slice(&std::fs::read(state_path).unwrap()).unwrap();
         let rows = state["resources"].as_array().unwrap();
         assert!(!rows.iter().any(|row| row["identity"] == old));

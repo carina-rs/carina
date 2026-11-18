@@ -176,16 +176,16 @@ If the schema declares identity paths, Carina generates the resource's state ide
 
 A user-defined function without parameter or return type annotations expands during parsing at both the root and in module bodies, unless it contains another retained user-defined call. A function with any declared type, including `String`, `Int`, `Bool`, `Float`, or `Duration`, stays as a call while an argument is unknown. It is inlined when every argument is known and its declared checks pass; otherwise the checks run when values become available, including during apply. A plan containing a retained user-defined call cannot be saved with `carina plan --out` or `carina plan --json`. Apply the project directly instead.
 
-At the root, an anonymous resource's address can change on upgrade when a value used to derive its identity calls an untyped user-defined function whose argument contains a call that has not yet been evaluated at parse time, such as `outer(upper(src.emitted))`. Carina now expands the user-defined call before computing the address. These root resources move automatically, including resources with declared identity attributes. Named resources keep their addresses.
+At the root, an anonymous resource's address can change on upgrade when a value used to derive its identity calls an untyped user-defined function whose argument contains a call that has not yet been evaluated at parse time, such as `outer(upper(src.emitted))`. Carina now expands the user-defined call before computing the address. These untyped-call address changes move automatically, including resources with declared identity attributes. Named resources keep their addresses.
 
-An upgrade can also change a module-body anonymous resource's address when all of these conditions hold:
+An upgrade can also change an anonymous resource's address at the root or in a module body when all of these conditions hold:
 
 - The function declares a primitive parameter or return type.
-- An argument is not known until apply, so the function call stays retained.
+- An argument is unknown during parsing, so the authored call stays retained for the resource's address.
 - The call's result contributes to the anonymous resource's identity material.
 - State written by an older version exists, using the expanded function body for that address.
 
-Inside a module, an existing resource whose value is such a call is re-created on upgrade unless you write `moved`; a schema with a declared identity stops with an error instead. Carina moves the row automatically only when it can prove a match, which can happen for create-only schemas. Review the plan before applying. This also applies to module-body calls retained for non-primitive declared checks.
+This includes plain-reference arguments such as `p(src.emitted)`. At either scope, a schema with a declared identity can stop with an error asking for `moved`. Without declared identity, Carina moves the row automatically only when it can prove a match; otherwise it plans to re-create the resource unless you write `moved`. Both mutable and create-only schemas can match automatically. Review the plan before applying. This also applies to module-body calls retained for non-primitive declared checks.
 
 For example, a declared-identity resource in a module instance named `network` can report the following error (the type and addresses depend on the project):
 
