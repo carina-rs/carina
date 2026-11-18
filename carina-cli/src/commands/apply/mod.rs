@@ -656,11 +656,13 @@ fn saved_plan_unresolved_by_resolved_id<S: Clone, D>(
         carina_core::resource::AbsoluteBindingAddress,
         D,
     >],
-    unresolved_resources: &[carina_core::resource::Resource<
-        S,
-        carina_core::resource::NoPlaceholder,
-        carina_core::resource::AbsoluteBindingAddress,
-        (),
+    unresolved_resources: &[carina_core::value::SavedAuthored<
+        carina_core::resource::Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            (),
+        >,
     >],
     apply_target: ApplyTarget<'_>,
 ) -> Result<HashMap<ResolvedResourceId, UnresolvedResource<S>>, AppError> {
@@ -687,7 +689,7 @@ fn saved_plan_unresolved_by_resolved_id<S: Clone, D>(
             )));
         }
 
-        let mut source = unresolved.clone();
+        let mut source = unresolved.as_inner().clone();
         source.id = resolved.id.clone();
         let resolved_id = ResolvedResourceId::try_new(resolved.id.clone()).ok_or_else(|| {
             carina_core::resource::PendingResourceIdentityError::new(resolved.id.clone())
@@ -3410,6 +3412,22 @@ trait SavedPlanResourceLike {
     fn attributes(&self) -> &indexmap::IndexMap<String, Value<Self::Stage>>;
 }
 
+impl<T: SavedPlanResourceLike> SavedPlanResourceLike for carina_core::value::SavedAuthored<T> {
+    type Stage = T::Stage;
+
+    fn id(&self) -> &ResourceId {
+        self.as_inner().id()
+    }
+
+    fn binding(&self) -> Option<&str> {
+        self.as_inner().binding()
+    }
+
+    fn attributes(&self) -> &indexmap::IndexMap<String, Value<Self::Stage>> {
+        self.as_inner().attributes()
+    }
+}
+
 impl<S, D, P: carina_core::resource::PlanValueKind> SavedPlanResourceLike
     for carina_core::resource::Resource<S, P, carina_core::resource::AbsoluteBindingAddress, D>
 {
@@ -3723,8 +3741,8 @@ fn rehydrate_desired_plan_file_with_verified_configs(
                     plan_file.unresolved_resources(),
                     &resource_candidates,
                     apply_target,
-                    carina_core::value::rehydrate_resource_secrets,
-                    Resource::to_value_resource,
+                    carina_core::value::SavedAuthored::rehydrate_resource_secrets,
+                    carina_core::value::SavedAuthored::to_value_resource,
                 )?;
 
                 let mut composition_source_identities =

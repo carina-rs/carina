@@ -2110,7 +2110,11 @@ mod tests {
                 ))
                 .into(),
             ));
-        let snapshot = carina_core::value::redact_secrets_in_value(&secret).unwrap();
+        let snapshot = crate::test_support::with_saved_document(|conversion| {
+            conversion.redact_secrets_in_value(&secret)
+        })
+        .map(carina_core::value::Saved::into_inner)
+        .unwrap();
         let unavailable = snapshot.to_value_at(&raw).unwrap_err();
         let replan = "carina plan".to_string();
         for error in [
@@ -2172,7 +2176,11 @@ mod tests {
         let secret: Value = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
         ));
-        let snapshot = carina_core::value::redact_secrets_in_value(&secret).unwrap();
+        let snapshot = crate::test_support::with_saved_document(|conversion| {
+            conversion.redact_secrets_in_value(&secret)
+        })
+        .map(carina_core::value::Saved::into_inner)
+        .unwrap();
         let unavailable = snapshot.to_value_at("loop.items").unwrap_err();
         let error = AppError::from(
             carina_core::parser::DeferredForExpansionError::UnavailableSecret(unavailable),

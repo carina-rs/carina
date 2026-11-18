@@ -1290,7 +1290,7 @@ impl<P> RehydratedPlanFile<P> {
         &self.planned_secret_hashes
     }
 
-    fn unresolved_resources(&self) -> &[SavedResource] {
+    fn unresolved_resources(&self) -> &[carina_core::value::SavedAuthored<SavedResource>] {
         self.plan_file.unresolved_resources()
     }
 
@@ -1367,7 +1367,9 @@ impl ExecutablePlanFile {
         self.plan.planned_secret_hashes()
     }
 
-    pub(super) fn unresolved_resources(&self) -> &[SavedResource] {
+    pub(super) fn unresolved_resources(
+        &self,
+    ) -> &[carina_core::value::SavedAuthored<SavedResource>] {
         self.plan.unresolved_resources()
     }
 
@@ -1805,7 +1807,11 @@ mod tests {
         contents.state_serial = Some(locked_state.serial);
         let desired = Resource::from_id(to.clone()).into_value_snapshot();
         contents.sorted_resources.push(desired.to_snapshot());
-        contents.unresolved_resources.push(desired.to_snapshot());
+        contents
+            .unresolved_resources
+            .push(crate::test_support::saved_authored_resource(
+                carina_core::executor::UnresolvedResource::from_pre_resolve(desired.clone()),
+            ));
         contents
             .sorted_value_destroy_dependencies
             .push(Default::default());

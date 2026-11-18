@@ -103,7 +103,8 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
             unresolved_resources: planned
                 .unresolved_resources
                 .iter()
-                .map(|resource| resource.as_resource().to_snapshot())
+                .cloned()
+                .map(crate::test_support::saved_authored_resource)
                 .collect(),
             compositions: Vec::new(),
             data_sources: Vec::new(),

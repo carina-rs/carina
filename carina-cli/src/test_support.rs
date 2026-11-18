@@ -7,6 +7,34 @@ use carina_core::{EnvironmentSnapshot, TestUserDirs};
 use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
 use std::sync::{Arc, OnceLock};
 
+/// Build synthetic admitted values through the production conversion.
+pub fn with_saved_document<T>(
+    build: impl FnOnce(
+        &carina_core::value::SavedDocumentConversion,
+    ) -> Result<T, carina_core::value::SerializationError>,
+) -> Result<T, carina_core::value::SerializationError> {
+    carina_core::value::SavedDocumentConversion::document(
+        &carina_core::parser::ExpandedInferredFile::default(),
+        &[],
+        build,
+    )
+}
+
+/// Capture an authored resource from a synthetic pre-resolution fixture.
+pub fn saved_authored_resource<S: Clone>(
+    source: carina_core::executor::UnresolvedResource<S>,
+) -> carina_core::value::SavedAuthored<
+    carina_core::resource::Resource<
+        S,
+        carina_core::resource::SnapshotLeaf,
+        carina_core::resource::AbsoluteBindingAddress,
+        (),
+    >,
+> {
+    with_saved_document(|conversion| conversion.authored_resource(&source, source.as_resource()))
+        .expect("authored fixture must pass saved-document admission")
+}
+
 /// A confirmed storage failure; every state or lock operation is forbidden.
 #[cfg(test)]
 pub(crate) struct UnavailableStorageBackend {

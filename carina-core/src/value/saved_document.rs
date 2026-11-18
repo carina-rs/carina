@@ -5,7 +5,7 @@ use std::ops::Deref;
 /// A saved-document tree whose values passed retained-call admission.
 /// No mutable view or unchecked constructor is available.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0423
 /// use carina_core::{resource::Resource, value::Saved};
 /// fn bypass(resource: Resource) {
 ///     let _ = Saved(resource.to_snapshot());
@@ -35,6 +35,139 @@ impl<T: serde::Serialize> serde::Serialize for Saved<T> {
 impl<'de, T: serde::Deserialize<'de> + DocumentTree> serde::Deserialize<'de> for Saved<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         admit(T::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An admitted pre-resolution resource tree, distinct from evaluated snapshots.
+///
+/// ```compile_fail,E0423
+/// use carina_core::{resource::Resource, value::SavedAuthored};
+/// fn bypass(resource: Resource) {
+///     let _ = SavedAuthored(resource.to_snapshot());
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// use carina_core::{resource::Resource, value::{Saved, SavedAuthored}};
+/// fn bypass(evaluated: Saved<Resource>) -> SavedAuthored<Resource> {
+///     evaluated.into()
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::{resource::Resource, value::SavedDocumentConversion};
+/// fn bypass(conversion: &SavedDocumentConversion, evaluated: &Resource) {
+///     let _ = conversion.authored_resource(evaluated, evaluated);
+/// }
+/// ```
+///
+/// ```compile_fail,E0596
+/// use carina_core::{resource::Resource, value::SavedAuthored};
+/// fn mutate(mut authored: SavedAuthored<Resource>) {
+///     authored.attributes.clear();
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedAuthored<T>(T);
+
+impl<T> SavedAuthored<T> {
+    pub fn as_inner(&self) -> &T {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T> Deref for SavedAuthored<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: serde::Serialize> serde::Serialize for SavedAuthored<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de> + DocumentTree> serde::Deserialize<'de> for SavedAuthored<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        admit(T::deserialize(deserializer)?)
+            .map(|value| Self(value.into_inner()))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl<S, P: PlanValueKind>
+    SavedAuthored<crate::resource::Resource<S, P, AbsoluteBindingAddress, ()>>
+{
+    pub fn into_saved_source(
+        self,
+    ) -> SavedAuthored<
+        crate::resource::Resource<
+            crate::resource::SavedModuleSource,
+            P,
+            AbsoluteBindingAddress,
+            (),
+        >,
+    >
+    where
+        crate::resource::Resource<S, P, AbsoluteBindingAddress, ()>: Into<
+            crate::resource::Resource<
+                crate::resource::SavedModuleSource,
+                P,
+                AbsoluteBindingAddress,
+                (),
+            >,
+        >,
+    {
+        SavedAuthored(self.0.into())
+    }
+}
+
+impl<S: Clone>
+    SavedAuthored<crate::resource::Resource<S, SnapshotLeaf, AbsoluteBindingAddress, ()>>
+{
+    pub fn to_value_resource(
+        &self,
+    ) -> Result<
+        SavedAuthored<
+            crate::resource::Resource<
+                S,
+                crate::resource::NoPlaceholder,
+                AbsoluteBindingAddress,
+                (),
+            >,
+        >,
+        crate::resource::UnavailableSecretError,
+    > {
+        self.0.to_value_resource().map(SavedAuthored)
+    }
+
+    pub fn rehydrate_resource_secrets<T, E>(
+        &self,
+        evaluated: &crate::resource::Resource<
+            T,
+            crate::resource::NoPlaceholder,
+            AbsoluteBindingAddress,
+            E,
+        >,
+    ) -> Result<
+        SavedAuthored<
+            crate::resource::Resource<
+                S,
+                crate::resource::NoPlaceholder,
+                AbsoluteBindingAddress,
+                (),
+            >,
+        >,
+        SecretRehydrationSiteError,
+    > {
+        rehydrate_resource_secrets(&self.0, evaluated).map(SavedAuthored)
     }
 }
 
@@ -79,7 +212,7 @@ fn admit<T: DocumentTree>(value: T) -> Result<Saved<T>, SerializationError> {
 
 /// Borrowed conversion authority minted by the document constructor after exports.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0423
 /// let conversion = carina_core::value::SavedDocumentConversion;
 /// ```
 pub struct SavedDocumentConversion {
@@ -119,6 +252,40 @@ impl SavedDocumentConversion {
     }
     pub fn value(&self, value: &Value) -> Result<Saved<SnapshotValue>, SerializationError> {
         self.snapshot(value.to_snapshot())
+    }
+    pub fn redact_secrets_in_value(
+        &self,
+        value: &Value,
+    ) -> Result<Saved<SnapshotValue>, SerializationError> {
+        self.convert(value, redact_secrets_in_value)
+    }
+    pub fn redact_secrets_in_attributes(
+        &self,
+        attributes: &HashMap<String, Value>,
+    ) -> Result<Saved<HashMap<String, SnapshotValue>>, SerializationError> {
+        self.convert(attributes, redact_secrets_in_attributes)
+    }
+    pub fn redact_secrets_in_saved_composition(
+        &self,
+        composition: &crate::resource::SavedComposition,
+    ) -> Result<Saved<crate::resource::SavedComposition>, SerializationError> {
+        self.convert(composition, redact_secrets_in_saved_composition)
+    }
+    pub fn authored_resource<S: Clone, T, E>(
+        &self,
+        source: &crate::effect::deps::UnresolvedResource<S>,
+        evaluated: &crate::resource::Resource<
+            T,
+            crate::resource::NoPlaceholder,
+            AbsoluteBindingAddress,
+            E,
+        >,
+    ) -> Result<
+        SavedAuthored<crate::resource::Resource<S, SnapshotLeaf, AbsoluteBindingAddress, ()>>,
+        SerializationError,
+    > {
+        self.redact_secrets_in_resource_using_evaluated(source.as_resource(), evaluated)
+            .map(|saved| SavedAuthored(saved.into_inner()))
     }
     pub fn state_value<P: StateValueLeaf>(
         &self,
@@ -304,6 +471,11 @@ impl<T: DocumentTree> sealed::Tree for &T {
         sealed::Tree::visit(*self, names);
     }
 }
+impl<T: DocumentTree> sealed::Tree for SavedAuthored<T> {
+    fn visit(&self, names: &mut FunctionNames) {
+        names.tree(self.as_inner());
+    }
+}
 impl<T: DocumentTree> sealed::Tree for Vec<T> {
     fn visit(&self, names: &mut FunctionNames) {
         for value in self {
@@ -437,6 +609,7 @@ impl<T: DocumentTree> sealed::Tree for Box<T> {
         names.tree(self.as_ref());
     }
 }
+
 macro_rules! effect_tree {
     ($node:ident, $this:expr, $names:expr) => {
         match $this {
@@ -536,6 +709,8 @@ impl sealed::Tree for crate::replacement::ReplacementInputs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect::deps::UnresolvedResource;
+    use crate::resource::{Resource, SavedModuleSource};
 
     fn call(name: &str, file: &str) -> Value {
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
@@ -582,5 +757,60 @@ mod tests {
             refusal(values),
             "the plan contains unevaluated calls to the user-defined functions 'f00', 'f01', 'f02', 'f03', 'f04', 'f05', 'f06', 'f07' (and 2 more). A saved plan cannot carry these calls."
         );
+    }
+
+    #[test]
+    fn authored_resource_keeps_references_and_serialized_bytes() {
+        let authored: Resource = Resource::new("test.Sink", "sink")
+            .with_attribute(
+                "value",
+                Value::root_resource_ref("src", "emitted", Vec::new()),
+            )
+            .with_attribute(
+                "settings",
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "nested".into(),
+                    Value::Concrete(ConcreteValue::List(vec![
+                        Value::Concrete(ConcreteValue::Int(7)),
+                        Value::Concrete(ConcreteValue::Bool(true)),
+                    ])),
+                )]))),
+            );
+        let source = UnresolvedResource::from_pre_resolve(authored);
+        let evaluated: Resource = Resource::new("test.Sink", "sink").with_attribute(
+            "value",
+            Value::Concrete(ConcreteValue::String("evaluated".into())),
+        );
+        let expected = source.as_resource().to_snapshot();
+        let saved = crate::value::with_saved_document(|conversion| {
+            conversion.authored_resource(&source, &evaluated)
+        })
+        .unwrap();
+        assert_eq!(saved.as_inner(), &expected);
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&expected).unwrap());
+        let decoded: SavedAuthored<
+            Resource<SavedModuleSource, SnapshotLeaf, AbsoluteBindingAddress, ()>,
+        > = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn authored_resource_admission_precedes_evaluated_replacement() {
+        let source: Resource = Resource::new("test.Sink", "sink").with_attribute(
+            "value",
+            crate::value::retained_call_snapshot_tests::retained_call(),
+        );
+        let source = UnresolvedResource::from_pre_resolve(source);
+        let evaluated: Resource = Resource::new("test.Sink", "sink").with_attribute(
+            "value",
+            Value::Concrete(ConcreteValue::String("evaluated".into())),
+        );
+        assert!(matches!(
+            crate::value::with_saved_document(|conversion| {
+                conversion.authored_resource(&source, &evaluated)
+            }),
+            Err(SerializationError::RetainedUserFunctionCall(_))
+        ));
     }
 }

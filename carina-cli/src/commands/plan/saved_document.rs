@@ -1,5 +1,5 @@
 use super::*;
-use carina_core::value::{Saved, SavedDocumentConversion};
+use carina_core::value::{Saved, SavedAuthored, SavedDocumentConversion};
 /// Immutable admitted contents awaiting provider evidence.
 /// Its constructor requires admitted values for every DSL-bearing field.
 /// The transport view is read-only; recording consumes this owner.
@@ -28,21 +28,44 @@ use carina_core::value::{Saved, SavedDocumentConversion};
 /// ```
 /// Saved-document fields require admission, including snapshots made without redaction.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_cli::commands::plan::PlanFileContents;
-/// fn bypass(contents: &mut PlanFileContents) {
+/// use carina_core::value::Saved;
+/// fn bypass(contents: &PlanFileContents) {
 ///     let resource = contents.sorted_resources[0].to_value_resource().unwrap();
-///     contents.sorted_resources = vec![resource.to_snapshot()];
+///     let _: Saved<_> = resource.to_snapshot();
 /// }
 /// ```
 ///
-/// ```compile_fail
-/// use carina_cli::commands::plan::PlanFileContents;
+/// ```compile_fail,E0603
 /// use carina_core::value::redact_secrets_in_resource;
-/// fn bypass(contents: &mut PlanFileContents) {
-///     let resource = contents.sorted_resources[0].to_value_resource().unwrap();
-///     contents.sorted_resources = vec![redact_secrets_in_resource(&resource).unwrap()];
-/// }
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_in_resource_reusing_persisted_hashes;
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_in_resource_using_evaluated;
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_in_data_source;
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_in_data_source_using_evaluated;
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_in_live_composition;
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_in_saved_composition;
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_in_value;
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_in_attributes;
+/// ```
+/// ```compile_fail,E0603
+/// use carina_core::value::redact_secrets_using_evaluated;
 /// ```
 #[derive(Debug, Clone)]
 pub struct PlanFileContents {
@@ -74,7 +97,8 @@ pub(super) struct Parts<S = ModuleSource> {
     #[serde(deserialize_with = "deserialize_persisted_destroy_dependency_vec")]
     pub sorted_explicit_destroy_dependencies: Vec<PersistedDestroyDependencies>,
     pub legacy_dependency_classification: Option<LegacyDependencyClassification>,
-    pub unresolved_resources: Vec<Saved<Resource<S, SnapshotLeaf, AbsoluteBindingAddress, ()>>>,
+    pub unresolved_resources:
+        Vec<SavedAuthored<Resource<S, SnapshotLeaf, AbsoluteBindingAddress, ()>>>,
     pub compositions: Vec<Saved<SavedComposition>>,
     pub data_sources:
         Vec<Saved<carina_core::resource::DataSource<S, SnapshotLeaf, AbsoluteBindingAddress, ()>>>,
@@ -150,7 +174,7 @@ where
             legacy_dependency_classification,
             unresolved_resources: unresolved_resources
                 .into_iter()
-                .map(|resource| resource.into_inner().into())
+                .map(SavedAuthored::into_saved_source)
                 .collect(),
             compositions: compositions.into_iter().map(Saved::into_inner).collect(),
             data_sources: data_sources
@@ -326,7 +350,7 @@ pub(super) fn admit_fixture(
             sorted_value_destroy_dependencies,
             sorted_explicit_destroy_dependencies,
             legacy_dependency_classification,
-            unresolved_resources: resources(unresolved_resources)?,
+            unresolved_resources,
             compositions: compositions
                 .into_iter()
                 .map(|value| conversion.snapshot(value))

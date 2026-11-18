@@ -183,7 +183,9 @@ moved {
 }
 ```
 
-Resources whose schemas use mutable attributes or create-only attributes without a declared identity move automatically. Named resources and root-level resources keep their addresses.
+Resources whose schemas use mutable attributes or create-only attributes without a declared identity move automatically. Named resources keep their addresses.
+
+At the root, an anonymous resource's address also changes when a value used to derive its identity calls an untyped or primitive-only user-defined function whose argument contains a call that has not yet been evaluated at parse time, such as `outer(upper(src.emitted))`. Carina now expands the user-defined call before computing the address. The upgrade moves these resources automatically, including resources with declared identity attributes.
 
 ### Named Resources (Let Bindings)
 

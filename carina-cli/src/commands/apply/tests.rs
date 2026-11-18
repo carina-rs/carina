@@ -1218,7 +1218,8 @@ for account_id in orgs.accounts {
         unresolved_resources: vec![resource]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
-            .map(|value| value.to_snapshot())
+            .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+            .map(crate::test_support::saved_authored_resource)
             .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -1347,15 +1348,16 @@ async fn run_saved_plan_schema_fingerprint_case(
         backend_config: crate::commands::plan::SavedBackendConfig::default(),
         plan: crate::test_support::creation_fixture::recorded_snapshot(&plan),
         sorted_resources: vec![
-            carina_core::value::redact_secrets_in_resource(&resource)
-                .unwrap()
-                .into_value_snapshot(),
+            crate::test_support::with_saved_document(|conversion| {
+                conversion.redact_secrets_in_resource(&resource)
+            })
+            .map(carina_core::value::Saved::into_inner)
+            .unwrap()
+            .into_value_snapshot(),
         ],
-        unresolved_resources: vec![
-            carina_core::value::redact_secrets_in_resource(&resource)
-                .unwrap()
-                .into_value_snapshot(),
-        ],
+        unresolved_resources: vec![crate::test_support::saved_authored_resource(
+            carina_core::executor::UnresolvedResource::from_pre_resolve(resource.clone()),
+        )],
         compositions: Vec::new(),
         data_sources: Vec::new(),
         data_source_origins: Vec::new(),
@@ -1891,10 +1893,13 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
     )
     .expect("create composition source identity resolver");
-    let saved = carina_core::value::redact_secrets_in_live_composition(&saved)
-        .expect("redact composition")
-        .into_saved_with_resolver(&mut source_identities)
-        .expect("save anonymous composition");
+    let saved = crate::test_support::with_saved_document(|conversion| {
+        conversion.redact_secrets_in_live_composition(&saved)
+    })
+    .map(carina_core::value::Saved::into_inner)
+    .expect("redact composition")
+    .into_saved_with_resolver(&mut source_identities)
+    .expect("save anonymous composition");
 
     let mut current = saved_module_composition(secret, "rejected");
     current.id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -2054,10 +2059,13 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
     )
     .expect("create composition source identity resolver");
-    let saved = carina_core::value::redact_secrets_in_live_composition(&composition)
-        .expect("capture composition snapshot")
-        .into_saved_with_resolver(&mut source_identities)
-        .expect("save composition");
+    let saved = crate::test_support::with_saved_document(|conversion| {
+        conversion.redact_secrets_in_live_composition(&composition)
+    })
+    .map(carina_core::value::Saved::into_inner)
+    .expect("capture composition snapshot")
+    .into_saved_with_resolver(&mut source_identities)
+    .expect("save composition");
     let plan_file = record_with_test_context(PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: "test".to_string(),
@@ -2248,7 +2256,8 @@ async fn saved_plan_persists_pending_state_migration_before_drift_return() {
         unresolved_resources: vec![resource]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
-            .map(|value| value.to_snapshot())
+            .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+            .map(crate::test_support::saved_authored_resource)
             .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -2417,7 +2426,8 @@ async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write
         unresolved_resources: vec![dependency, example]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
-            .map(|value| value.to_snapshot())
+            .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+            .map(crate::test_support::saved_authored_resource)
             .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -4880,7 +4890,8 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
         unresolved_resources: vec![target, consumer]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
-            .map(|value| value.to_snapshot())
+            .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+            .map(crate::test_support::saved_authored_resource)
             .collect(),
         compositions: Vec::new(),
         data_sources: (vec![lookup.clone().into_value_snapshot()])
@@ -5000,10 +5011,13 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
     )
     .expect("create composition source identity resolver");
-    let saved_composition = carina_core::value::redact_secrets_in_live_composition(&composition)
-        .expect("capture composition snapshot")
-        .into_saved_with_resolver(&mut source_identities)
-        .expect("save composition");
+    let saved_composition = crate::test_support::with_saved_document(|conversion| {
+        conversion.redact_secrets_in_live_composition(&composition)
+    })
+    .map(carina_core::value::Saved::into_inner)
+    .expect("capture composition snapshot")
+    .into_saved_with_resolver(&mut source_identities)
+    .expect("save composition");
     let mut graph_file = carina_core::parser::ExpandedParsedFile::default();
     graph_file.resources = vec![producer.clone(), consumer.clone()];
     let graph = carina_core::resolved_graph::resolve_expanded_graph(graph_file.into())
@@ -5052,7 +5066,8 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
         legacy_dependency_classification: None,
         unresolved_resources: (vec![producer.into_value_snapshot(), consumer_for_unresolved])
             .into_iter()
-            .map(|value| value.to_snapshot())
+            .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+            .map(crate::test_support::saved_authored_resource)
             .collect(),
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
@@ -5119,9 +5134,13 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
     )
     .expect("create composition source identity resolver");
-    let saved_composition = carina_core::value::redact_secrets_in_live_composition(
-        &saved_module_composition(string_value("bad"), "bad"),
-    )
+    let saved_composition = crate::test_support::with_saved_document(|conversion| {
+        conversion.redact_secrets_in_live_composition(&saved_module_composition(
+            string_value("bad"),
+            "bad",
+        ))
+    })
+    .map(carina_core::value::Saved::into_inner)
     .expect("capture composition snapshot")
     .into_saved_with_resolver(&mut source_identities)
     .expect("save composition");
@@ -5787,7 +5806,8 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
         unresolved_resources: vec![resource]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
-            .map(|value| value.to_snapshot())
+            .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+            .map(crate::test_support::saved_authored_resource)
             .collect(),
         compositions: Vec::new(),
         data_sources: Vec::new(),
@@ -12012,7 +12032,8 @@ mod saved_plan_version_tests {
             unresolved_resources: vec![resource]
                 .into_iter()
                 .map(|resource| resource.into_value_snapshot())
-                .map(|value| value.to_snapshot())
+                .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+                .map(crate::test_support::saved_authored_resource)
                 .collect(),
             compositions: Vec::new(),
             data_sources: Vec::new(),

@@ -49,9 +49,9 @@ fn root_resource_ref(binding: &str, attribute: &str) -> Value {
 use carina_core::config_loader::load_configuration_for_bootstrap;
 use carina_core::schema::SchemaKind;
 use carina_core::upstream_exports::AdmittedRemoteBindings;
-use carina_core::value::PersistedExportValue;
 #[cfg(test)]
 use carina_core::value::PersistedValue;
+use carina_core::value::{PersistedExportValue, SavedAuthored};
 use carina_state::{
     LegacyDependencyClassification, ResolvedReadBackend, S3BootstrapInfo, StateFile,
     StorageReadinessStatus,
@@ -680,6 +680,32 @@ mod provider_scope_evidence_tests {
 
 /// Mutable transport for decoded/replayed plans and test fixtures.
 /// It is not accepted by the production document recorder.
+///
+/// Evaluated resources cannot replace the admitted authored-source snapshots.
+///
+/// ```compile_fail,E0308
+/// use carina_cli::commands::plan::PlanFileTransport;
+/// use carina_core::resource::{AbsoluteBindingAddress, ModuleSource, Resource, SnapshotLeaf};
+/// use carina_core::value::Saved;
+/// fn replace_source(
+///     transport: &mut PlanFileTransport,
+///     evaluated: Saved<Resource<ModuleSource, SnapshotLeaf, AbsoluteBindingAddress, ()>>,
+/// ) {
+///     transport.unresolved_resources = vec![evaluated.into_inner()];
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_cli::commands::plan::PlanFileTransport;
+/// use carina_core::resource::{AbsoluteBindingAddress, ModuleSource, Resource, SnapshotLeaf};
+/// use carina_core::value::Saved;
+/// fn replace_source(
+///     transport: &mut PlanFileTransport,
+///     evaluated: Saved<Resource<ModuleSource, SnapshotLeaf, AbsoluteBindingAddress, ()>>,
+/// ) {
+///     transport.unresolved_resources = vec![evaluated];
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct PlanFileTransport<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueKind = SnapshotLeaf>
 {
@@ -789,7 +815,7 @@ pub struct PlanFileTransport<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValue
     /// and keys by the sorted resource ID for dependency analysis and
     /// apply-time reference re-resolution.
     pub unresolved_resources:
-        Vec<Resource<S, V, carina_core::resource::AbsoluteBindingAddress, ()>>,
+        Vec<SavedAuthored<Resource<S, V, carina_core::resource::AbsoluteBindingAddress, ()>>>,
     /// Virtual resources (module-call attribute containers) emitted
     /// by module expansion at plan time (carina#3248). Persisted so
     /// the saved-plan apply path builds the same `ResolvedBindings`
@@ -939,7 +965,7 @@ where
             legacy_dependency_classification,
             unresolved_resources: unresolved_resources
                 .into_iter()
-                .map(Resource::from)
+                .map(SavedAuthored::into_saved_source)
                 .collect(),
             compositions,
             data_sources: data_sources
@@ -1210,7 +1236,7 @@ struct PlanFileWire {
     sorted_explicit_destroy_dependencies: Vec<PersistedDestroyDependencies>,
     legacy_dependency_classification: Option<LegacyDependencyClassification>,
     unresolved_resources:
-        Vec<Resource<SavedModuleSource, SnapshotLeaf, AbsoluteBindingAddress, ()>>,
+        Vec<SavedAuthored<Resource<SavedModuleSource, SnapshotLeaf, AbsoluteBindingAddress, ()>>>,
     compositions: Vec<SavedComposition>,
     #[serde(default)]
     data_sources: Vec<
@@ -1915,11 +1941,11 @@ impl<S, V: PlanValueKind> PlanFileTransport<S, Plan<S, V>, V> {
                 }
             }
         }
-        for resource in self
-            .sorted_resources
-            .iter()
-            .chain(&self.unresolved_resources)
-        {
+        for resource in self.sorted_resources.iter().chain(
+            self.unresolved_resources
+                .iter()
+                .map(SavedAuthored::as_inner),
+        ) {
             insert(&mut instances, &resource.id);
         }
         for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
@@ -2099,11 +2125,11 @@ impl UnresolvedPlanFileTransport {
                 }
             }
         }
-        for resource in self
-            .sorted_resources
-            .iter()
-            .chain(&self.unresolved_resources)
-        {
+        for resource in self.sorted_resources.iter().chain(
+            self.unresolved_resources
+                .iter()
+                .map(SavedAuthored::as_inner),
+        ) {
             insert(&mut instances, &resource.id);
         }
         for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
@@ -2433,7 +2459,9 @@ impl PlanFile {
             })
             || plan.contains_redacted_secret_placeholders()
             || sorted_resources.iter().any(resource_contains)
-            || unresolved_resources.iter().any(resource_contains)
+            || unresolved_resources
+                .iter()
+                .any(|resource| resource_contains(resource.as_inner()))
             || compositions
                 .iter()
                 .any(SavedComposition::contains_redacted_secret_placeholder)
@@ -4179,7 +4207,7 @@ impl<V: PlanValueKind, P> ReloadedPlanFile<V, P> {
 
     pub(crate) fn unresolved_resources(
         &self,
-    ) -> &[Resource<SavedModuleSource, V, AbsoluteBindingAddress, ()>] {
+    ) -> &[SavedAuthored<Resource<SavedModuleSource, V, AbsoluteBindingAddress, ()>>] {
         &self.contents.unresolved_resources
     }
 
@@ -4236,7 +4264,7 @@ pub(crate) struct LivePlanFileValues {
         carina_core::provider_text::SavedInputsResolved,
     >,
     pub(crate) plan: carina_core::saved_replay::SavedPlanReplay,
-    pub(crate) unresolved_resources: Vec<SavedResource>,
+    pub(crate) unresolved_resources: Vec<SavedAuthored<SavedResource>>,
     pub(crate) compositions: Vec<SavedComposition<NoPlaceholder>>,
     pub(crate) data_source_origins: Vec<SavedDataSource>,
     pub(crate) provider_configs: SavedProviderConfigs<NoPlaceholder>,
@@ -4337,7 +4365,7 @@ impl ReloadedPlanFile<SnapshotLeaf> {
             unresolved_resources: self
                 .unresolved_resources()
                 .iter()
-                .map(Resource::to_value_resource)
+                .map(SavedAuthored::to_value_resource)
                 .collect::<Result<_, _>>()?,
             compositions: self
                 .compositions()
@@ -5514,12 +5542,7 @@ impl CheckedPlanFileContents {
                     .unresolved_resources
                     .iter()
                     .zip(&ctx.sorted_resources)
-                    .map(|(source, evaluated)| {
-                        conversion.redact_secrets_in_resource_using_evaluated(
-                            source.as_resource(),
-                            evaluated,
-                        )
-                    })
+                    .map(|(source, evaluated)| conversion.authored_resource(source, evaluated))
                     .collect::<Result<Vec<_>, _>>()?,
                 compositions: ctx
                     .compositions
@@ -11016,7 +11039,7 @@ mod plan_serialization_error_tests {
     use carina_core::resource::{
         AccessPath, ApplyTimeUnknown, ConcreteValue, DeferredValue, Resource, Value,
     };
-    use carina_core::value::{PersistedValue, SerializationError, redact_secrets_in_resource};
+    use carina_core::value::{PersistedValue, SerializationError};
 
     fn upstream_unknown() -> Value {
         let path = AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
@@ -11053,7 +11076,6 @@ mod plan_serialization_error_tests {
         use carina_core::plan::Plan;
         use carina_core::resource::SnapshotValue;
         use carina_core::resource::{ResolvedResource, SnapshotState};
-        use carina_core::value::redact_secrets_in_value;
         use std::collections::HashMap;
 
         let secret = Value::Deferred(DeferredValue::Secret(
@@ -11063,7 +11085,14 @@ mod plan_serialization_error_tests {
             .into(),
         ));
         let historical = SnapshotValue::Concrete(carina_core::resource::ConcreteValue::Map(
-            indexmap::IndexMap::from([("token".into(), redact_secrets_in_value(&secret).unwrap())]),
+            indexmap::IndexMap::from([(
+                "token".into(),
+                crate::test_support::with_saved_document(|conversion| {
+                    conversion.redact_secrets_in_value(&secret)
+                })
+                .map(carina_core::value::Saved::into_inner)
+                .unwrap(),
+            )]),
         ));
         let whole_secret = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::Map(
@@ -11172,7 +11201,11 @@ mod plan_serialization_error_tests {
     fn redact_secrets_in_resource_errors_on_unknown_attribute() {
         let mut r = Resource::new("test.resource", "name");
         r.attributes.insert("vpc_id".into(), upstream_unknown());
-        let err = redact_secrets_in_resource(&r).unwrap_err();
+        let err = crate::test_support::with_saved_document(|conversion| {
+            conversion.redact_secrets_in_resource(&r)
+        })
+        .map(carina_core::value::Saved::into_inner)
+        .unwrap_err();
         assert!(matches!(err, SerializationError::UnknownNotAllowed { .. }));
     }
 }

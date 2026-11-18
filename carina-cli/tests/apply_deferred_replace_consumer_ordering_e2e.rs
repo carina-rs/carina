@@ -451,7 +451,8 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         unresolved_resources: sorted_resources
             .into_iter()
             .map(Resource::into_value_snapshot)
-            .map(|value| value.to_snapshot())
+            .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+            .map(carina_cli::test_support::saved_authored_resource)
             .collect(),
         compositions: vec![],
         data_sources: vec![],

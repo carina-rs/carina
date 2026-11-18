@@ -999,7 +999,8 @@ fn plan_file_serde_round_trip() {
             unresolved_resources: sorted_resources
                 .into_iter()
                 .map(Resource::into_value_snapshot)
-                .map(|value| value.to_snapshot())
+                .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+                .map(crate::test_support::saved_authored_resource)
                 .collect(),
             current_states,
             compositions: vec![],
@@ -1026,6 +1027,12 @@ fn plan_file_serde_round_trip() {
     );
 
     let json = serde_json::to_string_pretty(&plan_file).unwrap();
+    let decoded: PlanFile = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        serde_json::to_string_pretty(&decoded).unwrap(),
+        json,
+        "admission must preserve every byte of this resource, state, and effect document"
+    );
     let mut wire: serde_json::Value = serde_json::from_str(&json).unwrap();
     let saved_module_source = serde_json::json!({
         "Module": { "name": "web_tier", "instance": "web" }
@@ -3934,8 +3941,6 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
 #[test]
 fn plan_file_serialization_redacts_secrets() {
-    use carina_core::value::redact_secrets_in_resource;
-
     // Build a plan with secrets in resources, states, and effects
     let secret_password = Value::Deferred(DeferredValue::Secret(
         Box::new(Value::Concrete(ConcreteValue::String(
@@ -3994,15 +3999,21 @@ fn plan_file_serialization_redacts_secrets() {
             backend_config: crate::commands::plan::SavedBackendConfig::default(),
             plan: crate::test_support::creation_fixture::recorded_snapshot(&plan),
             sorted_resources: vec![
-                redact_secrets_in_resource(&resolved_inner(resource_with_secret.clone())).unwrap(),
+                crate::test_support::with_saved_document(|conversion| {
+                    conversion
+                        .redact_secrets_in_resource(&resolved_inner(resource_with_secret.clone()))
+                })
+                .map(carina_core::value::Saved::into_inner)
+                .unwrap(),
             ],
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
             legacy_dependency_classification: None,
-            unresolved_resources: vec![redact_secrets_in_resource(&resource_with_secret).unwrap()]
-                .into_iter()
-                .map(|resource| resource.into_value_snapshot())
-                .collect(),
+            unresolved_resources: vec![crate::test_support::saved_authored_resource(
+                carina_core::executor::UnresolvedResource::from_pre_resolve(
+                    resource_with_secret.clone(),
+                ),
+            )],
             compositions: vec![],
             data_sources: vec![],
             data_source_origins: vec![],

@@ -3,6 +3,17 @@ mod creation;
 
 use carina_core::resource::{ConcreteValue, DeferredValue, SnapshotValue, Value};
 
+fn redact_for_snapshot(
+    value: &Value,
+) -> Result<SnapshotValue, carina_core::value::SerializationError> {
+    carina_core::value::SavedDocumentConversion::document(
+        &carina_core::parser::ExpandedInferredFile::default(),
+        &[],
+        |conversion| conversion.redact_secrets_in_value(value),
+    )
+    .map(carina_core::value::Saved::into_inner)
+}
+
 fn root_resource_ref(
     binding: &str,
     attribute: &str,
@@ -16,7 +27,7 @@ fn root_resource_ref(
 
 fn hash_wire() -> serde_json::Value {
     serde_json::to_value(
-        carina_core::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+        redact_for_snapshot(&Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String("password".into()))).into(),
         )))
         .unwrap(),
@@ -176,7 +187,7 @@ fn historical_siblings() -> SnapshotValue {
             )])),
         ),
     ])));
-    let redacted = carina_core::value::redact_secrets_in_value(&desired).unwrap();
+    let redacted = redact_for_snapshot(&desired).unwrap();
     carina_core::value::PersistedValue::encode_provider_value(&redacted, None)
         .unwrap()
         .decode()

@@ -1,7 +1,7 @@
 //! Value conversion and formatting utilities
 
 pub(crate) mod saved_document;
-pub use saved_document::{DocumentTree, Saved, SavedDocumentConversion};
+pub use saved_document::{DocumentTree, Saved, SavedAuthored, SavedDocumentConversion};
 
 use crate::resource::DiagnosticScope;
 use crate::resource::InsideSecret;
@@ -3231,7 +3231,7 @@ pub use observations::{
 pub(crate) use secret_protection::SecretProtection;
 
 /// Evaluation owns whether an expression's selected result is secret.
-pub fn redact_secrets_using_evaluated(
+pub(crate) fn redact_secrets_using_evaluated(
     source: &Value,
     evaluated: &Value,
 ) -> Result<SnapshotValue, SerializationError> {
@@ -3652,7 +3652,7 @@ pub fn rehydrate_secret_entry<P: PlaceholderKind>(
     Ok(Some(value))
 }
 
-pub fn redact_secrets_in_value(value: &Value) -> Result<SnapshotValue, SerializationError> {
+pub(crate) fn redact_secrets_in_value(value: &Value) -> Result<SnapshotValue, SerializationError> {
     match value {
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
@@ -3690,14 +3690,14 @@ where
 }
 
 /// Redact all secrets in an attributes map.
-pub fn redact_secrets_in_attributes(
+pub(crate) fn redact_secrets_in_attributes(
     attrs: &HashMap<String, Value>,
 ) -> Result<HashMap<String, SnapshotValue>, SerializationError> {
     redact_attrs_with_guide(attrs.iter(), |_, value| redact_secrets_in_value(value))
 }
 
 /// Redact all secrets in a `Resource`, returning a new Resource with secrets replaced by hashes.
-pub fn redact_secrets_in_resource<S: Clone, D: Clone>(
+pub(crate) fn redact_secrets_in_resource<S: Clone, D: Clone>(
     resource: &crate::resource::Resource<
         S,
         crate::resource::NoPlaceholder,
@@ -3733,7 +3733,7 @@ fn redact_secrets_in_resource_impl<S: Clone, D: Clone>(
 
 /// Redact desired secrets while reusing matching persisted digests at the
 /// same nested paths.
-pub fn redact_secrets_in_resource_reusing_persisted_hashes<S: Clone, D: Clone>(
+pub(crate) fn redact_secrets_in_resource_reusing_persisted_hashes<S: Clone, D: Clone>(
     resource: &crate::resource::Resource<
         S,
         crate::resource::NoPlaceholder,
@@ -3808,7 +3808,7 @@ fn redact_resource_using_redacted_shape_impl<S: Clone, D: Clone, T, E>(
 /// Redact an authored resource by pairing it with the evaluator's resource at
 /// the same identity. Attribute names form the first path segment; nested
 /// paths are handled by [`redact_secrets_using_evaluated`].
-pub fn redact_secrets_in_resource_using_evaluated<S: Clone, D: Clone, T, E>(
+pub(crate) fn redact_secrets_in_resource_using_evaluated<S: Clone, D: Clone, T, E>(
     source: &crate::resource::Resource<
         S,
         crate::resource::NoPlaceholder,
@@ -3899,7 +3899,7 @@ pub fn rehydrate_resource_secrets<S: Clone, D: Clone, T, E>(
     ))
 }
 
-pub fn redact_secrets_in_data_source<S: Clone, D: Clone>(
+pub(crate) fn redact_secrets_in_data_source<S: Clone, D: Clone>(
     resource: &crate::resource::DataSource<
         S,
         crate::resource::NoPlaceholder,
@@ -3933,7 +3933,7 @@ fn redact_secrets_in_data_source_impl<S: Clone, D: Clone>(
     ))
 }
 
-pub fn redact_secrets_in_data_source_using_evaluated<S: Clone, D: Clone, T, E>(
+pub(crate) fn redact_secrets_in_data_source_using_evaluated<S: Clone, D: Clone, T, E>(
     source: &crate::resource::DataSource<
         S,
         crate::resource::NoPlaceholder,
@@ -4043,7 +4043,7 @@ fn snapshot_constraints_impl(
         .collect()
 }
 
-pub fn redact_secrets_in_live_composition(
+pub(crate) fn redact_secrets_in_live_composition(
     resource: &crate::resource::LiveComposition,
 ) -> Result<crate::resource::LiveComposition<SnapshotLeaf>, SerializationError> {
     redact_secrets_in_live_composition_impl(resource)
@@ -4082,7 +4082,7 @@ fn redact_secrets_in_live_composition_impl(
         }))
 }
 
-pub fn redact_secrets_in_saved_composition(
+pub(crate) fn redact_secrets_in_saved_composition(
     resource: &crate::resource::SavedComposition,
 ) -> Result<crate::resource::SavedComposition, SerializationError> {
     let arguments = resource
