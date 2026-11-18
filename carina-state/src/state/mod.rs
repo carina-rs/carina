@@ -54,7 +54,7 @@ use carina_core::state_document::{
 
 #[cfg(any(test, feature = "test-utils"))]
 fn persisted_attributes_from_test_json(
-    attributes: HashMap<String, serde_json::Value>,
+    attributes: impl IntoIterator<Item = (String, serde_json::Value)>,
 ) -> PersistedAttributes {
     PersistedAttributes::from_encoded(attributes)
         .expect("test state row contains valid persisted JSON")
@@ -87,7 +87,7 @@ fn recorded_write_only_keys(
 /// relabelling an arbitrary provider map as provenance-safe.
 #[derive(Debug)]
 struct SelectedStateAttributes {
-    encoded: HashMap<String, PersistedValue>,
+    encoded: BTreeMap<String, PersistedValue>,
     write_only_keys: HashSet<String>,
     retained_write_only: HashSet<String>,
 }
@@ -103,13 +103,12 @@ impl SelectedStateAttributes {
     }
 
     fn from_provider_values_lossy<P: StateValueLeaf>(
-        attributes: &HashMap<String, Value<P>>,
+        attributes: &BTreeMap<String, Value<P>>,
         schema: Option<&ResourceSchema>,
         additionally_recorded: &[String],
     ) -> Result<Self, SerializationError> {
         let write_only_keys = Self::write_only_keys(schema, additionally_recorded);
-        let mut encoded = HashMap::new();
-        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
+        let mut encoded = BTreeMap::new();
         for (key, value) in attributes {
             if write_only_keys.contains(key) {
                 continue;
@@ -130,7 +129,7 @@ impl SelectedStateAttributes {
     }
 
     fn try_from_provider_values<P: StateValueLeaf>(
-        attributes: &HashMap<String, Value<P>>,
+        attributes: &BTreeMap<String, Value<P>>,
         schema: Option<&ResourceSchema>,
         additionally_recorded: &[String],
         preferred_hashes: Option<&PersistedAttributes>,
@@ -169,7 +168,7 @@ impl SelectedStateAttributes {
                     .cloned()
                     .map(|value| (key.clone(), value))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<BTreeMap<_, _>>();
         let retained_write_only = write_only_keys
             .iter()
             .filter(|key| encoded.contains_key(*key))
@@ -708,19 +707,12 @@ impl OutcomeUnknownRow<'_> {
 /// [`carina_core::plan::PlanErrorKind::MissingProviderIdentifier`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LoadedOrphans {
-    by_id: HashMap<ResourceId, Orphan>,
+    by_id: carina_core::differ::Orphans,
 }
 
 impl LoadedOrphans {
-    pub fn insert(&mut self, orphan: Orphan) {
-        let id = match orphan.current() {
-            Current::Absent(state) => state.state().id.clone(),
-            Current::Present(present) => present.state().id.clone(),
-            Current::CreateInFlight(pending) => pending.id().clone(),
-            Current::CreateOutcomeUnknown(unknown) => unknown.id().clone(),
-            Current::MissingIdentifier(state) => state.state().id.clone(),
-        };
-        self.by_id.insert(id, orphan);
+    pub fn insert(&mut self, key: ResolvedResourceId, orphan: Orphan) {
+        self.by_id.insert(key, orphan);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -735,26 +727,24 @@ impl LoadedOrphans {
     /// consumed. Missing-identifier rows remain present and invalid in the
     /// returned provider state; they are not converted to `not_found`.
     pub fn into_plan_orphans(self) -> carina_core::differ::Orphans {
-        self.by_id.into_values().collect()
+        self.by_id
     }
 }
 
 impl IntoIterator for LoadedOrphans {
     type Item = (ResourceId, Orphan);
-    type IntoIter = std::collections::hash_map::IntoIter<ResourceId, Orphan>;
+    type IntoIter = <carina_core::differ::Orphans as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
         self.by_id.into_iter()
     }
 }
 
-impl FromIterator<Orphan> for LoadedOrphans {
-    fn from_iter<T: IntoIterator<Item = Orphan>>(iter: T) -> Self {
-        let mut loaded = Self::default();
-        for orphan in iter {
-            loaded.insert(orphan);
+impl FromIterator<(ResolvedResourceId, Orphan)> for LoadedOrphans {
+    fn from_iter<T: IntoIterator<Item = (ResolvedResourceId, Orphan)>>(iter: T) -> Self {
+        Self {
+            by_id: iter.into_iter().collect(),
         }
-        loaded
     }
 }
 
@@ -1770,7 +1760,7 @@ impl StateFile {
         #[allow(clippy::iter_over_hash_type)]
         // keyed rebuild: distinct missing write-only keys preserve existing-value precedence
         for key in recorded_write_only_keys(Some(schema.as_schema()), attributes, &[]) {
-            if let std::collections::hash_map::Entry::Vacant(entry) =
+            if let std::collections::btree_map::Entry::Vacant(entry) =
                 current.attributes.entry(key.clone())
                 && let Some(value) = attributes.get(&key)
             {
@@ -1846,6 +1836,23 @@ impl StateFile {
         }
     }
 
+    /// Bind a persisted current payload to its containing row, just as decoding
+    /// the complete row does. In-memory continuations may retain an older ID.
+    pub(crate) fn orphan_row(&self, row: &ResourceState) -> (ResolvedResourceId, Current) {
+        let id = ResolvedResourceId::with_provider_identity(
+            row.provider.clone(),
+            row.resource_type.clone(),
+            row.identity.clone(),
+            row.directives.provider_instance.clone(),
+        );
+        let current = carina_core::state_document::current_from_state_row(
+            &id,
+            row.current(),
+            &row.dependency_bindings,
+        );
+        (id, current)
+    }
+
     /// Build cached planner orphans with host-owned binding/directive metadata.
     /// Provider refresh inputs are minted by `PreparedRows` before this split.
     pub fn build_orphans(
@@ -1854,11 +1861,11 @@ impl StateFile {
     ) -> LoadedOrphans {
         let mut loaded = LoadedOrphans::default();
         for rs in &self.resources {
-            let id = Self::id_for_resource_state(rs);
-            if desired_ids.contains(&id) {
+            let (id, current) = self.orphan_row(rs);
+            if desired_ids.contains(id.as_inner()) {
                 continue;
             }
-            let orphan = match self.build_state_for_resource(&id) {
+            let mut orphan = match current {
                 Current::Absent(_state) => continue,
                 Current::Present(present) => {
                     Orphan::present(present, rs.binding.clone(), rs.directives.clone())
@@ -1875,7 +1882,8 @@ impl StateFile {
                     Orphan::missing_identifier(state, rs.binding.clone(), rs.directives.clone())
                 }
             };
-            loaded.insert(orphan);
+            orphan.set_destroy_metadata(rs.dependency_bindings.clone(), rs.directives.clone());
+            loaded.insert(id, orphan);
         }
         loaded
     }
@@ -3117,7 +3125,7 @@ impl DeposedInstance {
         key: DeposedKey,
         identifier: String,
         provider_instance: Option<String>,
-        attributes: HashMap<String, serde_json::Value>,
+        attributes: impl IntoIterator<Item = (String, serde_json::Value)>,
         dependency_bindings: PersistedDestroyDependencies,
     ) -> Self {
         Self::from_persisted_attributes(
@@ -3141,7 +3149,7 @@ impl DeposedInstance {
         &self,
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
-        fresh_attributes: &HashMap<String, Value<P>>,
+        fresh_attributes: &BTreeMap<String, Value<P>>,
     ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
         let carried_write_only = recorded_write_only_keys(schema, &self.attributes, &[]);
         let mut selected =
@@ -3197,7 +3205,7 @@ pub struct ResourceState {
     pub directives: PersistedDirectives,
     /// Attribute prefixes used to generate names (e.g., {"bucket_name": "my-app-"})
     #[serde(default)]
-    pub prefixes: HashMap<String, String>,
+    pub prefixes: std::collections::BTreeMap<String, String>,
     /// Permanent name overrides from create_before_destroy with non-renameable attributes.
     /// Maps attribute name to the temporary cloud-side name and the DSL value recorded with it.
     #[serde(default)]
@@ -3302,7 +3310,7 @@ impl WritableResourceState {
         state: &State<P>,
     ) -> Result<ResourceState, ResourceStateEncodingError> {
         let previous = self.0.persisted_attributes().cloned().unwrap_or_default();
-        let encoded = state
+        let encoded: BTreeMap<_, _> = state
             .attributes
             .iter()
             .filter_map(|(key, value)| {
@@ -3677,7 +3685,7 @@ impl ResourceState {
             deposed: Vec::new(),
             protected: false,
             directives: PersistedDirectives::default(),
-            prefixes: HashMap::new(),
+            prefixes: Default::default(),
             name_overrides: HashMap::new(),
             explicit: ExplicitFields::default(),
             binding: None,
@@ -3839,7 +3847,7 @@ impl ResourceState {
     pub fn deposed_attributes_without_previous<S, P: StateValueLeaf>(
         resource: &ResolvedResource<S>,
         schema: Option<&ResourceSchema>,
-        attributes: &HashMap<String, Value<P>>,
+        attributes: &BTreeMap<String, Value<P>>,
         previous_hash_authority: PreviousSecretHashAuthority<'_>,
     ) -> Result<DeposedAttributes, ResourceStateEncodingError> {
         let selected =
@@ -3932,7 +3940,7 @@ impl ResourceState {
         &mut self,
         resource: &ResolvedResource<S>,
         existing: Option<&ResourceState>,
-        stored_attributes: &HashMap<String, SnapshotValue>,
+        stored_attributes: &BTreeMap<String, SnapshotValue>,
         schema: Option<&ResourceSchema>,
         authoring_basis: DesiredAuthoringBasis<'_>,
         comparison: &ComparisonContext<'_, R>,
@@ -3986,7 +3994,7 @@ impl ResourceState {
     fn carried_explicit_for_stored_values<S, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
         existing: Option<&ResourceState>,
-        stored_attributes: &HashMap<String, SnapshotValue>,
+        stored_attributes: &BTreeMap<String, SnapshotValue>,
         schema: Option<&ResourceSchema>,
         comparison: &ComparisonContext<'_, R>,
     ) -> ExplicitFields {
@@ -4033,7 +4041,7 @@ impl ResourceState {
         let writeback_resource = applied_desired.as_ref().unwrap_or(resource);
         let sent_desired = identified.sent_desired_attributes_for(writeback_resource);
         let previous = existing.and_then(ResourceState::persisted_attributes);
-        let no_observed_values = HashMap::new();
+        let no_observed_values = BTreeMap::new();
         let (observed_values, pending_reread) = match identified.observation() {
             HostCreateObservation::Observed(state) => (state.attributes(), None),
             HostCreateObservation::Unobserved(
@@ -4190,7 +4198,7 @@ impl ResourceState {
                     if matches!(row.explicit, ExplicitFields::Unrecorded) {
                         row.explicit = explicit::build_from_read_resource_for_stored_values(
                             resource,
-                            &HashMap::<String, SnapshotValue>::new(),
+                            &BTreeMap::<String, SnapshotValue>::new(),
                             schema,
                             comparison,
                         );
@@ -4235,7 +4243,7 @@ impl ResourceState {
         row.populate_desired_metadata(
             resource,
             existing,
-            &HashMap::new(),
+            &BTreeMap::new(),
             schema,
             authoring_basis,
             comparison,
@@ -4268,7 +4276,7 @@ impl ResourceState {
         row.populate_desired_metadata(
             resource,
             existing,
-            &HashMap::new(),
+            &BTreeMap::new(),
             schema,
             DesiredAuthoringBasis::DesiredRead,
             comparison,
@@ -4511,7 +4519,7 @@ struct ResourceStateV14CurrentDto {
     #[serde(default)]
     identifier: Option<String>,
     #[serde(default)]
-    attributes: HashMap<String, serde_json::Value>,
+    attributes: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     deposed: Vec<serde_json::Value>,
     #[serde(default)]
@@ -4519,7 +4527,7 @@ struct ResourceStateV14CurrentDto {
     #[serde(default)]
     directives: LegacyPersistedDirectives,
     #[serde(default)]
-    prefixes: HashMap<String, String>,
+    prefixes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     name_overrides: HashMap<String, NameOverride>,
     #[serde(default)]

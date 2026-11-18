@@ -3060,7 +3060,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
 /// One binding snapshot serves both typed provider-configuration routes.
 struct ProviderAttributeBindings {
     resolved: crate::binding_index::ResolvedBindings<NoPlaceholder, AbsoluteBindingAddress>,
-    parser: HashMap<String, HashMap<String, RuntimeValue>>,
+    parser: std::collections::BTreeMap<String, std::collections::BTreeMap<String, RuntimeValue>>,
 }
 
 impl ProviderAttributeBindings {
@@ -3069,16 +3069,19 @@ impl ProviderAttributeBindings {
         remote: &crate::upstream_exports::AdmittedRemoteBindings,
     ) -> Self {
         let mut resolved = crate::binding_index::ResolvedBindings::default();
-        let mut parser = HashMap::new();
+        let mut parser = std::collections::BTreeMap::new();
         for rref in parsed.iter_top_level_resources() {
             if let Some(binding) = rref.binding() {
                 let attributes = match rref {
-                    super::TopLevelResourceRef::Resource(resource) => {
-                        resource.resolved_attributes()
-                    }
-                    super::TopLevelResourceRef::DataSource(data_source) => {
-                        crate::resource::attrs_to_hashmap(&data_source.attributes)
-                    }
+                    super::TopLevelResourceRef::Resource(resource) => resource
+                        .resolved_attributes()
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>(),
+                    super::TopLevelResourceRef::DataSource(data_source) => data_source
+                        .attributes
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
                     super::TopLevelResourceRef::LiveComposition(composition) => composition
                         .signature
                         .attributes
@@ -3098,8 +3101,6 @@ impl ProviderAttributeBindings {
             }
         }
         resolved.install_upstream(remote);
-        #[allow(clippy::iter_over_hash_type)]
-        // keyed rebuild: distinct remote names are copied after the fixed local-binding pass
         for (binding, attributes) in remote {
             parser.insert(binding.clone(), (**attributes).clone());
         }

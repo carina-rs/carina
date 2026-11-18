@@ -2785,7 +2785,7 @@ pub fn protocol_to_core_persisted_value(
 
 /// Convert a core map at a persisted-state position.
 pub fn try_core_to_protocol_persisted_value_map(
-    values: &HashMap<String, SnapshotValue>,
+    values: &BTreeMap<String, SnapshotValue>,
 ) -> Result<BTreeMap<String, protocol::PersistedValue>, ProtocolConvertError> {
     values
         .iter()
@@ -2800,7 +2800,7 @@ pub fn try_core_to_protocol_persisted_value_map(
 /// Decode a persisted protocol value map.
 pub fn protocol_to_core_persisted_value_map(
     values: &BTreeMap<String, protocol::PersistedValue>,
-) -> Result<HashMap<String, SnapshotValue>, ProtocolConvertError> {
+) -> Result<BTreeMap<String, SnapshotValue>, ProtocolConvertError> {
     values
         .iter()
         .map(|(key, value)| {
@@ -4339,7 +4339,7 @@ mod tests {
 
     #[test]
     fn persisted_value_converters_keep_complete_structured_paths() {
-        let core: HashMap<String, SnapshotValue> = HashMap::from([(
+        let core: BTreeMap<String, SnapshotValue> = std::collections::BTreeMap::from([(
             "root".into(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(IndexMap::from([(

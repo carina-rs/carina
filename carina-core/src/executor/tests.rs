@@ -688,13 +688,15 @@ async fn scheduler_delete_failure_skips_ancestors_without_dispatch() {
         .await;
     assert!(result.is_err());
     scheduler.complete(completion).unwrap();
-    for index in 1..3 {
+    let releases = scheduler.release_ready(1..3, 2).unwrap();
+    assert_eq!(
+        releases.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    for (index, release) in releases {
         assert!(
-            matches!(
-                scheduler.release(index).unwrap(),
-                Some(DeleteRelease::Blocked { dependency: 0 })
-            ),
-            "retain the original failed descendant in skip diagnostics"
+            matches!(release, DeleteRelease::Blocked { dependency: 0 }),
+            "retain the original failed descendant in skip diagnostics, including same-pass skips"
         );
         assert!(scheduler.release(index).unwrap().is_none());
     }
@@ -2921,11 +2923,11 @@ fn independent_dependency_cycles_have_unambiguous_blocked_references() {
         create_effect(make_resource("e", &["c"])),
     ];
     let deps = HashMap::from([
-        (0, HashSet::from([1])),
-        (1, HashSet::from([0])),
-        (2, HashSet::from([3])),
-        (3, HashSet::from([2])),
-        (4, HashSet::from([2])),
+        (0, BTreeSet::from([1])),
+        (1, BTreeSet::from([0])),
+        (2, BTreeSet::from([3])),
+        (3, BTreeSet::from([2])),
+        (4, BTreeSet::from([2])),
     ]);
     let failures = classify_stalled_effects(
         &effects,
@@ -2965,7 +2967,7 @@ fn stalled_acyclic_graph_reports_unsatisfied_dependencies_without_inventing_cycl
     ];
     let failures = classify_stalled_effects(
         &effects,
-        &HashMap::from([(0, HashSet::from([1]))]),
+        &HashMap::from([(0, BTreeSet::from([1]))]),
         &HashSet::from([0]),
         &HashSet::new(),
     );
@@ -2985,10 +2987,10 @@ fn completed_dependency_does_not_attribute_an_unrelated_cycle_to_stuck_effect() 
     let failures = classify_stalled_effects(
         &effects,
         &HashMap::from([
-            (0, HashSet::from([1])),
-            (1, HashSet::from([0])),
-            (2, HashSet::from([3, 4])),
-            (4, HashSet::from([0])),
+            (0, BTreeSet::from([1])),
+            (1, BTreeSet::from([0])),
+            (2, BTreeSet::from([3, 4])),
+            (4, BTreeSet::from([0])),
         ]),
         &HashSet::from([0, 1, 2]),
         &HashSet::from([4]),
@@ -3015,9 +3017,9 @@ fn dependency_cycle_display_does_not_claim_index_order_is_an_edge_path() {
     let failures = classify_stalled_effects(
         &effects,
         &HashMap::from([
-            (0, HashSet::from([2])),
-            (2, HashSet::from([1])),
-            (1, HashSet::from([0])),
+            (0, BTreeSet::from([2])),
+            (2, BTreeSet::from([1])),
+            (1, BTreeSet::from([0])),
         ]),
         &HashSet::from([0, 1, 2]),
         &HashSet::new(),
@@ -4691,7 +4693,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let schemas = provider_boundary_constraint_schemas();
@@ -4802,7 +4804,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
         compositions: &[],
         managed_current: &HashMap::new(),
         data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let schemas = provider_boundary_constraint_schemas();
@@ -4962,7 +4964,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let schemas = deferred_data_source_constraint_schemas();
@@ -5050,7 +5052,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let schemas = deferred_data_source_constraint_schemas();
@@ -5251,7 +5253,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let schemas = SchemaRegistry::new();
@@ -5501,7 +5503,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
         compositions: std::slice::from_ref(&outer),
         managed_current: &HashMap::new(),
         data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -5576,7 +5578,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
         compositions: std::slice::from_ref(&composition),
         managed_current: &HashMap::new(),
         data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -6198,7 +6200,7 @@ fn module_constraint_resolution_keeps_unavailable_secret_typed() {
     let mut bindings = ResolvedBindings::default();
     bindings.set_historical_with_completeness(
         "history",
-        HashMap::from([("secret".into(), hash)]),
+        std::collections::BTreeMap::from([("secret".into(), hash)]),
         BindingValueSource::Local,
         BindingCompleteness::Complete,
     );
@@ -7250,7 +7252,7 @@ async fn apply_gate_revalidates_plan_normalized_data_source_literal() {
             std::slice::from_ref(&authored),
             &HashMap::new(),
         ),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let resource_origins = HashMap::from([(
@@ -9402,7 +9404,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
             &[],
         ),
         data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -9488,7 +9490,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
             &[],
         ),
         data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -9726,11 +9728,19 @@ fn orphan_delete_waits_for_update_that_previously_depended_on_it() {
         std::slice::from_ref(&desired),
     );
     let desired = ResolvedResource::collect_resolved([desired]).unwrap();
-    let orphans = crate::differ::Orphans::from([crate::differ::Orphan::from_state(
-        orphan_state,
-        Some(absolute_binding("dependency")),
-        crate::resource::PersistedDirectives::default(),
-    )]);
+    let orphans = crate::differ::Orphans::from(
+        [crate::differ::Orphan::from_state(
+            orphan_state,
+            Some(absolute_binding("dependency")),
+            crate::resource::PersistedDirectives::default(),
+        )]
+        .map(|orphan| {
+            (
+                crate::resource::ResolvedResourceId::new(orphan.current().id().clone()),
+                orphan,
+            )
+        }),
+    );
     let plan = crate::differ::create_plan(
         &desired,
         &[],
@@ -9807,8 +9817,6 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
     // commutative: dependency-level assertions are independent per effect
     for (idx, deps) in &dep_map {
         let idx_level = levels.iter().position(|group| group.contains(idx)).unwrap();
-        #[allow(clippy::iter_over_hash_type)]
-        // commutative: dependency-level assertions are independent per edge
         for dep in deps {
             let dep_level = levels.iter().position(|group| group.contains(dep)).unwrap();
             assert!(
@@ -10049,7 +10057,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         )]
         .into_iter()
         .map(|(key, value)| (key, value.to_snapshot()))
-        .collect(),
+        .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .with_identifier("vpc-12345");
     provider.push_create(Ok(vpc_state));
@@ -10063,7 +10071,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         )]
         .into_iter()
         .map(|(key, value)| (key, value.to_snapshot()))
-        .collect(),
+        .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .with_identifier("subnet-67890");
     provider.push_create(Ok(subnet_state));
@@ -10347,7 +10355,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), value.clone()))
                 .map(|(key, value)| (key, value.to_snapshot()))
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
         )
         .with_identifier(identifier)
     }
@@ -10526,7 +10534,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         compositions: &[],
         managed_current: &plan_input_states,
         data_source_values: &DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
     let provider = CascadeReplaceProvider::new();
@@ -11332,7 +11340,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         )]
         .into_iter()
         .map(|(key, value)| (key, value.to_snapshot()))
-        .collect(),
+        .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .with_identifier("acm-cert-id");
     provider.push_create(Ok(cert_state));
@@ -12669,7 +12677,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
             )]
             .into_iter()
             .map(|(key, value)| (key, value.to_snapshot()))
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
         ),
     );
 
@@ -12716,7 +12724,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
             std::slice::from_ref(&ds),
             &data_source_states,
         ),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -12883,7 +12891,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
             std::slice::from_ref(&data_source),
             &current_states,
         ),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -13028,7 +13036,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
             std::slice::from_ref(&data_source),
             &current_states,
         ),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -13120,7 +13128,7 @@ async fn test_apply_time_data_source_read_retries_transient_errors() {
             std::slice::from_ref(&data_source),
             &HashMap::new(),
         ),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -13234,7 +13242,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
             std::slice::from_ref(&data_source),
             &current_states,
         ),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     });
 
@@ -13592,7 +13600,7 @@ fn issue_4283_deferred_prior_snapshot_redacts_secrets() {
         dependencies: Default::default(),
         explicit_dependencies: Default::default(),
         blocked_by_updates: Default::default(),
-        previous_attributes: HashMap::from([(
+        previous_attributes: std::collections::BTreeMap::from([(
             "secret".into(),
             crate::resource::SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
                 Box::new(crate::resource::SnapshotValue::Concrete(
@@ -13647,7 +13655,7 @@ fn issue_4283_deferred_prior_snapshot_uses_persisted_secret_shape() {
         dependencies: Default::default(),
         explicit_dependencies: Default::default(),
         blocked_by_updates: Default::default(),
-        previous_attributes: HashMap::from([(
+        previous_attributes: std::collections::BTreeMap::from([(
             "secret".into(),
             crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
                 "OLD_CHILD_SECRET_PLAINTEXT".into(),
@@ -13872,7 +13880,7 @@ async fn review5_4283_unbound_loop_after_read_does_not_block_unrelated_replaceme
     let mut plan = Plan::new();
     plan.add_delete(DeferredReplaceDelete {
         generation: EffectGeneration::Current,
-        previous_attributes: HashMap::new(),
+        previous_attributes: std::collections::BTreeMap::new(),
         id: ResolvedResourceId::new(parent_id.clone()),
         identifier: crate::effect::fixture_applied_identifier("old-producer"),
         directives: Default::default(),
@@ -14006,7 +14014,7 @@ async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: boo
                 .attributes
                 .into_iter()
                 .map(|(key, value)| (key, value.to_value_at("fixture").unwrap()))
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             crate::binding_index::BindingValueSource::Upstream,
             crate::binding_index::BindingCompleteness::Complete,
         );
@@ -14057,7 +14065,7 @@ async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: boo
         dependencies: Default::default(),
         explicit_dependencies: Default::default(),
         blocked_by_updates: Default::default(),
-        previous_attributes: HashMap::new(),
+        previous_attributes: std::collections::BTreeMap::new(),
     };
     let mut deposed = old.clone();
     deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
@@ -14216,7 +14224,7 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
     let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
         &[deferred, Effect::Create(consumer)],
         &COEXISTING_TEST_SCHEMAS,
-        |_| HashMap::new(),
+        |_| std::collections::BTreeMap::new(),
     )
     .unwrap();
     let effects = admitted.effects();
@@ -14228,7 +14236,7 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
             let (existing, _, _) = crate::replacement::AdmittedReplacementEffects::resolve(
                 &saved_effects,
                 &COEXISTING_TEST_SCHEMAS,
-                |_| HashMap::new(),
+                |_| std::collections::BTreeMap::new(),
             )
             .unwrap()
             .expand_deferred_replacements();
@@ -14293,7 +14301,7 @@ fn review_4283_redacted_deferred_debug_drops_preview_snapshots() {
         dependencies: Default::default(),
         explicit_dependencies: Default::default(),
         blocked_by_updates: Default::default(),
-        previous_attributes: HashMap::from([(
+        previous_attributes: std::collections::BTreeMap::from([(
             "secret".into(),
             crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::String(
                 "REVIEW_DEFERRED_SECRET_PLAINTEXT".into(),
@@ -14679,7 +14687,7 @@ fn review6_4283_historical_secret_rehydration_preserves_approval_order() {
 fn review2_4283_secret_wrapped_deferred_history_uses_shared_hashes() {
     use crate::resource::{SnapshotLeaf, SnapshotValue};
     let id = test_resolved_id("test", "validation_records[0]");
-    let previous = HashMap::from([(
+    let previous = std::collections::BTreeMap::from([(
         "secret".into(),
         SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
             Box::new(SnapshotValue::Concrete(

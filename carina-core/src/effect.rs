@@ -12,6 +12,8 @@ pub(crate) mod value_stage;
 
 #[cfg(test)]
 use crate::resource::Resource;
+use std::collections::BTreeMap;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::{
     collections::{BTreeSet, HashSet},
@@ -212,8 +214,8 @@ pub struct DeferredReplaceDelete {
     #[serde(default, skip_serializing_if = "EffectGeneration::is_current")]
     pub generation: EffectGeneration,
     /// Prior snapshot retained for replacement naming and recovery.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub previous_attributes: HashMap<String, crate::resource::SnapshotValue>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub previous_attributes: BTreeMap<String, crate::resource::SnapshotValue>,
     pub id: ResolvedResourceId,
     pub identifier: AppliedIdentifier,
     #[serde(default)]
@@ -499,8 +501,8 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
         &mut self,
         protect: impl Fn(
             &DeletedInstanceKey,
-            &HashMap<String, crate::resource::SnapshotValue>,
-        ) -> HashMap<String, crate::resource::SnapshotValue>,
+            &BTreeMap<String, crate::resource::SnapshotValue>,
+        ) -> BTreeMap<String, crate::resource::SnapshotValue>,
     ) {
         for old in self.request.deletes.iter_mut() {
             old.previous_attributes = protect(&old.instance_key(), &old.previous_attributes);
@@ -2123,7 +2125,8 @@ impl EffectWithSource<ModuleSource> {
             (
                 Effect::Update {
                     from: Box::new(
-                        State::existing(id.clone(), Default::default()).with_identifier("x-1"),
+                        State::existing(id.clone(), std::collections::BTreeMap::new())
+                            .with_identifier("x-1"),
                     ),
                     identifier: fixture_applied_identifier("x-1"),
                     to: ResolvedResource::new(Resource::new("test", "x").with_dependency_phase(()),),
@@ -2362,7 +2365,7 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
     /// Capture a delete endpoint with the history of that exact generation.
     pub(crate) fn to_delete_payload(
         &self,
-        previous: impl FnOnce(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
+        previous: impl FnOnce(&DeletedInstanceKey) -> BTreeMap<String, SnapshotValue>,
     ) -> Option<DeferredReplaceDelete> {
         let Self::Delete {
             id,
@@ -3181,7 +3184,8 @@ mod tests {
                 "Update",
                 Effect::Update {
                     from: Box::new(
-                        State::existing(rid.clone(), Default::default()).with_identifier("x-1"),
+                        State::existing(rid.clone(), std::collections::BTreeMap::new())
+                            .with_identifier("x-1"),
                     ),
                     identifier: fixture_applied_identifier("x-1"),
                     to: ResolvedResource::new(Resource::new("test", "x").with_dependency_phase(())),
@@ -4338,9 +4342,7 @@ mod tests {
         ));
 
         let update: Effect = Effect::Update {
-            from: Box::new(
-                ResState::existing(rid.clone(), Default::default()).with_identifier("x-1"),
-            ),
+            from: Box::new(ResState::existing(rid.clone(), BTreeMap::new()).with_identifier("x-1")),
             identifier: fixture_applied_identifier("x-1"),
             to: ResolvedResource::new(Resource::new("test", "x").with_dependency_phase(())),
             changed_attributes: vec![],

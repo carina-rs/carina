@@ -190,7 +190,7 @@ fn update_effect_has_detail_rows() {
                     Value::Concrete(ConcreteValue::String("Disabled".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("my-bucket-id"),
         ),
@@ -838,7 +838,7 @@ fn move_suppressed_when_update_exists_for_same_target() {
                     Value::Concrete(ConcreteValue::String("Disabled".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("new-name-id"),
         ),

@@ -324,7 +324,7 @@ impl Fixture {
         let state = State {
             id: resource.id.clone(),
             identifier: Some("resource-123".into()),
-            attributes: HashMap::from([("key".into(), current)]),
+            attributes: std::collections::BTreeMap::from([("key".into(), current)]),
             exists: true,
             dependency_bindings: Default::default(),
             partial_read: None,
@@ -1795,7 +1795,7 @@ async fn nested_write_only_reference_resolves_against_accepted_leaf_when_read_om
                     crate::value::PersistedValue::encode_provider_value(value, None).unwrap(),
                 )
             })
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .unwrap();
     fixture.registry.insert("test", schema);
@@ -1922,7 +1922,10 @@ async fn unordered_reference_list_elements_share_one_resolution_path() {
     let state = State {
         id: resource.id.clone(),
         identifier: Some("resource-123".into()),
-        attributes: HashMap::from([("key".into(), list(&["alias/b", "alias/a"]))]),
+        attributes: std::collections::BTreeMap::from([(
+            "key".into(),
+            list(&["alias/b", "alias/a"]),
+        )]),
         exists: true,
         dependency_bindings: Default::default(),
         partial_read: None,
@@ -2149,7 +2152,7 @@ async fn unordered_list_index_ignore_precedes_projection_pairing_and_saved_merge
                     crate::value::PersistedValue::encode_provider_value(value, None).unwrap(),
                 )
             })
-            .collect(),
+            .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .unwrap();
     let Current::Present(current) = fixture.current[&fixture.desired[0].id].current() else {
@@ -3508,7 +3511,7 @@ async fn round4_omitted_write_only_list_reference_is_still_a_desired_operand() {
                 accepted
                     .into_iter()
                     .map(|(key, value)| (key, value.to_snapshot()))
-                    .collect(),
+                    .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .unwrap(),
         )]),
@@ -3922,7 +3925,7 @@ async fn round5_projected_write_only_reference_is_still_a_desired_operand() {
                 accepted
                     .into_iter()
                     .map(|(key, value)| (key, value.to_snapshot()))
-                    .collect(),
+                    .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .unwrap(),
         )]),

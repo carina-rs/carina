@@ -297,7 +297,7 @@ pub fn enum_attr_at_schema_path<'a>(
 /// let identity = String::from("runtime-identity");
 /// let _ = ResourceId::with_identity("test.Resource", identity);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceIdentity(String);
 
 /// Error returned when a runtime value cannot be used as a resource identity.
@@ -961,7 +961,7 @@ struct ResourceWithDependenciesWire<S, P: ValueKind> {
     #[serde(default)]
     directives: Directives<AbsoluteBindingAddress, P>,
     #[serde(default)]
-    prefixes: HashMap<String, String>,
+    prefixes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     binding: Option<AbsoluteBindingAddress>,
     dependencies: (),
@@ -4832,6 +4832,30 @@ enum RedactedSecretHashKind {
     },
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) mod secret_hash_test_entropy {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SALT: Cell<Option<[u8; 16]>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn salt() -> Option<[u8; 16]> {
+        SALT.get()
+    }
+
+    pub(crate) fn with_salt<T>(salt: [u8; 16], record: impl FnOnce() -> T) -> T {
+        struct Restore(Option<[u8; 16]>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SALT.set(self.0);
+            }
+        }
+        let _restore = Restore(SALT.replace(Some(salt)));
+        record()
+    }
+}
+
 impl RedactedSecretHash {
     const SALT_LEN: usize = 16;
     const MAX_EXPLICIT_LEGACY_SALT_LEN: usize = 4096;
@@ -4845,6 +4869,11 @@ impl RedactedSecretHash {
     const LEGACY_FALLBACK_SALT: &'static [u8] = b"carina-secret-v1";
 
     pub(crate) fn generate(plaintext: &[u8]) -> Self {
+        #[cfg(any(test, feature = "test-utils"))]
+        let salt = secret_hash_test_entropy::salt()
+            .map(|salt| SaltString::encode_b64(&salt).expect("fixture salt has valid length"))
+            .unwrap_or_else(|| SaltString::generate(&mut OsRng));
+        #[cfg(not(any(test, feature = "test-utils")))]
         let salt = SaltString::generate(&mut OsRng);
         let encoded = Argon2::default()
             .hash_password(plaintext, &salt)
@@ -9222,7 +9251,7 @@ pub struct Resource<
     /// Attribute prefixes: maps attribute name -> prefix string
     /// e.g., {"bucket_name": "my-app-"} from `bucket_name_prefix = "my-app-"`
     #[serde(default)]
-    pub prefixes: HashMap<String, String>,
+    pub prefixes: std::collections::BTreeMap<String, String>,
     /// Binding name from `let` bindings in DSL (e.g., `let vpc = ...`)
     #[serde(default)]
     pub binding: Option<B>,
@@ -9536,7 +9565,7 @@ impl<P: ValueKind, B: BindingAddress> Resource<ModuleSource, P, B> {
             attributes: IndexMap::new(),
             directives: Directives::default(),
             resolved_ignore_changes: ResolvedIgnoreChanges::default(),
-            prefixes: HashMap::new(),
+            prefixes: Default::default(),
             binding: None,
             dependencies: UnexpandedDependencyFields::default(),
             module_source: None,
@@ -10991,7 +11020,7 @@ impl UnidentifiedState {
 /// use carina_core::resource::{Current, ResourceId, SnapshotState};
 ///
 /// let id = ResourceId::with_identity("test.Resource", "example");
-/// let state = SnapshotState::existing(id, Default::default());
+/// let state = SnapshotState::existing(id, std::collections::BTreeMap::new());
 /// let current = Current::MissingIdentifier(state);
 /// ```
 ///
@@ -11020,7 +11049,7 @@ pub struct StateBearingCurrentMut<'a> {
 }
 
 impl StateBearingCurrentMut<'_> {
-    pub fn attributes_mut(&mut self) -> &mut HashMap<String, SnapshotValue> {
+    pub fn attributes_mut(&mut self) -> &mut BTreeMap<String, SnapshotValue> {
         &mut self.state.attributes
     }
 
@@ -11105,7 +11134,7 @@ impl Current {
         }
     }
 
-    pub fn attributes_mut(&mut self) -> Option<&mut HashMap<String, SnapshotValue>> {
+    pub fn attributes_mut(&mut self) -> Option<&mut BTreeMap<String, SnapshotValue>> {
         self.state_bearing_mut()
             .map(|projection| &mut projection.state.attributes)
     }
@@ -11148,8 +11177,10 @@ impl Current {
             Self::Present(present) => {
                 present.state.dependency_bindings = dependency_bindings;
             }
-            Self::CreateInFlight(_pending) => {}
-            Self::CreateOutcomeUnknown(_unknown) => {}
+            Self::CreateInFlight(pending) => *pending.dependency_bindings = dependency_bindings,
+            Self::CreateOutcomeUnknown(unknown) => {
+                *unknown.dependency_bindings = dependency_bindings
+            }
             Self::MissingIdentifier(state) => {
                 state.0.dependency_bindings = dependency_bindings;
             }
@@ -11251,17 +11282,19 @@ pub struct PlanInputDesired<'a> {
 /// post-order canonicalization without mutating the provider-bound resource.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CanonicalComparisonAttributes {
-    attributes: HashMap<String, SnapshotValue>,
+    attributes: BTreeMap<String, SnapshotValue>,
 }
 
 /// Attribute values used only when no resource schema exists.
 ///
 /// The wrapper makes schema-less passthrough construction explicit instead of
 /// presenting it as an already-canonical comparison map.
-pub(crate) struct UnschematizedComparisonAttributes(HashMap<String, SnapshotValue>);
+pub(crate) struct UnschematizedComparisonAttributes(BTreeMap<String, SnapshotValue>);
 
 impl UnschematizedComparisonAttributes {
-    pub(crate) fn new<P: StateValueLeaf>(attributes: HashMap<String, Value<P>>) -> Self {
+    pub(crate) fn new<P: StateValueLeaf>(
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
+    ) -> Self {
         Self(
             attributes
                 .into_iter()
@@ -11275,10 +11308,10 @@ impl CanonicalComparisonAttributes {
     /// Secret-grafted apply views retain the authored hash material even when
     /// provider normalization changed a secret's structural representation.
     pub(crate) fn canonicalize_preserving_secret_shapes<P: StateValueLeaf>(
-        attributes: HashMap<String, Value<P>>,
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
         schema: &crate::schema::CompiledResourceSchema,
     ) -> Self {
-        let mut attributes: HashMap<_, _> = attributes
+        let mut attributes: BTreeMap<_, _> = attributes
             .into_iter()
             .map(|(key, value)| (key, state_value_snapshot(&value)))
             .collect();
@@ -11294,10 +11327,10 @@ impl CanonicalComparisonAttributes {
 
     /// Build the state-style canonical comparison view for one resource.
     pub fn canonicalize<P: StateValueLeaf>(
-        attributes: HashMap<String, Value<P>>,
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
         schema: &crate::schema::CompiledResourceSchema,
     ) -> Self {
-        let mut attributes: HashMap<_, _> = attributes
+        let mut attributes: BTreeMap<_, _> = attributes
             .into_iter()
             .map(|(key, value)| (key, state_value_snapshot(&value)))
             .collect();
@@ -11334,7 +11367,7 @@ impl CanonicalComparisonAttributes {
 
 impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
     type Item = (&'a String, &'a SnapshotValue);
-    type IntoIter = std::collections::hash_map::Iter<'a, String, SnapshotValue>;
+    type IntoIter = std::collections::btree_map::Iter<'a, String, SnapshotValue>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.attributes.iter()
@@ -11343,7 +11376,7 @@ impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
 
 impl IntoIterator for CanonicalComparisonAttributes {
     type Item = (String, SnapshotValue);
-    type IntoIter = std::collections::hash_map::IntoIter<String, SnapshotValue>;
+    type IntoIter = std::collections::btree_map::IntoIter<String, SnapshotValue>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.attributes.into_iter()
@@ -11511,7 +11544,7 @@ pub struct State<P: ValueKind = NoPlaceholder> {
     pub id: ResourceId,
     /// AWS internal identifier (e.g., vpc-xxx, subnet-xxx)
     pub identifier: Option<String>,
-    pub attributes: HashMap<String, Value<P>>,
+    pub attributes: BTreeMap<String, Value<P>>,
     /// Whether this state exists
     pub exists: bool,
     /// Binding names this resource depended on when it was last applied.
@@ -11530,18 +11563,21 @@ impl<P: ValueKind> State<P> {
         Self {
             id,
             identifier: None,
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
             exists: false,
             dependency_bindings: PersistedDestroyDependencies::default(),
             partial_read: None,
         }
     }
 
-    pub fn existing(id: ResourceId, attributes: HashMap<String, Value<P>>) -> Self {
+    pub fn existing(
+        id: ResourceId,
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
+    ) -> Self {
         Self {
             id,
             identifier: None,
-            attributes,
+            attributes: attributes.into_iter().collect(),
             exists: true,
             dependency_bindings: PersistedDestroyDependencies::default(),
             partial_read: None,

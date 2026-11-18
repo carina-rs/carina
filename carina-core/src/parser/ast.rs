@@ -1340,7 +1340,7 @@ impl<P: ValueKind, T: ValueKind, D>
 mod deferred_template_resource_serde {
     use super::*;
     use serde::{Deserialize, Serialize};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     #[derive(Serialize)]
     struct ResourceIdRef<'a> {
@@ -1359,7 +1359,7 @@ mod deferred_template_resource_serde {
         id: ResourceIdRef<'a>,
         attributes: &'a IndexMap<String, Value<T, B>>,
         directives: &'a Directives<B, T>,
-        prefixes: &'a HashMap<String, String>,
+        prefixes: &'a std::collections::BTreeMap<String, String>,
         binding: &'a Option<B>,
         dependencies: &'a D,
         module_source: &'a Option<S>,
@@ -1436,7 +1436,7 @@ mod deferred_template_resource_serde {
         #[serde(default)]
         directives: Directives<B, T>,
         #[serde(default)]
-        prefixes: HashMap<String, String>,
+        prefixes: std::collections::BTreeMap<String, String>,
         #[serde(default)]
         binding: Option<B>,
         #[serde(default)]

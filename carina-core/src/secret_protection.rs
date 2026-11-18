@@ -1,5 +1,6 @@
 //! The one owner of authored-secret projection onto observations.
 use super::*;
+use std::collections::BTreeMap;
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct SecretProtection {
@@ -314,7 +315,7 @@ pub struct ProtectedObservation {
     persisted: Option<crate::provider::PersistedAttributes>,
     nested_write_only: crate::provider::NestedWriteOnlyRecord,
     snapshot: std::sync::Arc<
-        std::sync::OnceLock<Result<HashMap<String, SnapshotValue>, SerializationError>>,
+        std::sync::OnceLock<Result<BTreeMap<String, SnapshotValue>, SerializationError>>,
     >,
 }
 impl std::fmt::Debug for ProtectedObservation {
@@ -381,8 +382,6 @@ impl ProtectedObservation {
     ) -> Self {
         let mut state = state.clone();
         let mut protection = HashMap::new();
-        #[allow(clippy::iter_over_hash_type)]
-        // keyed rebuild: each existing attribute is projected independently, without ordering output
         for (key, value) in &mut state.attributes {
             let previous = persisted
                 .and_then(|attributes| attributes.encoded_value(key))
@@ -417,8 +416,6 @@ impl ProtectedObservation {
                 actual: Box::new(self.id().clone()),
             });
         }
-        #[allow(clippy::iter_over_hash_type)]
-        // keyed rebuild: history refines protection independently for each existing attribute
         for (key, value) in &mut self.state.attributes {
             if let Some(protection) = history.protection.get(key) {
                 *value = protection.mask(value);
@@ -461,7 +458,7 @@ impl ProtectedObservation {
     pub fn id(&self) -> &crate::resource::ResourceId {
         &self.state.id
     }
-    pub(crate) fn display_attributes(&self) -> &HashMap<String, SnapshotValue> {
+    pub(crate) fn display_attributes(&self) -> &BTreeMap<String, SnapshotValue> {
         &self.state.attributes
     }
     /// The batch owner shares salts only for identical classified observations.

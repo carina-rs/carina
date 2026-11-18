@@ -313,7 +313,7 @@ impl Provider for MeasuringProvider {
         let id = source.id.clone();
         let attributes = source.attributes.clone();
         // This local fixture echoes checked query inputs; no network or cloud IO.
-        Box::pin(async move { Ok(State::existing(id, attributes.into_iter().collect())) })
+        Box::pin(async move { Ok(State::existing(id, attributes)) })
     }
     fn create(
         &self,

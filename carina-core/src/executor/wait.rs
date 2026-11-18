@@ -151,7 +151,7 @@ pub enum WaitOutcome {
     Abandoned,
     Unsatisfiable(UnsatisfiableReason),
     Timeout {
-        last_attrs: HashMap<String, crate::resource::SnapshotValue>,
+        last_attrs: BTreeMap<String, crate::resource::SnapshotValue>,
         elapsed: Duration,
     },
     NotFound(HostError),
@@ -233,7 +233,7 @@ pub(super) fn wait_failure(
     }
 }
 
-fn format_wait_last_attrs(last_attrs: &HashMap<String, crate::resource::SnapshotValue>) -> String {
+fn format_wait_last_attrs(last_attrs: &BTreeMap<String, crate::resource::SnapshotValue>) -> String {
     let mut keys: Vec<_> = last_attrs.keys().collect();
     keys.sort();
     if keys.is_empty() {
@@ -887,7 +887,7 @@ mod tests {
     #[test]
     fn provider_text_wait_last_attrs_escapes_keys_after_raw_sorting_and_lookup() {
         let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
-        let attrs = HashMap::from([
+        let attrs = std::collections::BTreeMap::from([
             (
                 raw.to_string(),
                 Value::Concrete(ConcreteValue::String("observed".into())),
@@ -1515,7 +1515,7 @@ mod tests {
     fn wait_timeout_failure_message_uses_display_formatting_for_last_attrs() {
         let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let outcome = WaitOutcome::Timeout {
-            last_attrs: HashMap::from([
+            last_attrs: std::collections::BTreeMap::from([
                 (
                     "status".to_string(),
                     Value::Concrete(ConcreteValue::String("pending".into())),
@@ -1543,7 +1543,7 @@ mod tests {
     fn wait_timeout_failure_message_handles_empty_last_attrs() {
         let target = ResolvedResourceId::new(ResourceId::with_identity("acm.Certificate", "cert"));
         let outcome = WaitOutcome::Timeout {
-            last_attrs: HashMap::new(),
+            last_attrs: std::collections::BTreeMap::new(),
             elapsed: Duration::from_secs(1),
         };
 

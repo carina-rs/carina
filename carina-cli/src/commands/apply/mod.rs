@@ -541,7 +541,7 @@ fn bootstrap_resolved_bindings(
     parsed: &carina_core::parser::ExpandedInferredFile,
 ) -> ResolvedBindings {
     let managed_current = HashMap::new();
-    let remote_bindings = HashMap::new();
+    let remote_bindings = std::collections::BTreeMap::new();
     let wait_aliases: Vec<WaitAliasSpec> = parsed
         .wait_bindings
         .iter()
@@ -964,13 +964,13 @@ async fn execute_rehydrated_saved_plan(
 async fn verify_upstream_snapshot(
     wiring: &crate::wiring::WiringContext,
     sources: &[crate::commands::plan::UpstreamSource],
-    snapshot: &HashMap<String, HashMap<String, Value>>,
+    snapshot: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>,
     project_dir: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), AppError> {
     let provider_context = wiring.provider_context().as_provider_context();
     let mut cycle_guard = super::plan::seed_cycle_guard(project_dir);
-    let mut current = HashMap::new();
+    let mut current = AdmittedRemoteBindings::new();
     for source in sources {
         let state = ExpandedUpstreamState {
             binding: source.binding.clone(),
@@ -1031,11 +1031,10 @@ pub(crate) fn upstream_snapshot_drift(binding: &str, apply_target: ApplyTarget<'
 ///
 /// Split out so it can be unit-tested without a real upstream backend.
 fn diff_upstream_snapshot(
-    snapshot: &HashMap<String, HashMap<String, Value>>,
+    snapshot: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>>,
     current: &AdmittedRemoteBindings,
     apply_target: ApplyTarget<'_>,
 ) -> Result<(), String> {
-    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (binding, planned_attrs) in snapshot {
         match current.get(binding) {
             None => {
@@ -1052,7 +1051,6 @@ fn diff_upstream_snapshot(
             Some(_) => {}
         }
     }
-    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for binding in current.keys() {
         if !snapshot.contains_key(binding) {
             return Err(format!(
@@ -1069,7 +1067,28 @@ fn diff_upstream_snapshot(
 #[cfg(test)]
 mod upstream_snapshot_tests {
     use super::*;
-    use carina_core::upstream_exports::remote_bindings_for_test;
+    use std::collections::BTreeMap;
+
+    fn remote_bindings_for_test(
+        bindings: BTreeMap<String, BTreeMap<String, Value>>,
+    ) -> AdmittedRemoteBindings {
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        bindings
+            .into_iter()
+            .map(|(name, values)| {
+                let admitted = carina_core::validation::deferred_types::with_session_for_test(
+                    &context,
+                    |session| {
+                        carina_core::upstream_exports::ResolvedUpstreamSource::for_test(&name, None)
+                            .admit_snapshot(values, session)
+                    },
+                )
+                .expect("fixture admission");
+                (name, admitted)
+            })
+            .collect()
+    }
 
     #[test]
     fn round2_4_wrapped_admission_failure_remains_drift() {
@@ -1140,7 +1159,7 @@ mod upstream_snapshot_tests {
         let error = verify_upstream_snapshot(
             &wiring,
             &sources,
-            &HashMap::new(),
+            &std::collections::BTreeMap::new(),
             &ResolvedPath::new(root.path()).unwrap(),
             ApplyTarget::Project(root.path()),
         )
@@ -1154,7 +1173,7 @@ mod upstream_snapshot_tests {
         assert!(matches!(error, AppError::Backend(_)), "{error:?}");
     }
 
-    fn binding(name: &str, attrs: &[(&str, &str)]) -> (String, HashMap<String, Value>) {
+    fn binding(name: &str, attrs: &[(&str, &str)]) -> (String, BTreeMap<String, Value>) {
         let map = attrs
             .iter()
             .map(|(k, v)| {
@@ -1169,10 +1188,12 @@ mod upstream_snapshot_tests {
 
     #[test]
     fn matching_snapshot_passes() {
-        let snapshot: HashMap<String, HashMap<String, Value>> =
-            vec![binding("network", &[("vpc_id", "vpc-A")])]
-                .into_iter()
-                .collect();
+        let snapshot: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Value>,
+        > = vec![binding("network", &[("vpc_id", "vpc-A")])]
+            .into_iter()
+            .collect();
         let current = remote_bindings_for_test(snapshot.clone());
         assert!(
             diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
@@ -1185,10 +1206,12 @@ mod upstream_snapshot_tests {
         // Same binding name, but the attribute value changed underneath.
         // This is the original bug: cascade re-resolution would silently
         // see "vpc-B" while the static plan was built around "vpc-A".
-        let snapshot: HashMap<String, HashMap<String, Value>> =
-            vec![binding("network", &[("vpc_id", "vpc-A")])]
-                .into_iter()
-                .collect();
+        let snapshot: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Value>,
+        > = vec![binding("network", &[("vpc_id", "vpc-A")])]
+            .into_iter()
+            .collect();
         let current = remote_bindings_for_test(
             vec![binding("network", &[("vpc_id", "vpc-B")])]
                 .into_iter()
@@ -1205,11 +1228,13 @@ mod upstream_snapshot_tests {
 
     #[test]
     fn binding_disappeared_fails() {
-        let snapshot: HashMap<String, HashMap<String, Value>> =
-            vec![binding("network", &[("vpc_id", "vpc-A")])]
-                .into_iter()
-                .collect();
-        let current = remote_bindings_for_test(HashMap::new());
+        let snapshot: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Value>,
+        > = vec![binding("network", &[("vpc_id", "vpc-A")])]
+            .into_iter()
+            .collect();
+        let current = remote_bindings_for_test(std::collections::BTreeMap::new());
         let err = diff_upstream_snapshot(&snapshot, &current, ApplyTarget::Project(Path::new(".")))
             .expect_err("must fail");
         assert!(err.contains("missing now"), "got: {err}");
@@ -1217,7 +1242,10 @@ mod upstream_snapshot_tests {
 
     #[test]
     fn binding_appeared_fails() {
-        let snapshot: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let snapshot: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, Value>,
+        > = std::collections::BTreeMap::new();
         let current = remote_bindings_for_test(
             vec![binding("network", &[("vpc_id", "vpc-A")])]
                 .into_iter()
@@ -1230,8 +1258,9 @@ mod upstream_snapshot_tests {
 
     #[test]
     fn empty_both_sides_passes() {
-        let empty: HashMap<String, HashMap<String, Value>> = HashMap::new();
-        let current = remote_bindings_for_test(HashMap::new());
+        let empty: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Value>> =
+            std::collections::BTreeMap::new();
+        let current = remote_bindings_for_test(std::collections::BTreeMap::new());
         assert!(
             diff_upstream_snapshot(&empty, &current, ApplyTarget::Project(Path::new("."))).is_ok()
         );
@@ -1908,7 +1937,7 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
         planned_state_entries.iter().map(|entry| {
             let crate::commands::plan::ReloadedCurrentStateEntry::Managed { id, current } = entry;
             (
-                historical_addresses.origin_for(id).clone(),
+                ResolvedResourceId::new(historical_addresses.origin_for(id).clone()),
                 *current.clone(),
             )
         }),
@@ -2670,7 +2699,7 @@ async fn run_apply_locked_owned(
             if persisted_state.is_some() {
                 let loaded_orphans = expansion_prelude.loaded_orphans(std::iter::empty());
                 let orphan_results: Vec<
-                    Result<(ResourceId, carina_core::differ::Orphan), AppError>,
+                    Result<(ResolvedResourceId, carina_core::differ::Orphan), AppError>,
                 > = stream::iter(loaded_orphans)
                     .map(|(id, loaded)| async move {
                         let refreshed = refresh_loaded_orphan_with_retry(
@@ -2697,9 +2726,9 @@ async fn run_apply_locked_owned(
                         Current::MissingIdentifier(_state) => true,
                     };
                     if exists {
-                        orphan_refreshed_ids.insert(id.clone());
+                        orphan_refreshed_ids.insert(id.as_inner().clone());
                     }
-                    refreshed_orphans.insert(loaded);
+                    refreshed_orphans.insert(id, loaded);
                 }
                 orphans = refreshed_orphans.into_plan_orphans();
             }

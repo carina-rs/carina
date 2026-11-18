@@ -71,7 +71,7 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -385,7 +385,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         data_source_origins: vec![],
         data_source_values: vec![],
         current_states,
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: vec![],
         wait_bindings: vec![],
     };
@@ -511,7 +511,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         data_source_origins: vec![],
         data_source_values: vec![],
         current_states: vec![],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: vec![],
         wait_bindings: vec![],
     };

@@ -720,7 +720,7 @@ pub(crate) fn resolve_export_values_post_apply<D>(
                         compositions: &[],
                         managed_current: &plan_input_current,
                         data_source_values: input.post_apply_states.data_source_values(),
-                        remote_bindings: &HashMap::new(),
+                        remote_bindings: &Default::default(),
                         wait_aliases: input.wait_aliases,
                     },
                 );

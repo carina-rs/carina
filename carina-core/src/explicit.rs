@@ -161,7 +161,7 @@ pub fn build_from_read_resource_for_stored_values<S, D, P: StateValueLeaf, R: Re
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
-    stored_attributes: &HashMap<String, Value<P>>,
+    stored_attributes: &BTreeMap<String, Value<P>>,
     schema: Option<&ResourceSchema>,
     comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
@@ -203,8 +203,8 @@ pub fn build_from_resource_for_stored_values_after_send<
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
-    prior_stored_authoring: Option<(&HashMap<String, Value<P>>, &ExplicitFields)>,
-    stored_attributes: &HashMap<String, Value<P>>,
+    prior_stored_authoring: Option<(&BTreeMap<String, Value<P>>, &ExplicitFields)>,
+    stored_attributes: &BTreeMap<String, Value<P>>,
     sent_desired: &SentDesiredAttributes<'_>,
     schema: Option<&ResourceSchema>,
     comparison: &ComparisonContext<'_, R>,
@@ -283,7 +283,7 @@ fn build_for_stored_values<S, D, P: StateValueLeaf, R: ReferenceEquality>(
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
-    stored_attributes: &HashMap<String, Value<P>>,
+    stored_attributes: &BTreeMap<String, Value<P>>,
     schema: Option<&ResourceSchema>,
     basis: StoredValueAuthoringBasis,
     comparison: &ComparisonContext<'_, R>,
@@ -335,9 +335,9 @@ pub fn build_carried_from_resource_for_stored_values<
         crate::resource::AbsoluteBindingAddress,
         D,
     >,
-    prior_stored_attributes: &HashMap<String, Value<P>>,
+    prior_stored_attributes: &BTreeMap<String, Value<P>>,
     prior_explicit: &ExplicitFields,
-    fresh_stored_attributes: &HashMap<String, Value<P>>,
+    fresh_stored_attributes: &BTreeMap<String, Value<P>>,
     schema: Option<&ResourceSchema>,
     comparison: &ComparisonContext<'_, R>,
 ) -> ExplicitFields {
@@ -376,9 +376,9 @@ pub fn build_carried_from_resource_for_stored_values<
     carry_struct_fields(
         prior_children,
         rebuilt,
-        Some(CarryMap::Hash(&prior_snapshot)),
+        Some(CarryMap::Stored(&prior_snapshot)),
         CarryMap::Index(&desired_snapshot),
-        CarryMap::Hash(&fresh_snapshot),
+        CarryMap::Stored(&fresh_snapshot),
         CarryContext::resource(schema, defs, *comparison),
     )
     .explicit
@@ -391,14 +391,14 @@ struct CarriedNode {
 
 #[derive(Clone, Copy)]
 enum CarryMap<'a> {
-    Hash(&'a HashMap<String, SnapshotValue>),
+    Stored(&'a BTreeMap<String, SnapshotValue>),
     Index(&'a IndexMap<String, SnapshotValue>),
 }
 
 impl<'a> CarryMap<'a> {
     fn get(self, key: &str) -> Option<&'a SnapshotValue> {
         match self {
-            Self::Hash(fields) => fields.get(key),
+            Self::Stored(fields) => fields.get(key),
             Self::Index(fields) => fields.get(key),
         }
     }
@@ -1644,7 +1644,7 @@ impl<'a, R: ReferenceEquality> ExplicitProjection<'a, R> {
             return ProjectedAttributes::unprojected(attributes, Some(self.explicit));
         };
 
-        let mut projected_attributes = HashMap::new();
+        let mut projected_attributes = BTreeMap::new();
         let mut projected_children = HashMap::new();
         let mut origins = crate::differ::OperandOrigins::new();
         for (key, value) in attributes {
@@ -1699,7 +1699,7 @@ pub struct ProjectedAttributes {
 
 impl ProjectedAttributes {
     fn canonicalized(
-        attributes: HashMap<String, crate::resource::SnapshotValue>,
+        attributes: BTreeMap<String, crate::resource::SnapshotValue>,
         authoring: ProjectedAuthoring,
         schema: Option<&ResourceSchema>,
     ) -> Self {
@@ -2095,9 +2095,15 @@ mod tests {
     ) -> ExplicitFields {
         super::build_carried_from_resource_for_stored_values(
             resource,
-            prior_stored_attributes,
+            &prior_stored_attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
             prior_explicit,
-            fresh_stored_attributes,
+            &fresh_stored_attributes
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
             schema,
             &crate::differ::exact_comparison_context_for_tests(),
         )
@@ -2241,7 +2247,7 @@ mod tests {
         let resource: Resource =
             Resource::new("example.Listener", "listener").with_attribute("items", desired);
         let stored_attributes = stored
-            .map(|stored| HashMap::from([("items".to_string(), stored)]))
+            .map(|stored| BTreeMap::from([("items".to_string(), stored)]))
             .unwrap_or_default();
         let sent = crate::executor::AcceptedRequest::create_for_test();
         let sent_desired = sent.sent_desired_attributes(&resource);
@@ -2279,7 +2285,7 @@ mod tests {
                 Value::Concrete(ConcreteValue::String("after".into())),
             )
             .with_attribute("items", desired_items.clone());
-        let prior_stored = HashMap::from([
+        let prior_stored = std::collections::BTreeMap::from([
             (
                 "description".to_string(),
                 Value::Concrete(ConcreteValue::String("before".into())),
@@ -2302,7 +2308,7 @@ mod tests {
             None,
             &crate::differ::exact_comparison_context_for_tests(),
         );
-        let fresh_stored = HashMap::from([
+        let fresh_stored = std::collections::BTreeMap::from([
             (
                 "description".to_string(),
                 Value::Concrete(ConcreteValue::String("after".into())),
@@ -3146,7 +3152,7 @@ mod tests {
         let stored = Value::Concrete(ConcreteValue::List(vec![stored_item]));
         let resource: Resource =
             Resource::new("example.Listener", "listener").with_attribute("items", desired);
-        let stored_attributes = HashMap::from([("items".to_string(), stored)]);
+        let stored_attributes = std::collections::BTreeMap::from([("items".to_string(), stored)]);
         let sent = crate::executor::AcceptedRequest::create_for_test();
         let sent_desired = sent.sent_desired_attributes(&resource);
 

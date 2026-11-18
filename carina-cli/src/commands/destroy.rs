@@ -3,7 +3,7 @@ use carina_core::config_loader::get_base_dir;
 use carina_core::planning_state::{StateRowKey, state_row_key_from_parts};
 #[cfg(test)]
 use carina_core::resource::ResolvedResource;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -686,7 +686,7 @@ validated_config.provider_plan())
                         }
                     }
                 };
-                let result: Result<(ResourceId, carina_core::differ::Orphan), AppError> = match next {
+                let result: Result<(ResolvedResourceId, carina_core::differ::Orphan), AppError> = match next {
                     CleanupInterrupted::Completed(Some(result)) => result,
                     CleanupInterrupted::Completed(None) => break,
                     CleanupInterrupted::Abandoned => {
@@ -699,7 +699,7 @@ validated_config.provider_plan())
                     continue;
                 }
                 let (id, loaded) = result?;
-                orphans.insert(loaded.clone());
+                orphans.insert(id.clone(), loaded.clone());
                 let current = loaded.into_current();
                 let exists = match &current {
                     Current::Absent(_state) => false,
@@ -708,13 +708,11 @@ validated_config.provider_plan())
                     Current::CreateOutcomeUnknown(_unknown) => true,
                     Current::MissingIdentifier(_state) => true,
                 };
-                if exists
-                    && let Some(resolved_id) = ResolvedResourceId::try_new(id.clone())
-                {
-                    let orphan_resource = build_orphan_resource(sf, &resolved_id);
+                if exists {
+                    let orphan_resource = build_orphan_resource(sf, &id);
                     all_resources.push(orphan_resource);
                 }
-                managed_current.insert(id, current);
+                managed_current.insert(id.into_inner(), current);
             }
             if refresh_cancelled {
                 return Err(AppError::Interrupted);
@@ -740,14 +738,14 @@ validated_config.provider_plan())
                 provider: &provider,
                 state_file: &state_file,
                 refresh_phase: &refresh_phase,
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 cancel: &cancel,
             },
         ).await?;
         all_resources = crate::wiring::resources_at_destroy_addresses(sorted_resources, &moved_pairs);
         let crate::wiring::AddressedStateParts { managed_current: expanded_current, orphans, .. } = parts.addressed.into_parts();
         if let Some(state) = state_file.as_ref() {
-            all_resources.extend(orphans.keys().map(|id| build_orphan_resource(state, &ResolvedResourceId::new(id.clone()))));
+            all_resources.extend(orphans.resolved_keys().map(|id| build_orphan_resource(state, id)));
         }
         managed_current = carina_core::differ::into_all_prior_states(orphans, expanded_current);
         config
@@ -764,11 +762,9 @@ validated_config.provider_plan())
             let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
             for (id, loaded) in prepared_rows.refreshable.build_orphans(&desired_ids) {
                 let current = loaded.into_orphan().into_current();
-                if let Some(resolved_id) = ResolvedResourceId::try_new(id.clone()) {
-                    let orphan_resource = build_orphan_resource(sf, &resolved_id);
-                    all_resources.push(orphan_resource);
-                }
-                managed_current.insert(id, current);
+                let orphan_resource = build_orphan_resource(sf, &id);
+                all_resources.push(orphan_resource);
+                managed_current.insert(id.into_inner(), current);
             }
         }
         validated_config.into_offline_legacy_configuration()
@@ -1208,23 +1204,18 @@ validated_config.provider_plan())
         if !cancelled {
             // Only the shared scheduler can release delete authority. The CLI
             // retains display priority and its provider-retry gate.
-            let mut newly_ready = Vec::new();
             let capacity = parallelism.get().saturating_sub(in_flight.len());
-            for &idx in &all_indices {
-                if newly_ready.len() == capacity {
-                    break;
-                }
-                if dispatched.contains(&idx) || retry_pending.contains(&idx) {
-                    continue;
-                }
-                if let Some((failure, completion)) = pending_retries.remove(&idx) {
-                    delete_scheduler.retry(completion)?;
-                    active_retries.insert(idx, failure);
-                }
-                if let Some(release) = delete_scheduler.release(idx)? {
-                    newly_ready.push((idx, release));
+            let candidates: Vec<_> = all_indices.iter().copied()
+                .filter(|idx| !dispatched.contains(idx) && !retry_pending.contains(idx)).collect();
+            if capacity > 0 {
+                for &idx in &candidates {
+                    if let Some((failure, completion)) = pending_retries.remove(&idx) {
+                        delete_scheduler.retry(completion)?;
+                        active_retries.insert(idx, failure);
+                    }
                 }
             }
+            let newly_ready = delete_scheduler.release_ready(candidates, capacity)?;
 
             // Process newly ready resources
             for (idx, release) in newly_ready {
@@ -2071,7 +2062,7 @@ fn state_row_key_from_id(id: &ResolvedResourceId) -> StateRowKey {
 
 fn topological_delete_order(
     delete_count: usize,
-    deletion_deps: &HashMap<usize, HashSet<usize>>,
+    deletion_deps: &HashMap<usize, BTreeSet<usize>>,
     depths: &[usize],
     names: &[String],
 ) -> Result<Vec<usize>, String> {
@@ -2109,14 +2100,12 @@ fn topological_delete_order(
 
 fn compute_delete_depths(
     delete_count: usize,
-    deletion_deps: &HashMap<usize, HashSet<usize>>,
+    deletion_deps: &HashMap<usize, BTreeSet<usize>>,
 ) -> Vec<usize> {
-    let mut create_parents: HashMap<usize, HashSet<usize>> = HashMap::new();
+    let mut create_parents: HashMap<usize, BTreeSet<usize>> = HashMap::new();
     #[allow(clippy::iter_over_hash_type)]
     // keyed rebuild: reverse dependency sets union duplicate edges idempotently
     for (&parent, children) in deletion_deps {
-        #[allow(clippy::iter_over_hash_type)]
-        // keyed rebuild: parent membership and maximum depth do not depend on traversal
         for &child in children {
             create_parents.entry(child).or_default().insert(parent);
         }
@@ -2130,7 +2119,7 @@ fn compute_delete_depths(
 
 fn compute_delete_depth(
     idx: usize,
-    create_parents: &HashMap<usize, HashSet<usize>>,
+    create_parents: &HashMap<usize, BTreeSet<usize>>,
     memo: &mut HashMap<usize, usize>,
     visiting: &mut HashSet<usize>,
 ) -> usize {
@@ -2157,12 +2146,12 @@ fn compute_delete_depth(
 
 fn cycle_path(
     delete_count: usize,
-    deletion_deps: &HashMap<usize, HashSet<usize>>,
+    deletion_deps: &HashMap<usize, BTreeSet<usize>>,
     names: &[String],
 ) -> String {
     fn dfs(
         idx: usize,
-        deletion_deps: &HashMap<usize, HashSet<usize>>,
+        deletion_deps: &HashMap<usize, BTreeSet<usize>>,
         visiting: &mut Vec<usize>,
         visited: &mut HashSet<usize>,
     ) -> Option<Vec<usize>> {
@@ -2377,13 +2366,16 @@ mod tests {
         for (dependencies, remaining) in [
             (
                 HashMap::from([
-                    (0, HashSet::from([1])),
-                    (1, HashSet::from([0])),
-                    (2, HashSet::from([0])),
+                    (0, BTreeSet::from([1])),
+                    (1, BTreeSet::from([0])),
+                    (2, BTreeSet::from([0])),
                 ]),
                 HashSet::from([0, 1, 2]),
             ),
-            (HashMap::from([(2, HashSet::from([3]))]), HashSet::from([2])),
+            (
+                HashMap::from([(2, BTreeSet::from([3]))]),
+                HashSet::from([2]),
+            ),
         ] {
             let completed = HashSet::new();
             let apply = carina_core::executor::classify_stalled_effects(
@@ -2915,7 +2907,7 @@ mod tests {
 
     #[test]
     fn topological_delete_order_reports_cycles() {
-        let deletion_deps = HashMap::from([(0, HashSet::from([1])), (1, HashSet::from([0]))]);
+        let deletion_deps = HashMap::from([(0, BTreeSet::from([1])), (1, BTreeSet::from([0]))]);
         let depths = compute_delete_depths(2, &deletion_deps);
         let names = vec!["a".to_string(), "b".to_string()];
 
@@ -2936,13 +2928,13 @@ mod tests {
             "route".to_string(),
         ];
         let deletion_deps = HashMap::from([
-            (0, HashSet::from([1, 2, 5])),
-            (1, HashSet::new()),
-            (2, HashSet::from([4])),
-            (3, HashSet::from([4])),
-            (4, HashSet::from([6])),
-            (5, HashSet::from([6])),
-            (6, HashSet::new()),
+            (0, BTreeSet::from([1, 2, 5])),
+            (1, BTreeSet::new()),
+            (2, BTreeSet::from([4])),
+            (3, BTreeSet::from([4])),
+            (4, BTreeSet::from([6])),
+            (5, BTreeSet::from([6])),
+            (6, BTreeSet::new()),
         ]);
         let depths = compute_delete_depths(names.len(), &deletion_deps);
 

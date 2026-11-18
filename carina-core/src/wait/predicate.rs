@@ -5,7 +5,7 @@
 //! is shaped to grow (`NotEquals`, `And`, `Or`, comparisons, `In`)
 //! without breaking call sites.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -61,7 +61,7 @@ impl AttrPath {
     /// or `None` if any segment is missing or not a map at a non-leaf.
     pub(crate) fn resolve<'a, P: crate::resource::ValueKind, B: BindingAddress>(
         &self,
-        attrs: &'a HashMap<String, Value<P, B>>,
+        attrs: &'a std::collections::BTreeMap<String, Value<P, B>>,
     ) -> Option<&'a Value<P, B>> {
         let (first, rest) = self.segments().split_first()?;
         let mut current = attrs.get(first)?;
@@ -504,7 +504,7 @@ impl<B: BindingAddress> WaitPredicate<B> {
     /// Evaluate against the target's `read()` attribute map. Returns
     /// `true` when the predicate is satisfied; missing attributes and
     /// type mismatches both yield `false` (the wait keeps polling).
-    pub fn evaluate(&self, attrs: &HashMap<String, Value<NoPlaceholder, B>>) -> bool {
+    pub fn evaluate(&self, attrs: &BTreeMap<String, Value<NoPlaceholder, B>>) -> bool {
         match self {
             WaitPredicate::Equals { attr, value } => attr
                 .resolve(attrs)
@@ -543,7 +543,7 @@ mod tests {
     use crate::resource::ExpandedConcreteValue as ConcreteValue;
     use crate::resource::{DeferredValue, InterpolationPart};
     type Value = crate::resource::ExpandedValue;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     #[test]
     fn round2_wait_decode_accepts_only_authored_scalar_shapes() {
@@ -585,7 +585,7 @@ mod tests {
             ) {
                 let predicate = WaitPredicate::equals(AttrPath::single("status"), decoded).unwrap();
                 let observed = rhs.to_value();
-                assert!(predicate.evaluate(&HashMap::from([("status".to_string(), observed)])));
+                assert!(predicate.evaluate(&BTreeMap::from([("status".to_string(), observed)])));
                 let wire = serde_json::to_string(&predicate).unwrap();
                 let decoded: WaitPredicate<crate::resource::RelativeBindingName> =
                     serde_json::from_str(&wire).unwrap();
@@ -632,7 +632,7 @@ mod tests {
         );
         let decoded: WaitPredicate = serde_json::from_str(&wire).unwrap();
         assert_eq!(serde_json::to_string(&decoded).unwrap(), wire);
-        assert!(predicate.evaluate(&HashMap::from([(
+        assert!(predicate.evaluate(&BTreeMap::from([(
             "status".to_string(),
             Value::Concrete(ConcreteValue::String("Issued".into()))
         )])));
@@ -717,7 +717,7 @@ mod tests {
                 &predicate.value(),
                 &Value::Concrete(ConcreteValue::String(expected.into()))
             );
-            assert!(predicate.evaluate(&HashMap::from([(
+            assert!(predicate.evaluate(&BTreeMap::from([(
                 "identifier".to_string(),
                 Value::Concrete(ConcreteValue::String(expected.into())),
             )])));
@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn resolve_returns_none_for_missing_attr() {
-        let attrs = HashMap::from([(
+        let attrs = BTreeMap::from([(
             "status".to_string(),
             Value::Concrete(ConcreteValue::String("pending".into())),
         )]);
@@ -818,7 +818,7 @@ mod tests {
             )),
         )
         .unwrap();
-        let attrs = HashMap::from([(
+        let attrs = BTreeMap::from([(
             "status".to_string(),
             Value::Concrete(ConcreteValue::String("Issued".into())),
         )]);
@@ -837,8 +837,8 @@ mod tests {
             ))
         }
 
-        let plan_state = HashMap::from([("status".to_string(), canonical_status())]);
-        let apply_state = HashMap::from([(
+        let plan_state = BTreeMap::from([("status".to_string(), canonical_status())]);
+        let apply_state = BTreeMap::from([(
             "status".to_string(),
             Value::Concrete(ConcreteValue::String("ISSUED".into())),
         )]);

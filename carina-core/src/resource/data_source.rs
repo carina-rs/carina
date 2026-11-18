@@ -28,10 +28,10 @@ use super::{
 /// `prefixes` is dropped (auto-generated names do not apply to
 /// read-only lookups):
 ///
-/// ```compile_fail
+/// ```compile_fail,E0609
 /// use carina_core::resource::DataSource;
-/// fn _f(d: &DataSource) -> &std::collections::HashMap<String, String> {
-///     &d.prefixes
+/// fn _f(d: &DataSource) {
+///     let _ = &d.prefixes;
 /// }
 /// ```
 ///

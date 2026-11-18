@@ -550,7 +550,7 @@ fn shape_for_projection<'a>(
 /// `Union` types are not recursed into because the active arm cannot be known
 /// without re-running validation.
 pub fn lift_state_enum_leaves(
-    attributes: &mut std::collections::HashMap<String, crate::resource::SnapshotValue>,
+    attributes: &mut std::collections::BTreeMap<String, crate::resource::SnapshotValue>,
     schema: &crate::schema::CompiledResourceSchema,
 ) {
     for (name, attr) in &schema.attributes {
@@ -572,7 +572,7 @@ pub fn lift_state_enum_leaves(
 pub(crate) fn lift_saved_state_enum_leaves(
     saved_attrs: &mut std::collections::HashMap<
         crate::resource::ResourceId,
-        std::collections::HashMap<String, crate::resource::SnapshotValue>,
+        std::collections::BTreeMap<String, crate::resource::SnapshotValue>,
     >,
     registry: &crate::schema::SchemaRegistry,
 ) {
@@ -1830,18 +1830,19 @@ mod tests {
             "version".to_string(),
             Value::Concrete(ConcreteValue::String("2012-10-17".into())),
         );
-        let mut known_attrs = HashMap::new();
+        let mut known_attrs = std::collections::BTreeMap::new();
         known_attrs.insert(
             "policy_document".to_string(),
             Value::Concrete(ConcreteValue::Map(pd)),
         );
-        let mut unknown_attrs = HashMap::new();
+        let mut unknown_attrs = std::collections::BTreeMap::new();
         unknown_attrs.insert(
             "whatever".to_string(),
             Value::Concrete(ConcreteValue::String("Allow".into())),
         );
 
-        let mut saved: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        let mut saved: HashMap<ResourceId, std::collections::BTreeMap<String, Value>> =
+            HashMap::new();
         saved.insert(known.id.clone(), known_attrs);
         saved.insert(unknown.id.clone(), unknown_attrs);
 

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::resource::{
@@ -156,7 +155,7 @@ fn equals_returns_true_when_attribute_matches() {
             .unwrap(),
     )
     .unwrap();
-    let mut attrs = HashMap::new();
+    let mut attrs = std::collections::BTreeMap::new();
     attrs.insert(
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("ISSUED".into())),
@@ -172,7 +171,7 @@ fn equals_returns_false_when_attribute_differs() {
             .unwrap(),
     )
     .unwrap();
-    let mut attrs = HashMap::new();
+    let mut attrs = std::collections::BTreeMap::new();
     attrs.insert(
         "status".to_string(),
         Value::Concrete(ConcreteValue::String("PENDING_VALIDATION".into())),
@@ -188,7 +187,7 @@ fn equals_returns_false_when_attribute_absent() {
             .unwrap(),
     )
     .unwrap();
-    let attrs: HashMap<String, Value> = HashMap::new();
+    let attrs: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
     assert!(!pred.evaluate(&attrs));
 }
 

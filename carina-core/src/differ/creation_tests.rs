@@ -65,7 +65,7 @@ fn checked(
 fn delete(resource: &ResolvedResource) -> DeferredReplaceDelete {
     DeferredReplaceDelete {
         generation: EffectGeneration::Current,
-        previous_attributes: HashMap::new(),
+        previous_attributes: std::collections::BTreeMap::new(),
         blocked_by_updates: Default::default(),
         id: resource.resolved_id().clone(),
         identifier: AppliedIdentifier::new("old-id").unwrap(),
@@ -322,7 +322,7 @@ fn creation_admission_deferred_replace_retains_all_absorbed_delete_slots() {
     let mut plan = Plan::new();
     let deletes = ["old-a", "old-b"].map(|identity| DeferredReplaceDelete {
         generation: EffectGeneration::Current,
-        previous_attributes: HashMap::new(),
+        previous_attributes: std::collections::BTreeMap::new(),
         id: ResolvedResourceId::with_provider_identity("mock", "Bucket", identity, None),
         identifier: AppliedIdentifier::new(identity).unwrap(),
         directives: Default::default(),
@@ -729,7 +729,7 @@ fn input_scope_classification_table_covers_every_effect_variant() {
             Effect::DeferredReplace(Box::new(DeferredReplacePayload::new(
                 NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
                     generation: EffectGeneration::Current,
-                    previous_attributes: HashMap::new(),
+                    previous_attributes: std::collections::BTreeMap::new(),
                     id: resource.resolved_id().clone(),
                     identifier: AppliedIdentifier::new("old").unwrap(),
                     directives: Default::default(),

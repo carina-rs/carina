@@ -208,7 +208,7 @@ fn historical_bindings() -> carina_core::binding_index::ResolvedBindings {
         compositions: &[],
         managed_current: &current,
         data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-        remote_bindings: &HashMap::new(),
+        remote_bindings: &Default::default(),
         wait_aliases: &[],
     })
 }
