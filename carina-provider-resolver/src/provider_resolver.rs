@@ -15173,6 +15173,58 @@ sha256 = "abc"
     }
 
     #[test]
+    fn lock_load_rejects_versions_one_through_four() {
+        let path = Path::new("project/carina-providers.lock");
+        for found in 1..=4 {
+            let error = LockFile::from_toml_str(&format!("version = {found}\n"), path)
+                .expect_err("only the current lock format may be loaded");
+            let rendered = error.to_string();
+            assert!(rendered.contains(&path.display().to_string()), "{rendered}");
+            assert!(rendered.contains(&format!("version {found}")), "{rendered}");
+            assert!(rendered.contains("reads only version 5"), "{rendered}");
+            assert!(rendered.contains("Carina v0.15.0"), "{rendered}");
+            assert!(rendered.contains("carina init project"), "{rendered}");
+            assert!(
+                rendered.contains("carina providers repin-discovery"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("carina providers repin-identity"),
+                "{rendered}"
+            );
+            assert!(rendered.contains("then `carina init` again"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn lock_load_rejects_pre_4020_v5_entries() {
+        let path = Path::new("carina-providers.lock");
+        for fixture in [
+            include_str!("../tests/fixtures/rejected-github-version.toml"),
+            include_str!("../tests/fixtures/rejected-github-revision.toml"),
+        ] {
+            let error = LockFile::from_toml_str(fixture, path)
+                .expect_err("GitHub locks require an exact artifact identity");
+            assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+            assert!(error.to_string().contains("hint:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn lock_load_rejects_required_legacy() {
+        let path = Path::new("carina-providers.lock");
+        for fixture in [
+            include_str!("../tests/fixtures/rejected-provider-signer.toml"),
+            include_str!("../tests/fixtures/rejected-unpinned-signer.toml"),
+        ] {
+            let error = LockFile::from_toml_str(fixture, path)
+                .expect_err("signer pins must use the current identity schema");
+            assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+            assert!(error.to_string().contains("hint:"), "{error}");
+        }
+    }
+
+    #[test]
     fn reset_pending_anchor_lock_format_is_v5() {
         assert_eq!(LockFile::CURRENT_VERSION, 5);
     }
