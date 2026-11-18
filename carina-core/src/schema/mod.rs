@@ -1350,6 +1350,15 @@ pub struct PatternAttributeType<R: PatternForm = Draft> {
 
 /// Provider-facing draft type. Schema admission compiles all of its patterns.
 ///
+/// The `kind` field is private; use constructors and shape views instead.
+///
+/// ```compile_fail,E0616
+/// fn peek(_: &carina_core::schema::AttributeType) {
+///     // Check field visibility independently of the private enum type.
+///     let _ = std::mem::offset_of!(carina_core::schema::AttributeType, kind);
+/// }
+/// ```
+///
 /// Drafts cannot enter a value-validation API:
 ///
 /// ```compile_fail,E0308
@@ -1381,8 +1390,38 @@ pub struct PatternAttributeType<R: PatternForm = Draft> {
 /// assert_eq!(value.api_value(), "x");
 /// ```
 pub type AttributeType = PatternAttributeType<Draft>;
+
+/// Provider-facing draft struct field.
+///
+/// Fields are private; build through the builders and read through `parts()`.
+///
+/// ```compile_fail,E0616
+/// fn peek(x: &carina_core::schema::StructField) {
+///     let _ = &x.name;
+/// }
+/// ```
 pub type StructField = PatternStructField<Draft>;
+
+/// Provider-facing draft attribute schema.
+///
+/// Fields are private; build through the builders and read through `parts()`.
+///
+/// ```compile_fail,E0616
+/// fn peek(x: &carina_core::schema::AttributeSchema) {
+///     let _ = &x.name;
+/// }
+/// ```
 pub type AttributeSchema = PatternAttributeSchema<Draft>;
+
+/// Provider-facing draft resource schema.
+///
+/// Fields are private; build through the builders and read through `parts()`.
+///
+/// ```compile_fail,E0616
+/// fn peek(x: &carina_core::schema::ResourceSchema) {
+///     let _ = &x.resource_type;
+/// }
+/// ```
 pub type ResourceSchema = PatternResourceSchema<Draft>;
 
 /// An attribute type whose string patterns are compiled regexes.
