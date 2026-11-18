@@ -1620,6 +1620,7 @@ enum PrefixDependencyKind {
     ModuleOutput,
     UpstreamExport,
     ResourceInput,
+    // Managed-input origin attribution applies only to ResourceInput.
     DataSourceAttribute,
     UnresolvedReference,
 }
@@ -1714,12 +1715,11 @@ fn deferred_prefix_message(
 ) -> String {
     // Keep this match exhaustive: a new reference kind needs a wording decision.
     let clause = |kind| match kind {
-        PrefixDependencyKind::ProviderAttribute | PrefixDependencyKind::DataSourceAttribute => {
-            "which is known only after apply"
-        }
+        PrefixDependencyKind::ProviderAttribute => "which is known only after apply",
         PrefixDependencyKind::ModuleOutput
         | PrefixDependencyKind::UpstreamExport
         | PrefixDependencyKind::ResourceInput
+        | PrefixDependencyKind::DataSourceAttribute
         | PrefixDependencyKind::UnresolvedReference => {
             "which is not resolved when names are generated"
         }

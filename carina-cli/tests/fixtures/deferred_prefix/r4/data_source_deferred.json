@@ -16,7 +16,7 @@
             }
           }
         },
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'ds.names[0]', which is known only after apply",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'ds.names[0]', which is not resolved when names are generated",
         "severity": "error"
       }
     ],
@@ -31,7 +31,7 @@
     "lets.crn": [],
     "main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'ds.names[0]', which is known only after apply",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'ds.names[0]', which is not resolved when names are generated",
         "range": {
           "end": {
             "character": 27,
@@ -47,6 +47,6 @@
     ],
     "providers.crn": []
   },
-  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'ds.names[0]', which is known only after apply\n",
+  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'ds.names[0]', which is not resolved when names are generated\n",
   "text_exit": 1
 }

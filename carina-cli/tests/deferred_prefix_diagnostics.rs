@@ -1455,24 +1455,50 @@ r4_main_case!(
     "forward_literal_attr"
 );
 
-// Data-source timing remains undecided: pin the measured pre-fix observation.
+async fn assert_data_source_capture(case: &str, captured: &str) {
+    let expected: serde_json::Value = serde_json::from_str(captured).unwrap();
+    assert_eq!(r4_fixture(case).observation().await, expected, "{case}");
+}
+
 #[tokio::test]
-async fn r4_data_source_wording_stays_undecided() {
-    for (case, captured) in [
-        (
-            "data_source_names",
-            include_str!("fixtures/deferred_prefix/r4/data_source_names.json"),
-        ),
-        (
-            "data_source_input",
-            include_str!("fixtures/deferred_prefix/r4/data_source_input.json"),
-        ),
-        (
-            "data_source_deferred",
-            include_str!("fixtures/deferred_prefix/r4/data_source_deferred.json"),
-        ),
-    ] {
-        let expected: serde_json::Value = serde_json::from_str(captured).unwrap();
-        assert_eq!(r4_fixture(case).observation().await, expected, "{case}");
-    }
+async fn r4_data_source_names_use_name_generation_clause() {
+    assert_data_source_capture(
+        "data_source_names",
+        include_str!("fixtures/deferred_prefix/r4/data_source_names.json"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r4_data_source_deferred_uses_name_generation_clause() {
+    assert_data_source_capture(
+        "data_source_deferred",
+        include_str!("fixtures/deferred_prefix/r4/data_source_deferred.json"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r4_data_source_literal_input_stays_known() {
+    assert_data_source_capture(
+        "data_source_input",
+        include_str!("fixtures/deferred_prefix/r4/data_source_input.json"),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn r4b_data_source_iterable_uses_name_generation_clause() {
+    let mut fixture = r4_fixture("data_source_names").with_file(
+        "main.crn",
+        "let children = for x in ds.names {\n  mock.test.resource {\n    name_prefix = x\n  }\n}\n",
+    );
+    fixture.subject = "mock.test.resource.children[?]".into();
+    assert_named_dependency_reason(
+        fixture,
+        "'x'",
+        Range::new(Position::new(2, 4), Position::new(2, 19)),
+        "not resolved when names are generated",
+    )
+    .await;
 }

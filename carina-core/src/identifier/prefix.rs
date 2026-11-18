@@ -1771,18 +1771,12 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
                             )));
                         });
                     }
-                    // A loop binding represents the entire iterable, in either
-                    // reference order. Any apply-time producer makes it apply-time.
+                    // Prefer managed provider-populated attributes in either
+                    // reference order. Other producers share the name-generation clause.
                     return kinds
                         .iter()
                         .copied()
-                        .find(|kind| {
-                            matches!(
-                                kind,
-                                PrefixDependencyKind::ProviderAttribute
-                                    | PrefixDependencyKind::DataSourceAttribute
-                            )
-                        })
+                        .find(|kind| *kind == PrefixDependencyKind::ProviderAttribute)
                         .or_else(|| kinds.first().copied())
                         .unwrap_or(PrefixDependencyKind::UnresolvedReference);
                 }
@@ -1847,9 +1841,8 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
                     selected = next;
                 }
                 if data_source {
-                    // DATA SOURCE: UNDECIDED (carina#4461 round 4). The mock
-                    // plan retains the reference rather than showing its value
-                    // or timing. Preserve existing data-source wording.
+                    // Data sources are not managed resources, irrespective of
+                    // the selected attribute's provider-populated mode.
                     PrefixDependencyKind::DataSourceAttribute
                 } else if selected.is_provider_populated() {
                     PrefixDependencyKind::ProviderAttribute
