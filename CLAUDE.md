@@ -469,14 +469,10 @@ Enum values use namespaced identifiers like `aws.s3.BucketVersioning.VersioningS
 
 **When adding new namespaced patterns:**
 
-1. **Pattern matching must handle digits** - Resource names like `s3` contain digits. Use `c.is_ascii_digit()` in addition to `c.is_lowercase()`:
-   ```rust
-   // Wrong: "s3" fails because '3'.is_lowercase() == false
-   resource.chars().all(|c| c.is_lowercase() || c == '_')
-
-   // Correct:
-   resource.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
-   ```
+1. **Reuse the segment predicates.** `is_provider_segment`,
+   `is_service_segment` and `is_intermediate_segment` in
+   `carina-core/src/utils.rs` decide segment syntax, including digits in
+   names like `s3`; do not write a new `chars().all(..)` predicate.
 
 2. **Treat `TypeIdentity` as the source of truth when one is available.**
    `NamespacedId::parse` in `carina-core/src/utils.rs` remains the
@@ -487,70 +483,49 @@ Enum values use namespaced identifiers like `aws.s3.BucketVersioning.VersioningS
    the identity's provider, structural segments, and kind rather than
    re-deriving those axes from the dotted display string. Deep
    multi-segment full paths validate by this structural identity match.
+   (Not yet true for the full-form branch of `validate_enum_namespace`:
+   carina#4543.)
 
-3. **Plan display should not quote namespaced identifiers** - They are identifiers, not strings
+3. **Refined types are checked per identity.** A refined string/int/float type
+   with a validator takes a mandatory `TypeIdentity` (no identity-less
+   validator constructor exists). The LSP checks refined types generically per
+   identity, so a new type needs no per-type LSP wiring.
 
-4. **LSP diagnostics must validate refined types** - When adding a refined
-   string/int/float type with a validator binding, provide its mandatory
-   `TypeIdentity` and ensure `carina-lsp/src/diagnostics/mod.rs` invokes the
-   provider lookup for editor warnings.
-
-5. **Always test with actual values** - Don't assume pattern matching works; write a quick test to verify
+4. **Always test with actual values** - Don't assume pattern matching works; write a quick test to verify
 
 ## Struct Types
 
-A struct type represents a nested object with typed fields.
+A struct type represents a nested object with typed fields. Most guarantees
+below are held by types, compile_fail doctests and named tests in
+`carina-core/src/schema/`; read the rustdoc of the type named in each bullet
+for the details.
 
 - `AttributeType` is an opaque newtype (`pub struct AttributeType { pub(crate)
   kind: AttrTypeKind }`) defined in `carina-core/src/schema/mod.rs`. Its
   variant enum `AttrTypeKind` is `pub(crate)`, so downstream crates cannot
   pattern-match a raw `&AttributeType` — they construct one via the
-  constructor methods (`AttributeType::struct_(name, fields)`,
-  `AttributeType::refined_string(Some(identity), ...)`, etc.) and read it
-  through the `Ref`-peeled
-  `Shape` view. The struct case is the `AttrTypeKind::Struct { name, fields:
-  Vec<StructField> }` variant (carina#3349 made this unrepresentable from
-  outside `carina-core`).
-- Each `StructField` (`carina-core/src/schema/mod.rs`) has `name`,
-  `field_type` (recursive `AttributeType`), a private declared input mode,
-  `description`, `provider_name`, `block_name`, `deferred_populate`, and
-  `write_only`. Input mode is selected once by the `optional`, `required`, or
-  `provider_populated` constructor, and each mode-specific builder exposes
-  only valid modifiers; mode conflicts therefore cannot be expressed and are
-  not builder panics. A nested declaration is not itself an effective mode:
+  constructor methods and read it through the `Ref`-peeled `Shape` view
+  (carina#3349). No check pins this visibility yet: carina#4540.
+- `StructField` input mode is selected once by the `optional`, `required`, or
+  `provider_populated` constructor; see the struct's rustdoc for its fields.
+  A nested declaration is not itself an effective mode:
   provider-populated ancestry belongs to the reference path. Consumers must
   start from a validated schema and use `EffectiveAttribute`, `EffectiveType`,
   and `EffectiveField` traversal views; below provider-populated output these
   report `ProviderPopulated` even when a shared definition declares the field
   optional or required. Assignments are checked against that effective mode
-  (carina#3772). Resource-path value validation and state canonicalization
-  enter through `EffectiveAttribute` / `EffectiveType`
-  (`validate`, `validate_collect`, `canonicalize_state`); genuinely rootless
-  types use an owned `RootlessType` obtained from a pathless owner such as
-  `ValidatedConfigSchema`—there is no public constructor from an arbitrary
-  `AttributeType`. The raw writable-rooted walker is crate-private, so a
-  path-derived cursor cannot enter it through public API. Canonical
+  (carina#3772). (Four `input_rules` sites still read the raw
+  `declared_input_mode`: carina#4538.) Canonical
   provider/state/differ lookup uses `effective_attribute`; authored DSL lookup
   that may accept a block alias uses the explicitly named
   `effective_attribute_by_authored_name` /
   `effective_node_at_authored_path` traversal.
-- **Patterns require explicit semantics.** Build a `PatternSpec::new(regex,
-  PatternMatch::Full)` for whole-value constraints. Use
-  `PatternMatch::Substring { reason: PatternReason::new(reason)? }` only for a
-  documented exception; reasons must contain visible text. Pass the
-  typed spec to refined-string/reference constructors and Matches/NotMatches
-  input predicates. No string-only constructor, conversion, or default mode is
-  permitted. Preserve authored regex text; `CompiledPattern::try_new(&spec)`
-  compiles absolute Full boundaries internally once at schema admission.
+- **Patterns require explicit semantics.** `PatternSpec::new(regex,
+  PatternMatch)` has no default mode or string-only form. Use
+  `PatternMatch::Substring` only for a documented exception.
 - **Schema types are builder-only.** `StructField`, `AttributeSchema`, and
-  `ResourceSchema` keep their fields `pub(crate)` (carina#3984 / PR #3999).
-  Code outside `carina-core` builds them only through the builders
-  (`StructField::{optional,required,provider_populated}(..)`, the corresponding
-  `AttributeSchema` constructors, and
-  `ResourceSchema::new(..).attribute(..)`). A complete draft must pass
-  `ResourceSchema::validate()` before it becomes a
-  `ValidatedResourceSchema`; registries and provider factories accept only
-  that witness. Provider-config types likewise cross factory boundaries as a
+  `ResourceSchema` keep their fields `pub(crate)` (carina#3984 / PR #3999);
+  registries and factories accept only `ValidatedResourceSchema` /
   `ValidatedConfigSchema`. To destructure exhaustively (provider conversions,
   the WASM seam), use the read-only views
   `parts()` → `StructFieldParts` / `AttributeSchemaParts` /
@@ -558,57 +533,21 @@ A struct type represents a nested object with typed fields.
   `#[non_exhaustive]`, so adding a field still breaks every destructuring
   site until it is carried across. The parts views call the raw mode
   `declared_input_mode` because it is conversion data, not a consumer-facing
-  effective mode. Refined validators require a `TypeIdentity`; there is no
-  identity-less validator constructor. Resource validation is portable
-  declaration data only—native/in-process resource validators are not part of
-  the schema API. Don't add `pub` back to the schema structs' fields to "make
-  a conversion easier".
+  effective mode. Don't add `pub` back to the schema structs' fields to "make
+  a conversion easier". (Neither the field privacy nor the ban on `..` in
+  `*Parts` patterns is pinned by a check yet: carina#4540.)
 - **Write-only, top-level and nested.** `write_only` marks a value that is
   sent on create/update but never returned by reads (CloudFormation
-  `writeOnlyProperties`). It is set by `.write_only()` on `AttributeSchema`
-  or on a nested user-input `StructField`. Provider-populated builders do not
-  expose `.write_only()`, and whole-schema validation also rejects write-only
-  on every path below provider-populated output (including through refs,
-  unions, maps, and recursive definitions). Declared requiredness, defaults,
-  and block aliases below such an ancestor are inert on that path; walkers
-  must obtain their effective mode and active alias from an `Effective*` view.
-  Whether a top-level attribute contains a nested
-  write-only field is **derived** from the type
-  (`ResourceSchema::write_only_bearing`), never stored, so the flag can't
-  disagree with the type. `first_write_only_conflict` rejects shapes that
-  can't carry nested write-only provenance (for example, write-only inside a
-  union). The differ compares a write-only value against the accepted value
-  recorded in state, not against the read model (which omits it); see
-  `key_should_enter_patch` in `carina-core/src/differ/comparison.rs`. So an
-  **unchanged** write-only value never causes an Update by itself, and a
-  **changed** one does, sent as a normal `Replace`. When an Update happens,
-  every other updatable desired attribute that is write-only or
-  write-only-bearing is re-sent as `PatchOp::Reassert` alongside the change
-  (carina#3981, carina#3984). Accepted write-only values, including nested
-  leaves, are recorded in state (since state v18; secrets as hashes) so plans
-  converge.
-- **Observed secret protection** (carina#4479): `value::SecretProtection` owns
-  projection of authored/persisted secret paths onto observations. A kind mismatch
-  on a path to an authored secret or a changed length of a secret-bearing list hides
-  the observed subtree at the first divergence (`StringList` matches `List`). Maps
-  match keys one to one: missing keys, including write-only secrets, and extra
-  observed keys never widen protection. Matching keys retain descendant protection;
-  unmatched observed keys stay ordinary. JSON/saved plans hash the observed masking
-  unit; a newly promoted unit gets a fresh salt on every plan.
-  The carina-state wrapper `ObservationStateAuthority` has private constructors
-  and fields. Its core authority is minted only by decoding a complete state
-  document through the shared state/version decoder, including the empty document
-  for a backend-confirmed absence. Any crate may decode such a document; this
-  does not authenticate its bytes or backend origin. `ObservedStateFile` pairs this
-  authority alongside mutable state. Plan contexts retain it for output, so a
-  serializer cannot replace history with `None`. Desired protection is retained by
-  the plan at planning/replay, including unchanged resources and deferred templates;
-  observation inputs accept no independent desired slice. The authority's `protect`
-  method is the output entry; the core batch constructor is private. Saved-plan
-  recording requires the complete `ProtectedObservations` batch. Core selects
-  desired/persisted/moved-origin authority and keeps the selected persisted row in
-  each product. Raw execution plans and generic value rendering remain unavailable
-  through the public planned-output API.
+  `writeOnlyProperties`). Where it may be set, its rejection below
+  provider-populated output, the derived `ResourceSchema::write_only_bearing`
+  and `first_write_only_conflict` are held by doctests and schema tests. The
+  differ compares a write-only value against the accepted value recorded in
+  state (`key_should_enter_patch`), so an unchanged value never causes an
+  Update and other write-only attributes are re-sent as `PatchOp::Reassert`
+  (carina#3981, carina#3984).
+- **Observed secret protection** (carina#4479): `value::SecretProtection`,
+  `ObservationStateAuthority` and `ProtectedObservations` hold the projection
+  and authority rules (private constructors, value_observed_secret_tests).
   Dispatch rules consume the separate `RuleUpdatePatch` with the existing lenient
   kind and positional annotation. Diagnostics and `RedactionSet` consume
   `DiagnosticUpdatePatch` with output protection: enroll every string classified
@@ -616,71 +555,32 @@ A struct type represents a nested object with typed fields.
   Output promotion must not affect reference bindings or ordinary data-source read
   attributes. Preserve state merge policy and structured event coverage
   (`Unclassified` for updates).
-- **Provider input wire checks**: `WireReady<T>::try_new` checks and caches the
-  transport projection of complete desired resources, data sources, final update
-  patches and admitted provider configuration. It does not mint declaration admission. It caches the checked projection after
-  host rewrites, including default tags and observed ignored patch leaves.
-  Each final payload is projected once. Wire failures remain
-  `ProviderPreparationError::Wire`, with protected diagnostic paths retained.
-  Native and WASM dispatch share this proof; WASM only adapts the cached wire
-  values to WIT. Native create validators use infallible
-  `DesiredInputs::from_provider_ready`. Updates expose desired values only
-  through the checked patch, with no desired resource or validation view
-  (#2559). Create validation and normalization maps use protocol key order.
-  Raw normalization queries belong to `DesiredView` or
-  `NativeDesiredNormalization`. Keep `ProviderWireError`
-  terminal: render its typed conversion reason once, without input values,
-  and access the typed reason through `conversion_error()`.
-  `FinalInput<T>` owns the exact immutable admitted payload; no receipt can be
-  detached or paired with a replacement. Dispatch binds that payload to its
-  protected diagnostic source, so admission cannot receive a mismatched map.
+- **Provider input wire checks**: `WireReady<T>`, `DesiredInputs::from_provider_ready`,
+  `ProviderWireError` and `FinalInput<T>` hold the checked, cached transport
+  projection (private fields, compile_fail doctests). Create validation and
+  normalization maps use protocol key order. Raw normalization queries belong
+  to `DesiredView` or `NativeDesiredNormalization`.
   Final admission retains every finding across all attributes and leaves,
   and rejects undeclared attributes introduced by normalization.
   Plan comparison consumes `FinalPlanInputs` after normalization and identity
   reconciliation. A changed payload must obtain a new aggregate through admission.
   Update patches obtain their own aggregate after observed ignored leaves are
   grafted; preparing a replacement must succeed before its paired delete is released.
-- **Refinement layers** (carina#4348): protocol 27 and later require
-  separate `identity_layer` and `member_layer` records for String and Int.
-  `StringIdentityLayer`/`IntIdentityLayer` own reusable definitions;
-  `StringMemberConstraints`/`IntMemberConstraints` add declaration-local bounds.
-  `string_member` and `int_member` take these distinct types once and preserve
-  the complete identity. Each String layer has one optional `PatternSpec` and
-  one optional length interval; each Int layer has one optional range. Float
-  is unchanged. Validate the identity pattern then bounds, member pattern then
+- **Refinement layers** (carina#4348): String and Int carry separate
+  identity and member layers (`StringIdentityLayer`/`IntIdentityLayer`,
+  `StringMemberConstraints`/`IntMemberConstraints`; see
+  `carina-core/src/schema/refinement_layers.rs`). Identity-definition
+  agreement, annotation evidence, and owner forms are checked at schema
+  admission and decode. Validate the identity pattern then bounds, member pattern then
   bounds, and finally the semantic callback; retain first-failure diagnostics.
-  Never repeat structural checks in callbacks. Within one provider, every
-  occurrence of a String/Int/Float identity must have the same identity-layer
-  definition (including Float ranges). Reference declarations must agree on
-  pattern and length too. Mixed String/Reference declarations must have equal
-  identity patterns and lengths, and the String's `to_dsl` must be absent.
-  Single-schema validation and aggregate admission share one identified-declaration
-  walk and agreement rule. Disagreements are schema-definition issues locally
-  and `ConflictingIdentityDeclarations` at aggregate admission. An Enum occurrence
-  never masks later scalar agreement. Single-schema identity-definition agreement
-  does not compare Enum and Reference occurrences of the same identity.
-  For identities with reference forms,
-  Enum/Reference mixing remains an aggregate-only `NonStringReferenceForm` error.
+  Never repeat structural checks in callbacks.
   Callbacks do not participate in agreement. Dispatch merges callbacks per
   identity, so a String declaration's callback also applies to Reference slots
   of that identity.
   Provider migrations must put resource-specific String/Int bounds in member
   layers and Reference restrictions in input rules. Across different owners
   (for example AWS and AWSCC), annotation constraints are conjoined:
-  values must satisfy every owner's identity layer. Annotation-origin evidence
-  uses an identity-only payload with no member slots. Read-value projections
-  are identity-only too: their typed declarations preserve enum values,
-  reference kind and semantic callbacks but cannot store member constraints.
-  Projection fingerprints cover identity/value metadata, never slot members.
-  Decoding either value-evidence origin with member fields must fail.
-  Native single-owner and multi-owner annotations are distinct
-  forms: a single holds one `SchemaTypeOwner`, and a multi holds a checked map
-  keyed by at least two `SchemaTypeOwner`s. Wire single-owner annotations omit
-  `owner_layers`; multi-owner annotations retain exactly one identity layer per
-  owner. Decoding verifies the exact conjunction of owner layers, including
-  empty bounds from same-owner repeats, and recomputes the empty-intersection
-  marker after Float normalization. Owner sets derive from layer keys. Annotation
-  pattern conjunctions are sorted, deduplicated sets, including same-owner repeats.
+  values must satisfy every owner's identity layer.
   Structural scalar reads use the same canonical evidence as identity annotations,
   so equal identity-level types compare and serialize equally. Callbacks,
   transforms, enums and references retain exact projection provenance.
@@ -697,18 +597,10 @@ A struct type represents a nested object with typed fields.
   It includes custom validators and merged tag keys, values and entry counts,
   while authored-shape cross-attribute validators retain their authored scope.
   Authored tag overrides win; overridden defaults do not participate in membership.
-  Default tags for desired inputs must be known when provider configurations resolve; validate
-  and LSP reject local apply-time references. Desired configurations retain
-  all defaults. Plain plan display may instead use `PlanPreviewProviderConfigs`
-  to omit individual default values authored as map entries that refer only to
-  missing upstream state, with a warning. Whole-map expressions such as
-  `default_tags = mgmt.tags` must resolve to a map during configuration finalization.
-  Preview inputs cannot be saved or dispatched; `plan --out` and `plan --json`
-  require strict configurations and reject those missing defaults.
-  Destroy, state refresh and state bucket deletion use
-  `ReadOnlyProviderConfigs`, which has no default tags or projection into desired
-  inputs. Their validation retains authored defaults without demanding them;
-  only the typed read/delete provider path excludes those inputs.
+  `PlanPreviewProviderConfigs` (plain plan display only) and
+  `ReadOnlyProviderConfigs` (destroy, state refresh, bucket deletion) cannot be
+  saved, dispatched or projected into desired inputs (compile_fail doctests in
+  `parser/resolve.rs`).
   Anonymous scalar refinements occur only in provider schema slots; `TypeExpr`
   boundaries use identified refinements or unconstrained scalars. Adding overlapping
   source constraints never reduces assignability.
@@ -720,26 +612,15 @@ A struct type represents a nested object with typed fields.
   Enum bases describe definitions, never slots: schema admission rejects String/Int
   member constraints inside a base with `EnumBaseMemberLayerError`; identity-less
   enum base comparisons follow the same overlap-or-defer rule.
-  Built-in and aggregate comparisons accept identity-only typed projections. Exact
-  declarations and their fingerprints preserve both layers. Hover renders
-  both layers through the core's read-only bounded refinement walk, which counts
-  refined String/Int/Reference leaves and structural nodes, including Refs and
-  nested unions. Every emitted position, including an identity-only String/Int,
-  consumes budget. Plain scalar leaves and bare References emit nothing and cost
-  no budget; only actual omissions mark truncation. Anonymous refinements use
+  Hover renders both layers through the core's read-only bounded refinement
+  walk (`RefinementPositions`). Every emitted position, including an
+  identity-only String/Int, consumes budget. Plain scalar leaves and bare
+  References emit nothing and cost no budget; only actual omissions mark
+  truncation. Anonymous refinements use
   structural labels with intersected bounds and every pattern rather than
   identity/member labels; identified leaves show every identity-conjunction
   pattern. Shared provider docgen
-  must render both layers too. This change needs no WIT change.
-  Schema fingerprints use v13 and saved plans use format 46; format 45 plans
-  must fail the version gate before decoding the payload. Saved module
-  `pending_constraints` contain `ValidateExpr` values, not retained types.
-  Condition strings, `require` messages, and wait RHS strings retain checked
-  quoted source so decoding can reject interpolation.
-  Core literal and wait-operand decode errors state only the problem; the
-  saved-plan CLI renders recovery commands with `hint::ProjectCommand`, using
-  the recorded project path and supplied plan-file path.
-  Replay reloads refinement layers from fingerprint-checked provider schemas.
+  must render both layers too.
   Every typed sink uses the same String/Int identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,
   exports, module arguments, and function parameters/returns. Resource/data-source
@@ -753,24 +634,10 @@ A struct type represents a nested object with typed fields.
   reference checks, regardless of source identity. Original-evidence rechecks
   inspect only identified leaves.
   Declaration compatibility admits types, not resolved-value validity.
-  `NeedsLocal` exists only in the admission-facing reference relation, requiring
-  a `ReferenceCandidate`; it cannot convert back into general type compatibility.
-  Resource/data-source final inputs use `admit_apply_resource` and
-  `admit_apply_data_source`. Provider/backend configuration has its own field admission
-  in `validation/admission/configuration/`, including compact-list callbacks.
-  `ConfigurationKind` destinations carry a `ConfigurationContract` with no resource
-  lookup; configuration kinds cannot name `PendingAdmission` and cannot be passed
-  to `admit` or `discharge`.
-  Complete admissions own the canonical payload and placements; analysis cannot
-  authorize construction. Undeclared keys are rejected before value checks or
-  factory validation, using resource unknown-attribute suggestions. The payload
-  contains exactly its placed fields. The native mock has no configuration
-  fields; WASM mock controls belong to its own declaration.
-  Provider construction binds admitted configuration to its factory and instance.
-  Core owns the S3/local declarations; state extracts settings only from
-  `AdmittedConfiguration<BackendAttribute>`. Native file addresses retain their
-  own pins and non-UTF-8 bytes. S3 URLs keep encryption on and auto-creation off.
-  CLI and LSP share the owner. Function parameters/returns use
+  `NeedsLocal` exists only in the admission-facing reference relation and cannot
+  convert back into general type compatibility. Configuration admission lives
+  in `validation/admission/configuration/` and is closed off from resource
+  admission by its types. Function parameters/returns use
   `check_resolved_constraints_at`. Member String failures retain their pattern/
   length category and member label; identity failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment
@@ -787,12 +654,9 @@ A struct type represents a nested object with typed fields.
   accepts only `ValidatedResourceSchema` / `ValidatedConfigSchema` witnesses
   and projects them there before JSON serialization, while the host keeps only
   JSON/WIT glue and delegates protocol-record decoding to the same module.
-  Declared descendant modes are preserved; whole-schema validation applies
-  provider-populated ancestry after the graph is reconstructed. Schema
-  defaults use the JSON-compatible projection (`StringList` normalizes to
-  `List`) and reject deferred/core-only values. Non-finite floats cannot be
-  represented at all: value floats and float range bounds are `FiniteF64`,
-  admitted only through its checked constructor (carina#4257). SDK
+  Required protocol fields, typed pattern specs, `FiniteF64`, and the
+  protocol minimum are held by the protocol types (no serde defaults) and
+  their tests. SDK
   guests derive custom-type dispatch from the identity/callback pairs in the
   same validated resource/config witnesses they serialize; providers do not
   implement an optional success-default hook. The guest builds a callback
@@ -813,27 +677,14 @@ A struct type represents a nested object with typed fields.
   then applies that provider's identity-level guest callback set, which may
   include callbacks declared by sibling schemas because the protocol cannot identify a
   declaration more narrowly.
-  Authored annotations cannot select an owner: their `OwnedTypeIdentity`
-  contains a non-empty set of every loaded schema owner declaring the semantic
-  `TypeIdentity`, and their values must satisfy every owner. Enum definitions
-  or canonical spellings that disagree across that set are typed errors. Never
-  construct loaded recognition and validation separately: the opaque
-  `ProviderCustomTypes` loaded state derives both its known owner-set keys and
-  its indexed resolver from one factory-schema/config snapshot. Never
+  Authored annotations cannot select an owner (`OwnedTypeIdentity`,
+  `ProviderCustomTypes`). Never
   infer ownership from `TypeIdentity::provider`, because AWSCC may own types in
-  the shared `aws` namespace. Authored/display spelling remains the semantic
-  `TypeIdentity`; schema owners are routing-only data, and bare schema
-  identities are also lifted to owner-bearing `SchemaType` nodes. Core
-  built-ins are keyed
-  by `(RefinedScalarKind, TypeIdentity)`, and scalar canonicalization requires
-  the exact declared `AttributeType`, so an enum cannot inherit a scalar
-  callback or bypass spelling resolution. Whole-schema validation rejects
-  every identified type without a scalar base and every enum shape that the protocol
-  cannot represent; conversion retains typed defensive errors. The protocol's
-  `StringEnum` cannot carry a closed enum's DSL transform or non-plain-String
-  base. The current protocol also has no fields for attribute completions or resource
-  wait defaults: those are host-only authoring/execution metadata and are the
-  two intentional one-way omissions pinned by projection tests. The legacy
+  the shared `aws` namespace (the field is still public and read directly:
+  carina#4542). The current protocol has no fields for attribute completions
+  or resource wait defaults: those are host-only authoring/execution metadata
+  and are the two intentional one-way omissions, pinned by the named
+  `_v18_omits_*` bindings in the exhaustive destructures. The legacy
   `Custom` decoder preserves the first outer record's name as the only
   identity, including an empty name; nested `Custom.name` and primitive-base
   identities never fill it in. Enclosing String/int refinements take
@@ -848,33 +699,19 @@ A struct type represents a nested object with typed fields.
   `ResourceSchema`, `AttributeSchema`, and `StructField` conversions destructure
   both core parts and protocol records exhaustively (`OperationConfig` needs no
   conversion: carina-core re-exports the protocol type, carina#3907), and
-  `AttributeType` conversion patterns name every variant field. The nested
-  `write_only` flag is required in schema JSON (no `#[serde(default)]`), and the
-  protocol minimum (`MIN_SUPPORTED_PROTOCOL_VERSION`) requires it, so a host
-  and provider that disagree about it
-  fail at load instead of silently dropping nested write-only members. Protocol
-  24 also requires a typed pattern spec (regex plus explicit mode, and a reason
-  containing visible text for Substring); convert the complete spec
-  exhaustively, including its reason. Never supply a default mode or admit a bare
-  string, including on the schema-only migration path. Protocol 25 requires
-  the WIT 0.2.0 `diagnostics` and `protected-material` imports described below.
-  Protocol 26 adds required `InputRule.condition` and Struct `input_rules`, even when the
-  condition is `Always` or the collection is empty; neither field has a serde default.
-  Conditions and Struct rules travel once in the existing schema JSON, with no
-  further WIT change beyond the diagnostics imports. Resource and Struct
-  declarations use the same admitted rule type,
+  `AttributeType` conversion patterns name every variant field.
+  Resource and Struct declarations use the same admitted rule type,
   with Struct paths relative to each object instance (including recursive defs).
-  `InputPredicate::Secret` (`kind: "secret"`) applies to scalar String Value targets,
-  including refined Strings and String definition refs; containers, other scalar
-  shapes, and MapKeys targets are rejected. Check failure first, then
+  `InputPredicate::Secret` (`kind: "secret"`) applies to scalar String Value
+  targets (checked at rule admission). Check failure first, then
   `NodeRef::scope()`, then knownness: Secret is proven even with a pending
   payload, known Public is a violation, and a pending Public value and every
   withheld target remain pending. An absent optional target uses the existing
   omission proof. Never extract or estimate the plaintext for Secret. The schema
-  input rule is the sole owner. WIT stays 0.3.0, fingerprint encoding stays v13
-  (new predicate tag 15), and saved-plan format stays 45. The record decodes at
+  input rule is the sole owner. The record decodes at
   protocol 28, but providers must not declare it until the next protocol bump:
-  a host predating it rejects the whole schema as an unknown variant.
+  a host predating it rejects the whole schema as an unknown variant (nothing
+  gates this yet: carina#4544).
   The shared input-rule admission gate checks writable canonical paths, typed
   scalar literals, enum identity and canonical membership, predicate compatibility,
   duplicate target/code pairs, and a condition depth limit of 16. The one evaluator
@@ -883,20 +720,18 @@ A struct type represents a nested object with typed fields.
   extraction: enum aliases use canonical API values, and invalid known values
   remain failures. Public binding and site evaluation return complete typed
   findings and pending obligations; only the private single-rule evaluator
-  returns a verdict. Dispatch retains every established finding. Each write site owns one immutable `RuleInput`,
-  constructed only at authored, plan or protected dispatch stage boundaries.
-  Those constructors seal ordinary union fits with their stage's provider
-  lookup, retaining nested choices in the graph. Evaluation consumes that
-  authority; unavailable provider validation remains pending and never selects
-  a branch by structural declaration order alone. The same authority travels
-  through admitted provider-ready values and their protected update capability.
+  returns a verdict. Dispatch retains every established finding. Each write site
+  owns one immutable `RuleInput` and authored checks require `AuthoredInputs`;
+  both are minted only at stage boundaries (compile_fail doctests). Evaluation
+  consumes the stage's union-fit authority; unavailable provider validation
+  remains pending and never selects a branch by structural declaration order
+  alone.
   Recursive admission memoizes declaration/node judgements, including provider
   callbacks, ancestry and reference guards. Fit children share immutable witnesses
   rather than copying subtrees on memo hits. Schema walkers consume cached
   protected classifications through a scoped capability that protects results
   before returning; they never reopen those payloads for classification.
-  Authored checks require immutable parser/admission-minted `AuthoredInputs`;
-  mutating public AST fields cannot reseal their snapshot. Every successful module
+  Every successful module
   publication retains resource authority even if provider configuration fails;
   unavailable default-map membership remains pending. Missing authority is an
   explicit error, never an empty successful report. Authored reports retain each
@@ -929,9 +764,8 @@ A struct type represents a nested object with typed fields.
   depth. Default membership belongs to that graph and is recomputed at dispatch.
   An erased normalized expression has no authored fallback without carried
   correspondence. Update inputs overlay the exact annotated patch on the full
-  protected desired tree, never observed state. `UpdateRequest::checked` mints
-  their sealed `ProtectedUpdateInput` together; dispatch cannot accept a desired
-  tree and a patch independently. Both owners use
+  protected desired tree, never observed state (`UpdateRequest::checked` mints
+  the sealed `ProtectedUpdateInput`). Both owners use
   the same write-scope classifier; `AuthoredDesired` evaluates `CreateOnly` as
   warnings with core-rendered rejected-if-created wording, while `EveryWrite`
   remains an error. The core finding derives severity from rule scope and write
@@ -946,115 +780,46 @@ A struct type represents a nested object with typed fields.
   parentheses or quotes use the same quoting helper. This distinguishes literal
   controls, regex backslash escapes, and metadata delimiters. Plan errors budget
   only their prefix
-  and embed the already-budgeted requirement verbatim. Its `DiagnosticText` field
-  sanitizes and bounds construction and deserialization. Multiline diagnostics
-  preserve newlines and tabs while escaping default-ignorables and Unicode
-  line/paragraph separators.
-  A closed `DiagnosticEncoding` enum owns the sole character escaper for
-  multiline, inline, double-quoted, and single-quoted builder output. Its variants
-  and complete inventory are generated together; quote classification and
-  redaction use that same encoding. Inventory spellings stay unbounded so
+  and embed the already-budgeted requirement verbatim. `DiagnosticText` and
+  the closed `DiagnosticEncoding` (one escaper, generated together with its
+  inventory) hold sanitization and escaping. Inventory spellings stay unbounded so
   complete escaped secrets are matched before diagnostic truncation.
   Independent Rust str `Debug` echoes are inventoried with the standard
   formatter, stripping only the surrounding quotes. They must not pass through
   diagnostic sanitization or truncation before matching.
   Violations retain their declaration and a rejection/evaluation-failure kind;
-  `InputViolationReason` is classification data without `Display` or `Error`.
+  `InputViolationReason` has no `Display` or `Error` (compile_fail doctest).
   Render through the violation's `message()`, never invent a second predicate
   formatter. Only provider-declared parameters may appear; rejected values and
   protected instance keys must not enter the declaration display. Struct-local
   declaration paths stay relative to their declaring object.
   Plans reject `CreateOnly` violations only at create-capable write sites.
-  Semantic fingerprints encode conditions and nested rules in encoding v13. Adding
+  Adding
   a protocol field must break compilation until it is consciously carried
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
   is invisible in production and cost carina#3034 its effect (carina#3772).
-- **Provider diagnostics** (carina#4334): protocol 28 and WIT package 0.3.0
-  require `diagnostics` and `protected-material` imports in every provider
-  world. Component type scanning rejects a legacy package before linking or
-  executing any start/info code, naming the found package and the required
-  `carina:provider@0.3.0` and the current host protocol. `ProviderDiagnostics::emit` accepts only typed events borrowing
-  provider errors/diagnostics or carrying structured value candidates. The
-  host binds them through the same private text kernel as returned errors.
-  Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound
-  segments and never constructs `HostText` or uses generic Bound error or
-  partial-reason constructors. Closing those older constructors remains #4301.
-  Value origin is advisory: host-resolved addresses, protected desired-input
-  paths, schema write-only fields and the existing `RedactionSet` decide
-  masking. An unresolved address masks the subtree. Every string leaf and key
-  uses that same redactor; decoded guest values acquire no protection marks.
-  Raw WASI stdout/stderr have discard-only capabilities from metadata through
-  teardown. Host-owned HTTP traces keep the redacting stream. The SDK panic
-  hook precedes construction and exports, preserves string payloads and typed
-  locations, and never invokes the default hook or formats unknown payloads.
-  Only long-lived AWS session credentials and GitHub tokens are registered;
-  adoption requires acknowledgement before operational wrappers reach transport.
-  Registration is idempotent by value, retains old generations, and charges only
-  new credentials. AWS providers enable the SDK `aws` feature and implement
-  `AwsSessionSource`, returning each current generation as
-  `AwsSessionMaterial::new(credentials)`. Material privately retains the complete
-  AWS SDK `Credentials`; registration reads only its key/secret/token. After
-  acknowledgement the same credentials are returned unchanged, preserving expiry,
-  account ID, provider name and feature/custom properties. Material Debug is opaque.
-  The public AWS credential/configuration entry points are `AwsSessionMaterial`,
-  `AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts`. Registration and its
-  consuming snapshot conversion are internal; snapshots implement no public
-  credentials-provider or unsigned request-preparation API.
-  `AwsSdkParts::new(source, diagnostics)` keeps its registering credentials provider and
-  HTTP client private. Its consuming `apply` installs both together on one AWS
-  SDK config builder; the SDK exposes neither component alone. Every credentials
-  lookup fetches the source, registers the generation before handing it to the
-  signer, and preserves expiry. Registration failure returns a typed credentials
-  error with its source chain. Direct WASI AWS
-  client constructors remain private. This guarantees paired installation on
-  that builder; later changes through AWS APIs remain under caller control.
-  The synchronous WASI HTTP transport accepts only fully buffered request
-  bodies and carries `RequestBody::Empty` / `Sized` through to explicit
-  `Content-Length` framing. `TryFrom<&SdkBody>` rejects streaming or taken
-  bodies with `UnbufferedRequestBody`, retained as the source of a non-retryable
-  `ConnectorError::user` before sending. It never polls or buffers a stream.
-  The generic HTTP path classifies its owned `Vec<u8>` infallibly.
-  Per-request headers and query fields use the existing
-  structural HTTP trace masking, followed by the session `RedactionSet`. Each
-  request the transport accepts emits one completed HTTP event, including early
-  transport failures. A body rejected by `TryFrom<&SdkBody>` is returned to the
-  SDK as a user error without an HTTP event. Signing material and ordinary query
-  values never enter the long-lived inventory.
-  Core owns all diagnostic budgets. Count/rate windows reset per WASM export
-  and native dispatch through the same core call scope,
-  with separate quotas for Error/Warn/Info and Debug/Trace. Only the first panic
-  per call bypasses count/rate limits; later panics consume the ordinary quota.
-  Panic context, message and location share a 256 KiB input cap; over-cap guest
-  text is masked before binding while numeric location fields remain available.
-  Call completion emits one fixed host-authored suppression notice containing
-  only the total count. Rejection has no plaintext fallback. Admission filters
-  invisible levels before budgeting or counting suppression. The default sink
-  shows Error/Warn/Info; Debug/Trace require `CARINA_WASI_HTTP_TRACE=1`, read once
-  by the host and never forwarded to guests. Custom sinks explicitly observe
-  all levels, with the same separate quotas. Call fallback inputs inherit the
-  store's sink and validated schemas.
-  The host chooses the sink on a consumed `ProviderSessionBuilder` before
-  constructing a shared session; cloned sessions have no sink setter. Session
-  construction and budget/presentation plumbing are exposed by `provider-host`
-  (`guest-runtime` includes it for the native plugin host). WASM SDK guests use
-  core without either feature. Enabling `provider-host` on wasm32, directly or
-  transitively, is a compile error: host plumbing is unavailable to guest
-  providers. The in-repo provider manifest check remains an additional lint;
-  it does not resolve transitive features or police external provider repos.
-  Native in-process providers are trusted code linked into the host binary,
-  where host feature unification is accepted.
-  Native factories receive the same typed channel through `ProviderSession`;
-  native calls also finish with one count-only suppression notice when needed.
-  Native `tokio::spawn`, `spawn_blocking` and other threads do not inherit a call
-  scope. Their events share a bounded session budget; the last diagnostic owner
-  flushes its total suppressed count as one fixed host-authored notice on drop.
-  Retained emission handles are weak and cannot keep that owner alive. Every
+  (Not enforced by a check yet: carina#4541, carina#4533.)
+- **Provider diagnostics** (carina#4334): provider worlds import the WIT
+  `diagnostics` and `protected-material` interfaces, and legacy packages are
+  rejected before any guest code runs. The typed event channel
+  (`ProviderEvent`, `BoundProviderEvent`), host-side masking, discard-only raw
+  WASI stdio, the registered protected material (`AwsSessionMaterial`,
+  `AwsSdkParts`), the buffered-body WASI HTTP transport, per-call budgets, the
+  consumed `ProviderSessionBuilder`, and the `provider-host` feature boundary
+  (including the wasm32 `compile_error!`) are held by private fields,
+  compile_fail doctests, `scripts/check-provider-cause-test-api.sh`,
+  `scripts/check-provider-boundaries.sh`, and the provider diagnostics tests.
+  The presenter consumes Bound segments and never constructs `HostText` or
+  uses generic Bound error or partial-reason constructors; closing those older
+  constructors remains #4301. The SDK panic hook is installed before
+  construction and at the start of every export (each export calls
+  `enter_export()`). Native in-process providers are trusted code linked into
+  the host binary, where host feature unification is accepted. Every
   configured normalizer owns live diagnostic inputs and dispatches in a call
   scope, including fixtures. Custom-type validation inherits the host sink and
-  schemas. Native OS output
-  remains outside this channel. Diagnostics are not persisted and do
-  not change the state format.
+  schemas. Native OS output remains outside this channel. Diagnostics are not
+  persisted and do not change the state format.
 - **Provider error retryability** (carina#4350): Provider errors carry a required
   exclusive retryability class: Unclassified, Transient (including throttling),
   or DependencyBlocked. Message, cause and code never infer this class; the wire
@@ -1064,55 +829,28 @@ A struct type represents a nested object with typed fields.
   encode retryability.
 - **Desired normalization is per leaf** (carina#4194). The normalization opacity policy,
   `carina_core::resource::is_deferred_desired_leaf`, marks every
-  `Value::Deferred` leaf (references, unknowns, secrets, other unresolved
-  expressions) inside concrete lists/maps. The SDK's `DesiredView` presents
-  the same `DesiredValue` tree on the native route (`NativeDesiredNormalization`)
-  and the WASM route (`DesiredResource::into_normalization`), so a provider
-  normalizer is the same code on both. Deferred leaves are opaque
-  `DeferredLeaf` values: providers cannot construct, clone or inspect them,
-  and may only move them within their original top-level attribute. On the
-  wire they are host-issued slots (`desired-value::deferred-val`, or
-  `{"$carina_deferred": <u32>}` inside normalization JSON, whose user keys
-  starting with `$` are escaped only by `carina_provider_protocol::normalization`).
-  The host restores each slot to its original value only after checking that
-  every slot occurs exactly once in its original resource and attribute;
-  otherwise it returns a typed error naming them and applies nothing. CRUD,
-  config and persisted-state values never carry slots, and create/update still
-  deliver real secret values. Don't reintroduce a top-level deferred-name list
+  `Value::Deferred` leaf inside concrete lists/maps. The SDK's `DesiredView`
+  presents the same `DesiredValue` tree on the native and WASM routes. Deferred
+  leaves are opaque `DeferredLeaf` values that providers cannot construct,
+  clone or inspect (its compile_fail doctests carry no error code yet:
+  carina#4534). On the wire they are host-issued slots whose `$`-prefixed user
+  keys are escaped only by `carina_provider_protocol::normalization`; the host
+  restores each slot only after checking it occurs exactly once in its original
+  resource and attribute. Don't reintroduce a top-level deferred-name list
   or let provider code see a deferred leaf's value.
 - **Runtime value knowledge** (carina#4316) is classified by
-  `Value::knowledge()` in `carina-core/src/resource/knowledge.rs`. Concrete
-  lists/maps can have exact membership while their leaves remain pending.
-  Scalar builtin, shape builtin, child-expansion, ordinary wire, import,
-  and resolved function-constraint boundaries take knowledge proofs. The
-  classifier retains Secret as an opaque node. Known means fully evaluable,
-  including a Secret payload. Pending Secret keeps protected child evidence
-  and inherits its timing; payload errors propagate. Inner proofs and data
-  never leave that boundary; named protected operations own payload computation. Knowledge grants no plaintext access or transport
-  permission. Attempted failures are separate Failed nodes: structural checks
-  retain known sibling findings, while known-value, expansion and plan-boundary
-  projections reject failures in active positions. An unselected coalesce
-  alternative stays typed evidence behind its coalesce-pending node, including
-  after plan projection; selecting it reports the original failure. Protected
-  coalesce and expression timing consume the same classified child evidence.
-  Syntax/type
-  judgement and normalization opacity remain separate policies. The plan
-  boundary accepts only `Knowledge<Plan>` and projects pending results to
-  `PlanResolved`, rejecting remaining Plan-phase work. Validation, Plan, and
-  Apply are distinct context markers, and the Plan and Apply contexts both take
-  the same `ResolvedBindings` type. Structural `Classification` views cannot
-  mint stage proofs, but can yield a fully known, stage-independent `KnownValue`
-  through `into_known`. The apply-specific `KnownValue::from_apply` entry point
-  takes only `Knowledge<Apply>`; it is not the only way to obtain `KnownValue`.
+  `Value::knowledge()` in `carina-core/src/resource/knowledge.rs`. Its proofs,
+  stage markers (`Knowledge<Plan>` / `Knowledge<Apply>`, `PlanResolved`,
+  `KnownValue::from_apply`) and crate-private visitors are held by sealed
+  traits, private fields and the compile_fail doctests in that module.
   Resource and data-source dispatch classify their final attributes with
   `KnowledgeContext::apply(bindings)` and obtain proofs through
   `KnownValue::from_apply`. Structural serialization checks do not replace
   this dispatch gate.
+  Syntax/type judgement and normalization opacity remain separate policies.
   Reference timing uses the resolver's shared typed
   plan-reference decision. Per-attribute validation keeps failed inputs present
-  and continues checking their siblings. Pending sites use LeafPath and operand steps, are enumerated
-  from cached classifications on demand, and remain runtime-only. Visitors
-  stay crate-private to Knowledge consumers. Lexical UserFunction body/local
+  and continues checking their siblings. Lexical UserFunction body/local
   analysis shares immutable evidence within one classification, keyed by the
   existing function Arc identity. The private lookup is discarded on return;
   arguments and site paths remain specific to each call. Typed plan projection
