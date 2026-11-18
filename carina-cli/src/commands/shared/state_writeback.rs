@@ -2131,17 +2131,22 @@ mod post_apply_states_tests {
 
         // state.resources carries the POST-apply value — this must win.
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 1,
             "lineage": "test",
             "carina_version": "0.4.0",
             "resources": [
                 {
                     "resource_type": "s3.Bucket",
-                    "name": "log",
-                    "identifier": "log-bucket",
+                    "identity": "log",
                     "provider": "awscc",
-                    "attributes": { "versioning": "Enabled" }
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "log-bucket",
+                        "attributes": { "versioning": "Enabled" },
+                        "nested_write_only": {}
+                    }
                 }
             ]
         });

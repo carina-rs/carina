@@ -1,5 +1,5 @@
 {
-  "version": 20,
+  "version": 21,
   "exports_version": 1,
   "serial": 4,
   "lineage": "5ab578ba-14d7-4fcb-8e4d-4b1db4ee9d62",
@@ -131,8 +131,16 @@
           "kind": "unspecified"
         },
         "depends_on": [
-          "direct.seed",
-          "root"
+          {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.seed"
+          },
+          {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "root"
+          }
         ]
       },
       "prefixes": {},
@@ -150,8 +158,16 @@
       },
       "binding": "direct.consumer",
       "dependency_bindings": [
-        "direct.seed",
-        "root"
+        {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "direct.seed"
+        },
+        {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "root"
+        }
       ]
     },
     {
@@ -175,7 +191,11 @@
           "kind": "unspecified"
         },
         "depends_on": [
-          "direct.consumer"
+          {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "direct.consumer"
+          }
         ]
       },
       "prefixes": {},
@@ -190,7 +210,11 @@
       },
       "binding": "direct.nested.leaf",
       "dependency_bindings": [
-        "direct.consumer"
+        {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "direct.consumer"
+        }
       ]
     },
     {
@@ -285,8 +309,16 @@
           "kind": "unspecified"
         },
         "depends_on": [
-          "looped[0].seed",
-          "root"
+          {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].seed"
+          },
+          {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "root"
+          }
         ]
       },
       "prefixes": {},
@@ -304,8 +336,16 @@
       },
       "binding": "looped[0].consumer",
       "dependency_bindings": [
-        "looped[0].seed",
-        "root"
+        {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "looped[0].seed"
+        },
+        {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "root"
+        }
       ]
     },
     {
@@ -329,7 +369,11 @@
           "kind": "unspecified"
         },
         "depends_on": [
-          "looped[0].consumer"
+          {
+            "provider": "mock",
+            "resource_type": "test.resource",
+            "identity": "looped[0].consumer"
+          }
         ]
       },
       "prefixes": {},
@@ -344,7 +388,11 @@
       },
       "binding": "looped[0].nested.leaf",
       "dependency_bindings": [
-        "looped[0].consumer"
+        {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "looped[0].consumer"
+        }
       ]
     },
     {
@@ -380,7 +428,11 @@
       },
       "binding": "direct.children.first",
       "dependency_bindings": [
-        "direct.deferred_source"
+        {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "direct.deferred_source"
+        }
       ]
     },
     {
@@ -416,7 +468,11 @@
       },
       "binding": "looped[0].children.first",
       "dependency_bindings": [
-        "looped[0].deferred_source"
+        {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "looped[0].deferred_source"
+        }
       ]
     }
   ]

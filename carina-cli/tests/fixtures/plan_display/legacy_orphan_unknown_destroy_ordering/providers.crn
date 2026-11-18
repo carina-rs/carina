@@ -1,3 +1,0 @@
-provider awscc {
-  region = awscc.Region.ap_northeast_1
-}

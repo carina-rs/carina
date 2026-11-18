@@ -148,7 +148,7 @@ fn current_state_root_and_nested_hashes_round_trip_byte_for_byte() {
     use carina_core::resource::{ConcreteValue, DeferredValue, SnapshotLeaf, Value};
     use carina_state::StateFile;
     assert_eq!(StateFile::CURRENT_VERSION, 21);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v21.state.json");
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.state.json");
     let mut wire: serde_json::Value = serde_json::from_str(fixture).unwrap();
     let attributes = wire["resources"]
         .as_array_mut()

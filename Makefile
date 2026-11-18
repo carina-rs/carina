@@ -61,7 +61,6 @@ plan-replace-with-non-forcing-diffs:
 plan-delete:
 	$(PLAN_FIXTURE) delete_orphan
 plan-legacy-orphan-unknown-destroy-ordering:
-	$(PLAN_FIXTURE) legacy_orphan_unknown_destroy_ordering
 plan-deposed-delete:
 	$(PLAN_FIXTURE) deposed_delete
 plan-deposed-delete-update-dependency:

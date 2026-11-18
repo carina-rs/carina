@@ -1,51 +1,53 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-lineage-list-diff-best-first-mid-insert",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-list-diff-best-first-mid-insert",
   "resources": [
     {
-      "resource_type": "iam.RolePolicy",
-      "identity": "policy",
-      "provider": "awscc",
-      "identifier": "carina-registry|carina-registry-publish",
-      "attributes": {
-        "policy_name": "carina-registry-publish",
-        "role_name": "carina-registry",
-        "statement": [
-          {
-            "sid": "ManagePublishStackRoles",
-            "effect": "Allow",
-            "action": [
-              "iam:CreateRole",
-              "iam:DeleteRole"
-            ],
-            "resource": [
-              "arn:aws:iam::*:role/carina-registry-publish-api-task",
-              "arn:aws:iam::*:role/carina-registry-policy-write"
-            ]
-          },
-          {
-            "sid": "AllowRegistryExecution",
-            "effect": "Allow",
-            "action": [
-              "iam:PassRole"
-            ],
-            "resource": [
-              "arn:aws:iam::*:role/carina-registry-publish-api-execution"
-            ],
-            "provider_default_field": "provider-only"
-          }
-        ]
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "policy",
+      "current": {
+        "attributes": {
+          "policy_name": "carina-registry-publish",
+          "role_name": "carina-registry",
+          "statement": [
+            {
+              "action": [
+                "iam:CreateRole",
+                "iam:DeleteRole"
+              ],
+              "effect": "Allow",
+              "resource": [
+                "arn:aws:iam::*:role/carina-registry-publish-api-task",
+                "arn:aws:iam::*:role/carina-registry-policy-write"
+              ],
+              "sid": "ManagePublishStackRoles"
+            },
+            {
+              "action": [
+                "iam:PassRole"
+              ],
+              "effect": "Allow",
+              "provider_default_field": "provider-only",
+              "resource": [
+                "arn:aws:iam::*:role/carina-registry-publish-api-execution"
+              ],
+              "sid": "AllowRegistryExecution"
+            }
+          ]
+        },
+        "identifier": "carina-registry|carina-registry-publish",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "policy_name": {
             "kind": "leaf"
@@ -56,8 +58,17 @@
           "statement": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "policy",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "iam.RolePolicy"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

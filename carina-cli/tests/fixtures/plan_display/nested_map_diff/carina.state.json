@@ -1,32 +1,34 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-lineage-nested-map-diff",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-nested-map-diff",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "vpc",
-      "provider": "awscc",
-      "identifier": "vpc-0123456789abcdef0",
-      "attributes": {
-        "cidr_block": "10.0.0.0/16",
-        "vpc_id": "vpc-0123456789abcdef0",
-        "config": {
-          "settings": {
-            "mode": "basic",
-            "timeout": "30"
-          }
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "vpc",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "config": {
+            "settings": {
+              "mode": "basic",
+              "timeout": "30"
+            }
+          },
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "vpc-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "cidr_block": {
             "kind": "leaf"
@@ -34,8 +36,17 @@
           "config": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "vpc",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

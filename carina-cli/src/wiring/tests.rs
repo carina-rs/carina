@@ -6770,7 +6770,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
     let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
     let state = carina_state::check_and_migrate(
         &serde_json::json!({
-            "version": 20,
+            "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
             "serial": 1,
             "lineage": "import-unknown",
@@ -6779,6 +6779,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
                 "resource_type": "test.Resource",
                 "identity": "unknown",
                 "provider": "mock",
+                "dependency_bindings": [],
                 "current": {
                     "kind": "create_outcome_unknown",
                     "started_at": "2026-10-23T08:00:00Z"
@@ -6892,7 +6893,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
     );
     let state = carina_state::check_and_migrate(
         &serde_json::json!({
-            "version": 20,
+            "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
             "serial": 1,
             "lineage": "import-other-instance",
@@ -6901,6 +6902,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
                 "resource_type": "test.Resource",
                 "identity": "shared",
                 "provider": "mock",
+                "dependency_bindings": [],
                 "current": {
                     "kind": "create_outcome_unknown",
                     "started_at": "2026-10-23T08:00:00Z"

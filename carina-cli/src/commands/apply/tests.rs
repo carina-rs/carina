@@ -9655,20 +9655,25 @@ fn resolve_exports_resolves_cross_file_resource_refs() {
     // Build a state file with a resource that has a binding and attributes
     let state = {
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 1,
             "lineage": "test",
             "carina_version": "0.4.0",
             "resources": [
                 {
                     "resource_type": "organizations.account",
-                    "name": "registry-prod",
-                    "identifier": "459524413166",
+                    "identity": "registry-prod",
                     "provider": "awscc",
                     "binding": "registry_prod",
-                    "attributes": {
-                        "account_id": "459524413166",
-                        "account_name": "registry-prod"
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "459524413166",
+                        "attributes": {
+                            "account_id": "459524413166",
+                            "account_name": "registry-prod"
+                        },
+                        "nested_write_only": {}
                     }
                 }
             ]
@@ -9738,19 +9743,24 @@ fn resolve_exports_resolves_module_call_attribute_via_composition() {
 
     let state = {
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 1,
             "lineage": "test",
             "carina_version": "0.4.0",
             "resources": [
                 {
                     "resource_type": "iam.Role",
-                    "name": "github_actions_carina.role",
-                    "identifier": "github-actions-carina",
+                    "identity": "github_actions_carina.role",
                     "provider": "awscc",
                     "binding": "github_actions_carina.role",
-                    "attributes": {
-                        "arn": "arn:aws:iam::123456789012:role/github-actions-carina"
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "github-actions-carina",
+                        "attributes": {
+                            "arn": "arn:aws:iam::123456789012:role/github-actions-carina"
+                        },
+                        "nested_write_only": {}
                     }
                 }
             ]
@@ -9852,19 +9862,24 @@ fn resolve_exports_resolves_chained_module_call_attribute_via_two_compositions()
 
     let state = {
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 1,
             "lineage": "test",
             "carina_version": "0.4.0",
             "resources": [
                 {
                     "resource_type": "iam.Role",
-                    "name": "outer.inner.role",
-                    "identifier": "github-actions-carina",
+                    "identity": "outer.inner.role",
                     "provider": "awscc",
                     "binding": "outer.inner.role",
-                    "attributes": {
-                        "arn": "arn:aws:iam::123456789012:role/chained"
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "github-actions-carina",
+                        "attributes": {
+                            "arn": "arn:aws:iam::123456789012:role/chained"
+                        },
+                        "nested_write_only": {}
                     }
                 }
             ]
@@ -10025,18 +10040,23 @@ fn resolve_exports_picks_post_apply_role_arn_after_replace_3169() {
     // what `resolve_export_values_post_apply` sees as its `state` argument.
     let post_apply_state_file = {
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 2,
             "lineage": "test",
             "carina_version": "0.4.0",
             "resources": [
                 {
                     "resource_type": "iam.Role",
-                    "name": "carina_role",
-                    "identifier": "carina-role-NEW",
+                    "identity": "carina_role",
                     "provider": "awscc",
                     "binding": "role",
-                    "attributes": { "arn": post_apply_arn }
+                    "current": {
+                        "kind": "applied",
+                        "identifier": "carina-role-NEW",
+                        "attributes": { "arn": post_apply_arn },
+                        "nested_write_only": {}
+                    }
                 }
             ]
         });
@@ -10211,7 +10231,8 @@ fn resolve_exports_resolves_data_source_attribute_after_apply_3266() {
     // to `state.resources`.
     let post_apply_state_file = {
         let json = serde_json::json!({
-            "version": 5,
+            "version": 21,
+            "exports_version": 1,
             "serial": 2,
             "lineage": "test",
             "carina_version": "0.4.0",

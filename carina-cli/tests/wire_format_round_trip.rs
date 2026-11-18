@@ -62,7 +62,7 @@ fn current_plan_fixture(fixture: &str) -> String {
 #[test]
 fn current_state_binding_addresses_and_resolved_dependencies_round_trip() {
     assert_eq!(StateFile::CURRENT_VERSION, 21);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v21.state.json");
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.state.json");
     let original: Value = serde_json::from_str(fixture).expect("fixture must contain valid JSON");
     let decoded: StateFile = check_and_migrate(fixture)
         .expect("fixture must pass the state version gate")
