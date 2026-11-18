@@ -583,8 +583,12 @@ type each bullet names; read that type's rustdoc for the details.
   identity and member layers (`StringIdentityLayer`/`IntIdentityLayer`,
   `StringMemberConstraints`/`IntMemberConstraints`; see
   `carina-core/src/schema/refinement_layers.rs`). Identity-definition
-  agreement, annotation evidence, and owner forms are checked at schema
-  admission and decode. Validate the identity pattern then bounds, member pattern then
+  agreement (`ConflictingIdentityDeclarations`), annotation evidence, and owner
+  forms are checked at schema admission and decode. An Enum occurrence never
+  masks later scalar agreement. Single-schema identity-definition agreement
+  does not compare Enum and Reference occurrences of the same identity; for
+  identities with reference forms, Enum/Reference mixing remains an
+  aggregate-only `NonStringReferenceForm` error. Validate the identity pattern then bounds, member pattern then
   bounds, and finally the semantic callback; retain first-failure diagnostics.
   Never repeat structural checks in callbacks.
   Callbacks do not participate in agreement. Dispatch merges callbacks per
@@ -613,8 +617,14 @@ type each bullet names; read that type's rustdoc for the details.
   `PlanPreviewProviderConfigs` (plain plan display only) and
   `ReadOnlyProviderConfigs` (destroy, state refresh, bucket deletion) cannot be
   saved, dispatched or projected into desired inputs (compile_fail doctests in
-  `parser/resolve.rs`). `plan --out` and `plan --json` require strict
-  configurations and reject missing defaults.
+  `parser/resolve.rs`). Default tags for desired inputs must be known when
+  provider configurations resolve; validate and LSP reject local apply-time
+  references. Plain plan display may omit individual default values authored
+  as map entries that refer only to missing upstream state, with a warning;
+  `plan --out` and `plan --json` require strict configurations and reject
+  those missing defaults. Read-only validation retains authored defaults
+  without demanding them; only the typed read/delete provider path excludes
+  those inputs.
   Anonymous scalar refinements occur only in provider schema slots; `TypeExpr`
   boundaries use identified refinements or unconstrained scalars. Adding overlapping
   source constraints never reduces assignability.
@@ -672,7 +682,7 @@ type each bullet names; read that type's rustdoc for the details.
   The nested `write_only` flag, the pattern mode, `InputRule.condition` and
   Struct `input_rules` are required fields with no serde default, and
   `MIN_SUPPORTED_PROTOCOL_VERSION` requires them; never add a default to
-  them. Floats are `FiniteF64`, admitted only through its checked
+  them. Value floats and float range bounds are `FiniteF64`, admitted only through its checked
   constructor (carina#4257). SDK
   guests derive custom-type dispatch from the identity/callback pairs in the
   same validated resource/config witnesses they serialize; providers do not
@@ -739,7 +749,8 @@ type each bullet names; read that type's rustdoc for the details.
   findings and pending obligations; only the private single-rule evaluator
   returns a verdict. Dispatch retains every established finding. Each write site
   owns one immutable `RuleInput` and authored checks require `AuthoredInputs`;
-  both are minted only at stage boundaries (compile_fail doctests). Evaluation
+  both are minted only at stage boundaries (`RuleInput` by compile_fail
+  doctests, `AuthoredInputs` by private fields only). Evaluation
   consumes the stage's union-fit authority; unavailable provider validation
   remains pending and never selects a branch by structural declaration order
   alone.
@@ -821,12 +832,15 @@ type each bullet names; read that type's rustdoc for the details.
   `diagnostics` and `protected-material` interfaces, and legacy packages are
   rejected before any guest code runs. The typed event channel
   (`ProviderEvent`, `BoundProviderEvent`), host-side masking, discard-only raw
-  WASI stdio, the registered protected material (`AwsSessionMaterial`,
-  `AwsSdkParts`), the buffered-body WASI HTTP transport, per-call budgets, the
-  consumed `ProviderSessionBuilder`, and the `provider-host` feature boundary
-  (including the wasm32 `compile_error!`) are held by private fields,
-  compile_fail doctests, `scripts/check-provider-cause-test-api.sh`,
-  `scripts/check-provider-boundaries.sh`, and the provider diagnostics tests.
+  WASI stdio, the registered protected material (only AWS session
+  credentials and GitHub tokens: `AwsSessionMaterial`, `AwsSdkParts`,
+  `GithubTokenMaterial`), the buffered-body WASI HTTP transport, per-call
+  budgets and the consumed `ProviderSessionBuilder` are held by private
+  fields, compile_fail doctests and the provider diagnostics tests. The
+  `provider-host` feature boundary, including the wasm32 `compile_error!`, is
+  held by the provider-diagnostic-host-api fixtures of
+  `scripts/check-provider-cause-test-api.sh` and by the manifest check in
+  `scripts/check-provider-boundaries.sh`.
   The presenter consumes Bound segments and never constructs `HostText` or
   uses generic Bound error or partial-reason constructors; closing those older
   constructors remains #4301. The SDK panic hook is installed before
@@ -860,10 +874,12 @@ type each bullet names; read that type's rustdoc for the details.
   presents the same `DesiredValue` tree on the native and WASM routes. Deferred
   leaves are opaque `DeferredLeaf` values that providers cannot construct,
   clone or inspect (its compile_fail doctests carry no error code yet:
-  carina#4534). On the wire they are host-issued slots whose `$`-prefixed user
-  keys are escaped only by `carina_provider_protocol::normalization`; the host
+  carina#4534). On the wire they are host-issued slots (`{"$carina_deferred": <u32>}`
+  inside normalization JSON, whose user keys starting with `$` are escaped
+  only by `carina_provider_protocol::normalization`); the host
   restores each slot only after checking it occurs exactly once in its original
-  resource and attribute. Don't reintroduce a top-level deferred-name list
+  resource and attribute. CRUD, config and persisted-state values never carry
+  slots, and create/update still deliver real secret values. Don't reintroduce a top-level deferred-name list
   or let provider code see a deferred leaf's value.
 - **Runtime value knowledge** (carina#4316) is classified by
   `Value::knowledge()` in `carina-core/src/resource/knowledge.rs`. Its proofs,
