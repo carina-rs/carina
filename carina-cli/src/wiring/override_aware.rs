@@ -122,14 +122,8 @@ impl<'s, E> ParserCanonicalResourcePair<'s, E> {
     }
     pub(crate) fn resolve_attr_prefixes_report(
         self,
-    ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixError>> {
-        let errors = self
-            .parsed
-            .prefix_errors()
-            .iter()
-            .filter(|error| error.blocks_name_resolution())
-            .cloned()
-            .collect::<Vec<_>>();
+    ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixRejection>> {
+        let errors = self.parsed.rejections().to_vec();
         if errors.is_empty() {
             Ok(self)
         } else {
@@ -315,9 +309,10 @@ impl<E, P: PlaceholderKind, T: PlaceholderKind> CanonicalResourcePair<E, P, T> {
     pub(crate) fn resolve_attr_prefixes_report(
         mut self,
         registry: &carina_core::schema::SchemaRegistry,
-    ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixError>> {
+    ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixRejection>> {
         let errors =
-            carina_core::identifier::resolve_attr_prefix_findings(&mut self.parsed, registry);
+            carina_core::identifier::resolve_attr_prefix_findings(&mut self.parsed, registry)
+                .into_rejections();
         if errors.is_empty() {
             Ok(self)
         } else {

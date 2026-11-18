@@ -414,7 +414,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             ExprKind::Parens => AuthoredForm::Parens,
             ExprKind::Convert { .. } => AuthoredForm::Convert,
             ExprKind::Definition => AuthoredForm::Definition,
-            ExprKind::Binding(_) => AuthoredForm::Binding,
+            ExprKind::Binding { .. } => AuthoredForm::Binding,
             ExprKind::Reference { .. } => AuthoredForm::Reference,
             ExprKind::List => AuthoredForm::List,
             ExprKind::Map(_) => AuthoredForm::Map,
@@ -476,7 +476,11 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
     }
 
     pub(crate) fn definition(&self) -> Result<Option<Self>, MissingEvidence> {
-        let ExprKind::Binding(binding) = &self.node.node.kind else {
+        let ExprKind::Binding {
+            binding,
+            authored_binding: _,
+        } = &self.node.node.kind
+        else {
             return Ok(None);
         };
         let Some(expression) = self.node.snapshot.definitions.get(binding) else {
@@ -1048,7 +1052,7 @@ impl<'s, B: BindingAddress> AuthoredCursor<'s, B> {
                 binding,
                 attribute,
                 segments,
-                ..
+                authored_binding: _,
             } => Some(SourceReference {
                 binding,
                 attribute,
@@ -1205,15 +1209,6 @@ impl JudgedSlot {
 impl<B: BindingAddress> JudgedSlot<B> {
     /// Diagnostic syntax inventory, independent of the current projection/judgement.
     /// Inlining an alias or substituting a module argument must retain its authored name.
-    /// Use the parser's iterable span in this slot's concrete instance.
-    pub(crate) fn dependency_uses_at(
-        &self,
-        location: &crate::parser::DeclarationLocation,
-        expressions: &super::Expressions<B>,
-    ) -> Vec<super::AuthoredDependency<B>> {
-        expressions.dependency_uses_at(&self.root.location.instance, location)
-    }
-
     pub(crate) fn dependency_uses(&self) -> Vec<super::AuthoredDependency<B>> {
         let mut uses = Vec::new();
         self.root
@@ -1517,7 +1512,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 | ExprKind::Parameter(_)
                 | ExprKind::LoopSlot(_)
                 | ExprKind::UntypedParameter
-                | ExprKind::Binding(_)
+                | ExprKind::Binding { .. }
                 | ExprKind::Reference { .. }
                 | ExprKind::NestedBlock { .. }
                 | ExprKind::EmptyInterpolation

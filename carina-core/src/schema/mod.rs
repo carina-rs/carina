@@ -7903,7 +7903,7 @@ fn format_field_group_violation(path: &FieldPath, group: &FieldGroup) -> String 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum TypeError {
     #[error("{}", .0.diagnostic_message())]
-    AttributePrefix(Box<crate::identifier::AttributePrefixError>),
+    AttributePrefix(Box<crate::identifier::AttributePrefixFinding>),
 
     #[error("Type mismatch: {types}")]
     TypeMismatch { types: MismatchTypeNames },
@@ -16587,8 +16587,7 @@ impl PatternResourceSchema<Compiled> {
         }
 
         // Run custom validator if present
-        if awaiting.is_empty()
-            && let Some(validator) = self.validator()
+        if let Some(validator) = self.validator()
             && let Some(attributes) = attributes_without_placeholders(
                 &attributes
                     .iter()

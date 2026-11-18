@@ -88,8 +88,11 @@ pub fn admit_resource_attribute_report<
         Err(errors) => {
             return crate::schema::ResourceValueValidation::from_errors(
                 errors
-                    .into_iter()
-                    .map(|error| crate::schema::TypeError::AttributePrefix(Box::new(error)))
+                    .rejections()
+                    .map(|error| crate::schema::TypeError::AttributePrefix(Box::new(error.into())))
+                    .chain(errors.deferred_findings().iter().map(|finding| {
+                        crate::schema::TypeError::AttributePrefix(Box::new(finding.into()))
+                    }))
                     .collect(),
             );
         }
@@ -99,13 +102,22 @@ pub fn admit_resource_attribute_report<
         .filter(|name| is_string_literal(name))
         .cloned()
         .collect();
-    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        crate::validation::admission::attributes::admit_value_only_attributes::<
-            crate::validation::admission::kind::ResourceAttribute,
-            P,
-            B,
-        >(schema, &id, &attributes, &quoted, session)
-    })
+    let mut report =
+        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+            crate::validation::admission::attributes::admit_value_only_attributes::<
+                crate::validation::admission::kind::ResourceAttribute,
+                P,
+                B,
+            >(schema, &id, &attributes, &quoted, session)
+        });
+    report.append_values(crate::schema::ResourceValueValidation::from_errors(
+        attributes
+            .deferred_findings()
+            .iter()
+            .map(|finding| crate::schema::TypeError::AttributePrefix(Box::new(finding.into())))
+            .collect(),
+    ));
+    report
 }
 
 /// Validate a resource's authored attributes through production admission.

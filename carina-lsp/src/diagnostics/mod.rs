@@ -2873,9 +2873,9 @@ impl DiagnosticRun<'_> {
                 }
             }
             // The canonical files supply both owners and values. Raw document trees remain only for syntax checks.
-            publish_prefix_errors(doc, &pre_expansion_configuration, &mut diagnostics);
+            publish_prefix_findings(doc, &pre_expansion_configuration, &mut diagnostics);
             if let Some(configuration) = &expanded_configuration {
-                publish_prefix_errors(doc, configuration, &mut diagnostics);
+                publish_prefix_findings(doc, configuration, &mut diagnostics);
             }
             let resource_diagnostics_start = diagnostics.len();
             if let Some(authored_tree) = &authored_tree {
@@ -3724,7 +3724,7 @@ fn decorate_schema_diagnostic(diagnostic: &mut Diagnostic, error: &carina_core::
     }
 }
 
-fn publish_prefix_errors<X, D, B: BindingAddress>(
+fn publish_prefix_findings<X, D, B: BindingAddress>(
     doc: &Document,
     configuration: &PrefixCanonicalized<'_, carina_core::parser::retained::JudgedFile<'_, X, D, B>>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -3732,18 +3732,34 @@ fn publish_prefix_errors<X, D, B: BindingAddress>(
     X: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
     D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    for error in configuration.prefix_failures() {
-        let location = error.owner().location_in(doc.source_file());
-        if let Some(location) = location
-            && let Some(diagnostic) = render_merged(
-                doc,
-                &carina_core::parser::Located::new(location.clone(), ()),
-                DiagnosticSeverity::ERROR,
-                error.diagnostic_message(),
-            )
-            && !diagnostics.contains(&diagnostic)
-        {
-            diagnostics.push(diagnostic);
-        }
+    for error in configuration.rejections() {
+        publish_prefix_finding(doc, error.owner(), error.diagnostic_message(), diagnostics);
+    }
+    for finding in configuration.deferred_findings() {
+        publish_prefix_finding(
+            doc,
+            finding.owner(),
+            finding.diagnostic_message(),
+            diagnostics,
+        );
+    }
+}
+fn publish_prefix_finding(
+    doc: &Document,
+    owner: &carina_core::finding::FindingOwner,
+    message: String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let location = owner.location_in(doc.source_file());
+    if let Some(location) = location
+        && let Some(diagnostic) = render_merged(
+            doc,
+            &carina_core::parser::Located::new(location.clone(), ()),
+            DiagnosticSeverity::ERROR,
+            message,
+        )
+        && !diagnostics.contains(&diagnostic)
+    {
+        diagnostics.push(diagnostic);
     }
 }

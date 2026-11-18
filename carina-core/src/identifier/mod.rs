@@ -1495,23 +1495,94 @@ pub(crate) fn consumed_prefix_companions<S, P: PlaceholderKind, B: BindingAddres
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ResourcePrefixSource(());
 
-/// One prefix failure, retaining resource ownership and authored provenance.
+/// A blocking prefix rejection. Its reason cannot contain a deferred finding.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AttributePrefixError {
+pub struct AttributePrefixRejection {
     resource: ResourceId,
     prefix: String,
-    failure: AttributePrefixFailure,
+    failure: AttributePrefixRejectionReason,
+    owner: crate::finding::FindingOwner,
+}
+#[derive(Debug, Clone, PartialEq)]
+enum AttributePrefixRejectionReason {
+    Empty,
+    Conflict(String),
+}
+
+/// A non-blocking companion finding; siblings still enter resource admission.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredPrefixFinding {
+    resource: ResourceId,
+    prefix: String,
+    base: String,
+    dependencies: Box<DeferredPrefixDependencies>,
     owner: crate::finding::FindingOwner,
 }
 
+/// Reporting can present both kinds; admission and name resolution use the
+/// separate typed collections below, never this presentation union.
 #[derive(Debug, Clone, PartialEq)]
-enum AttributePrefixFailure {
-    Empty,
-    Conflict(String),
-    Deferred {
-        base: String,
-        dependencies: Box<DeferredPrefixDependencies>,
-    },
+pub enum AttributePrefixFinding {
+    Rejection(AttributePrefixRejection),
+    Deferred(DeferredPrefixFinding),
+}
+impl From<AttributePrefixRejection> for AttributePrefixFinding {
+    fn from(value: AttributePrefixRejection) -> Self {
+        Self::Rejection(value)
+    }
+}
+impl From<DeferredPrefixFinding> for AttributePrefixFinding {
+    fn from(value: DeferredPrefixFinding) -> Self {
+        Self::Deferred(value)
+    }
+}
+impl From<&AttributePrefixRejection> for AttributePrefixFinding {
+    fn from(value: &AttributePrefixRejection) -> Self {
+        value.clone().into()
+    }
+}
+impl From<&DeferredPrefixFinding> for AttributePrefixFinding {
+    fn from(value: &DeferredPrefixFinding) -> Self {
+        value.clone().into()
+    }
+}
+
+/// A rejected caller-value projection must contain an actual rejection.
+/// Deferred findings remain available for reporting alongside that rejection.
+#[derive(Debug, Clone)]
+pub struct RejectedPrefixValues {
+    first: Box<AttributePrefixRejection>,
+    rest: Vec<AttributePrefixRejection>,
+    deferred: Vec<DeferredPrefixFinding>,
+}
+impl RejectedPrefixValues {
+    pub fn rejections(&self) -> impl Iterator<Item = &AttributePrefixRejection> {
+        std::iter::once(self.first.as_ref()).chain(&self.rest)
+    }
+    pub fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
+        &self.deferred
+    }
+}
+
+/// Recognition has one result with two disjoint diagnostic collections.
+#[derive(Debug, Clone, Default)]
+pub struct PrefixFindings {
+    rejections: Vec<AttributePrefixRejection>,
+    deferred: Vec<DeferredPrefixFinding>,
+}
+impl PrefixFindings {
+    pub fn rejections(&self) -> &[AttributePrefixRejection] {
+        &self.rejections
+    }
+    pub fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
+        &self.deferred
+    }
+    pub fn into_rejections(self) -> Vec<AttributePrefixRejection> {
+        self.rejections
+    }
+    pub fn is_empty(&self) -> bool {
+        self.rejections.is_empty() && self.deferred.is_empty()
+    }
 }
 
 /// A deferred companion always retains a cause; it cannot masquerade as an
@@ -1528,16 +1599,16 @@ struct DeferredPrefixDependencies {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrefixDependencyKey {
     path: PrefixDependencyPath,
-    through: Option<crate::resource::DependencyKey<crate::resource::RelativeBindingName>>,
+    through: Option<crate::resource::DependencyKey<crate::resource::AbsoluteBindingAddress>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PrefixDependencyPath {
     Resource(
         crate::resource::DependencyKey<
-            crate::resource::AccessPath<crate::resource::RelativeBindingName>,
+            crate::resource::AccessPath<crate::resource::AbsoluteBindingAddress>,
         >,
     ),
-    Binding(crate::resource::DependencyKey<crate::resource::RelativeBindingName>),
+    Binding(crate::resource::DependencyKey<crate::resource::AbsoluteBindingAddress>),
     Loop(crate::resource::LoopSlot),
 }
 
@@ -1547,20 +1618,12 @@ enum PrefixDependency {
         path: String,
         through: Option<String>,
     },
-    LoopVariable {
-        name: String,
-        through: Option<String>,
-    },
 }
 
 impl std::fmt::Display for PrefixDependency {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Reference { path, through }
-            | Self::LoopVariable {
-                name: path,
-                through,
-            } => {
+            Self::Reference { path, through } => {
                 write!(formatter, "'{path}'")?;
                 if let Some(alias) = through {
                     write!(formatter, " (through '{alias}')")?;
@@ -1581,86 +1644,118 @@ impl std::fmt::Display for DeferredPrefixDependencies {
     }
 }
 
-impl AttributePrefixError {
-    fn same_argument_finding(&self, other: &Self) -> bool {
-        use crate::finding::FindingOwner;
-        let (FindingOwner::ModuleArgument(_), FindingOwner::ModuleArgument(_)) =
-            (&self.owner, &other.owner)
-        else {
-            return false;
-        };
-        let (
-            AttributePrefixFailure::Deferred {
-                base: left_base,
-                dependencies: left,
-            },
-            AttributePrefixFailure::Deferred {
-                base: right_base,
-                dependencies: right,
-            },
-        ) = (&self.failure, &other.failure)
-        else {
-            return false;
-        };
-        self.owner == other.owner
-            && self.prefix == other.prefix
-            && left_base == right_base
-            && left.keys.len() == right.keys.len()
-            && left.keys.iter().all(|key| right.keys.contains(key))
-    }
-
-    /// Empty/conflicting companions prevent name generation. A deferred
-    /// companion instead retains its obligation while siblings are admitted.
-    pub fn blocks_name_resolution(&self) -> bool {
-        !matches!(self.failure, AttributePrefixFailure::Deferred { .. })
-    }
-
+impl AttributePrefixRejection {
     pub fn owner(&self) -> &crate::finding::FindingOwner {
         &self.owner
-    }
-
-    pub(crate) fn resource_id(&self) -> &ResourceId {
-        &self.resource
     }
     pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
         self.owner.location()
     }
-
     fn semantic_message(&self) -> String {
         match &self.failure {
-            AttributePrefixFailure::Empty => format!("'{}' cannot be empty", self.prefix),
-            AttributePrefixFailure::Conflict(base) => {
+            AttributePrefixRejectionReason::Empty => format!("'{}' cannot be empty", self.prefix),
+            AttributePrefixRejectionReason::Conflict(base) => {
                 format!("cannot specify both '{}' and '{}'", self.prefix, base)
             }
-            AttributePrefixFailure::Deferred { base, dependencies } => format!(
-                "'{}' must be known at plan time to generate '{base}', but it depends on {dependencies}, which is known only after apply",
-                self.prefix
-            ),
         }
     }
-
-    /// Deferred findings share one semantic message across CLI JSON and LSP.
-    /// Existing empty/conflict messages retain their decoration.
     pub fn diagnostic_message(&self) -> String {
-        match &self.failure {
-            AttributePrefixFailure::Deferred { .. } => self.semantic_message(),
-            AttributePrefixFailure::Empty | AttributePrefixFailure::Conflict(_) => self.to_string(),
-        }
+        self.to_string()
     }
 }
-impl std::fmt::Display for AttributePrefixError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = self.semantic_message();
+impl std::fmt::Display for AttributePrefixRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.resource, self.semantic_message())
+    }
+}
+impl std::error::Error for AttributePrefixRejection {}
+
+impl DeferredPrefixFinding {
+    fn same_argument_finding(&self, other: &Self) -> bool {
+        use crate::finding::FindingOwner;
+        matches!(
+            (&self.owner, &other.owner),
+            (
+                FindingOwner::ModuleArgument(_),
+                FindingOwner::ModuleArgument(_)
+            )
+        ) && self.owner == other.owner
+            && self.prefix == other.prefix
+            && self.base == other.base
+            && self.dependencies.keys.len() == other.dependencies.keys.len()
+            && self
+                .dependencies
+                .keys
+                .iter()
+                .all(|key| other.dependencies.keys.contains(key))
+    }
+    pub fn owner(&self) -> &crate::finding::FindingOwner {
+        &self.owner
+    }
+    pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
+        self.owner.location()
+    }
+    pub fn diagnostic_message(&self) -> String {
+        deferred_prefix_message(&self.prefix, &self.base, &self.dependencies)
+    }
+}
+/// Keep the approved reason clause in one place while its wording is pending.
+fn deferred_prefix_message(
+    prefix: &str,
+    base: &str,
+    dependencies: &DeferredPrefixDependencies,
+) -> String {
+    format!(
+        "'{prefix}' must be known at plan time to generate '{base}', but it depends on {dependencies}, which is known only after apply"
+    )
+}
+impl std::fmt::Display for DeferredPrefixFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = self.diagnostic_message();
         match &self.owner {
             crate::finding::FindingOwner::ModuleArgument(call) => {
-                crate::parser::Located::new(call.declaration_location().clone(), message)
-                    .fmt(formatter)
+                crate::parser::Located::new(call.declaration_location().clone(), message).fmt(f)
             }
-            _ => write!(formatter, "{}: {message}", self.resource),
+            crate::finding::FindingOwner::Declaration { .. } => {
+                write!(f, "{}: {message}", self.resource)
+            }
         }
     }
 }
-impl std::error::Error for AttributePrefixError {}
+impl std::error::Error for DeferredPrefixFinding {}
+
+impl AttributePrefixFinding {
+    pub fn owner(&self) -> &crate::finding::FindingOwner {
+        match self {
+            Self::Rejection(finding) => finding.owner(),
+            Self::Deferred(finding) => finding.owner(),
+        }
+    }
+    pub(crate) fn resource_id(&self) -> &ResourceId {
+        match self {
+            Self::Rejection(finding) => &finding.resource,
+            Self::Deferred(finding) => &finding.resource,
+        }
+    }
+    pub fn location(&self) -> Option<&crate::parser::DeclarationLocation> {
+        self.owner().location()
+    }
+    pub fn diagnostic_message(&self) -> String {
+        match self {
+            Self::Rejection(finding) => finding.diagnostic_message(),
+            Self::Deferred(finding) => finding.diagnostic_message(),
+        }
+    }
+}
+impl std::fmt::Display for AttributePrefixFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejection(finding) => finding.fmt(f),
+            Self::Deferred(finding) => finding.fmt(f),
+        }
+    }
+}
+impl std::error::Error for AttributePrefixFinding {}
 
 /// Resolve `<attr>_prefix` meta-attributes in resources.
 ///
@@ -1686,8 +1781,10 @@ pub fn resolve_attr_prefixes<
         Ok(())
     } else {
         Err(errors
+            .rejections()
             .iter()
             .map(ToString::to_string)
+            .chain(errors.deferred_findings().iter().map(ToString::to_string))
             .collect::<Vec<_>>()
             .join("\n"))
     }
@@ -1704,7 +1801,7 @@ pub fn resolve_attr_prefix_findings<
 >(
     file: &mut crate::parser::File<X, P, T, D, B>,
     registry: &SchemaRegistry,
-) -> Vec<AttributePrefixError> {
+) -> PrefixFindings {
     prefix::resolve_file(file, registry, SuffixSource::Random)
 }
 

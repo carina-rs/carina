@@ -559,6 +559,23 @@ async fn r1_loop_variable_dependency_is_named() {
 }
 
 #[tokio::test]
+async fn r3_root_loop_does_not_inherit_unrelated_call_arguments() {
+    let mut fixture = Fixture::new(
+        "let children = for x in src.domain_validation_options {\n  mock.test.resource {\n    name_prefix = x\n  }\n}\nlet c = use { source = './child' }\nlet other = c { names = src.domain_validation_options }\n",
+        SOURCE,
+        true,
+    ).with_file("child/arguments.crn", "arguments { names: list(String) }\n")
+        .with_file("child/main.crn", "for n in names { mock.test.resource { name = n } }\n");
+    fixture.subject = "mock.test.resource.children[?]".into();
+    assert_named_dependency(
+        fixture,
+        "'x'",
+        Range::new(Position::new(2, 4), Position::new(2, 19)),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn r1_user_function_dependency_names_reference() {
     let main = "mock.test.resource {\n  name_prefix = render(src.identifier)\n}\n";
     let fixture = Fixture::new(
@@ -763,19 +780,6 @@ fn r2_fixture(case: &str) -> Fixture {
             .with_file("child/main.crn","mock.test.resource {\n  name_prefix = local.identifier\n  bogus = 1\n}\n"),
         "s1_root_siblings" => Fixture::new("let child = use { source = './child' }\nlet net = child {}\nmock.test.resource { name_prefix = net.first bogus = 'one' }\nmock.test.resource { name_prefix = net.second bogus = 'two' }\n", "", false)
             .with_file("child/main.crn", "attributes { first: String = 'first' second: String = 'second' }\n"),
-        "s3_literal_iterable" | "s3_deferred_iterable" => {
-            let arg=if case == "s3_literal_iterable" { "['app']" } else { "src.domain_validation_options" };
-            Fixture::new(&format!("let c = use {{ source = './child' }}\nlet s = c {{ names = {arg} }}\n"),if case == "s3_literal_iterable" { "" } else { SOURCE },true)
-                .with_file("child/arguments.crn","arguments { names: list(String) }\n")
-                .with_file("child/main.crn","let children = for n in names {\n  mock.test.resource {\n    name_prefix = n\n  }\n}\n")
-        }
-        "s3_local_value_ignores_iterable" => r2_fixture("s3_deferred_iterable")
-            .with_file("child/lets.crn","let local = mock.test.resource { name = 'local' }\n")
-            .with_file("child/main.crn","let children = for n in names {\n  mock.test.resource {\n    name_prefix = local.identifier\n    comment = n\n  }\n}\n"),
-        "s3_shadowed_iterable" => r2_fixture("s3_deferred_iterable")
-            .with_file("main.crn","let c = use { source = './child' }\nlet s = c { n = src.domain_validation_options }\n")
-            .with_file("child/arguments.crn","arguments { n: list(String) }\n")
-            .with_file("child/main.crn","let children = for n in n {\n  mock.test.resource {\n    name_prefix = n\n  }\n}\n"),
         "s4_one_call_two_resources" => Fixture::new(call,SOURCE,true)
             .with_file("child/main.crn","let first = mock.test.resource { name_prefix = prefix }\nlet second = mock.test.resource { name_prefix = prefix }\nattributes { first_id: String = first.identifier second_id: String = second.identifier }\n"),
         "n1_mixed_deferred" | "n1_mixed_literal" | "n2_middle_alias" => {
@@ -828,20 +832,6 @@ async fn r2_s1_root_siblings() {
     let actual = fixture.observation().await;
     let expected: serde_json::Value = serde_json::from_str(include_str!(
         "fixtures/deferred_prefix/r2/s1_root_siblings.json"
-    ))
-    .unwrap();
-    assert_eq!(
-        actual, expected,
-        "complete validate text, JSON, and per-file LSP inventory"
-    );
-}
-
-#[tokio::test]
-async fn r2_s3_deferred_iterable() {
-    let fixture = r2_fixture("s3_deferred_iterable");
-    let actual = fixture.observation().await;
-    let expected: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/deferred_prefix/r2/s3_deferred_iterable.json"
     ))
     .unwrap();
     assert_eq!(
@@ -921,20 +911,6 @@ async fn r2_n4_undefined_binding() {
 }
 
 #[tokio::test]
-async fn r2_s3_literal_iterable() {
-    let fixture = r2_fixture("s3_literal_iterable");
-    let actual = fixture.observation().await;
-    let expected: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/deferred_prefix/r2/s3_literal_iterable.json"
-    ))
-    .unwrap();
-    assert_eq!(
-        actual, expected,
-        "main validate behavior and awaiting unbound child buffer"
-    );
-}
-
-#[tokio::test]
 async fn r2_b1_local_module_siblings() {
     let fixture = r2_fixture("b1_local_module_siblings");
     let expected: serde_json::Value = serde_json::from_str(include_str!(
@@ -948,30 +924,58 @@ async fn r2_b1_local_module_siblings() {
     );
 }
 
-#[tokio::test]
-async fn r2_s3_shadowed_iterable() {
-    let fixture = r2_fixture("s3_shadowed_iterable");
-    let expected: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/deferred_prefix/r2/s3_shadowed_iterable.json"
-    ))
-    .unwrap();
-    assert_eq!(
-        fixture.observation().await,
-        expected,
-        "the iterable uses its enclosing argument scope, before the loop variable shadows it"
-    );
+fn r3_fixture(case: &str) -> Fixture {
+    let argument = if case == "literal" {
+        "['app']"
+    } else {
+        "src.domain_validation_options"
+    };
+    let child = if case == "concat_unknown" {
+        "for x in concat(items, nope.list) { mock.test.resource { name = x } }\n"
+    } else {
+        "for n in names {\n  mock.test.resource {\n    name_prefix = n\n  }\n}\n"
+    };
+    let argname = if case == "concat_unknown" {
+        "items"
+    } else {
+        "names"
+    };
+    Fixture::new(
+        &format!("let c = use {{ source = './child' }}\nlet s = c {{ {argname} = {argument} }}\n"),
+        if case == "literal" { "" } else { SOURCE },
+        true,
+    )
+    .with_file(
+        "child/arguments.crn",
+        &format!("arguments {{ {argname}: list(String) }}\n"),
+    )
+    .with_file("child/main.crn", child)
 }
-
 #[tokio::test]
-async fn r2_s3_local_value_ignores_iterable() {
-    let fixture = r2_fixture("s3_local_value_ignores_iterable");
+async fn r3_module_argument_iterable_matches_main() {
+    for (case, expected) in [
+        (
+            "literal",
+            include_str!("fixtures/deferred_prefix/r3/literal.json"),
+        ),
+        (
+            "apply",
+            include_str!("fixtures/deferred_prefix/r3/apply.json"),
+        ),
+    ] {
+        let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
+        assert_eq!(
+            r3_fixture(case).observation().await,
+            expected,
+            "main-captured {case}: complete text, JSON, and every file's LSP inventory"
+        );
+    }
+}
+#[tokio::test]
+async fn r3_module_argument_concat_unknown_matches_main() {
     let expected: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/deferred_prefix/r2/s3_local_value_ignores_iterable.json"
+        "fixtures/deferred_prefix/r3/concat_unknown.json"
     ))
     .unwrap();
-    assert_eq!(
-        fixture.observation().await,
-        expected,
-        "an iterable is not a prefix-value dependency when that value does not use the loop binding"
-    );
+    assert_eq!(r3_fixture("concat_unknown").observation().await, expected);
 }

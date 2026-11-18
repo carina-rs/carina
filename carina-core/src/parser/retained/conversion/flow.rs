@@ -49,7 +49,7 @@ impl PlacementRole {
             ExprKind::Map(_) => Self::Transport(T::MapValue),
             ExprKind::NestedBlock { .. } => Self::Transport(T::StructFieldValue),
             ExprKind::Definition => Self::Transport(T::DefinitionValue),
-            ExprKind::Binding(_) | ExprKind::Alias => Self::Transport(T::AliasForward),
+            ExprKind::Binding { .. } | ExprKind::Alias => Self::Transport(T::AliasForward),
             ExprKind::Sink { .. } => Self::Transport(T::AttributeSlot),
             ExprKind::Sequence => Self::Transport(T::SequenceResult),
             ExprKind::Function { .. }

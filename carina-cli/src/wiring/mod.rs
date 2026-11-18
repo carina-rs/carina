@@ -3809,11 +3809,10 @@ pub(crate) fn resolve_file_names_with_ctx<
     );
     errors.extend(
         canonical
-            .prefix_errors()
+            .rejections()
             .iter()
-            .filter(|error| error.blocks_name_resolution())
             .cloned()
-            .map(|error| AppError::AttributePrefix(Box::new(error))),
+            .map(|error| AppError::AttributePrefix(Box::new(error.into()))),
     );
     if errors.is_empty() {
         Ok(canonical)
@@ -3834,7 +3833,7 @@ fn resolve_config_names_with_ctx<'s, E>(
         .map_err(|errors| {
             errors
                 .into_iter()
-                .map(|error| AppError::AttributePrefix(Box::new(error)))
+                .map(|error| AppError::AttributePrefix(Box::new(error.into())))
                 .collect()
         })
 }
@@ -3868,9 +3867,17 @@ pub fn resolve_attr_prefixes_with_ctx<
     ctx: &WiringContext,
     file: &mut carina_core::parser::File<X, P, T, D, B>,
 ) -> Vec<AppError> {
-    identifier::resolve_attr_prefix_findings(file, ctx.schemas())
-        .into_iter()
-        .map(|error| AppError::AttributePrefix(Box::new(error)))
+    let findings = identifier::resolve_attr_prefix_findings(file, ctx.schemas());
+    findings
+        .rejections()
+        .iter()
+        .map(|error| AppError::AttributePrefix(Box::new(error.into())))
+        .chain(
+            findings
+                .deferred_findings()
+                .iter()
+                .map(|error| AppError::AttributePrefix(Box::new(error.into()))),
+        )
         .collect()
 }
 

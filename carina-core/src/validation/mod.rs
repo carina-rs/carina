@@ -5384,7 +5384,8 @@ impl ResourceAdmissionFinding {
             .join("\n");
         self
     }
-    fn prefix(error: &crate::identifier::AttributePrefixError) -> Self {
+    fn prefix(error: impl Into<crate::identifier::AttributePrefixFinding>) -> Self {
+        let error = error.into();
         let mut finding = Self::schema(
             error.resource_id(),
             &crate::schema::SchemaDiagnostic::unlocated(TypeError::AttributePrefix(Box::new(
@@ -5748,9 +5749,15 @@ pub fn validate_resources<
     let report = canonical.validation_report(provider_context);
     let mut run: ConversionValidation = ConversionValidation::new(&report);
     let mut findings = canonical
-        .prefix_errors()
+        .rejections()
         .iter()
         .map(ResourceAdmissionFinding::prefix)
+        .chain(
+            canonical
+                .deferred_findings()
+                .iter()
+                .map(ResourceAdmissionFinding::prefix),
+        )
         .collect::<Vec<_>>();
     match canonical.schema_validation_resources() {
         Ok(inputs) => findings.extend(run.walk_in(FindingSubject::Root, |coverage| {
@@ -6108,18 +6115,19 @@ impl ResourceAdmissionReport {
         references: ResourceAdmissionFindings,
         boundary: presentation::AdmissionBoundary,
     ) -> Self {
-        let prefixes = file
-            .prefix_errors()
+        let mut prefixes = file
+            .rejections()
             .iter()
-            // A template preflight cannot stop the caller graph's sibling
-            // admission on a deferred companion. Its obligation survives;
-            // the live pass publishes its fully attributed finding once.
-            .filter(|error| {
-                matches!(boundary, presentation::AdmissionBoundary::Live)
-                    || error.blocks_name_resolution()
-            })
             .map(ResourceAdmissionFinding::prefix)
             .collect::<Vec<_>>();
+        // Preflight retains obligations; live reporting adds their attributed findings.
+        if matches!(boundary, presentation::AdmissionBoundary::Live) {
+            prefixes.extend(
+                file.deferred_findings()
+                    .iter()
+                    .map(ResourceAdmissionFinding::prefix),
+            );
+        }
         Self {
             attributes,
             prefixes,

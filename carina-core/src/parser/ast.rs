@@ -558,14 +558,6 @@ impl DiagnosticLocation {
     }
 }
 
-/// Validation provenance, consumed at the parser-placeholder boundary. It is
-/// deliberately absent from saved deferred-expression wire data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeferredIterableOrigin {
-    Authored,
-    EnclosingModuleArgument,
-}
-
 /// A for-expression whose iterable is unresolved (e.g., upstream_state not yet available).
 ///
 /// Parser-side deferred loops use [`ParsedDeferredForExpression`] instead.
@@ -580,7 +572,6 @@ enum DeferredIterableOrigin {
 ///     expression.file = Some("unrelated.crn".into());
 /// }
 /// ```
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredForExpression<
     S = ModuleSource,
@@ -594,7 +585,6 @@ pub struct DeferredForExpression<
     target: DeferredForTarget<B>,
     pub iterable: Value<P, B>,
     pub binding: ForBinding,
-    iterable_origin: DeferredIterableOrigin,
     template_resource: DeferredForTemplateResource<S, T, B, D>,
     deferred_effect_id: ResolvedResourceId,
 }
@@ -631,7 +621,6 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             binding,
             template_resource: _,
             deferred_effect_id: _,
-            iterable_origin,
         } = self;
         DeferredForExpression::from_template_resource(
             location,
@@ -640,7 +629,6 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             iterable,
             binding,
             DeferredForTemplateResource::new(resource),
-            iterable_origin,
         )
     }
 
@@ -661,7 +649,6 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             iterable,
             binding,
             template_resource,
-            DeferredIterableOrigin::Authored,
         )
     }
 
@@ -672,7 +659,6 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
         iterable: Value<P, B>,
         binding: ForBinding,
         template_resource: DeferredForTemplateResource<S, T, B, D>,
-        iterable_origin: DeferredIterableOrigin,
     ) -> Self {
         let template_resource = template_resource.into_materialized_for_target(&target);
         let deferred_effect_id = deferred_effect_id(&target, &template_resource);
@@ -684,7 +670,6 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             binding,
             template_resource,
             deferred_effect_id,
-            iterable_origin,
         }
     }
 
@@ -788,7 +773,6 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForExpression<S, 
             binding,
             template_resource,
             deferred_effect_id: _,
-            iterable_origin,
         } = self;
         DeferredForExpression::from_template_resource(
             location,
@@ -797,7 +781,6 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForExpression<S, 
             iterable,
             binding,
             template_resource.map_resource(|resource| resource.with_dependency_phase(())),
-            iterable_origin,
         )
     }
 }
@@ -1181,14 +1164,6 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             iterable,
             binding,
             template_resource,
-            if matches!(
-                iterable_state,
-                ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
-            ) {
-                DeferredIterableOrigin::EnclosingModuleArgument
-            } else {
-                DeferredIterableOrigin::Authored
-            },
         ))
     }
 }
@@ -1284,7 +1259,6 @@ impl<P: ValueKind, T: ValueKind> DeferredForExpression<ModuleSource, P, T, Absol
             binding: _binding,
             template_resource,
             deferred_effect_id,
-            iterable_origin: _,
         } = self;
         match target {
             DeferredForTarget::Bound(bound) => {
@@ -1343,7 +1317,6 @@ impl<P: ValueKind, T: ValueKind, D>
             binding,
             mut template_resource,
             deferred_effect_id: _,
-            iterable_origin,
         } = expression;
         if let Some(root) = location.source_root() {
             T::make_directive_sources_relative(template_resource.directives_mut(), &root);
@@ -1356,7 +1329,6 @@ impl<P: ValueKind, T: ValueKind, D>
             binding,
             template_resource
                 .map_resource(Resource::<SavedModuleSource, T, AbsoluteBindingAddress, D>::from),
-            iterable_origin,
         )
     }
 }
@@ -1691,7 +1663,6 @@ where
             wire.iterable,
             wire.binding,
             template_resource,
-            DeferredIterableOrigin::Authored,
         ))
     }
 }
@@ -1778,7 +1749,6 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
             binding,
             template_resource,
             deferred_effect_id: _,
-            iterable_origin: _,
         } = self;
         let template_resource = template_resource.try_map_resource(|resource| {
             resource.into_loop_template(schemas, element_type.as_ref())
@@ -1790,7 +1760,6 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
             iterable.into_expanded()?,
             binding,
             template_resource,
-            DeferredIterableOrigin::Authored,
         ))
     }
 }
@@ -6450,22 +6419,6 @@ pub trait DeferredForPhaseTraversal<
         P: 'a,
         T: 'a;
 
-    /// A parser-retained iterable whose value comes from an enclosing argument.
-    /// Its elements cannot be judged independently of the caller's expression.
-    fn deferred_argument_iterable<'a, S: 'a>(
-        deferred: Self::DeferredRef<'a, S>,
-    ) -> Option<&'a Value<P, B>>
-    where
-        P: 'a,
-        T: 'a;
-
-    fn deferred_iterable_location<'a, S: 'a>(
-        deferred: Self::DeferredRef<'a, S>,
-    ) -> Option<&'a super::DeclarationLocation>
-    where
-        P: 'a,
-        T: 'a;
-
     fn deferred_binding<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a ForBinding
     where
         P: 'a,
@@ -6585,22 +6538,6 @@ impl<P: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P, P, B>
         &deferred.iterable
     }
 
-    fn deferred_argument_iterable<'a, S: 'a>(
-        deferred: Self::DeferredRef<'a, S>,
-    ) -> Option<&'a Value<P, B>> {
-        matches!(
-            deferred.iterable_state,
-            ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
-        )
-        .then_some(&deferred.iterable)
-    }
-
-    fn deferred_iterable_location<'a, S: 'a>(
-        deferred: Self::DeferredRef<'a, S>,
-    ) -> Option<&'a super::DeclarationLocation> {
-        deferred.location.iterable.location()
-    }
-
     fn deferred_binding<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a ForBinding {
         &deferred.binding
     }
@@ -6703,30 +6640,6 @@ impl<P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForPhaseTraversal<P,
         T: 'a,
     {
         &deferred.iterable
-    }
-
-    fn deferred_argument_iterable<'a, S: 'a>(
-        deferred: Self::DeferredRef<'a, S>,
-    ) -> Option<&'a Value<P, B>>
-    where
-        P: 'a,
-        T: 'a,
-    {
-        matches!(
-            deferred.iterable_origin,
-            DeferredIterableOrigin::EnclosingModuleArgument
-        )
-        .then_some(&deferred.iterable)
-    }
-
-    fn deferred_iterable_location<'a, S: 'a>(
-        deferred: Self::DeferredRef<'a, S>,
-    ) -> Option<&'a super::DeclarationLocation>
-    where
-        P: 'a,
-        T: 'a,
-    {
-        deferred.location.iterable.location()
     }
 
     fn deferred_binding<'a, S: 'a>(deferred: Self::DeferredRef<'a, S>) -> &'a ForBinding

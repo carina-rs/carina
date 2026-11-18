@@ -622,11 +622,7 @@ pub(crate) fn parse_for_expr(
                 declaration.clone(),
                 header,
                 iterable.clone(),
-                if crate::parser::functions::contains_module_argument(&iterable) {
-                    ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
-                } else {
-                    ParsedDeferredForIterableState::Deferred
-                },
+                ParsedDeferredForIterableState::Deferred,
             )?;
             // Return empty — the for body produces zero concrete resources
         }
