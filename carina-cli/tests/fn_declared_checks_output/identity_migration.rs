@@ -1,5 +1,6 @@
 use carina_cli::commands::apply::run_apply_with_factories_for_test;
-use carina_cli::error::AppError;
+use carina_cli::error::{AppError, format_unresolved_declared_identity_migration};
+use carina_cli::output_style::ColorMode;
 use carina_cli::test_support::{TestCommandRuntime, run_observed_plan_with_factories};
 use carina_cli::wiring::LoadedProviderFactory;
 use carina_core::identifier::AnonymousIdentifierReconciliationError;
@@ -249,7 +250,7 @@ pub(super) async fn check_legacy_rows() {
         store.lock().unwrap().operations.clear();
         std::fs::write(&child, body("p(lower(src.emitted))")).unwrap();
 
-        if kind == "IdentitySink" {
+        let moved_block = if kind == "IdentitySink" {
             let error =
                 run_observed_plan_with_factories(&runtime, path, None, true, false, factories())
                     .await
@@ -267,14 +268,20 @@ pub(super) async fn check_legacy_rows() {
                 error.candidate_rows()[0].to_string(),
                 format!("test.{kind}.{old}")
             );
+            let rendered = format_unresolved_declared_identity_migration(ColorMode::Plain, &error);
             assert_eq!(
-                error.to_string(),
+                rendered,
                 format!(
-                    "Anonymous resource `test.{kind}.{new}` has an authored declared-identity expression that cannot be evaluated from binding state while unclaimed legacy state rows remain: `test.{kind}.{old}`. Add a `moved` block to select the intended state row."
+                    "Error: Anonymous resource `test.{kind}.{new}` has an authored declared-identity expression that cannot be evaluated from binding state while unclaimed legacy state rows remain: `test.{kind}.{old}`. Add a `moved` block to select the intended state row.\n\n  moved {{\n    from = test.{kind} '{old}'\n    to   = test.{kind} '{new}'\n  }}\n"
                 )
             );
             assert!(store.lock().unwrap().operations.is_empty());
             assert_eq!(std::fs::read(&state_path).unwrap(), before);
+            rendered
+                .split_once("\n\n")
+                .expect("single-candidate error must provide a pasteable moved block")
+                .1
+                .to_owned()
         } else {
             println!("MUTABLE_MIGRATION_PLAN_BEGIN");
             assert!(
@@ -283,7 +290,8 @@ pub(super) async fn check_legacy_rows() {
                     .unwrap()
             );
             println!("MUTABLE_MIGRATION_PLAN_END");
-        }
+            format!("moved {{\n  from = test.{kind} '{old}'\n  to = test.{kind} '{new}'\n}}\n")
+        };
         assert!(
             store
                 .lock()
@@ -293,11 +301,7 @@ pub(super) async fn check_legacy_rows() {
                 .all(|op| *op == "read")
         );
 
-        std::fs::write(
-            path.join("moved.crn"),
-            format!("moved {{\n  from = test.{kind} '{old}'\n  to = test.{kind} '{new}'\n}}\n"),
-        )
-        .unwrap();
+        std::fs::write(path.join("moved.crn"), moved_block).unwrap();
         run_observed_plan_with_factories(&runtime, path, None, true, false, factories())
             .await
             .unwrap();

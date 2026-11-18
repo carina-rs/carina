@@ -5,7 +5,6 @@ use std::io::ErrorKind;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
-use carina_cli::output_style::Colorize;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{CompleteEnv, Shell, generate};
 
@@ -23,7 +22,7 @@ use carina_cli::commands::providers::{ProvidersCommands, run_providers_command};
 use carina_cli::commands::skills;
 use carina_cli::commands::state::{StateCommands, run_force_unlock, run_state_command};
 use carina_cli::commands::validate::{collect_validate, render_validate};
-use carina_cli::error;
+use carina_cli::error::{self, format_error_lines};
 use carina_cli::plan_image::{ImageTheme, PlanImageTarget};
 use carina_cli::{DEFAULT_PARALLELISM, DetailLevel};
 
@@ -818,6 +817,26 @@ fn render_app_error(
                 exit_code: 1,
             }
         }
+        error::AppError::AnonymousIdentifierReconciliation(reconciliation) => {
+            use carina_core::identifier::AnonymousIdentifierReconciliationError;
+
+            let stderr = match reconciliation.as_ref() {
+                AnonymousIdentifierReconciliationError::UnresolvedDeclaredIdentity(migration) => {
+                    error::format_unresolved_declared_identity_migration(color_mode, migration)
+                }
+                AnonymousIdentifierReconciliationError::Comparison(_)
+                | AnonymousIdentifierReconciliationError::SecretComparison(_)
+                | AnonymousIdentifierReconciliationError::UnavailableSecret(_)
+                | AnonymousIdentifierReconciliationError::AmbiguousDeclaredIdentity(_)
+                | AnonymousIdentifierReconciliationError::UnknownIdentityOverrideOrigin(_) => {
+                    format_error_lines(color_mode, &error::format_error_with_source_chain(e))
+                }
+            };
+            AppErrorRendering {
+                stderr,
+                exit_code: 1,
+            }
+        }
         _ => AppErrorRendering {
             stderr: format_error_lines(color_mode, &error::format_error_with_source_chain(e)),
             exit_code: 1,
@@ -845,13 +864,6 @@ fn handle_app_error(
     std::process::exit(rendering.exit_code);
 }
 
-fn format_error_lines(color_mode: carina_cli::output_style::ColorMode, msg: &str) -> String {
-    let prefix = "Error:".red(color_mode).bold(color_mode).to_string();
-    msg.lines()
-        .map(|line| format!("{} {}\n", prefix, line))
-        .collect()
-}
-
 #[cfg(test)]
 mod cli_version_tests;
 
@@ -859,6 +871,73 @@ mod cli_version_tests;
 mod error_format_tests {
     use super::*;
     use crate::provider_text_fixtures::*;
+
+    fn unresolved_identity_error(candidates: &[&str]) -> error::AppError {
+        use carina_core::identifier::{
+            AnonymousIdentifierReconciliationError, UnresolvedDeclaredIdentityMigration,
+        };
+        use carina_core::resource::{ResolvedResourceId, ResourceIdentity};
+
+        let id = |name: &str| {
+            ResolvedResourceId::with_provider_identity(
+                "awscc",
+                "ec2.Vpc",
+                ResourceIdentity::try_from(name.to_owned()).expect("nonempty fixture identity"),
+                None,
+            )
+        };
+        let migration = UnresolvedDeclaredIdentityMigration::new(
+            &id("network.ec2_vpc_04c023e3"),
+            candidates.iter().map(|name| id(name)).collect(),
+        )
+        .expect("fixture has legacy candidates");
+        error::AppError::AnonymousIdentifierReconciliation(Box::new(
+            AnonymousIdentifierReconciliationError::UnresolvedDeclaredIdentity(migration),
+        ))
+    }
+
+    #[test]
+    fn unresolved_identity_single_candidate_block_is_pasteable() {
+        let rendered = render_app_error(
+            carina_cli::output_style::ColorMode::Plain,
+            &unresolved_identity_error(&["network.ec2_vpc_0312f2cf"]),
+        );
+        assert_eq!(rendered.exit_code, 1);
+        assert_eq!(
+            rendered.stderr,
+            concat!(
+                "Error: Anonymous resource `awscc.ec2.Vpc.network.ec2_vpc_04c023e3` has an ",
+                "authored declared-identity expression that cannot be evaluated from binding ",
+                "state while unclaimed legacy state rows remain: ",
+                "`awscc.ec2.Vpc.network.ec2_vpc_0312f2cf`. ",
+                "Add a `moved` block to select the intended state row.\n\n",
+                "  moved {\n",
+                "    from = awscc.ec2.Vpc 'network.ec2_vpc_0312f2cf'\n",
+                "    to   = awscc.ec2.Vpc 'network.ec2_vpc_04c023e3'\n",
+                "  }\n",
+            )
+        );
+    }
+
+    #[test]
+    fn unresolved_identity_multiple_candidates_keep_existing_output() {
+        let rendered = render_app_error(
+            carina_cli::output_style::ColorMode::Plain,
+            &unresolved_identity_error(&["network.ec2_vpc_0312f2cf", "network.ec2_vpc_12345678"]),
+        );
+        assert_eq!(rendered.exit_code, 1);
+        assert_eq!(
+            rendered.stderr,
+            concat!(
+                "Error: Anonymous resource `awscc.ec2.Vpc.network.ec2_vpc_04c023e3` has an ",
+                "authored declared-identity expression that cannot be evaluated from binding ",
+                "state while unclaimed legacy state rows remain: ",
+                "`awscc.ec2.Vpc.network.ec2_vpc_0312f2cf`, ",
+                "`awscc.ec2.Vpc.network.ec2_vpc_12345678`. ",
+                "Add a `moved` block to select the intended state row.\n",
+            )
+        );
+    }
 
     #[test]
     fn terminal_upstream_errors_render_every_detail_once() {

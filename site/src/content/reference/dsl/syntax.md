@@ -191,9 +191,14 @@ For example, a declared-identity resource in a module instance named `network` c
 
 ```text
 Error: Anonymous resource `awscc.ec2.Vpc.network.ec2_vpc_04c023e3` has an authored declared-identity expression that cannot be evaluated from binding state while unclaimed legacy state rows remain: `awscc.ec2.Vpc.network.ec2_vpc_0312f2cf`. Add a `moved` block to select the intended state row.
+
+  moved {
+    from = awscc.ec2.Vpc 'network.ec2_vpc_0312f2cf'
+    to   = awscc.ec2.Vpc 'network.ec2_vpc_04c023e3'
+  }
 ```
 
-After checking which old row belongs to the desired resource, add a `moved` block at the project root. The `from` and `to` strings include the module instance path:
+When exactly one old row is named, the error includes a `moved` block. After checking that the row belongs to the desired resource, paste the block into a `.crn` file at the project root. With several old rows, the error lists them without suggesting a block; select the intended row yourself. The `from` and `to` strings include the module instance path:
 
 ```crn
 moved {

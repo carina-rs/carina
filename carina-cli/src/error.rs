@@ -10,6 +10,7 @@ use carina_core::resource::{ResolvedResourceId, ResourceId};
 use carina_state::BackendError;
 
 use crate::commands::shared::state_writeback::PersistedDirectiveChange;
+use crate::output_style::{ColorMode, Colorize};
 
 #[derive(Debug)]
 pub struct SavedPlanSourceResolutionError {
@@ -1938,6 +1939,27 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
         messages.push(format!("Re-run `{command}` to create a new plan."));
     }
     messages.join("\n")
+}
+
+fn error_prefix(color_mode: ColorMode) -> String {
+    "Error:".red(color_mode).bold(color_mode).to_string()
+}
+
+/// Render ordinary diagnostic lines with the CLI's error prefix.
+pub fn format_error_lines(color_mode: ColorMode, message: &str) -> String {
+    let prefix = error_prefix(color_mode);
+    message
+        .lines()
+        .map(|line| format!("{prefix} {line}\n"))
+        .collect()
+}
+
+/// Leave the typed diagnostic's recovery block ready to paste as source.
+pub fn format_unresolved_declared_identity_migration(
+    color_mode: ColorMode,
+    error: &carina_core::identifier::UnresolvedDeclaredIdentityMigration,
+) -> String {
+    format!("{} {error}\n", error_prefix(color_mode))
 }
 
 impl From<carina_core::resource::ResolvedResourceError> for AppError {

@@ -4240,6 +4240,66 @@ fn reconcile_declared_identity_migration_evaluates_interpolation_over_state_back
 }
 
 #[test]
+fn unresolved_declared_identity_single_candidate_appends_pasteable_moved_block() {
+    let id = |name| {
+        ResolvedResourceId::with_provider_identity(
+            "awscc",
+            "ec2.Vpc",
+            ResourceIdentity::new(name),
+            None,
+        )
+    };
+    let error = UnresolvedDeclaredIdentityMigration::new(
+        &id("network.ec2_vpc_04c023e3"),
+        vec![id("network.ec2_vpc_0312f2cf")],
+    )
+    .expect("one legacy candidate");
+    assert_eq!(
+        error.to_string(),
+        concat!(
+            "Anonymous resource `awscc.ec2.Vpc.network.ec2_vpc_04c023e3` has an authored ",
+            "declared-identity expression that cannot be evaluated from binding state while ",
+            "unclaimed legacy state rows remain: `awscc.ec2.Vpc.network.ec2_vpc_0312f2cf`. ",
+            "Add a `moved` block to select the intended state row.\n\n",
+            "  moved {\n",
+            "    from = awscc.ec2.Vpc 'network.ec2_vpc_0312f2cf'\n",
+            "    to   = awscc.ec2.Vpc 'network.ec2_vpc_04c023e3'\n",
+            "  }",
+        )
+    );
+}
+
+#[test]
+fn unresolved_declared_identity_multiple_candidates_keeps_list_only() {
+    let id = |name| {
+        ResolvedResourceId::with_provider_identity(
+            "awscc",
+            "ec2.Vpc",
+            ResourceIdentity::new(name),
+            None,
+        )
+    };
+    let error = UnresolvedDeclaredIdentityMigration::new(
+        &id("network.ec2_vpc_04c023e3"),
+        vec![
+            id("network.ec2_vpc_0312f2cf"),
+            id("network.ec2_vpc_12345678"),
+        ],
+    )
+    .expect("multiple legacy candidates");
+    assert_eq!(
+        error.to_string(),
+        concat!(
+            "Anonymous resource `awscc.ec2.Vpc.network.ec2_vpc_04c023e3` has an authored ",
+            "declared-identity expression that cannot be evaluated from binding state while ",
+            "unclaimed legacy state rows remain: `awscc.ec2.Vpc.network.ec2_vpc_0312f2cf`, ",
+            "`awscc.ec2.Vpc.network.ec2_vpc_12345678`. ",
+            "Add a `moved` block to select the intended state row.",
+        )
+    );
+}
+
+#[test]
 fn reconcile_unresolved_declared_identity_with_legacy_candidate_requires_moved() {
     let registry = scalar_identity_registry();
     let mut desired = Resource::pending_with_provider("mock", "test.resource", None);

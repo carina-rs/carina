@@ -3,7 +3,9 @@ use std::fmt;
 
 use crate::output_style::Colorize;
 use carina_core::effect::{Effect, EffectGeneration};
-use carina_core::identifier::{DesiredCreateOnlyValues, StateCreateOnlyValues};
+use carina_core::identifier::{
+    DesiredCreateOnlyValues, MovedBlock, MovedBlockAddress, StateCreateOnlyValues,
+};
 use carina_core::plan::Plan;
 use carina_core::provider::{ComparisonResolutionError, ProviderRouter};
 use carina_core::resource::{
@@ -154,10 +156,7 @@ impl fmt::Display for MovedBlockHint {
                     "Warning: this plan destroys {from} and creates {to}, whose configured create-only values match. If they are the same resource, add this block to keep it instead of replacing it:"
                 )?;
                 writeln!(f)?;
-                writeln!(f, "  moved {{")?;
-                writeln!(f, "    from = {from}")?;
-                writeln!(f, "    to   = {to}")?;
-                write!(f, "  }}")
+                write!(f, "{}", MovedBlock::new(pair.from(), pair.to()))
             }
             Self::Ambiguous(group) => {
                 writeln!(
@@ -442,34 +441,7 @@ fn resources_match(
 }
 
 fn render_address(id: &ResolvedResourceId) -> String {
-    let resource_type = if id.provider().is_empty() {
-        id.resource_type().to_string()
-    } else {
-        format!("{}.{}", id.provider(), id.resource_type())
-    };
-    format!(
-        "{} {}",
-        resource_type,
-        render_identity_literal(id.identity_str())
-    )
-}
-
-fn render_identity_literal(identity: &str) -> String {
-    if !identity.contains('\'') && !identity.contains("${") {
-        return format!("'{}'", identity.replace('\\', "\\\\"));
-    }
-
-    let mut escaped = String::with_capacity(identity.len());
-    let mut chars = identity.chars().peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '$' if chars.peek() == Some(&'{') => escaped.push_str("\\$"),
-            character => escaped.push(character),
-        }
-    }
-    format!("\"{escaped}\"")
+    MovedBlockAddress::new(id).to_string()
 }
 
 #[cfg(test)]
@@ -627,6 +599,18 @@ mod tests {
         };
         assert_eq!(pair.from().identity_str(), "old_vpc");
         assert_eq!(pair.to().identity_str(), "vpcs[0]");
+        assert_eq!(
+            hints.to_string(),
+            concat!(
+                "Warning: this plan destroys awscc.ec2.Vpc 'old_vpc' and creates ",
+                "awscc.ec2.Vpc 'vpcs[0]', whose configured create-only values match. ",
+                "If they are the same resource, add this block to keep it instead of replacing it:\n\n",
+                "  moved {\n",
+                "    from = awscc.ec2.Vpc 'old_vpc'\n",
+                "    to   = awscc.ec2.Vpc 'vpcs[0]'\n",
+                "  }",
+            )
+        );
     }
 
     #[test]
