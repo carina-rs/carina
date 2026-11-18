@@ -131,6 +131,10 @@ run_kind() {
         provider-boundaries)
             bash scripts/check-provider-boundaries.sh
             bash scripts/check-wit-guest-text-confinement.sh
+            bash scripts/test-check-schema-parts-exhaustive.sh
+            bash scripts/check-schema-parts-exhaustive.sh
+            bash scripts/test-check-protocol-convert-exhaustive.sh
+            bash scripts/check-protocol-convert-exhaustive.sh
             ;;
         error-source-display)
             bash scripts/check-error-source-not-in-display.sh
@@ -161,6 +165,8 @@ run_kind() {
             bash scripts/test-release-tag-channel.sh
             bash scripts/test-classify-ci-diff.sh
             bash scripts/test-rust-cache-key.sh
+            bash scripts/test-pre-commit.sh
+            bash scripts/test-setup-hooks.sh
             bash scripts/test-verify-sh.sh
             bash scripts/test-touched-crates.sh
             ;;
