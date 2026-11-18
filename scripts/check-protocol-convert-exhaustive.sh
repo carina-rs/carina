@@ -20,6 +20,9 @@ if not seam.is_dir():
 # tuple-struct pattern; bind a full range first or use explicit bounds there.
 # Functional updates are recognized in braces following a constructor name;
 # unusually shaped block expressions may also need a named range binding.
+# Enum pattern tests (`if let`, `let ... else`, `matches!`) are not checked
+# for catch-all arms. Slice rest patterns (`[a, ..]`) are not checked because
+# they drop list elements, not record fields.
 identifier = re.compile(r"[A-Za-z_][A-Za-z_0-9]*\Z")
 raw_string = re.compile(r'(?:br|cr|r)(#*)"')
 character = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|[^\n])|[^'\\\n])'")
@@ -138,9 +141,10 @@ def constructor_brace(words, pairs, opening):
         return False
     # A prefix range can also be a block's result: `if condition { ..end }`
     # or `fn range() -> Range { ..end }`. Walk the enclosing header, jumping
-    # over complete argument lists but stopping at an enclosing delimiter.
+    # over complete argument lists but stopping at an enclosing delimiter or
+    # match-arm boundary.
     cursor = opening - 1
-    while cursor >= 0 and words[cursor] not in (";", "{", "}", "(", "["):
+    while cursor >= 0 and words[cursor] not in (";", "=>", ",", "{", "}", "(", "["):
         if words[cursor] in ("fn", "if", "while", "for", "match"):
             return False
         if words[cursor] in (")", "]") and cursor in pairs:
@@ -151,10 +155,10 @@ def constructor_brace(words, pairs, opening):
 
 sources = {}
 test_files = set()
-for path in sorted(seam.glob("*.rs")):
-    if path.name == "error.rs":
+for path in sorted(seam.rglob("*.rs")):
+    if path == seam / "error.rs":
         continue
-    source = path.read_text()
+    source = path.read_text(encoding="utf-8")
     tokens, words, pairs, parents = tokenize(source)
     excluded, files = test_modules(path, words, pairs)
     test_files.update(files)

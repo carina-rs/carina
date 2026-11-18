@@ -1,8 +1,3 @@
-#![allow(
-    clippy::wildcard_enum_match_arm,
-    reason = "error rendering and classification, not conversion: a catch-all here cannot drop a protocol field"
-)]
-
 use crate::provider_text::DiagnosticText;
 use crate::schema::TypeIdentity;
 use std::error::Error;
@@ -234,6 +229,10 @@ impl Error for ProtocolConvertError {
 }
 
 impl crate::resource::InsideSecret for ProtocolConvertError {
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "error classification: unlisted leaf errors inside secrets fail closed as NonWireValue"
+    )]
     fn inside_secret(self) -> Self {
         let leaf = match self.into_leaf_error() {
             error @ (Self::DurationOutOfRange
@@ -249,6 +248,10 @@ impl crate::resource::InsideSecret for ProtocolConvertError {
 
 impl ProtocolConvertError {
     /// Structured container path, in outermost-to-innermost order.
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "error rendering: only path-carrying variants contribute segments"
+    )]
     pub fn value_path(&self) -> Vec<WirePathSegment> {
         match self {
             Self::ValuePath { segment, error } => {
@@ -263,6 +266,10 @@ impl ProtocolConvertError {
 
     /// The typed conversion reason beneath contextual wrappers.
     #[cfg(test)]
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "error inspection: every non-wrapper variant is already a leaf and is returned by reference"
+    )]
     pub fn leaf_error(&self) -> &Self {
         match self {
             Self::ValuePath { error, .. } => error.leaf_error(),
@@ -271,6 +278,10 @@ impl ProtocolConvertError {
         }
     }
 
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "error classification: every non-wrapper variant is already a leaf and is returned unchanged"
+    )]
     pub(crate) fn into_leaf_error(self) -> Self {
         match self {
             Self::ValuePath { error, .. } => error.into_leaf_error(),

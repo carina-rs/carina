@@ -1,4 +1,7 @@
-#![deny(clippy::wildcard_enum_match_arm)]
+#![deny(
+    clippy::wildcard_enum_match_arm,
+    clippy::match_wildcard_for_single_variants
+)]
 
 //! The single typed conversion seam between `carina-core` and the provider
 //! protocol.

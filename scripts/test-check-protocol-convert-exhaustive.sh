@@ -80,6 +80,12 @@ fn convert(base: Foo) {
     if inspect(Foo { a: 1, ..base }) {}
 }
 RS
+reject 'functional update in a guarded match arm' 1 <<'RS'
+fn c(k: K, base: Foo) -> Foo { match k { K::A if g() => Foo { a: 1, ..base }, } }
+RS
+reject 'functional update after a guarded match arm' 1 <<'RS'
+fn c(k: K, base: Foo) -> Foo { match k { K::A if g() => base, K::B => Foo { a: 1, ..base }, } }
+RS
 reject 'test-only helper outside a module' 2 <<'RS'
 #[cfg(test)]
 fn helper(value: Foo) { let Foo { .. } = value; }
@@ -159,5 +165,24 @@ if ! grep -Fxq 'carina-core/src/protocol_convert/conversion.rs:1' "$fixtures/out
     cat "$fixtures/output" >&2
     exit 1
 fi
+rm "$seam/conversion.rs"
+
+# Nested production files, including error.rs, must also be checked.
+mkdir -p "$seam/sub"
+for name in deep error; do
+    cat >"$seam/sub/$name.rs" <<'RS'
+fn convert(value: Foo) { let Foo { .. } = value; }
+RS
+    if bash "$checker" "$fixtures" >"$fixtures/output" 2>&1; then
+        echo "checker unexpectedly skipped a nested production file: sub/$name.rs" >&2
+        exit 1
+    fi
+    if [[ $(cat "$fixtures/output") != "carina-core/src/protocol_convert/sub/$name.rs:1"$'\n'"$message" ]]; then
+        echo "checker reported the wrong location or message for sub/$name.rs" >&2
+        cat "$fixtures/output" >&2
+        exit 1
+    fi
+    rm "$seam/sub/$name.rs"
+done
 
 echo 'OK: protocol-convert exhaustiveness checker fixtures passed.'
