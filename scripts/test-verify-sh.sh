@@ -202,7 +202,7 @@ cp "$verify" "$fixture/scripts/verify.sh"
 cp "$repo_root/scripts/wasm-fixture-crates.txt" "$fixture/scripts/wasm-fixture-crates.txt"
 # Observe the default dispatch with substitutes: no Rust tools or invariant
 # scripts execute. A case arm left out of the default kinds must fail too.
-for script in "$repo_root"/scripts/*.sh "$repo_root/scripts/test-pre-commit"; do
+for script in "$repo_root"/scripts/*.sh; do
     name=${script##*/}
     [[ "$name" != verify.sh ]] || continue
     cat > "$fixture/scripts/$name" <<'SH'
@@ -223,7 +223,7 @@ if ! PATH="$fixture/bin:$PATH" VERIFY_GUARD_TRACE="$fixture/trace" \
     exit 1
 fi
 missing=0
-for script in "$repo_root"/scripts/check-*.sh "$repo_root"/scripts/test-*.sh "$repo_root/scripts/test-pre-commit"; do
+for script in "$repo_root"/scripts/check-*.sh "$repo_root"/scripts/test-*.sh; do
     [[ -e "$script" ]] || continue
     name=${script##*/}
     if ! grep -Fxq "$name" "$fixture/trace"; then
