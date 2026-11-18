@@ -652,6 +652,10 @@ mod tests {
     }
 
     impl EnvironmentGuard {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the AWS SDK and rustls read AWS_*, HOME and SSL_CERT_FILE from the process environment themselves and take no injected environment; nextest runs this test in its own process on a current_thread runtime"
+        )]
         fn isolated(home: &Path, profile: Option<&str>) -> Self {
             const NAMES: &[&str] = &[
                 "HOME",
@@ -729,6 +733,10 @@ mod tests {
     }
 
     impl Drop for EnvironmentGuard {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the AWS SDK and rustls read AWS_*, HOME and SSL_CERT_FILE from the process environment themselves and take no injected environment; nextest runs this test in its own process on a current_thread runtime"
+        )]
         fn drop(&mut self) {
             while let Some((name, previous)) = self.previous.pop() {
                 match previous {
@@ -755,6 +763,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the AWS SDK and rustls read AWS_*, HOME and SSL_CERT_FILE from the process environment themselves and take no injected environment; nextest runs this test in its own process on a current_thread runtime"
+    )]
     async fn empty_ca_bundle_returns_typed_provider_failure() {
         let home = tempfile::tempdir().unwrap();
         write_aws_files(home.path(), "");
