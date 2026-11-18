@@ -556,7 +556,9 @@ type each bullet names; read that type's rustdoc for the details.
   `ObservationStateAuthority` and `ProtectedObservations` hold the projection
   and authority rules (private constructors, value_observed_secret_tests).
   Any crate may decode a state document into an authority; this does not
-  authenticate its bytes or backend origin.
+  authenticate its bytes or backend origin. Maps match keys one to one:
+  missing keys, including write-only secrets, and extra observed keys never
+  widen protection, and unmatched observed keys stay ordinary.
   Dispatch rules consume the separate `RuleUpdatePatch` with the existing lenient
   kind and positional annotation. Diagnostics and `RedactionSet` consume
   `DiagnosticUpdatePatch` with output protection: enroll every string classified
@@ -614,13 +616,16 @@ type each bullet names; read that type's rustdoc for the details.
   It includes custom validators and merged tag keys, values and entry counts,
   while authored-shape cross-attribute validators retain their authored scope.
   Authored tag overrides win; overridden defaults do not participate in membership.
-  `PlanPreviewProviderConfigs` (plain plan display only) and
-  `ReadOnlyProviderConfigs` (destroy, state refresh, bucket deletion) cannot be
-  saved, dispatched or projected into desired inputs (compile_fail doctests in
-  `parser/resolve.rs`). Default tags for desired inputs must be known when
+  `PlanPreviewProviderConfigs` (plain plan display only) cannot be saved or
+  dispatched (compile_fail doctests in `parser/resolve.rs`).
+  `ReadOnlyProviderConfigs` (destroy, state refresh, bucket deletion) has no
+  default tags or projection into desired inputs (compile_fail doctests in the
+  same file); it is the dispatch input for read/delete. Default tags for desired inputs must be known when
   provider configurations resolve; validate and LSP reject local apply-time
   references. Plain plan display may omit individual default values authored
   as map entries that refer only to missing upstream state, with a warning;
+  whole-map expressions such as `default_tags = mgmt.tags` must still resolve
+  to a map during configuration finalization;
   `plan --out` and `plan --json` require strict configurations and reject
   those missing defaults. Read-only validation retains authored defaults
   without demanding them; only the typed read/delete provider path excludes
