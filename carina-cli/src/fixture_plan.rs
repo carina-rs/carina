@@ -1692,17 +1692,10 @@ mod tests {
                 let fixture = build_plan_from_fixture_path(&runtime, directory.path()).unwrap();
                 assert_eq!(fixture.desired_resources.len(), 1);
             } else {
-                let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    build_plan_from_fixture_path(&runtime, directory.path())
-                }));
-                let panic = rejected
+                let error = build_plan_from_fixture_path(&runtime, directory.path())
                     .err()
                     .expect("skipping resource admission cannot skip a Judge error");
-                let message = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap();
+                let message = crate::error::format_error_with_source_chain(&error);
                 assert!(
                     message.contains("conversion target must be a loaded named scalar type"),
                     "{message}"
