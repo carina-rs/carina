@@ -600,15 +600,13 @@ impl CompletionProvider {
         let current_segment = cursor_line_segment(text, position);
         match &block_context {
             EnclosingBlock::Arguments => {
-                return if current_segment
+                if current_segment
                     .trim()
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
                 {
-                    CompletionContext::InsideArgumentsBlock
-                } else {
-                    CompletionContext::None
-                };
+                    return CompletionContext::InsideArgumentsBlock;
+                }
             }
             EnclosingBlock::Resource {
                 selector,
