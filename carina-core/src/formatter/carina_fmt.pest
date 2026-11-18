@@ -22,7 +22,8 @@ block_comment = @{ "/*" ~ (block_comment | (!"*/" ~ ANY))* ~ "*/" }
 statement = { backend_block | provider_block | arguments_block | attributes_block | exports_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource | require_statement }
 
 // Require statement: require <validate_expr>, "error message"
-require_head = _{ kw_require ~ trivia* ~ validate_expr }
+require_head = _{ kw_require ~ trivia* ~ require_condition }
+require_condition = { validate_or_expr }
 require_statement = { require_head ~ trivia* ~ comma ~ trivia* ~ string }
 
 // Backend block: backend s3 { ... }

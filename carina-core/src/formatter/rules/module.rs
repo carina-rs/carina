@@ -38,7 +38,7 @@ impl Formatter {
         self.write_indent();
         self.write("require ");
 
-        // Write children: validate_expr, comma, string
+        // require_condition uses a ValidateExpr CST node, followed by comma and string.
         let mut wrote_expr = false;
         for child in &node.children {
             match child {
