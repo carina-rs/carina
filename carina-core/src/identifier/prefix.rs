@@ -3,8 +3,9 @@ mod read;
 use super::RejectedPrefixValues;
 use super::{
     AttributePrefixRejection, AttributePrefixRejectionReason, DeferredPrefixDependencies,
-    DeferredPrefixFinding, PrefixDependency, PrefixDependencyKey, PrefixDependencyPath,
-    PrefixFindings, ResourcePrefixSource, generate_random_suffix, prefix_companion_attribute,
+    DeferredPrefixFinding, PrefixDependency, PrefixDependencyKey, PrefixDependencyKind,
+    PrefixDependencyPath, PrefixFindings, ResourcePrefixSource, generate_random_suffix,
+    prefix_companion_attribute,
 };
 use crate::parser::retained::JudgedFile;
 use crate::parser::{
@@ -18,6 +19,7 @@ use crate::resource::{
 };
 use crate::schema::{OwnerBoundResourceSchema, SchemaKind, SchemaRegistry};
 use crate::validation::admission::{DeclarationIdentity, attributes::declaration_identity};
+use crate::validation::inference::{InferenceBinding, InferenceBindings, bindings_from_parsed};
 use indexmap::IndexMap;
 pub use read::{ModuleResolvedFileRead, PrefixFileRead};
 use std::ops::Deref;
@@ -332,12 +334,13 @@ fn canonicalize_in_place<
         judgements.awaiting.0.extend(findings.awaiting.0);
         visits.push(OwnerVisit { owner, state });
     };
+    let bindings = bindings_from_parsed(file);
     let expressions = file.parser_binding_metadata.syntax().expressions();
     let variables = &file.variables;
     for (index, resource) in file.resources.iter_mut().enumerate() {
         record(
             OwnerAddress::Resource(index),
-            resolve_resource(resource, schemas, suffix, expressions, variables),
+            resolve_resource(resource, schemas, suffix, expressions, variables, &bindings),
         );
     }
     // Reads never generate names. Deferred-for templates retain their existing
@@ -356,7 +359,9 @@ fn canonicalize_in_place<
                     slots: Some(&resource.authored_slots),
                     expressions,
                     variables,
+                    bindings: &bindings,
                     loop_binding: Some(D::deferred_binding(deferred)),
+                    loop_iterable: Some(D::deferred_iterable(deferred)),
                     legacy_argument_loop: argument_iterable(
                         D::deferred_iterable(deferred),
                         expressions,
@@ -386,7 +391,7 @@ fn canonicalize_in_place<
         for (branch, body) in deferred.branches_mut().enumerate() {
             let findings = match body {
                 crate::parser::DeferredIfBody::Resource(resource) => {
-                    resolve_resource(resource, schemas, suffix, expressions, variables)
+                    resolve_resource(resource, schemas, suffix, expressions, variables, &bindings)
                 }
                 crate::parser::DeferredIfBody::DataSource(_) => PrefixJudgements::default(),
                 crate::parser::DeferredIfBody::ModuleCall(_) => continue,
@@ -776,8 +781,10 @@ where
                 slots: self.resource.authored_slots(),
                 expressions: self.file.parser_binding_metadata.syntax().expressions(),
                 variables: &self.file.variables,
+                bindings: &bindings_from_parsed(self.file),
                 module_source: self.resource.module_source(),
                 loop_binding: self.resource.loop_binding(),
+                loop_iterable: self.resource.loop_iterable(),
                 legacy_argument_loop: self.resource.loop_iterable().is_some_and(|iterable| {
                     argument_iterable(
                         iterable,
@@ -1021,6 +1028,7 @@ fn resolve_resource<P: PlaceholderKind, B: BindingAddress>(
     suffix: SuffixSource,
     expressions: &crate::parser::retained::Expressions<B>,
     variables: &IndexMap<String, Value<P, B>>,
+    bindings: &InferenceBindings,
 ) -> PrefixJudgements {
     let Some(schema) = schemas.get_for(resource) else {
         return PrefixJudgements::default();
@@ -1034,8 +1042,10 @@ fn resolve_resource<P: PlaceholderKind, B: BindingAddress>(
             slots: Some(&resource.authored_slots),
             expressions,
             variables,
+            bindings,
             module_source: resource.module_source.as_ref(),
             loop_binding: None,
+            loop_iterable: None,
             legacy_argument_loop: false,
         },
         suffix,
@@ -1099,8 +1109,10 @@ pub(crate) fn canonicalize_fixture_prefix_values<P: PlaceholderKind, B: BindingA
             slots: None,
             expressions: &Default::default(),
             variables: &IndexMap::new(),
+            bindings: &InferenceBindings::new(),
             module_source: None,
             loop_binding: None,
+            loop_iterable: None,
             legacy_argument_loop: false,
         },
         values,
@@ -1135,8 +1147,10 @@ struct PrefixSource<'a, P: PlaceholderKind, B: BindingAddress> {
     slots: Option<&'a crate::parser::retained::AuthoredSlots<B>>,
     expressions: &'a crate::parser::retained::Expressions<B>,
     variables: &'a IndexMap<String, Value<P, B>>,
+    bindings: &'a InferenceBindings,
     module_source: Option<&'a ModuleSource>,
     loop_binding: Option<&'a crate::parser::ForBinding>,
+    loop_iterable: Option<&'a Value<P, B>>,
     legacy_argument_loop: bool,
 }
 
@@ -1390,11 +1404,54 @@ fn protected_scope(a: DiagnosticScope, b: DiagnosticScope) -> DiagnosticScope {
 }
 
 impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
+    /// This is the sole reference-kind classifier. Opaque binding identity,
+    /// including under secret wrappers, selects retained binding metadata.
+    fn dependency_kind(&self, identity: &DependencyIdentity<B>) -> PrefixDependencyKind {
+        let binding = match identity {
+            DependencyIdentity::Resource(path) => {
+                path.clone().map_key(|path| path.binding_address().clone())
+            }
+            DependencyIdentity::Binding(binding) => binding.clone(),
+            DependencyIdentity::Loop(_) => {
+                let mut source = None;
+                if let Some(iterable) = self.source.loop_iterable {
+                    iterable.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                        source.get_or_insert_with(|| {
+                            DependencyIdentity::Resource(reference.identity().path_key())
+                        });
+                    });
+                    if source.is_none() {
+                        iterable.visit_binding_refs_for_diagnostics(&mut |reference| {
+                            source.get_or_insert_with(|| {
+                                DependencyIdentity::Binding(reference.identity())
+                            });
+                        });
+                    }
+                }
+                return source
+                    .as_ref()
+                    .map(|source| self.dependency_kind(source))
+                    .unwrap_or(PrefixDependencyKind::PendingBinding);
+            }
+        };
+        match binding.lookup_by_name(self.source.bindings) {
+            Some(InferenceBinding::Resource { .. }) => PrefixDependencyKind::ProviderAttribute,
+            Some(InferenceBinding::ModuleCall | InferenceBinding::Virtual { .. }) => {
+                PrefixDependencyKind::ModuleOutput
+            }
+            Some(InferenceBinding::UpstreamState) => PrefixDependencyKind::UpstreamExport,
+            Some(InferenceBinding::Argument { .. } | InferenceBinding::UserFunction) | None => {
+                PrefixDependencyKind::PendingBinding
+            }
+        }
+    }
+
     fn push(
         &mut self,
         identity: DependencyIdentity<B>,
         through: Option<&B>,
-        dependency: PrefixDependency,
+        path: String,
+        alias: Option<String>,
         owner: Option<&crate::parser::ModuleCallId>,
     ) {
         let through = through.map(|binding| DependencyKey::new(binding.clone()));
@@ -1403,10 +1460,15 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
                 && existing.through == through
                 && existing.owner.as_ref() == owner
         }) {
+            let kind = self.dependency_kind(&identity);
             self.named.push(NamedPrefixDependency {
                 identity,
                 through,
-                dependency,
+                dependency: PrefixDependency {
+                    path,
+                    through: alias,
+                    kind,
+                },
                 owner: owner.cloned(),
             });
         }
@@ -1448,10 +1510,8 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
         self.push(
             DependencyIdentity::Resource(DependencyKey::new(identity.clone())),
             through,
-            PrefixDependency::Reference {
-                path,
-                through: alias,
-            },
+            path,
+            alias,
             owner,
         );
     }
@@ -1478,15 +1538,7 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
             ))
             .to_dot_string();
         let alias = self.alias(through, scope);
-        self.push(
-            DependencyIdentity::Loop(slot),
-            through,
-            PrefixDependency::Reference {
-                path: name,
-                through: alias,
-            },
-            owner,
-        );
+        self.push(DependencyIdentity::Loop(slot), through, name, alias, owner);
     }
 
     fn uses(
@@ -1578,10 +1630,8 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
                 self.push(
                     DependencyIdentity::Binding(DependencyKey::new(binding.clone())),
                     through,
-                    PrefixDependency::Reference {
-                        path,
-                        through: None,
-                    },
+                    path,
+                    None,
                     owner,
                 );
             }
@@ -1617,10 +1667,8 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
             self.push(
                 DependencyIdentity::Resource(key),
                 through,
-                PrefixDependency::Reference {
-                    path,
-                    through: alias,
-                },
+                path,
+                alias,
                 owner,
             );
         });
@@ -1730,10 +1778,8 @@ fn deferred_prefix_dependencies<P: PlaceholderKind, V: PlaceholderKind, B: Bindi
             dependencies.push(
                 key,
                 None,
-                PrefixDependency::Reference {
-                    path: reference.diagnostic_path().to_dot_string(),
-                    through: None,
-                },
+                reference.diagnostic_path().to_dot_string(),
+                None,
                 None,
             );
         }
@@ -2022,8 +2068,10 @@ mod tests {
                 slots: None,
                 expressions: file.parser_binding_metadata.syntax().expressions(),
                 variables: &file.variables,
+                bindings: &bindings_from_parsed(&file),
                 module_source: None,
                 loop_binding: None,
+                loop_iterable: None,
                 legacy_argument_loop: false,
             },
             IndexMap::from([(

@@ -1,5 +1,5 @@
 {
-  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is known only after apply\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.second', which is known only after apply\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\n",
+  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.second', which is not resolved when names are generated\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\n",
   "text_exit": 1,
   "json": {
     "errors": [
@@ -18,7 +18,7 @@
             }
           }
         },
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is known only after apply",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated",
         "severity": "error"
       },
       {
@@ -36,7 +36,7 @@
             }
           }
         },
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.second', which is known only after apply",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.second', which is not resolved when names are generated",
         "severity": "error"
       },
       {
@@ -88,7 +88,7 @@
     "lets.crn": [],
     "main.crn": [
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is known only after apply",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.first', which is not resolved when names are generated",
         "range": {
           "end": {
             "character": 44,
@@ -102,7 +102,7 @@
         "severity": 1
       },
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.second', which is known only after apply",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.second', which is not resolved when names are generated",
         "range": {
           "end": {
             "character": 45,

@@ -979,3 +979,233 @@ async fn r3_module_argument_concat_unknown_matches_main() {
     .unwrap();
     assert_eq!(r3_fixture("concat_unknown").observation().await, expected);
 }
+
+fn w_fixture(case: &str) -> Fixture {
+    if case == "caller_module" {
+        return Fixture::new(
+            "let sink = child { prefix = net.first }\n",
+            "let origin = use { source = './origin' }\nlet net = origin {}\nlet child = use { source = './child' }\n",
+            true,
+        ).with_file("origin/main.crn", "attributes { first: String = 'first' }\n");
+    }
+    let (expression, lets) = match case {
+        "provider" => ("src.identifier", SOURCE.to_owned()),
+        "module" | "module_pair" | "loop_module" => (
+            if case == "module_pair" {
+                "\"${net.first}-${net.second}\""
+            } else {
+                "net.first"
+            },
+            "let child = use { source = './child' }\nlet net = child {}\n".into(),
+        ),
+        "module_alias" => (
+            "p",
+            "let child = use { source = './child' }\nlet net = child {}\nlet p = net.first\n"
+                .into(),
+        ),
+        "module_secret" => (
+            "secret(net.first)",
+            "let child = use { source = './child' }\nlet net = child {}\n".into(),
+        ),
+        "upstream" | "loop_upstream" => (
+            "net.first",
+            "let net = upstream_state { source = './upstream' }\n".into(),
+        ),
+        "mixed" => (
+            "\"${src.identifier}-${net.first}\"",
+            format!("{SOURCE}let child = use {{ source = './child' }}\nlet net = child {{}}\n"),
+        ),
+        _ => panic!("unknown wording fixture: {case}"),
+    };
+    let main = if case.starts_with("loop_") {
+        "let children = for x in net.names {\n  mock.test.resource {\n    name_prefix = x\n  }\n}\n"
+            .into()
+    } else {
+        format!("mock.test.resource {{\n  name_prefix = {expression}\n}}\n")
+    };
+    let mut fixture = Fixture::new(&main, &lets, false);
+    if matches!(
+        case,
+        "module" | "module_pair" | "module_alias" | "module_secret" | "mixed" | "loop_module"
+    ) {
+        fixture = fixture.with_file("child/main.crn", "attributes { first: String = 'first' second: String = 'second' names: list(String) = ['app'] }\n");
+    }
+    if matches!(case, "upstream" | "loop_upstream") {
+        fixture = fixture
+            .with_file(
+                "upstream/backend.crn",
+                "backend local { path = 'carina.state.json' }\n",
+            )
+            .with_file(
+                "upstream/exports.crn",
+                "exports { first: String = 'first' names: list(String) = ['app'] }\n",
+            );
+        let mut state = serde_json::to_value(carina_state::StateFile::new()).unwrap();
+        state["exports"] = json!({"first": "first", "names": ["app"]});
+        std::fs::write(
+            fixture.root().join("upstream/carina.state.json"),
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+    }
+    if case.starts_with("loop_") {
+        fixture.subject = "mock.test.resource.children[?]".into();
+    }
+    fixture
+}
+
+async fn w_assert(case: &str, dependencies: &str) {
+    let fixture = w_fixture(case);
+    let main = std::fs::read_to_string(fixture.root().join("main.crn")).unwrap();
+    let (line, assignment) = main
+        .lines()
+        .enumerate()
+        .find(|(_, line)| {
+            line.contains(if case == "caller_module" {
+                "child {"
+            } else {
+                "name_prefix ="
+            })
+        })
+        .unwrap();
+    let range = Range::new(
+        Position::new(
+            line as u32,
+            assignment
+                .find(if case == "caller_module" {
+                    "child {"
+                } else {
+                    "name_prefix"
+                })
+                .unwrap() as u32,
+        ),
+        Position::new(line as u32, assignment.len() as u32),
+    );
+    let subject = if case == "caller_module" {
+        format!(
+            "./main.crn:{}:{}",
+            range.start.line + 1,
+            range.start.character + 1
+        )
+    } else {
+        fixture.subject.clone()
+    };
+    let message = format!(
+        "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependencies}"
+    );
+    let mut inventory = serde_json::Map::new();
+    for file in &fixture.files {
+        inventory.insert(
+            file.clone(),
+            if file == "main.crn" {
+                json!([{"message":message,"range":range,"severity":1}])
+            } else {
+                json!([])
+            },
+        );
+    }
+    let expected = json!({
+        "text": format!("Validating...\nError: {subject}: {message}\n"),
+        "text_exit":1,"json_exit":1,"json_stderr":"",
+        "json":{"status":"error","resource_count":0,"resources":[],"errors":[{
+            "message":message,"severity":"error","code":null,
+            "location":{"file":"main.crn","range":{
+                "start":{"line":range.start.line+1,"column":range.start.character+1},
+                "end":{"line":range.end.line+1,"column":range.end.character+1}
+            }}
+        }]},
+        "lsp":inventory
+    });
+    println!("C4461_W_CASE={case}");
+    assert_eq!(
+        fixture.observation().await,
+        expected,
+        "exact validate text, JSON, and every file's LSP inventory: {case}"
+    );
+}
+
+#[tokio::test]
+async fn w_provider_attribute_keeps_apply_clause() {
+    w_assert(
+        "provider",
+        "'src.identifier', which is known only after apply",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_module_output_uses_name_generation_clause() {
+    w_assert(
+        "module",
+        "'net.first', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_upstream_export_uses_name_generation_clause() {
+    w_assert(
+        "upstream",
+        "'net.first', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_mixed_kinds_keep_each_clause() {
+    w_assert("mixed", "'src.identifier', which is known only after apply, and 'net.first', which is not resolved when names are generated").await;
+}
+
+#[tokio::test]
+async fn w_module_alias_keeps_kind_and_authored_name() {
+    w_assert(
+        "module_alias",
+        "'net.first' (through 'p'), which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_same_kind_uses_one_clause() {
+    w_assert(
+        "module_pair",
+        "'net.first' and 'net.second', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_loop_over_module_output_inherits_kind() {
+    w_assert(
+        "loop_module",
+        "'x', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_loop_over_upstream_export_inherits_kind() {
+    w_assert(
+        "loop_upstream",
+        "'x', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_module_argument_keeps_caller_kind_and_owner() {
+    w_assert(
+        "caller_module",
+        "'net.first', which is not resolved when names are generated",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn w_secret_module_output_keeps_kind_without_rendered_identity() {
+    w_assert(
+        "module_secret",
+        "'(secret)', which is not resolved when names are generated",
+    )
+    .await;
+}

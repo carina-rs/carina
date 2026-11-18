@@ -633,7 +633,7 @@ async fn prefix_companion_module_outputs_on_unnamed_roots_keep_deferred_companio
         .map(|error| error["message"].as_str().unwrap())
         .collect::<Vec<_>>();
     let expected = ["first", "second"].map(|attribute| format!(
-        "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.{attribute}', which is known only after apply"
+        "'name_prefix' must be known at plan time to generate 'name', but it depends on 'net.{attribute}', which is not resolved when names are generated"
     ));
     let expected = vec![
         expected[0].as_str(),

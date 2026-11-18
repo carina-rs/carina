@@ -1612,25 +1612,29 @@ enum PrefixDependencyPath {
     Loop(crate::resource::LoopSlot),
 }
 
+/// Recognition retains the reference kind even when its name is redacted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixDependencyKind {
+    ProviderAttribute,
+    ModuleOutput,
+    UpstreamExport,
+    PendingBinding,
+}
+
 #[derive(Debug, Clone, PartialEq)]
-enum PrefixDependency {
-    Reference {
-        path: String,
-        through: Option<String>,
-    },
+struct PrefixDependency {
+    path: String,
+    through: Option<String>,
+    kind: PrefixDependencyKind,
 }
 
 impl std::fmt::Display for PrefixDependency {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Reference { path, through } => {
-                write!(formatter, "'{path}'")?;
-                if let Some(alias) = through {
-                    write!(formatter, " (through '{alias}')")?;
-                }
-                Ok(())
-            }
+        write!(formatter, "'{}'", self.path)?;
+        if let Some(alias) = &self.through {
+            write!(formatter, " (through '{alias}')")?;
         }
+        Ok(())
     }
 }
 
@@ -1699,14 +1703,40 @@ impl DeferredPrefixFinding {
         deferred_prefix_message(&self.prefix, &self.base, &self.dependencies)
     }
 }
-/// Keep the approved reason clause in one place while its wording is pending.
+/// Render every reason here; recognition supplies kinds, never rendered names.
 fn deferred_prefix_message(
     prefix: &str,
     base: &str,
     dependencies: &DeferredPrefixDependencies,
 ) -> String {
+    // Keep this match exhaustive: a new reference kind needs a wording decision.
+    let clause = |kind| match kind {
+        PrefixDependencyKind::ProviderAttribute | PrefixDependencyKind::PendingBinding => {
+            "which is known only after apply"
+        }
+        PrefixDependencyKind::ModuleOutput | PrefixDependencyKind::UpstreamExport => {
+            "which is not resolved when names are generated"
+        }
+    };
+    let dependencies = if dependencies
+        .rest
+        .iter()
+        .all(|dependency| dependency.kind == dependencies.first.kind)
+    {
+        let reason = clause(dependencies.first.kind);
+        format!("{dependencies}, {reason}")
+    } else {
+        std::iter::once(&dependencies.first)
+            .chain(&dependencies.rest)
+            .map(|dependency| {
+                let reason = clause(dependency.kind);
+                format!("{dependency}, {reason}")
+            })
+            .collect::<Vec<_>>()
+            .join(", and ")
+    };
     format!(
-        "'{prefix}' must be known at plan time to generate '{base}', but it depends on {dependencies}, which is known only after apply"
+        "'{prefix}' must be known at plan time to generate '{base}', but it depends on {dependencies}"
     )
 }
 impl std::fmt::Display for DeferredPrefixFinding {
