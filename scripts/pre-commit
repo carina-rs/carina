@@ -5,18 +5,80 @@
 # Environment variables:
 #   SKIP_CLIPPY=1  - Skip clippy check (useful for WIP commits)
 
-# Block direct commits to main/master
-current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
-if [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
-    echo "ERROR: Direct commits to '$current_branch' are not allowed."
-    echo "Create a feature branch first: git worktree add .worktrees/<branch-name> -b <branch-name> main"
-    exit 1
-fi
-
 changed_crates=()
 fmt_scope=()
 clippy_scope=()
 check_mode=""
+
+hook_static_checks=(
+    check-error-source-not-in-display
+    check-no-direct-resources-access
+    check-cli-hints-use-project-command
+    check-no-home-env-reads
+    check-plan-fixtures
+    check-provider-boundaries
+    check-wit-guest-text-confinement
+    check-docs-use-new-spellings
+    check-rust-cache-via-local-action
+)
+
+excluded_static_checks=(
+    # Imports tomllib (Python 3.11+); macOS /usr/bin/python3 is 3.9,
+    # so commits fail with a traceback unless a newer python3 is first on PATH.
+    check-pinned-toolchain
+    check-no-wall-clock-test-assertions # Full Rust source scan takes 37s, too slow for a hook.
+    check-provider-sdk-bindings # Uses cargo metadata to resolve provider dependencies.
+    check-test-utils-dev-only # Uses cargo tree to resolve workspace dependency features.
+    check-crates-not-publishable # Uses cargo metadata to read effective publish settings.
+    check-wit-bindgen-workspace # Uses cargo metadata to resolve workspace bindings.
+    check-vendored-patches-used # Resolves dependencies with cargo metadata --locked.
+    check-example-warnings # Builds the CLI with cargo build.
+    check-provider-cause-test-api # Compiles downstream fixtures with cargo check.
+)
+
+run_static_checks() (
+    local scripts_dir="${1:-scripts}"
+    local log_dir
+    local script
+    local start
+    local elapsed
+    local check_exit
+    local failed=0
+    local i
+    local pids=()
+
+    log_dir=$(mktemp -d) || return 1
+    trap 'rm -rf "$log_dir"' EXIT
+
+    for script in "${hook_static_checks[@]}"; do
+        (
+            start=$(date +%s)
+            check_exit=0
+            bash "$scripts_dir/$script.sh" >"$log_dir/$script.log" 2>&1 || check_exit=$?
+            echo "$(( $(date +%s) - start ))" >"$log_dir/$script.elapsed"
+            exit "$check_exit"
+        ) &
+        pids+=("$!")
+    done
+
+    for ((i = 0; i < ${#hook_static_checks[@]}; i++)); do
+        script="${hook_static_checks[$i]}"
+        check_exit=0
+        wait "${pids[$i]}" || check_exit=$?
+        elapsed=$(cat "$log_dir/$script.elapsed")
+        if [ "$check_exit" -ne 0 ]; then
+            echo "$script FAILED (${elapsed}s):"
+            cat "$log_dir/$script.log"
+            echo
+            echo "this static check also runs in CI; fix it now instead of spending a CI round"
+            failed=1
+        else
+            echo "$script passed (${elapsed}s)"
+        fi
+    done
+
+    return "$failed"
+)
 
 path_requires_workspace_rust_checks() {
     case "$1" in
@@ -82,7 +144,11 @@ set_check_scopes() {
 }
 
 main() {
+    local current_branch
     local staged_files
+    local static_exit
+    local static_log
+    local static_pid
     local fmt_log
     local clippy_log
     local fmt_start
@@ -98,18 +164,30 @@ main() {
 
     set -e
 
+    # Block direct commits to main/master only when running the hook, so tests
+    # can source its functions on main or a detached CI checkout.
+    current_branch=$(git symbolic-ref --short HEAD 2>/dev/null) || current_branch=""
+    if [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
+        echo "ERROR: Direct commits to '$current_branch' are not allowed."
+        echo "Create a feature branch first: git worktree add .worktrees/<branch-name> -b <branch-name> main"
+        exit 1
+    fi
+
     echo "Running pre-commit checks..."
 
-    staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
-    if [ -z "$staged_files" ]; then
+    staged_files=$(git diff --cached --name-only)
+    # Commits that only delete files still need static checks.
+    if [ -z "$staged_files" ] && git diff --cached --quiet; then
         echo "No staged files, skipping checks."
         exit 0
     fi
 
+    static_exit=0
     set_check_scopes "$staged_files"
     if [ "$check_mode" = "skip" ]; then
-        echo "No Rust-affecting changes detected, skipping checks."
-        exit 0
+        echo "No Rust-affecting changes detected, skipping Rust checks."
+        run_static_checks || static_exit=$?
+        exit "$static_exit"
     fi
 
     # sccache (configured via .cargo/config.toml) is incompatible with cargo's
@@ -117,12 +195,16 @@ main() {
     # compilation for pre-commit checks. We unconditionally clear RUSTC_WRAPPER
     # because cargo resolves .cargo/config.toml from parent directories, so
     # sccache may be active even when no config exists in the current worktree.
-    clippy_env=(env RUSTC_WRAPPER="")
     export CARGO_INCREMENTAL=1
 
+    static_log=$(mktemp)
     fmt_log=$(mktemp)
     clippy_log=$(mktemp)
-    trap 'rm -f "$fmt_log" "$clippy_log"' EXIT
+    # Capture paths while main's local variables are still in scope.
+    trap "$(printf 'rm -f %q %q %q' "$static_log" "$fmt_log" "$clippy_log")" EXIT
+
+    run_static_checks >"$static_log" 2>&1 &
+    static_pid=$!
 
     fmt_start=$(date +%s)
     cargo fmt "${fmt_scope[@]}" -- --check >"$fmt_log" 2>&1 &
@@ -133,7 +215,7 @@ main() {
         clippy_pid=""
     else
         clippy_start=$(date +%s)
-        "${clippy_env[@]}" cargo clippy "${clippy_scope[@]}" --no-deps -- -D warnings >"$clippy_log" 2>&1 &
+        RUSTC_WRAPPER="" cargo clippy "${clippy_scope[@]}" --no-deps -- -D warnings >"$clippy_log" 2>&1 &
         clippy_pid=$!
     fi
 
@@ -148,6 +230,9 @@ main() {
         clippy_end=$(date +%s)
         clippy_elapsed=$((clippy_end - clippy_start))
     fi
+
+    wait "$static_pid" || static_exit=$?
+    cat "$static_log"
 
     if [ $fmt_exit -ne 0 ]; then
         echo "Formatting check FAILED (${fmt_elapsed}s):"
@@ -167,7 +252,7 @@ main() {
         fi
     fi
 
-    if [ $fmt_exit -ne 0 ] || [ $clippy_exit -ne 0 ]; then
+    if [ $static_exit -ne 0 ] || [ $fmt_exit -ne 0 ] || [ $clippy_exit -ne 0 ]; then
         exit 1
     fi
 
