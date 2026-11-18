@@ -11431,8 +11431,7 @@ fn build_schema_only_factories_from_providers(
             ProviderSource::File(_) => carina_provider_resolver::find_file_provider_source(
                 base_dir,
                 &config.loading_projection(),
-            )
-            .map_err(carina_provider_resolver::FindInstalledProviderError::from),
+            ),
             ProviderSource::Remote(_) => {
                 carina_provider_resolver::find_installed_provider(base_dir, config)
             }

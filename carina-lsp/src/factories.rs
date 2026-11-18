@@ -230,6 +230,23 @@ pub fn trusted_local_grants_from_env(
 
 #[cfg(test)]
 mod tests {
+    fn test_registry_source(value: &str) -> carina_core::provider_source::RegistrySource {
+        use carina_core::provider_source::{ProviderSource, RemoteSource};
+        let ProviderSource::Remote(RemoteSource::Registry(source)) = value.parse().unwrap() else {
+            panic!("expected registry source: {value}");
+        };
+        source
+    }
+
+    fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource {
+        use carina_core::provider_source::{ProviderSource, RemoteSource};
+        let ProviderSource::Remote(RemoteSource::GithubDirect(source)) = value.parse().unwrap()
+        else {
+            panic!("expected github source: {value}");
+        };
+        source
+    }
+
     use super::*;
     use carina_core::parser::ProviderConfig;
 
@@ -409,8 +426,8 @@ mod tests {
         let mut lock = carina_provider_resolver::LockFile::default();
         lock.upsert(carina_provider_resolver::LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: carina_provider_resolver::LockEntryKind::Version {
+                source: test_registry_source(source),
                 version: version.into(),
                 constraint: None,
             },
@@ -454,8 +471,8 @@ mod tests {
         let mut lock = carina_provider_resolver::LockFile::default();
         lock.upsert(carina_provider_resolver::LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+                source: test_github_source(source),
                 version: version.parse().unwrap(),
                 tag: serde_json::from_str(&format!("\"v{version}\"")).unwrap(),
                 asset_id: serde_json::from_str("42").unwrap(),
@@ -512,8 +529,8 @@ mod tests {
         let mut lock = carina_provider_resolver::LockFile::default();
         lock.upsert(carina_provider_resolver::LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+                source: test_github_source(source),
                 version: version.parse().unwrap(),
                 tag: serde_json::from_str("\"v0.5.0\"").unwrap(),
                 asset_id: serde_json::from_str("42").unwrap(),

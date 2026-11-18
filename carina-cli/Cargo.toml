@@ -75,6 +75,7 @@ tokio = { version = "1", features = ["test-util"] }
 portable-pty = "0.8"
 regex-lite = "0.1"
 tempfile = "3"
+toml = "0.8"
 tower-lsp = "0.20"
 wat = "1"
 # In-process AWS service emulator: the KMS decryptor's integration test

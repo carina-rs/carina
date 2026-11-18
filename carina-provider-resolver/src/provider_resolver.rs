@@ -64,100 +64,151 @@ pub fn provider_lock_path(project_dir: &Path) -> PathBuf {
     project_dir.join(PROVIDER_LOCK_FILE_NAME)
 }
 
-/// Distinguishes the shapes a lock entry can take. Encoded as a tagged
-/// enum so that invalid field combinations (e.g. `version = ""` *and*
-/// `revision = "main"`, the root cause of #2028) can't be constructed at
-/// all — no runtime validator, no empty-string filler.
-///
-/// Serialized with an explicit `mode` discriminator so the on-disk shape is
-/// unambiguous:
-///
-/// ```toml
-/// [[provider]]
-/// name = "aws"; source = "..."; sha256 = "..."
-/// mode = "version"
-/// version = "0.5.2"
-/// constraint = "~0.5.0"
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub enum LockEntryKind {
-    /// Registry provider pinned to a published version.
-    Version {
-        version: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        constraint: Option<String>,
-    },
-    /// GitHub release pinned to both its semver cache key and exact tag.
-    #[serde(rename = "release")]
-    GithubRelease {
-        version: Version,
-        tag: ReleaseTag,
-        asset_id: AssetId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        constraint: Option<String>,
-    },
-    /// Provider built from a git revision (branch/tag/SHA) via CI artifacts.
-    Revision {
-        revision: String,
-        resolved_sha: CommitSha,
-        artifact_id: ArtifactId,
-    },
-    /// Registry-hosted provider resolved by following a branch revision.
-    RegistryRevision { revision: String, version: String },
-    /// Local `file://` provider — identified entirely by `source`.
-    File,
+// Share one schema between serialization and the private entry decoder without
+// exposing a second Deserialize implementation for the in-memory pin.
+macro_rules! define_lock_entry_kind {
+    ($(#[$attribute:meta])* pub enum LockEntryKind { $($variants:tt)* }) => {
+        #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+        $(#[$attribute])*
+        pub enum LockEntryKind { $($variants)* }
+
+        #[derive(Deserialize)]
+        $(#[$attribute])*
+        #[serde(remote = "LockEntryKind")]
+        enum CurrentProviderPin { $($variants)* }
+    };
+}
+
+define_lock_entry_kind! {
+    /// Distinguishes the shapes a lock entry can take. Encoded as a tagged
+    /// enum so that invalid field combinations (e.g. `version = ""` *and*
+    /// `revision = "main"`, the root cause of #2028) can't be constructed at
+    /// all — no runtime validator, no empty-string filler.
+    ///
+    /// Serialized with an explicit `mode` discriminator so the on-disk shape is
+    /// unambiguous:
+    ///
+    /// ```toml
+    /// [[provider]]
+    /// name = "aws"; source = "..."; sha256 = "..."
+    /// mode = "version"
+    /// version = "0.5.2"
+    /// constraint = "~0.5.0"
+    /// ```
+    #[serde(tag = "mode", rename_all = "lowercase")]
+    pub enum LockEntryKind {
+        /// Registry provider pinned to a published version.
+        Version {
+            #[serde(skip_serializing, deserialize_with = "decode_registry_source")]
+            source: RegistrySource,
+            version: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            constraint: Option<String>,
+        },
+        /// GitHub release pinned to both its semver cache key and exact tag.
+        #[serde(rename = "release")]
+        GithubRelease {
+            #[serde(skip_serializing, deserialize_with = "decode_github_source")]
+            source: GithubSource,
+            version: Version,
+            tag: ReleaseTag,
+            asset_id: AssetId,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            constraint: Option<String>,
+        },
+        /// Provider built from a git revision (branch/tag/SHA) via CI artifacts.
+        Revision {
+            #[serde(skip_serializing, deserialize_with = "decode_github_source")]
+            source: GithubSource,
+            revision: String,
+            resolved_sha: CommitSha,
+            artifact_id: ArtifactId,
+        },
+        /// Registry-hosted provider resolved by following a branch revision.
+        RegistryRevision {
+            #[serde(skip_serializing, deserialize_with = "decode_registry_source")]
+            source: RegistrySource,
+            revision: String,
+            version: String,
+        },
+        /// Local `file://` provider — identified entirely by `source`.
+        File {
+            #[serde(skip_serializing, deserialize_with = "decode_file_source")]
+            source: FileSource,
+        },
+    }
 }
 
 impl LockEntryKind {
+    /// Return the validated source carried by this pin's mode.
+    pub fn source(&self) -> ProviderSource {
+        match self {
+            Self::Version { source, .. } | Self::RegistryRevision { source, .. } => {
+                ProviderSource::Remote(RemoteSource::Registry(source.clone()))
+            }
+            Self::GithubRelease { source, .. } | Self::Revision { source, .. } => {
+                ProviderSource::Remote(RemoteSource::GithubDirect(source.clone()))
+            }
+            Self::File { source } => ProviderSource::File(source.clone()),
+        }
+    }
+
     /// The concrete published version this entry pins, for modes that have one.
     fn resolved_version(&self) -> Option<Cow<'_, str>> {
         match self {
             LockEntryKind::Version {
+                source: _,
                 version,
                 constraint: _,
             }
             | LockEntryKind::RegistryRevision {
+                source: _,
                 revision: _,
                 version,
             } => Some(Cow::Borrowed(version)),
             LockEntryKind::GithubRelease {
+                source: _,
                 version,
                 tag: _,
                 asset_id: _,
                 constraint: _,
             } => Some(Cow::Owned(version.to_string())),
             LockEntryKind::Revision {
+                source: _,
                 revision: _,
                 resolved_sha: _,
                 artifact_id: _,
             }
-            | LockEntryKind::File => None,
+            | LockEntryKind::File { .. } => None,
         }
     }
 
     fn resolution_slot(&self) -> LockEntryResolutionSlot<'_> {
         match self {
             Self::Version {
+                source: _,
                 version: _,
                 constraint,
             } => LockEntryResolutionSlot::Version(constraint.as_deref()),
             Self::GithubRelease {
+                source: _,
                 version: _,
                 tag: _,
                 asset_id: _,
                 constraint,
             } => LockEntryResolutionSlot::GithubRelease(constraint.as_deref()),
             Self::Revision {
+                source: _,
                 revision,
                 resolved_sha: _,
                 artifact_id: _,
             } => LockEntryResolutionSlot::Revision(revision),
             Self::RegistryRevision {
+                source: _,
                 revision,
                 version: _,
             } => LockEntryResolutionSlot::RegistryRevision(revision),
-            Self::File => LockEntryResolutionSlot::File,
+            Self::File { .. } => LockEntryResolutionSlot::File,
         }
     }
 }
@@ -172,20 +223,51 @@ enum LockEntryResolutionSlot<'a> {
 }
 
 /// Uninhabited marker for an entry that cannot carry registry metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub enum NoRegistryLock {}
 
 /// A single provider entry in carina-providers.lock.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(serialize = "R: Serialize", deserialize = "R: Deserialize<'de>"))]
+#[derive(Debug, Clone)]
 pub struct LockEntry<R = NoRegistryLock> {
     pub name: String,
-    pub source: String,
-    #[serde(flatten)]
     pub kind: LockEntryKind,
     pub sha256: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry: Option<R>,
+}
+
+impl<R> LockEntry<R> {
+    /// The canonical source spelling, derived from this entry's typed pin.
+    pub fn source(&self) -> String {
+        self.kind.source().to_string()
+    }
+}
+
+impl<R: Serialize> Serialize for LockEntry<R> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Keep source before mode, preserving the existing lock-file bytes.
+        // Its value comes exclusively from the typed source inside kind.
+        #[derive(Serialize)]
+        struct Entry<'a, R> {
+            name: &'a str,
+            source: String,
+            #[serde(flatten)]
+            kind: &'a LockEntryKind,
+            sha256: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            registry: &'a Option<R>,
+        }
+        Entry {
+            name: &self.name,
+            source: self.source(),
+            kind: &self.kind,
+            sha256: &self.sha256,
+            registry: &self.registry,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl LockEntry<NoRegistryLock> {
@@ -196,7 +278,6 @@ impl LockEntry<NoRegistryLock> {
         };
         LockEntry {
             name: self.name,
-            source: self.source,
             kind: self.kind,
             sha256: self.sha256,
             registry,
@@ -631,12 +712,9 @@ impl<'de> Deserialize<'de> for RegistryHostLock {
     }
 }
 
-/// Discovery material retained while migrating a v1 provider entry or v2
-/// registry host record.
-///
-/// Neither value is a v3 discovery pin: v3 pins the resolved discovery-value
-/// map, while v1 and v2 pinned the API base alongside a hash of the document
-/// bytes.
+/// Pending discovery material retained in a v5 lock after an older Carina
+/// migrated it. Only the v5 decoder can restore this state; current discovery
+/// pins record the resolved value map rather than a document hash.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyRegistryDiscoveryPin {
@@ -867,11 +945,6 @@ pub enum SignerPinState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiscardedSignerPins {
-    Current(CurrentSignerPins),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct ListedVersion {
     raw: String,
     parsed: Version,
@@ -1082,36 +1155,27 @@ fn merge_optional_workflow(
     }
 }
 
-impl DiscardedSignerPins {
+impl CurrentSignerPins {
     fn merge(self, other: Self) -> Result<Self, RegistryIdentityPinConflict> {
-        let conflict_left = self.clone();
-        let conflict_right = other.clone();
-        match (self, other) {
-            (Self::Current(left), Self::Current(right)) if left.source == right.source => left
-                .workflows
-                .merge(&right.workflows)
-                .map(|workflows| {
-                    Self::Current(CurrentSignerPins {
-                        source: left.source,
-                        workflows,
-                    })
-                })
-                .ok_or(RegistryIdentityPinConflict {
-                    left: Box::new(conflict_left),
-                    right: Box::new(conflict_right),
-                }),
-            _ => Err(RegistryIdentityPinConflict {
-                left: Box::new(conflict_left),
-                right: Box::new(conflict_right),
-            }),
+        if self.source == other.source
+            && let Some(workflows) = self.workflows.merge(&other.workflows)
+        {
+            return Ok(Self {
+                source: self.source,
+                workflows,
+            });
         }
+        Err(RegistryIdentityPinConflict {
+            left: Box::new(self),
+            right: Box::new(other),
+        })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryIdentityPinConflict {
-    pub left: Box<DiscardedSignerPins>,
-    pub right: Box<DiscardedSignerPins>,
+    pub left: Box<CurrentSignerPins>,
+    pub right: Box<CurrentSignerPins>,
 }
 
 #[derive(Debug)]
@@ -1269,7 +1333,7 @@ struct ResolvedRegistryRecovery {
 }
 
 struct RegistryIdentityRepinState {
-    pin: DiscardedSignerPins,
+    pin: CurrentSignerPins,
     residual: RegistryIdentityRepinResidual,
 }
 
@@ -1352,9 +1416,7 @@ impl RegistryRatchets {
             transparency_log_present,
         } = self;
         let pin = match signature {
-            RegistrySignatureProtection::Required(SignerPinState::Current(pins)) => {
-                DiscardedSignerPins::Current(pins)
-            }
+            RegistrySignatureProtection::Required(SignerPinState::Current(pins)) => pins,
             RegistrySignatureProtection::Required(SignerPinState::Unpinned) => {
                 return Err(RegistryLockRecoveryError::IdentityAlreadyUnpinned { provider });
             }
@@ -1932,11 +1994,9 @@ impl RegistrySignatureProtection {
         }
     }
 
-    fn established_pins(&self) -> Option<DiscardedSignerPins> {
+    fn established_pins(&self) -> Option<CurrentSignerPins> {
         match self {
-            Self::Required(SignerPinState::Current(pins)) => {
-                Some(DiscardedSignerPins::Current(pins.clone()))
-            }
+            Self::Required(SignerPinState::Current(pins)) => Some(pins.clone()),
             Self::NotRequired | Self::Required(SignerPinState::Unpinned) => None,
         }
     }
@@ -1949,9 +2009,7 @@ impl RegistrySignatureProtection {
             (None, None) => None,
         };
         Ok(match pins {
-            Some(DiscardedSignerPins::Current(pins)) => {
-                Self::Required(SignerPinState::Current(pins))
-            }
+            Some(pins) => Self::Required(SignerPinState::Current(pins)),
             None if required => Self::Required(SignerPinState::Unpinned),
             None => Self::NotRequired,
         })
@@ -2022,7 +2080,7 @@ struct EgressArtifactKey {
 impl EgressArtifactKey {
     fn from_entry(entry: &LockEntry<RegistryLock>) -> Self {
         Self {
-            source: canonical_lock_source(&entry.source),
+            source: entry.source(),
             sha256: entry.sha256.clone(),
         }
     }
@@ -2177,51 +2235,13 @@ struct UncheckedLockFile {
 #[derive(Deserialize)]
 struct CurrentProviderEntry {
     name: String,
-    #[serde(flatten)]
-    pin: CurrentProviderPin,
+    #[serde(flatten, deserialize_with = "CurrentProviderPin::deserialize")]
+    pin: LockEntryKind,
     sha256: String,
     #[serde(default)]
     registry: Option<RegistryLock>,
     #[serde(default)]
     egress: Option<crate::EgressLockRecord>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-enum CurrentProviderPin {
-    Version {
-        #[serde(deserialize_with = "decode_registry_source")]
-        source: RegistrySource,
-        version: String,
-        #[serde(default)]
-        constraint: Option<String>,
-    },
-    Release {
-        #[serde(deserialize_with = "decode_github_source")]
-        source: GithubSource,
-        version: Version,
-        tag: ReleaseTag,
-        asset_id: AssetId,
-        #[serde(default)]
-        constraint: Option<String>,
-    },
-    Revision {
-        #[serde(deserialize_with = "decode_github_source")]
-        source: GithubSource,
-        revision: String,
-        resolved_sha: CommitSha,
-        artifact_id: ArtifactId,
-    },
-    RegistryRevision {
-        #[serde(deserialize_with = "decode_registry_source")]
-        source: RegistrySource,
-        revision: String,
-        version: String,
-    },
-    File {
-        #[serde(deserialize_with = "decode_file_source")]
-        source: FileSource,
-    },
 }
 
 fn decode_registry_source<'de, D>(deserializer: D) -> Result<RegistrySource, D::Error>
@@ -2260,63 +2280,10 @@ where
 
 impl CurrentProviderEntry {
     fn into_entry(self) -> (LockEntry<RegistryLock>, Option<crate::EgressLockRecord>) {
-        let (source, kind) = match self.pin {
-            CurrentProviderPin::Version {
-                source,
-                version,
-                constraint,
-            } => (
-                source.to_string(),
-                LockEntryKind::Version {
-                    version,
-                    constraint,
-                },
-            ),
-            CurrentProviderPin::Release {
-                source,
-                version,
-                tag,
-                asset_id,
-                constraint,
-            } => (
-                source.to_string(),
-                LockEntryKind::GithubRelease {
-                    version,
-                    tag,
-                    asset_id,
-                    constraint,
-                },
-            ),
-            CurrentProviderPin::Revision {
-                source,
-                revision,
-                resolved_sha,
-                artifact_id,
-            } => (
-                source.to_string(),
-                LockEntryKind::Revision {
-                    revision,
-                    resolved_sha,
-                    artifact_id,
-                },
-            ),
-            CurrentProviderPin::RegistryRevision {
-                source,
-                revision,
-                version,
-            } => (
-                source.to_string(),
-                LockEntryKind::RegistryRevision { revision, version },
-            ),
-            CurrentProviderPin::File { source } => {
-                (format!("file://{}", source.path()), LockEntryKind::File)
-            }
-        };
         (
             LockEntry {
                 name: self.name,
-                source,
-                kind,
+                kind: self.pin,
                 sha256: self.sha256,
                 registry: self.registry,
             },
@@ -2393,10 +2360,12 @@ define_lock_file_error! {
     },
     UnsupportedVersion {
         path: PathBuf,
+        project_dir: PathBuf,
         found: u32,
         supported: u32,
     } => Self::UnsupportedVersion {
         path: PathBuf::from("carina-providers.lock"),
+        project_dir: PathBuf::from("."),
         found: 4,
         supported: LockFile::CURRENT_VERSION,
     },
@@ -2453,22 +2422,22 @@ define_lock_file_error! {
         path: PathBuf::from("carina-providers.lock"),
         provider: "carina-rs/aws".into(),
         source: Box::new(RegistryIdentityPinConflict {
-            left: Box::new(DiscardedSignerPins::Current(CurrentSignerPins {
+            left: Box::new(CurrentSignerPins {
                 source: SourcePin {
                     oidc_issuer: "issuer-a".into(),
                     repository_owner_id: "owner".into(),
                     repository_id: "identity-a".into(),
                 },
                 workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
-            })),
-            right: Box::new(DiscardedSignerPins::Current(CurrentSignerPins {
+            }),
+            right: Box::new(CurrentSignerPins {
                 source: SourcePin {
                     oidc_issuer: "issuer-b".into(),
                     repository_owner_id: "owner".into(),
                     repository_id: "identity-b".into(),
                 },
                 workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
-            })),
+            }),
         }),
     },
 }
@@ -2500,18 +2469,15 @@ impl fmt::Display for LockFileError {
             ),
             Self::UnsupportedVersion {
                 path,
+                project_dir,
                 found,
                 supported,
             } => {
-                let dir = path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."));
                 write!(
                     f,
                     "Lock file {} uses format version {found}, but this Carina reads only version {supported}. Rewrite it with Carina v0.15.0, the last release that converts older lock formats: run `{}` with v0.15.0, and if it reports a required recovery command (such as `carina providers repin-discovery` or `carina providers repin-identity`), run that first, then `carina init` again.",
                     path.display(),
-                    ProjectCommand::new("init", dir)
+                    ProjectCommand::new("init", project_dir)
                 )
             }
             Self::InvalidVersion { found } => write!(
@@ -2607,7 +2573,7 @@ impl Default for LockFile {
 
 impl<'a> PreparedRegistryIdentityRepin<'a> {
     /// Return the identity pin that committing this recovery will discard.
-    pub fn identity_pin(&self) -> &DiscardedSignerPins {
+    pub fn identity_pin(&self) -> &CurrentSignerPins {
         &self.target.state().pin
     }
 
@@ -2809,8 +2775,9 @@ impl LockFile {
                 let unchecked: UncheckedLockFile = parse_lock_toml(content, path)?;
                 Self::from_unchecked(unchecked, path, project_dir)
             }
-            1..=4 => Err(LockFileError::UnsupportedVersion {
+            1..Self::CURRENT_VERSION => Err(LockFileError::UnsupportedVersion {
                 path: path.to_path_buf(),
+                project_dir: project_dir.source_label(),
                 found: version,
                 supported: Self::CURRENT_VERSION,
             }),
@@ -2883,6 +2850,7 @@ impl LockFile {
         for entry in &provider {
             match &entry.kind {
                 LockEntryKind::GithubRelease {
+                    source: _,
                     version,
                     tag,
                     asset_id: _,
@@ -2894,26 +2862,29 @@ impl LockFile {
                     if !version_matches_tag {
                         return Err(LockFileError::InvalidGithubReleasePin {
                             path: path.to_path_buf(),
-                            source: entry.source.clone(),
+                            source: entry.source(),
                             version: version.to_string(),
                             tag: tag.clone(),
                         });
                     }
                 }
                 LockEntryKind::Version {
+                    source: _,
                     version: _,
                     constraint: _,
                 }
                 | LockEntryKind::Revision {
+                    source: _,
                     revision: _,
                     resolved_sha: _,
                     artifact_id: _,
                 }
                 | LockEntryKind::RegistryRevision {
+                    source: _,
                     revision: _,
                     version: _,
                 }
-                | LockEntryKind::File => {}
+                | LockEntryKind::File { .. } => {}
             }
         }
         for entry in &provider {
@@ -2923,7 +2894,7 @@ impl LockFile {
             if !registry_host.contains_key(registry.resolved_hostname()) {
                 return Err(LockFileError::MissingRegistryHostRecord {
                     project_dir: project_dir.source_label(),
-                    provider: canonical_lock_source(&entry.source),
+                    provider: entry.source(),
                     hostname: registry.resolved_hostname().to_owned(),
                 });
             }
@@ -2970,7 +2941,7 @@ impl LockFile {
     /// version pin. Git revision and file entries never match.
     fn find(&self, source: &str, version: &str) -> Option<&LockEntry<RegistryLock>> {
         self.provider.iter().find(|e| {
-            Self::sources_match(&e.source, source)
+            Self::sources_match(&e.source(), source)
                 && e.kind.resolved_version().as_deref() == Some(version)
         })
     }
@@ -2987,7 +2958,7 @@ impl LockFile {
     fn find_by_source(&self, source: &str) -> Option<&LockEntry<RegistryLock>> {
         self.provider
             .iter()
-            .find(|e| Self::sources_match(&e.source, source))
+            .find(|e| Self::sources_match(&e.source(), source))
     }
 
     fn find_by_remote_config<P: PlaceholderKind, B: BindingAddress>(
@@ -2997,8 +2968,8 @@ impl LockFile {
     ) -> Option<&LockEntry<RegistryLock>> {
         let source_key = source.source_key();
         self.provider.iter().find(|entry| {
-            Self::sources_match(&entry.source, source_key.as_str())
-                && lock_entry_matches_remote_config(entry, config, source)
+            Self::sources_match(&entry.source(), source_key.as_str())
+                && lock_entry_matches_remote_config(entry, config)
         })
     }
 
@@ -3023,7 +2994,8 @@ impl LockFile {
         project_dir: &ResolvedPath,
     ) -> Option<crate::LockedEgress> {
         let entry = self.find_by_verified_artifact(source, sha256, project_dir)?;
-        let locked_source = crate::CanonicalSource::from_lock_source(&entry.source, project_dir)?;
+        let locked_source =
+            crate::CanonicalSource::from_provider_source(entry.kind.source(), project_dir)?;
         let record = self
             .egress
             .get(&EgressArtifactKey::from_entry(entry))?
@@ -3044,7 +3016,8 @@ impl LockFile {
     ) -> Option<&LockEntry<RegistryLock>> {
         self.provider.iter().find(|entry| {
             let source_matches =
-                crate::CanonicalSource::from_lock_source(&entry.source, project_dir).as_ref()
+                crate::CanonicalSource::from_provider_source(entry.kind.source(), project_dir)
+                    .as_ref()
                     == Some(source);
             source_matches && (source.is_file() || entry.sha256 == sha256)
         })
@@ -3057,7 +3030,7 @@ impl LockFile {
     ) -> Option<&crate::EgressLockRecord> {
         self.provider.iter().find_map(|entry| {
             let locked_source =
-                crate::CanonicalSource::from_lock_source(&entry.source, project_dir)?;
+                crate::CanonicalSource::from_provider_source(entry.kind.source(), project_dir)?;
             if &locked_source != source {
                 return None;
             }
@@ -3072,7 +3045,7 @@ impl LockFile {
     ) -> Option<crate::LockedEgress> {
         self.provider.iter().find_map(|entry| {
             let locked_source =
-                crate::CanonicalSource::from_lock_source(&entry.source, project_dir)?;
+                crate::CanonicalSource::from_provider_source(entry.kind.source(), project_dir)?;
             if &locked_source != declaration.source() {
                 return None;
             }
@@ -3137,7 +3110,7 @@ impl LockFile {
 
     fn find_registry_by_source_with_index(&self, source: &str) -> Option<(usize, &RegistryLock)> {
         self.provider.iter().enumerate().find_map(|(index, entry)| {
-            Self::sources_match(&entry.source, source)
+            Self::sources_match(&entry.source(), source)
                 .then_some(entry.registry.as_ref())
                 .flatten()
                 .map(|registry| (index, registry))
@@ -3343,7 +3316,7 @@ impl LockFile {
         sha: &CommitSha,
     ) -> Option<&LockEntry<RegistryLock>> {
         self.provider.iter().find(|e| {
-            Self::sources_match(&e.source, source)
+            Self::sources_match(&e.source(), source)
                 && matches!(
                     &e.kind,
                     LockEntryKind::Revision { resolved_sha, .. } if resolved_sha == sha
@@ -3406,10 +3379,10 @@ impl LockFile {
         &mut self,
     ) -> Result<(), RegistryIdentityPinConflictRecord> {
         for entry in &mut self.provider {
+            let source_key = entry.source();
             let Some(registry) = entry.registry.as_mut() else {
                 continue;
             };
-            let source_key = canonical_lock_source(&entry.source);
             if let Some(unpinned) = self.unpinned_registry_ratchets.remove(&source_key) {
                 unpinned.merge_into_registry(registry).map_err(|source| {
                     RegistryIdentityPinConflictRecord {
@@ -3431,7 +3404,7 @@ impl LockFile {
         if let Some(registry) = self
             .provider
             .iter_mut()
-            .find(|entry| Self::sources_match(&entry.source, &source_key))
+            .find(|entry| Self::sources_match(&entry.source(), &source_key))
             .and_then(|entry| entry.registry.as_mut())
         {
             ratchets.merge_into_registry(registry)?;
@@ -3453,8 +3426,9 @@ impl LockFile {
         mut entry: LockEntry<RegistryLock>,
         host: RegistryHostLock,
     ) -> Result<(), RegistryIdentityPinConflict> {
+        let source = entry.source();
         if let Some(registry) = entry.registry.as_mut() {
-            let observed = self.known_registry_ratchets(&entry.source)?;
+            let observed = self.known_registry_ratchets(&source)?;
             observed.merge_into_registry(registry)?;
             self.registry_host
                 .insert(registry.resolved_hostname.clone(), host);
@@ -3465,23 +3439,22 @@ impl LockFile {
 
     fn upsert_entry(&mut self, entry: LockEntry<RegistryLock>) {
         if entry.registry.is_some() {
-            self.unpinned_registry_ratchets
-                .remove(&canonical_lock_source(&entry.source));
+            self.unpinned_registry_ratchets.remove(&entry.source());
         }
         let matching_source_count = self
             .provider
             .iter()
-            .filter(|existing| Self::sources_match(&existing.source, &entry.source))
+            .filter(|existing| Self::sources_match(&existing.source(), &entry.source()))
             .count();
         let matching_slot = self.provider.iter().position(|existing| {
-            Self::sources_match(&existing.source, &entry.source)
+            Self::sources_match(&existing.source(), &entry.source())
                 && existing.kind.resolution_slot() == entry.kind.resolution_slot()
         });
         let replacement = matching_slot.or_else(|| {
             (matching_source_count == 1).then(|| {
                 self.provider
                     .iter()
-                    .position(|existing| Self::sources_match(&existing.source, &entry.source))
+                    .position(|existing| Self::sources_match(&existing.source(), &entry.source()))
                     .expect("the source count proves a matching entry exists")
             })
         });
@@ -3731,7 +3704,6 @@ impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
         self.lock_file.upsert_registry_with_host(
             LockEntry {
                 name,
-                source: source.to_string(),
                 kind,
                 sha256,
                 registry: None,
@@ -3872,7 +3844,7 @@ impl InstalledProvider {
                 pin: artifact.pin().clone(),
             },
             InstalledArtifact::File(artifact) => ProviderArtifactProvenance::File {
-                source: format!("file://{}", artifact.source.path()),
+                source: ProviderSource::File(artifact.source.clone()).to_string(),
             },
         }
     }
@@ -4141,7 +4113,7 @@ pub enum ProviderArtifactProvenance {
 }
 
 /// The lock-entry modes that can select a cached provider artifact.
-/// [`LockEntryKind::File`] is deliberately absent: file artifacts have their
+/// [`LockEntryKind::File { .. }`] is deliberately absent: file artifacts have their
 /// own provenance variant and are never candidates for a stale-lock hint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockedProviderPin {
@@ -4316,27 +4288,6 @@ fn missing_locked_artifact_error(
         "{action}\nConsulted {} ({pin}), but its artifact is missing.",
         lock_path.display()
     )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FindInstalledProviderError {
-    Other(String),
-}
-
-impl fmt::Display for FindInstalledProviderError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Other(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for FindInstalledProviderError {}
-
-impl From<String> for FindInstalledProviderError {
-    fn from(message: String) -> Self {
-        Self::Other(message)
-    }
 }
 
 // Registry sequence advances only when the canonical version-set digest changes;
@@ -6660,14 +6611,15 @@ fn verify_and_decide_signer<H: RegistryHttp>(
 fn record_verified_github_release_pin(
     lock_file: &mut LockFile,
     artifact: &VerifiedArtifact,
+    source: &GithubSource,
     pin: GithubReleaseArtifactPin,
     resolved: &ResolvedGithubRelease,
     name: &str,
 ) {
     lock_file.upsert(LockEntry {
         name: name.to_string(),
-        source: artifact.source().to_string(),
         kind: LockEntryKind::GithubRelease {
+            source: source.clone(),
             version: resolved.version().clone(),
             tag: resolved.tag().clone(),
             asset_id: resolved.asset_id(),
@@ -6697,25 +6649,29 @@ fn verify_registry_lock_pin(
     let entry = current_lock.find_by_source_key(source_key);
     let existing_constraint = entry.and_then(|entry| match &entry.kind {
         LockEntryKind::Version {
+            source: _,
             version: _,
             constraint,
         } => constraint.clone(),
         LockEntryKind::GithubRelease {
+            source: _,
             version: _,
             tag: _,
             asset_id: _,
             constraint: _,
         }
         | LockEntryKind::Revision {
+            source: _,
             revision: _,
             resolved_sha: _,
             artifact_id: _,
         }
         | LockEntryKind::RegistryRevision {
+            source: _,
             revision: _,
             version: _,
         }
-        | LockEntryKind::File => None,
+        | LockEntryKind::File { .. } => None,
     });
     if let Some(entry) = entry
         && entry.kind.resolved_version().as_deref() == Some(version)
@@ -6838,6 +6794,7 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
     accept_registry_download_with_http(
         user_dirs,
         PendingRegistryDownload {
+            source,
             source_key,
             version: listed_version,
             name,
@@ -6878,29 +6835,34 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
             .find_by_source_key(&source_key)
             .and_then(|entry| match &entry.kind {
                 LockEntryKind::RegistryRevision {
+                    source: _,
                     revision: locked_revision,
                     version,
                 } if locked_revision == revision => Some(version.clone()),
                 LockEntryKind::Version {
+                    source: _,
                     version: _,
                     constraint: _,
                 }
                 | LockEntryKind::GithubRelease {
+                    source: _,
                     version: _,
                     tag: _,
                     asset_id: _,
                     constraint: _,
                 }
                 | LockEntryKind::Revision {
+                    source: _,
                     revision: _,
                     resolved_sha: _,
                     artifact_id: _,
                 }
                 | LockEntryKind::RegistryRevision {
+                    source: _,
                     revision: _,
                     version: _,
                 }
-                | LockEntryKind::File => None,
+                | LockEntryKind::File { .. } => None,
             })
     };
     let (listed_version, download, selection) = if let Some(locked_version) = locked_version {
@@ -6925,6 +6887,7 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
     accept_registry_download_with_http(
         user_dirs,
         PendingRegistryDownload {
+            source,
             source_key: &source_key,
             version: listed_version,
             name,
@@ -6978,6 +6941,7 @@ enum RegistryDownloadIntent<'a> {
 }
 
 struct PendingRegistryDownload<'a> {
+    source: &'a RegistrySource,
     source_key: &'a RemoteSourceKey,
     version: ListedVersion,
     name: &'a str,
@@ -6994,6 +6958,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
     http: &H,
 ) -> Result<WasmArtifactPath, String> {
     let PendingRegistryDownload {
+        source,
         source_key,
         version,
         name,
@@ -7068,6 +7033,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
 
     let kind = match intent {
         RegistryDownloadIntent::Version => LockEntryKind::Version {
+            source: source.clone(),
             version: version.raw.clone(),
             constraint: existing_constraint,
         },
@@ -7087,6 +7053,7 @@ fn accept_registry_download_with_http<H: RegistryHttp>(
                 return Err(error);
             }
             LockEntryKind::RegistryRevision {
+                source: source.clone(),
                 revision: requested.to_string(),
                 version: version.raw.clone(),
             }
@@ -7142,10 +7109,10 @@ fn annotate_version_lock_entry(
     lock_file: &mut LockFile,
 ) {
     if let Some(entry) = lock_file.provider.iter_mut().find(|entry| {
-        LockFile::sources_match(&entry.source, source.as_str())
+        LockFile::sources_match(&entry.source(), source.as_str())
             && matches!(
                 &entry.kind,
-                LockEntryKind::Version {
+                LockEntryKind::Version { source: _,
                     version: locked_version,
                     constraint: _
                 } if locked_version == version
@@ -7166,10 +7133,10 @@ fn annotate_github_release_lock_entry(
     lock_file: &mut LockFile,
 ) {
     if let Some(entry) = lock_file.provider.iter_mut().find(|entry| {
-        LockFile::sources_match(&entry.source, source.as_str())
+        LockFile::sources_match(&entry.source(), source.as_str())
             && matches!(
                 &entry.kind,
-                LockEntryKind::GithubRelease {
+                LockEntryKind::GithubRelease { source: _,
                     version: locked_version,
                     tag: _,
                     asset_id: _,
@@ -7177,6 +7144,7 @@ fn annotate_github_release_lock_entry(
                 } if locked_version == version
             )
     }) && let LockEntryKind::GithubRelease {
+        source: _,
         version: _,
         tag: _,
         asset_id: _,
@@ -7306,7 +7274,7 @@ where
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
-        record_verified_github_release_pin(lock_file, &verified, pin, resolved, name);
+        record_verified_github_release_pin(lock_file, &verified, source, pin, resolved, name);
         return Ok(verified.path().clone());
     }
 
@@ -7330,7 +7298,7 @@ where
             }
             Err(VerifiedArtifactError::Other(message)) => return Err(message),
         };
-        record_verified_github_release_pin(lock_file, &verified, pin, resolved, name);
+        record_verified_github_release_pin(lock_file, &verified, source, pin, resolved, name);
         eprintln!(
             "Installed WASM provider '{}' from global cache ({}@{})",
             name, source_key, version
@@ -7369,7 +7337,7 @@ where
     let installed_path = match publish_download(user_dirs, staged, artifact_pin, download_location)?
     {
         DownloadedArtifact::Verified { artifact, pin } => {
-            record_verified_github_release_pin(lock_file, &artifact, pin, resolved, name);
+            record_verified_github_release_pin(lock_file, &artifact, source, pin, resolved, name);
             artifact.path().clone()
         }
         DownloadedArtifact::FirstUse {
@@ -7379,8 +7347,8 @@ where
         } => {
             lock_file.upsert(LockEntry {
                 name: name.to_string(),
-                source: source_key.to_string(),
                 kind: LockEntryKind::GithubRelease {
+                    source: source.clone(),
                     version: version.clone(),
                     tag: resolved.tag().clone(),
                     asset_id,
@@ -7479,13 +7447,9 @@ where
 {
     let install_lock = lock_file.install_lock();
     match (source, config.revision.as_deref()) {
-        (ProviderSource::File(file_source), _) => resolve_file_provider(
-            install_lock,
-            &config.name,
-            &source.to_string(),
-            file_source.path(),
-            lock_file,
-        ),
+        (ProviderSource::File(file_source), _) => {
+            resolve_file_provider(install_lock, &config.name, file_source, lock_file)
+        }
         (ProviderSource::Remote(RemoteSource::Registry(registry_source)), Some(revision)) => {
             resolve_registry_revision_with_http(
                 user_dirs,
@@ -7572,10 +7536,10 @@ where
 fn resolve_file_provider(
     install_lock: &ProviderInstallLock,
     provider_name: &str,
-    source: &str,
-    file_path: &str,
+    source: &FileSource,
     lock_file: &mut LockFile,
 ) -> Result<WasmArtifactPath, String> {
+    let file_path = source.path();
     let src_path = WasmArtifactPath::new(PathBuf::from(file_path), provider_name)?;
     let source_label = carina_core::paths::DisplayPath::new(src_path.as_path())
         .map_err(|error| error.to_string())?;
@@ -7595,8 +7559,9 @@ fn resolve_file_provider(
 
     lock_file.upsert(LockEntry {
         name: provider_name.to_string(),
-        source: source.to_string(),
-        kind: LockEntryKind::File,
+        kind: LockEntryKind::File {
+            source: source.clone(),
+        },
         sha256: sha,
         registry: None,
     });
@@ -7665,127 +7630,24 @@ pub fn find_file_provider_source(
 fn lock_entry_matches_remote_config<P: PlaceholderKind, B: BindingAddress>(
     entry: &LockEntry<RegistryLock>,
     config: &ProviderConfig<P, B>,
-    source: &RemoteSource,
 ) -> bool {
-    match (source, config.revision.as_deref(), &entry.kind) {
+    match (config.revision.as_deref(), &entry.kind) {
         (
-            RemoteSource::Registry(_),
             Some(requested),
-            LockEntryKind::RegistryRevision {
-                revision,
-                version: _,
-            },
+            LockEntryKind::RegistryRevision { revision, .. }
+            | LockEntryKind::Revision { revision, .. },
         ) => revision == requested,
-        (
-            RemoteSource::GithubDirect(_),
-            Some(requested),
-            LockEntryKind::Revision {
-                revision,
-                resolved_sha: _,
-                artifact_id: _,
-            },
-        ) => revision == requested,
-        (
-            RemoteSource::Registry(_),
-            None,
-            LockEntryKind::Version {
-                version,
-                constraint: _,
-            },
-        ) => config
+        (None, LockEntryKind::Version { version, .. }) => config
             .version
             .as_ref()
             .is_none_or(|constraint| constraint.matches(version).unwrap_or(false)),
-        (
-            RemoteSource::GithubDirect(_),
-            None,
-            LockEntryKind::GithubRelease {
-                version,
-                tag: _,
-                asset_id: _,
-                constraint: _,
-            },
-        ) => config
+        (None, LockEntryKind::GithubRelease { version, .. }) => config
             .version
             .as_ref()
             .is_none_or(|constraint| constraint.req.matches(version)),
-        (
-            RemoteSource::Registry(_),
-            Some(_),
-            LockEntryKind::Version {
-                version: _,
-                constraint: _,
-            }
-            | LockEntryKind::GithubRelease {
-                version: _,
-                tag: _,
-                asset_id: _,
-                constraint: _,
-            }
-            | LockEntryKind::Revision {
-                revision: _,
-                resolved_sha: _,
-                artifact_id: _,
-            }
-            | LockEntryKind::File,
-        )
-        | (
-            RemoteSource::GithubDirect(_),
-            Some(_),
-            LockEntryKind::Version {
-                version: _,
-                constraint: _,
-            }
-            | LockEntryKind::GithubRelease {
-                version: _,
-                tag: _,
-                asset_id: _,
-                constraint: _,
-            }
-            | LockEntryKind::RegistryRevision {
-                revision: _,
-                version: _,
-            }
-            | LockEntryKind::File,
-        )
-        | (
-            RemoteSource::Registry(_),
-            None,
-            LockEntryKind::GithubRelease {
-                version: _,
-                tag: _,
-                asset_id: _,
-                constraint: _,
-            }
-            | LockEntryKind::Revision {
-                revision: _,
-                resolved_sha: _,
-                artifact_id: _,
-            }
-            | LockEntryKind::RegistryRevision {
-                revision: _,
-                version: _,
-            }
-            | LockEntryKind::File,
-        )
-        | (
-            RemoteSource::GithubDirect(_),
-            None,
-            LockEntryKind::Version {
-                version: _,
-                constraint: _,
-            }
-            | LockEntryKind::Revision {
-                revision: _,
-                resolved_sha: _,
-                artifact_id: _,
-            }
-            | LockEntryKind::RegistryRevision {
-                revision: _,
-                version: _,
-            }
-            | LockEntryKind::File,
-        ) => false,
+        (Some(_), LockEntryKind::Version { .. } | LockEntryKind::GithubRelease { .. })
+        | (None, LockEntryKind::Revision { .. } | LockEntryKind::RegistryRevision { .. })
+        | (_, LockEntryKind::File { .. }) => false,
     }
 }
 
@@ -7794,13 +7656,10 @@ fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
     config: &ProviderConfig<P, B>,
     remote_source: &RemoteSource,
     lock_file: &'lock LockFile,
-) -> Result<Option<LockArtifactSelection<'lock>>, FindInstalledProviderError> {
+) -> Result<Option<LockArtifactSelection<'lock>>, String> {
     lock_file
         .find_by_remote_config(config, remote_source)
-        .map(|lock_entry| {
-            lock_artifact_selection(base_dir, lock_entry, &config.name)
-                .map_err(FindInstalledProviderError::from)
-        })
+        .map(|lock_entry| lock_artifact_selection(base_dir, lock_entry, &config.name))
         .transpose()
 }
 
@@ -7887,7 +7746,7 @@ pub fn provider_artifact_fingerprint(
             };
             match select_locked_artifact(base_dir, config, remote_source, &loaded_lock) {
                 Ok(Some(selection)) => file_metadata_fingerprint(&selection.path),
-                Ok(None) | Err(FindInstalledProviderError::Other(_)) => None,
+                Ok(None) | Err(_) => None,
             }
         }
         None => None,
@@ -7908,7 +7767,7 @@ pub fn provider_artifact_fingerprint(
 pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
     base_dir: &ResolvedPath,
     config: &ProviderConfig<P, B>,
-) -> Result<InstalledProvider, FindInstalledProviderError> {
+) -> Result<InstalledProvider, String> {
     let io_base = base_dir.clone();
     let base_dir = &io_base;
     let source = config
@@ -7922,25 +7781,25 @@ pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
             let dest = file_provider_cache_path(base_dir, &src, &config.name)?;
             if dest
                 .resolve(&io_base)
-                .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?
+                .map_err(|error| error.to_string())?
                 .exists()
             {
-                return Ok(InstalledProvider::file_source(
+                return InstalledProvider::file_source(
                     dest,
                     config.name.clone(),
                     file_source.clone(),
                     &io_base,
-                )?);
+                );
             }
-            return Err(FindInstalledProviderError::Other(format!(
+            return Err(format!(
                 "not installed. Run `{}`",
                 ProjectCommand::for_display_path("init", base_dir.display())
-            )));
+            ));
         }
         ProviderSource::Remote(remote_source) => remote_source,
     };
     let lock_file = LockFile::load(&io_base)
-        .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?
+        .map_err(|error| error.to_string())?
         .unwrap_or_default();
 
     // Only the project-local `.carina/` counts. The global plugin cache is an
@@ -7950,29 +7809,26 @@ pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
     // local install yet (issue #2018).
     if let Some(selection) = select_locked_artifact(base_dir, config, remote_source, &lock_file)? {
         if selection.path.exists() {
-            return installed_provider_from_lock(&config.name, selection, &io_base)
-                .map_err(FindInstalledProviderError::Other);
+            return installed_provider_from_lock(&config.name, selection, &io_base);
         }
-        return Err(FindInstalledProviderError::Other(
-            missing_locked_artifact_error(
-                &base_dir.source_label(),
-                &selection.pin,
-                config.revision.as_deref(),
-            ),
+        return Err(missing_locked_artifact_error(
+            &base_dir.source_label(),
+            &selection.pin,
+            config.revision.as_deref(),
         ));
     }
 
     if let Some(revision) = &config.revision {
-        return Err(FindInstalledProviderError::Other(format!(
+        return Err(format!(
             "not installed. Run `{}` to install (revision: {revision})",
             ProjectCommand::for_display_path("init", base_dir.display())
-        )));
+        ));
     }
 
-    Err(FindInstalledProviderError::Other(format!(
+    Err(format!(
         "not installed. Run `{}`",
         ProjectCommand::for_display_path("init", base_dir.display())
-    )))
+    ))
 }
 
 fn try_reuse_locked_registry_version(
@@ -7981,11 +7837,12 @@ fn try_reuse_locked_registry_version(
     lock_file: &LockFile,
 ) -> Option<String> {
     lock_file.provider.iter().find_map(|entry| {
-        if !LockFile::sources_match(&entry.source, source.as_str()) {
+        if !LockFile::sources_match(&entry.source(), source.as_str()) {
             return None;
         }
         match &entry.kind {
             LockEntryKind::Version {
+                source: _,
                 version,
                 constraint: _,
             } if constraint
@@ -7994,25 +7851,29 @@ fn try_reuse_locked_registry_version(
                 Some(version.clone())
             }
             LockEntryKind::Version {
+                source: _,
                 version: _,
                 constraint: _,
             }
             | LockEntryKind::GithubRelease {
+                source: _,
                 version: _,
                 tag: _,
                 asset_id: _,
                 constraint: _,
             }
             | LockEntryKind::Revision {
+                source: _,
                 revision: _,
                 resolved_sha: _,
                 artifact_id: _,
             }
             | LockEntryKind::RegistryRevision {
+                source: _,
                 revision: _,
                 version: _,
             }
-            | LockEntryKind::File => None,
+            | LockEntryKind::File { .. } => None,
         }
     })
 }
@@ -8023,11 +7884,12 @@ fn try_reuse_locked_github_release(
     lock_file: &LockFile,
 ) -> Result<Option<ResolvedGithubRelease>, String> {
     Ok(lock_file.provider.iter().find_map(|entry| {
-        if !LockFile::sources_match(&entry.source, source.as_str()) {
+        if !LockFile::sources_match(&entry.source(), source.as_str()) {
             return None;
         }
         match &entry.kind {
             LockEntryKind::GithubRelease {
+                source: _,
                 version,
                 tag,
                 asset_id,
@@ -8036,25 +7898,29 @@ fn try_reuse_locked_github_release(
                 ResolvedGithubRelease::from_lock_entry(version.clone(), tag.clone(), *asset_id),
             ),
             LockEntryKind::GithubRelease {
+                source: _,
                 version: _,
                 tag: _,
                 asset_id: _,
                 constraint: _,
             }
             | LockEntryKind::Version {
+                source: _,
                 version: _,
                 constraint: _,
             }
             | LockEntryKind::Revision {
+                source: _,
                 revision: _,
                 resolved_sha: _,
                 artifact_id: _,
             }
             | LockEntryKind::RegistryRevision {
+                source: _,
                 revision: _,
                 version: _,
             }
-            | LockEntryKind::File => None,
+            | LockEntryKind::File { .. } => None,
         }
     }))
 }
@@ -8137,24 +8003,9 @@ pub enum LockMode {
     Locked,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LockMismatchError {
-    Mismatch(String),
-}
-
-impl fmt::Display for LockMismatchError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Mismatch(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for LockMismatchError {}
-
 #[derive(Debug)]
 pub enum ResolveAllError {
-    LockMismatch(LockMismatchError),
+    LockMismatch(String),
     Egress(Box<EgressInitializationError>),
     Other(String),
 }
@@ -8172,16 +8023,10 @@ impl fmt::Display for ResolveAllError {
 impl std::error::Error for ResolveAllError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::LockMismatch(error) => error.source(),
+            Self::LockMismatch(_) => None,
             Self::Egress(error) => error.source(),
             Self::Other(_) => None,
         }
-    }
-}
-
-impl From<LockMismatchError> for ResolveAllError {
-    fn from(error: LockMismatchError) -> Self {
-        Self::LockMismatch(error)
     }
 }
 
@@ -8265,7 +8110,7 @@ pub fn check_lock_mismatch(
     lock_file: &LockFile,
     mode: LockMode,
     project_dir: &ResolvedPath,
-) -> Result<(), LockMismatchError> {
+) -> Result<(), String> {
     if mode == LockMode::Upgrade {
         return Ok(());
     }
@@ -8287,13 +8132,13 @@ pub fn check_lock_mismatch(
                 .unwrap_or(first_entry),
             None => {
                 if mode == LockMode::Locked {
-                    return Err(LockMismatchError::Mismatch(format!(
+                    return Err(format!(
                         "provider '{}' is declared in .crn but missing from carina-providers.lock\n\
                          hint: running with --locked requires the lock to be committed up-to-date;\n\
                                re-run without --locked (or `{}`) to populate it.",
                         config.name,
                         ProjectCommand::for_display_path("init --upgrade", project_dir.display())
-                    )));
+                    ));
                 }
                 continue;
             }
@@ -8306,6 +8151,7 @@ pub fn check_lock_mismatch(
                 Some(_),
                 Some(_),
                 LockEntryKind::Version {
+                    source: _,
                     version: _,
                     constraint: _,
                 },
@@ -8314,6 +8160,7 @@ pub fn check_lock_mismatch(
                 Some(_),
                 Some(_),
                 LockEntryKind::GithubRelease {
+                    source: _,
                     version: _,
                     tag: _,
                     asset_id: _,
@@ -8324,6 +8171,7 @@ pub fn check_lock_mismatch(
                 Some(_),
                 Some(_),
                 LockEntryKind::Revision {
+                    source: _,
                     revision: _,
                     resolved_sha: _,
                     artifact_id: _,
@@ -8333,16 +8181,18 @@ pub fn check_lock_mismatch(
                 Some(_),
                 Some(_),
                 LockEntryKind::RegistryRevision {
+                    source: _,
                     revision: _,
                     version: _,
                 },
             )
-            | (Some(_), Some(_), LockEntryKind::File) => {}
+            | (Some(_), Some(_), LockEntryKind::File { .. }) => {}
             // .crn revision — lock revision: must match literally.
             (
                 Some(crn_rev),
                 _,
                 LockEntryKind::Revision {
+                    source: _,
                     revision: locked_rev,
                     resolved_sha: _,
                     artifact_id: _,
@@ -8361,6 +8211,7 @@ pub fn check_lock_mismatch(
                 Some(crn_rev),
                 _,
                 LockEntryKind::RegistryRevision {
+                    source: _,
                     revision: locked_rev,
                     version: _,
                 },
@@ -8378,6 +8229,7 @@ pub fn check_lock_mismatch(
                 Some(crn_rev),
                 _,
                 LockEntryKind::Version {
+                    source: _,
                     version: locked_ver,
                     constraint: _,
                 },
@@ -8392,6 +8244,7 @@ pub fn check_lock_mismatch(
                 Some(crn_rev),
                 _,
                 LockEntryKind::GithubRelease {
+                    source: _,
                     version: locked_ver,
                     tag: locked_tag,
                     asset_id: _,
@@ -8409,6 +8262,7 @@ pub fn check_lock_mismatch(
                 None,
                 Some(constraint),
                 LockEntryKind::Version {
+                    source: _,
                     version: locked_ver,
                     constraint: _,
                 },
@@ -8425,6 +8279,7 @@ pub fn check_lock_mismatch(
                 None,
                 Some(constraint),
                 LockEntryKind::GithubRelease {
+                    source: _,
                     version: locked_ver,
                     tag: _,
                     asset_id: _,
@@ -8444,6 +8299,7 @@ pub fn check_lock_mismatch(
                 None,
                 Some(constraint),
                 LockEntryKind::Revision {
+                    source: _,
                     revision: locked_rev,
                     resolved_sha: _,
                     artifact_id: _,
@@ -8460,6 +8316,7 @@ pub fn check_lock_mismatch(
                 None,
                 Some(constraint),
                 LockEntryKind::RegistryRevision {
+                    source: _,
                     revision: locked_rev,
                     version: _,
                 },
@@ -8479,6 +8336,7 @@ pub fn check_lock_mismatch(
                 None,
                 None,
                 LockEntryKind::RegistryRevision {
+                    source: _,
                     revision: locked_rev,
                     version: _,
                 },
@@ -8493,6 +8351,7 @@ pub fn check_lock_mismatch(
                 None,
                 None,
                 LockEntryKind::Version {
+                    source: _,
                     version: _,
                     constraint: _,
                 },
@@ -8501,6 +8360,7 @@ pub fn check_lock_mismatch(
                 None,
                 None,
                 LockEntryKind::GithubRelease {
+                    source: _,
                     version: _,
                     tag: _,
                     asset_id: _,
@@ -8511,6 +8371,7 @@ pub fn check_lock_mismatch(
                 None,
                 None,
                 LockEntryKind::Revision {
+                    source: _,
                     revision: locked_rev,
                     resolved_sha: _,
                     artifact_id: _,
@@ -8524,7 +8385,7 @@ pub fn check_lock_mismatch(
             }
             // .crn provider vs a file-mode lock entry: sources shouldn't match,
             // so this arm is effectively unreachable, but bail safely.
-            (_, _, LockEntryKind::File) => {}
+            (_, _, LockEntryKind::File { .. }) => {}
         }
     }
 
@@ -8536,8 +8397,8 @@ fn mismatch_error(
     lock_shape: &str,
     crn_shape: &str,
     project_dir: &ResolvedPath,
-) -> LockMismatchError {
-    LockMismatchError::Mismatch(format!(
+) -> String {
+    format!(
         "lock file does not match providers.crn\n  \
          provider '{name}':\n    \
          providers.crn:  {crn_shape}\n    \
@@ -8545,7 +8406,7 @@ fn mismatch_error(
          hint: run `{}` to resolve providers from the current\n        \
          configuration and rewrite carina-providers.lock",
         ProjectCommand::for_display_path("init --upgrade", project_dir.display())
-    ))
+    )
 }
 
 /// Resolve all configured provider sources.
@@ -8696,7 +8557,8 @@ where
     // disagrees with .crn.
     // Rewriting the lock requires `--upgrade`; `--locked` tightens this to
     // require every provider to be present in the lock too.
-    check_lock_mismatch(providers, &lock_file, mode, base_dir)?;
+    check_lock_mismatch(providers, &lock_file, mode, base_dir)
+        .map_err(ResolveAllError::LockMismatch)?;
 
     let mut resolved = HashMap::new();
     let mut initialized_egress = InitializedEgressDeclarations::default();
@@ -9104,25 +8966,29 @@ pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
         if let Some(lock_entry) = lock_entry {
             let locked_version = match &lock_entry.kind {
                 LockEntryKind::Version {
+                    source: _,
                     version,
                     constraint: _,
                 } => Some(version.clone()),
                 LockEntryKind::GithubRelease {
+                    source: _,
                     version,
                     tag: _,
                     asset_id: _,
                     constraint: _,
                 } => Some(version.to_string()),
                 LockEntryKind::Revision {
+                    source: _,
                     revision: _,
                     resolved_sha: _,
                     artifact_id: _,
                 }
                 | LockEntryKind::RegistryRevision {
+                    source: _,
                     revision: _,
                     version: _,
                 }
-                | LockEntryKind::File => None,
+                | LockEntryKind::File { .. } => None,
             };
             if let Some(version) = locked_version
                 && !constraint.matches(&version).unwrap_or(false)
@@ -9142,6 +9008,15 @@ pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
 
 #[cfg(test)]
 mod tests {
+
+    fn test_file_source(value: &str) -> carina_core::provider_source::FileSource {
+        use carina_core::provider_source::ProviderSource;
+        let ProviderSource::File(source) = value.parse().unwrap() else {
+            panic!("expected file source: {value}");
+        };
+        source
+    }
+
     use super::*;
     use crate::github::{FixtureGithubHttp, GithubApi, GithubHttp, GithubTokenProvider};
     use crate::github_location::ReleaseTag;
@@ -9347,8 +9222,8 @@ sha256 = "abc"
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(tag.into()),
                 asset_id: release_asset_id(42),
@@ -9690,7 +9565,7 @@ sha256 = "abc"
         providers: &[ProviderConfig],
         lock_file: &LockFile,
         mode: LockMode,
-    ) -> Result<(), LockMismatchError> {
+    ) -> Result<(), String> {
         super::check_lock_mismatch(
             providers,
             lock_file,
@@ -10484,8 +10359,8 @@ sha256 = "abc"
         lock.upsert_registry(
             LockEntry {
                 name: "aws".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source("carina-rs/aws"),
                     version: "0.5.0".into(),
                     constraint: None,
                 },
@@ -10574,8 +10449,8 @@ transparency_log_present = true
             registry_host: registry_host_table(hostname, &api_base_url),
             provider: vec![LockEntry {
                 name: "aws".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source("carina-rs/aws"),
                     version: "0.5.0".into(),
                     constraint: Some("^0.5".into()),
                 },
@@ -10650,8 +10525,8 @@ transparency_log_present = true
     fn version_entry<R>(source: &str, version: &str) -> LockEntry<R> {
         LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::Version {
+                source: registry_source(source),
                 version: version.into(),
                 constraint: None,
             },
@@ -10663,8 +10538,8 @@ transparency_log_present = true
     fn github_release_entry<R>(source: &str, version: &str) -> LockEntry<R> {
         LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -10678,8 +10553,8 @@ transparency_log_present = true
     fn revision_entry<R>(source: &str, revision: &str, sha: &str) -> LockEntry<R> {
         LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::Revision {
+                source: github_source(source),
                 revision: revision.into(),
                 resolved_sha: commit_sha(sha),
                 artifact_id: artifact_id(42),
@@ -10706,6 +10581,7 @@ transparency_log_present = true
         assert_eq!(
             parsed.provider[0].kind,
             LockEntryKind::Revision {
+                source: github_source("github.com/carina-rs/carina-provider-awscc"),
                 revision: "main".into(),
                 resolved_sha: commit_sha(TEST_COMMIT_SHA),
                 artifact_id: artifact_id(42),
@@ -10739,7 +10615,7 @@ sha256 = "malformed"
     }
 
     #[test]
-    fn misspelled_revision_artifact_id_is_not_treated_as_legacy() {
+    fn revision_entry_with_misspelled_artifact_id_is_rejected() {
         let serialized = format!(
             r#"version = {}
 
@@ -10977,6 +10853,7 @@ sha256 = "malformed"
             .expect("cache-hit path must upsert a lock entry");
         match &entry.kind {
             LockEntryKind::GithubRelease {
+                source: _,
                 version: locked,
                 tag: _,
                 asset_id: _,
@@ -10997,8 +10874,8 @@ sha256 = "malformed"
             registry_host: BTreeMap::new(),
             provider: vec![LockEntry {
                 name: "aws".into(),
-                source: source.into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source(source),
                     version: "0.5.2".into(),
                     constraint: Some("~0.5.0".into()),
                 },
@@ -11009,6 +10886,19 @@ sha256 = "malformed"
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let toml_str = lock.to_toml_string().unwrap();
+        assert_eq!(
+            toml_str,
+            r#"version = 5
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "version"
+version = "0.5.2"
+constraint = "~0.5.0"
+sha256 = "abc123"
+"#
+        );
         assert!(
             toml_str.contains("mode = \"version\""),
             "serialized form should tag the variant: {toml_str}"
@@ -11017,6 +10907,7 @@ sha256 = "malformed"
         let loaded =
             LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(loaded.provider[0].kind, lock.provider[0].kind);
+        assert_eq!(loaded.to_toml_string().unwrap(), toml_str);
     }
 
     #[test]
@@ -11027,8 +10918,8 @@ sha256 = "malformed"
             registry_host: BTreeMap::new(),
             provider: vec![LockEntry {
                 name: "aws".into(),
-                source: source.into(),
                 kind: LockEntryKind::GithubRelease {
+                    source: github_source(source),
                     version: Version::parse("0.5.2").unwrap(),
                     tag: crate::github_location::ReleaseTag::from_lock("v0.5.2".into()),
                     asset_id: release_asset_id(42),
@@ -11042,6 +10933,21 @@ sha256 = "malformed"
         };
 
         let toml_str = lock.to_toml_string().unwrap();
+        assert_eq!(
+            toml_str,
+            r#"version = 5
+
+[[provider]]
+name = "aws"
+source = "github.com/carina-rs/carina-provider-aws"
+mode = "release"
+version = "0.5.2"
+tag = "v0.5.2"
+asset_id = 42
+constraint = "~0.5.0"
+sha256 = "abc123"
+"#
+        );
 
         assert!(toml_str.contains("mode = \"release\""), "{toml_str}");
         assert!(toml_str.contains("tag = \"v0.5.2\""), "{toml_str}");
@@ -11049,10 +10955,11 @@ sha256 = "malformed"
         let loaded =
             LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(loaded.provider[0].kind, lock.provider[0].kind);
+        assert_eq!(loaded.to_toml_string().unwrap(), toml_str);
     }
 
     #[test]
-    fn github_release_entry_without_asset_id_is_malformed_not_legacy() {
+    fn github_release_entry_without_asset_id_is_rejected() {
         let error = LockFile::from_toml_str(
             r#"version = 5
 
@@ -11068,7 +10975,8 @@ sha256 = "abc"
         )
         .unwrap_err();
 
-        assert!(matches!(error, LockFileError::Parse { .. }));
+        assert!(matches!(&error, LockFileError::Parse { .. }));
+        assert!(error.to_string().contains("asset_id"), "{error}");
     }
 
     /// Registry-revision mode records both the originating branch and resolved
@@ -11080,8 +10988,8 @@ sha256 = "abc"
             registry_host: BTreeMap::new(),
             provider: vec![LockEntry {
                 name: "aws".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::RegistryRevision {
+                    source: registry_source("carina-rs/aws"),
                     revision: "main".into(),
                     version: "0.0.0-main.10.bbb".into(),
                 },
@@ -11092,6 +11000,19 @@ sha256 = "abc"
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let toml_str = lock.to_toml_string().unwrap();
+        assert_eq!(
+            toml_str,
+            r#"version = 5
+
+[[provider]]
+name = "aws"
+source = "carina-rs/aws"
+mode = "registryrevision"
+revision = "main"
+version = "0.0.0-main.10.bbb"
+sha256 = "abc123"
+"#
+        );
         assert!(
             toml_str.contains("mode = \"registryrevision\""),
             "serialized form should tag the variant: {toml_str}"
@@ -11105,6 +11026,7 @@ sha256 = "abc"
         let loaded =
             LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(loaded.provider[0].kind, lock.provider[0].kind);
+        assert_eq!(loaded.to_toml_string().unwrap(), toml_str);
     }
 
     /// Revision-mode round-trip with the new tag. Note no `version` field.
@@ -11122,6 +11044,20 @@ sha256 = "abc"
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let toml_str = lock.to_toml_string().unwrap();
+        assert_eq!(
+            toml_str,
+            r#"version = 5
+
+[[provider]]
+name = "awscc"
+source = "github.com/carina-rs/carina-provider-awscc"
+mode = "revision"
+revision = "main"
+resolved_sha = "81b6910fb34e84784daac2a02c915e821b2da570"
+artifact_id = 42
+sha256 = "abc"
+"#
+        );
         assert!(
             toml_str.contains("mode = \"revision\""),
             "serialized form should tag the variant: {toml_str}"
@@ -11134,6 +11070,7 @@ sha256 = "abc"
         let loaded =
             LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
         assert_eq!(loaded.provider[0].kind, lock.provider[0].kind);
+        assert_eq!(loaded.to_toml_string().unwrap(), toml_str);
     }
 
     #[test]
@@ -11143,8 +11080,9 @@ sha256 = "abc"
             registry_host: BTreeMap::new(),
             provider: vec![LockEntry {
                 name: "test".into(),
-                source: "file:///tmp/my-provider.wasm".into(),
-                kind: LockEntryKind::File,
+                kind: LockEntryKind::File {
+                    source: test_file_source("file:///tmp/my-provider.wasm"),
+                },
                 sha256: "abc".into(),
                 registry: None,
             }],
@@ -11152,11 +11090,23 @@ sha256 = "abc"
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let toml_str = lock.to_toml_string().unwrap();
+        assert_eq!(
+            toml_str,
+            r#"version = 5
+
+[[provider]]
+name = "test"
+source = "file:///tmp/my-provider.wasm"
+mode = "file"
+sha256 = "abc"
+"#
+        );
         assert!(toml_str.contains("mode = \"file\""), "{toml_str}");
 
         let loaded =
             LockFile::from_toml_str(&toml_str, Path::new("carina-providers.lock")).unwrap();
-        assert_eq!(loaded.provider[0].kind, LockEntryKind::File);
+        assert_eq!(loaded.provider[0].kind, lock.provider[0].kind);
+        assert_eq!(loaded.to_toml_string().unwrap(), toml_str);
     }
 
     #[test]
@@ -11278,8 +11228,8 @@ hosts = ["z.example.com", "**.example.com", "a.example.com"]
         };
         let entry = LockEntry {
             name: "aws".into(),
-            source: source.to_string(),
             kind: LockEntryKind::Version {
+                source: registry_source(source.as_str()),
                 version: version.into(),
                 constraint: Some(format!("={version}")),
             },
@@ -11374,8 +11324,8 @@ hosts = ["z.example.com", "**.example.com", "a.example.com"]
         for (index, load) in loads.into_iter().enumerate() {
             lock.provider.push(LockEntry {
                 name: format!("mock-{index}"),
-                source: source.into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source(source),
                     version: format!("1.0.{index}"),
                     constraint: Some(format!("=1.0.{index}")),
                 },
@@ -11582,15 +11532,17 @@ hosts = ["*.com"]
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "provider-a".into(),
-            source: "file://mock-http.wasm".into(),
-            kind: LockEntryKind::File,
+            kind: LockEntryKind::File {
+                source: test_file_source("file://mock-http.wasm"),
+            },
             sha256: "provider-a-sha256".into(),
             registry: None,
         });
         lock.upsert(LockEntry {
             name: "provider-b".into(),
-            source: "file://project/mock-http.wasm".into(),
-            kind: LockEntryKind::File,
+            kind: LockEntryKind::File {
+                source: test_file_source("file://project/mock-http.wasm"),
+            },
             sha256: "provider-b-sha256".into(),
             registry: None,
         });
@@ -12221,6 +12173,7 @@ sha256 = "abc"
                         name: "aws".into(),
                         source: source_key,
                         kind: LockEntryKind::Version {
+                            source: source.clone(),
                             version: "0.5.0".into(),
                             constraint: None,
                         },
@@ -12296,6 +12249,7 @@ sha256 = "abc"
                     name: "aws".into(),
                     source: source_key,
                     kind: LockEntryKind::Version {
+                        source: source.clone(),
                         version: "0.5.0".into(),
                         constraint: None,
                     },
@@ -12362,6 +12316,7 @@ sha256 = "abc"
                         name: "aws".into(),
                         source: source_key.clone(),
                         kind: LockEntryKind::Version {
+                            source: source.clone(),
                             version: "0.5.0".into(),
                             constraint: None,
                         },
@@ -12563,7 +12518,7 @@ sha256 = "abc"
             let error = LockFile::from_toml_str(&format!("version = {found}\n"), path)
                 .expect_err("only the current lock format may be loaded");
             assert!(
-                matches!(&error, LockFileError::UnsupportedVersion { path: actual, found: actual_found, supported: LockFile::CURRENT_VERSION } if actual == path && *actual_found == found)
+                matches!(&error, LockFileError::UnsupportedVersion { path: actual, found: actual_found, supported: LockFile::CURRENT_VERSION, .. } if actual == path && *actual_found == found)
             );
             let rendered = error.to_string();
             assert!(rendered.contains(&path.display().to_string()), "{rendered}");
@@ -12584,16 +12539,58 @@ sha256 = "abc"
     }
 
     #[test]
+    fn unsupported_lock_version_hint_uses_the_supplied_project_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = ResolvedPath::new(dir.path()).unwrap();
+        let path = Path::new("separate-lock-location/carina-providers.lock");
+        let error = LockFile::parse_toml_str("version = 3\n", path, &project).unwrap_err();
+        assert!(
+            matches!(&error, LockFileError::UnsupportedVersion { project_dir, .. }
+            if *project_dir == project.source_label())
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&ProjectCommand::new("init", dir.path()).to_string()),
+            "{error}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("carina init separate-lock-location"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn lock_load_rejects_pre_4020_v5_entries() {
         let path = Path::new("carina-providers.lock");
-        for fixture in [
-            include_str!("../tests/fixtures/rejected-github-version.toml"),
-            include_str!("../tests/fixtures/rejected-github-revision.toml"),
+        for (fixture, reason, current) in [
+            (
+                include_str!("../tests/fixtures/rejected-github-version.toml"),
+                "registry pin requires a registry source",
+                include_str!("../tests/fixtures/rejected-github-version.toml").replace(
+                    "mode = \"version\"",
+                    "mode = \"release\"\ntag = \"v1.0.0\"\nasset_id = 42",
+                ),
+            ),
+            (
+                include_str!("../tests/fixtures/rejected-github-revision.toml"),
+                "artifact_id",
+                format!(
+                    "{}\nartifact_id = 42\n",
+                    include_str!("../tests/fixtures/rejected-github-revision.toml")
+                ),
+            ),
         ] {
             let error = LockFile::from_toml_str(fixture, path)
                 .expect_err("GitHub locks require an exact artifact identity");
-            assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+            let LockFileError::Parse { source, .. } = &error else {
+                panic!("{error}")
+            };
+            assert!(source.to_string().contains(reason), "{error}");
             assert!(error.to_string().contains("hint:"), "{error}");
+            LockFile::from_toml_str(&current, path).expect("the current pin must load");
         }
     }
 
@@ -12604,15 +12601,85 @@ sha256 = "abc"
             include_str!("../tests/fixtures/rejected-provider-signer.toml"),
             include_str!("../tests/fixtures/rejected-unpinned-signer.toml"),
         ] {
-            for fixture in [
-                fixture.to_string(),
-                fixture.replace("required_legacy", "required_unpinned"),
+            for (fixture, reason) in [
+                (fixture.to_string(), "required_legacy"),
+                (
+                    fixture.replace("required_legacy", "required_unpinned"),
+                    "legacy_certificate_identity",
+                ),
             ] {
                 let error = LockFile::from_toml_str(&fixture, path)
                     .expect_err("signer pins must use the current identity schema");
-                assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+                let LockFileError::Parse { source, .. } = &error else {
+                    panic!("{error}")
+                };
+                assert!(source.to_string().contains(reason), "{error}");
                 assert!(error.to_string().contains("hint:"), "{error}");
+
+                // Replace only the obsolete signer encoding, retaining all
+                // other provider, host, and ratchet fields from the fixture.
+                let current = fixture.lines()
+                    .filter(|line| !line.starts_with("legacy_"))
+                    .map(|line| if line.starts_with("signature_state =") {
+                        "signature_state = \"required_current\"\nsource_oidc_issuer = \"https://token.actions.githubusercontent.com\"\nsource_repository_owner_id = \"260157389\"\nsource_repository_id = \"123\"\nstable_workflow = \"https://github.com/carina-rs/carina/.github/workflows/release.yml\""
+                    } else { line })
+                    .collect::<Vec<_>>().join("\n");
+                LockFile::from_toml_str(&current, path).expect("the current signer must load");
             }
+        }
+    }
+
+    #[test]
+    fn lock_load_rejects_mismatched_source_pin_pairings() {
+        for (mode, invalid_source, valid_source, fields, reason) in [
+            (
+                "release",
+                "carina-rs/aws",
+                "github.com/acme/widget",
+                "version = \"1.0.0\"\ntag = \"v1.0.0\"\nasset_id = 42",
+                "GitHub pin requires a GitHub source",
+            ),
+            (
+                "revision",
+                "carina-rs/aws",
+                "github.com/acme/widget",
+                "revision = \"main\"\nresolved_sha = \"0123456789abcdef0123456789abcdef01234567\"\nartifact_id = 42",
+                "GitHub pin requires a GitHub source",
+            ),
+            (
+                "registryrevision",
+                "github.com/acme/widget",
+                "carina-rs/aws",
+                "revision = \"main\"\nversion = \"1.0.0\"",
+                "registry pin requires a registry source",
+            ),
+            (
+                "file",
+                "carina-rs/aws",
+                "file://widget.wasm",
+                "",
+                "file pin requires a file source",
+            ),
+            (
+                "version",
+                "file://widget.wasm",
+                "carina-rs/aws",
+                "version = \"1.0.0\"",
+                "registry pin requires a registry source",
+            ),
+        ] {
+            let fixture = format!(
+                "version = 5\n\n[[provider]]\nname = \"widget\"\nsource = {invalid_source:?}\nmode = {mode:?}\nsha256 = \"abc\"\n{fields}\n"
+            );
+            let path = Path::new("carina-providers.lock");
+            let error = LockFile::from_toml_str(&fixture, path)
+                .expect_err("source kind must match pin mode");
+            let LockFileError::Parse { source, .. } = &error else {
+                panic!("{mode}: {error}")
+            };
+            assert!(source.to_string().contains(reason), "{mode}: {error}");
+            let current = fixture.replace(invalid_source, valid_source);
+            LockFile::from_toml_str(&current, path).expect("matching source kind must load");
         }
     }
 
@@ -13079,8 +13146,8 @@ discovery_pin_present = true
             .copied()
             .map(|(name, source, version, sha256)| LockEntry {
                 name: name.into(),
-                source: source.into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source(source),
                     version: version.into(),
                     constraint: None,
                 },
@@ -13620,8 +13687,8 @@ transparency_log_present = false
             ),
             provider: vec![LockEntry {
                 name: "aws".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source("carina-rs/aws"),
                     version: "0.5.0".into(),
                     constraint: None,
                 },
@@ -13931,10 +13998,7 @@ transparency_log_present = false
         else {
             panic!("fixture must carry a current signer pin");
         };
-        assert_eq!(
-            recovery.identity_pin(),
-            &DiscardedSignerPins::Current(before_pin.clone())
-        );
+        assert_eq!(recovery.identity_pin(), &before_pin.clone());
         recovery.commit().unwrap();
 
         assert!(lock.provider[0].registry.is_none());
@@ -13974,7 +14038,7 @@ transparency_log_present = false
         let recovery = lock
             .prepare_registry_identity_repin("carina-rs/aws")
             .unwrap();
-        assert_eq!(recovery.identity_pin(), &DiscardedSignerPins::Current(pins));
+        assert_eq!(recovery.identity_pin(), &pins);
         recovery.commit().unwrap();
 
         let after = lock.provider[0].registry.as_ref().unwrap();
@@ -14003,14 +14067,14 @@ transparency_log_present = false
         let preview = recovery.identity_pin().clone();
         assert_eq!(
             preview,
-            DiscardedSignerPins::Current(CurrentSignerPins {
+            CurrentSignerPins {
                 source: SourcePin {
                     oidc_issuer: "issuer-a".into(),
                     repository_owner_id: "owner".into(),
                     repository_id: "identity-a".into(),
                 },
                 workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
-            })
+            }
         );
         recovery.commit().unwrap();
 
@@ -14150,8 +14214,8 @@ transparency_log_present = false
         let mut lock = lock_with_registry_security_state(signature_pin("identity-a", "issuer-a"));
         lock.provider.push(LockEntry {
             name: "random".into(),
-            source: "carina-rs/random".into(),
             kind: LockEntryKind::Version {
+                source: registry_source("carina-rs/random"),
                 version: "1.0.0".into(),
                 constraint: Some("^1".into()),
             },
@@ -15488,8 +15552,8 @@ transparency_log_present = true
         lock.upsert_registry(
             LockEntry {
                 name: "aws".into(),
-                source: source.into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source(source),
                     version: "0.5.0".into(),
                     constraint: None,
                 },
@@ -15563,6 +15627,7 @@ transparency_log_present = true
                     name: name.into(),
                     source: source_key(source),
                     kind: LockEntryKind::Version {
+                        source: registry_source.clone(),
                         version: "1.0.0".into(),
                         constraint: None,
                     },
@@ -15583,7 +15648,7 @@ transparency_log_present = true
                     lock.registry_host
                         .contains_key(registry.resolved_hostname()),
                     "registry provider {:?} references missing host {:?}",
-                    entry.source,
+                    entry.source(),
                     registry.resolved_hostname()
                 );
             }
@@ -15613,8 +15678,8 @@ transparency_log_present = true
         lock.upsert_registry(
             LockEntry {
                 name: "aws".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source("carina-rs/aws"),
                     version: "0.5.0".into(),
                     constraint: None,
                 },
@@ -15637,8 +15702,8 @@ transparency_log_present = true
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: "0.6.0".into(),
                         constraint: None,
                     },
@@ -15658,31 +15723,32 @@ transparency_log_present = true
             .expect_err("a conflicting identity pin must be rejected");
         assert_eq!(
             *hostile.left,
-            DiscardedSignerPins::Current(CurrentSignerPins {
+            CurrentSignerPins {
                 source: SourcePin {
                     oidc_issuer: "EVIL-issuer".into(),
                     repository_owner_id: "owner".into(),
                     repository_id: "EVIL".into()
                 },
                 workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
-            })
+            }
         );
         assert_eq!(
             *hostile.right,
-            DiscardedSignerPins::Current(CurrentSignerPins {
+            CurrentSignerPins {
                 source: SourcePin {
                     oidc_issuer: "issuer-a".into(),
                     repository_owner_id: "owner".into(),
                     repository_id: "id-a".into()
                 },
                 workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
-            })
+            }
         );
 
         let entry = lock.find_by_source("carina-rs/aws").unwrap();
         assert_eq!(
             entry.kind,
             LockEntryKind::Version {
+                source: registry_source("carina-rs/aws"),
                 version: "0.5.0".into(),
                 constraint: None,
             },
@@ -15838,8 +15904,8 @@ transparency_log_present = true
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::RegistryRevision {
+                source: registry_source(source),
                 revision: "main".into(),
                 version: "0.0.0-main.10.bbb".into(),
             },
@@ -15907,7 +15973,12 @@ transparency_log_present = true
             .unwrap()
             .unwrap();
         let entry = lock.find_by_source(&source).unwrap();
-        assert_eq!(entry.kind, LockEntryKind::File);
+        assert_eq!(
+            entry.kind,
+            LockEntryKind::File {
+                source: test_file_source(&source)
+            }
+        );
         assert!(!entry.sha256.is_empty());
     }
 
@@ -15982,7 +16053,12 @@ hosts = ["api.example.com"]
             .unwrap()
             .expect("a Locked run must still save non-revision lock state");
         let entry = lock.find_by_source(&source).unwrap();
-        assert_eq!(entry.kind, LockEntryKind::File);
+        assert_eq!(
+            entry.kind,
+            LockEntryKind::File {
+                source: test_file_source(&source)
+            }
+        );
         assert_eq!(entry.sha256, sha256_bytes(wasm));
     }
 
@@ -15995,8 +16071,8 @@ hosts = ["api.example.com"]
         lock.upsert_registry(
             LockEntry {
                 name: "awscc".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source("carina-rs/aws"),
                     version: SIGNED_FIXTURE_VERSION.into(),
                     constraint: None,
                 },
@@ -17665,8 +17741,8 @@ hosts = ["api.example.com"]
             let mut lock_file = LockFile::default();
             lock_file.upsert(LockEntry {
                 name: "awscc".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source("carina-rs/aws"),
                     version: "0.5.0".into(),
                     constraint: None,
                 },
@@ -18329,8 +18405,8 @@ hosts = ["api.example.com"]
             ),
             provider: vec![LockEntry {
                 name: "aws".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::Version {
+                    source: registry_source("carina-rs/aws"),
                     version: CAPTURED_AWS_STABLE_VERSION.into(),
                     constraint: None,
                 },
@@ -18551,8 +18627,8 @@ hosts = ["api.example.com"]
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: SIGNED_FIXTURE_VERSION.into(),
                         constraint: None,
                     },
@@ -19471,6 +19547,7 @@ transparency_log_present = false
         assert_eq!(
             entry.kind,
             LockEntryKind::RegistryRevision {
+                source: registry_source("carina-rs/aws"),
                 revision: "main".into(),
                 version: "0.0.0-main.10.bbb".into(),
             }
@@ -19489,8 +19566,8 @@ transparency_log_present = false
         lock.upsert_registry(
             LockEntry {
                 name: "aws".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::RegistryRevision {
+                    source: registry_source("carina-rs/aws"),
                     revision: "main".into(),
                     version: "0.0.0-main.1.aaa".into(),
                 },
@@ -19554,6 +19631,7 @@ transparency_log_present = false
         assert_eq!(
             lock.find_by_source("carina-rs/aws").unwrap().kind,
             LockEntryKind::RegistryRevision {
+                source: registry_source("carina-rs/aws"),
                 revision: "main".into(),
                 version: "0.0.0-main.10.bbb".into(),
             }
@@ -19571,8 +19649,8 @@ transparency_log_present = false
             lock.upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::RegistryRevision {
+                        source: registry_source("carina-rs/aws"),
                         revision: "main".into(),
                         version: "0.0.0-main.1.aaa".into(),
                     },
@@ -19644,8 +19722,8 @@ transparency_log_present = false
         lock.upsert_registry(
             LockEntry {
                 name: "aws".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::RegistryRevision {
+                    source: registry_source("carina-rs/aws"),
                     revision: "main".into(),
                     version: "0.0.0-main.1.aaa".into(),
                 },
@@ -19718,8 +19796,8 @@ transparency_log_present = false
         lock.upsert_registry(
             LockEntry {
                 name: "aws".into(),
-                source: "carina-rs/aws".into(),
                 kind: LockEntryKind::RegistryRevision {
+                    source: registry_source("carina-rs/aws"),
                     revision: "main".into(),
                     version: "0.0.0-main.1.aaa".into(),
                 },
@@ -19891,8 +19969,8 @@ transparency_log_present = false
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: "0.5.0".into(),
                         constraint: None,
                     },
@@ -19962,8 +20040,8 @@ transparency_log_present = false
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: "0.5.0".into(),
                         constraint: None,
                     },
@@ -20033,8 +20111,8 @@ transparency_log_present = false
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: "0.5.0".into(),
                         constraint: None,
                     },
@@ -20081,8 +20159,8 @@ transparency_log_present = false
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: "0.5.0".into(),
                         constraint: None,
                     },
@@ -20138,8 +20216,8 @@ transparency_log_present = false
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: "0.5.0".into(),
                         constraint: None,
                     },
@@ -20215,8 +20293,8 @@ transparency_log_present = false
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: "0.5.0".into(),
                         constraint: None,
                     },
@@ -20277,8 +20355,8 @@ transparency_log_present = false
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: "0.5.0".into(),
                         constraint: None,
                     },
@@ -20325,8 +20403,8 @@ transparency_log_present = false
 
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: "carina-rs/aws".into(),
             kind: LockEntryKind::Version {
+                source: registry_source("carina-rs/aws"),
                 version: "0.6.0".into(),
                 constraint: None,
             },
@@ -20335,7 +20413,7 @@ transparency_log_present = false
         });
 
         assert_eq!(lock_file.provider.len(), 1);
-        assert_eq!(lock_file.provider[0].source, "carina-rs/aws");
+        assert_eq!(lock_file.provider[0].source(), "carina-rs/aws");
     }
 
     #[test]
@@ -20382,7 +20460,7 @@ transparency_log_present = false
                 .as_path()
             );
             assert_eq!(lock_file.provider.len(), 1);
-            assert_eq!(lock_file.provider[0].source, "carina-rs/aws");
+            assert_eq!(lock_file.provider[0].source(), "carina-rs/aws");
         }
     }
 
@@ -20426,7 +20504,7 @@ transparency_log_present = false
 
             assert_eq!(resolved_path, installed_path);
             assert_eq!(saved_lock.provider.len(), 1);
-            assert_eq!(saved_lock.provider[0].source, "carina-rs/aws");
+            assert_eq!(saved_lock.provider[0].source(), "carina-rs/aws");
             assert!(
                 matches!(
                     &saved_lock.provider[0].kind,
@@ -20479,7 +20557,7 @@ transparency_log_present = false
 
             assert_eq!(resolved.get("awscc"), Some(&installed_path));
             assert_eq!(saved_lock.provider.len(), 1);
-            assert_eq!(saved_lock.provider[0].source, "carina-rs/aws");
+            assert_eq!(saved_lock.provider[0].source(), "carina-rs/aws");
             assert!(
                 matches!(
                     &saved_lock.provider[0].kind,
@@ -20508,8 +20586,8 @@ transparency_log_present = false
             .upsert_registry(
                 LockEntry {
                     name: "aws".into(),
-                    source: "carina-rs/aws".into(),
                     kind: LockEntryKind::Version {
+                        source: registry_source("carina-rs/aws"),
                         version: "0.5.0".into(),
                         constraint: None,
                     },
@@ -20766,8 +20844,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "widget".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag,
                 asset_id: release_asset_id(42),
@@ -20884,8 +20962,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(tag.into()),
                 asset_id: release_asset_id(42),
@@ -20965,8 +21043,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag,
                 asset_id: release_asset_id(42),
@@ -21030,8 +21108,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock("v0.1.0".into()),
                 asset_id: release_asset_id(42),
@@ -21117,7 +21195,7 @@ transparency_log_present = false
             .unwrap();
         assert!(matches!(
             &saved.find_by_source(source).unwrap().kind,
-            LockEntryKind::GithubRelease {
+            LockEntryKind::GithubRelease { source: _,
                 version,
                 tag,
                 asset_id,
@@ -21188,8 +21266,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "widget".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock("v1.0.0".into()),
                 asset_id: release_asset_id(111),
@@ -21228,7 +21306,7 @@ transparency_log_present = false
             .unwrap();
         assert!(matches!(
             &saved.find_by_source(source).unwrap().kind,
-            LockEntryKind::GithubRelease {
+            LockEntryKind::GithubRelease { source: _,
                 version: saved_version,
                 tag,
                 asset_id,
@@ -21258,8 +21336,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse("0.1.0").unwrap(),
                 tag: ReleaseTag::from_lock("v0.1.0".into()),
                 asset_id: release_asset_id(42),
@@ -21323,8 +21401,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -21514,8 +21592,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -21574,8 +21652,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -21638,8 +21716,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -21688,7 +21766,7 @@ transparency_log_present = false
         assert_eq!(entry.sha256, expected_sha256);
         assert!(matches!(
             &entry.kind,
-            LockEntryKind::GithubRelease {
+            LockEntryKind::GithubRelease { source: _,
                 version: locked_version,
                 tag: _,
                 asset_id: _,
@@ -21724,8 +21802,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -21876,8 +21954,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -21933,8 +22011,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -21963,7 +22041,7 @@ transparency_log_present = false
         assert_eq!(entry.sha256, expected_sha256);
         assert!(matches!(
             &entry.kind,
-            LockEntryKind::GithubRelease {
+            LockEntryKind::GithubRelease { source: _,
                 version: locked_version,
                 tag: _,
                 asset_id: _,
@@ -22082,8 +22160,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -22188,6 +22266,7 @@ transparency_log_present = false
                         cache_path_wasm(&project, &source_key(source), version),
                         ".carina/providers/github.com/example/provider-widget/1.0.0/provider-widget.wasm",
                         LockEntryKind::GithubRelease {
+                            source: github_source(source),
                             version: Version::parse(version).unwrap(),
                             tag: ReleaseTag::from_lock(format!("v{version}")),
                             asset_id: release_asset_id(42),
@@ -22203,6 +22282,7 @@ transparency_log_present = false
                         ),
                         ".carina/providers/github.com/example/provider-widget/rev-abc123def456/provider-widget.wasm",
                         LockEntryKind::Revision {
+                            source: github_source(source),
                             revision: "main".into(),
                             resolved_sha: sha.clone(),
                             artifact_id: ArtifactId::from_lock(42),
@@ -22221,7 +22301,12 @@ transparency_log_present = false
                             config,
                             artifact,
                             ".carina/providers/file/local/local.wasm",
-                            LockEntryKind::File,
+                            LockEntryKind::File {
+                                source: test_file_source(&format!(
+                                    "file://{}",
+                                    source_path.display()
+                                )),
+                            },
                         )
                     }
                     _ => unreachable!(),
@@ -22231,7 +22316,6 @@ transparency_log_present = false
                 let mut lock = LockFile::default();
                 lock.upsert(LockEntry {
                     name: config.name.clone(),
-                    source: config.source.as_ref().unwrap().to_string(),
                     kind,
                     sha256: sha256_bytes(bytes),
                     registry: None,
@@ -22298,8 +22382,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -22338,8 +22422,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -22389,8 +22473,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -22675,8 +22759,8 @@ transparency_log_present = false
                     let version = "0.1.0";
                     lock.upsert(LockEntry {
                         name: config.name.clone(),
-                        source: remote_source.source_key().to_string(),
                         kind: LockEntryKind::GithubRelease {
+                            source: github_source(remote_source.source_key().as_str()),
                             version: Version::parse(version).unwrap(),
                             tag: ReleaseTag::from_lock(format!("v{version}")),
                             asset_id: release_asset_id(42),
@@ -22744,8 +22828,7 @@ transparency_log_present = false
         let installed = resolve_file_provider(
             &guard,
             "local",
-            &format!("file://{file_path}"),
-            file_path,
+            &test_file_source(&format!("file://{file_path}")),
             &mut lock,
         )
         .expect("init must install inside a project with non-UTF-8 path bytes");
@@ -23170,8 +23253,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -23237,8 +23320,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -23314,8 +23397,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -23395,8 +23478,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -23469,8 +23552,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::Revision {
+                source: github_source(source),
                 revision: revision.into(),
                 resolved_sha,
                 artifact_id: ArtifactId::from_lock(42),
@@ -23590,8 +23673,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "widget".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -23726,8 +23809,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::GithubRelease {
+                source: github_source(source),
                 version: Version::parse(version).unwrap(),
                 tag: ReleaseTag::from_lock(format!("v{version}")),
                 asset_id: release_asset_id(42),
@@ -23820,8 +23903,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::RegistryRevision {
+                source: registry_source(source),
                 revision: "main".into(),
                 version: version.into(),
             },
@@ -24015,8 +24098,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::RegistryRevision {
+                source: registry_source(source),
                 revision: "main".into(),
                 version: "0.0.0-main.1.aaa".into(),
             },
@@ -24034,8 +24117,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::RegistryRevision {
+                source: registry_source(source),
                 revision: "dev".into(),
                 version: "0.0.0-dev.1.aaa".into(),
             },
@@ -24056,8 +24139,8 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: LockEntryKind::RegistryRevision {
+                source: registry_source(source),
                 revision: "main".into(),
                 version: "0.0.0-main.10.bbb".into(),
             },
@@ -24225,8 +24308,9 @@ transparency_log_present = false
         let mut lock = LockFile::default();
         lock.upsert(LockEntry {
             name: "test".into(),
-            source: "file:///tmp/provider.wasm".into(),
-            kind: LockEntryKind::File,
+            kind: LockEntryKind::File {
+                source: test_file_source("file:///tmp/provider.wasm"),
+            },
             sha256: "abc".into(),
             registry: None,
         });

@@ -504,9 +504,23 @@ mod tests {
             .filter(|(key, _)| key.as_str() == "signature_state" || key.starts_with("legacy_"))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        record["signer"] = serde_json::to_value(signer).unwrap();
-        for state in ["required_legacy", "required_unpinned"] {
-            record["signer"]["signature_state"] = state.into();
+        let obsolete_signer = serde_json::to_value(signer).unwrap();
+        for (signer, reason) in [
+            (obsolete_signer.clone(), "legacy_certificate_identity"),
+            (
+                {
+                    let mut signer = obsolete_signer;
+                    signer["signature_state"] = "required_unpinned".into();
+                    signer
+                },
+                "legacy_certificate_identity",
+            ),
+            (
+                serde_json::json!({"signature_state": "required_legacy"}),
+                "required_legacy",
+            ),
+        ] {
+            record["signer"] = signer;
             let contents = serde_json::to_vec(&record).unwrap();
             let error = UserTrustRecord::parse_at(&path, &contents).unwrap_err();
             assert!(
@@ -514,6 +528,11 @@ mod tests {
                     .to_string()
                     .contains("Failed to parse provider trust record"),
                 "{error}"
+            );
+            assert!(
+                error.display_chain().contains(reason),
+                "{}",
+                error.display_chain()
             );
             fs::write(&path, contents).unwrap();
             let error = load_user_verified_identity(&user_dirs, &sha256, &source).unwrap_err();
@@ -523,6 +542,27 @@ mod tests {
                     .contains("Failed to parse provider trust record"),
                 "{error}"
             );
+            assert!(
+                error.display_chain().contains(reason),
+                "{}",
+                error.display_chain()
+            );
+
+            let mut current = record.clone();
+            current["signer"] = serde_json::json!({
+                "signature_state": "required_current",
+                "source_oidc_issuer": "https://token.actions.githubusercontent.com",
+                "source_repository_owner_id": "260157389",
+                "source_repository_id": "123",
+                "stable_workflow": "https://github.com/carina-rs/carina/.github/workflows/release.yml"
+            });
+            let contents = serde_json::to_vec(&current).unwrap();
+            UserTrustRecord::parse_at(&path, &contents).expect("current signer must parse");
+            fs::write(&path, contents).unwrap();
+            let identity = load_user_verified_identity(&user_dirs, &sha256, &source)
+                .expect("current signer must load")
+                .unwrap();
+            assert!(identity.signer().is_some());
         }
     }
 

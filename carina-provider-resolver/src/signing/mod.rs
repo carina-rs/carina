@@ -34,6 +34,7 @@ pub(crate) struct SourceIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExtractedSignerIdentity {
+    #[cfg(test)]
     certificate_san: String,
     source: SourceIdentity,
     source_ref: String,
@@ -71,7 +72,7 @@ impl VerifiedSignerIdentity {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn for_test(
-        certificate_san: &str,
+        _certificate_san: &str,
         oidc_issuer: &str,
         repository_owner_id: &str,
         repository_id: &str,
@@ -80,7 +81,8 @@ impl VerifiedSignerIdentity {
         repository_digest: Option<&str>,
     ) -> Self {
         Self(ExtractedSignerIdentity {
-            certificate_san: certificate_san.to_string(),
+            #[cfg(test)]
+            certificate_san: _certificate_san.to_string(),
             source: SourceIdentity {
                 oidc_issuer: oidc_issuer.to_string(),
                 repository_owner_id: repository_owner_id.to_string(),
@@ -165,6 +167,7 @@ fn extract_signer_identity(certificate: &Certificate) -> Result<ExtractedSignerI
         .to_string();
 
     Ok(ExtractedSignerIdentity {
+        #[cfg(test)]
         certificate_san: certificate_san.to_string(),
         source: SourceIdentity {
             oidc_issuer,

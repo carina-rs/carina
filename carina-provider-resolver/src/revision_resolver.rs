@@ -1279,10 +1279,6 @@ mod verified_revision_artifact {
             &self.path
         }
 
-        pub(super) fn source(&self) -> &RemoteSourceKey {
-            &self.source
-        }
-
         pub(super) fn name(&self) -> &str {
             &self.name
         }
@@ -1460,14 +1456,15 @@ mod verified_revision_artifact {
 use verified_revision_artifact::{PublishedRevisionArtifact, VerifiedRevisionArtifact};
 
 fn revision_lock_entry(
+    source: &GithubSource,
     artifact: &VerifiedRevisionArtifact,
     revision: &str,
     resolved_sha: &CommitSha,
 ) -> crate::provider_resolver::LockEntry {
     crate::provider_resolver::LockEntry {
         name: artifact.name().to_string(),
-        source: artifact.source().to_string(),
         kind: crate::provider_resolver::LockEntryKind::Revision {
+            source: source.clone(),
             revision: revision.to_string(),
             resolved_sha: resolved_sha.clone(),
             artifact_id: artifact.artifact_id(),
@@ -1622,6 +1619,7 @@ where
     let sha = if mode != LockMode::Upgrade
         && let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
         && let super::provider_resolver::LockEntryKind::Revision {
+            source: _,
             revision: locked_revision,
             resolved_sha,
             artifact_id: _,
@@ -1674,6 +1672,7 @@ where
         };
         if mode != LockMode::Locked {
             lock_file.upsert(revision_lock_entry(
+                source,
                 &verified,
                 &pin.revision,
                 &pin.resolved_sha,
@@ -1707,6 +1706,7 @@ where
         };
         if mode != LockMode::Locked {
             lock_file.upsert(revision_lock_entry(
+                source,
                 &verified,
                 &pin.revision,
                 &pin.resolved_sha,
@@ -1761,6 +1761,7 @@ where
         PublishedRevisionArtifact::Pinned { artifact, pin } => {
             if mode != LockMode::Locked {
                 lock_file.upsert(revision_lock_entry(
+                    source,
                     &artifact,
                     &pin.revision,
                     &pin.resolved_sha,
@@ -1774,7 +1775,7 @@ where
                     "Locked resolution for provider '{name}' has no matching revision entry"
                 ));
             }
-            lock_file.upsert(revision_lock_entry(&artifact, revision, &sha));
+            lock_file.upsert(revision_lock_entry(source, &artifact, revision, &sha));
             artifact
         }
     };
@@ -1809,6 +1810,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource {
+        use carina_core::provider_source::{ProviderSource, RemoteSource};
+        let ProviderSource::Remote(RemoteSource::GithubDirect(source)) = value.parse().unwrap()
+        else {
+            panic!("expected github source: {value}");
+        };
+        source
+    }
+
     use super::*;
     use crate::github::{FixtureGithubHttp, GithubRequest};
     use crate::provider_resolver::{LockEntry, RegistryLock, sha256_file};
@@ -1982,8 +1992,8 @@ mod tests {
         std::fs::write(&artifact_path, b"actual").unwrap();
         let lock_entry: LockEntry<RegistryLock> = LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2040,8 +2050,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(crate::provider_resolver::LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2102,8 +2112,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2154,8 +2164,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(crate::provider_resolver::LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2252,8 +2262,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(crate::provider_resolver::LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2358,8 +2368,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2449,8 +2459,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2930,8 +2940,8 @@ mod tests {
         .unwrap();
         let lock_entry: LockEntry<RegistryLock> = LockEntry {
             name: "aws".into(),
-            source: source.to_string(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: source.clone(),
                 revision: "main".into(),
                 resolved_sha: sha.clone(),
                 artifact_id: test_artifact_id(42),
@@ -3574,8 +3584,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -3627,8 +3637,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -3682,8 +3692,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -3776,8 +3786,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -3963,8 +3973,8 @@ mod tests {
             let mut lock_file = crate::provider_resolver::LockFile::default();
             lock_file.upsert(LockEntry {
                 name: "aws".into(),
-                source: TEST_SOURCE.into(),
                 kind: crate::provider_resolver::LockEntryKind::Revision {
+                    source: test_github_source(TEST_SOURCE),
                     revision: "main".into(),
                     resolved_sha: test_sha(),
                     artifact_id: test_artifact_id(42),
@@ -4044,6 +4054,7 @@ mod tests {
             };
             let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
             guarded.upsert(revision_lock_entry(
+                &source,
                 &verified,
                 &verified_pin.revision,
                 &verified_pin.resolved_sha,
@@ -4069,8 +4080,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4120,8 +4131,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4176,8 +4187,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4232,8 +4243,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4299,8 +4310,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4389,8 +4400,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4455,8 +4466,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4511,8 +4522,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4584,8 +4595,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4722,8 +4733,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4783,8 +4794,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4854,8 +4865,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4912,8 +4923,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4975,8 +4986,8 @@ mod tests {
             let mut lock_file = crate::provider_resolver::LockFile::default();
             lock_file.upsert(LockEntry {
                 name: "aws".into(),
-                source: TEST_SOURCE.into(),
                 kind: crate::provider_resolver::LockEntryKind::Revision {
+                    source: test_github_source(TEST_SOURCE),
                     revision: "main".into(),
                     resolved_sha: test_sha(),
                     artifact_id: test_artifact_id(42),
@@ -5033,8 +5044,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -5096,8 +5107,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -5137,7 +5148,7 @@ mod tests {
         assert_eq!(entry.sha256, sha256_bytes(wasm));
         assert!(matches!(
             &entry.kind,
-            crate::provider_resolver::LockEntryKind::Revision {
+            crate::provider_resolver::LockEntryKind::Revision { source: _,
                 revision,
                 resolved_sha,
                 artifact_id,
@@ -5159,8 +5170,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -5202,7 +5213,7 @@ mod tests {
         assert_eq!(entry.sha256, sha256_bytes(moved_wasm));
         assert!(matches!(
             &entry.kind,
-            crate::provider_resolver::LockEntryKind::Revision {
+            crate::provider_resolver::LockEntryKind::Revision { source: _,
                 revision,
                 resolved_sha,
                 artifact_id,

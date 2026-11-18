@@ -1072,7 +1072,7 @@ impl VerifiedArtifact {
             return Err(VerifiedArtifactError::ChecksumMismatch(Box::new(
                 ChecksumMismatch {
                     provider_name: provider_name.to_string(),
-                    locked_source: lock_entry.source.clone(),
+                    locked_source: lock_entry.source(),
                     locked_identity: locked_identity.to_string(),
                     expected_sha256: lock_entry.sha256.clone(),
                     actual_sha256,
@@ -1102,6 +1102,7 @@ pub(crate) fn lookup_github_release_artifact_pin<'a>(
         .find_by_source_key_and_version(source, &version_string)
         .and_then(|entry| match &entry.kind {
             LockEntryKind::GithubRelease {
+                source: _,
                 version: locked_version,
                 tag: _,
                 asset_id: _,
@@ -1113,25 +1114,29 @@ pub(crate) fn lookup_github_release_artifact_pin<'a>(
                 },
             )),
             LockEntryKind::GithubRelease {
+                source: _,
                 version: _,
                 tag: _,
                 asset_id: _,
                 constraint: _,
             }
             | LockEntryKind::Version {
+                source: _,
                 version: _,
                 constraint: _,
             }
             | LockEntryKind::Revision {
+                source: _,
                 revision: _,
                 resolved_sha: _,
                 artifact_id: _,
             }
             | LockEntryKind::RegistryRevision {
+                source: _,
                 revision: _,
                 version: _,
             }
-            | LockEntryKind::File => None,
+            | LockEntryKind::File { .. } => None,
         });
     match pinned {
         Some((lock_entry, pin)) => ArtifactPin::Pinned {
@@ -1159,6 +1164,7 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
         .find_by_source_key_and_sha(source, resolved_sha)
         .and_then(|entry| match &entry.kind {
             LockEntryKind::Revision {
+                source: _,
                 revision: _,
                 resolved_sha: locked_sha,
                 artifact_id,
@@ -1171,20 +1177,23 @@ pub(crate) fn lookup_revision_artifact_pin<'a>(
                 },
             )),
             LockEntryKind::Version {
+                source: _,
                 version: _,
                 constraint: _,
             }
             | LockEntryKind::GithubRelease {
+                source: _,
                 version: _,
                 tag: _,
                 asset_id: _,
                 constraint: _,
             }
             | LockEntryKind::RegistryRevision {
+                source: _,
                 revision: _,
                 version: _,
             }
-            | LockEntryKind::File => None,
+            | LockEntryKind::File { .. } => None,
         });
     match pinned {
         Some((lock_entry, pin)) => ArtifactPin::Pinned {
@@ -1356,44 +1365,27 @@ fn lock_artifact_selection_with<'lock, R>(
     provider_name: &str,
     resolve_artifact: impl FnOnce(&WasmArtifactPath) -> io::Result<ResolvedPath>,
 ) -> Result<LockArtifactSelection<'lock, R>, String> {
-    let source = lock_entry
-        .source
-        .parse::<ProviderSource>()
-        .map_err(|error| format!("Invalid provider source in lock entry: {error}"))?;
-    let remote_source = match source {
-        ProviderSource::Remote(source) => source,
-        ProviderSource::File(_) => {
-            return Err(format!(
-                "Provider '{provider_name}' has file provenance and no remote project-cache path"
-            ));
-        }
-    };
-    let source_key = remote_source.source_key();
-
-    let (path, locked_identity, pin) = match (&lock_entry.kind, remote_source) {
-        (
-            LockEntryKind::Version {
-                version,
-                constraint,
-            },
+    let (path, locked_identity, pin, source_key) = match &lock_entry.kind {
+        LockEntryKind::Version {
             source,
-        ) => (
+            version,
+            constraint,
+        } => (
             cache_path_wasm(project_dir, &source.source_key(), version),
             version.clone(),
             LockedProviderPin::Version {
                 version: version.clone(),
                 constraint: constraint.clone(),
             },
+            source.source_key(),
         ),
-        (
-            LockEntryKind::GithubRelease {
-                version,
-                tag,
-                asset_id,
-                constraint,
-            },
-            RemoteSource::GithubDirect(source),
-        ) => (
+        LockEntryKind::GithubRelease {
+            source,
+            version,
+            tag,
+            asset_id,
+            constraint,
+        } => (
             cache_path_github_release(project_dir, &source.source_key(), version),
             version.to_string(),
             LockedProviderPin::GithubRelease {
@@ -1402,62 +1394,37 @@ fn lock_artifact_selection_with<'lock, R>(
                 asset_id: *asset_id,
                 constraint: constraint.clone(),
             },
+            source.source_key(),
         ),
-        (
-            LockEntryKind::GithubRelease {
-                version: _,
-                tag: _,
-                asset_id: _,
-                constraint: _,
-            },
-            RemoteSource::Registry(_source),
-        ) => {
-            return Err(format!(
-                "Provider '{provider_name}' has a GitHub release lock pin for a registry source"
-            ));
-        }
-        (LockEntryKind::RegistryRevision { revision, version }, source) => (
+        LockEntryKind::RegistryRevision {
+            source,
+            revision,
+            version,
+        } => (
             cache_path_wasm(project_dir, &source.source_key(), version),
             version.clone(),
             LockedProviderPin::RegistryRevision {
                 revision: revision.clone(),
                 version: version.clone(),
             },
+            source.source_key(),
         ),
-        (
-            LockEntryKind::Revision {
-                revision,
-                resolved_sha,
-                artifact_id,
-            },
-            RemoteSource::GithubDirect(source),
-        ) => (
-            cache_path_revision(project_dir, &source, resolved_sha),
+        LockEntryKind::Revision {
+            source,
+            revision,
+            resolved_sha,
+            artifact_id,
+        } => (
+            cache_path_revision(project_dir, source, resolved_sha),
             resolved_sha.short().to_string(),
             LockedProviderPin::Revision {
                 revision: revision.clone(),
                 resolved_sha: resolved_sha.clone(),
                 artifact_id: *artifact_id,
             },
+            source.source_key(),
         ),
-        (
-            LockEntryKind::Revision {
-                revision: _revision,
-                resolved_sha: _resolved_sha,
-                artifact_id: _artifact_id,
-            },
-            RemoteSource::Registry(_registry_source),
-        ) => {
-            return Err(format!(
-                "Provider '{provider_name}' has a GitHub revision lock pin for a registry source"
-            ));
-        }
-        (LockEntryKind::File, RemoteSource::GithubDirect(_github_source)) => {
-            return Err(format!(
-                "Provider '{provider_name}' has file provenance and no remote project-cache path"
-            ));
-        }
-        (LockEntryKind::File, RemoteSource::Registry(_registry_source)) => {
+        LockEntryKind::File { .. } => {
             return Err(format!(
                 "Provider '{provider_name}' has file provenance and no remote project-cache path"
             ));
@@ -1478,6 +1445,14 @@ fn lock_artifact_selection_with<'lock, R>(
 
 #[cfg(test)]
 mod tests {
+    fn test_registry_source(value: &str) -> carina_core::provider_source::RegistrySource {
+        use carina_core::provider_source::{ProviderSource, RemoteSource};
+        let ProviderSource::Remote(RemoteSource::Registry(source)) = value.parse().unwrap() else {
+            panic!("expected registry source: {value}");
+        };
+        source
+    }
+
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
 
@@ -1695,8 +1670,8 @@ mod tests {
         let mut lock_file = LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: source.to_string(),
             kind: LockEntryKind::GithubRelease {
+                source: github.clone(),
                 version: version.clone(),
                 tag: tag.clone(),
                 asset_id,
@@ -1747,8 +1722,8 @@ mod tests {
         let source = "carina-rs/awscc";
         let lock: LockEntry = LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: LockEntryKind::Version {
+                source: test_registry_source(source),
                 version: "0.5.0".into(),
                 constraint: None,
             },

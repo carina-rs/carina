@@ -957,6 +957,37 @@ fn local_trust_and_unwritable_cache_notices_belong_to_the_report() {
 }
 
 #[test]
+fn validate_reports_unsupported_lock_versions_in_human_and_json() {
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    for version in 1..carina_provider_resolver::LockFile::CURRENT_VERSION {
+        std::fs::write(
+            fixture.path().join("carina-providers.lock"),
+            format!("version = {version}\n"),
+        )
+        .unwrap();
+        let human = validate(fixture.path(), false);
+        assert_eq!(human.status.code(), Some(1), "{human:?}");
+        let stderr = String::from_utf8(human.stderr).unwrap();
+        let json = report(&validate(fixture.path(), true), 1, 0);
+        let message = json["errors"][0]["message"].as_str().unwrap();
+        for expected in [
+            format!("uses format version {version}"),
+            "reads only version 5".into(),
+            "Carina v0.15.0".into(),
+            carina_core::hint::ProjectCommand::new("init", fixture.path()).to_string(),
+        ] {
+            assert!(stderr.contains(&expected), "{stderr}");
+            assert!(message.contains(&expected), "{json}");
+        }
+        assert!(
+            stderr.contains(message),
+            "human and JSON must retain the same UnsupportedVersion diagnostic: {stderr}\n{json}"
+        );
+    }
+}
+
+#[test]
 fn malformed_lock_diagnostics_never_serialize_source_snippets_or_values() {
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.crn"), "provider mock {}\n").unwrap();

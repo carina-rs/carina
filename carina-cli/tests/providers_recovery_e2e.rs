@@ -382,6 +382,126 @@ fn pending_discovery_repin_previews_and_clears_every_pending_pin_for_the_host() 
 }
 
 #[test]
+fn pending_discovery_repin_preserves_other_hosts_pending_pins() {
+    const OTHER_HOST: &str = "other.registry.example.test";
+    let dir = tempfile::tempdir().unwrap();
+    write_pending_discovery_lock(dir.path());
+    let path = dir.path().join("carina-providers.lock");
+    let mut fixture = fs::read_to_string(&path).unwrap();
+    fixture.push_str(
+        r#"
+[registry_host."other.registry.example.test"]
+discovery_pin_present = false
+
+[[registry_host."other.registry.example.test".migration_pending_discovery_pins]]
+api_base_url = "https://other.registry.example.test/v1/providers/"
+discovery_sha256 = "other-host-pending-sha256"
+"#,
+    );
+    fs::write(&path, &fixture).unwrap();
+    let before: toml::Value = toml::from_str(&fixture).unwrap();
+    let output = carina_target(dir.path(), "repin-discovery", HOST, true, "");
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("legacy-discovery-sha256"), "{stderr}");
+    assert!(!stderr.contains("other-host-pending-sha256"), "{stderr}");
+    carina_provider_resolver::LockFile::load(
+        &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let saved: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        saved["registry_host"][OTHER_HOST],
+        before["registry_host"][OTHER_HOST]
+    );
+    assert!(
+        saved["registry_host"][HOST]
+            .get("migration_pending_discovery_pins")
+            .is_none()
+    );
+    assert_eq!(
+        saved["registry_host"][HOST]["discovery_pin_present"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(saved["provider"], before["provider"]);
+}
+
+#[test]
+fn provider_recovery_on_pending_host_keeps_discovery_blocked() {
+    for operation in ["repin-identity", "re-bootstrap"] {
+        let dir = tempfile::tempdir().unwrap();
+        write_pending_discovery_lock(dir.path());
+        let path = dir.path().join("carina-providers.lock");
+        let before: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let output = carina(dir.path(), operation, true, "");
+        assert!(output.status.success(), "{operation}: {output:?}");
+        let saved: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"].as_integer(), Some(5));
+        assert_eq!(saved["registry_host"], before["registry_host"]);
+        assert_eq!(
+            saved["registry_host"][HOST]["migration_pending_discovery_pins"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut expected = before["provider"].clone();
+        let registry = expected[0]["registry"].as_table_mut().unwrap();
+        match operation {
+            "repin-identity" => {
+                registry.insert("signature_state".into(), "required_unpinned".into());
+                for key in [
+                    "source_oidc_issuer",
+                    "source_repository_owner_id",
+                    "source_repository_id",
+                    "stable_workflow",
+                ] {
+                    registry.remove(key);
+                }
+            }
+            "re-bootstrap" => {
+                registry.insert("sequence_present".into(), false.into());
+                registry.insert("sequence_anchor_established".into(), false.into());
+                registry.insert("sequence_anchor_reset_pending".into(), true.into());
+                registry.remove("sequence");
+                registry.remove("sequence_anchor");
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(saved["provider"], expected, "{operation}");
+        let install_lock = ProviderInstallLock::acquire(
+            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
+        )
+        .unwrap();
+        let http = FixtureRegistryHttp::default();
+        let error = resolve_all_with_fixture_registry(
+            &UserDirs::under(&dir.path().join("test-user")),
+            &install_lock,
+            &[registry_provider_config()],
+            LockMode::Normal,
+            &http,
+            &mut |_| {},
+        )
+        .expect_err("provider-scoped recovery must leave discovery blocked");
+        assert!(
+            error
+                .to_string()
+                .contains("carina providers repin-discovery registry.carina-rs.dev"),
+            "{operation}: {error}"
+        );
+        assert!(
+            http.requested_urls().is_empty(),
+            "{operation}: discovery must require authorization before HTTP"
+        );
+        assert_eq!(
+            toml::from_str::<toml::Value>(&fs::read_to_string(&path).unwrap()).unwrap(),
+            saved
+        );
+    }
+}
+
+#[test]
 fn declining_migrated_discovery_repin_preserves_pin_and_resolution_block() {
     let dir = tempfile::tempdir().unwrap();
     write_pending_discovery_lock(dir.path());

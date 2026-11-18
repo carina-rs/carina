@@ -1,9 +1,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use carina_provider_resolver::{
-    DiscardedSignerPins, GuardedLockFile, ProviderInstallLock, WorkflowPins,
-};
+use carina_provider_resolver::{GuardedLockFile, ProviderInstallLock, WorkflowPins};
 
 use crate::error::AppError;
 use carina_core::hint::ProjectCommand;
@@ -177,10 +175,9 @@ fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<()
     let recovery = lock
         .prepare_registry_identity_repin(provider)
         .map_err(|error| AppError::Config(error.to_string()))?;
-    let pin = recovery.identity_pin();
+    let pins = recovery.identity_pin();
 
     eprintln!("Registry provider: {provider}");
-    let DiscardedSignerPins::Current(pins) = pin;
     eprintln!("Discarding source OIDC issuer: {}", pins.source.oidc_issuer);
     eprintln!(
         "Discarding source repository owner ID: {}",
