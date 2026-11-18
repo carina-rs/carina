@@ -763,10 +763,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the AWS SDK and rustls read AWS_*, HOME and SSL_CERT_FILE from the process environment themselves and take no injected environment; nextest runs this test in its own process on a current_thread runtime"
-    )]
     async fn empty_ca_bundle_returns_typed_provider_failure() {
         let home = tempfile::tempdir().unwrap();
         write_aws_files(home.path(), "");
@@ -775,7 +771,13 @@ mod tests {
         std::fs::write(&empty_ca_bundle, "").unwrap();
         // SAFETY: nextest runs this test in a separate process on a
         // single-threaded runtime, as required by `EnvironmentGuard`.
-        unsafe { std::env::set_var("SSL_CERT_FILE", empty_ca_bundle) };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the AWS SDK and rustls read AWS_*, HOME and SSL_CERT_FILE from the process environment themselves and take no injected environment; nextest runs this test in its own process on a current_thread runtime"
+        )]
+        unsafe {
+            std::env::set_var("SSL_CERT_FILE", empty_ca_bundle)
+        };
 
         let error = AwsSdkCredentialSource::new()
             .await

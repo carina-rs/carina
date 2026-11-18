@@ -623,13 +623,13 @@ fn settings() -> crate::GitHubBackendSettings {
 }
 
 #[test]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "carina_core::github_auth::get_github_token reads GITHUB_TOKEN and PATH from the process; remove once carina#4553 passes an EnvironmentSnapshot"
-)]
 fn github_selection_constructs_no_s3_client_and_performs_no_http() {
     // nextest executes each test in an isolated process, before this runtime
     // is created; no other thread in this process reads the environment.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "carina_core::github_auth::get_github_token reads GITHUB_TOKEN and PATH from the process; remove once carina#4553 passes an EnvironmentSnapshot"
+    )]
     unsafe {
         std::env::set_var("GITHUB_TOKEN", "offline-test-token");
     }
