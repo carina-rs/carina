@@ -390,6 +390,7 @@ enum ParseOwnership {
 }
 /// Source dependency occurrences, before alias substitution and redaction.
 /// Identity and diagnostic spelling remain separate across module expansion.
+#[derive(Clone)]
 pub(crate) enum AuthoredDependency<B: BindingAddress> {
     Binding {
         binding: B,
@@ -401,6 +402,178 @@ pub(crate) enum AuthoredDependency<B: BindingAddress> {
         authored: crate::resource::AccessPath<RelativeBindingName>,
         scope: DiagnosticScope,
     },
+}
+
+/// Proof that every path to a formal argument uses only bare names, aliases
+/// and interpolation. Only the authored-tree traversal can construct it.
+pub(crate) enum PrefixArgumentUses<B: BindingAddress> {
+    Independent,
+    Bare(BareArgumentEvidence<B>),
+    NotBare,
+}
+
+pub(crate) struct BareArgumentEvidence<B: BindingAddress> {
+    routes: Vec<BareArgumentRoute<B>>,
+    awaiting: bool,
+}
+
+pub(crate) struct BareArgumentRoute<B: BindingAddress> {
+    binding: B,
+    owner: BareArgumentOwner,
+    uses: Vec<AuthoredDependency<B>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BareArgumentOwner(super::ModuleCallId);
+impl BareArgumentOwner {
+    pub(crate) fn call(&self) -> &super::ModuleCallId {
+        &self.0
+    }
+}
+#[derive(Clone)]
+pub(crate) struct AwaitingBareArgument(());
+
+impl<B: BindingAddress> BareArgumentEvidence<B> {
+    pub(crate) fn route(
+        &self,
+        binding: &B,
+        call: &super::ModuleCallId,
+    ) -> Option<&BareArgumentRoute<B>> {
+        self.routes
+            .iter()
+            .find(|route| &route.binding == binding && route.owner.call() == call)
+    }
+    pub(crate) fn awaiting(&self) -> Option<AwaitingBareArgument> {
+        self.awaiting.then_some(AwaitingBareArgument(()))
+    }
+}
+impl<B: BindingAddress> BareArgumentRoute<B> {
+    pub(crate) fn owner(&self) -> &BareArgumentOwner {
+        &self.owner
+    }
+    pub(crate) fn uses(&self) -> Vec<AuthoredDependency<B>> {
+        self.uses.clone()
+    }
+}
+
+impl<B: BindingAddress> Expressions<B> {
+    fn prefix_argument_uses(
+        &self,
+        root: &AuthoredExpr<ParserPlaceholder, B>,
+        calls: &[&super::ModuleCallId],
+        bindings: &crate::validation::inference::InferenceBindings,
+    ) -> PrefixArgumentUses<B> {
+        struct Walk<'a, B: BindingAddress> {
+            expressions: &'a Expressions<B>,
+            bindings: &'a crate::validation::inference::InferenceBindings,
+            calls: &'a [&'a super::ModuleCallId],
+            evidence: BareArgumentEvidence<B>,
+            visiting: Vec<B>,
+        }
+        impl<B: BindingAddress> Walk<'_, B> {
+            fn binding(
+                &mut self,
+                binding: &B,
+                bare: bool,
+                index: Option<usize>,
+            ) -> Result<bool, ()> {
+                if self.visiting.contains(binding) {
+                    return Ok(false);
+                }
+                self.visiting.push(binding.clone());
+                let result = if self.expressions.is_module_argument(binding)
+                    || matches!(
+                        crate::resource::DependencyKey::new(binding.clone())
+                            .lookup_by_name(self.bindings),
+                        Some(crate::validation::inference::InferenceBinding::Argument { .. })
+                    ) {
+                    if !bare {
+                        return Err(());
+                    }
+                    if let Some(call) = index.and_then(|index| self.calls.get(index)).copied() {
+                        if let Some(node) = self.expressions.argument_expression(binding, call) {
+                            self.node(node, true, index.and_then(|index| index.checked_sub(1)))?;
+                            let mut uses = Vec::new();
+                            node.dependency_uses(DiagnosticScope::Public, &mut uses);
+                            self.evidence.routes.push(BareArgumentRoute {
+                                binding: binding.clone(),
+                                owner: BareArgumentOwner(call.clone()),
+                                uses,
+                            });
+                        } else {
+                            self.evidence.awaiting = true;
+                        }
+                    } else {
+                        self.evidence.awaiting = true;
+                    }
+                    true
+                } else if let Some(definition) = self.expressions.definitions.get(binding) {
+                    self.node(&definition.authored, bare, index)?
+                } else {
+                    false
+                };
+                self.visiting.pop();
+                Ok(result)
+            }
+            fn node(
+                &mut self,
+                node: &AuthoredExpr<ParserPlaceholder, B>,
+                bare: bool,
+                index: Option<usize>,
+            ) -> Result<bool, ()> {
+                if let AuthoredChildRoles::Sink { value, .. } = node.roles {
+                    return match node.children.iter().find(|child| child.node_id() == value) {
+                        Some(child) => self.node(&child.authored, bare, index),
+                        None => Ok(false),
+                    };
+                }
+                match &node.kind {
+                    ExprKind::Binding {
+                        binding,
+                        authored_binding: _,
+                    } => return self.binding(binding, bare, index),
+                    ExprKind::Reference {
+                        binding,
+                        authored_binding: _,
+                        attribute: _,
+                        segments: _,
+                    } => return self.binding(binding, false, index),
+                    // References to a resource/module output do not inline its
+                    // constructor's inputs into the prefix's authored value.
+                    ExprKind::Resource { .. } | ExprKind::ModuleCall => return Ok(false),
+                    _ => {}
+                }
+                let bare = bare
+                    && matches!(
+                        node.kind,
+                        ExprKind::Interpolation { .. }
+                            | ExprKind::Alias
+                            | ExprKind::Definition
+                            | ExprKind::Sink { .. }
+                    );
+                let mut reaches_argument = false;
+                for child in &node.children {
+                    reaches_argument |= self.node(&child.authored, bare, index)?;
+                }
+                Ok(reaches_argument)
+            }
+        }
+        let mut walk = Walk {
+            expressions: self,
+            bindings,
+            calls,
+            visiting: Vec::new(),
+            evidence: BareArgumentEvidence {
+                routes: Vec::new(),
+                awaiting: false,
+            },
+        };
+        match walk.node(root, true, calls.len().checked_sub(1)) {
+            Ok(false) => PrefixArgumentUses::Independent,
+            Ok(true) => PrefixArgumentUses::Bare(walk.evidence),
+            Err(()) => PrefixArgumentUses::NotBare,
+        }
+    }
 }
 
 impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
@@ -1316,11 +1489,11 @@ impl<B: BindingAddress> Expressions<B> {
     }
 
     /// Retain the argument's declared name separately from its binding address.
-    pub(crate) fn argument_dependency_uses(
+    fn argument_expression(
         &self,
         binding: &B,
         call: &super::ModuleCallId,
-    ) -> Option<Vec<AuthoredDependency<B>>> {
+    ) -> Option<&AuthoredExpr<ParserPlaceholder, B>> {
         let argument = self.arguments.get(binding)?;
         let location = call.argument_value_location(argument.name.as_str())?;
         let caller = self.argument_instances.get(binding)?;
@@ -1332,9 +1505,7 @@ impl<B: BindingAddress> Expressions<B> {
         while let Some(node) = pending.pop() {
             let owns_instance = &node.location.instance == caller;
             if owns_instance && &node.location.authored == location {
-                let mut uses = Vec::new();
-                node.dependency_uses(DiagnosticScope::Public, &mut uses);
-                return Some(uses);
+                return Some(node);
             }
             pending.extend(node.children.iter().map(|child| child.authored.as_ref()));
         }

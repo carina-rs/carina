@@ -11,8 +11,9 @@ pub use diagnostics::{
 };
 pub use prefix::{
     CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, MatchedResourceProjection,
-    ModuleResolvedFileRead, PrefixCanonicalized, PrefixFileRead, ResourceProjection, SuffixSource,
-    canonicalize_file_prefixes,
+    ModuleResolvedFileRead, PrefixArgumentContext, PrefixCanonicalized, PrefixFileRead,
+    ResourceProjection, SuffixSource, canonicalize_file_prefixes,
+    canonicalize_file_prefixes_with_argument_context,
 };
 pub(crate) use prefix::{CanonicalSchemaInputs, CanonicalSchemaResource, PrefixObligations};
 
@@ -1592,7 +1593,7 @@ struct DeferredPrefixDependencies {
     keys: Vec<PrefixDependencyKey>,
     first: PrefixDependency,
     rest: Vec<PrefixDependency>,
-    argument_call: Option<crate::parser::ModuleCallId>,
+    argument_call: Option<crate::parser::retained::BareArgumentOwner>,
 }
 
 /// Opaque source identity survives diagnostic redaction and binding typestates.
@@ -1618,7 +1619,9 @@ enum PrefixDependencyKind {
     ProviderAttribute,
     ModuleOutput,
     UpstreamExport,
-    PendingBinding,
+    ResourceInput,
+    DataSourceAttribute,
+    UnresolvedReference,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1711,17 +1714,20 @@ fn deferred_prefix_message(
 ) -> String {
     // Keep this match exhaustive: a new reference kind needs a wording decision.
     let clause = |kind| match kind {
-        PrefixDependencyKind::ProviderAttribute | PrefixDependencyKind::PendingBinding => {
+        PrefixDependencyKind::ProviderAttribute | PrefixDependencyKind::DataSourceAttribute => {
             "which is known only after apply"
         }
-        PrefixDependencyKind::ModuleOutput | PrefixDependencyKind::UpstreamExport => {
+        PrefixDependencyKind::ModuleOutput
+        | PrefixDependencyKind::UpstreamExport
+        | PrefixDependencyKind::ResourceInput
+        | PrefixDependencyKind::UnresolvedReference => {
             "which is not resolved when names are generated"
         }
     };
     let dependencies = if dependencies
         .rest
         .iter()
-        .all(|dependency| dependency.kind == dependencies.first.kind)
+        .all(|dependency| clause(dependency.kind) == clause(dependencies.first.kind))
     {
         let reason = clause(dependencies.first.kind);
         format!("{dependencies}, {reason}")

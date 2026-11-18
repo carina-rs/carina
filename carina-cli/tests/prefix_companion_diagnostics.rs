@@ -402,8 +402,13 @@ async fn prefix_companion_deferred_reference_rejected_at_plan_time() {
         let lsp = fixture.lsp(false).await;
         let messages = error_messages(&lsp);
         assert_eq!(cli["status"], "error", "{cli:#}");
+        let reason = if attribute == "identifier" {
+            "known only after apply"
+        } else {
+            "not resolved when names are generated"
+        };
         let expected = format!(
-            "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.{attribute}', which is known only after apply"
+            "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.{attribute}', which is {reason}"
         );
         assert!(messages.contains(&expected.as_str()), "{lsp:#?}");
         assert!(

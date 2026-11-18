@@ -935,6 +935,8 @@ pub(super) struct DiagnosticRun<'a> {
     analysis_sources: &'a RefCell<carina_core::config_loader::SourceOverrides>,
     secrecy_causes: &'a RefCell<SecrecyCauses>,
     routed_secrecy: &'a RefCell<BTreeMap<PathBuf, Vec<Diagnostic>>>,
+    module_callers: &'a [carina_core::paths::ResolvedPath],
+    argument_context_directories: &'a RefCell<BTreeSet<PathIdentity>>,
 }
 
 #[cfg(test)]
@@ -950,6 +952,60 @@ impl std::ops::Deref for DiagnosticRun<'_> {
 }
 
 impl DiagnosticRun<'_> {
+    fn prefix_argument_context(
+        &self,
+        doc: &Document,
+        sources: &carina_core::config_loader::SourceOverrides,
+    ) -> carina_core::identifier::PrefixArgumentContext {
+        let mut context = carina_core::identifier::PrefixArgumentContext::default();
+        for caller in self.module_callers {
+            self.argument_context_directories
+                .borrow_mut()
+                .insert(PathIdentity::from(caller.identity()));
+            let Ok(overrides) = sources.with_entries(
+                self.open_sources
+                    .iter()
+                    .filter(|(path, _)| path != doc.source_file())
+                    .filter_map(|(path, text)| {
+                        carina_core::paths::ResolvedPath::new(path)
+                            .ok()
+                            .map(|path| (path, text.to_string()))
+                    }),
+            ) else {
+                continue;
+            };
+            let Ok(mut merged) = self.parse_merged_with_buffer(caller, &overrides) else {
+                continue;
+            };
+            let directory = Arc::clone(&merged.directory);
+            let Ok(tree) =
+                carina_core::parser::AnalysisTree::try_from_file(directory.parsed.parsed())
+            else {
+                continue;
+            };
+            let Ok((exports, _)) =
+                self.resolve_diagnostic_upstream_exports(caller, &tree, &overrides)
+            else {
+                continue;
+            };
+            // This syntax query does not publish a second caller validation.
+            // The caller's normal run retains ownership of its findings.
+            let mut validation =
+                carina_core::validation::ConversionValidation::for_directory(&directory.parsed);
+            self.resolve_merged_modules(
+                &mut merged,
+                &tree,
+                caller,
+                &exports,
+                &overrides,
+                &mut validation,
+            );
+            if let checks::MergedModuleResolution::Expanded { graph } = &merged.module_resolution {
+                let _ = context.include(graph);
+            }
+        }
+        context
+    }
     fn resolve_diagnostic_upstream_exports<D, B: BindingAddress>(
         &self,
         base: &carina_core::paths::ResolvedPath,
@@ -2287,8 +2343,26 @@ impl DiagnosticRun<'_> {
                     }
                 }
             }
+            let mut arguments = carina_core::identifier::PrefixArgumentContext::default();
+            let caller_input = (!self.module_callers.is_empty()).then(|| admission_file.clone());
             let canonical_pre_expansion =
                 canonicalize_file_prefixes(admission_file, &self.schemas, SuffixSource::Preview);
+            let canonical_pre_expansion = match caller_input {
+                Some(input) if canonical_pre_expansion.awaits_module_arguments() => {
+                    arguments = self.prefix_argument_context(doc, &overrides);
+                    if arguments.is_empty() {
+                        canonical_pre_expansion
+                    } else {
+                        carina_core::identifier::canonicalize_file_prefixes_with_argument_context(
+                            input,
+                            &self.schemas,
+                            SuffixSource::Preview,
+                            &arguments,
+                        )
+                    }
+                }
+                _ => canonical_pre_expansion,
+            };
             let pre_expansion_configuration =
                 canonical_pre_expansion.judge(self.provider_context.catalog());
             let expression_report = pre_expansion_configuration.judged().report();
@@ -2370,7 +2444,12 @@ impl DiagnosticRun<'_> {
                 (None, None) => Default::default(),
             };
             let expanded_canonical = expanded_graph.map(|graph| {
-                canonicalize_file_prefixes(graph.clone(), &self.schemas, SuffixSource::Preview)
+                carina_core::identifier::canonicalize_file_prefixes_with_argument_context(
+                    graph.clone(),
+                    &self.schemas,
+                    SuffixSource::Preview,
+                    &arguments,
+                )
             });
             let expanded_configuration = expanded_canonical
                 .as_ref()
@@ -3268,6 +3347,8 @@ impl DiagnosticEngine {
                     analysis_sources: &RefCell::default(),
                     secrecy_causes: &RefCell::default(),
                     routed_secrecy: &RefCell::default(),
+                    module_callers: &[],
+                    argument_context_directories: &RefCell::default(),
                 })
             },
         )
@@ -3298,7 +3379,7 @@ impl DiagnosticEngine {
             .iter()
             .map(|doc| (doc.source_file().to_path_buf(), doc.source_snapshot()))
             .collect::<Vec<_>>();
-        self.analyze_with_open_sources(raw, current_file_path, &open_sources)
+        self.analyze_with_open_sources(raw, current_file_path, &open_sources, &[])
     }
 
     /// Analyze the current document and route instantiated secrecy findings to
@@ -3322,8 +3403,10 @@ impl DiagnosticEngine {
         raw: &crate::document::Document,
         current_file_path: Option<&Path>,
         open_sources: &[(PathBuf, Arc<str>)],
+        module_callers: &[carina_core::paths::ResolvedPath],
     ) -> Vec<Diagnostic> {
-        self.analyze_document_set_with_open_sources(raw, current_file_path, open_sources)
+        self.analyze_document_snapshot(raw, current_file_path, open_sources, module_callers)
+            .into_documents()
             .remove(raw.source_file())
             .unwrap_or_default()
     }
@@ -3334,7 +3417,7 @@ impl DiagnosticEngine {
         current_file_path: Option<&Path>,
         open_sources: &[(PathBuf, Arc<str>)],
     ) -> BTreeMap<PathBuf, Vec<Diagnostic>> {
-        self.analyze_document_snapshot(raw, current_file_path, open_sources)
+        self.analyze_document_snapshot(raw, current_file_path, open_sources, &[])
             .into_documents()
     }
 
@@ -3343,6 +3426,7 @@ impl DiagnosticEngine {
         raw: &crate::document::Document,
         current_file_path: Option<&Path>,
         open_sources: &[(PathBuf, Arc<str>)],
+        module_callers: &[carina_core::paths::ResolvedPath],
     ) -> DocumentDiagnostics {
         #[cfg(test)]
         ANALYZED_DOCUMENTS.with(|paths| paths.borrow_mut().push(raw.source_file().to_path_buf()));
@@ -3394,6 +3478,7 @@ impl DiagnosticEngine {
         let routed_secrecy = RefCell::default();
         let analysis_sources = RefCell::default();
         let secrecy_causes = RefCell::default();
+        let argument_context_directories = RefCell::default();
         let terminal =
             carina_core::validation::deferred_types::TypeCheckSession::run(&context, |session| {
                 DiagnosticRun {
@@ -3404,6 +3489,8 @@ impl DiagnosticEngine {
                     analysis_sources: &analysis_sources,
                     secrecy_causes: &secrecy_causes,
                     routed_secrecy: &routed_secrecy,
+                    module_callers,
+                    argument_context_directories: &argument_context_directories,
                 }
                 .collect_diagnostics(&doc, current_file_path)
             });
@@ -3431,7 +3518,12 @@ impl DiagnosticEngine {
                     })
                     .collect()
             },
-            imported_directories: analysis_sources.into_inner().imported_directories(),
+            imported_directories: analysis_sources
+                .into_inner()
+                .imported_directories()
+                .into_iter()
+                .chain(argument_context_directories.into_inner())
+                .collect(),
         }
     }
 

@@ -9946,6 +9946,11 @@ impl<'a> EffectiveType<'a> {
         }
     }
 
+    /// Whether this exact projected type inherits provider-populated mode.
+    pub(crate) fn is_provider_populated(&self) -> bool {
+        self.field_ancestry.provider_populated
+    }
+
     pub fn as_type(&self) -> &'a PatternAttributeType<Compiled> {
         self.attr_type
     }

@@ -229,10 +229,19 @@ impl ProviderStates {
         Self {
             discovery_scope: workspace::DiscoveryScope::default(),
             by_dir: HashMap::new(),
-            import_map: HashMap::new(),
+            import_map: Default::default(),
             empty: ProviderState::empty(environment.clone()),
             environment,
         }
+    }
+
+    fn module_callers(&self, file: Option<&Path>) -> Vec<carina_core::paths::ResolvedPath> {
+        file.and_then(Path::parent)
+            .map(|directory| {
+                self.import_map
+                    .caller_directories(&PathIdentity::new(directory))
+            })
+            .unwrap_or_default()
     }
 
     /// Find the ProviderState for a given file path.
@@ -816,12 +825,14 @@ async fn publish_diagnostics_for(
             .and_then(Path::parent)
             .map(|path| guard.state_for_path(path))
             .unwrap_or(&guard.empty);
+        let callers = guard.module_callers(path.as_deref());
         results.push((
             uri.clone(),
             state.diagnostic_engine.analyze_document_snapshot(
                 &entry,
                 path.as_deref(),
                 &open_sources,
+                &callers,
             ),
         ));
     }
@@ -963,9 +974,13 @@ fn analyze_document_with_open_sources(
         .and_then(Path::parent)
         .map(|path| states.state_for_path(path))
         .unwrap_or(&states.empty);
-    state
-        .diagnostic_engine
-        .analyze_with_open_sources(document, current_file_path, open_sources)
+    let callers = states.module_callers(current_file_path);
+    state.diagnostic_engine.analyze_with_open_sources(
+        document,
+        current_file_path,
+        open_sources,
+        &callers,
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1871,13 +1886,12 @@ let duplicate = mock.test.resource {
         states
             .by_dir
             .insert(PathIdentity::new(&last_caller), provider_state("last_rule"));
-        states.import_map.insert(
-            PathIdentity::new(&module),
-            std::collections::BTreeSet::from([
-                PathIdentity::new(&last_caller),
-                PathIdentity::new(&first_caller),
-            ]),
-        );
+        for caller in [&last_caller, &first_caller] {
+            states.import_map.record(
+                &carina_core::paths::ResolvedPath::new(&module).unwrap(),
+                &carina_core::paths::ResolvedPath::new(caller).unwrap(),
+            );
+        }
 
         let state = states.state_for_path(&module);
         let block_names = collect_all_block_names(&state.schemas);

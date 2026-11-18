@@ -1122,6 +1122,20 @@ impl SourceOverrides {
         Ok(overrides)
     }
 
+    /// Add editor sources while retaining this analysis's pinned disk reads.
+    pub fn with_entries(
+        &self,
+        entries: impl IntoIterator<Item = (ResolvedPath, String)>,
+    ) -> Result<Self, SourceOverrideConflict> {
+        let mut combined = Self::try_from_entries(
+            self.iter()
+                .map(|(path, text)| (path.clone(), text.to_owned()))
+                .chain(entries),
+        )?;
+        combined.reads.clone_from(&self.reads);
+        Ok(combined)
+    }
+
     // Only the parser-owned buffer may replace text already in a snapshot.
     pub(crate) fn replacing(&self, path: ResolvedPath, text: String) -> Self {
         let mut overrides = self.clone();
