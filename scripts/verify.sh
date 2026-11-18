@@ -161,6 +161,8 @@ run_kind() {
             bash scripts/test-release-tag-channel.sh
             bash scripts/test-classify-ci-diff.sh
             bash scripts/test-rust-cache-key.sh
+            bash scripts/test-pre-commit.sh
+            bash scripts/test-setup-hooks.sh
             bash scripts/test-verify-sh.sh
             bash scripts/test-touched-crates.sh
             ;;
