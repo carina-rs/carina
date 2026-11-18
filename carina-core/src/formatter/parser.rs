@@ -55,26 +55,22 @@ pub fn parse(source: &str) -> Result<pest::iterators::Pairs<'_, Rule>, FormatPar
         .map_err(|error| FormatParseError::from_syntax(error, source))
 }
 
-/// Reuse the main parser's dedicated syntax diagnostic when formatting fails.
+/// Reuse the main parser's dedicated syntax diagnostic before formatting.
 /// Consult the authored source so heredoc preprocessing cannot shift its position.
 pub(super) fn parse_preprocessed(
     source: &crate::heredoc::PreprocessResult,
 ) -> Result<pest::iterators::Pairs<'_, Rule>, FormatParseError> {
-    parse(source.transformed_source()).map_err(|formatter_error| {
-        let syntax = crate::parser::preprocess_file(source.authored_source())
-            .and_then(|file| file.parse().map(|_| ()));
-        match syntax {
-            Err(error @ crate::parser::ParseError::RequireOutsideArguments { .. }) => {
-                let range = error.diagnostic_range().expect("syntax keyword range");
-                FormatParseError {
-                    message: error.diagnostic_message(),
-                    line: range.start_line,
-                    column: range.start_column,
-                }
-            }
-            _ => formatter_error,
-        }
-    })
+    let syntax = crate::parser::preprocess_file(source.authored_source())
+        .and_then(|file| file.parse().map(|_| ()));
+    if let Err(error @ crate::parser::ParseError::RequireOutsideArguments { .. }) = syntax {
+        let range = error.diagnostic_range().expect("syntax keyword range");
+        return Err(FormatParseError {
+            message: error.diagnostic_message(),
+            line: range.start_line,
+            column: range.start_column,
+        });
+    }
+    parse(source.transformed_source())
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 identifier_continue = _{ ASCII_ALPHANUMERIC | "_" }
 binding_keyword = _{ "let" }
 iteration_keyword = _{ "for" }
-require_keyword = _{ "require" }
+require_keyword = @{ "require" ~ !identifier_continue }
 conditional_keyword = _{ "if" }
 iterable_keyword = _{ "in" }
 call_open = _{ identifier ~ paren_open }

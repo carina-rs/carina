@@ -301,6 +301,11 @@ fn assert_legacy_syntax_error(name: &str, source: &str, direct_module: bool, lin
     );
     for other in ["main.crn", "providers.crn", "checked/arguments.crn"] {
         let other_findings = d.diagnostics(other);
+        if name.starts_with("checked/") && other == "main.crn" {
+            assert_eq!(other_findings.len(), 1, "{other_findings:?}");
+            assert!(other_findings[0].message.contains(REQUIRE_PLACEMENT_ERROR));
+            continue;
+        }
         assert!(
             other_findings
                 .iter()
@@ -335,6 +340,49 @@ fn issue4398_root_sibling_top_level_require_is_syntax_error() {
 #[test]
 fn issue4398_module_top_level_require_is_syntax_error() {
     assert_legacy_syntax_error("checked/guards.crn", "require n == 2, 'x'\n", false, 1);
+}
+
+#[test]
+fn issue4398_imported_misplaced_require_matches_other_parse_errors() {
+    let d = Directory::new();
+    for prefix in ["", "// module guard\n  "] {
+        d.write("checked/guards.crn", &format!("{prefix}let x = \n"));
+        let mut generic = d.diagnostics("main.crn");
+        assert_eq!(generic.len(), 1, "{generic:?}");
+        assert!(
+            generic[0]
+                .message
+                .contains("Parse error in checked/guards.crn:")
+        );
+
+        d.write(
+            "checked/guards.crn",
+            &format!("{prefix}require n == 2, 'x'\n"),
+        );
+        let mut misplaced = d.diagnostics("main.crn");
+        assert_eq!(misplaced.len(), 1, "{misplaced:?}");
+        assert!(
+            misplaced[0]
+                .message
+                .contains("Parse error in checked/guards.crn:")
+        );
+        assert!(misplaced[0].message.contains(REQUIRE_PLACEMENT_ERROR));
+        generic[0].message.clear();
+        misplaced[0].message.clear();
+        assert_eq!(misplaced, generic);
+
+        let source_findings = d.diagnostics("checked/guards.crn");
+        assert_eq!(source_findings.len(), 1, "{source_findings:?}");
+        assert_eq!(source_findings[0].message, REQUIRE_PLACEMENT_ERROR);
+        let (line, column) = if prefix.is_empty() { (0, 0) } else { (1, 2) };
+        assert_eq!(
+            source_findings[0].range,
+            tower_lsp::lsp_types::Range::new(
+                tower_lsp::lsp_types::Position::new(line, column),
+                tower_lsp::lsp_types::Position::new(line, column + 7),
+            )
+        );
+    }
 }
 
 #[test]

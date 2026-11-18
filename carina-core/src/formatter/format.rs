@@ -1766,6 +1766,34 @@ mod tests {
     }
 
     #[test]
+    fn misplaced_require_with_other_syntax_error_keeps_formatter_position() {
+        let error = format("require true, 'a'\nlet x = \n", &FormatConfig::default()).unwrap_err();
+        assert_eq!((error.line, error.column), (3, 1));
+        assert_eq!(
+            error.message,
+            "expected trivia, identifier, primary, or kw_use"
+        );
+    }
+
+    #[test]
+    fn issue4398_format_parenthesized_require_condition() {
+        let source = "arguments { n: Int\n require(n == 3), 'x' }\n";
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let original = crate::parser::parse(source, &context).unwrap();
+        let formatted = format(source, &FormatConfig::default()).unwrap();
+        assert_eq!(
+            formatted,
+            "arguments {\n  n: Int\n  require (n == 3), 'x'\n}\n"
+        );
+        let parsed = crate::parser::parse(&formatted, &context).unwrap();
+        assert_eq!(parsed.requires[0].condition, original.requires[0].condition);
+        assert_eq!(
+            format(&formatted, &FormatConfig::default()).unwrap(),
+            formatted
+        );
+    }
+
+    #[test]
     fn test_format_require_statement() {
         let input = r#"arguments {
   port: Int

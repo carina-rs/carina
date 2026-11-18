@@ -218,18 +218,17 @@ impl PreprocessedFile {
             })?;
         for statement in pairs
             .clone()
-            .flatten()
+            .flat_map(|file| file.into_inner())
             .filter(|pair| pair.as_rule() == Rule::statement)
         {
             let member = statement.into_inner().next().expect("statement member");
             if member.as_rule() == Rule::require_statement {
-                let start = member.as_span().start();
+                let keyword = member
+                    .into_inner()
+                    .next()
+                    .expect("require_statement keyword");
                 return Err(ParseError::RequireOutsideArguments {
-                    span: super::SourceSpan::from_preprocessed_range(
-                        start,
-                        start + "require".len(),
-                        self,
-                    ),
+                    span: super::SourceSpan::from_pest(&keyword, self),
                 });
             }
         }
@@ -364,6 +363,23 @@ mod tests {
             let range = error.diagnostic_range().unwrap();
             assert_eq!((range.start_line, range.start_column), (line, column));
             assert_eq!((range.end_line, range.end_column), (line, column + 7));
+        }
+    }
+
+    #[test]
+    fn issue4398_require_keyword_boundary_in_arguments() {
+        for statement in ["requiren == 3, 'x'", "requires == 2, 'x'"] {
+            let source = format!("arguments {{ n: Int s: Int\n {statement} }}\n");
+            let error = preprocess_file(&source).unwrap().parse().unwrap_err();
+            assert!(matches!(error, ParseError::Syntax(_)), "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn issue4398_require_prefixed_top_level_comparisons_are_ordinary_syntax_errors() {
+        for source in ["requiren == 3, 'x'\n", "requires == 2, 'x'\n"] {
+            let error = preprocess_file(source).unwrap().parse().unwrap_err();
+            assert!(matches!(error, ParseError::Syntax(_)), "{source}: {error}");
         }
     }
 

@@ -191,12 +191,9 @@ pub(in crate::parser) fn parse_arguments_block(
                     validations,
                 });
             }
-            rule => {
-                return Err(ParseError::InvalidExpression {
-                    line: param.line_col().0,
-                    message: format!("unexpected {rule:?} in arguments block"),
-                });
-            }
+            rule => unreachable!(
+                "arguments_block contains only require_statement or arguments_param, got {rule:?}"
+            ),
         }
     }
 
@@ -418,6 +415,7 @@ fn parse_require_statement(
     preprocessed_file: &PreprocessedFile,
 ) -> Result<RequireBlock, ParseError> {
     let mut inner = pair.into_inner();
+    let _keyword = inner.next().expect("require_statement keyword");
     let condition_pair = next_pair(&mut inner, "validate_expr", "require statement")?;
     // Constraint diagnostics belong to the offending expression, not to the
     // beginning of a potentially multi-line `require` statement.

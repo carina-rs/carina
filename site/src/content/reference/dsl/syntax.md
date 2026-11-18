@@ -480,8 +480,15 @@ arguments {
 An `arguments` block may contain zero or more requirements, in any order with
 its parameters. Each requirement sees every argument declared by the module,
 including later parameters, other `arguments` blocks, and sibling `.crn` files.
-A `require` outside an `arguments` block reports the syntax error "`require` must be written inside an `arguments` block" at the `require` keyword.
+A `require` at statement position outside an `arguments` block reports the syntax
+error "`require` must be written inside an `arguments` block" at the `require`
+keyword. Nested positions, such as inside an `if`, `for`, function, resource,
+`attributes`, `exports`, or per-argument block, produce an ordinary syntax error.
 Root configurations cannot contain `arguments` blocks.
+
+To be called as a module, a directory must declare at least one argument
+parameter or output attribute. An `arguments` block containing only requirements
+does not make the directory callable; a call reports `Module not found`.
 
 When validated directly, a module directory keeps its requirements unevaluated
 until its arguments are supplied by a call. Per-argument `validation` blocks

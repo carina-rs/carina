@@ -416,6 +416,7 @@ impl<'a> CstBuilder<'a> {
             // but suppresses its output, so this arm should be unreachable
             // in practice. Exists only so the exhaustive match compiles.
             Rule::numeric_tail => None,
+            Rule::identifier_continue => None,
             Rule::plus_op
             | Rule::minus_op
             | Rule::multiply_op

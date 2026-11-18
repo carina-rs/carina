@@ -276,12 +276,7 @@ impl ModuleError {
     }
 
     pub(crate) fn with_owning_calls(self, calls: Vec<ModuleCallId>) -> Self {
-        // Misplaced statement syntax belongs to the parsed file, before any
-        // call is evaluated. Retain that ownership through nested imports.
-        if calls.is_empty()
-            || matches!(self.root_cause(), Self::ParseInFile { error, .. }
-                if matches!(error.as_ref(), ParseError::RequireOutsideArguments { .. }))
-        {
+        if calls.is_empty() {
             self
         } else {
             Self::OwnedByCalls {

@@ -158,8 +158,11 @@ still unresolved.
 
 Requirements are members of `arguments` blocks and may appear before or after
 parameters. Their scope includes arguments from all blocks and sibling files
-in the module directory. A `require` outside an `arguments` block is a syntax
-error. Root configurations cannot contain `arguments` blocks.
+in the module directory. A `require` at statement position outside an
+`arguments` block reports "`require` must be written inside an `arguments`
+block" at the keyword. Nested positions, including inside an `if`, `for`,
+function, resource, `attributes`, `exports`, or per-argument block, produce an
+ordinary syntax error. Root configurations cannot contain `arguments` blocks.
 
 When a module directory is validated directly, its requirements remain
 unevaluated until the module is called.
@@ -322,7 +325,8 @@ modules/network/
 
 To be called as a module, the merged directory must declare at least one
 argument parameter or output attribute. Empty `arguments` or `attributes`
-blocks alone do not make it callable.
+blocks, or an `arguments` block containing only requirements, do not make it
+callable. Calling such a directory reports `Module not found`.
 
 Single-file sources (`use { source = "./modules/network.crn" }`) are **not supported**:
 the loader returns `NotADirectory` for an existing file source. A missing or

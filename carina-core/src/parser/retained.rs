@@ -2859,6 +2859,7 @@ fn compile_remaining_form(
         | Rule::exports_block
         | Rule::backend_block
         | Rule::require_statement
+        | Rule::require_keyword
         | Rule::wait_attr
         | Rule::wait_timeout_attr
         | Rule::upstream_state_expr
@@ -2963,7 +2964,6 @@ fn compile_remaining_form(
         | Rule::pipe_token
         | Rule::require_condition
         | Rule::require_head
-        | Rule::require_keyword
         | Rule::single_quote) => node(
             &pair,
             ExprKind::Unsupported(format!("{rule:?}")),
