@@ -469,10 +469,11 @@ Enum values use namespaced identifiers like `aws.s3.BucketVersioning.VersioningS
 
 **When adding new namespaced patterns:**
 
-1. **Reuse the segment predicates.** `is_provider_segment`,
-   `is_service_segment` and `is_intermediate_segment` in
-   `carina-core/src/utils.rs` decide segment syntax, including digits in
-   names like `s3`; do not write a new `chars().all(..)` predicate.
+1. **Go through `NamespacedId::parse`.** Segment syntax is decided by the
+   private predicates behind it in `carina-core/src/utils.rs` (service and
+   intermediate segments accept digits, as in `s3`). Do not write a new
+   `chars().all(..)` predicate elsewhere; if one is unavoidable, accept
+   `c.is_ascii_digit()` too.
 
 2. **Treat `TypeIdentity` as the source of truth when one is available.**
    `NamespacedId::parse` in `carina-core/src/utils.rs` remains the
@@ -496,9 +497,8 @@ Enum values use namespaced identifiers like `aws.s3.BucketVersioning.VersioningS
 ## Struct Types
 
 A struct type represents a nested object with typed fields. Most guarantees
-below are held by types, compile_fail doctests and named tests in
-`carina-core/src/schema/`; read the rustdoc of the type named in each bullet
-for the details.
+below are held by types, compile_fail doctests and named tests next to the
+type each bullet names; read that type's rustdoc for the details.
 
 - `AttributeType` is an opaque newtype (`pub struct AttributeType { pub(crate)
   kind: AttrTypeKind }`) defined in `carina-core/src/schema/mod.rs`. Its
@@ -507,7 +507,8 @@ for the details.
   constructor methods and read it through the `Ref`-peeled `Shape` view
   (carina#3349). No check pins this visibility yet: carina#4540.
 - `StructField` input mode is selected once by the `optional`, `required`, or
-  `provider_populated` constructor; see the struct's rustdoc for its fields.
+  `provider_populated` constructor; its fields are documented on
+  `PatternStructField` (`StructField` is an alias).
   A nested declaration is not itself an effective mode:
   provider-populated ancestry belongs to the reference path. Consumers must
   start from a validated schema and use `EffectiveAttribute`, `EffectiveType`,
@@ -534,20 +535,28 @@ for the details.
   site until it is carried across. The parts views call the raw mode
   `declared_input_mode` because it is conversion data, not a consumer-facing
   effective mode. Don't add `pub` back to the schema structs' fields to "make
-  a conversion easier". (Neither the field privacy nor the ban on `..` in
-  `*Parts` patterns is pinned by a check yet: carina#4540.)
+  a conversion easier". (compile_fail doctests pin field privacy for
+  `StructField` and `AttributeSchema` only; `ResourceSchema` and the ban on
+  `..` in `*Parts` patterns are not pinned yet: carina#4540.)
 - **Write-only, top-level and nested.** `write_only` marks a value that is
   sent on create/update but never returned by reads (CloudFormation
   `writeOnlyProperties`). Where it may be set, its rejection below
   provider-populated output, the derived `ResourceSchema::write_only_bearing`
-  and `first_write_only_conflict` are held by doctests and schema tests. The
-  differ compares a write-only value against the accepted value recorded in
-  state (`key_should_enter_patch`), so an unchanged value never causes an
-  Update and other write-only attributes are re-sent as `PatchOp::Reassert`
-  (carina#3981, carina#3984).
+  and `first_write_only_conflict` are held by doctests and schema tests.
+  Declared requiredness, defaults, and block aliases below a provider-populated
+  ancestor are inert on that path; walkers must obtain their effective mode and
+  active alias from an `Effective*` view. The differ compares a write-only
+  value against the accepted value recorded in state, not against the read
+  model (`key_should_enter_patch`). So an unchanged write-only value never
+  causes an Update by itself, and a changed one does, sent as a normal
+  `Replace`. When an Update happens, every other updatable desired attribute
+  that is write-only or write-only-bearing is re-sent as `PatchOp::Reassert`
+  alongside the change (carina#3981, carina#3984).
 - **Observed secret protection** (carina#4479): `value::SecretProtection`,
   `ObservationStateAuthority` and `ProtectedObservations` hold the projection
   and authority rules (private constructors, value_observed_secret_tests).
+  Any crate may decode a state document into an authority; this does not
+  authenticate its bytes or backend origin.
   Dispatch rules consume the separate `RuleUpdatePatch` with the existing lenient
   kind and positional annotation. Diagnostics and `RedactionSet` consume
   `DiagnosticUpdatePatch` with output protection: enroll every string classified
@@ -557,7 +566,11 @@ for the details.
   (`Unclassified` for updates).
 - **Provider input wire checks**: `WireReady<T>`, `DesiredInputs::from_provider_ready`,
   `ProviderWireError` and `FinalInput<T>` hold the checked, cached transport
-  projection (private fields, compile_fail doctests). Create validation and
+  projection (private fields, compile_fail doctests). `WireReady` does not
+  mint declaration admission. Updates expose desired values only through the
+  checked patch, with no desired resource or validation view (#2559). Keep
+  `ProviderWireError` terminal: render its typed conversion reason once,
+  without input values. Create validation and
   normalization maps use protocol key order. Raw normalization queries belong
   to `DesiredView` or `NativeDesiredNormalization`.
   Final admission retains every finding across all attributes and leaves,
@@ -600,7 +613,8 @@ for the details.
   `PlanPreviewProviderConfigs` (plain plan display only) and
   `ReadOnlyProviderConfigs` (destroy, state refresh, bucket deletion) cannot be
   saved, dispatched or projected into desired inputs (compile_fail doctests in
-  `parser/resolve.rs`).
+  `parser/resolve.rs`). `plan --out` and `plan --json` require strict
+  configurations and reject missing defaults.
   Anonymous scalar refinements occur only in provider schema slots; `TypeExpr`
   boundaries use identified refinements or unconstrained scalars. Adding overlapping
   source constraints never reduces assignability.
@@ -637,7 +651,8 @@ for the details.
   `NeedsLocal` exists only in the admission-facing reference relation and cannot
   convert back into general type compatibility. Configuration admission lives
   in `validation/admission/configuration/` and is closed off from resource
-  admission by its types. Function parameters/returns use
+  admission by its types. S3 backend URLs keep encryption on and
+  auto-creation off. Function parameters/returns use
   `check_resolved_constraints_at`. Member String failures retain their pattern/
   length category and member label; identity failures run first.
   Int-to-Float widening between identified scalars uses identity-bound containment
@@ -654,9 +669,11 @@ for the details.
   accepts only `ValidatedResourceSchema` / `ValidatedConfigSchema` witnesses
   and projects them there before JSON serialization, while the host keeps only
   JSON/WIT glue and delegates protocol-record decoding to the same module.
-  Required protocol fields, typed pattern specs, `FiniteF64`, and the
-  protocol minimum are held by the protocol types (no serde defaults) and
-  their tests. SDK
+  The nested `write_only` flag, the pattern mode, `InputRule.condition` and
+  Struct `input_rules` are required fields with no serde default, and
+  `MIN_SUPPORTED_PROTOCOL_VERSION` requires them; never add a default to
+  them. Floats are `FiniteF64`, admitted only through its checked
+  constructor (carina#4257). SDK
   guests derive custom-type dispatch from the identity/callback pairs in the
   same validated resource/config witnesses they serialize; providers do not
   implement an optional success-default hook. The guest builds a callback
@@ -814,8 +831,18 @@ for the details.
   uses generic Bound error or partial-reason constructors; closing those older
   constructors remains #4301. The SDK panic hook is installed before
   construction and at the start of every export (each export calls
-  `enter_export()`). Native in-process providers are trusted code linked into
-  the host binary, where host feature unification is accepted. Every
+  `enter_export()`). Only the first panic per call bypasses count/rate
+  limits, and panic text shares a 256 KiB input cap. The default sink shows
+  Error/Warn/Info; Debug/Trace require `CARINA_WASI_HTTP_TRACE=1`, read once
+  by the host and never forwarded to guests. `AwsSdkParts` guarantees paired
+  installation on one AWS SDK config builder; later changes through AWS APIs
+  remain under caller control. The in-repo provider manifest check is an
+  additional lint; it does not resolve transitive features or police external
+  provider repos. Native in-process providers are trusted code linked into
+  the host binary, where host feature unification is accepted. Native
+  `tokio::spawn`, `spawn_blocking` and other threads do not inherit a call
+  scope; their events share a bounded session budget, and the last diagnostic
+  owner flushes the suppressed count as one notice on drop. Every
   configured normalizer owns live diagnostic inputs and dispatches in a call
   scope, including fixtures. Custom-type validation inherits the host sink and
   schemas. Native OS output remains outside this channel. Diagnostics are not
@@ -843,6 +870,10 @@ for the details.
   stage markers (`Knowledge<Plan>` / `Knowledge<Apply>`, `PlanResolved`,
   `KnownValue::from_apply`) and crate-private visitors are held by sealed
   traits, private fields and the compile_fail doctests in that module.
+  Knowledge grants no plaintext access or transport permission.
+  `KnownValue::from_apply` takes only `Knowledge<Apply>`, but it is not the
+  only way to obtain `KnownValue` (`Classification::into_known` also yields
+  one).
   Resource and data-source dispatch classify their final attributes with
   `KnowledgeContext::apply(bindings)` and obtain proofs through
   `KnownValue::from_apply`. Structural serialization checks do not replace
