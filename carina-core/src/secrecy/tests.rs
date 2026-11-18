@@ -1,4 +1,6 @@
 use super::*;
+
+mod deferred_children;
 use crate::parser::ProviderContext;
 use crate::schema::{
     PatternAttributeSchema as Attribute, PatternAttributeType as Type,

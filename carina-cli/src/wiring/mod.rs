@@ -1728,6 +1728,9 @@ fn resolve_file_error(error: carina_core::validation::ResolveFileError) -> AppEr
             AppError::Config(error.to_string())
         }
         carina_core::validation::ResolveFileError::Secrecy(finding) => AppError::Secrecy(finding),
+        carina_core::validation::ResolveFileError::TemplateSecrecy(error) => {
+            AppError::Config(error.to_string())
+        }
         carina_core::validation::ResolveFileError::Expression(finding) => {
             AppError::ExpressionType(finding)
         }

@@ -853,7 +853,6 @@ impl std::error::Error for BindingUseReport {}
 #[derive(Debug)]
 pub struct ResolvedFile<E> {
     inner: crate::parser::ExpandedFile<E>,
-    secrecy: Option<crate::secrecy::ValidatedSecrecyGraph>,
 }
 
 impl<E> ResolvedFile<E> {
@@ -865,16 +864,16 @@ impl<E> ResolvedFile<E> {
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn for_test(inner: crate::parser::ExpandedFile<E>) -> Self {
-        Self {
-            inner,
-            secrecy: None,
-        }
+        Self { inner }
     }
 
     pub fn validated_secrecy(
         &self,
     ) -> Result<&crate::secrecy::ValidatedSecrecyGraph, crate::secrecy::PendingSecrecy> {
-        self.secrecy.as_ref().ok_or(crate::secrecy::PendingSecrecy)
+        self.inner
+            .authored_inputs()
+            .map_err(|_| crate::secrecy::PendingSecrecy)?
+            .validated_secrecy()
     }
 
     pub fn as_file(&self) -> &crate::parser::ExpandedFile<E> {
@@ -902,6 +901,8 @@ pub enum ResolveFileError {
     Expression(Box<crate::parser::Located<inference::InferenceError>>),
     #[error(transparent)]
     Secrecy(Box<crate::secrecy::Finding>),
+    #[error(transparent)]
+    TemplateSecrecy(#[from] crate::secrecy::TemplateAdmissionError),
     #[error(transparent)]
     ResourceDirective(Box<crate::parser::Located<ResourceDirectiveFinding>>),
     #[error(transparent)]
@@ -2457,12 +2458,18 @@ fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteB
     let schemas = judged.schemas();
     let file = judged.into_file();
     let mut inner = file.into_expanded(schemas, provider_context)?;
-    if let Some(graph) = &secrecy
+    if let Some(graph) = &secrecy {
+        for template in inner.deferred_for_expressions_mut().iter_mut() {
+            let evidence = graph.template_evidence(template)?;
+            template.attach_template_evidence(evidence);
+        }
+    }
+    if let Some(graph) = secrecy
         && let Some(inputs) = &inner.authored_inputs
     {
-        inner.attach_authored_inputs(inputs.with_validated_secrecy(graph.clone()));
+        inner.attach_authored_inputs(inputs.with_validated_secrecy(graph));
     }
-    Ok(ResolvedFile { inner, secrecy })
+    Ok(ResolvedFile { inner })
 }
 
 fn exactly_one<T>(mut values: impl Iterator<Item = T>) -> Option<T> {

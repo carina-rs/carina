@@ -29,6 +29,7 @@ use crate::resource::{
     Resource, ResourceId, ResourceIdentity, ResourceIdentityError, RootScope, SavedModuleSource,
     StructuralOperand, StructuralOperandRef, UnboundLoopTemplate, Value, ValueKind,
 };
+use crate::secrecy::{ChildSecrecy, TemplateEvidence, TemplateSecrecy};
 use crate::static_type::{ConsumerStaticType, ExportStaticType};
 use crate::version_constraint::VersionConstraint;
 use indexmap::IndexMap;
@@ -392,14 +393,11 @@ impl<S, P: ValueKind, B: BindingAddress, D> DeferredForTemplateResource<S, P, B,
 }
 
 impl<S: Clone, P: ValueKind, B: BindingAddress, D: Clone> DeferredForTemplateResource<S, P, B, D> {
-    pub(crate) fn instantiate(&self) -> Resource<S, P, B, D> {
+    fn instantiate(&self) -> Resource<S, P, B, D> {
         self.resource.instantiate()
     }
 
-    pub(crate) fn instantiate_with_identity(
-        &self,
-        identity: ResourceIdentity,
-    ) -> Resource<S, P, B, D> {
+    fn instantiate_with_identity(&self, identity: ResourceIdentity) -> Resource<S, P, B, D> {
         self.resource.instantiate_with_identity(identity)
     }
 }
@@ -572,7 +570,7 @@ impl DiagnosticLocation {
 ///     expression.file = Some("unrelated.crn".into());
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 pub struct DeferredForExpression<
     S = ModuleSource,
     P: ValueKind = NoPlaceholder,
@@ -587,6 +585,80 @@ pub struct DeferredForExpression<
     pub binding: ForBinding,
     template_resource: DeferredForTemplateResource<S, T, B, D>,
     deferred_effect_id: ResolvedResourceId,
+    secrecy: TemplateSecrecy,
+}
+
+// Admission metadata is excluded from value equality and diagnostic rendering,
+// just as a resource's authored slots are. Saved-plan round trips keep their
+// existing value semantics even though their in-memory secrecy is unavailable.
+impl<S: PartialEq, P: ValueKind, T: ValueKind, B: BindingAddress, D: PartialEq> PartialEq
+    for DeferredForExpression<S, P, T, B, D>
+{
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            location,
+            header,
+            target,
+            iterable,
+            binding,
+            template_resource,
+            deferred_effect_id,
+            secrecy: _secrecy,
+        } = self;
+        let Self {
+            location: other_location,
+            header: other_header,
+            target: other_target,
+            iterable: other_iterable,
+            binding: other_binding,
+            template_resource: other_resource,
+            deferred_effect_id: other_effect_id,
+            secrecy: _other_secrecy,
+        } = other;
+        (
+            location,
+            header,
+            target,
+            iterable,
+            binding,
+            template_resource,
+            deferred_effect_id,
+        ) == (
+            other_location,
+            other_header,
+            other_target,
+            other_iterable,
+            other_binding,
+            other_resource,
+            other_effect_id,
+        )
+    }
+}
+
+impl<S: std::fmt::Debug, P: ValueKind, T: ValueKind, B: BindingAddress, D: std::fmt::Debug>
+    std::fmt::Debug for DeferredForExpression<S, P, T, B, D>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            location,
+            header,
+            target,
+            iterable,
+            binding,
+            template_resource,
+            deferred_effect_id,
+            secrecy: _secrecy,
+        } = self;
+        f.debug_struct("DeferredForExpression")
+            .field("location", location)
+            .field("header", header)
+            .field("target", target)
+            .field("iterable", iterable)
+            .field("binding", binding)
+            .field("template_resource", template_resource)
+            .field("deferred_effect_id", deferred_effect_id)
+            .finish()
+    }
 }
 
 impl<S, P: ValueKind, T: ValueKind, D> DeferredForExpression<S, P, T, AbsoluteBindingAddress, D> {
@@ -621,6 +693,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             binding,
             template_resource: _,
             deferred_effect_id: _,
+            secrecy,
         } = self;
         DeferredForExpression::from_template_resource(
             location,
@@ -629,6 +702,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             iterable,
             binding,
             DeferredForTemplateResource::new(resource),
+            secrecy,
         )
     }
 
@@ -649,6 +723,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             iterable,
             binding,
             template_resource,
+            TemplateSecrecy::default(),
         )
     }
 
@@ -659,6 +734,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
         iterable: Value<P, B>,
         binding: ForBinding,
         template_resource: DeferredForTemplateResource<S, T, B, D>,
+        secrecy: TemplateSecrecy,
     ) -> Self {
         let template_resource = template_resource.into_materialized_for_target(&target);
         let deferred_effect_id = deferred_effect_id(&target, &template_resource);
@@ -670,6 +746,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             binding,
             template_resource,
             deferred_effect_id,
+            secrecy,
         }
     }
 
@@ -703,6 +780,14 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
 
     pub fn template_resource(&self) -> &DeferredForTemplateResource<S, T, B, D> {
         &self.template_resource
+    }
+
+    pub fn secrecy(&self) -> &TemplateSecrecy {
+        &self.secrecy
+    }
+
+    pub(crate) fn attach_template_evidence(&mut self, evidence: Arc<TemplateEvidence>) {
+        self.secrecy = TemplateSecrecy::Derived(evidence);
     }
 
     pub fn template_resource_binding(&self) -> Option<&str> {
@@ -773,6 +858,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForExpression<S, 
             binding,
             template_resource,
             deferred_effect_id: _,
+            secrecy,
         } = self;
         DeferredForExpression::from_template_resource(
             location,
@@ -781,6 +867,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress> DeferredForExpression<S, 
             iterable,
             binding,
             template_resource.map_resource(|resource| resource.with_dependency_phase(())),
+            secrecy,
         )
     }
 }
@@ -1166,6 +1253,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             iterable,
             binding,
             template_resource,
+            TemplateSecrecy::default(),
         ))
     }
 }
@@ -1261,6 +1349,7 @@ impl<P: ValueKind, T: ValueKind> DeferredForExpression<ModuleSource, P, T, Absol
             binding: _binding,
             template_resource,
             deferred_effect_id,
+            secrecy: _secrecy,
         } = self;
         match target {
             DeferredForTarget::Bound(bound) => {
@@ -1319,6 +1408,7 @@ impl<P: ValueKind, T: ValueKind, D>
             binding,
             mut template_resource,
             deferred_effect_id: _,
+            secrecy,
         } = expression;
         if let Some(root) = location.source_root() {
             T::make_directive_sources_relative(template_resource.directives_mut(), &root);
@@ -1331,6 +1421,7 @@ impl<P: ValueKind, T: ValueKind, D>
             binding,
             template_resource
                 .map_resource(Resource::<SavedModuleSource, T, AbsoluteBindingAddress, D>::from),
+            secrecy,
         )
     }
 }
@@ -1665,6 +1756,7 @@ where
             wire.iterable,
             wire.binding,
             template_resource,
+            TemplateSecrecy::Unavailable(crate::secrecy::TemplateEvidenceUnavailable::SavedPlan),
         ))
     }
 }
@@ -1751,6 +1843,7 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
             binding,
             template_resource,
             deferred_effect_id: _,
+            secrecy,
         } = self;
         let template_resource = template_resource.try_map_resource(|resource| {
             resource.into_loop_template(schemas, element_type.as_ref())
@@ -1762,6 +1855,7 @@ impl<S, B: BindingAddress> DeferredForExpression<S, ParserPlaceholder, ParserPla
             iterable.into_expanded()?,
             binding,
             template_resource,
+            secrecy,
         ))
     }
 }
@@ -1775,6 +1869,10 @@ pub struct ShapeMismatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DeferredForExpansionError {
+    #[error(transparent)]
+    TemplateSecrecy(#[from] crate::secrecy::TemplateEvidenceMismatch),
+    #[error(transparent)]
+    ChildSecrecy(#[from] crate::secrecy::ChildEvidenceInsertError),
     #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
     #[error(transparent)]
@@ -9033,6 +9131,18 @@ impl<E> ExpandedFile<E> {
             }
         }
 
+        // Insert into a private copy first so a failed hand-over leaves both
+        // the file and its attached graph unchanged.
+        if let Some(inputs) = &self.authored_inputs
+            && let Ok(graph) = inputs.validated_secrecy()
+        {
+            let mut graph = graph.clone();
+            for child in &expanded_resources {
+                graph.insert_child(child)?;
+            }
+            self.attach_authored_inputs(inputs.with_validated_secrecy(graph));
+        }
+
         // Remove parse-time warnings for mismatched entries (the new
         // shape-mismatch warning replaces the generic "not yet available" one).
         for idx in &mismatched_indices {
@@ -9066,6 +9176,8 @@ fn retain_non_matching_deferred_for_warnings(
 }
 
 /// Expand an exact collection shape, whose leaves may still await apply.
+/// Every returned resource carries its [`ChildSecrecy`] in the same value via
+/// [`Resource::child_secrecy`]; all deferred child producers use this operation.
 ///
 /// ```compile_fail,E0308
 /// use carina_core::{parser::{expand_deferred_children, DeferredForExpression}, resource::{Value, AccessMissPolicy}, validation::deferred_types::ProviderTypeCheckContext};
@@ -9174,6 +9286,14 @@ fn deferred_iterable_kind(value: &Value) -> &'static str {
     }
 }
 
+pub(super) struct DeferredChildSecrecy(ChildSecrecy);
+
+impl DeferredChildSecrecy {
+    pub(super) fn into_inner(self) -> ChildSecrecy {
+        self.0
+    }
+}
+
 fn build_expanded_child<
     S: Clone,
     D: crate::resource::DeferredDependencyPhase<AbsoluteBindingAddress>,
@@ -9210,7 +9330,7 @@ fn build_expanded_child<
             let mut resource = deferred.template_resource.instantiate();
             resource.binding = None;
             resource.loop_provenance =
-                crate::resource::LoopProvenance::direct(template.element_origin(element));
+                crate::resource::LoopProvenance::direct(template.element_origin(element.clone()));
             resource
         }
     };
@@ -9219,7 +9339,7 @@ fn build_expanded_child<
         deferred.root_bindings(),
         deferred.site().iterable_location,
     );
-    let resource = substitute_attrs(
+    let mut resource = substitute_attrs(
         resource,
         index,
         key,
@@ -9239,6 +9359,15 @@ fn build_expanded_child<
             }
         }
     })?;
+    let secrecy = match deferred.secrecy() {
+        TemplateSecrecy::Derived(evidence) => ChildSecrecy::Row(Arc::new(
+            evidence.instantiate_child(deferred, &element, &resource)?,
+        )),
+        TemplateSecrecy::Unavailable(reason) => ChildSecrecy::Unavailable(*reason),
+    };
+    resource
+        .authored_slots
+        .set_child_secrecy(DeferredChildSecrecy(secrecy));
     Ok(resource)
 }
 
