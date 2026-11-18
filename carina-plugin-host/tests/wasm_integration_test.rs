@@ -430,11 +430,19 @@ fn create_state_for_writeback(outcome: CreateOutcome) -> SnapshotState {
     complete_create_for_writeback(outcome, request).0
 }
 
-fn lifted_saved_attrs(
-    entries: impl IntoIterator<Item = (ResourceId, HashMap<String, SnapshotValue>)>,
-) -> carina_core::provider::LiftedSavedAttrs {
-    RawSavedAttrs::from_decoded_values_for_test(entries.into_iter().collect())
-        .lift(&carina_core::schema::SchemaRegistry::new())
+fn lifted_saved_attrs<M>(
+    entries: impl IntoIterator<Item = (ResourceId, M)>,
+) -> carina_core::provider::LiftedSavedAttrs
+where
+    M: IntoIterator<Item = (String, SnapshotValue)>,
+{
+    RawSavedAttrs::from_decoded_values_for_test(
+        entries
+            .into_iter()
+            .map(|(id, attributes)| (id, attributes.into_iter().collect()))
+            .collect(),
+    )
+    .lift(&carina_core::schema::SchemaRegistry::new())
 }
 
 fn migrate_legacy_state_attribute(
@@ -1419,7 +1427,7 @@ fn resolved_provider_config(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },

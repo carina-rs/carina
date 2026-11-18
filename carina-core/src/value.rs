@@ -3692,7 +3692,7 @@ where
 /// Redact all secrets in an attributes map.
 pub(crate) fn redact_secrets_in_attributes(
     attrs: &HashMap<String, Value>,
-) -> Result<HashMap<String, SnapshotValue>, SerializationError> {
+) -> Result<BTreeMap<String, SnapshotValue>, SerializationError> {
     redact_attrs_with_guide(attrs.iter(), |_, value| redact_secrets_in_value(value))
 }
 
@@ -4301,7 +4301,6 @@ pub fn verify_historical_state_secrets(
     let mut state = saved.clone();
     let mut drifted_attributes = BTreeSet::new();
     let mut drift_errors = Vec::new();
-    #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
     for (key, saved_value) in &saved.attributes {
         if !contains_redacted_secret(saved_value) {
             continue;
@@ -4382,9 +4381,9 @@ pub(crate) fn redact_secrets_in_effect<S: Clone>(
 }
 
 fn redact_historical_attributes_impl<'a>(
-    attributes: &HashMap<String, SnapshotValue>,
+    attributes: &BTreeMap<String, SnapshotValue>,
     mut guide: impl FnMut(&str) -> Option<&'a SnapshotValue>,
-) -> Result<HashMap<String, SnapshotValue>, SerializationError> {
+) -> Result<BTreeMap<String, SnapshotValue>, SerializationError> {
     redact_attrs_with_guide(attributes.iter(), |key, value| match guide(key) {
         Some(shape) => redact_using_redacted_shape(value, shape),
         None => redact_snapshot_secrets(value),
@@ -4598,7 +4597,6 @@ fn redact_secrets_in_plan_with_desired_and_historical_impl<D>(
         let resource_id = create_ids.get(metadata.create_idx).and_then(Option::as_ref);
         let historical = resource_id.and_then(|id| historical.get(id));
         let guide = resource_id.and_then(|id| planned_resources.get(id));
-        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut metadata.previous_attributes {
             *value = if let Some(shape) = historical.and_then(|state| state.attributes.get(key)) {
                 redact_using_redacted_shape(value, shape)?
@@ -4812,7 +4810,6 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
         verified: &crate::resource::SnapshotState,
     ) -> Result<crate::resource::SnapshotState, SecretRehydrationSiteError> {
         let mut out = saved.clone();
-        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut out.attributes {
             if !contains_redacted_secret(value) {
                 continue;
@@ -4936,7 +4933,6 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
                 )
             })?;
         let (redacted, verified) = state_evidence(resource_id)?;
-        #[allow(clippy::iter_over_hash_type)] // order reaches output; migration tracked in #4414
         for (key, value) in &mut metadata.previous_attributes {
             if !contains_redacted_secret(value) {
                 continue;
@@ -10417,7 +10413,7 @@ mod tests {
             );
         let managed = vec![source];
         let current_states = std::collections::HashMap::new();
-        let remote_bindings = std::collections::HashMap::new();
+        let remote_bindings = std::collections::BTreeMap::new();
         let bindings = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
             managed: &managed,
             compositions: &[],
@@ -14329,7 +14325,7 @@ mod tests {
 
     fn make_resource(attrs: Vec<(&str, Value)>) -> crate::resource::Resource {
         use crate::resource::{ExpandedResource as Resource, ResourceId};
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashSet;
         let mut attributes = IndexMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
@@ -14339,7 +14335,7 @@ mod tests {
             attributes,
             directives: Default::default(),
             resolved_ignore_changes: Default::default(),
-            prefixes: HashMap::new(),
+            prefixes: Default::default(),
             binding: Some(absolute_binding("p1")),
             dependencies: Default::default(),
             module_source: None,
@@ -14500,8 +14496,7 @@ mod tests {
 
     fn make_state(attrs: Vec<(&str, Value)>) -> crate::resource::State {
         use crate::resource::{ResourceId, State};
-        use std::collections::HashMap;
-        let mut attributes = HashMap::new();
+        let mut attributes = std::collections::BTreeMap::new();
         for (k, v) in attrs {
             attributes.insert(k.to_string(), v);
         }

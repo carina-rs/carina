@@ -1145,7 +1145,7 @@ mod tests {
             from: Box::new(
                 (State::<carina_core::resource::NoPlaceholder>::existing(
                     update_id.clone(),
-                    Default::default(),
+                    std::collections::BTreeMap::new(),
                 )
                 .with_identifier("subnet-old"))
                 .to_snapshot(),

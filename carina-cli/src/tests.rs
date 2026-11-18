@@ -329,7 +329,7 @@ fn saved_provider_configs(
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -1019,7 +1019,7 @@ fn plan_file_serde_round_trip() {
                     .to_snapshot(),
                 ),
             }],
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: vec![],
         },
@@ -1743,7 +1743,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
             Value::Concrete(ConcreteValue::String(run1_bucket_name.clone())),
         )]
         .into_iter()
-        .collect(),
+        .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .with_identifier("my-app-abcd1234");
 
@@ -1875,7 +1875,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
             ),
         ]
         .into_iter()
-        .collect(),
+        .collect::<std::collections::BTreeMap<_, _>>(),
     )
     .with_identifier(run1_role_name.expose_plaintext());
 
@@ -2222,7 +2222,10 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
             planned.clone(),
         )],
         &carina_state::PreparedRows::from_snapshots(
-            [(id, Current::from_state(planned))],
+            [(
+                carina_core::resource::ResolvedResourceId::new(id),
+                Current::from_state(planned),
+            )],
             &carina_state::ResolvedRemovedClaims::resolve(&[], None),
         )
         .refreshable,
@@ -2955,10 +2958,11 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     std::fs::write(
         &mock_state_path,
         serde_json::json!({
-            "s3.Bucket.alive-deposed-bucket": {
+            "version": 3,
+            "states": {"old-bucket": {
                 "bucket": "old-bucket",
                 "status": "alive"
-            }
+            }}
         })
         .to_string(),
     )
@@ -3269,7 +3273,10 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
             // In the real code the typed orphan supplies `AppliedIdentifier`
             // and the provider returns `ReadOutcome::NotFound`.
             let refreshed = State::<carina_core::resource::NoPlaceholder>::not_found(id.clone());
-            orphan.with_refreshed_state(refreshed.to_snapshot())
+            (
+                carina_core::resource::ResolvedResourceId::new(id),
+                orphan.with_refreshed_state(refreshed.to_snapshot()),
+            )
         })
         .collect::<carina_state::LoadedOrphans>()
         .into_plan_orphans();
@@ -3658,7 +3665,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
         complete_create(State {
             id: id.clone(),
             identifier: Some("vpc-123".to_string()),
-            attributes: HashMap::from([(
+            attributes: std::collections::BTreeMap::from([(
                 "cidr_block".to_string(),
                 Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
             )]),
@@ -3860,7 +3867,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
             State {
                 id: id.clone(),
                 identifier: Some("vpc-123".to_string()),
-                attributes: HashMap::from([(
+                attributes: std::collections::BTreeMap::from([(
                     "cidr_block".to_string(),
                     Value::Concrete(ConcreteValue::String("10.0.0.0/24".into())),
                 )]),
@@ -4024,7 +4031,7 @@ fn plan_file_serialization_redacts_secrets() {
                     .snapshot()
                     .unwrap(),
             )],
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: vec![],
         },
@@ -4089,7 +4096,7 @@ fn plan_file_serialization_rejects_pending_resource_identity() {
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         },
@@ -4139,7 +4146,7 @@ fn plan_file_validation_rejects_missing_resource_identity() {
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         },
@@ -4209,7 +4216,7 @@ fn plan_file_with_deferred_effect(effect: Effect) -> PlanFile {
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         },
@@ -4573,7 +4580,7 @@ fn plan_file_contents_with_unchanged_managed_wait_target() -> PlanFileTransport 
             State::<carina_core::resource::NoPlaceholder>::existing(target_id, HashMap::new())
                 .with_identifier("managed-id"),
         )],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: Vec::new(),
         wait_bindings: Vec::new(),
     }
@@ -4704,7 +4711,7 @@ fn plan_file_validation_rejects_blocked_data_source_without_plan_errors() {
                 value: DataSourceValue::blocked_by_plan_error(),
             }],
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         },

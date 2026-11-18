@@ -4028,7 +4028,7 @@ fn prefix_state_info(
 ) -> Option<PrefixStateInfo> {
     let persisted_attributes = persisted.persisted_attributes()?;
     let persisted_values = persisted_attributes.plain_string_values();
-    let mut attribute_values = HashMap::new();
+    let mut attribute_values = BTreeMap::new();
 
     if let Some(current) = current {
         attribute_values.extend(current.attributes.iter().filter_map(|(name, value)| {
@@ -4049,8 +4049,6 @@ fn prefix_state_info(
                     });
             }
         }
-        #[allow(clippy::iter_over_hash_type)]
-        // keyed rebuild: distinct persisted keys fill missing entries with refreshed-value precedence
         for (name, value) in persisted_values {
             attribute_values
                 .entry(name)
@@ -10360,23 +10358,16 @@ async fn refresh_loaded_orphans(
     state_file: Option<&StateFile>,
     schemas: &SchemaRegistry,
 ) -> Result<LoadedOrphans, AppError> {
-    let results: Vec<Result<Orphan, AppError>> = stream::iter(loaded)
-        .map(|(_id, loaded)| {
-            let id = match loaded.current() {
-                Current::Absent(state) => &state.state().id,
-                Current::Present(present) => &present.state().id,
-                Current::CreateInFlight(pending) => pending.id(),
-                Current::CreateOutcomeUnknown(unknown) => unknown.id(),
-                Current::MissingIdentifier(state) => &state.state().id,
-            };
-            let progress = refresh_phase.begin(id);
+    let results: Vec<Result<(ResolvedResourceId, Orphan), AppError>> = stream::iter(loaded)
+        .map(|(key, loaded)| {
+            let progress = refresh_phase.begin(loaded.current().id());
             async move {
                 let refreshed =
                     refresh_loaded_orphan_with_retry(provider, loaded, state_file, schemas)
                         .await
                         .map_err(AppError::Provider)?;
                 progress.finish();
-                Ok(refreshed)
+                Ok((key, refreshed))
             }
         })
         .buffer_unordered(5)
@@ -10384,7 +10375,8 @@ async fn refresh_loaded_orphans(
         .await;
     let mut refreshed = LoadedOrphans::default();
     for result in results {
-        refreshed.insert(result?);
+        let (id, orphan) = result?;
+        refreshed.insert(id, orphan);
     }
     Ok(refreshed)
 }
@@ -11707,7 +11699,7 @@ impl MigrationCheckConfig {
                         compositions: &self.resources.compositions,
                         managed_current: &managed_current,
                         data_source_values: &data_source_values,
-                        remote_bindings: &HashMap::new(),
+                        remote_bindings: &Default::default(),
                         wait_aliases: &wait_aliases,
                     });
                     self.resources

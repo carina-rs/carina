@@ -106,7 +106,7 @@ pub(super) struct Parts<S = ModuleSource> {
         Vec<Saved<carina_core::resource::DataSource<S, SnapshotLeaf, AbsoluteBindingAddress, ()>>>,
     pub data_source_values: Vec<DataSourcePart>,
     pub current_states: Vec<CurrentStateEntry>,
-    pub upstream_snapshot: HashMap<String, HashMap<String, Saved<SnapshotValue>>>,
+    pub upstream_snapshot: BTreeMap<String, BTreeMap<String, Saved<SnapshotValue>>>,
     pub upstream_sources: Vec<UpstreamSource>,
     pub wait_bindings: Vec<PlanWaitBinding>,
 }

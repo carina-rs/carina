@@ -297,7 +297,7 @@ pub fn enum_attr_at_schema_path<'a>(
 /// let identity = String::from("runtime-identity");
 /// let _ = ResourceId::with_identity("test.Resource", identity);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceIdentity(String);
 
 /// Error returned when a runtime value cannot be used as a resource identity.
@@ -961,7 +961,7 @@ struct ResourceWithDependenciesWire<S, P: ValueKind> {
     #[serde(default)]
     directives: Directives<AbsoluteBindingAddress, P>,
     #[serde(default)]
-    prefixes: HashMap<String, String>,
+    prefixes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     binding: Option<AbsoluteBindingAddress>,
     dependencies: (),
@@ -4884,6 +4884,30 @@ enum RedactedSecretHashKind {
     },
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) mod secret_hash_test_entropy {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SALT: Cell<Option<[u8; 16]>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn salt() -> Option<[u8; 16]> {
+        SALT.get()
+    }
+
+    pub(crate) fn with_salt<T>(salt: [u8; 16], record: impl FnOnce() -> T) -> T {
+        struct Restore(Option<[u8; 16]>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SALT.set(self.0);
+            }
+        }
+        let _restore = Restore(SALT.replace(Some(salt)));
+        record()
+    }
+}
+
 impl RedactedSecretHash {
     const SALT_LEN: usize = 16;
     const MAX_EXPLICIT_LEGACY_SALT_LEN: usize = 4096;
@@ -4897,6 +4921,11 @@ impl RedactedSecretHash {
     const LEGACY_FALLBACK_SALT: &'static [u8] = b"carina-secret-v1";
 
     pub(crate) fn generate(plaintext: &[u8]) -> Self {
+        #[cfg(any(test, feature = "test-utils"))]
+        let salt = secret_hash_test_entropy::salt()
+            .map(|salt| SaltString::encode_b64(&salt).expect("fixture salt has valid length"))
+            .unwrap_or_else(|| SaltString::generate(&mut OsRng));
+        #[cfg(not(any(test, feature = "test-utils")))]
         let salt = SaltString::generate(&mut OsRng);
         let encoded = Argon2::default()
             .hash_password(plaintext, &salt)
@@ -5070,13 +5099,6 @@ impl RedactedSecretHash {
 ///     "password",
 /// );
 /// ```
-///
-/// ```compile_fail
-/// use carina_core::resource::legacy_secret_migration;
-///
-/// let mut value = serde_json::json!("_secret:argon2-legacy:73616c74:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-/// legacy_secret_migration::migrate_self_contained_markers(&mut value);
-/// ```
 pub mod legacy_secret_migration {
     use super::RedactedSecretHash;
 
@@ -5141,31 +5163,6 @@ pub mod legacy_secret_migration {
         serde_json::json!({
             crate::value::PERSISTED_SECRET_KEY: hash.encoded_digest(),
         })
-    }
-
-    /// Migrate the self-contained marker strings understood by mock-state v1.
-    /// Raw row-bound markers remain strings because that format never carried
-    /// the resource-row inputs required to assign them secret semantics.
-    fn migrate_self_contained_markers(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::String(marker) => {
-                if let Some(hash) = RedactedSecretHash::parse_legacy_persisted_marker(marker) {
-                    *value = structural_secret(&hash);
-                }
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    migrate_self_contained_markers(value);
-                }
-            }
-            serde_json::Value::Object(values) => {
-                for value in values.values_mut() {
-                    migrate_self_contained_markers(value);
-                }
-            }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            }
-        }
     }
 
     /// Migrate one top-level resource attribute from state v13 or earlier.
@@ -5322,47 +5319,6 @@ pub mod legacy_secret_migration {
         Ok(())
     }
 
-    /// Upgrade a complete mock-provider v1 state document. Only values below
-    /// `states.<resource>.<attribute>` are eligible for legacy marker
-    /// classification.
-    pub fn migrate_mock_state_document_v1(
-        document: &mut serde_json::Value,
-    ) -> Result<(), LegacySecretMigrationError> {
-        const ARTIFACT: &str = "mock-provider state v1";
-        let version = document_version(document, ARTIFACT)?;
-        if version != 1 {
-            return Err(LegacySecretMigrationError::UnsupportedVersion {
-                artifact: ARTIFACT,
-                found: version,
-                expected: "version 1",
-            });
-        }
-
-        let mut migrated = document.clone();
-        let states = migrated
-            .get_mut("states")
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or(LegacySecretMigrationError::InvalidDocument {
-                artifact: ARTIFACT,
-                detail: "states must be an object",
-            })?;
-        for attributes in states.values_mut() {
-            let attributes =
-                attributes
-                    .as_object_mut()
-                    .ok_or(LegacySecretMigrationError::InvalidDocument {
-                        artifact: ARTIFACT,
-                        detail: "each resource state must be an attribute object",
-                    })?;
-            for value in attributes.values_mut() {
-                migrate_self_contained_markers(value);
-            }
-        }
-        migrated["version"] = serde_json::json!(2);
-        *document = migrated;
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn migrate_legacy_state_attribute_for_test(
         value: serde_json::Value,
@@ -5438,46 +5394,6 @@ pub mod legacy_secret_migration {
             });
             let unchanged = current.clone();
             assert!(migrate_state_document_v13(&mut current).is_err());
-            assert_eq!(current, unchanged);
-        }
-
-        #[test]
-        fn mock_v1_migration_checks_version_and_walks_only_states() {
-            let marker = format!("_secret:argon2-legacy:73616c74:{}", "ab".repeat(32));
-            let mut document = serde_json::json!({
-                "version": 1,
-                "metadata": marker,
-                "states": {
-                    "test.resource.example": {
-                        "token": marker,
-                        "nested": [marker]
-                    }
-                }
-            });
-
-            migrate_mock_state_document_v1(&mut document).expect("migrate mock v1 document");
-
-            assert_eq!(document["version"], 2);
-            assert!(
-                document["states"]["test.resource.example"]["token"]
-                    [crate::value::PERSISTED_SECRET_KEY]
-                    .is_string()
-            );
-            assert!(
-                document["states"]["test.resource.example"]["nested"][0]
-                    [crate::value::PERSISTED_SECRET_KEY]
-                    .is_string()
-            );
-            assert_eq!(document["metadata"], marker);
-
-            let mut current = serde_json::json!({
-                "version": 2,
-                "states": {
-                    "test.resource.example": {"token": marker}
-                }
-            });
-            let unchanged = current.clone();
-            assert!(migrate_mock_state_document_v1(&mut current).is_err());
             assert_eq!(current, unchanged);
         }
     }
@@ -9413,7 +9329,7 @@ pub struct Resource<
     /// Attribute prefixes: maps attribute name -> prefix string
     /// e.g., {"bucket_name": "my-app-"} from `bucket_name_prefix = "my-app-"`
     #[serde(default)]
-    pub prefixes: HashMap<String, String>,
+    pub prefixes: std::collections::BTreeMap<String, String>,
     /// Binding name from `let` bindings in DSL (e.g., `let vpc = ...`)
     #[serde(default)]
     pub binding: Option<B>,
@@ -9727,7 +9643,7 @@ impl<P: ValueKind, B: BindingAddress> Resource<ModuleSource, P, B> {
             attributes: IndexMap::new(),
             directives: Directives::default(),
             resolved_ignore_changes: ResolvedIgnoreChanges::default(),
-            prefixes: HashMap::new(),
+            prefixes: Default::default(),
             binding: None,
             dependencies: UnexpandedDependencyFields::default(),
             module_source: None,
@@ -11192,7 +11108,7 @@ impl UnidentifiedState {
 /// use carina_core::resource::{Current, ResourceId, SnapshotState};
 ///
 /// let id = ResourceId::with_identity("test.Resource", "example");
-/// let state = SnapshotState::existing(id, Default::default());
+/// let state = SnapshotState::existing(id, std::collections::BTreeMap::new());
 /// let current = Current::MissingIdentifier(state);
 /// ```
 ///
@@ -11221,7 +11137,7 @@ pub struct StateBearingCurrentMut<'a> {
 }
 
 impl StateBearingCurrentMut<'_> {
-    pub fn attributes_mut(&mut self) -> &mut HashMap<String, SnapshotValue> {
+    pub fn attributes_mut(&mut self) -> &mut BTreeMap<String, SnapshotValue> {
         &mut self.state.attributes
     }
 
@@ -11306,7 +11222,7 @@ impl Current {
         }
     }
 
-    pub fn attributes_mut(&mut self) -> Option<&mut HashMap<String, SnapshotValue>> {
+    pub fn attributes_mut(&mut self) -> Option<&mut BTreeMap<String, SnapshotValue>> {
         self.state_bearing_mut()
             .map(|projection| &mut projection.state.attributes)
     }
@@ -11349,8 +11265,10 @@ impl Current {
             Self::Present(present) => {
                 present.state.dependency_bindings = dependency_bindings;
             }
-            Self::CreateInFlight(_pending) => {}
-            Self::CreateOutcomeUnknown(_unknown) => {}
+            Self::CreateInFlight(pending) => *pending.dependency_bindings = dependency_bindings,
+            Self::CreateOutcomeUnknown(unknown) => {
+                *unknown.dependency_bindings = dependency_bindings
+            }
             Self::MissingIdentifier(state) => {
                 state.0.dependency_bindings = dependency_bindings;
             }
@@ -11452,17 +11370,19 @@ pub struct PlanInputDesired<'a> {
 /// post-order canonicalization without mutating the provider-bound resource.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CanonicalComparisonAttributes {
-    attributes: HashMap<String, SnapshotValue>,
+    attributes: BTreeMap<String, SnapshotValue>,
 }
 
 /// Attribute values used only when no resource schema exists.
 ///
 /// The wrapper makes schema-less passthrough construction explicit instead of
 /// presenting it as an already-canonical comparison map.
-pub(crate) struct UnschematizedComparisonAttributes(HashMap<String, SnapshotValue>);
+pub(crate) struct UnschematizedComparisonAttributes(BTreeMap<String, SnapshotValue>);
 
 impl UnschematizedComparisonAttributes {
-    pub(crate) fn new<P: StateValueLeaf>(attributes: HashMap<String, Value<P>>) -> Self {
+    pub(crate) fn new<P: StateValueLeaf>(
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
+    ) -> Self {
         Self(
             attributes
                 .into_iter()
@@ -11476,10 +11396,10 @@ impl CanonicalComparisonAttributes {
     /// Secret-grafted apply views retain the authored hash material even when
     /// provider normalization changed a secret's structural representation.
     pub(crate) fn canonicalize_preserving_secret_shapes<P: StateValueLeaf>(
-        attributes: HashMap<String, Value<P>>,
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
         schema: &crate::schema::CompiledResourceSchema,
     ) -> Self {
-        let mut attributes: HashMap<_, _> = attributes
+        let mut attributes: BTreeMap<_, _> = attributes
             .into_iter()
             .map(|(key, value)| (key, state_value_snapshot(&value)))
             .collect();
@@ -11495,10 +11415,10 @@ impl CanonicalComparisonAttributes {
 
     /// Build the state-style canonical comparison view for one resource.
     pub fn canonicalize<P: StateValueLeaf>(
-        attributes: HashMap<String, Value<P>>,
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
         schema: &crate::schema::CompiledResourceSchema,
     ) -> Self {
-        let mut attributes: HashMap<_, _> = attributes
+        let mut attributes: BTreeMap<_, _> = attributes
             .into_iter()
             .map(|(key, value)| (key, state_value_snapshot(&value)))
             .collect();
@@ -11535,7 +11455,7 @@ impl CanonicalComparisonAttributes {
 
 impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
     type Item = (&'a String, &'a SnapshotValue);
-    type IntoIter = std::collections::hash_map::Iter<'a, String, SnapshotValue>;
+    type IntoIter = std::collections::btree_map::Iter<'a, String, SnapshotValue>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.attributes.iter()
@@ -11544,7 +11464,7 @@ impl<'a> IntoIterator for &'a CanonicalComparisonAttributes {
 
 impl IntoIterator for CanonicalComparisonAttributes {
     type Item = (String, SnapshotValue);
-    type IntoIter = std::collections::hash_map::IntoIter<String, SnapshotValue>;
+    type IntoIter = std::collections::btree_map::IntoIter<String, SnapshotValue>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.attributes.into_iter()
@@ -11712,7 +11632,7 @@ pub struct State<P: ValueKind = NoPlaceholder> {
     pub id: ResourceId,
     /// AWS internal identifier (e.g., vpc-xxx, subnet-xxx)
     pub identifier: Option<String>,
-    pub attributes: HashMap<String, Value<P>>,
+    pub attributes: BTreeMap<String, Value<P>>,
     /// Whether this state exists
     pub exists: bool,
     /// Binding names this resource depended on when it was last applied.
@@ -11731,18 +11651,21 @@ impl<P: ValueKind> State<P> {
         Self {
             id,
             identifier: None,
-            attributes: HashMap::new(),
+            attributes: BTreeMap::new(),
             exists: false,
             dependency_bindings: PersistedDestroyDependencies::default(),
             partial_read: None,
         }
     }
 
-    pub fn existing(id: ResourceId, attributes: HashMap<String, Value<P>>) -> Self {
+    pub fn existing(
+        id: ResourceId,
+        attributes: impl IntoIterator<Item = (String, Value<P>)>,
+    ) -> Self {
         Self {
             id,
             identifier: None,
-            attributes,
+            attributes: attributes.into_iter().collect(),
             exists: true,
             dependency_bindings: PersistedDestroyDependencies::default(),
             partial_read: None,

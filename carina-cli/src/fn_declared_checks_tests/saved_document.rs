@@ -56,7 +56,7 @@ fn positions() -> Vec<(&'static str, Case)> {
         ),
         (
             "require operand",
-            "arguments { input: String }\nrequire input != 'rejected', 'required'\n",
+            "arguments { input: String require input != 'rejected', 'required' }\n",
         ),
     ] {
         cases.push((position,Case {name:position.into(),main:format!("{base}let child = use {{ source = './child' }}\nlet instance = child {{ input = checked(src.emitted) }}\n"),child:Some(child.into()),emitted:"allowed".into()}));

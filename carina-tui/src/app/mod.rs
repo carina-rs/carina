@@ -302,6 +302,9 @@ impl App {
             return all_dfs;
         }
         let mut visible_set: HashSet<usize> = HashSet::new();
+        #[allow(clippy::iter_over_hash_type)]
+        // This only unions membership with ancestors. Output filters all_dfs,
+        // whose order is independent of the set's traversal.
         for &idx in &match_set {
             visible_set.insert(idx);
             // Walk up ancestors

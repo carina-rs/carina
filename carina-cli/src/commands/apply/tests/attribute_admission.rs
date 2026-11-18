@@ -122,7 +122,7 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
                     )
                 })
                 .collect(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         };
@@ -318,7 +318,7 @@ fn saved_plan_layered_scalars_reload_and_validate_both_layers() {
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         };

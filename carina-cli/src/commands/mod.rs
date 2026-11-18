@@ -873,9 +873,11 @@ fn validate_and_resolve_configuration<'s>(
     // backend is misplaced, so do not also classify the module's arguments as
     // misplaced root declarations. Provider + arguments retains the existing
     // root-arguments rule (#2198).
+    // An analysis Err is reported below as AnalysisInvariant / ValidationStopped.
     if let Err(msg) = carina_core::validation::validate_no_backend_in_module(parsed.parsed()) {
         errors.push(AppError::Validation(msg));
-    } else if let Err(msg) = carina_core::validation::validate_no_arguments_in_root(parsed.parsed())
+    } else if let Ok(tree) = &analysis
+        && let Err(msg) = carina_core::validation::validate_no_arguments_in_root(tree.tree())
     {
         errors.push(AppError::Validation(msg));
     }

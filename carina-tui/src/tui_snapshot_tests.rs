@@ -119,7 +119,7 @@ fn build_mixed_operations_plan() -> Plan {
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("my-vpc-id"),
         ),
@@ -203,7 +203,7 @@ fn build_map_key_diff_plan() -> Plan {
     plan.add(Effect::Update {
         identifier: crate::fixture_applied_identifier("my-vpc-id"),
         from: Box::new(
-            State::existing(
+            State::<carina_core::resource::NoPlaceholder>::existing(
                 ResourceId::with_identity("ec2.Vpc", "my-vpc"),
                 [
                     (
@@ -216,7 +216,7 @@ fn build_map_key_diff_plan() -> Plan {
                     ),
                 ]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("my-vpc-id")
             .to_snapshot(),
@@ -713,7 +713,7 @@ fn build_moved_with_changes_plan() -> Plan {
                     Value::Concrete(ConcreteValue::String("10.0.0.0/16".into())),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<std::collections::BTreeMap<_, _>>(),
             )
             .with_identifier("new-vpc-id"),
         ),

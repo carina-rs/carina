@@ -166,13 +166,19 @@ fn primitive_sink_values(project: &Project, module: bool) -> Vec<serde_json::Val
         return Vec::new();
     }
     let store: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let key = if module {
-        "test.resource.instance.sink"
-    } else {
-        "test.resource.sink"
-    };
-    store["states"][key]
-        .get("computed")
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.path().join("carina.state.json")).unwrap())
+            .unwrap();
+    let identity = if module { "instance.sink" } else { "sink" };
+    let identifier = state["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["identity"] == identity)
+        .and_then(|row| row.pointer("/current/identifier"))
+        .and_then(serde_json::Value::as_str);
+    identifier
+        .and_then(|key| store["states"][key].get("computed"))
         .cloned()
         .into_iter()
         .collect()

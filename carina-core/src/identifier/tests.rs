@@ -18,6 +18,7 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 use indexmap::IndexMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 type LoopValue = crate::resource::Value<LoopSlot>;
@@ -58,7 +59,7 @@ where
     let attributes = attributes
         .into_iter()
         .map(|(name, value)| (name.into(), value))
-        .collect::<HashMap<_, _>>();
+        .collect::<std::collections::BTreeMap<_, _>>();
     let origin_id = ResolvedResourceId::with_provider_identity(
         provider,
         resource_type,
@@ -1548,7 +1549,7 @@ fn historical_identity_binding_selects_siblings_and_rejects_hashes_with_typed_pa
             "hash": format!("argon2-legacy:73616c74:{}", "ab".repeat(32)),
         },
     });
-    let attributes: HashMap<String, crate::resource::SnapshotValue> =
+    let attributes: BTreeMap<String, crate::resource::SnapshotValue> =
         serde_json::from_value(serde_json::json!({
             "password": hash,
             "details": {"Map": {
@@ -2923,7 +2924,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
             prefixes: vec![("bucket_name".to_string(), "my-app-".to_string())]
                 .into_iter()
                 .collect(),
-            attribute_values: HashMap::from([(
+            attribute_values: std::collections::BTreeMap::from([(
                 "bucket_name".to_string(),
                 PrefixStateValue::Known("my-app-existing1".to_string()),
             )]),
@@ -2956,7 +2957,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
             prefixes: vec![("bucket_name".to_string(), "old-prefix-".to_string())]
                 .into_iter()
                 .collect(),
-            attribute_values: HashMap::from([(
+            attribute_values: std::collections::BTreeMap::from([(
                 "bucket_name".to_string(),
                 PrefixStateValue::Known("old-prefix-existing1".to_string()),
             )]),
@@ -3122,7 +3123,8 @@ fn state_row_identity_values_use_the_original_permanent_name_override() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect("historical identity fixture remains available");
-    let attributes = HashMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]);
+    let attributes =
+        std::collections::BTreeMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]);
     let without_override =
         StateRowIdentityValues::from_state_row(&schema, &attributes, &HashMap::new());
     let with_override = StateRowIdentityValues::from_state_row(
@@ -3189,7 +3191,7 @@ fn reconcile_unknown_name_override_origin_requires_an_explicit_moved_block() {
             )
             .expect("registered schema")
             .schema(),
-        &HashMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]),
+        &std::collections::BTreeMap::from([("name".to_string(), concrete_string("role-a1b2c3d4"))]),
         &HashMap::from([(
             "name".to_string(),
             crate::name_override::NameOverride {
@@ -3270,7 +3272,7 @@ fn reconcile_override_hidden_identity_row_with_comparable_mismatch_is_ignored() 
             )
             .expect("registered schema")
             .schema(),
-        &HashMap::from([
+        &std::collections::BTreeMap::from([
             ("name".to_string(), concrete_string("old-role-temporary")),
             ("scope".to_string(), concrete_string("old-scope")),
         ]),
@@ -4139,7 +4141,7 @@ fn nested_when_present_absence_does_not_match_redacted_state() {
     for settings in [redacted_leaf, redacted_identity_value()] {
         let state = StateRowIdentityValues::from_state_row(
             &schema,
-            &HashMap::from([("settings".to_string(), settings)]),
+            &std::collections::BTreeMap::from([("settings".to_string(), settings)]),
             &HashMap::new(),
         );
         assert_eq!(
@@ -4174,7 +4176,7 @@ fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted
         .expect("historical identity fixture remains available");
         let state = StateRowIdentityValues::from_state_row(
             schema,
-            &HashMap::from([("name".to_string(), redacted_identity_value())]),
+            &std::collections::BTreeMap::from([("name".to_string(), redacted_identity_value())]),
             &HashMap::new(),
         );
         let context = crate::differ::exact_comparison_context_for_tests();
@@ -4185,7 +4187,7 @@ fn declared_identity_resolved_and_prefix_values_are_undecidable_against_redacted
         ));
         let absent = StateRowIdentityValues::from_state_row(
             schema,
-            &HashMap::<String, crate::resource::ExpandedValue>::new(),
+            &std::collections::BTreeMap::<String, crate::resource::ExpandedValue>::new(),
             &HashMap::new(),
         );
         assert_eq!(
@@ -4797,7 +4799,7 @@ fn create_only_snapshot_container_verifies_secret_leaves() {
     let snapshot = crate::value::redact_secrets_in_value(&settings("original", "legacy")).unwrap();
     let state = StateCreateOnlyValues::from_state_attributes(
         &schema,
-        &HashMap::from([("settings".into(), snapshot)]),
+        &std::collections::BTreeMap::from([("settings".into(), snapshot)]),
     );
     let context = crate::differ::exact_comparison_context_for_tests();
     for (token, name, matches) in [
@@ -4869,7 +4871,7 @@ fn empty_struct_create_only_values_are_absent_inline_deferred_and_in_state() {
     };
     let state = StateCreateOnlyValues::from_state_attributes(
         &schema,
-        &HashMap::from([("config".to_string(), empty.clone())]),
+        &std::collections::BTreeMap::from([("config".to_string(), empty.clone())]),
     );
 
     for desired in [&inline, &deferred] {
@@ -10092,7 +10094,10 @@ fn historical_identity_inspection_preserves_hashes_and_propagates_selection_erro
         &|_| {
             vec![AnonymousIdBindingStateInfo {
                 name: "history".into(),
-                attribute_values: HashMap::from([("settings".into(), snapshot.clone())]),
+                attribute_values: std::collections::BTreeMap::from([(
+                    "settings".into(),
+                    snapshot.clone(),
+                )]),
             }]
         },
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -10109,7 +10114,7 @@ fn deferred_identity_propagates_an_unavailable_historical_secret() {
     let mut bindings = ResolvedBindings::default();
     bindings.set_historical_with_completeness(
         "history",
-        HashMap::from([("token".into(), redacted_identity_value())]),
+        std::collections::BTreeMap::from([("token".into(), redacted_identity_value())]),
         BindingValueSource::Local,
         BindingCompleteness::Complete,
     );
@@ -10136,7 +10141,10 @@ fn deferred_identity_propagates_an_unavailable_historical_secret() {
         &|_| {
             vec![AnonymousIdBindingStateInfo {
                 name: "history".into(),
-                attribute_values: HashMap::from([("token".into(), redacted_identity_value())]),
+                attribute_values: std::collections::BTreeMap::from([(
+                    "token".into(),
+                    redacted_identity_value(),
+                )]),
             }]
         },
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
@@ -10169,7 +10177,7 @@ fn identity_projection_evaluates_env_from_the_caller_snapshot() {
         assert_eq!(binding, "source");
         vec![AnonymousIdBindingStateInfo {
             name: binding.to_string(),
-            attribute_values: HashMap::from([(
+            attribute_values: std::collections::BTreeMap::from([(
                 "variable".to_string(),
                 concrete_string("IDENTITY_VARIABLE").to_snapshot(),
             )]),

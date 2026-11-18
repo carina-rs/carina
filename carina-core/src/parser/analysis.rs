@@ -174,6 +174,7 @@ impl DeclarationLocation {
                 | Rule::attributes_param
                 | Rule::exports_param
                 | Rule::validate_expr
+                | Rule::require_condition
                 | Rule::for_expr
                 | Rule::if_expr
                 | Rule::resource_address

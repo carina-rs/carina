@@ -73,7 +73,7 @@ impl PlacementRole {
             | ExprKind::Compose
             | ExprKind::DynamicAccess
             | ExprKind::Boolean
-            | ExprKind::RequireCondition(_)
+            | ExprKind::RequireCondition
             | ExprKind::Unsupported(_) => Self::Computed,
         }
     }

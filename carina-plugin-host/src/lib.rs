@@ -1,3 +1,5 @@
+#![deny(clippy::iter_over_hash_type)]
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 

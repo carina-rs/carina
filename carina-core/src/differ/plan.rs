@@ -1416,7 +1416,7 @@ fn create_plan_parts(
         }
         let binding = orphan.binding_address().cloned();
         let explicit_dependencies = persisted_directives.depends_on.to_resolved_dependencies();
-        let mut dependencies = state.dependency_bindings.clone();
+        let mut dependencies = orphan.destroy_dependencies().clone();
         dependencies.extend_projected(&persisted_directives.depends_on);
         plan.add_delete(DeferredReplaceDelete {
             id: ResolvedResourceId::new(id.clone()),

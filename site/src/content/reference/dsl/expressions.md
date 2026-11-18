@@ -478,8 +478,7 @@ arguments {
 }
 ```
 
-Use `length` in validate expressions. Root `require` conditions also accept
-`len` as an alias. Evaluating other direct function calls, including `env`
+Use `length` in validate expressions. Evaluating other direct function calls, including `env`
 and user-defined functions, produces an error:
 
 ```crn
@@ -494,27 +493,21 @@ arguments {
 ```
 
 The condition in an argument's `validation` block may reference only that
-argument. To compare two or more module arguments, use a module-level
-`require` statement:
+argument. To compare two or more module arguments, use a `require` statement
+inside the `arguments` block:
 
 ```crn
 arguments {
   min_size: Int
   max_size: Int
+  require min_size <= max_size, 'min_size must not exceed max_size'
 }
-
-require min_size <= max_size, 'min_size must not exceed max_size'
 ```
 
-At the root of a configuration directory, `require` has no arguments in scope.
-Use literal booleans, integers, floats, durations, strings, or `null`, together
-with operators, parentheses, `len`, and `length`. A condition must return a
-boolean. `len` and `length` count string bytes; constraint strings retain
-their authored escape spelling, so `length("a\nb")` is `4`. Collection literals
-are not part of validate expressions; field access and indexing require a module
-argument as their base. Root references to lets, resources, or other names
-are errors, including in a branch that would otherwise short-circuit.
-Root requirements are always decided during validation.
+A requirement sees all module arguments, including later declarations and
+arguments in sibling files. Outside an `arguments` block, `require` is a syntax
+error. A condition must return a boolean. Collection literals are not part of validate
+expressions; field access and indexing require a module argument as their base.
 
 Validate expressions are evaluated when their referenced values become known.
 Literal arguments are checked during validation; reference values are checked

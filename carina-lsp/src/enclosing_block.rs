@@ -506,6 +506,7 @@ impl BindingSelectorParser<'_> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum EnclosingBlock {
+    Arguments,
     Resource {
         selector: SchemaSelector,
         struct_path: StructPath,
@@ -1096,6 +1097,9 @@ fn classify_non_resource(mut reverse_path: Vec<PathSegment>) -> EnclosingBlock {
         SegmentSyntax::Bare | SegmentSyntax::NamedModule => outermost.name,
         SegmentSyntax::Assignment => return EnclosingBlock::Other,
     };
+    if module_name == "arguments" && reverse_path.is_empty() {
+        return EnclosingBlock::Arguments;
+    }
     if matches!(
         module_name.as_str(),
         "arguments" | "attributes" | "directives" | "exports"

@@ -448,7 +448,7 @@ async fn removed_no_refresh_state_preserves_deposed_read_behavior() {
         serde_json::from_value(serde_json::json!("historical")).unwrap(),
         "historical-id".into(),
         None,
-        Default::default(),
+        std::collections::BTreeMap::new(),
         Default::default(),
     );
     saved["resources"][0]["deposed"] = serde_json::json!([generation]);

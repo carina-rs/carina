@@ -1184,7 +1184,7 @@ checked { r = vpc }
     write_file(
         fixture.path(),
         "checked/constraints.crn",
-        "require r.name == \"vpc\", \"wrong resource name\"\n",
+        "arguments { require r.name == \"vpc\", \"wrong resource name\" }\n",
     );
     write_file(
         fixture.path(),
@@ -1224,8 +1224,8 @@ checked { inner = r }
     write_file(
         fixture.path(),
         "checked/main.crn",
-        r#"arguments { inner: mock.compute.Instance }
-require inner.name == "vpc", "wrong nested resource name"
+        r#"arguments { inner: mock.compute.Instance
+require inner.name == "vpc", "wrong nested resource name" }
 mock.test.resource { name = "consumer" parent = inner.name }
 "#,
     );
@@ -1262,8 +1262,8 @@ checked { inner = r }
     write_file(
         fixture.path(),
         "checked/main.crn",
-        r#"arguments { inner: mock.compute.Instance }
-require inner.name == "nope", "wrong nested resource name"
+        r#"arguments { inner: mock.compute.Instance
+require inner.name == "nope", "wrong nested resource name" }
 mock.test.resource { name = "consumer" parent = inner.name }
 "#,
     );
@@ -1302,7 +1302,7 @@ checked { r = vpc }
     write_file(
         false_fixture.path(),
         "checked/constraints.crn",
-        "require r.name == \"nope\", \"wrong resource name\"\n",
+        "arguments { require r.name == \"nope\", \"wrong resource name\" }\n",
     );
     write_file(
         false_fixture.path(),
@@ -1327,14 +1327,14 @@ checked { r = vpc }
     for (arguments, constraint, expression, source_file, line) in [
         (
             "arguments { r: mock.compute.Instance }\n",
-            "require r == \"x\", \"bare handle\"\n",
+            "arguments { require r == \"x\", \"bare handle\" }\n",
             "r == \"x\"",
             "checked/constraints.crn",
             1,
         ),
         (
             "arguments { r: mock.compute.Instance }\n",
-            "require\n  length(r) > 0,\n  \"bare handle\"\n",
+            "arguments { require\n  length(r) > 0,\n  \"bare handle\" }\n",
             "length(r)",
             "checked/constraints.crn",
             2,
@@ -1647,7 +1647,7 @@ fn deferred_handle_constraint_reports_the_selected_operand() {
     write_file(
         fixture.path(),
         "checked/main.crn",
-        "arguments { r: mock.test.resource }\nrequire r.identifier == \"nope\", \"bad identifier\"\nmock.test.resource { name = \"consumer\" parent = r.identifier }\n",
+        "arguments { r: mock.test.resource \nrequire r.identifier == \"nope\", \"bad identifier\" }\nmock.test.resource { name = \"consumer\" parent = r.identifier }\n",
     );
 
     assert_success("carina init", &run(fixture.path(), &["init", "."]));
@@ -1677,7 +1677,7 @@ fn validation_subscript_uses_the_regular_expression_parser() {
     write_file(
         fixture.path(),
         "checked/main.crn",
-        "arguments { values: map(String) }\nrequire values[(\"ONE\")] == \"one\", \"wrong element\"\nmock.test.resource { name = \"consumer\" }\n",
+        "arguments { values: map(String) \nrequire values[(\"ONE\")] == \"one\", \"wrong element\" }\nmock.test.resource { name = \"consumer\" }\n",
     );
 
     assert_success(

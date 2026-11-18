@@ -1,6 +1,8 @@
 mod saved_document;
 pub use saved_document::PlanFileContents;
 mod backend_config;
+#[cfg(test)]
+mod ordering_tests;
 pub use backend_config::SavedBackendConfig;
 
 use carina_core::resource::{PersistedDestroyDependencies, ResolvedResourceId};
@@ -502,7 +504,7 @@ mod provider_scope_evidence_tests {
             data_source_origins: Vec::new(),
             data_source_values: Vec::new(),
             current_states: Vec::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             upstream_sources: Vec::new(),
             wait_bindings: Vec::new(),
         }
@@ -525,7 +527,7 @@ mod provider_scope_evidence_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -604,7 +606,7 @@ mod provider_scope_evidence_tests {
         ));
         contents.upstream_snapshot.insert(
             "upstream".to_string(),
-            HashMap::from([
+            std::collections::BTreeMap::from([
                 ("minutes".to_string(), stamped_unknown.to_snapshot()),
                 ("secret_minutes".to_string(), stamped_redacted),
             ]),
@@ -879,7 +881,7 @@ pub struct PlanFileTransport<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValue
     /// plan-time and apply-time values during cascade re-resolution.
     ///
     /// Empty when the configuration declares no `upstream_state` blocks.
-    pub upstream_snapshot: HashMap<String, HashMap<String, Value<V>>>,
+    pub upstream_snapshot: BTreeMap<String, BTreeMap<String, Value<V>>>,
     /// `upstream_state` block sources (binding name → directory) as
     /// declared in the original `.crn` config (#2303). Persisted so
     /// `apply --plan` can re-load each upstream and compare against
@@ -1258,7 +1260,7 @@ struct PlanFileWire {
     >,
     data_source_values: Vec<SavedDataSourceValue>,
     current_states: Vec<CurrentStateEntry>,
-    upstream_snapshot: HashMap<String, HashMap<String, SnapshotValue>>,
+    upstream_snapshot: BTreeMap<String, BTreeMap<String, SnapshotValue>>,
     upstream_sources: Vec<UpstreamSource>,
     #[serde(default)]
     wait_bindings: Vec<PlanWaitBinding>,
@@ -2984,7 +2986,7 @@ mod schema_fingerprint_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -3664,7 +3666,7 @@ mod historical_display_tests {
         .unwrap();
         let saved = RawSavedAttrs::from_decoded_values_for_test(HashMap::from([(
             id.clone(),
-            HashMap::from([("key".into(), string("key/planning").to_snapshot())]),
+            BTreeMap::from([("key".into(), string("key/planning").to_snapshot())]),
         )]))
         .lift(&schemas);
         let mut preparation = ReferencePreparation::default();
@@ -4037,22 +4039,46 @@ impl UnresolvedReloadedPlanFile {
         let origins = MovedOrigins::from_plan(&contents.plan);
         // A move source can share an address with a data source. Keep their
         // refresh inputs separate and apply removed claims only to managed rows.
-        let managed_snapshots = current_states.iter().map(|entry| {
-            let ReloadedCurrentStateEntry::Managed { id, current } = entry;
-            (origins.origin_for(id).clone(), *current.clone())
-        });
+        let managed_snapshots = current_states
+            .iter()
+            .map(|entry| {
+                let ReloadedCurrentStateEntry::Managed { id, current } = entry;
+                let origin = origins.origin_for(id);
+                let key = ResolvedResourceId::try_new(origin.clone()).ok_or_else(|| {
+                    carina_core::resource::ResolvedResourceError::PendingIdentity(
+                        carina_core::resource::PendingResourceIdentityError::new(origin.clone()),
+                    )
+                })?;
+                Ok((key, *current.clone()))
+            })
+            .collect::<Result<Vec<_>, carina_core::resource::ResolvedResourceError>>()?;
         let refresh_rows = carina_state::PreparedRows::from_snapshots(
             managed_snapshots,
             &carina_state::ResolvedRemovedClaims::from_effects(contents.plan.effects()),
         )
         .refreshable;
-        let data_source_refresh_rows = carina_state::PreparedRows::from_snapshots(
-            contents.data_source_values.iter().filter_map(|saved| {
+        let data_source_snapshots = contents
+            .data_source_values
+            .iter()
+            .filter_map(|saved| {
                 let DataSourceValue::Read(state) = &saved.value else {
                     return None;
                 };
-                Some((saved.id.clone(), Current::from_snapshot(*state.clone())))
-            }),
+                Some(
+                    ResolvedResourceId::try_new(saved.id.clone())
+                        .map(|key| (key, Current::from_snapshot(*state.clone())))
+                        .ok_or_else(|| {
+                            carina_core::resource::ResolvedResourceError::PendingIdentity(
+                                carina_core::resource::PendingResourceIdentityError::new(
+                                    saved.id.clone(),
+                                ),
+                            )
+                        }),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let data_source_refresh_rows = carina_state::PreparedRows::from_snapshots(
+            data_source_snapshots,
             &carina_state::ResolvedRemovedClaims::resolve(&[], None),
         )
         .refreshable;
@@ -4237,7 +4263,7 @@ impl<V: PlanValueKind, P> ReloadedPlanFile<V, P> {
         &mut self.contents.data_source_values
     }
 
-    pub(crate) fn upstream_snapshot(&self) -> &HashMap<String, HashMap<String, Value<V>>> {
+    pub(crate) fn upstream_snapshot(&self) -> &BTreeMap<String, BTreeMap<String, Value<V>>> {
         &self.contents.upstream_snapshot
     }
 
@@ -4268,7 +4294,7 @@ pub(crate) struct LivePlanFileValues {
     pub(crate) compositions: Vec<SavedComposition<NoPlaceholder>>,
     pub(crate) data_source_origins: Vec<SavedDataSource>,
     pub(crate) provider_configs: SavedProviderConfigs<NoPlaceholder>,
-    pub(crate) upstream_snapshot: HashMap<String, HashMap<String, Value>>,
+    pub(crate) upstream_snapshot: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 impl ReloadedPlanFile<SnapshotLeaf> {
@@ -4802,9 +4828,11 @@ mod managed_current_serde_tests {
     #[test]
     fn present_round_trip_uses_typed_identifier_when_raw_identifier_differs() {
         let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "logs", None);
-        let raw =
-            State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), Default::default())
-                .with_identifier("raw-provider-identifier");
+        let raw = State::<carina_core::resource::NoPlaceholder>::existing(
+            id.clone(),
+            std::collections::BTreeMap::new(),
+        )
+        .with_identifier("raw-provider-identifier");
         let typed = AppliedIdentifier::new("typed-provider-identifier")
             .expect("fixture identifier is non-empty");
         let entry = CurrentStateEntry::Managed {
@@ -5278,11 +5306,7 @@ impl CheckedPlanFileContents {
                 CompositionSourceIdentityResolver::new(&source)?;
 
             let provider_configs = provider_snapshot.redact_secrets(conversion)?;
-            #[allow(clippy::iter_over_hash_type)]
-            // order reaches output; migration tracked in #4414
             for (binding, attributes) in &ctx.upstream_snapshot {
-                #[allow(clippy::iter_over_hash_type)]
-                // order reaches output; migration tracked in #4414
                 for (key, value) in attributes.iter() {
                     // Export validation rejects secret-valued exports before an
                     // upstream state snapshot can be produced. Keep this guard for
@@ -6695,7 +6719,7 @@ pub(crate) fn check_exports_pre_apply<D>(
                             compositions: input.compositions,
                             managed_current: input.managed_current,
                             data_source_values: input.data_source_values,
-                            remote_bindings: &HashMap::new(),
+                            remote_bindings: &Default::default(),
                             wait_aliases: input.wait_aliases,
                         },
                         input.plan,
@@ -7014,7 +7038,7 @@ async fn load_provider_referenced_upstream_states<E>(
     schemas: &carina_core::schema::SchemaRegistry,
     policy: UpstreamMissingStatePolicy,
 ) -> Result<AdmittedRemoteBindings, AppError> {
-    let mut remote_bindings = HashMap::new();
+    let mut remote_bindings = AdmittedRemoteBindings::new();
     for referenced in provider_referenced_upstream_states(parsed) {
         let ProviderReferencedUpstream {
             upstream,
@@ -7254,7 +7278,7 @@ pub(crate) async fn load_selected_upstream_states<B: carina_core::resource::Bind
     selected_keys: Option<&HashSet<carina_core::resource::DependencyKey<String>>>,
 ) -> Result<AdmittedRemoteBindings, crate::error::UpstreamLoadFailure> {
     let color_mode = runtime.color_mode();
-    let mut result = HashMap::new();
+    let mut result = AdmittedRemoteBindings::new();
 
     for us in upstream_states {
         let identity = carina_core::upstream_exports::UpstreamSourceIdentity::resolve(us, base_dir)
@@ -7354,10 +7378,10 @@ pub(crate) fn admit_saved_upstream_snapshot(
     base_dir: &ResolvedPath,
     provider_context: &ProviderContext,
     schemas: &carina_core::schema::SchemaRegistry,
-    values: &HashMap<String, HashMap<String, Value>>,
+    values: &BTreeMap<String, BTreeMap<String, Value>>,
     apply_target: crate::commands::apply::ApplyTarget<'_>,
 ) -> Result<AdmittedRemoteBindings, AppError> {
-    let mut admitted = HashMap::new();
+    let mut admitted = AdmittedRemoteBindings::new();
     for source in sources {
         let binding = source.binding.to_string();
         let Some(values) = values.get(&binding) else {
@@ -7611,9 +7635,9 @@ mod load_upstream_states_tests {
                 Value::Concrete(ConcreteValue::Int(73))
             );
 
-            let snapshot = HashMap::from([(
+            let snapshot = std::collections::BTreeMap::from([(
                 "orgs".into(),
-                HashMap::from([("count".into(), Value::Concrete(ConcreteValue::Int(73)))]),
+                BTreeMap::from([("count".into(), Value::Concrete(ConcreteValue::Int(73)))]),
             )]);
             let saved = admit_saved_upstream_snapshot(
                 &runtime,
@@ -8088,7 +8112,7 @@ mod load_upstream_states_tests {
             &ResolvedPath::new(root.path()).unwrap(),
             &context,
             &carina_core::schema::SchemaRegistry::new(),
-            &HashMap::from([("orgs".into(), HashMap::new())]),
+            &std::collections::BTreeMap::from([("orgs".into(), std::collections::BTreeMap::new())]),
             crate::commands::apply::ApplyTarget::Project(root.path()),
         )
         .unwrap_err();
@@ -9731,7 +9755,7 @@ mod run_plan_out_tests {
             managed_current: HashMap::new(),
             data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             observation_authority: crate::test_support::observation_authority_for_test(Some(
@@ -9744,7 +9768,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10155,7 +10179,7 @@ mod run_plan_out_tests {
             managed_current: HashMap::new(),
             data_source_values,
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             observation_authority: crate::test_support::observation_authority_for_test(None),
@@ -10167,7 +10191,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10267,7 +10291,7 @@ mod run_plan_out_tests {
             managed_current: HashMap::new(),
             data_source_values,
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             observation_authority: crate::test_support::observation_authority_for_test(None),
@@ -10279,7 +10303,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10416,7 +10440,7 @@ mod run_plan_out_tests {
             managed_current: moved_current,
             data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             observation_authority: crate::test_support::observation_authority_for_test(None),
@@ -10427,7 +10451,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10509,7 +10533,7 @@ mod run_plan_out_tests {
             managed_current: HashMap::from([(desired.id.clone(), Current::from_state(observed))]),
             data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             observation_authority: crate::test_support::observation_authority_for_test(None),
@@ -10520,7 +10544,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10605,7 +10629,7 @@ mod run_plan_out_tests {
             managed_current: HashMap::new(),
             data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             observation_authority: crate::test_support::observation_authority_for_test(None),
@@ -10617,7 +10641,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10697,7 +10721,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10749,7 +10773,7 @@ mod run_plan_out_tests {
             |session| {
                 carina_core::parser::resolve_provider_attributes_with_remote(
                     &parsed,
-                    &HashMap::new(),
+                    &std::collections::BTreeMap::new(),
                     session,
                 )
             },
@@ -10774,7 +10798,7 @@ mod run_plan_out_tests {
             managed_current: HashMap::new(),
             data_source_values: carina_core::data_source_value::DataSourceValues::empty(),
             moved_origins: HashMap::new(),
-            upstream_snapshot: HashMap::new(),
+            upstream_snapshot: Default::default(),
             prev_explicit: HashMap::new(),
             residual_deferred_for: parsed.deferred_for_expressions().empty_like(),
             observation_authority: crate::test_support::observation_authority_for_test(None),
@@ -10961,7 +10985,7 @@ mod export_diff_tests {
                 compositions: &[],
                 managed_current: &HashMap::new(),
                 data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
         );
@@ -11004,7 +11028,7 @@ mod export_diff_tests {
                 compositions: &[],
                 managed_current: &HashMap::new(),
                 data_source_values: &carina_core::data_source_value::DataSourceValues::empty(),
-                remote_bindings: &HashMap::new(),
+                remote_bindings: &Default::default(),
                 wait_aliases: &[],
             },
         );

@@ -71,7 +71,7 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
         |session| {
             carina_core::parser::resolve_provider_attributes_with_remote(
                 &parsed,
-                &HashMap::new(),
+                &std::collections::BTreeMap::new(),
                 session,
             )
         },
@@ -163,11 +163,11 @@ provider mock {}
     }
 
     fn seed_mock_provider_state(&self) {
-        let provider_state = serde_json::json!({
-            "test.resource.validation_records[0]": {
+        let provider_state = serde_json::json!({"version": 3, "states": {
+            "old-validation-id": {
                 "name": "old-validation-token"
             }
-        });
+        }});
         fs::write(
             &self.mock_state_path,
             carina_core::utils::pretty_with_newline(&provider_state).unwrap(),
@@ -386,7 +386,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
         data_source_origins: vec![],
         data_source_values: vec![],
         current_states,
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: vec![],
         wait_bindings: vec![],
     };
@@ -411,17 +411,21 @@ fn apply_saved_plan_deferred_replace_persists_new_child_and_siblings() {
     let validation = saved
         .find_resource("mock", "test.resource", "validation_records[0]")
         .expect("new validation record state must be persisted");
-    assert_eq!(
-        validation.identifier().map(|value| value.as_str()),
-        Some("mock-id")
-    );
+    let identifier = validation.identifier().expect("replacement identifier");
+    assert_ne!(identifier.as_str(), "old-validation-id");
+    let provider: serde_json::Value =
+        serde_json::from_slice(&fs::read(&scenario.mock_state_path).unwrap()).unwrap();
+    assert!(provider["states"][identifier.as_str()].is_object());
+    let mut identifiers = std::collections::BTreeSet::from([identifier.as_str()]);
     for name in ["load_balancer", "cert", "alias_record"] {
         let row = saved
             .find_resource("mock", "test.resource", name)
             .unwrap_or_else(|| panic!("sibling resource {name} must be persisted"));
-        assert_eq!(
-            row.identifier().map(|value| value.as_str()),
-            Some("mock-id")
+        let identifier = row.identifier().expect("sibling provider identifier");
+        assert!(provider["states"][identifier.as_str()].is_object());
+        assert!(
+            identifiers.insert(identifier.as_str()),
+            "created objects must be distinct"
         );
     }
 }
@@ -461,10 +465,11 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
     fs::write(
         &scenario.mock_state_path,
         carina_core::utils::pretty_with_newline(&serde_json::json!({
-            "test.resource.main": {
+            "version": 3,
+            "states": {"main-current": {
                 "name": "main-current",
                 "status": "ACTIVE"
-            }
+            }}
         }))
         .unwrap(),
     )
@@ -512,7 +517,7 @@ fn apply_saved_plan_deposed_delete_renders_state_file_attributes() {
         data_source_origins: vec![],
         data_source_values: vec![],
         current_states: vec![],
-        upstream_snapshot: HashMap::new(),
+        upstream_snapshot: Default::default(),
         upstream_sources: vec![],
         wait_bindings: vec![],
     };

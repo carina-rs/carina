@@ -72,8 +72,9 @@ mock.test.resource {{
         fs::write(
             self.project.join("mock-provider-state.json"),
             r#"{
-  "version": 2,
-  "states": {
+  "version": 3,
+  "states": {},
+  "data_sources": {
     "iam.Roles.roles": {
       "name_regex": "late",
       "names": ["resolved-role"]

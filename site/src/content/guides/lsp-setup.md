@@ -92,7 +92,8 @@ vim.filetype.add({
 
 The LSP provides context-aware completions:
 
-- **Top-level keywords**: `provider`, `backend`, `let`, `let use`, `import`, `read`, `fn`, `arguments`, `attributes`, `exports`, `moved`, `removed`, `require`, `upstream_state`, `wait`
+- **Top-level keywords**: `provider`, `backend`, `let`, `let use`, `import`, `read`, `fn`, `arguments`, `attributes`, `exports`, `moved`, `removed`, `upstream_state`, `wait`
+- **Argument requirements**: Inside an `arguments` block, complete `require` alongside parameter declarations
 - **Resource types**: Type `awscc.` to see available services, then `awscc.ec2.` to see resource types
 - **Attributes**: Inside a resource block, get completions for all valid attributes
 - **Attribute values**: For enum-typed attributes, get valid value completions

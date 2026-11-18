@@ -373,6 +373,9 @@ pub(crate) fn same_parse_error(
         ParseError::Syntax(error) => {
             matches!(b, ParseError::Syntax(other) if std::ops::Deref::deref(error) == std::ops::Deref::deref(other))
         }
+        ParseError::RequireOutsideArguments { span } => {
+            same_fields!(RequireOutsideArguments { span })
+        }
         ParseError::DeferredForBodyUnsupported(error) => {
             matches!(b, ParseError::DeferredForBodyUnsupported(other) if error == other)
         }

@@ -1,3 +1,5 @@
+#![deny(clippy::iter_over_hash_type)]
+
 //! TUI (Terminal User Interface) for interactive plan review
 //!
 //! Provides an interactive tree view of a Plan with color-coded effects

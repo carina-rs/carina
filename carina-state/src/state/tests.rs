@@ -12,6 +12,88 @@ use carina_core::schema::{
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+fn mismatched_create_orphan_state(kind: &str) -> (StateFile, ResolvedResourceId, Current) {
+    let mut current = serde_json::json!({
+        "kind": kind,
+        "started_at": "2026-10-23T08:00:00Z"
+    });
+    if kind == "create_in_flight" {
+        current["envelope"] = serde_json::json!({
+            "token": "opaque-token",
+            "identifier": "issued-id",
+            "write_only": {"password": "sent"},
+            "secrets": {}
+        });
+    }
+    let mut row: ResourceState = serde_json::from_value(serde_json::json!({
+        "resource_type": "test.Resource",
+        "identity": "payload-address",
+        "provider": "mock",
+        "current": current,
+        "directives": {"provider_instance": "payload-route"}
+    }))
+    .unwrap();
+    // In-memory rows can retain a continuation from a different address.
+    row.identity = ResourceIdentity::try_from("row-address".to_owned()).unwrap();
+    row.directives.provider_instance = Some("row-route".to_owned());
+    let id = ResolvedResourceId::with_provider_identity(
+        row.provider.clone(),
+        row.resource_type.clone(),
+        row.identity.clone(),
+        row.directives.provider_instance.clone(),
+    );
+    let decoded: ResourceState =
+        serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+    let expected = match decoded.current() {
+        CurrentInstance::CreateInFlight { pending } => Current::create_in_flight(pending.clone()),
+        CurrentInstance::CreateOutcomeUnknown { unknown } => {
+            Current::create_outcome_unknown(unknown.clone())
+        }
+        _ => panic!("expected persisted create continuation"),
+    };
+    let payload_id = match row.current() {
+        CurrentInstance::CreateInFlight { pending } => pending.id(),
+        CurrentInstance::CreateOutcomeUnknown { unknown } => unknown.id(),
+        _ => panic!("expected in-memory create continuation"),
+    };
+    assert_ne!(payload_id, id.as_inner());
+    let mut state = StateFile::new();
+    state.upsert_resource(row).unwrap();
+    (state, id, expected)
+}
+
+#[test]
+fn issue_4491_cached_orphans_rebind_in_memory_create_payload_to_row_address() {
+    for kind in ["create_in_flight", "create_outcome_unknown"] {
+        let (state, id, expected) = mismatched_create_orphan_state(kind);
+        let orphans = state.build_orphans(&HashSet::new());
+        let entries: Vec<_> = orphans.iter().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, id.as_inner());
+        assert_eq!(entries[0].1.current(), &expected);
+    }
+}
+
+#[test]
+fn issue_4491_prepared_orphans_rebind_in_memory_create_payload_to_row_address() {
+    use crate::{PreparedRows, ResolvedRemovedClaims};
+    for kind in ["create_in_flight", "create_outcome_unknown"] {
+        let (state, id, expected) = mismatched_create_orphan_state(kind);
+        let prepared = PreparedRows::from_state(
+            Some(&state),
+            &ResolvedRemovedClaims::resolve(&[], Some(&state)),
+        );
+        let entries: Vec<_> = prepared
+            .refreshable
+            .build_orphans(&HashSet::new())
+            .into_iter()
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(&entries[0].0, &id);
+        assert_eq!(entries[0].1.current(), &expected);
+    }
+}
+
 #[test]
 fn round2_3_full_state_and_export_display_keep_main_namespace_error_text() {
     let mut state = serde_json::to_value(StateFile::new()).unwrap();
@@ -342,10 +424,10 @@ fn published_exports_from_state(state: &StateFile) -> PublishedExports {
 // Preserve the original decoder-fixture assertions while exercising admission
 // before exposing their decoded maps to resolver fixtures.
 trait PublishedFixtureBindings {
-    fn build_remote_bindings(&self) -> HashMap<String, Value>;
+    fn build_remote_bindings(&self) -> std::collections::BTreeMap<String, Value>;
 }
 impl PublishedFixtureBindings for PublishedExports {
-    fn build_remote_bindings(&self) -> HashMap<String, Value> {
+    fn build_remote_bindings(&self) -> std::collections::BTreeMap<String, Value> {
         let context =
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
         let admitted =
@@ -4352,7 +4434,7 @@ fn test_from_provider_state_replaces_unrecorded_when_desired_and_state_attrs_are
     let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("id".to_string()),
-        attributes: HashMap::new(),
+        attributes: std::collections::BTreeMap::new(),
         exists: true,
         dependency_bindings: Default::default(),
 
@@ -7798,7 +7880,7 @@ fn deposed_encoders_return_unavailable_secret_errors() {
     )]);
     let previous = persisted_attributes_from_state_json(&previous_json);
     let opaque = previous.get("password").unwrap();
-    let attributes = HashMap::from([(
+    let attributes = std::collections::BTreeMap::from([(
         "password".into(),
         SnapshotValue::Concrete(ConcreteValue::Map(IndexMap::from([(
             "nested".into(),
@@ -7836,7 +7918,7 @@ fn lossy_state_json_rehashes_previous_secret_hash_without_desired_secret() {
     use carina_core::resource::{ConcreteValue, Resource, Value};
 
     let resource = Resource::with_provider("awscc", "db.Instance", "main", None);
-    let attrs: HashMap<String, Value> = HashMap::from([(
+    let attrs: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::from([(
         "password".to_string(),
         Value::Concrete(ConcreteValue::String("plain-secret".into())),
     )]);
@@ -8745,7 +8827,7 @@ fn lossy_state_json_preserves_hydrated_secret_hash_without_double_hashing() {
         .encoded_value("password")
         .expect("legacy state marker is upgraded")
         .clone();
-    let attrs = HashMap::from([(
+    let attrs = std::collections::BTreeMap::from([(
         "password".to_string(),
         existing
             .get("password")
@@ -8828,7 +8910,7 @@ fn write_only_secret_to_plain_demotion_merges_plain_desired_value() {
     let provider_state: carina_core::resource::State = ProviderState {
         id: resource.id.clone(),
         identifier: Some("db-old".to_string()),
-        attributes: HashMap::new(),
+        attributes: std::collections::BTreeMap::new(),
         exists: true,
         dependency_bindings: Default::default(),
 
@@ -9046,7 +9128,7 @@ fn lossy_state_json_merges_previous_nested_secret_hash_per_leaf() {
         "SecretTag".to_string(),
         Value::Concrete(ConcreteValue::String("plain-secret".into())),
     );
-    let attrs = HashMap::from([(
+    let attrs = std::collections::BTreeMap::from([(
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(provider_tags)),
     )]);
@@ -9107,7 +9189,7 @@ fn lossy_state_json_drops_omitted_non_secret_sibling_but_keeps_missing_hash_leaf
         "Name": "old-name",
         "SecretTag": structural_legacy_secret(&"ab".repeat(32)),
     });
-    let attrs: HashMap<String, Value> = HashMap::from([(
+    let attrs: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::from([(
         "tags".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::new())),
     )]);
@@ -9170,7 +9252,7 @@ fn lossy_state_json_hashes_whole_array_when_secret_hash_alignment_is_untrusted()
         "Token".to_string(),
         Value::Concrete(ConcreteValue::String("plain-secret".into())),
     );
-    let attrs = HashMap::from([(
+    let attrs = std::collections::BTreeMap::from([(
         "items".to_string(),
         Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::Map(first_provider_item)),

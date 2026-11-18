@@ -358,9 +358,9 @@ mod tests {
         let effect = Effect::Update {
             identifier: crate::fixture_applied_identifier("example-id"),
             from: Box::new(
-                State::existing(
+                State::<carina_core::resource::NoPlaceholder>::existing(
                     id.clone(),
-                    [("value".to_string(), old)].into_iter().collect(),
+                    [("value".to_string(), old)],
                 )
                 .with_identifier("example-id")
                 .to_snapshot(),

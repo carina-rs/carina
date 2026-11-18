@@ -8307,9 +8307,9 @@ fn concrete_invalid_module_require_reports_authored_message_at_call() {
         r#"arguments {
   left: String
   right: String
-}
 
-require left == right, "left and right must match"
+
+require left == right, "left and right must match" }
 "#,
     )
     .unwrap();
@@ -15913,7 +15913,7 @@ fn handle_backed_module_constraint_failure_is_an_error_in_the_lsp() {
     .unwrap();
     std::fs::write(
         module.join("constraints.crn"),
-        "require r.name == \"nope\", \"wrong resource name\"\n",
+        "arguments { require r.name == \"nope\", \"wrong resource name\" }\n",
     )
     .unwrap();
     std::fs::write(
@@ -15943,7 +15943,7 @@ fn nested_handle_backed_module_constraint_failure_is_an_lsp_error() {
     std::fs::create_dir(&outer).unwrap();
     std::fs::write(
         checked.join("main.crn"),
-        "arguments { inner: mock.compute.Instance }\nrequire inner.name == \"nope\", \"wrong nested resource name\"\n",
+        "arguments { inner: mock.compute.Instance \nrequire inner.name == \"nope\", \"wrong nested resource name\" }\n",
     )
     .unwrap();
     std::fs::write(
@@ -15975,7 +15975,7 @@ fn bare_handle_in_module_constraint_is_a_located_lsp_error() {
         "arguments { r: mock.compute.Instance }\n",
     )
     .unwrap();
-    let constraint = "require\n  length(r) > 0,\n  \"bare handle\"\n";
+    let constraint = "arguments { require\n  length(r) > 0,\n  \"bare handle\" }\n";
     std::fs::write(module.join("constraints.crn"), constraint).unwrap();
     let source = "let vpc = mock.compute.Instance { name = \"vpc\" }\nlet checked = use { source = \"./checked\" }\nchecked { r = vpc }\n";
     std::fs::write(root.path().join("main.crn"), source).unwrap();
@@ -16992,7 +16992,7 @@ fn handle_constraint_lsp_failure_reports_the_selected_operand() {
     std::fs::create_dir(&module).unwrap();
     std::fs::write(
         module.join("main.crn"),
-        "arguments { r: mock.test.resource }\nrequire r.name == \"nope\", \"bad name\"\nmock.test.resource { name = \"consumer\" parent = r.name }\n",
+        "arguments { r: mock.test.resource \nrequire r.name == \"nope\", \"bad name\" }\nmock.test.resource { name = \"consumer\" parent = r.name }\n",
     )
     .unwrap();
     let source = "let vpc = mock.test.resource { name = \"vpc\" }\nlet checked = use { source = \"./checked\" }\nchecked { r = vpc }\n";
@@ -17019,7 +17019,7 @@ fn validation_subscript_uses_the_regular_expression_parser_in_lsp() {
     std::fs::create_dir(&module).unwrap();
     std::fs::write(
         module.join("main.crn"),
-        "arguments { values: map(String) }\nrequire values[(\"ONE\")] == \"one\", \"wrong element\"\nmock.test.resource { name = \"consumer\" }\n",
+        "arguments { values: map(String) \nrequire values[(\"ONE\")] == \"one\", \"wrong element\" }\nmock.test.resource { name = \"consumer\" }\n",
     )
     .unwrap();
     let source = "let checked = use { source = \"./checked\" }\nchecked { values = { \"ONE\" = \"one\" } }\n";

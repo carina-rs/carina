@@ -262,7 +262,7 @@ impl SavedDocumentConversion {
     pub fn redact_secrets_in_attributes(
         &self,
         attributes: &HashMap<String, Value>,
-    ) -> Result<Saved<HashMap<String, SnapshotValue>>, SerializationError> {
+    ) -> Result<Saved<BTreeMap<String, SnapshotValue>>, SerializationError> {
         self.convert(attributes, redact_secrets_in_attributes)
     }
     pub fn redact_secrets_in_saved_composition(
@@ -491,6 +491,11 @@ impl<T: DocumentTree> sealed::Tree for Option<T> {
     }
 }
 impl<K, V: DocumentTree> sealed::Tree for HashMap<K, V> {
+    fn visit(&self, names: &mut FunctionNames) {
+        self.values().for_each(|value| value.visit(names));
+    }
+}
+impl<K, V: DocumentTree> sealed::Tree for BTreeMap<K, V> {
     fn visit(&self, names: &mut FunctionNames) {
         self.values().for_each(|value| value.visit(names));
     }

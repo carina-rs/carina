@@ -162,7 +162,7 @@ pub(crate) fn parse_resource_for_target(
         authored_slots,
         directives,
         resolved_ignore_changes: Default::default(),
-        prefixes: HashMap::new(),
+        prefixes: Default::default(),
         binding,
         dependencies: UnexpandedDependencyFields {
             value_bindings: Default::default(),

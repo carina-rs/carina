@@ -21,7 +21,7 @@ const INTERPOLATION: &str = "${secret('CANARY_4386')}";
 fn round3_decode_hints_preserve_project_and_plan_paths() {
     let fixture = Fixture::new_named(
         "let w = wait vpc { until = vpc.identifier == 'vpc-id' }\nmock.test.resource { name = 'consumer' parent = w.identifier }\n",
-        Some("arguments { r: mock.test.resource }\nrequire r.identifier != 'x', 'safe message'\n"),
+        Some("arguments { r: mock.test.resource \nrequire r.identifier != 'x', 'safe message' }\n"),
         "project with spaces",
     );
     assert!(
@@ -227,8 +227,8 @@ fn round1_require_message_keeps_proof_and_validation_message_keeps_secret_protec
             r#"arguments { r: mock.test.resource { validation {
 condition = r.identifier == 'impossible'
 error_message = "${secret('CANARY_4386')}"
-} } }
-require r.identifier != 'x', 'safe message'
+} }
+require r.identifier != 'x', 'safe message' }
 "#,
         ),
     );
@@ -532,14 +532,8 @@ impl Fixture {
 }
 
 #[test]
-fn root_require_condition_rejects_interpolation() {
-    Fixture::new(r#"require "${secret('CANARY_4386')}" == 'x', 'bad'"#, None)
-        .assert_rejected("main.crn", "`require` condition");
-}
-
-#[test]
 fn module_require_condition_rejects_interpolation() {
-    Fixture::new("", Some("arguments { r: mock.test.resource }\nrequire r.identifier != \"${secret('CANARY_4386')}\", 'bad identifier'\nmock.test.resource { name = 'consumer' parent = r.identifier }\n"))
+    Fixture::new("", Some("arguments { r: mock.test.resource \nrequire r.identifier != \"${secret('CANARY_4386')}\", 'bad identifier' }\nmock.test.resource { name = 'consumer' parent = r.identifier }\n"))
         .assert_rejected("checked/main.crn", "`require` condition");
 }
 
@@ -560,17 +554,11 @@ fn constraint_function_argument_rejects_interpolation() {
     Fixture::new(
         "",
         Some(
-            r#"arguments { r: mock.test.resource }
-require length("${secret('CANARY_4386')}") > 0 && r.identifier != 'x', 'bad'"#,
+            r#"arguments { r: mock.test.resource
+require length("${secret('CANARY_4386')}") > 0 && r.identifier != 'x', 'bad' }"#,
         ),
     )
     .assert_rejected("checked/main.crn", "`require` condition");
-}
-
-#[test]
-fn root_require_message_rejects_interpolation() {
-    Fixture::new(r#"require false, "${secret('CANARY_4386')}""#, None)
-        .assert_rejected("main.crn", "`require` message");
 }
 
 #[test]
@@ -578,8 +566,8 @@ fn module_require_message_rejects_interpolation() {
     Fixture::new(
         "",
         Some(
-            r#"arguments { r: mock.test.resource }
-require r.identifier == 'impossible', "${secret('CANARY_4386')}""#,
+            r#"arguments { r: mock.test.resource
+require r.identifier == 'impossible', "${secret('CANARY_4386')}" }"#,
         ),
     )
     .assert_rejected("checked/main.crn", "`require` message");
@@ -645,8 +633,8 @@ fn bound_argument_operand_rejects_secret_subscript_before_retaining_diagnostic_t
     let fixture = Fixture::new(
         "",
         Some(
-            r#"arguments { r: mock.test.resource }
-require r["${secret('CANARY_4386')}"] == 'x', 'bad operand'"#,
+            r#"arguments { r: mock.test.resource
+require r["${secret('CANARY_4386')}"] == 'x', 'bad operand' }"#,
         ),
     );
     for args in [
@@ -675,11 +663,11 @@ fn literal_constraint_strings_survive_saved_plan_apply() {
     let fixture = Fixture::new(
         "",
         Some(
-            r#"arguments { r: mock.test.resource }
+            r#"arguments { r: mock.test.resource
 require r.identifier != "plain", 'bad plain'
 require r.identifier != '${secret("literal")}', 'bad single quote'
 require r.identifier != "\${secret('literal')}", 'bad escaped dollar'
-require r.identifier != "raw\nescapes\\", 'bad raw escapes'
+require r.identifier != "raw\nescapes\\", 'bad raw escapes' }
 mock.test.resource { name = 'consumer' parent = r.identifier }
 "#,
         ),

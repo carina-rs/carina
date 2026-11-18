@@ -1251,7 +1251,7 @@ fn retained_ready_handle_never_materializes_unread_attributes() {
         let mut bindings = ResolvedBindings::default();
         bindings.set_historical_with_completeness(
             "db",
-            std::collections::HashMap::from([("private".into(), private)]),
+            std::collections::BTreeMap::from([("private".into(), private)]),
             BindingValueSource::Local,
             BindingCompleteness::Complete,
         );

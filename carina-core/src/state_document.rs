@@ -6,8 +6,9 @@ use crate::provider::{
     StateRowInFlightCreate, StateRowUnknownCreateOutcome, UnknownCreateOutcome,
 };
 use crate::resource::{
-    AbsoluteBindingAddress, DeposedKey, PartialReadMarker, PersistedDestroyDependencies,
+    AbsoluteBindingAddress, Current, DeposedKey, PartialReadMarker, PersistedDestroyDependencies,
     PersistedDirectives, ResolvedResourceId, ResourceId, ResourceIdentity, ResourceIdentityError,
+    SnapshotState,
 };
 use crate::value::PersistedExportValue;
 use serde::de::IntoDeserializer;
@@ -383,13 +384,61 @@ pub enum CurrentInstance {
     },
 }
 
+/// Project a row's typed address, stored current payload, and destroy metadata
+/// into planner state. The containing row supplies the complete provider route,
+/// matching complete-row decoding even when an in-memory payload has an older
+/// address. The caller must pass the row's own address: this function cannot
+/// check that `id` belongs to the row that stored `stored` (carina#4519).
+pub fn current_from_state_row(
+    id: &ResolvedResourceId,
+    stored: &CurrentInstance,
+    dependency_bindings: &PersistedDestroyDependencies,
+) -> Current {
+    let (identifier, attributes, partial_read) = match stored {
+        CurrentInstance::None => return Current::absent(id.as_inner().clone()),
+        CurrentInstance::Applied {
+            identifier,
+            attributes,
+            partial_read,
+            ..
+        } => (
+            Some(identifier.as_str().to_string()),
+            attributes,
+            partial_read,
+        ),
+        CurrentInstance::CreateInFlight { pending } => {
+            return Current::create_in_flight(
+                StateRowInFlightCreate::bind(id, pending.clone()).into_inner(),
+            );
+        }
+        CurrentInstance::CreateOutcomeUnknown { unknown } => {
+            return Current::create_outcome_unknown(
+                StateRowUnknownCreateOutcome::bind(id, unknown.clone()).into_inner(),
+            );
+        }
+        CurrentInstance::MissingIdentifier {
+            attributes,
+            partial_read,
+            ..
+        } => (None, attributes, partial_read),
+    };
+    Current::from_snapshot(SnapshotState {
+        id: id.as_inner().clone(),
+        identifier,
+        attributes: attributes.to_values(),
+        exists: true,
+        dependency_bindings: dependency_bindings.clone(),
+        partial_read: partial_read.clone(),
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum EncodedCurrentInstance {
     None,
     Applied {
         identifier: AppliedIdentifier,
-        attributes: HashMap<String, serde_json::Value>,
+        attributes: BTreeMap<String, serde_json::Value>,
         #[serde(default)]
         write_only_attributes: Vec<String>,
         nested_write_only: NestedWriteOnlyRecord,
@@ -404,7 +453,7 @@ enum EncodedCurrentInstance {
         started_at: serde_json::Value,
     },
     MissingIdentifier {
-        attributes: HashMap<String, serde_json::Value>,
+        attributes: BTreeMap<String, serde_json::Value>,
         #[serde(default)]
         write_only_attributes: Vec<String>,
         nested_write_only: NestedWriteOnlyRecord,
@@ -430,7 +479,7 @@ pub struct DecodedResourceState {
     /// Carina-side directives persisted from the DSL `directives` block.
     pub directives: PersistedDirectives,
     /// Attribute prefixes used to generate names (e.g., {"bucket_name": "my-app-"})
-    pub prefixes: HashMap<String, String>,
+    pub prefixes: std::collections::BTreeMap<String, String>,
     /// Permanent name overrides from create_before_destroy with non-renameable attributes.
     /// Maps attribute name to the temporary cloud-side name and the DSL value recorded with it.
     pub name_overrides: HashMap<String, NameOverride>,
@@ -473,7 +522,7 @@ struct EncodedDeposedInstance {
     identifier: String,
     #[serde(default)]
     provider_instance: Option<String>,
-    attributes: HashMap<String, serde_json::Value>,
+    attributes: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     dependency_bindings: BTreeSet<ResolvedResourceId>,
 }
@@ -492,7 +541,7 @@ struct EncodedResourceState {
     #[serde(default)]
     directives: PersistedDirectives,
     #[serde(default)]
-    prefixes: HashMap<String, String>,
+    prefixes: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     name_overrides: HashMap<String, NameOverride>,
     #[serde(default)]

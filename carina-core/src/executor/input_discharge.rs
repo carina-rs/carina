@@ -1,4 +1,5 @@
 //! Linear preparation of exact provider requests and replacement delete permits.
+use std::collections::BTreeSet;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -456,9 +457,9 @@ pub(super) struct ExecutionInputChecks {
     run: Arc<()>,
     pub(super) checks: HashMap<usize, PendingInputObligation>,
     pub(super) paired: HashMap<usize, Vec<usize>>,
-    pub(super) absorbed: HashMap<usize, HashSet<usize>>,
+    pub(super) absorbed: HashMap<usize, BTreeSet<usize>>,
     cohorts: HashSet<usize>,
-    required_deletes: HashMap<usize, HashSet<usize>>,
+    required_deletes: HashMap<usize, BTreeSet<usize>>,
     receipts: HashMap<(usize, usize), DeleteDischargeReceipt>,
     consumed: HashSet<usize>,
     delete_targets: HashMap<usize, DeleteTarget>,
@@ -575,7 +576,7 @@ impl ExecutionInputChecks {
                 }
                 if result
                     .required_deletes
-                    .insert(delete_idx, HashSet::from([write]))
+                    .insert(delete_idx, BTreeSet::from([write]))
                     .is_some()
                 {
                     return Err(InputCheckConstructionError::DuplicateDelete { index: delete_idx });
@@ -1385,7 +1386,7 @@ mod tests {
             id: resource.resolved_id(),
             identifier: AppliedIdentifier::new("old").unwrap(),
             generation: EffectGeneration::Current,
-            previous_attributes: HashMap::new(),
+            previous_attributes: std::collections::BTreeMap::new(),
             directives: Default::default(),
             binding: None,
             dependencies: Default::default(),
@@ -1546,7 +1547,7 @@ mod tests {
                                     .attributes
                                     .clone()
                                     .into_iter()
-                                    .collect();
+                                    .collect::<std::collections::BTreeMap<_, _>>();
                                 let writeback = SecretPreservingAttributes::from_provider_values(
                                     &attributes,
                                     &attributes,
@@ -1598,7 +1599,7 @@ mod tests {
         // effect slot even if their resource and generation were identical.
         checks
             .required_deletes
-            .extend([(1, HashSet::from([0])), (2, HashSet::from([3]))]);
+            .extend([(1, BTreeSet::from([0])), (2, BTreeSet::from([3]))]);
         let target = DeleteTarget {
             id: ResourceId::with_identity("test", "same-instance"),
             identifier: AppliedIdentifier::new("old-id").unwrap(),
@@ -1631,7 +1632,7 @@ mod tests {
         let cohort = first.take_write(0).unwrap();
         let permit = cohort.cohort_receipts::<CreateRequest>(&[]).pop().unwrap();
         let mut second = ExecutionInputChecks::new(Vec::new(), &effects, &[]).unwrap();
-        second.required_deletes.insert(1, HashSet::from([0]));
+        second.required_deletes.insert(1, BTreeSet::from([0]));
         // Deliberately corrupt the private store to exercise its final check.
         second.receipts.insert((1, 0), permit);
         let ready = super::super::scheduler::ReadyDelete::for_test(DeletedInstanceKey::new(

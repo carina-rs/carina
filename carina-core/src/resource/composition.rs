@@ -1448,10 +1448,10 @@ impl SavedCompositionOriginId {
 ///
 /// `prefixes` is dropped (no auto-generated names on a synthetic node):
 ///
-/// ```compile_fail
+/// ```compile_fail,E0609
 /// use carina_core::resource::LiveComposition;
-/// fn _f(v: &LiveComposition) -> &std::collections::HashMap<String, String> {
-///     &v.prefixes
+/// fn _f(v: &LiveComposition) {
+///     let _ = &v.prefixes;
 /// }
 /// ```
 ///

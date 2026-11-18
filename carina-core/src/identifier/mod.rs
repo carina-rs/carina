@@ -11,14 +11,14 @@ pub use diagnostics::{
     legacy_loop_move_target_diagnostics,
 };
 pub use moved_block::{MovedBlock, MovedBlockAddress};
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) use prefix::canonicalize_prefix_values;
 pub use prefix::{
     CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, MatchedResourceProjection,
     ModuleResolvedFileRead, PrefixCanonicalized, PrefixFileRead, ResourceProjection, SuffixSource,
     canonicalize_file_prefixes,
 };
-pub(crate) use prefix::{
-    CanonicalSchemaInputs, CanonicalSchemaResource, canonicalize_prefix_values,
-};
+pub(crate) use prefix::{CanonicalSchemaInputs, CanonicalSchemaResource};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1577,9 +1577,9 @@ pub fn resolve_attr_prefix_findings<P: PlaceholderKind, B: BindingAddress>(
 #[derive(Clone)]
 pub struct PrefixStateInfo {
     /// Attribute prefixes stored in state (e.g., {"bucket_name": "my-app-"})
-    pub prefixes: HashMap<String, String>,
+    pub prefixes: std::collections::BTreeMap<String, String>,
     /// Attribute values available for prefix reconciliation.
-    pub attribute_values: HashMap<String, PrefixStateValue>,
+    pub attribute_values: BTreeMap<String, PrefixStateValue>,
 }
 
 /// Persisted prefix value, including the typed case where a completed create
@@ -2906,7 +2906,7 @@ impl AnonymousIdStateInfo {
         origin_id: ResolvedResourceId,
         projected_id: Option<ResolvedResourceId>,
         schema: &ValidatedResourceSchema,
-        attributes: &HashMap<String, Value<P>>,
+        attributes: &BTreeMap<String, Value<P>>,
         name_overrides: &HashMap<String, NameOverride>,
     ) -> Option<Self> {
         Self::try_from_comparable_values(
@@ -3017,13 +3017,13 @@ impl StateIdentityValue {
 impl StateRowIdentityValues {
     fn from_state_row<P: crate::resource::StateValueLeaf>(
         schema: &ValidatedResourceSchema,
-        observed_attributes: &HashMap<String, Value<P>>,
+        observed_attributes: &BTreeMap<String, Value<P>>,
         name_overrides: &HashMap<String, NameOverride>,
     ) -> Self {
         let mut canonical = observed_attributes
             .iter()
             .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
-            .collect::<HashMap<_, _>>();
+            .collect::<BTreeMap<_, _>>();
         let identity_attributes = schema
             .identity_paths()
             .iter()
@@ -3543,7 +3543,7 @@ pub struct AnonymousIdBindingStateInfo {
     pub name: String,
     /// Persisted attribute values keyed by DSL attribute name (the state JSON
     /// attribute key). The consuming create-only schema canonicalizes them.
-    pub attribute_values: HashMap<String, crate::resource::SnapshotValue>,
+    pub attribute_values: BTreeMap<String, crate::resource::SnapshotValue>,
 }
 
 fn state_entry_matches_binding_scope(binding: &str, state_name: &str) -> bool {
@@ -3941,12 +3941,12 @@ impl StateCreateOnlyValues {
     /// attributes. Missing or non-comparable attributes remain absent.
     pub fn from_state_attributes<P: crate::resource::StateValueLeaf>(
         schema: &ValidatedResourceSchema,
-        observed_attributes: &HashMap<String, Value<P>>,
+        observed_attributes: &BTreeMap<String, Value<P>>,
     ) -> Self {
         let mut canonical = observed_attributes
             .iter()
             .map(|(key, value)| (key.clone(), crate::resource::state_value_snapshot(value)))
-            .collect::<HashMap<_, _>>();
+            .collect::<BTreeMap<_, _>>();
         crate::value::canonicalize_snapshot_attribute_map_with_schema(
             &mut canonical,
             schema.as_schema(),
