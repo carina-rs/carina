@@ -17,6 +17,7 @@ hook_static_checks=(
     check-no-home-env-reads
     check-plan-fixtures
     check-provider-boundaries
+    check-protocol-convert-exhaustive
     check-wit-guest-text-confinement
     check-schema-parts-exhaustive
     check-docs-use-new-spellings

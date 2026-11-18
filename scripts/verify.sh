@@ -133,6 +133,8 @@ run_kind() {
             bash scripts/check-wit-guest-text-confinement.sh
             bash scripts/test-check-schema-parts-exhaustive.sh
             bash scripts/check-schema-parts-exhaustive.sh
+            bash scripts/test-check-protocol-convert-exhaustive.sh
+            bash scripts/check-protocol-convert-exhaustive.sh
             ;;
         error-source-display)
             bash scripts/check-error-source-not-in-display.sh

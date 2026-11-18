@@ -54,7 +54,7 @@ assert_scope $'README.md\nCargo.lock' "workspace" "--all" "--all-targets --all-f
 
 echo "pre-commit scope tests passed"
 
-assert_equals 10 "${#hook_static_checks[@]}" 'the hook must run the ten approved static checks'
+assert_equals 11 "${#hook_static_checks[@]}" 'the hook must run the eleven approved static checks'
 case " ${excluded_static_checks[*]} " in
     *' check-pinned-toolchain '*) ;;
     *) echo 'Assertion failed: check-pinned-toolchain requires Python 3.11+ and must stay excluded'; exit 1 ;;
