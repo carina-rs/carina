@@ -7755,59 +7755,63 @@ fn module_argument_postfix_access_preserves_deferred_caller_value() {
 
 #[test]
 fn ref_function_parameter_substitutes_a_module_parameter_handle() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let module_dir = tmp.path().join("modules/selector");
-    fs::create_dir_all(&module_dir).unwrap();
-    fs::write(
-        module_dir.join("main.crn"),
-        r#"
-arguments { vpc: mock.test.Thing }
+    for declared_return in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let module_dir = tmp.path().join("modules/selector");
+        fs::create_dir_all(&module_dir).unwrap();
+        fs::write(
+            module_dir.join("main.crn"),
+            r#"
+    arguments { vpc: mock.test.Thing }
 
-fn id_of(resource: mock.test.Thing): String {
-  resource.identifier
-}
+    fn id_of(resource: mock.test.Thing): String {
+      resource.identifier
+    }
 
-let identifier = id_of(vpc)
-let selected = mock.test.Consumer { parent = identifier }
-"#,
-    )
-    .unwrap();
-
-    let root_dir = tmp.path().join("root");
-    fs::create_dir_all(&root_dir).unwrap();
-    let root_body = r#"
-let source = mock.test.Thing { name = "source" }
-let selector = use { source = "../modules/selector" }
-let child = selector { vpc = source }
-"#;
-    fs::write(root_dir.join("main.crn"), root_body).unwrap();
-
-    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    context
-        .resource_types
-        .insert(("mock".to_string(), "test.Thing".to_string()));
-    let parsed = crate::parser::parse(root_body, &context).unwrap();
-    let parsed = crate::validation::deferred_types::with_session_for_test(&context, |session| {
-        resolve_modules_with_config(
-            parsed,
-            &root_dir,
-            session.catalog(),
-            &crate::schema::SchemaRegistry::new(),
+    let identifier = id_of(vpc)
+    let selected = mock.test.Consumer { parent = identifier }
+    "#
+            .replace("): String", if declared_return { "): String" } else { ")" }),
         )
-        .expect("a Ref-typed function parameter must substitute a module handle")
-    });
+        .unwrap();
 
-    let selected = parsed
-        .resources
-        .iter()
-        .find(|resource| {
-            resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.selected")
-        })
-        .expect("expanded consumer");
-    assert_eq!(
-        selected.get_attr("parent"),
-        Some(&expanded_resource_ref("source", "identifier", vec![])),
-    );
+        let root_dir = tmp.path().join("root");
+        fs::create_dir_all(&root_dir).unwrap();
+        let root_body = r#"
+    let source = mock.test.Thing { name = "source" }
+    let selector = use { source = "../modules/selector" }
+    let child = selector { vpc = source }
+    "#;
+        fs::write(root_dir.join("main.crn"), root_body).unwrap();
+
+        let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        context
+            .resource_types
+            .insert(("mock".to_string(), "test.Thing".to_string()));
+        let parsed = crate::parser::parse(root_body, &context).unwrap();
+        let parsed =
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                resolve_modules_with_config(
+                    parsed,
+                    &root_dir,
+                    session.catalog(),
+                    &crate::schema::SchemaRegistry::new(),
+                )
+                .expect("a Ref-typed function parameter must substitute a module handle")
+            });
+
+        let selected = parsed
+            .resources
+            .iter()
+            .find(|resource| {
+                resource.binding.as_ref().map(|binding| binding.as_str()) == Some("child.selected")
+            })
+            .expect("expanded consumer");
+        assert_eq!(
+            selected.get_attr("parent"),
+            Some(&expanded_resource_ref("source", "identifier", vec![])),
+        );
+    }
 }
 
 #[test]

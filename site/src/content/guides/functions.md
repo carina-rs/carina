@@ -138,7 +138,11 @@ fn name(param1: type1, param2: type2): return_type {
 - **Return type** annotation is optional (`: String`)
 - The function body is a single expression (the return value)
 
-A plan cannot be saved with `carina plan --out` or `carina plan --json` while the project retains a call to a user-defined function, including calls in resource attributes and exports. Calls are retained when declared types require a value check, including when an untyped function wraps such a call or calls one in its body. This also applies when the value is already known from state. The error names the retained functions, which may be the outer functions. Run `carina apply` directly on the project, without a saved plan.
+A function without parameter or return type annotations expands during parsing at both the root and in module bodies, unless it contains another retained user-defined call. A function with any declared parameter or return type, including `String`, `Int`, `Bool`, `Float`, or `Duration`, stays as a call while an argument is unknown. It is inlined when every argument is known and its declared checks pass. Its declared types are checked when values become available, including during apply.
+
+A plan cannot be saved with `carina plan --out` or `carina plan --json` while the project retains a call to a user-defined function, including calls in resource attributes and exports. This also covers an untyped function that wraps a retained call or calls one in its body, and an authored call whose value is already known from state. The error names the retained functions, which may be the outer functions. Run `carina apply` directly on the project, without a saved plan.
+
+Untyped calls with pending builtin arguments now expand at the root too. An anonymous root resource whose address changes as a result moves automatically. Inside a module, an existing anonymous resource whose identity material contains a retained call to a function with primitive annotations can be re-created on upgrade unless you write `moved`; a schema with a declared identity stops with an error instead. This applies when an argument is unknown until apply and state from an older version uses the expanded function body for the address. Automatic moves require a proven match. See [anonymous resource upgrades](/reference/dsl/syntax/#anonymous-resources) for the full diagnostic and a `moved` example.
 
 ### Local variables in functions
 

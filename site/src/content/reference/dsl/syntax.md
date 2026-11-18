@@ -174,18 +174,35 @@ awscc.ec2.Vpc {
 
 If the schema declares identity paths, Carina generates the resource's state identity from only those values; paths may name top-level attributes or nested struct fields whose leaf is a scalar or enum. Other create-only values can force replacement without changing the address. Written values are schema-canonicalized. References and composite expressions over references and literals are hashed by their deterministic authored spelling, so their addresses stay stable after apply-time resolution; generated names hash a separately typed prefix. A missing required identity value or a written expression containing an unknown or unavailable leaf is an error: write the value or bind the resource with `let`. An omitted optional `identity_when_present()` value contributes an absence marker. A schema with no declared identity falls back to configured top-level create-only attributes and, when none are configured, to the resource's other attributes. Multiple resources using that attribute-derived fallback are rejected as ambiguous. Equal declared identity values, including equal expression spellings plus equal written values, are also rejected.
 
-When upgrading a module-body anonymous resource whose declared identity attribute contains a user-defined function call retained for a declared value check, its address changes to use the call's authored spelling, as at the root. Planning stops and asks for a `moved` block. Copy the old and new addresses from that diagnostic:
+A user-defined function without parameter or return type annotations expands during parsing at both the root and in module bodies, unless it contains another retained user-defined call. A function with any declared type, including `String`, `Int`, `Bool`, `Float`, or `Duration`, stays as a call while an argument is unknown. It is inlined when every argument is known and its declared checks pass; otherwise the checks run when values become available, including during apply. A plan containing a retained user-defined call cannot be saved with `carina plan --out` or `carina plan --json`. Apply the project directly instead.
+
+At the root, an anonymous resource's address can change on upgrade when a value used to derive its identity calls an untyped user-defined function whose argument contains a call that has not yet been evaluated at parse time, such as `outer(upper(src.emitted))`. Carina now expands the user-defined call before computing the address. These root resources move automatically, including resources with declared identity attributes. Named resources keep their addresses.
+
+An upgrade can also change a module-body anonymous resource's address when all of these conditions hold:
+
+- The function declares a primitive parameter or return type.
+- An argument is not known until apply, so the function call stays retained.
+- The call's result contributes to the anonymous resource's identity material.
+- State written by an older version exists, using the expanded function body for that address.
+
+Inside a module, an existing resource whose value is such a call is re-created on upgrade unless you write `moved`; a schema with a declared identity stops with an error instead. Carina moves the row automatically only when it can prove a match, which can happen for create-only schemas. Review the plan before applying. This also applies to module-body calls retained for non-primitive declared checks.
+
+For example, a declared-identity resource in a module instance named `network` can report the following error (the type and addresses depend on the project):
+
+```text
+Error: Anonymous resource `awscc.ec2.Vpc.network.ec2_vpc_04c023e3` has an authored declared-identity expression that cannot be evaluated from binding state while unclaimed legacy state rows remain: `awscc.ec2.Vpc.network.ec2_vpc_0312f2cf`. Add a `moved` block to select the intended state row.
+```
+
+After checking which old row belongs to the desired resource, add a `moved` block at the project root. The `from` and `to` strings include the module instance path:
 
 ```crn
 moved {
-  from = awscc.ec2.Vpc 'module_instance.old_address'
-  to   = awscc.ec2.Vpc 'module_instance.new_address'
+  from = awscc.ec2.Vpc 'network.ec2_vpc_0312f2cf'
+  to   = awscc.ec2.Vpc 'network.ec2_vpc_04c023e3'
 }
 ```
 
-Resources whose schemas use mutable attributes or create-only attributes without a declared identity move automatically. Named resources keep their addresses.
-
-At the root, an anonymous resource's address also changes when a value used to derive its identity calls an untyped or primitive-only user-defined function whose argument contains a call that has not yet been evaluated at parse time, such as `outer(upper(src.emitted))`. Carina now expands the user-defined call before computing the address. The upgrade moves these resources automatically, including resources with declared identity attributes.
+The same form selects an old row for a mutable schema whose plan otherwise shows a create and a delete. The move changes the state address without creating, updating, or deleting the provider resource. Retained-call identity evaluation is tracked in [#4549](https://github.com/carina-rs/carina/issues/4549).
 
 ### Named Resources (Let Bindings)
 

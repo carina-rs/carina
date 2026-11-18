@@ -513,8 +513,7 @@ fn static_rejection(case: &Case) -> bool {
         || (case.name.contains("-return-identity-")
             && !case.name.contains("-param-return-identity-"))
         || (case.name.starts_with("c2-module-param-"))
-        || (case.name.ends_with("invalid")
-            && (case.name.contains("literal") || case.name.contains("return-const")))
+        || (case.name.ends_with("invalid") && case.name.contains("literal"))
 }
 fn known_handle_rejection(case: &Case) -> bool {
     case.name == "c1-handle-known-invalid"
@@ -523,7 +522,7 @@ fn late_rejection(case: &Case) -> bool {
     case.name.ends_with("invalid") && !static_rejection(case) && !known_handle_rejection(case)
 }
 fn savable(case: &Case) -> bool {
-    !static_rejection(case) && (case.name.contains("literal") || case.name.contains("return-const"))
+    !static_rejection(case) && case.name.contains("literal")
 }
 const SUFFIX: &str = "expected test.Name, got string 'bad-name': test rejected `test.Name`: Invalid Name value 'bad-name': does not match required pattern /allowed/ (Full)";
 fn assert_declared_error(text: &str, prefix: &str) {
@@ -632,7 +631,7 @@ async fn commands_case_with_body_site(case: Case, body_line: Option<usize>) {
     if late_rejection(&case) {
         let prefix = if case.name.contains("handle-late") {
             "function 'f': return value:"
-        } else if case.name.contains("return-untyped") {
+        } else if case.name.contains("return-untyped") || case.name.contains("return-const") {
             "function 'g': return value:"
         } else {
             "function 'g': parameter 'x':"
@@ -824,7 +823,7 @@ fixture_tests!(
 );
 fixture_tests!(
     c2_module_return_const_late_valid,
-    c2_module_return_const_late_valid_saved_plan_control,
+    c2_module_return_const_late_valid_plan_out,
     "c2-module-return-const-late-valid"
 );
 fixture_tests!(
@@ -884,7 +883,7 @@ fixture_tests!(
 );
 fixture_tests!(
     c2_module_upstream_return_const_late_valid,
-    c2_module_upstream_return_const_late_valid_saved_plan_control,
+    c2_module_upstream_return_const_late_valid_plan_out,
     "c2-module-upstream-return-const-late-valid"
 );
 fixture_tests!(
@@ -944,7 +943,7 @@ fixture_tests!(
 );
 fixture_tests!(
     c2_module_handle_return_const_late_valid,
-    c2_module_handle_return_const_late_valid_saved_plan_control,
+    c2_module_handle_return_const_late_valid_plan_out,
     "c2-module-handle-return-const-late-valid"
 );
 fixture_tests!(
@@ -1004,7 +1003,7 @@ fixture_tests!(
 );
 fixture_tests!(
     c2_root_return_const_late_valid,
-    c2_root_return_const_late_valid_saved_plan_control,
+    c2_root_return_const_late_valid_plan_out,
     "c2-root-return-const-late-valid"
 );
 fixture_tests!(
@@ -1080,36 +1079,59 @@ async fn declared_checks_nested_arguments_locals_wrappers_in_module_and_root() {
 }
 
 #[tokio::test]
-async fn declared_checks_primitive_and_builtin_controls_inline_and_save() {
+async fn declared_checks_untyped_builtin_controls_inline_plan_out() {
     for scope in ["root", "module-upstream"] {
-        for function in [
-            "fn g(x: String): String { x }",
-            "fn g(x) { upper(x) }",
-            "fn g(x) { x }",
-            "fn g(x: list(String)): list(String) { x }",
+        for (function, call) in [
+            ("fn g(x) { upper(x) }", "g(src.emitted)"),
+            ("fn g(x) { x }", "g(upper(src.emitted))"),
         ] {
             let mut case = fixture_case(&format!("c2-{scope}-param-identity-late-invalid"));
             let source = case.child.as_mut().unwrap_or(&mut case.main);
-            *source = source.replace("fn g(x: test.Name): String { x }", function);
-            if function == "fn g(x) { x }" {
-                *source = source.replace("g(src.emitted)", "g(upper(src.emitted))");
-            }
-            if function.contains("list(String)") {
-                *source = source.replace("g(src.emitted)", "g([src.emitted])[0]");
-            }
+            *source = source
+                .replace("fn g(x: test.Name): String { x }", function)
+                .replace("g(src.emitted)", call);
             let directory = Directory::new(&case);
             let saved = directory.path().join("saved.plan.json");
             directory.plan(Some(&saved)).await.unwrap();
             directory.apply_saved(&saved).await.unwrap();
             assert_eq!(directory.fixture.count("create", "Sink"), 1);
-            let expected = if function == "fn g(x) { upper(x) }" || function == "fn g(x) { x }" {
-                "BAD-NAME"
-            } else {
-                "bad-name"
-            };
             assert_eq!(
                 directory.fixture.sink_values(),
-                [serde_json::json!(expected)]
+                [serde_json::json!("BAD-NAME")]
+            );
+            directory.assert_unlocked().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn declared_checks_primitive_annotations_wait_for_values_plan_out() {
+    for scope in ["root", "module-upstream"] {
+        for (function, call) in [
+            ("fn g(x: String): String { x }", "g(src.emitted)"),
+            (
+                "fn g(x: list(String)): list(String) { x }",
+                "g([src.emitted])[0]",
+            ),
+        ] {
+            let mut case = fixture_case(&format!("c2-{scope}-param-identity-late-invalid"));
+            let source = case.child.as_mut().unwrap_or(&mut case.main);
+            *source = source
+                .replace("fn g(x: test.Name): String { x }", function)
+                .replace("g(src.emitted)", call);
+            let directory = Directory::new(&case);
+            let saved = directory.path().join("saved.plan.json");
+            let result = directory.plan(Some(&saved)).await;
+            assert_eq!(
+                rendered(&result),
+                expected_retained_plan_refusal(directory.path(), "g")
+            );
+            assert!(!saved.exists());
+            directory.apply().await.unwrap();
+            assert_eq!(directory.fixture.count("create", "Sink"), 1);
+            assert_eq!(
+                directory.fixture.sink_values(),
+                [serde_json::json!("bad-name")]
             );
             directory.assert_unlocked().await;
         }

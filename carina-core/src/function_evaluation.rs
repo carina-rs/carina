@@ -79,8 +79,37 @@ impl<P: PlaceholderKind, B: BindingAddress> AnnotationValue<P, B> for Value<P, B
     }
 }
 
+enum AnnotationRequirement<'a> {
+    Unconstrained,
+    KnownValue(Option<&'a TypeExpr>),
+    Declared(&'a TypeExpr),
+}
+
+#[derive(Clone, Copy)]
+enum ArgumentKnowledge {
+    Unconstrained,
+    Required,
+}
+
 fn check_declared_annotation<P: PlaceholderKind, B: BindingAddress, V: AnnotationValue<P, B>>(
     annotation: Option<&TypeExpr>,
+    value: V,
+    provider: TypecheckProviderContext<'_>,
+    site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
+) -> Result<AnnotationCheck<V>, crate::validation::typecheck::TypeExprValueError> {
+    check_annotation(
+        annotation.map_or(
+            AnnotationRequirement::Unconstrained,
+            AnnotationRequirement::Declared,
+        ),
+        value,
+        provider,
+        site,
+    )
+}
+
+fn check_annotation<P: PlaceholderKind, B: BindingAddress, V: AnnotationValue<P, B>>(
+    requirement: AnnotationRequirement<'_>,
     value: V,
     provider: TypecheckProviderContext<'_>,
     site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
@@ -88,22 +117,30 @@ fn check_declared_annotation<P: PlaceholderKind, B: BindingAddress, V: Annotatio
     let discharged = AnnotationStatus::Discharged {
         provider_recheck: false,
     };
-    let status = match annotation {
-        None => discharged,
-        Some(expected) => {
-            let known = value.value().and_then(|value| {
-                value
-                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                    .ok()
-                    .and_then(|proof| proof.into_classification().into_known().ok())
-            });
-            if provider.session().is_none()
-                && !provider.as_provider_context().custom_types_loaded()
-                && annotation_requires_provider_session(expected)
-            {
-                AnnotationStatus::AwaitingValue(AwaitingReason::ProviderSession)
-            } else if let Some(known) = known {
-                match provider.check_resolved_constraints(expected, &known) {
+    let (expected, requires_known_value) = match requirement {
+        AnnotationRequirement::Unconstrained => return Ok(AnnotationCheck::new(value, discharged)),
+        AnnotationRequirement::KnownValue(expected) => (expected, true),
+        AnnotationRequirement::Declared(expected) => {
+            (Some(expected), requires_concrete_annotation_check(expected))
+        }
+    };
+    let known = value.value().and_then(|value| {
+        value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .ok()
+            .and_then(|proof| proof.into_classification().into_known().ok())
+    });
+    let status = if expected.is_some_and(|expected| {
+        provider.session().is_none()
+            && !provider.as_provider_context().custom_types_loaded()
+            && annotation_requires_provider_session(expected)
+    }) {
+        AnnotationStatus::AwaitingValue(AwaitingReason::ProviderSession)
+    } else {
+        match known {
+            Some(known) => match expected {
+                None => discharged,
+                Some(expected) => match provider.check_resolved_constraints(expected, &known) {
                     TypeExprValueCheck::Assignable => discharged,
                     TypeExprValueCheck::Mismatch(error) => return Err(error),
                     TypeExprValueCheck::Deferred(deferred)
@@ -123,11 +160,14 @@ fn check_declared_annotation<P: PlaceholderKind, B: BindingAddress, V: Annotatio
                         }
                         None => return Err(deferred.into_error()),
                     },
+                },
+            },
+            None => {
+                if requires_known_value {
+                    AnnotationStatus::AwaitingValue(AwaitingReason::ConcreteValue)
+                } else {
+                    discharged
                 }
-            } else if requires_concrete_annotation_check(expected) {
-                AnnotationStatus::AwaitingValue(AwaitingReason::ConcreteValue)
-            } else {
-                discharged
             }
         }
     };
@@ -137,11 +177,21 @@ fn check_declared_annotation<P: PlaceholderKind, B: BindingAddress, V: Annotatio
 fn check_parameter<P: PlaceholderKind, B: BindingAddress>(
     parameter: &FnParam<B>,
     argument: FunctionArgument<P, B>,
+    knowledge: ArgumentKnowledge,
     provider: TypecheckProviderContext<'_>,
     site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
     context: &str,
 ) -> Result<AnnotationCheck<FunctionArgument<P, B>>, AnnotationError> {
     let Some(annotation) = &parameter.param_type else {
+        if matches!(knowledge, ArgumentKnowledge::Required) && argument.handle().is_none() {
+            return check_annotation(
+                AnnotationRequirement::KnownValue(None),
+                argument,
+                provider,
+                site,
+            )
+            .map_err(Into::into);
+        }
         return Ok(AnnotationCheck::new(
             argument,
             AnnotationStatus::Discharged {
@@ -203,8 +253,8 @@ fn check_parameter<P: PlaceholderKind, B: BindingAddress>(
             },
         ));
     }
-    check_declared_annotation(
-        Some(&resolved_type.as_type_expr()),
+    check_annotation(
+        AnnotationRequirement::KnownValue(Some(&resolved_type.as_type_expr())),
         argument,
         provider,
         site,
@@ -244,8 +294,15 @@ pub(crate) fn check_parameter_annotation<P: PlaceholderKind, B: BindingAddress>(
     site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
     context: &str,
 ) -> Result<ParameterAnnotationCheck<P, B>, AnnotationError> {
-    check_parameter(parameter, argument, provider, site, context)
-        .map(|check| ParameterAnnotationCheck { check })
+    check_parameter(
+        parameter,
+        argument,
+        ArgumentKnowledge::Unconstrained,
+        provider,
+        site,
+        context,
+    )
+    .map(|check| ParameterAnnotationCheck { check })
 }
 
 #[derive(Debug)]
@@ -352,6 +409,7 @@ pub(crate) struct FunctionCompletion<'a, P: PlaceholderKind, B: BindingAddress> 
     arguments: std::vec::IntoIter<(&'a FnParam<B>, ArgumentSource<P, B>)>,
     checked_arguments: Vec<FunctionArgument<P, B>>,
     pending_check: bool,
+    argument_knowledge: ArgumentKnowledge,
     observations: CallObservations,
     retained: RetainedCall<P, B>,
 }
@@ -415,6 +473,16 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionCompletion<'a, P, B> {
             arguments,
             checked_arguments: Vec::new(),
             pending_check: false,
+            argument_knowledge: if function.return_type.is_some()
+                || function
+                    .params
+                    .iter()
+                    .any(|parameter| parameter.param_type.is_some())
+            {
+                ArgumentKnowledge::Required
+            } else {
+                ArgumentKnowledge::Unconstrained
+            },
             observations: CallObservations::default(),
             retained: RetainedCall::new(
                 Arc::clone(function),
@@ -479,7 +547,14 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> ArgumentSlot<'a, P, B> {
         site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
         context: &str,
     ) -> Result<(FunctionCompletion<'a, P, B>, ParameterCheckReport), AnnotationError> {
-        let check = check_parameter(self.parameter, argument, provider, site, context)?;
+        let check = check_parameter(
+            self.parameter,
+            argument,
+            self.cursor.argument_knowledge,
+            provider,
+            site,
+            context,
+        )?;
         let report = ParameterCheckReport(check.status());
         let argument = match check {
             AnnotationCheck::Discharged(witness) => witness.value,
@@ -602,7 +677,7 @@ impl<P: PlaceholderKind, B: BindingAddress> FunctionBodyCompletion<'_, P, B> {
 fn requires_concrete_annotation_check(expected: &TypeExpr) -> bool {
     match expected {
         TypeExpr::Simple(_)
-        | TypeExpr::SchemaType { .. }
+        | TypeExpr::SchemaType { owned: _ }
         | TypeExpr::UnloadedSchemaType(_)
         | TypeExpr::DottedUnresolved(_)
         | TypeExpr::StringLiteral(_) => true,
@@ -619,7 +694,6 @@ fn requires_concrete_annotation_check(expected: &TypeExpr) -> bool {
         | TypeExpr::Ref(_) => false,
     }
 }
-
 pub(crate) fn annotation_requires_provider_session(expected: &TypeExpr) -> bool {
     match expected {
         TypeExpr::UnloadedSchemaType(_)
@@ -772,6 +846,143 @@ mod tests {
     fn text(text: &str) -> AuthoredValue {
         Value::Concrete(ConcreteValue::String(text.into()))
     }
+
+    #[test]
+    fn known_handle_primitive_return_inlines_without_a_result_value() {
+        let mut context = config();
+        context
+            .resource_types
+            .insert(("mock".into(), "test.resource".into()));
+        let function = Arc::new(
+            parse_file(
+                "fn g(r: mock.test.resource): String { \"prefix-${r.computed}\" }",
+                std::path::Path::new("functions.crn"),
+                &context,
+            )
+            .unwrap()
+            .user_functions
+            .shift_remove("g")
+            .unwrap(),
+        );
+        let handle = crate::eval_value::UnexpandedStructuralHandle::new(
+            crate::eval_value::UnexpandedStructuralHandleKind::Resource(
+                crate::parser::ResourceTypePath::new("mock", "test.resource"),
+            ),
+            "src",
+        );
+        let argument = FunctionArgument::from_handle(handle);
+        let cursor = FunctionCompletion::new(
+            &function,
+            &Arc::new(IndexMap::new()),
+            vec![argument.clone()],
+            1.into(),
+        )
+        .unwrap();
+        let ArgumentStep::Argument(slot) = cursor.next_argument() else {
+            panic!("argument");
+        };
+        let (cursor, _) = slot
+            .check(
+                argument,
+                TypecheckProviderContext::for_parser(&context),
+                || None,
+                "argument",
+            )
+            .unwrap();
+        let ArgumentStep::Complete(PreparedFunction::Ready { completion }) = cursor.next_argument()
+        else {
+            panic!("known handle");
+        };
+        let LocalStep::Body(completion) = completion.next_local() else {
+            panic!("body");
+        };
+        let body = completion.substitute_body().unwrap();
+        let result = completion
+            .finish(
+                body.clone(),
+                TypecheckProviderContext::for_parser(&context),
+                || None,
+            )
+            .unwrap();
+        let FunctionEvaluation::Inline(value) = result else {
+            panic!("a known handle does not require a primitive result value");
+        };
+        assert_eq!(value.into_value(), body);
+    }
+
+    #[test]
+    fn primitive_argument_checks_await_unknown_values() {
+        for annotation in [
+            TypeExpr::String,
+            TypeExpr::Int,
+            TypeExpr::Bool,
+            TypeExpr::Float,
+            TypeExpr::Duration,
+        ] {
+            let checked = check_annotation(
+                AnnotationRequirement::KnownValue(Some(&annotation)),
+                unknown(),
+                TypecheckProviderContext::for_parser(&config()),
+                || None,
+            )
+            .unwrap();
+            assert!(
+                matches!(checked, AnnotationCheck::AwaitingValue(_)),
+                "{annotation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_declared_type_retains_an_ignored_unknown_argument() {
+        for (source, values) in [
+            ("fn g(x): String { 'constant' }", vec![unknown()]),
+            (
+                "fn g(x, y: String) { 'constant' }",
+                vec![unknown(), text("valid")],
+            ),
+            (
+                "fn g(x: String, y) { 'constant' }",
+                vec![text("valid"), unknown()],
+            ),
+        ] {
+            let function = function(source);
+            let mut cursor = FunctionCompletion::new(
+                &function,
+                &Arc::new(IndexMap::new()),
+                values
+                    .into_iter()
+                    .map(FunctionArgument::from_value)
+                    .collect(),
+                1.into(),
+            )
+            .unwrap();
+            loop {
+                match cursor.next_argument() {
+                    ArgumentStep::Argument(slot) => {
+                        let argument = match slot.argument() {
+                            ArgumentSource::Provided(argument) => argument.clone(),
+                            ArgumentSource::Default(value) => {
+                                FunctionArgument::from_value(value.clone())
+                            }
+                        };
+                        (cursor, _) = slot
+                            .check(
+                                argument,
+                                TypecheckProviderContext::for_parser(&config()),
+                                || None,
+                                "argument",
+                            )
+                            .unwrap();
+                    }
+                    ArgumentStep::Complete(PreparedFunction::Retain(_)) => break,
+                    ArgumentStep::Complete(PreparedFunction::Ready {
+                        completion: _completion,
+                    }) => panic!("typed call inlined with an unknown argument: {source}"),
+                }
+            }
+        }
+    }
     fn locals<'a>(
         function: &'a Arc<UserFunction>,
         config: &ProviderContext,
@@ -782,7 +993,7 @@ mod tests {
                 ArgumentStep::Argument(slot) => {
                     (cursor, _) = slot
                         .check(
-                            FunctionArgument::from_value(unknown()),
+                            FunctionArgument::from_value(text("allowed")),
                             TypecheckProviderContext::for_parser(config),
                             || None,
                             "argument",
@@ -793,7 +1004,7 @@ mod tests {
                     return completion;
                 }
                 ArgumentStep::Complete(PreparedFunction::Retain(_)) => {
-                    panic!("primitive arguments must prepare")
+                    panic!("known checked arguments must prepare")
                 }
             }
         }
@@ -855,7 +1066,7 @@ mod tests {
         assert!(matches!(
             body(&function, &config())
                 .finish(
-                    unknown(),
+                    text("allowed"),
                     TypecheckProviderContext::for_parser(&config()),
                     || None
                 )
@@ -897,6 +1108,7 @@ mod tests {
             let checked = check_parameter(
                 &function.params[0],
                 FunctionArgument::from_handle(handle),
+                ArgumentKnowledge::Required,
                 TypecheckProviderContext::for_session(session),
                 || None,
                 "argument",
@@ -944,7 +1156,7 @@ mod tests {
         };
         let (cursor, _) = slot
             .check(
-                FunctionArgument::from_value(unknown()),
+                FunctionArgument::from_value(text("resolved")),
                 TypecheckProviderContext::for_parser(&config()),
                 || None,
                 "argument",
@@ -960,7 +1172,7 @@ mod tests {
         assert!(matches!(
             completed
                 .finish(
-                    unknown(),
+                    text("resolved"),
                     TypecheckProviderContext::for_parser(&config()),
                     || None
                 )
@@ -1034,7 +1246,7 @@ mod tests {
         assert!(matches!(
             completed
                 .finish(
-                    unknown(),
+                    text("allowed"),
                     TypecheckProviderContext::for_parser(&config()),
                     || None
                 )
@@ -1043,7 +1255,7 @@ mod tests {
         ));
     }
     #[test]
-    fn failed_classification_only_discharges_shape_annotation() {
+    fn failed_classification_preserves_return_shapes_and_retains_arguments() {
         let failed: AuthoredValue = Value::Deferred(DeferredValue::Unavailable {
             name: crate::builtins::BuiltinFunction::env,
             args: vec![],
@@ -1075,6 +1287,14 @@ mod tests {
                 matches!(checked, AnnotationCheck::Discharged(_)),
                 discharged
             );
+            let argument = check_annotation(
+                AnnotationRequirement::KnownValue(Some(&annotation)),
+                failed.clone(),
+                TypecheckProviderContext::for_parser(&config()),
+                || None,
+            )
+            .unwrap();
+            assert!(matches!(argument, AnnotationCheck::AwaitingValue(_)));
         }
     }
     #[test]

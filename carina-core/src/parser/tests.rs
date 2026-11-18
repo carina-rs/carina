@@ -20528,91 +20528,91 @@ mock.test.Consumer { name = secondary }"#,
 
 #[test]
 fn ref_typed_user_function_argument_accepts_a_structural_handle() {
-    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    context
-        .resource_types
-        .insert(("mock".to_string(), "test.Thing".to_string()));
-    let parsed = parse(
-        r#"
-            fn resource_name(resource: mock.test.Thing): String {
-                resource.name
-            }
-            let vpc = mock.test.Thing { name = "source" }
-            let name = resource_name(vpc)
-        "#,
-        &context,
-    )
-    .expect("Ref-typed parameters consume typed handles");
+    for declared_return in [false, true] {
+        let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        context
+            .resource_types
+            .insert(("mock".to_string(), "test.Thing".to_string()));
+        let parsed = parse(
+            &r#"
+                fn resource_name(resource: mock.test.Thing): String {
+                    resource.name
+                }
+                let vpc = mock.test.Thing { name = "source" }
+                let name = resource_name(vpc)
+            "#
+            .replace("): String", if declared_return { "): String" } else { ")" }),
+            &context,
+        )
+        .expect("Ref-typed parameters consume typed handles");
 
-    assert_resource_reference_shape(
-        parsed.variables.get("name").expect("function result"),
-        "vpc",
-        "name",
-    );
+        let value = parsed.variables.get("name").expect("function result");
+        assert_resource_reference_shape(value, "vpc", "name");
+    }
 }
 
 #[test]
 fn ref_typed_user_function_argument_accepts_a_sibling_resource_handle() {
-    use crate::config_loader::parse_directory;
+    for declared_return in [false, true] {
+        use crate::config_loader::parse_directory;
 
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::write(
-        directory.path().join("main.crn"),
-        r#"
-fn resource_name(resource: mock.test.Thing): String {
-  resource.name
-}
-let name = resource_name(vpc)
-"#,
-    )
-    .unwrap();
-    std::fs::write(
-        directory.path().join("resources.crn"),
-        r#"let vpc = mock.test.Thing { name = "source" }
-"#,
-    )
-    .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("main.crn"),
+            r#"
+    fn resource_name(resource: mock.test.Thing): String {
+      resource.name
+    }
+    let name = resource_name(vpc)
+    "#
+            .replace("): String", if declared_return { "): String" } else { ")" }),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("resources.crn"),
+            r#"let vpc = mock.test.Thing { name = "source" }
+    "#,
+        )
+        .unwrap();
 
-    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    context
-        .resource_types
-        .insert(("mock".to_string(), "test.Thing".to_string()));
-    let parsed = parse_directory(
-        &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
-        &context,
-    )
-    .expect("Ref-typed parameters accept resources declared in sibling files");
+        let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        context
+            .resource_types
+            .insert(("mock".to_string(), "test.Thing".to_string()));
+        let parsed = parse_directory(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &context,
+        )
+        .expect("Ref-typed parameters accept resources declared in sibling files");
 
-    assert_resource_reference_shape(
-        parsed.variables.get("name").expect("function result"),
-        "vpc",
-        "name",
-    );
+        let value = parsed.variables.get("name").expect("function result");
+        assert_resource_reference_shape(value, "vpc", "name");
+    }
 }
 
 #[test]
 fn ref_typed_user_function_pipe_accepts_a_structural_handle() {
-    let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    context
-        .resource_types
-        .insert(("mock".to_string(), "test.Thing".to_string()));
-    let parsed = parse(
-        r#"
-            fn resource_name(resource: mock.test.Thing): String {
-                resource.name
-            }
-            let vpc = mock.test.Thing { name = "source" }
-            let name = vpc |> resource_name()
-        "#,
-        &context,
-    )
-    .expect("a pipe into a Ref-typed parameter consumes the typed handle");
+    for declared_return in [false, true] {
+        let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        context
+            .resource_types
+            .insert(("mock".to_string(), "test.Thing".to_string()));
+        let parsed = parse(
+            &r#"
+                fn resource_name(resource: mock.test.Thing): String {
+                    resource.name
+                }
+                let vpc = mock.test.Thing { name = "source" }
+                let name = vpc |> resource_name()
+            "#
+            .replace("): String", if declared_return { "): String" } else { ")" }),
+            &context,
+        )
+        .expect("a pipe into a Ref-typed parameter consumes the typed handle");
 
-    assert_resource_reference_shape(
-        parsed.variables.get("name").expect("function result"),
-        "vpc",
-        "name",
-    );
+        let value = parsed.variables.get("name").expect("function result");
+        assert_resource_reference_shape(value, "vpc", "name");
+    }
 }
 
 #[test]

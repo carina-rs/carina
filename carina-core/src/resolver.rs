@@ -5117,18 +5117,18 @@ mod declared_check_regressions {
         use crate::parser::TypeExpr;
         let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         for (annotation, pending) in [
-            (TypeExpr::String, false),
-            (TypeExpr::Bool, false),
-            (TypeExpr::Int, false),
-            (TypeExpr::Float, false),
-            (TypeExpr::Duration, false),
-            (TypeExpr::List(Box::new(TypeExpr::String)), false),
-            (TypeExpr::Map(Box::new(TypeExpr::Int)), false),
+            (TypeExpr::String, true),
+            (TypeExpr::Bool, true),
+            (TypeExpr::Int, true),
+            (TypeExpr::Float, true),
+            (TypeExpr::Duration, true),
+            (TypeExpr::List(Box::new(TypeExpr::String)), true),
+            (TypeExpr::Map(Box::new(TypeExpr::Int)), true),
             (
                 TypeExpr::Struct {
                     fields: vec![("x".into(), TypeExpr::String)],
                 },
-                false,
+                true,
             ),
             (TypeExpr::StringLiteral("allowed".into()), true),
             (
@@ -5288,7 +5288,7 @@ mod declared_check_regressions {
         }
     }
     #[test]
-    fn runtime_primitive_missing_span_is_not_required() {
+    fn runtime_primitive_missing_span_waits_for_a_value() {
         let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = parse_file(
             "fn g(x: String): String { x }",
@@ -5300,23 +5300,30 @@ mod declared_check_regressions {
         function.type_annotations.clear();
         function.params[0].type_span = None;
         function.return_type_span = None;
-        let args = [FunctionArgument::from_value(AuthoredValue::resource_ref(
-            "src",
-            "emitted",
-            vec![],
-        ))];
-        let result = crate::validation::deferred_types::with_session_for_test(&config, |session| {
-            evaluate_runtime_user_function(
-                &std::sync::Arc::new(function),
-                &std::sync::Arc::new(parsed.user_functions),
-                &args,
-                &ResolvedBindings::default(),
-                session,
-                1,
-            )
-        })
-        .unwrap();
-        assert!(matches!(result, FunctionEvaluation::Inline(_)));
+        let function = std::sync::Arc::new(function);
+        let functions = std::sync::Arc::new(parsed.user_functions);
+        for (argument, inline) in [
+            (AuthoredValue::resource_ref("src", "emitted", vec![]), false),
+            (
+                AuthoredValue::Concrete(crate::resource::ConcreteValue::String("known".into())),
+                true,
+            ),
+        ] {
+            let args = [FunctionArgument::from_value(argument)];
+            let result =
+                crate::validation::deferred_types::with_session_for_test(&config, |session| {
+                    evaluate_runtime_user_function(
+                        &function,
+                        &functions,
+                        &args,
+                        &ResolvedBindings::default(),
+                        session,
+                        1,
+                    )
+                })
+                .unwrap();
+            assert_eq!(matches!(result, FunctionEvaluation::Inline(_)), inline);
+        }
     }
 }
 

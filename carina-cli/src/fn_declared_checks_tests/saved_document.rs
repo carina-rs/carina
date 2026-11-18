@@ -107,7 +107,7 @@ async fn admissible_saved_document_bytes() {
     let directory = Directory::new(&Case {
         name: "admissible document bytes".into(),
         main: "let child = use { source = './child' }\nlet instance = child { input = 'allowed' }\ntest.Sink { name = 'sink' value = instance.output }\n".into(),
-        child: Some("arguments { input: String }\nlet src = test.Thing { name = input }\nfn identity(value: String): String { value }\nattributes { output: String = upper(identity(src.emitted)) }\n".into()),
+        child: Some("arguments { input: String }\nlet src = test.Thing { name = input }\nfn identity(value) { value }\nattributes { output: String = upper(identity(src.emitted)) }\n".into()),
         emitted: "allowed".into(),
     });
     let path = directory.path().join("saved.plan.json");

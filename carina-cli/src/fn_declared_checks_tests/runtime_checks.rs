@@ -419,7 +419,7 @@ async fn return_reference_schema_mismatch_precedes_shadow_recheck() {
     directory.assert_unlocked().await;
 }
 #[tokio::test]
-async fn primitive_module_argument_reaches_runtime_saved_plan_control() {
+async fn primitive_module_argument_reaches_runtime_and_refuses_plan_out() {
     let mut case = fixture_case("c2-module-param-identity-late-invalid");
     case.child = Some("arguments { input: String }\nfn g(x: String): String { x }\ntest.Sink { name = 'sink' value = g(input) }\n".into());
     let directory = Directory::new(&case);
@@ -430,16 +430,24 @@ async fn primitive_module_argument_reaches_runtime_saved_plan_control() {
     )
     .unwrap();
     assert!(matches!(
-        parsed.resources[0].get_attr("value"),
+        parsed
+            .iter_all_resources()
+            .next()
+            .unwrap()
+            .attributes()
+            .get("value"),
         Some(carina_core::resource::Value::Deferred(
             carina_core::resource::DeferredValue::ResolvedFunctionCall { .. }
         ))
     ));
     let saved = directory.path().join("primitive.plan.json");
     let planned = directory.plan(Some(&saved)).await;
-    assert!(planned.is_ok(), "{}", rendered(&planned));
-    assert!(saved.exists());
-    directory.apply_saved(&saved).await.unwrap();
+    assert_eq!(
+        rendered(&planned),
+        expected_retained_plan_refusal(directory.path(), "g")
+    );
+    assert!(!saved.exists());
+    directory.apply().await.unwrap();
     assert_eq!(directory.fixture.count("create", "Thing"), 1);
     assert_eq!(directory.fixture.count("create", "Sink"), 1);
     assert_eq!(

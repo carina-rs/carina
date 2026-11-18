@@ -1565,18 +1565,18 @@ mod declared_check_regressions {
         )
         .unwrap();
         for (annotation, pending) in [
-            (TypeExpr::String, false),
-            (TypeExpr::Bool, false),
-            (TypeExpr::Int, false),
-            (TypeExpr::Float, false),
-            (TypeExpr::Duration, false),
-            (TypeExpr::List(Box::new(TypeExpr::String)), false),
-            (TypeExpr::Map(Box::new(TypeExpr::Int)), false),
+            (TypeExpr::String, true),
+            (TypeExpr::Bool, true),
+            (TypeExpr::Int, true),
+            (TypeExpr::Float, true),
+            (TypeExpr::Duration, true),
+            (TypeExpr::List(Box::new(TypeExpr::String)), true),
+            (TypeExpr::Map(Box::new(TypeExpr::Int)), true),
             (
                 TypeExpr::Struct {
                     fields: vec![("x".into(), TypeExpr::String)],
                 },
-                false,
+                true,
             ),
             (TypeExpr::StringLiteral("allowed".into()), true),
             (
@@ -1694,17 +1694,18 @@ mod declared_check_regressions {
         );
     }
     #[test]
-    fn declared_checks_parser_primitive_and_builtin_controls_inline() {
-        for body in [
-            "fn outer(x: String): String { x }",
-            "fn outer(x) { upper(x) }",
+    fn declared_checks_parser_primitives_retain_and_untyped_builtins_inline() {
+        for (body, retained) in [
+            ("fn outer(x: String): String { x }", true),
+            ("fn outer(x) { upper(x) }", false),
         ] {
             let result = value(body, "outer(src.emitted)");
-            assert!(
-                !matches!(
+            assert_eq!(
+                matches!(
                     result,
                     Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
                 ),
+                retained,
                 "{result:?}"
             );
         }
