@@ -1390,6 +1390,8 @@ pub struct PatternAttributeType<R: PatternForm = Draft> {
 /// assert_eq!(value.api_value(), "x");
 /// ```
 pub type AttributeType = PatternAttributeType<Draft>;
+// Keeps the compile_fail doctest above honest: stable rustdoc does not check its error code, so renaming this field must break here and force the doctest to be updated.
+const _: usize = std::mem::offset_of!(PatternAttributeType<Draft>, kind);
 
 /// Provider-facing draft struct field.
 ///
@@ -1401,6 +1403,8 @@ pub type AttributeType = PatternAttributeType<Draft>;
 /// }
 /// ```
 pub type StructField = PatternStructField<Draft>;
+// Keeps the compile_fail doctest above honest: stable rustdoc does not check its error code, so renaming this field must break here and force the doctest to be updated.
+const _: usize = std::mem::offset_of!(PatternStructField<Draft>, name);
 
 /// Provider-facing draft attribute schema.
 ///
@@ -1412,6 +1416,8 @@ pub type StructField = PatternStructField<Draft>;
 /// }
 /// ```
 pub type AttributeSchema = PatternAttributeSchema<Draft>;
+// Keeps the compile_fail doctest above honest: stable rustdoc does not check its error code, so renaming this field must break here and force the doctest to be updated.
+const _: usize = std::mem::offset_of!(PatternAttributeSchema<Draft>, name);
 
 /// Provider-facing draft resource schema.
 ///
@@ -1423,6 +1429,8 @@ pub type AttributeSchema = PatternAttributeSchema<Draft>;
 /// }
 /// ```
 pub type ResourceSchema = PatternResourceSchema<Draft>;
+// Keeps the compile_fail doctest above honest: stable rustdoc does not check its error code, so renaming this field must break here and force the doctest to be updated.
+const _: usize = std::mem::offset_of!(PatternResourceSchema<Draft>, resource_type);
 
 /// An attribute type whose string patterns are compiled regexes.
 pub type CompiledAttributeType = PatternAttributeType<Compiled>;

@@ -32,6 +32,35 @@ RS
 cat >"$fixtures/src/generic.rs" <<'RS'
 let view = StructFieldParts<'_, Wrapper<R>> { name: "field", ..base };
 RS
+cat >"$fixtures/src/use_alias.rs" <<'RS'
+use schema::StructFieldParts as CoreStructFieldParts;
+let CoreStructFieldParts { name, .. } = value;
+RS
+cat >"$fixtures/src/grouped_use_alias.rs" <<'RS'
+use schema::{
+    StructFieldParts as FieldView, Other,
+};
+let FieldView { name, .. } = value;
+RS
+cat >"$fixtures/src/type_alias.rs" <<'RS'
+type FieldView<'a, R = Draft> = schema::StructFieldParts<'a, Wrapper<R>>;
+let FieldView { name, .. } = value;
+RS
+cat >"$fixtures/src/self_impl.rs" <<'RS'
+impl<'a, R> StructFieldParts<'a, R> {
+    fn read(value: Self) {
+        let Self { name, .. } = value;
+    }
+}
+RS
+cat >"$fixtures/src/self_alias_impl.rs" <<'RS'
+use schema::StructFieldParts as FieldView;
+impl<'a, R> SomeTrait for FieldView<'a, R> {
+    fn update(self) -> Self {
+        Self { name: "field", ..self }
+    }
+}
+RS
 cat >"$fixtures/src/attribute.rs" <<'RS'
 let AttributeSchemaParts { name, .. } = value;
 RS
@@ -57,6 +86,31 @@ cat >"$fixtures/src/after_helper.rs" <<'RS'
 fn helper() {}
 let StructFieldParts { a, b, .. } = value;
 RS
+cat >"$fixtures/src/test_only_function.rs" <<'RS'
+#[cfg(test)] fn t() { let StructFieldParts { name, .. } = v; }
+RS
+cat >"$fixtures/src/headers_and_ranges.rs" <<'RS'
+fn parts() -> StructFieldParts<'_> {
+    ..3;
+    let _ = 0..3;
+    todo!()
+}
+fn qualified_parts() -> schema::ResourceSchemaParts<'_> {
+    ..3;
+    let _ = 0..3;
+    todo!()
+}
+impl<'a, R> StructFieldParts<'a, R> {
+    fn range() { let _ = 0..3; }
+}
+impl<'a, R> SomeTrait for AttributeSchemaParts<'a, R> {
+    fn range() { let _ = 0..3; }
+}
+let view = InputRuleParts { target: &s[..], scope: 0..1 };
+RS
+cat >"$fixtures/src/missing.rs" <<'RS'
+let StructFieldParts { name, .. } = value;
+RS
 cat >"$fixtures/src/exhaustive.rs" <<'RS'
 let StructFieldParts { name, field_type } = value;
 let StructFieldParts {
@@ -77,6 +131,7 @@ let StructFieldParts {
 } = value;
 let SimilarStructFieldParts { name, .. } = value;
 let StructFieldPartsSuffix { name, .. } = value;
+let FieldView { name, .. } = value; // Aliases from other files do not apply here.
 pub struct StructFieldParts<'a> { pub name: &'a str }
 pub struct AttributeSchemaParts<'a, R> { pub field_type: &'a R }
 pub struct ResourceSchemaParts<'a> { pub resource_type: &'a str }
@@ -101,11 +156,18 @@ let StructFieldParts { a, b, .. } = value;
 RS
 done
 git -C "$fixtures" add -- '*.rs'
+# A tracked file missing from the working tree must be skipped without a traceback.
+rm "$fixtures/src/missing.rs"
 # An untracked production file must not influence the tracked-source scan.
 cp "$fixtures/src/single.rs" "$fixtures/src/untracked.rs"
 
 if bash "$checker" "$fixtures" >"$fixtures/output" 2>&1; then
   echo "checker unexpectedly accepted non-exhaustive Parts fixtures" >&2
+  cat "$fixtures/output" >&2
+  exit 1
+fi
+if grep -Fq 'Traceback' "$fixtures/output"; then
+  echo "checker raised a traceback for a missing tracked file" >&2
   cat "$fixtures/output" >&2
   exit 1
 fi
@@ -118,11 +180,17 @@ for location in \
   src/qualified.rs:1 \
   src/turbofish.rs:1 \
   src/generic.rs:1 \
+  src/use_alias.rs:2 \
+  src/grouped_use_alias.rs:4 \
+  src/type_alias.rs:2 \
+  src/self_impl.rs:3 \
+  src/self_alias_impl.rs:4 \
   src/attribute.rs:1 \
   src/resource.rs:1 \
   src/input_rule.rs:1 \
   src/after_module.rs:9 \
-  src/after_helper.rs:3
+  src/after_helper.rs:3 \
+  src/test_only_function.rs:1
 do
   if ! grep -Fxq "$location: $message" "$fixtures/output"; then
     echo "checker did not flag $location with the required diagnostic" >&2
@@ -130,7 +198,7 @@ do
     exit 1
   fi
 done
-if [ "$(wc -l <"$fixtures/output" | tr -d ' ')" -ne 11 ]; then
+if [ "$(wc -l <"$fixtures/output" | tr -d ' ')" -ne 17 ]; then
   echo "checker reported unexpected fixtures or duplicate diagnostics" >&2
   cat "$fixtures/output" >&2
   exit 1
@@ -138,7 +206,9 @@ fi
 
 # A separate passing run checks the exit status as well as the absence of false
 # positives; no fixture depends on Rust sources in the real repository.
-for file in multiline single update qualified turbofish generic attribute resource input_rule after_module after_helper; do
+for file in multiline single update qualified turbofish generic \
+  use_alias grouped_use_alias type_alias self_impl self_alias_impl \
+  attribute resource input_rule after_module after_helper test_only_function; do
   git -C "$fixtures" rm --quiet --force -- "src/$file.rs"
 done
 if ! bash "$checker" "$fixtures" >"$fixtures/output" 2>&1; then
