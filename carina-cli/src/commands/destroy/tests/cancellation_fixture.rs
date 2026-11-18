@@ -148,10 +148,10 @@ impl DestroyCancellationFixture {
         let ready_path = self.base.readiness_path("mock-read-ready");
         let outcome_path = self.base.readiness_path("mock-read-outcome");
         let provider_state_path = self.base.readiness_path("mock-provider-state.json");
-        let provider_state = std::collections::HashMap::from([(
-            format!("test.resource.{name}"),
-            serde_json::json!({ "name": name }),
-        )]);
+        let provider_state = serde_json::json!({
+            "version": 3,
+            "states": {"mock-id": serde_json::json!({ "name": name })},
+        });
         std::fs::write(
             &provider_state_path,
             carina_core::utils::pretty_with_newline(&provider_state)

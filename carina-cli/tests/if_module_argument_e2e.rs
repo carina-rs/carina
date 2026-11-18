@@ -180,8 +180,9 @@ let stack = outer {
         std::fs::write(
             caller.join("mock-provider-state.json"),
             r#"{
-  "version": 2,
-  "states": {
+  "version": 3,
+  "states": {},
+  "data_sources": {
     "iam.Roles.stack.roles": {
       "name_regex": "base",
       "names": ["from-data"]

@@ -200,10 +200,11 @@ fn removed_module(root_vpc: bool) {
         "attributes": {"name": "old-subnet"},
         "dependency_bindings": ["vpc"],
     }]);
-    let mut provider = json!({
-        "test.resource.net.vpc": {"name": "module-vpc"},
-        "test.resource.net.subnet": {"name": "subnet", "parent": "module-vpc"},
-    });
+    let mut provider = json!({"version": 3, "states": {
+        "net.vpc-provider-id": {"name": "module-vpc"},
+        "net.subnet-provider-id": {"name": "subnet", "parent": "module-vpc"},
+        "old-subnet-id": {"name": "old-subnet"},
+    }});
     if root_vpc {
         rows.push(row(
             "test.resource",
@@ -211,7 +212,7 @@ fn removed_module(root_vpc: bool) {
             json!({"name": "root-vpc"}),
             &[],
         ));
-        provider["test.resource.vpc"] = json!({"name": "root-vpc"});
+        provider["states"]["vpc-provider-id"] = json!({"name": "root-vpc"});
     }
     project.seed(rows, provider);
     let output = project.run(&["state", "refresh", "."]);
@@ -275,12 +276,13 @@ fn deferred_module(dependency: &str) -> Project {
                 &[dependency],
             ),
         ],
-        json!({
-            "test.resource.vpc": {"name": "root-vpc"},
-            "test.resource.net.vpc": {"name": "module-vpc"},
-            "test.resource.net.children[0]": {"name": "child", "parent": "module-vpc"},
+        json!({"version": 3, "states": {
+            "vpc-provider-id": {"name": "root-vpc"},
+            "net.vpc-provider-id": {"name": "module-vpc"},
+            "net.children[0]-provider-id": {"name": "child", "parent": "module-vpc"},
+        }, "data_sources": {
             "iam.Roles.net.roles": {"names": ["child"]},
-        }),
+        }}),
     );
     project
 }
@@ -378,7 +380,7 @@ fn residual_upstream_loop() -> Project {
             json!({"name": "child"}),
             &["missing_dependency"],
         )],
-        json!({"test.resource.children[0]": {"name": "child"}}),
+        json!({"version": 3, "states": {"children[0]-provider-id": {"name": "child"}}}),
     );
     project
 }

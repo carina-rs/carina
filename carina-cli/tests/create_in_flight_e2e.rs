@@ -1,4 +1,7 @@
 use std::fs;
+#[path = "support/mock_state.rs"]
+mod mock_state;
+
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -330,7 +333,10 @@ fn exercise_in_flight_cutover(resource: &str) {
     let final_state = scenario.state_json();
     let final_current = only_current(&final_state);
     assert_eq!(final_current["kind"], "applied");
-    assert_eq!(final_current["identifier"], "mock-id");
+    let identifier = final_current["identifier"]
+        .as_str()
+        .expect("resumed identifier");
+    assert!(scenario.mock_state_json()["states"][identifier].is_object());
 }
 
 #[test]
@@ -1050,6 +1056,17 @@ fn issued_not_created_resume_stays_in_flight() {
     let (output, plan, _raw) = scenario.save_plan(false, "issued-not_created-next.json");
     assert_success("plan after issued not_created resume", &output);
     assert_resume_only(&plan);
+
+    assert_success(
+        "complete issued resume",
+        &scenario.apply_with_modes("success", "resumed"),
+    );
+    let state = scenario.state_json();
+    assert_eq!(only_current(&state)["identifier"], "mock-id");
+    assert!(scenario.mock_state_json()["states"]["mock-id"].is_object());
+    let (output, plan, _) = scenario.save_plan(true, "issued-resume-converged.json");
+    assert_success("plan after completed issued resume", &output);
+    assert!(plan.plan.effects().is_empty());
 }
 
 #[test]
@@ -1071,7 +1088,8 @@ fn identifier_reported_read_failed_resume_marks_unknowns_without_replacing_or_re
     let state = scenario.state_json();
     let current = only_current(&state);
     assert_eq!(current["kind"], "applied");
-    assert_eq!(current["identifier"], "mock-id");
+    let identifier = current["identifier"].as_str().expect("resumed identifier");
+    assert!(scenario.mock_state_json()["states"][identifier].is_object());
     assert!(
         current["partial_read"]["missing_attributes"]
             .as_array()
@@ -1121,7 +1139,7 @@ fn identifier_reported_read_failed_resume_marks_unknowns_without_replacing_or_re
     // pending re-read unknown in the refreshed desired resource.
     let provider_returned_name = "provider-returned-exact-name";
     let mut provider_state = scenario.mock_state_json();
-    provider_state["states"]["test.resource.pending"]["name"] =
+    provider_state["states"][&mock_state::identifier(&scenario.project, "pending")]["name"] =
         Value::String(provider_returned_name.to_string());
     scenario.write_mock_state_json(&provider_state);
 
@@ -1237,7 +1255,7 @@ fn refresh_omitting_prefixed_name_keeps_stored_desired_name() {
     let stored_name = applied_prefixed_name(&scenario);
 
     let mut provider_state = scenario.mock_state_json();
-    provider_state["states"]["test.resource.prefixed"]
+    provider_state["states"][&mock_state::identifier(&scenario.project, "prefixed")]
         .as_object_mut()
         .expect("mock resource attributes are an object")
         .remove("name");

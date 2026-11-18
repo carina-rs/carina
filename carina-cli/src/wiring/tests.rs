@@ -16035,9 +16035,8 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 );
                 let (create, cancellation) =
                     carina_core::executor::dispatch_create(&provider, prepared);
-                create.await.unwrap();
+                let identifier = create.await.unwrap().identifier().clone();
                 drop(cancellation);
-                let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();
                 let read_id = if explicit {
                     id.clone()
                 } else {

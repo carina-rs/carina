@@ -417,6 +417,7 @@ where
                     .map(str::to_owned)
                     .unwrap_or_else(|| resource.id().to_string()),
                 Some(Value::Concrete(_) | Value::Deferred(_)) | None => resource.id().to_string(),
+                Some(Value::Reference(never) | Value::Conversion(never)) => match *never {},
             };
             resources.push((label, local));
         }

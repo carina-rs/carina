@@ -1094,6 +1094,9 @@ fn field_path_is_present(value: &SnapshotValue, path: &[String]) -> bool {
             | ConcreteValue::StringList(_),
         )
         | Value::Deferred(_) => false,
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 

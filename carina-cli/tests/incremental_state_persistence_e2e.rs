@@ -37,10 +37,14 @@ fn apply_persists_a_completed_create_before_sigkill() {
     let completed = state
         .find_resource("mock", "test.resource", FIRST)
         .expect("the completed create must be durable before the run ends");
-    assert_eq!(
-        completed.identifier().map(|id| id.as_str()),
-        Some("mock-id")
-    );
+    let identifier = completed
+        .identifier()
+        .expect("completed create has an identifier");
+    let provider: serde_json::Value = serde_json::from_slice(
+        &fs::read(&fixture.provider_state).expect("read provider store after kill"),
+    )
+    .unwrap();
+    assert!(provider["states"][identifier.as_str()].is_object());
     assert!(
         state
             .find_resource("mock", "test.resource", BLOCKED)

@@ -142,6 +142,7 @@ fn value_depends_on_module_output<'a>(
                 | ConcreteValue::StringList(_),
             )
             | Value::Deferred(DeferredValue::Unknown(_) | DeferredValue::Placeholder(_)) => {}
+            Value::Reference(never) | Value::Conversion(never) => match *never {},
         }
     }
     false
@@ -250,6 +251,7 @@ impl<'a> ContextFreeValue<'a> {
                 Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
                     is_context_free(expression.lhs()) && is_context_free(expression.rhs())
                 }
+                Value::Reference(never) | Value::Conversion(never) => match *never {},
             }
         }
 

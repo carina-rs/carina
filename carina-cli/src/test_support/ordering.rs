@@ -117,10 +117,7 @@ async fn orphan_command_output(mode: &str, test_name: &str) {
             row.dependency_bindings = dependencies;
         }
         state.upsert_resource(row).unwrap();
-        store.insert(
-            format!("test.resource.{name}"),
-            serde_json::json!({"name": name}),
-        );
+        store.insert(name.to_owned(), serde_json::json!({"name": name}));
     }
     fs::write(
         dir.path().join("carina.state.json"),
@@ -133,7 +130,7 @@ async fn orphan_command_output(mode: &str, test_name: &str) {
     let store_path = dir.path().join("mock.json");
     fs::write(
         &store_path,
-        serde_json::to_vec(&serde_json::json!({"version": 2, "states": store})).unwrap(),
+        serde_json::to_vec(&serde_json::json!({"version": 3, "states": store})).unwrap(),
     )
     .unwrap();
     let runtime = TestCommandRuntime::with_mock(

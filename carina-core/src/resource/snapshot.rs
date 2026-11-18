@@ -20,7 +20,23 @@ impl<P: PlaceholderKind> fmt::Display for SnapshotLeaf<P> {
     }
 }
 
+impl<P: PlaceholderKind> ValueShapeSealed for SnapshotLeaf<P> {}
+impl<P: PlaceholderKind> ValueShape for SnapshotLeaf<P> {
+    type ReferencePayload<B: BindingAddress> = NoReferencePayload;
+    type ConversionPayload<B: BindingAddress> = NoReferencePayload;
+}
 impl<P: PlaceholderKind> ValueKind for SnapshotLeaf<P> {
+    fn no_reference_payload<B: BindingAddress>(
+        payload: &Self::ReferencePayload<B>,
+    ) -> &NoReferencePayload {
+        payload
+    }
+    fn no_conversion_payload<B: BindingAddress>(
+        payload: &Self::ConversionPayload<B>,
+    ) -> &NoReferencePayload {
+        payload
+    }
+
     fn construct_access<B: BindingAddress>(
         base: Value<Self, B>,
         step: PathSegment,

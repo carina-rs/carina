@@ -2951,10 +2951,11 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     std::fs::write(
         &mock_state_path,
         serde_json::json!({
-            "s3.Bucket.alive-deposed-bucket": {
+            "version": 3,
+            "states": {"old-bucket": {
                 "bucket": "old-bucket",
                 "status": "alive"
-            }
+            }}
         })
         .to_string(),
     )

@@ -21,13 +21,13 @@ use carina_core::provider::{
 };
 use carina_core::resource::{
     BindingAddress, ConcreteValue, PlaceholderKind, Resource, ResourceId, SnapshotValue, State,
-    StateValueLeaf, Value, legacy_secret_migration,
+    StateValueLeaf, Value,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, ValidatedConfigSchema,
     ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
-use carina_core::value::{PersistedValue, migrate_legacy_persisted_json};
+use carina_core::value::PersistedValue;
 use serde::{Deserialize, Serialize};
 
 mod behavior;
@@ -47,27 +47,43 @@ const SERVER_ADDED_LIST_DEFAULTS: &[(&str, &str)] = &[
     ("load_balancing.algorithm.type", "round_robin"),
 ];
 
-const MOCK_STATE_VERSION: u32 = 2;
+const MOCK_STATE_VERSION: u32 = 3;
 
-type MockStates = HashMap<String, HashMap<String, PersistedValue>>;
-type RawMockStates = HashMap<String, HashMap<String, serde_json::Value>>;
+type MockAttributes = HashMap<String, PersistedValue>;
+type RawMockAttributes = HashMap<String, serde_json::Value>;
+
+#[derive(Clone, Default)]
+struct MockStates {
+    states: HashMap<AppliedIdentifier, MockAttributes>,
+    // Address-selected data-source responses are test controls, not objects.
+    data_sources: HashMap<String, MockAttributes>,
+}
+
+enum MockReadTarget<'a> {
+    Managed(&'a AppliedIdentifier),
+    DataSource,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EncodedMockStateFile {
     version: u32,
-    states: RawMockStates,
+    states: HashMap<AppliedIdentifier, RawMockAttributes>,
+    #[serde(default)]
+    data_sources: HashMap<String, RawMockAttributes>,
 }
 
 #[derive(Serialize)]
 struct MockStateFileRef<'a> {
     version: u32,
-    states: &'a MockStates,
+    states: &'a HashMap<AppliedIdentifier, MockAttributes>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    data_sources: &'a HashMap<String, MockAttributes>,
 }
 
 #[derive(Debug)]
 struct MockStateValueDecodeError {
-    resource_key: String,
+    store_key: String,
     attribute_key: String,
     source: serde_json::Error,
 }
@@ -76,8 +92,8 @@ impl std::fmt::Display for MockStateValueDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "mock state resource {:?} attribute {:?} is not valid persisted JSON",
-            self.resource_key, self.attribute_key
+            "mock state store key {:?} attribute {:?} is not valid persisted JSON",
+            self.store_key, self.attribute_key
         )
     }
 }
@@ -926,65 +942,58 @@ impl MockProvider {
     }
 
     fn decode_state_file(content: &str) -> io::Result<MockStates> {
-        let mut encoded: serde_json::Value = serde_json::from_str(content)
+        let file: EncodedMockStateFile = serde_json::from_str(content)
             .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-        let is_versioned = encoded
-            .as_object()
-            .is_some_and(|object| object.contains_key("version") || object.contains_key("states"));
-        if !is_versioned {
-            let mut states: RawMockStates = serde_json::from_value(encoded)
-                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-            for attributes in states.values_mut() {
-                for value in attributes.values_mut() {
-                    migrate_legacy_persisted_json(value);
-                }
-            }
-            encoded = serde_json::json!({
-                "version": 1,
-                "states": states,
-            });
+        if file.version != MOCK_STATE_VERSION {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "unsupported mock state version {}; expected {MOCK_STATE_VERSION}",
+                    file.version
+                ),
+            ));
         }
-
-        let file: EncodedMockStateFile = serde_json::from_value(encoded.clone())
-            .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-        let mut states = match file.version {
-            MOCK_STATE_VERSION => file.states,
-            1 => {
-                legacy_secret_migration::migrate_mock_state_document_v1(&mut encoded)
-                    .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?;
-                serde_json::from_value::<EncodedMockStateFile>(encoded)
-                    .map_err(|error| io::Error::new(ErrorKind::InvalidData, error))?
-                    .states
-            }
-            version => {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!(
-                        "unsupported mock state version {version}; expected {MOCK_STATE_VERSION}"
-                    ),
-                ));
-            }
-        };
-
-        let mut decoded = HashMap::with_capacity(states.len());
-        for (resource_key, attributes) in &mut states {
-            let mut decoded_attributes = HashMap::with_capacity(attributes.len());
-            for (attribute_key, value) in attributes {
-                let value = serde_json::from_value(value.take()).map_err(|source| {
-                    io::Error::new(
-                        ErrorKind::InvalidData,
-                        MockStateValueDecodeError {
-                            resource_key: resource_key.clone(),
-                            attribute_key: attribute_key.clone(),
-                            source,
-                        },
-                    )
-                })?;
-                decoded_attributes.insert(attribute_key.clone(), value);
-            }
-            decoded.insert(resource_key.clone(), decoded_attributes);
+        fn decode_attributes(
+            store_key: &str,
+            attributes: RawMockAttributes,
+        ) -> io::Result<MockAttributes> {
+            attributes
+                .into_iter()
+                .map(|(attribute_key, value)| {
+                    let value = serde_json::from_value(value).map_err(|source| {
+                        io::Error::new(
+                            ErrorKind::InvalidData,
+                            MockStateValueDecodeError {
+                                store_key: store_key.to_owned(),
+                                attribute_key: attribute_key.clone(),
+                                source,
+                            },
+                        )
+                    })?;
+                    Ok((attribute_key, value))
+                })
+                .collect()
         }
-        Ok(decoded)
+        let states = file
+            .states
+            .into_iter()
+            .map(|(identifier, attributes)| {
+                let attributes = decode_attributes(identifier.as_str(), attributes)?;
+                Ok((identifier, attributes))
+            })
+            .collect::<io::Result<_>>()?;
+        let data_sources = file
+            .data_sources
+            .into_iter()
+            .map(|(address, attributes)| {
+                let attributes = decode_attributes(&address, attributes)?;
+                Ok((address, attributes))
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(MockStates {
+            states,
+            data_sources,
+        })
     }
 
     fn lock_state_file(&self) -> ProviderResult<scope::ScopeLock<'_>> {
@@ -993,13 +1002,13 @@ impl MockProvider {
             .map_err(|error| ProviderError::internal_caused_by("Failed to lock mock state", error))
     }
 
-    fn resource_key(id: &ResourceId) -> Option<String> {
+    fn resource_address(id: &ResourceId) -> Option<String> {
         id.identity_str()
             .map(|identity| format!("{}.{}", id.resource_type, identity))
     }
 
-    fn resolved_resource_key(id: &ResourceId) -> ProviderResult<String> {
-        Self::resource_key(id).ok_or_else(|| {
+    fn resolved_resource_address(id: &ResourceId) -> ProviderResult<String> {
+        Self::resource_address(id).ok_or_else(|| {
             ProviderError::invalid_input(format!(
                 "mock provider operation requires a resolved resource identity for {id}"
             ))
@@ -1038,7 +1047,7 @@ impl MockProvider {
 
     fn append_op_log_if_configured(&self, op: &str, id: &ResourceId) -> ProviderResult<()> {
         if let Some(path) = self.behavior.observations.operation_log.clone() {
-            let key = Self::resolved_resource_key(id)?;
+            let key = Self::resolved_resource_address(id)?;
             Self::append_op_log(path, op, &key).map_err(|e| {
                 ProviderError::internal_caused_by("Failed to append operation log", e)
             })?;
@@ -1099,7 +1108,7 @@ impl MockProvider {
 
     fn create_fail_error_for(&self, id: &ResourceId) -> Option<ProviderError> {
         let target = self.behavior.create_fail_for.as_ref()?;
-        let key = Self::resource_key(id)?;
+        let key = Self::resource_address(id)?;
         (target == &key).then(|| {
             ProviderError::internal(format!(
                 "CARINA_MOCK_CREATE_FAIL_FOR requested create failure for {key}"
@@ -1109,7 +1118,7 @@ impl MockProvider {
 
     fn update_fail_error_for(&self, id: &ResourceId) -> Option<ProviderError> {
         let target = self.behavior.update_fail_for.as_ref()?;
-        let key = Self::resource_key(id)?;
+        let key = Self::resource_address(id)?;
         (target.matches(id)).then(|| {
             ProviderError::internal(format!(
                 "CARINA_MOCK_UPDATE_FAIL_FOR requested update failure for {key}"
@@ -1119,7 +1128,7 @@ impl MockProvider {
 
     fn delete_fail_error_for(&self, id: &ResourceId, identifier: &str) -> Option<ProviderError> {
         let target = self.behavior.delete_fail_for.as_ref()?;
-        let key = Self::resource_key(id)?;
+        let key = Self::resource_address(id)?;
         if !target.matches(id) {
             return None;
         }
@@ -1138,7 +1147,7 @@ impl MockProvider {
 
     fn delete_timeout_error_for(&self, id: &ResourceId) -> Option<ProviderError> {
         let target = self.behavior.delete_timeout_for.as_ref()?;
-        let key = Self::resource_key(id)?;
+        let key = Self::resource_address(id)?;
         (target.matches(id)).then(|| {
             ProviderError::timeout(format!(
                 "Operation timed out: CARINA_MOCK_DELETE_TIMEOUT_FOR matched {key}"
@@ -1413,10 +1422,7 @@ impl MockProvider {
             Ok(states) => states,
             Err(error) => return Err(attempt.not_created(error)),
         };
-        let key = match Self::resolved_resource_key(&id) {
-            Ok(key) => key,
-            Err(error) => return Err(attempt.not_created(error)),
-        };
+        let identifier = Self::mint_identifier();
 
         let mut persisted_values = resource.resolved_attributes();
         if let Err(error) = self.canonicalize_mock_reference_write(&id, &mut persisted_values) {
@@ -1441,7 +1447,7 @@ impl MockProvider {
             }
         }
 
-        states.insert(key, attrs);
+        states.states.insert(identifier.clone(), attrs);
         if let Err(error) = state_guard
             .save(&states)
             .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))
@@ -1459,8 +1465,6 @@ impl MockProvider {
                 state_attrs.remove(attr);
             }
         }
-        let identifier =
-            AppliedIdentifier::new("mock-id").expect("mock provider identifier is non-empty");
         let observed_state =
             AppliedState::from_identifier(id.clone(), identifier.clone(), state_attrs.clone());
         let issued = attempt.issued(identifier, sent);
@@ -1499,9 +1503,15 @@ impl MockProvider {
         Ok(issued.succeeded(state_attrs))
     }
 
+    fn mint_identifier() -> AppliedIdentifier {
+        AppliedIdentifier::new(uuid::Uuid::new_v4().to_string())
+            .expect("a UUID is a non-empty provider identifier")
+    }
+
     fn persist_resumed_resource<S, D>(
         &self,
         id: &ResourceId,
+        identifier: &AppliedIdentifier,
         resource: &Resource<
             S,
             carina_core::resource::NoPlaceholder,
@@ -1511,7 +1521,12 @@ impl MockProvider {
     ) -> ProviderResult<HashMap<String, Value>> {
         let state_guard = self.lock_state_file()?;
         let mut states = state_guard.load_states_for_operation()?;
-        let key = Self::resolved_resource_key(id)?;
+        if states.states.contains_key(identifier) {
+            return Err(ProviderError::internal(format!(
+                "builtin mock resumed-create identifier {:?} is already held by an object",
+                identifier.as_str()
+            )));
+        }
         let mut persisted_values = resource.resolved_attributes();
         Self::add_server_list_defaults(id, &mut persisted_values);
         let mut persisted = persisted_values
@@ -1527,7 +1542,7 @@ impl MockProvider {
                 )
             })?;
         Self::populate_generated_attribute_json(id, &mut persisted);
-        states.insert(key, persisted);
+        states.states.insert(identifier.clone(), persisted);
         state_guard.save(&states).map_err(|error| {
             ProviderError::internal_caused_by(
                 "Failed to save builtin mock resumed-create state",
@@ -1595,6 +1610,7 @@ impl MockProvider {
     async fn read_attributes(
         &self,
         id: &ResourceId,
+        target: MockReadTarget<'_>,
     ) -> ProviderResult<Option<BTreeMap<String, SnapshotValue>>> {
         self.append_op_log_if_configured("read", id)?;
         let mut read_outcome = None;
@@ -1613,18 +1629,22 @@ impl MockProvider {
 
         let state_guard = self.lock_state_file()?;
         let states = state_guard.load_states_for_operation()?;
-        let attributes = Self::resource_key(id).and_then(|key| {
-            states.get(&key).map(|attrs| {
-                let mut attributes: BTreeMap<_, _> = attrs
-                    .iter()
-                    .filter(|(key, _value)| key.as_str() != WRITE_ONLY_PASSWORD_ATTRIBUTE)
-                    .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
-                    .collect();
-                Self::strip_unobservable_nested_write_only(
-                    attributes.get_mut(NESTED_WRITE_ONLY_ATTRIBUTE),
-                );
-                attributes
-            })
+        let stored = match target {
+            MockReadTarget::Managed(identifier) => states.states.get(identifier),
+            MockReadTarget::DataSource => {
+                Self::resource_address(id).and_then(|address| states.data_sources.get(&address))
+            }
+        };
+        let attributes = stored.map(|attrs| {
+            let mut attributes: BTreeMap<_, _> = attrs
+                .iter()
+                .filter(|(key, _value)| key.as_str() != WRITE_ONLY_PASSWORD_ATTRIBUTE)
+                .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
+                .collect();
+            Self::strip_unobservable_nested_write_only(
+                attributes.get_mut(NESTED_WRITE_ONLY_ATTRIBUTE),
+            );
+            attributes
         });
         if let Some(read_outcome) = &mut read_outcome {
             read_outcome.complete();
@@ -1636,7 +1656,7 @@ impl MockProvider {
 impl MockNormalizer {
     fn append_normalizer_log_if_configured(&self, op: &str, id: &ResourceId) -> ProviderResult<()> {
         if let Some(path) = self.observations.operation_log.clone() {
-            let key = MockProvider::resource_key(id).unwrap_or_else(|| id.to_string());
+            let key = MockProvider::resource_address(id).unwrap_or_else(|| id.to_string());
             MockProvider::append_op_log(path, op, &key).map_err(|error| {
                 ProviderError::internal_caused_by("Failed to append operation log", error)
             })?;
@@ -1758,7 +1778,10 @@ impl Provider for MockProvider {
         let id = id.clone();
         let identifier = identifier.clone();
         Box::pin(async move {
-            let outcome = if let Some(attributes) = self.read_attributes(&id).await? {
+            let outcome = if let Some(attributes) = self
+                .read_attributes(&id, MockReadTarget::Managed(&identifier))
+                .await?
+            {
                 ReadOutcome::found(AppliedState::from_snapshot_parts(
                     id, identifier, attributes,
                 ))
@@ -1775,26 +1798,31 @@ impl Provider for MockProvider {
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = resource.id.clone();
         Box::pin(async move {
-            Ok(match self.read_attributes(&id).await? {
-                Some(attributes) => {
-                    let attributes = attributes
-                        .into_iter()
-                        .map(|(name, value)| {
-                            value
-                                .to_value_at(format!("{id}.{name}"))
-                                .map(|value| (name, value))
-                        })
-                        .collect::<Result<BTreeMap<_, _>, _>>()
-                        .map_err(|source| {
-                            ProviderError::internal_caused_by(
-                                "mock data-source output contains an unavailable secret",
-                                source,
-                            )
-                        })?;
-                    State::existing(id, attributes)
-                }
-                None => State::not_found(id),
-            })
+            Ok(
+                match self
+                    .read_attributes(&id, MockReadTarget::DataSource)
+                    .await?
+                {
+                    Some(attributes) => {
+                        let attributes = attributes
+                            .into_iter()
+                            .map(|(name, value)| {
+                                value
+                                    .to_value_at(format!("{id}.{name}"))
+                                    .map(|value| (name, value))
+                            })
+                            .collect::<Result<BTreeMap<_, _>, _>>()
+                            .map_err(|source| {
+                                ProviderError::internal_caused_by(
+                                    "mock data-source output contains an unavailable secret",
+                                    source,
+                                )
+                            })?;
+                        State::existing(id, attributes)
+                    }
+                    None => State::not_found(id),
+                },
+            )
         })
     }
 
@@ -1866,8 +1894,6 @@ impl Provider for MockProvider {
 
             let (resume, create_request) = request.into_parts();
             let resource = create_request.resource().as_resource().clone();
-            let fallback_identifier =
-                AppliedIdentifier::new("mock-id").expect("mock provider identifier is non-empty");
 
             if *mode == ResumeMode::Resend {
                 let attempt = match resume {
@@ -1878,21 +1904,22 @@ impl Provider for MockProvider {
                         )));
                     }
                 };
-                let attributes = match self.persist_resumed_resource(&id, &resource) {
+                let identifier = Self::mint_identifier();
+                let attributes = match self.persist_resumed_resource(&id, &identifier, &resource) {
                     Ok(attributes) => attributes,
                     Err(error) => return Err(attempt.preserve(error)),
                 };
                 return Ok(attempt
-                    .issued(fallback_identifier, Sent::AllRequestAttributes)
+                    .issued(identifier, Sent::AllRequestAttributes)
                     .succeeded(attributes));
             }
 
             let resumed = match resume {
-                CoreResume::Unissued(attempt) => attempt.issued(fallback_identifier),
+                CoreResume::Unissued(attempt) => attempt.issued(Self::mint_identifier()),
                 CoreResume::Issued(resumed) => resumed,
             };
             let identifier = resumed.identifier().clone();
-            let attributes = match self.persist_resumed_resource(&id, &resource) {
+            let attributes = match self.persist_resumed_resource(&id, &identifier, &resource) {
                 Ok(attributes) => attributes,
                 Err(error) => return Err(resumed.preserve(error)),
             };
@@ -1919,9 +1946,9 @@ impl Provider for MockProvider {
         _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
-        let identifier = identifier.as_str().to_string();
+        let identifier = identifier.clone();
         Box::pin(async move {
-            let key = Self::resolved_resource_key(&id)?;
+            let key = Self::resolved_resource_address(&id)?;
             let _active = self
                 .telemetry
                 .enter_update(key.clone(), &self.behavior.observations);
@@ -1941,26 +1968,27 @@ impl Provider for MockProvider {
                 return Err(error);
             }
             self.append_update_request_if_configured(&request)?;
+            let state_guard = self.lock_state_file()?;
+            let mut states = state_guard.load_states_for_operation()?;
+            let stored = states.states.get(&identifier).ok_or_else(|| {
+                ProviderError::not_found(format!(
+                    "builtin mock object with identifier {:?} was not found",
+                    identifier.as_str()
+                ))
+            })?;
             append_update_patch_log(
                 &self.behavior.observations.update_patch_log,
                 &id,
                 &request.patch().ops,
             )?;
 
-            let state_guard = self.lock_state_file()?;
-            let mut states = state_guard.load_states_for_operation()?;
             // Apply only the requested operations to the provider's current
             // value. In particular, a read may omit write-only leaves that
             // still exist in the backend and must survive an unrelated patch.
-            let mut attributes = states.get(&key).map_or_else(
-                || request.from().attributes.clone(),
-                |attributes| {
-                    attributes
-                        .iter()
-                        .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
-                        .collect()
-                },
-            );
+            let mut attributes = stored
+                .iter()
+                .filter_map(|(key, value)| value.decode().map(|value| (key.clone(), value)))
+                .collect();
             for op in &request.patch().ops {
                 match op {
                     PatchOp::Add { key, value }
@@ -1996,7 +2024,27 @@ impl Provider for MockProvider {
                 }
             }
 
-            states.insert(key, attrs);
+            let applied_identifier = self
+                .behavior
+                .update_result_identifier
+                .as_ref()
+                .map(|identifier| AppliedIdentifier::new(identifier.clone()))
+                .transpose()
+                .map_err(|source| {
+                    ProviderError::internal_caused_by(
+                        "mock update result identifier must not be empty",
+                        source,
+                    )
+                })?
+                .unwrap_or_else(|| identifier.clone());
+            if applied_identifier != identifier && states.states.contains_key(&applied_identifier) {
+                return Err(ProviderError::internal(format!(
+                    "builtin mock update result identifier {:?} is already held by another object",
+                    applied_identifier.as_str()
+                )));
+            }
+            states.states.remove(&identifier);
+            states.states.insert(applied_identifier.clone(), attrs);
             state_guard
                 .save(&states)
                 .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
@@ -2011,18 +2059,6 @@ impl Provider for MockProvider {
                 }
             }
             self.append_op_log_if_configured("update", &id)?;
-            let applied_identifier = self
-                .behavior
-                .update_result_identifier
-                .clone()
-                .unwrap_or(identifier);
-            let applied_identifier =
-                AppliedIdentifier::new(applied_identifier).map_err(|source| {
-                    ProviderError::internal_caused_by(
-                        "mock update result identifier must not be empty",
-                        source,
-                    )
-                })?;
             let state = AppliedState::from_snapshot_parts(id, applied_identifier, attributes);
             if let Some(config) = partial_update {
                 return Ok(UpdateOutcome::partial_success(
@@ -2045,11 +2081,11 @@ impl Provider for MockProvider {
         attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = attempt.id().clone();
-        let identifier = attempt.identifier().as_str().to_string();
+        let identifier = attempt.identifier().clone();
         Box::pin(async move {
             let _attempt = attempt;
-            let key = Self::resolved_resource_key(&id)?;
-            if let Some(err) = self.delete_fail_error_for(&id, &identifier) {
+            let key = Self::resolved_resource_address(&id)?;
+            if let Some(err) = self.delete_fail_error_for(&id, identifier.as_str()) {
                 return Err(err);
             }
             if let Some(err) = self.delete_timeout_error_for(&id) {
@@ -2082,7 +2118,7 @@ impl Provider for MockProvider {
             let state_guard = self.lock_state_file()?;
             let mut states = state_guard.load_states_for_operation()?;
 
-            states.remove(&key);
+            states.states.remove(&identifier);
             state_guard
                 .save(&states)
                 .map_err(|e| ProviderError::internal_caused_by("Failed to save state", e))?;
@@ -2186,6 +2222,20 @@ mod tests {
             }
             .create_provider(),
         ))
+    }
+
+    fn created_identifier(outcome: carina_core::provider::HostCreateOutcome) -> AppliedIdentifier {
+        match outcome.into_kind() {
+            CreateOutcomeKind::Success { state } => state.identifier().clone(),
+            CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
+                panic!("expected complete create, got {state:?}: {diagnostic:?}")
+            }
+        }
+    }
+
+    fn assert_minted_identifier(identifier: &AppliedIdentifier) {
+        let uuid = uuid::Uuid::parse_str(identifier.as_str()).expect("mock must mint a UUID");
+        assert_eq!(uuid.get_version_num(), 4);
     }
 
     async fn dispatch_mock_create(
@@ -2455,12 +2505,296 @@ mod tests {
         let states =
             MockProvider::decode_state_file(&fs::read_to_string(shared_path).unwrap()).unwrap();
         assert_eq!(
-            states.len(),
+            states.states.len(),
             16,
             "file transactions must not lose another provider's writes"
         );
 
         assert!(!tmp.path().join("shared.json.lock").exists());
+    }
+
+    #[tokio::test]
+    async fn created_objects_at_the_same_address_keep_independent_provider_identifiers() {
+        let provider = ConfiguredBuiltinMock::new(MockBehavior::default(), MockScope::memory())
+            .create_provider();
+        let resource = Resource::with_provider("mock", "test.resource", "same", None)
+            .with_attribute("name", string_value("same"))
+            .with_attribute("comment", string_value("first"));
+        let first = created_identifier(
+            dispatch_mock_create(&provider, resource.clone())
+                .await
+                .unwrap(),
+        );
+        let second = created_identifier(
+            dispatch_mock_create(
+                &provider,
+                resource.with_attribute("comment", string_value("second")),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_minted_identifier(&first);
+        assert_minted_identifier(&second);
+        assert_ne!(first, second);
+        let moved = ResourceId::with_provider_identity("mock", "test.resource", "moved", None);
+        let observed = provider
+            .read(&moved, &first, ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
+        assert_eq!(
+            observed.attributes["comment"],
+            string_value("first").to_snapshot()
+        );
+        let absent = provider
+            .read(&moved, &MockProvider::mint_identifier(), ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
+        assert!(!absent.exists);
+        carina_core::executor::dispatch_delete(
+            &mock_boundary(&provider),
+            carina_core::executor::delete_permit_for_test(
+                moved.clone(),
+                first.clone(),
+                Default::default(),
+            ),
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !provider
+                .read(&moved, &first, ReadRequest)
+                .await
+                .unwrap()
+                .into_state()
+                .exists
+        );
+        let observed = provider
+            .read(&moved, &second, ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
+        assert_eq!(
+            observed.attributes["comment"],
+            string_value("second").to_snapshot()
+        );
+    }
+
+    async fn dispatch_mock_update(
+        provider: &MockProvider,
+        identifier: AppliedIdentifier,
+        from: State<carina_core::resource::SnapshotLeaf>,
+        resource: Resource,
+    ) -> Result<carina_core::provider::HostUpdateOutcome, carina_core::provider::HostError> {
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = fixture_schemas();
+        let provider_types = carina_core::test_utils::loaded_fixture_snapshot(schemas.clone());
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &schemas,
+                    type_checks,
+                );
+                let request = carina_core::executor::prepare_update_request(
+                    resource,
+                    from,
+                    &["comment".to_string()],
+                    &preparation,
+                )
+                .await
+                .expect("mock update fixture passes preparation");
+                let permit = carina_core::replacement::update_permit_with_schemas_for_test(
+                    identifier, request, &schemas,
+                );
+                carina_core::executor::dispatch_update(&mock_boundary(provider), permit).await
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn update_missing_identifier_returns_not_found_without_creating_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let patch_log = tmp.path().join("update-patches.jsonl");
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    update_patch_log: Some(patch_log.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            MockScope::memory(),
+        )
+        .create_provider();
+        let identifier = AppliedIdentifier::new("never-created").unwrap();
+        let resource = Resource::with_provider("mock", "test.resource", "missing", None)
+            .with_attribute("name", string_value("missing"))
+            .with_attribute("comment", string_value("before"));
+        let from =
+            State::<NoPlaceholder>::existing(resource.id.clone(), resource.resolved_attributes())
+                .with_identifier(identifier.as_str())
+                .to_snapshot();
+
+        let error = dispatch_mock_update(
+            &provider,
+            identifier.clone(),
+            from,
+            resource
+                .clone()
+                .with_attribute("comment", string_value("after")),
+        )
+        .await
+        .expect_err("updating an identifier never created must return NotFound");
+
+        assert_eq!(
+            error.kind(),
+            carina_core::provider::ProviderErrorKind::NotFound
+        );
+        assert!(!patch_log.exists(), "missing objects must not log patches");
+        assert!(
+            provider
+                .lock_state_file()
+                .unwrap()
+                .load()
+                .unwrap()
+                .states
+                .is_empty()
+        );
+        assert!(
+            !provider
+                .read(&resource.id, &identifier, ReadRequest)
+                .await
+                .unwrap()
+                .into_state()
+                .exists
+        );
+    }
+
+    #[tokio::test]
+    async fn update_result_identifier_collision_preserves_both_objects() {
+        let scope = MockScope::memory();
+        let provider =
+            ConfiguredBuiltinMock::new(MockBehavior::default(), scope.clone()).create_provider();
+        let resource = Resource::with_provider("mock", "test.resource", "same", None)
+            .with_attribute("name", string_value("same"))
+            .with_attribute("comment", string_value("first"));
+        let first = created_identifier(
+            dispatch_mock_create(&provider, resource.clone())
+                .await
+                .unwrap(),
+        );
+        let second = created_identifier(
+            dispatch_mock_create(
+                &provider,
+                resource
+                    .clone()
+                    .with_attribute("comment", string_value("second")),
+            )
+            .await
+            .unwrap(),
+        );
+        let before = provider.lock_state_file().unwrap().load().unwrap().states;
+        let from = provider
+            .read(&resource.id, &first, ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                update_result_identifier: Some(second.as_str().to_owned()),
+                ..MockBehavior::default()
+            },
+            scope,
+        )
+        .create_provider();
+
+        let error = dispatch_mock_update(
+            &provider,
+            first,
+            from,
+            resource.with_attribute("comment", string_value("updated")),
+        )
+        .await
+        .expect_err("update must reject another object's identifier");
+
+        assert_eq!(
+            error.kind(),
+            carina_core::provider::ProviderErrorKind::Internal
+        );
+        assert_eq!(
+            provider.lock_state_file().unwrap().load().unwrap().states,
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn issued_resume_identifier_collision_preserves_existing_object() {
+        let provider = ConfiguredBuiltinMock::new(MockBehavior::default(), MockScope::memory())
+            .create_provider();
+        let existing = Resource::with_provider("mock", "test.resource", "existing", None)
+            .with_attribute("name", string_value("existing"));
+        let identifier =
+            created_identifier(dispatch_mock_create(&provider, existing).await.unwrap());
+        let before = provider.lock_state_file().unwrap().load().unwrap().states;
+        let resource = Resource::with_provider("mock", "test.resource", "resuming", None)
+            .with_attribute("name", string_value("resuming"));
+        let pending = create_attempt_for_test(resource.id.clone())
+            .issued(identifier.clone(), Sent::AllRequestAttributes)
+            .pending(PendingToken::new("builtin-mock-pending"), 1)
+            .persist(Default::default(), Default::default());
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = fixture_schemas();
+        let provider_types = carina_core::test_utils::loaded_fixture_snapshot(schemas.clone());
+        let request = carina_core::validation::deferred_types::with_session_for_test_async(
+            provider_types.provider_context(),
+            async |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::for_test(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &schemas,
+                    type_checks,
+                );
+                let request = carina_core::executor::prepare_create_request(resource, &preparation)
+                    .await
+                    .expect("resume fixture passes create preparation");
+                ResumeCreateRequest::for_test(pending.clone(), request).unwrap()
+            },
+        )
+        .await;
+
+        let error = provider
+            .resume_create(request)
+            .await
+            .expect_err("issued resume must reject another object's identifier");
+
+        let ResumeFailureKind::InFlight {
+            pending: preserved,
+            error,
+        } = error.into_kind()
+        else {
+            panic!("a rejected issued resume must preserve its continuation");
+        };
+        assert_eq!(
+            error.kind(),
+            carina_core::provider::ProviderErrorKind::Internal
+        );
+        assert_eq!(preserved, pending);
+        assert_eq!(
+            provider.lock_state_file().unwrap().load().unwrap().states,
+            before
+        );
     }
 
     #[test]
@@ -2536,7 +2870,7 @@ mod tests {
                     "identifier_reported",
                     Err(CreateFailureKind::IdentifierReported { identified, error }),
                 ) => {
-                    assert_eq!(identified.identifier().as_str(), "mock-id");
+                    assert_minted_identifier(identified.identifier());
                     drop(error);
                 }
                 ("in_flight", Err(CreateFailureKind::InFlight { pending, error })) => {
@@ -2672,12 +3006,30 @@ mod tests {
                 .map_err(ResumeFailure::into_kind);
             match (expected, result) {
                 ("resumed", Ok(ResumeOutcomeKind::Resumed(created))) => {
-                    assert_eq!(created.identifier().as_str(), "mock-id");
+                    assert_minted_identifier(created.identifier());
+                    assert!(
+                        provider
+                            .lock_state_file()
+                            .unwrap()
+                            .load()
+                            .unwrap()
+                            .states
+                            .contains_key(created.identifier())
+                    );
                 }
                 ("resent", Ok(ResumeOutcomeKind::Resent(outcome))) => {
                     match outcome.into_host_for_test().into_kind() {
                         CreateOutcomeKind::Success { state } => {
-                            assert_eq!(state.identifier().as_str(), "mock-id");
+                            assert_minted_identifier(state.identifier());
+                            assert!(
+                                provider
+                                    .lock_state_file()
+                                    .unwrap()
+                                    .load()
+                                    .unwrap()
+                                    .states
+                                    .contains_key(state.identifier())
+                            );
                         }
                         CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
                             panic!("unexpected partial resend {state:?}: {diagnostic:?}")
@@ -2783,13 +3135,15 @@ mod tests {
             MockScope::file(state_file.clone()).unwrap(),
         )
         .create_provider();
-        let mut states = HashMap::new();
+        let mut states = MockStates::default();
         let mut entry = HashMap::new();
         entry.insert(
             "k".to_string(),
             serde_json::from_value(serde_json::json!("v")).unwrap(),
         );
-        states.insert("aws.s3.Bucket.b".to_string(), entry);
+        states
+            .states
+            .insert(AppliedIdentifier::new("bucket-provider-id").unwrap(), entry);
         provider.lock_state_file().unwrap().save(&states).unwrap();
         let bytes = fs::read(&state_file).unwrap();
         assert_eq!(
@@ -2801,105 +3155,35 @@ mod tests {
     }
 
     #[test]
-    fn unversioned_state_migrates_dollar_keys_and_legacy_enums() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state_file = tmp.path().join("mock-state.json");
-        fs::write(
-            &state_file,
-            carina_core::utils::pretty_with_newline(&serde_json::json!({
-                "test.resource.legacy": {
-                    "payload": {"$x": "kept"},
-                    "mode": {
-                        "Enum": {
-                            "identity": {
-                                "provider": "mock",
-                                "segments": ["test", "resource"],
-                                "kind": "Mode"
-                            },
-                            "api_value": "active"
-                        }
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let provider = ConfiguredBuiltinMock::new(
-            MockBehavior::default(),
-            MockScope::file(state_file).unwrap(),
-        )
-        .create_provider();
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy", None);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-
-        let state = runtime
-            .block_on(provider.read(
-                &id,
-                &AppliedIdentifier::new("mock-id").unwrap(),
-                ReadRequest,
-            ))
-            .expect("legacy mock state should load after migration")
-            .into_state();
-
-        let Some(Value::Concrete(ConcreteValue::Map(payload))) = state.attributes.get("payload")
-        else {
-            panic!("legacy payload should remain a user map")
-        };
-        assert_eq!(payload.get("$x"), Some(&string_value("kept").to_snapshot()));
-        let Some(Value::Concrete(ConcreteValue::CanonicalEnum(mode))) =
-            state.attributes.get("mode")
-        else {
-            panic!("legacy enum should migrate to a canonical enum")
-        };
-        assert_eq!(mode.api_value(), "active");
-    }
-
-    #[test]
-    fn v1_state_migrates_self_contained_markers_to_structural_tags() {
-        let marker = valid_legacy_marker_shaped_string("mock-v1-secret");
-        let digest = marker
-            .strip_prefix("_secret:")
-            .expect("test marker has the old boundary prefix");
-        let content = serde_json::json!({
-            "version": 1,
-            "states": {
-                "test.resource.legacy": {
-                    "top": marker,
-                    "nested": {
-                        "items": [marker],
-                        "explicit": "_secret:argon2-legacy:73616c74:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    },
-                    "raw": "_secret:argon2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                }
-            }
+    fn stale_address_keyed_state_formats_are_rejected() {
+        let objects = serde_json::json!({
+            "test.resource.legacy": {"name": "legacy"}
         });
-
-        let states = MockProvider::decode_state_file(&content.to_string())
-            .expect("mock v1 state should migrate");
-        let attrs = &states["test.resource.legacy"];
-        let top = serde_json::to_value(&attrs["top"]).expect("serialize migrated top value");
-        let nested =
-            serde_json::to_value(&attrs["nested"]).expect("serialize migrated nested value");
-        assert_eq!(top, serde_json::json!({"$secret": digest}));
-        assert_eq!(nested["items"][0], serde_json::json!({"$secret": digest}));
+        let unversioned = MockProvider::decode_state_file(&objects.to_string())
+            .err()
+            .expect("unversioned address-keyed files must fail");
+        assert_eq!(unversioned.kind(), ErrorKind::InvalidData);
         assert!(
-            nested["explicit"]["$secret"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("argon2-legacy:"))
+            unversioned
+                .to_string()
+                .contains("unknown field `test.resource.legacy`"),
+            "{unversioned}"
         );
-        assert_eq!(
-            attrs["raw"].decode(),
-            Some(string_value(
-                "_secret:argon2:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            ).to_snapshot()),
-            "mock v1 never assigned row-aware semantics to raw legacy strings",
-        );
+        for version in [1, 2] {
+            let content = serde_json::json!({"version": version, "states": objects});
+            let error = MockProvider::decode_state_file(&content.to_string())
+                .err()
+                .expect("old address-keyed versions must fail");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert_eq!(
+                error.to_string(),
+                format!("unsupported mock state version {version}; expected 3")
+            );
+        }
     }
 
     #[test]
-    fn fresh_v2_state_round_trip_keeps_marker_shaped_plaintext_plain() {
+    fn fresh_v3_state_round_trip_keeps_marker_shaped_plaintext_plain() {
         let tmp = tempfile::tempdir().unwrap();
         let state_file = tmp.path().join("mock-state.json");
         let provider = ConfiguredBuiltinMock::new(
@@ -2907,7 +3191,7 @@ mod tests {
             MockScope::file(state_file.clone()).unwrap(),
         )
         .create_provider();
-        let marker = valid_legacy_marker_shaped_string("mock-v2-collision");
+        let marker = valid_legacy_marker_shaped_string("mock-v3-collision");
         let plain = string_value(marker.clone());
         let id = ResourceId::with_provider_identity("mock", "test.resource", "collision", None);
         let resource = Resource::with_provider("mock", "test.resource", "collision", None)
@@ -2925,25 +3209,19 @@ mod tests {
             .build()
             .unwrap();
 
-        runtime
+        let identifier = runtime
             .block_on(dispatch_mock_create(&provider, resource))
-            .expect("create should save mock v2 state");
+            .map(created_identifier)
+            .expect("create should save mock v3 state");
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
-        assert_eq!(raw["version"], 2);
-        assert_eq!(raw["states"]["test.resource.collision"]["comment"], marker);
-        assert_eq!(
-            raw["states"]["test.resource.collision"]["tags"]["nested"],
-            marker
-        );
+        assert_eq!(raw["version"], 3);
+        assert_eq!(raw["states"][identifier.as_str()]["comment"], marker);
+        assert_eq!(raw["states"][identifier.as_str()]["tags"]["nested"], marker);
 
         let state = runtime
-            .block_on(provider.read(
-                &id,
-                &AppliedIdentifier::new("mock-id").unwrap(),
-                ReadRequest,
-            ))
-            .expect("fresh mock v2 state should reload")
+            .block_on(provider.read(&id, &identifier, ReadRequest))
+            .expect("fresh mock v3 state should reload")
             .into_state();
         assert_eq!(state.attributes.get("comment"), Some(&plain.to_snapshot()));
         assert!(matches!(
@@ -2951,6 +3229,21 @@ mod tests {
             Some(Value::Concrete(ConcreteValue::Map(values)))
                 if values.get("nested") == Some(&plain.to_snapshot())
         ));
+    }
+
+    #[tokio::test]
+    async fn data_source_read_with_unresolved_identity_returns_not_found() {
+        let provider = ConfiguredBuiltinMock::new(MockBehavior::default(), MockScope::memory())
+            .create_provider();
+        let id = ResourceId::pending_with_provider("mock", "test.resource", None);
+
+        assert!(
+            provider
+                .read_attributes(&id, MockReadTarget::DataSource)
+                .await
+                .expect("an unresolved data-source identity must be treated as not found")
+                .is_none()
+        );
     }
 
     #[test]
@@ -2970,18 +3263,16 @@ mod tests {
             .build()
             .unwrap();
 
-        runtime
+        let identifier = runtime
             .block_on(dispatch_mock_create(&provider, resource))
+            .map(created_identifier)
             .expect("create should persist the write-only request value");
         let state = runtime
-            .block_on(provider.read(
-                &id,
-                &AppliedIdentifier::new("hidden-id").unwrap(),
-                ReadRequest,
-            ))
+            .block_on(provider.read(&id, &identifier, ReadRequest))
             .expect("read should succeed")
             .into_state();
 
+        assert!(state.exists, "read must find the created object");
         assert!(
             !state.attributes.contains_key(WRITE_ONLY_PASSWORD_ATTRIBUTE),
             "provider reads must model a non-echoing write-only attribute"
@@ -3006,15 +3297,28 @@ mod tests {
             ("{".to_string(), "EOF while parsing an object"),
             (
                 serde_json::json!({
-                    "version": 1,
+                    "version": 3,
                     "states": {
+                        "broken-id": {
+                            "payload": {"$unknown": true}
+                        }
+                    }
+                })
+                .to_string(),
+                "mock state store key \"broken-id\" attribute \"payload\" is not valid persisted JSON",
+            ),
+            (
+                serde_json::json!({
+                    "version": 3,
+                    "states": {},
+                    "data_sources": {
                         "test.resource.broken": {
                             "payload": {"$unknown": true}
                         }
                     }
                 })
                 .to_string(),
-                "mock state resource \"test.resource.broken\" attribute \"payload\" is not valid persisted JSON",
+                "mock state store key \"test.resource.broken\" attribute \"payload\" is not valid persisted JSON",
             ),
         ] {
             fs::write(&state_file, content).unwrap();
@@ -3058,20 +3362,17 @@ mod tests {
             .build()
             .unwrap();
 
-        runtime
+        let identifier = runtime
             .block_on(dispatch_mock_create(&provider, resource))
+            .map(created_identifier)
             .expect("create should save versioned mock state");
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
-        assert_eq!(raw.get("version"), Some(&serde_json::json!(2)));
+        assert_eq!(raw.get("version"), Some(&serde_json::json!(3)));
         assert!(raw.get("states").is_some());
 
         let state = runtime
-            .block_on(provider.read(
-                &id,
-                &AppliedIdentifier::new("mock-id").unwrap(),
-                ReadRequest,
-            ))
+            .block_on(provider.read(&id, &identifier, ReadRequest))
             .expect("new mock state should reload")
             .into_state();
         assert_eq!(
@@ -3118,15 +3419,13 @@ mod tests {
             .unwrap();
 
         let read = runtime.block_on(async {
-            dispatch_mock_create(&provider, resource)
-                .await
-                .expect("create succeeds");
+            let identifier = created_identifier(
+                dispatch_mock_create(&provider, resource)
+                    .await
+                    .expect("create succeeds"),
+            );
             provider
-                .read(
-                    &id,
-                    &AppliedIdentifier::new("mock-id").unwrap(),
-                    ReadRequest,
-                )
+                .read(&id, &identifier, ReadRequest)
                 .await
                 .expect("read succeeds")
                 .into_state()
@@ -3157,12 +3456,12 @@ mod tests {
 
         MockProvider::append_delete_log(
             log_path.clone(),
-            &MockProvider::resolved_resource_key(&first).unwrap(),
+            &MockProvider::resolved_resource_address(&first).unwrap(),
         )
         .unwrap();
         MockProvider::append_delete_log(
             log_path.clone(),
-            &MockProvider::resolved_resource_key(&second).unwrap(),
+            &MockProvider::resolved_resource_address(&second).unwrap(),
         )
         .unwrap();
 
@@ -3201,16 +3500,18 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            dispatch_mock_create(&provider, resource)
-                .await
-                .expect("create should succeed");
+            let identifier = created_identifier(
+                dispatch_mock_create(&provider, resource)
+                    .await
+                    .expect("create should succeed"),
+            );
 
             let mut from_attrs = HashMap::new();
             from_attrs.insert("name".to_string(), string_value("web-acl-new"));
             from_attrs.insert("comment".to_string(), string_value("v1"));
             let from =
                 State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), from_attrs)
-                    .with_identifier("mock-id");
+                    .with_identifier(identifier.as_str());
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let module_gate =
                 carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
@@ -3239,8 +3540,6 @@ mod tests {
                     )
                     .await;
                     let request = request.expect("update request should pass checked preparation");
-                    let identifier = AppliedIdentifier::new("mock-id")
-                        .expect("the mock identifier is non-empty");
                     let prepared = carina_core::replacement::update_permit_with_schemas_for_test(
                         identifier.clone(),
                         request,
@@ -3293,15 +3592,16 @@ mod tests {
         let id = ResourceId::with_provider_identity("mock", "test.resource", "read-me", None);
         let resource = Resource::with_provider("mock", "test.resource", "read-me", None)
             .with_attribute("name", string_value("read-me"));
-        let identifier = AppliedIdentifier::new("mock-id").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .unwrap();
         runtime.block_on(async {
-            dispatch_mock_create(&provider, resource)
-                .await
-                .expect("create should succeed");
+            let identifier = created_identifier(
+                dispatch_mock_create(&provider, resource)
+                    .await
+                    .expect("create should succeed"),
+            );
             fs::write(&log_path, "").expect("clear create log");
             provider
                 .read(&id, &identifier, ReadRequest)

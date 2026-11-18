@@ -215,10 +215,11 @@ fn mutating_apply_saves_resource_then_fails_for_unresolved_export() {
         "pure export failure must use the same success-count summary as mixed failures\nstdout/stderr:\n{text}",
     );
     let state = scenario.persisted_state();
-    assert!(
-        state.to_string().contains("mock-id"),
-        "the successfully-created resource must remain persisted: {state:#}",
-    );
+    let identifier = state["resources"][0]["current"]["identifier"]
+        .as_str()
+        .expect("the successfully-created resource must remain persisted");
+    let provider: Value = serde_json::from_slice(&fs::read(&scenario.mock_state).unwrap()).unwrap();
+    assert!(provider["states"][identifier].is_object(), "{state:#}");
 }
 
 #[test]

@@ -2102,7 +2102,8 @@ provider mock {}
         "refresh-disabled orphan saved plan",
         &scenario.carina(&["plan", "--refresh=false", "--out", "plan.json", "."]),
     );
-    fs::write(&scenario.mock_state, b"{}\n").expect("remove orphan from provider state");
+    fs::write(&scenario.mock_state, b"{\"version\":3,\"states\":{}}\n")
+        .expect("remove orphan from provider state");
 
     let apply = scenario.apply_plan();
     let rendered = output_text(&apply);
@@ -2874,9 +2875,12 @@ import {
     fs::write(
         &scenario.mock_state,
         serde_json::to_vec_pretty(&serde_json::json!({
-            "test.resource.imported-secret": {
-                "name": "imported-secret",
-                "comment": "provider-existing"
+            "version": 3,
+            "states": {
+                format!("{PLAINTEXT}|tail"): {
+                    "name": "imported-secret",
+                    "comment": "provider-existing"
+                }
             }
         }))
         .expect("serialize import provider state"),
@@ -2995,7 +2999,8 @@ let item = mock.test.resource {{
     assert_output_has_no_plaintext("vanished-resource saved plan", &plan, &[OLD, NEW]);
     assert_plan_is_redacted(&scenario, &[OLD, NEW]);
 
-    fs::write(&scenario.mock_state, b"{}\n").expect("clear provider state out of band");
+    fs::write(&scenario.mock_state, b"{\"version\":3,\"states\":{}}\n")
+        .expect("clear provider state out of band");
     let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
     let provider_before = fs::read(&scenario.mock_state).ok();
 

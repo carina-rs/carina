@@ -79,6 +79,12 @@ impl ValueDescription {
             Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
                 format!("placeholder ({placeholder})")
             }
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         })
     }
 }

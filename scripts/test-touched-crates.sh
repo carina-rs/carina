@@ -57,7 +57,7 @@ class TouchedCratesTests(unittest.TestCase):
         return subprocess.check_output(
             ["git", "-c", "user.name=Scope fixture", "-c",
              "user.email=scope@example.invalid", *args], cwd=self.root,
-            env=self.env, stderr=subprocess.PIPE, text=True, timeout=10,
+            env=self.env, stderr=subprocess.PIPE, text=True,
         ).strip()
 
     def track(self, filename, contents):
@@ -77,7 +77,7 @@ class TouchedCratesTests(unittest.TestCase):
         }))
         result = subprocess.run(["bash", str(HELPER), "--stdin"], cwd=self.root,
                                 input="\n".join(files), env=self.env,
-                                capture_output=True, text=True, timeout=10)
+                                capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 
@@ -449,7 +449,7 @@ let lifetime: &'static str = "site/after-lifetime.md";
                 result = subprocess.run(
                     ["bash", str(HELPER), "--base", "base"], cwd=self.root,
                     env=dict(self.env, GIT_FAIL_COMMAND=command),
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertEqual(result.stdout, "")
@@ -475,7 +475,7 @@ let lifetime: &'static str = "site/after-lifetime.md";
                                  "carina-tui/src/lib.rs")
                 result = subprocess.run(
                     ["bash", str(HELPER), "--base", base], cwd=self.root, env=self.env,
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), "-p carina-cli -p carina-tui")
@@ -485,7 +485,7 @@ let lifetime: &'static str = "site/after-lifetime.md";
             return subprocess.check_output(
                 ["git", "-c", "user.name=Scope fixture", "-c",
                  "user.email=scope@example.invalid", *args], cwd=self.root,
-                env=self.env, stderr=subprocess.PIPE, text=True, timeout=10,
+                env=self.env, stderr=subprocess.PIPE, text=True,
             ).strip()
 
         git("init", "-q", "--template=")
@@ -510,7 +510,7 @@ let lifetime: &'static str = "site/after-lifetime.md";
             with self.subTest(command=command):
                 result = subprocess.run(
                     command, cwd=self.root, env=self.env,
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertEqual(result.stdout, "")

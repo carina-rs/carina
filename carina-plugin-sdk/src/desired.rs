@@ -729,6 +729,7 @@ fn retain_native_value_metadata(tree: &mut DesiredValue, original: &Value, owner
             | DeferredValue::Unknown(_),
         ) => {}
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+        Value::Reference(never) | Value::Conversion(never) => match *never {},
     }
 }
 

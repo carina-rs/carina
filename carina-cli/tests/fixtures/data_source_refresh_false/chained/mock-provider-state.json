@@ -1,13 +1,18 @@
 {
-  "version": 2,
-  "states": {
+  "version": 3,
+  "states": {},
+  "data_sources": {
     "iam.Roles.roles": {
       "name_regex": "x",
-      "names": ["r1"]
+      "names": [
+        "r1"
+      ]
     },
     "iam.Roles.roles_again": {
       "name_regex": "r1",
-      "names": ["r2"]
+      "names": [
+        "r2"
+      ]
     }
   }
 }

@@ -9,14 +9,14 @@ use std::path::{Path, PathBuf};
 
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, DataSource, ModuleSource, ParserPlaceholder,
-    RelativeBindingName, Resource, Value, ValueKind,
+    RelativeBindingName, Resource, Value, ValueKind, ValueShape,
 };
 
 use super::ModuleCall;
 
 #[derive(Debug, Clone)]
 pub struct DeferredIfCondition<
-    P: ValueKind = ParserPlaceholder,
+    P: ValueShape = ParserPlaceholder,
     B: BindingAddress = RelativeBindingName,
 > {
     pub(crate) value: Value<P, B>,
@@ -29,10 +29,21 @@ pub struct DeferredIfCondition<
 
 impl<P: ValueKind, B: BindingAddress> PartialEq for DeferredIfCondition<P, B> {
     fn eq(&self, other: &Self) -> bool {
-        self.value == other.value
-            && self.source_file == other.source_file
-            && self.source_line == other.source_line
-            && self.source_expression == other.source_expression
+        let Self {
+            value: a,
+            source_file: af,
+            source_line: al,
+            source_expression: ae,
+            node_id: _,
+        } = self;
+        let Self {
+            value: b,
+            source_file: bf,
+            source_line: bl,
+            source_expression: be,
+            node_id: _,
+        } = other;
+        a == b && af == bf && al == bl && ae == be
     }
 }
 
@@ -118,9 +129,9 @@ impl<P: ValueKind, B: BindingAddress> DeferredIfCondition<P, B> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DeferredValueIf<
-    P: ValueKind = ParserPlaceholder,
+    P: ValueShape = ParserPlaceholder,
     B: BindingAddress = RelativeBindingName,
 > {
     pub(crate) condition: DeferredIfCondition<P, B>,
@@ -347,5 +358,21 @@ impl<P: ValueKind> DeferredIfBody<P, AbsoluteBindingAddress> {
             Self::DataSource(data_source) => data_source.map_absolute_bindings(map),
             Self::ModuleCall(call) => call.map_absolute_bindings(map),
         }
+    }
+}
+
+impl<P: ValueKind, B: BindingAddress> PartialEq for DeferredValueIf<P, B> {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            condition: a,
+            then_value: at,
+            else_value: ae,
+        } = self;
+        let Self {
+            condition: b,
+            then_value: bt,
+            else_value: be,
+        } = other;
+        a == b && at == bt && ae == be
     }
 }

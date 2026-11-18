@@ -8660,6 +8660,12 @@ impl<P: crate::resource::ValueKind, B: BindingAddress> Value<P, B> {
 
             Value::Deferred(DeferredValue::Unknown(_)) => "Unknown".to_string(),
             Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
+            crate::resource::Value::Reference(never) => {
+                match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+            }
+            crate::resource::Value::Conversion(never) => {
+                match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+            }
         }
     }
 }
@@ -12070,6 +12076,9 @@ fn validate_portable_default(
             | ConcreteValue::Bool(_)
             | ConcreteValue::StringList(_),
         ) => {}
+        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
+            match *never {}
+        }
     }
 }
 

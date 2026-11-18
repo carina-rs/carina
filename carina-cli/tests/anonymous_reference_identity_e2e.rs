@@ -95,16 +95,11 @@ impl Scenario {
         row["identity"] = Value::String(old_identity.to_string());
         write_json(&state_path, &state);
 
-        let mut provider_state = read_json(&self.mock_state);
-        let states = provider_state["states"]
-            .as_object_mut()
-            .expect("mock provider states");
-        let new_key = format!("route53.RecordSet.{new_identity}");
-        let attributes = states
-            .remove(&new_key)
-            .unwrap_or_else(|| panic!("missing mock provider row {new_key}: {states:#?}"));
-        states.insert(format!("route53.RecordSet.{old_identity}"), attributes);
-        write_json(&self.mock_state, &provider_state);
+        let provider_state = read_json(&self.mock_state);
+        for row in state["resources"].as_array().expect("applied resources") {
+            let identifier = row["current"]["identifier"].as_str().unwrap();
+            assert!(provider_state["states"][identifier].is_object());
+        }
         new_identity
     }
 }

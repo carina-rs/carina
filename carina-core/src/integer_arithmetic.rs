@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, PlaceholderKind, Value,
-    ValueKind,
+    ValueKind, ValueShape,
 };
 
 /// The closed set of binary integer operators in the Carina DSL.
@@ -221,9 +221,9 @@ impl fmt::Display for IntegerExpressionError {
 impl std::error::Error for IntegerExpressionError {}
 
 /// A sealed, structurally valid deferred integer expression.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ValidatedIntegerExpr<
-    P: ValueKind = crate::resource::NoPlaceholder,
+    P: ValueShape = crate::resource::NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
     lhs: Box<Value<P, B>>,
@@ -534,6 +534,12 @@ fn validate_operand_shape_at_stage<P: ValueKind, B: BindingAddress>(
             side,
             actual: "Map",
         }),
+        crate::resource::Value::Reference(never) => {
+            match *<P as crate::resource::ValueKind>::no_reference_payload::<B>(never) {}
+        }
+        crate::resource::Value::Conversion(never) => {
+            match *<P as crate::resource::ValueKind>::no_conversion_payload::<B>(never) {}
+        }
     }
 }
 
@@ -597,6 +603,84 @@ impl crate::resource::InsideSecret for IntegerExpressionError {
             Self::Evaluation(error) => Self::SecretEvaluation(error),
             error => error,
         }
+    }
+}
+
+impl<P: ValueKind, B: BindingAddress> PartialEq for ValidatedIntegerExpr<P, B> {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            lhs: a,
+            op: ao,
+            rhs: ar,
+            operator_span: asp,
+        } = self;
+        let Self {
+            lhs: b,
+            op: bo,
+            rhs: br,
+            operator_span: bsp,
+        } = other;
+        a == b && ao == bo && ar == br && asp == bsp
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl<P: ValueShape, B: BindingAddress> ValidatedIntegerExpr<P, B> {
+    pub(crate) fn visit_storage<'a>(&'a self, mut visit: impl FnMut(&'a Value<P, B>)) {
+        let Self {
+            lhs,
+            op: _,
+            rhs,
+            operator_span: _,
+        } = self;
+        visit(lhs);
+        visit(rhs);
+    }
+
+    pub(crate) fn copy_storage<Q: ValueShape>(
+        &self,
+        map: &mut impl FnMut(&Value<P, B>) -> Value<Q, B>,
+    ) -> ValidatedIntegerExpr<Q, B> {
+        let Self {
+            lhs,
+            op,
+            rhs,
+            operator_span,
+        } = self;
+        ValidatedIntegerExpr {
+            lhs: Box::new(map(lhs)),
+            op: *op,
+            rhs: Box::new(map(rhs)),
+            operator_span: operator_span.clone(),
+        }
+    }
+
+    pub(crate) fn same_storage(
+        &self,
+        other: &Self,
+        compare: impl Fn(&Value<P, B>, &Value<P, B>) -> bool,
+    ) -> bool {
+        let Self {
+            lhs: a,
+            op: ao,
+            rhs: ar,
+            operator_span: asp,
+        } = self;
+        let Self {
+            lhs: b,
+            op: bo,
+            rhs: br,
+            operator_span: bsp,
+        } = other;
+        let IntegerOperatorSpan {
+            location: al,
+            node: an,
+        } = asp;
+        let IntegerOperatorSpan {
+            location: bl,
+            node: bn,
+        } = bsp;
+        ao == bo && al == bl && an == bn && compare(a, b) && compare(ar, br)
     }
 }
 
