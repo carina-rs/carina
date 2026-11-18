@@ -343,7 +343,6 @@ fn mock_http_test_egress(
     carina_provider_resolver::load_locked_egress(
         &carina_core::paths::ResolvedPath::new(lock_dir).unwrap(),
         load,
-        &mut |_| {},
     )
     .expect("load mock HTTP egress consent")
     .expect("mock HTTP egress consent must match the fixture")

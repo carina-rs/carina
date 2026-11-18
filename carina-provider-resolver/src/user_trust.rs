@@ -392,7 +392,9 @@ mod tests {
     use carina_core::provider_source::ProviderSource;
 
     use super::*;
-    use crate::provider_resolver::{LegacySignerPin, SignerPinState};
+    use crate::provider_resolver::{
+        CurrentSignerPins, SignerPinState, SourcePin, WorkflowPin, WorkflowPins,
+    };
     use crate::verified_artifact::record_test_github_origin_download;
 
     fn github_source_key() -> RemoteSourceKey {
@@ -433,14 +435,26 @@ mod tests {
         };
         let sha256 = "01".repeat(32);
         let first_signer =
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
-                certificate_san: "https://github.com/carina-rs/old-workflow".into(),
-                oidc_issuer: "https://token.actions.githubusercontent.com".into(),
+            RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "https://token.actions.githubusercontent.com".into(),
+                    repository_owner_id: "260157389".into(),
+                    repository_id: "123".into(),
+                },
+                workflows: WorkflowPins::Stable(WorkflowPin(
+                    "https://github.com/carina-rs/old-workflow".into(),
+                )),
             }));
         let new_signer =
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
-                certificate_san: "https://github.com/carina-rs/new-workflow".into(),
-                oidc_issuer: "https://token.actions.githubusercontent.com".into(),
+            RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "https://token.actions.githubusercontent.com".into(),
+                    repository_owner_id: "260157389".into(),
+                    repository_id: "123".into(),
+                },
+                workflows: WorkflowPins::Stable(WorkflowPin(
+                    "https://github.com/carina-rs/new-workflow".into(),
+                )),
             }));
 
         record_test_github_origin_download(&user_dirs, &source, &sha256, Some(&first_signer))
@@ -467,6 +481,49 @@ mod tests {
         let stored: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(stored["version"], 1);
+    }
+
+    #[test]
+    fn user_trust_record_rejects_obsolete_signer_encodings() {
+        let root = tempfile::tempdir().unwrap();
+        let user_dirs = UserDirs::under(root.path());
+        let source = github_source_key();
+        let sha256 = "05".repeat(32);
+        record_test_github_origin_download(&user_dirs, &source, &sha256, None).unwrap();
+        let path = trust_record_path(&user_dirs, &sha256, source.as_str()).unwrap();
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let fixture: toml::Value = toml::from_str(include_str!(
+            "../tests/fixtures/rejected-provider-signer.toml"
+        ))
+        .unwrap();
+        let signer: toml::Table = fixture["provider"][0]["registry"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.as_str() == "signature_state" || key.starts_with("legacy_"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        record["signer"] = serde_json::to_value(signer).unwrap();
+        for state in ["required_legacy", "required_unpinned"] {
+            record["signer"]["signature_state"] = state.into();
+            let contents = serde_json::to_vec(&record).unwrap();
+            let error = UserTrustRecord::parse_at(&path, &contents).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to parse provider trust record"),
+                "{error}"
+            );
+            fs::write(&path, contents).unwrap();
+            let error = load_user_verified_identity(&user_dirs, &sha256, &source).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Failed to parse provider trust record"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

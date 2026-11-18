@@ -2,7 +2,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use carina_provider_resolver::{
-    DiscardedSignerPins, GuardedLockFile, LockFileMigration, ProviderInstallLock, WorkflowPins,
+    DiscardedSignerPins, GuardedLockFile, ProviderInstallLock, WorkflowPins,
 };
 
 use crate::error::AppError;
@@ -107,12 +107,6 @@ fn load_lock<'lock>(
     Ok(loaded)
 }
 
-fn report_lock_migration(migration: Option<&LockFileMigration>) {
-    if let Some(migration) = migration {
-        eprintln!("{migration}");
-    }
-}
-
 fn flush_preview() -> Result<(), AppError> {
     io::stderr()
         .flush()
@@ -158,14 +152,11 @@ fn confirm_recovery(target: &str, target_label: &str, force: bool) -> Result<boo
 
 fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
     let install_lock = acquire_install_lock(base_dir)?;
-    // The recovery preview folds this explicit load event into its discard
-    // report, so printing the event separately would duplicate its header.
     let mut lock = load_lock(&install_lock)?;
-    let migration = lock.take_migration();
     let recovery = lock
         .prepare_registry_discovery_repin(host)
         .map_err(|error| AppError::Config(error.to_string()))?;
-    eprintln!("{}", recovery.display_with_migration(migration.as_ref()));
+    eprintln!("{recovery}");
     flush_preview()?;
 
     if !confirm_recovery(host, "registry host", force)? {
@@ -183,46 +174,35 @@ fn run_repin_discovery(host: &str, force: bool, base_dir: &Path) -> Result<(), A
 fn run_repin_identity(provider: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
     let install_lock = acquire_install_lock(base_dir)?;
     let mut lock = load_lock(&install_lock)?;
-    let migration = lock.take_migration();
-    report_lock_migration(migration.as_ref());
     let recovery = lock
         .prepare_registry_identity_repin(provider)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let pin = recovery.identity_pin();
 
     eprintln!("Registry provider: {provider}");
-    match pin {
-        DiscardedSignerPins::Legacy(pin) => {
-            eprintln!(
-                "Discarding legacy certificate identity: {}",
-                pin.certificate_san
-            );
-            eprintln!("Discarding legacy OIDC issuer: {}", pin.oidc_issuer);
+    let DiscardedSignerPins::Current(pins) = pin;
+    eprintln!("Discarding source OIDC issuer: {}", pins.source.oidc_issuer);
+    eprintln!(
+        "Discarding source repository owner ID: {}",
+        pins.source.repository_owner_id
+    );
+    eprintln!(
+        "Discarding source repository ID: {}",
+        pins.source.repository_id
+    );
+    match &pins.workflows {
+        WorkflowPins::Stable(workflow) => {
+            eprintln!("Discarding stable workflow: {}", workflow.0);
         }
-        DiscardedSignerPins::Current(pins) => {
-            eprintln!("Discarding source OIDC issuer: {}", pins.source.oidc_issuer);
-            eprintln!(
-                "Discarding source repository owner ID: {}",
-                pins.source.repository_owner_id
-            );
-            eprintln!(
-                "Discarding source repository ID: {}",
-                pins.source.repository_id
-            );
-            match &pins.workflows {
-                WorkflowPins::Stable(workflow) => {
-                    eprintln!("Discarding stable workflow: {}", workflow.0);
-                }
-                WorkflowPins::Prerelease(workflow) => {
-                    eprintln!("Discarding pre-release workflow: {}", workflow.0);
-                }
-                WorkflowPins::Both { stable, prerelease } => {
-                    eprintln!("Discarding stable workflow: {}", stable.0);
-                    eprintln!("Discarding pre-release workflow: {}", prerelease.0);
-                }
-            }
+        WorkflowPins::Prerelease(workflow) => {
+            eprintln!("Discarding pre-release workflow: {}", workflow.0);
+        }
+        WorkflowPins::Both { stable, prerelease } => {
+            eprintln!("Discarding stable workflow: {}", stable.0);
+            eprintln!("Discarding pre-release workflow: {}", prerelease.0);
         }
     }
+
     eprintln!("The ratcheted signature requirement and all other lock state will be retained.");
     flush_preview()?;
 
@@ -249,8 +229,6 @@ fn display_sequence(value: Option<u64>) -> String {
 fn run_rebootstrap(provider: &str, force: bool, base_dir: &Path) -> Result<(), AppError> {
     let install_lock = acquire_install_lock(base_dir)?;
     let mut lock = load_lock(&install_lock)?;
-    let migration = lock.take_migration();
-    report_lock_migration(migration.as_ref());
     let recovery = lock
         .prepare_registry_rebootstrap(provider)
         .map_err(|error| AppError::Config(error.to_string()))?;

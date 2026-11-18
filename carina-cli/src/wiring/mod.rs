@@ -3289,9 +3289,7 @@ fn build_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
     notices: &mut ProviderNoticeSink,
 ) -> Result<ProviderFactoryLoad, AppError> {
     let providers = provider_loading_configs(providers);
-    carina_provider_resolver::validate_lock_constraints(base_dir, &providers, &mut |notice| {
-        notices.emit(ProviderLoadEvent::Resolver(notice))
-    })?;
+    carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
 
     build_factories_from_providers_impl(
         runtime,
@@ -3310,9 +3308,7 @@ fn build_schema_factories_from_providers<P: PlaceholderKind, B: BindingAddress>(
     notices: &mut ProviderNoticeSink,
 ) -> Result<ProviderFactoryLoad, AppError> {
     let providers = provider_loading_configs(providers);
-    carina_provider_resolver::validate_lock_constraints(base_dir, &providers, &mut |notice| {
-        notices.emit(ProviderLoadEvent::Resolver(notice))
-    })?;
+    carina_provider_resolver::validate_lock_constraints(base_dir, &providers)?;
 
     build_factories_from_providers_impl(
         runtime,
@@ -3338,11 +3334,7 @@ fn build_factories_from_providers_for_formatting<P: PlaceholderKind, B: BindingA
     notices: &mut ProviderNoticeSink,
 ) -> Result<FormattingFactoryLoad, AppError> {
     let providers = provider_loading_configs(providers);
-    if let Err(error) =
-        carina_provider_resolver::validate_lock_constraints(base_dir, &providers, &mut |notice| {
-            notices.emit(ProviderLoadEvent::Resolver(notice))
-        })
-    {
+    if let Err(error) = carina_provider_resolver::validate_lock_constraints(base_dir, &providers) {
         return Ok((
             Vec::new(),
             HashMap::from([(
@@ -3412,11 +3404,8 @@ fn build_factories_from_providers_impl<B: BindingAddress>(
                         .await
                     }
                     ProviderFactoryNetwork::Runtime => {
-                        match carina_provider_resolver::load_locked_egress(
-                            &project_dir,
-                            &verified,
-                            &mut |notice| notices.emit(ProviderLoadEvent::Resolver(notice)),
-                        ) {
+                        match carina_provider_resolver::load_locked_egress(&project_dir, &verified)
+                        {
                             Ok(locked_egress) => {
                                 carina_plugin_host::WasmProviderFactory::from_bytes_with_egress(
                                     verified,
@@ -3511,11 +3500,7 @@ where
             continue;
         }
 
-        let installed = match carina_provider_resolver::find_installed_provider(
-            base_dir,
-            config,
-            &mut |notice| notices.emit(ProviderLoadEvent::Resolver(notice)),
-        ) {
+        let installed = match carina_provider_resolver::find_installed_provider(base_dir, config) {
             Ok(installed) => installed,
             Err(e) => {
                 let reason = format!("Provider '{}' {}", config.name, e);
@@ -11446,13 +11431,10 @@ fn build_schema_only_factories_from_providers(
             ProviderSource::File(_) => carina_provider_resolver::find_file_provider_source(
                 base_dir,
                 &config.loading_projection(),
-                &mut |notice| notices.emit(ProviderLoadEvent::Resolver(notice)),
             )
             .map_err(carina_provider_resolver::FindInstalledProviderError::from),
             ProviderSource::Remote(_) => {
-                carina_provider_resolver::find_installed_provider(base_dir, config, &mut |notice| {
-                    notices.emit(ProviderLoadEvent::Resolver(notice))
-                })
+                carina_provider_resolver::find_installed_provider(base_dir, config)
             }
         };
         let installed = match installed {

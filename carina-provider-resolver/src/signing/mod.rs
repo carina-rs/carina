@@ -48,6 +48,7 @@ struct ExtractedSignerIdentity {
 pub(crate) struct VerifiedSignerIdentity(ExtractedSignerIdentity);
 
 impl VerifiedSignerIdentity {
+    #[cfg(test)]
     pub(crate) fn certificate_san(&self) -> &str {
         &self.0.certificate_san
     }

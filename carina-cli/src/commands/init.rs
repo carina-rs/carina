@@ -397,7 +397,6 @@ mod tests {
         let installed = carina_provider_resolver::find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project).unwrap(),
             config,
-            &mut |notice| eprintln!("{notice}"),
         )
         .unwrap();
         let grants = TrustedLocalGrants::parse(&[], None).unwrap();

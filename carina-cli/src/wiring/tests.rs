@@ -3191,7 +3191,6 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
-        &mut |_| {},
     )
     .unwrap();
 
@@ -14416,7 +14415,6 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
-        &mut |_| {},
     )
     .unwrap();
 

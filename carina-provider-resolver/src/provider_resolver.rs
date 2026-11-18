@@ -54,7 +54,7 @@ use crate::verified_artifact::{LoadedArtifactOrigin, record_test_github_origin_d
 use crate::version_resolver::{
     GithubRelease, ReleaseAssetVerificationError, VerifiedReleaseAsset,
     fetch_latest_release_with_api, fetch_releases_with_api, resolve_from_releases,
-    resolve_release_at_version, verify_fresh_release_asset,
+    verify_fresh_release_asset,
 };
 
 pub(crate) const PROVIDER_LOCK_FILE_NAME: &str = "carina-providers.lock";
@@ -82,7 +82,7 @@ pub fn provider_lock_path(project_dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum LockEntryKind {
-    /// Released provider pinned to a semver tag (or registry version).
+    /// Registry provider pinned to a published version.
     Version {
         version: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,7 +207,7 @@ impl LockEntry<NoRegistryLock> {
 /// A registry hostname normalized once at the lock-file boundary.
 ///
 /// Registry host map keys and provider references both use this type, so case
-/// differences cannot make a host record appear missing after migration.
+/// differences cannot make a host record appear missing after decoding.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CanonicalRegistryHostname(String);
 
@@ -653,10 +653,6 @@ pub struct LegacyRegistryDiscoveryPin {
 struct LegacyRegistryDiscoveryPins(BTreeSet<LegacyRegistryDiscoveryPin>);
 
 impl LegacyRegistryDiscoveryPins {
-    fn insert(&mut self, pin: LegacyRegistryDiscoveryPin) {
-        self.0.insert(pin);
-    }
-
     fn iter(&self) -> impl ExactSizeIterator<Item = &LegacyRegistryDiscoveryPin> {
         self.0.iter()
     }
@@ -685,74 +681,6 @@ impl<'de> Deserialize<'de> for LegacyRegistryDiscoveryPins {
             ));
         }
         Ok(Self(pins))
-    }
-}
-
-#[derive(Debug)]
-enum LegacyRegistryDiscoveryPinState {
-    Pinned(LegacyRegistryDiscoveryPin),
-    Unpinned,
-}
-
-#[derive(Debug)]
-struct LegacyRegistryHostLock {
-    discovery: LegacyRegistryDiscoveryPinState,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LegacyRegistryHostLockSerde {
-    discovery_pin_present: bool,
-    #[serde(default)]
-    api_base_url: Option<String>,
-    #[serde(default)]
-    discovery_sha256: Option<String>,
-}
-
-#[derive(Debug)]
-struct LegacyRegistryHostLockError;
-
-impl fmt::Display for LegacyRegistryHostLockError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "v2 registry host lock is inconsistent: api_base_url and discovery_sha256 must be present together exactly when discovery_pin_present is true"
-        )
-    }
-}
-
-impl std::error::Error for LegacyRegistryHostLockError {}
-
-impl TryFrom<LegacyRegistryHostLockSerde> for LegacyRegistryHostLock {
-    type Error = LegacyRegistryHostLockError;
-
-    fn try_from(value: LegacyRegistryHostLockSerde) -> Result<Self, Self::Error> {
-        let discovery = match (
-            value.discovery_pin_present,
-            value.api_base_url,
-            value.discovery_sha256,
-        ) {
-            (true, Some(api_base_url), Some(discovery_sha256)) => {
-                LegacyRegistryDiscoveryPinState::Pinned(LegacyRegistryDiscoveryPin {
-                    api_base_url,
-                    discovery_sha256,
-                })
-            }
-            (false, None, None) => LegacyRegistryDiscoveryPinState::Unpinned,
-            _ => return Err(LegacyRegistryHostLockError),
-        };
-        Ok(Self { discovery })
-    }
-}
-
-impl<'de> Deserialize<'de> for LegacyRegistryHostLock {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        LegacyRegistryHostLockSerde::deserialize(deserializer)?
-            .try_into()
-            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -907,12 +835,6 @@ enum ReleaseChannel {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacySignerPin {
-    pub certificate_san: String,
-    pub oidc_issuer: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourcePin {
     pub oidc_issuer: String,
     pub repository_owner_id: String,
@@ -941,13 +863,11 @@ pub struct CurrentSignerPins {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignerPinState {
     Unpinned,
-    Legacy(LegacySignerPin),
     Current(CurrentSignerPins),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscardedSignerPins {
-    Legacy(LegacySignerPin),
     Current(CurrentSignerPins),
 }
 
@@ -981,7 +901,6 @@ enum SignerTransition {
     Unchanged,
     FirstContact,
     ChannelPinned(ReleaseChannel),
-    LegacyConverted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -996,7 +915,6 @@ enum SignerRejection {
         expected: String,
         actual: String,
     },
-    LegacyIdentity,
     SourceMismatch {
         expected: Box<SourcePin>,
         actual: Box<SourcePin>,
@@ -1015,12 +933,6 @@ impl fmt::Display for SignerRejection {
                 f,
                 "stable provider certificate source ref mismatch: expected {expected:?}, got {actual:?}"
             ),
-            Self::LegacyIdentity => {
-                write!(
-                    f,
-                    "certificate SAN or OIDC issuer differs from the legacy lock pin"
-                )
-            }
             Self::SourceMismatch { expected, actual } => write!(
                 f,
                 "certificate source differs from the lock pin: expected {expected:?}, got {actual:?}"
@@ -1069,23 +981,6 @@ fn decide_signer(
             }),
             transition: SignerTransition::FirstContact,
         }),
-        SignerPinState::Legacy(pin) => {
-            // Legacy locks got oidc_issuer from Fulcio extension 1.1; the source
-            // issuer is extension 1.8. GitHub Actions writes the same
-            // token.actions.githubusercontent.com value to both extensions.
-            if pin.certificate_san != identity.certificate_san()
-                || pin.oidc_issuer != identity.source().oidc_issuer
-            {
-                return Err(SignerRejection::LegacyIdentity);
-            }
-            Ok(SignerAcceptance {
-                next: SignerPinState::Current(CurrentSignerPins {
-                    source,
-                    workflows: WorkflowPins::for_channel(channel, workflow),
-                }),
-                transition: SignerTransition::LegacyConverted,
-            })
-        }
         SignerPinState::Current(pins) => {
             if pins.source != source {
                 return Err(SignerRejection::SourceMismatch {
@@ -1192,7 +1087,6 @@ impl DiscardedSignerPins {
         let conflict_left = self.clone();
         let conflict_right = other.clone();
         match (self, other) {
-            (Self::Legacy(left), Self::Legacy(right)) if left == right => Ok(Self::Legacy(left)),
             (Self::Current(left), Self::Current(right)) if left.source == right.source => left
                 .workflows
                 .merge(&right.workflows)
@@ -1458,9 +1352,6 @@ impl RegistryRatchets {
             transparency_log_present,
         } = self;
         let pin = match signature {
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(pin)) => {
-                DiscardedSignerPins::Legacy(pin)
-            }
             RegistrySignatureProtection::Required(SignerPinState::Current(pins)) => {
                 DiscardedSignerPins::Current(pins)
             }
@@ -1595,7 +1486,6 @@ impl From<&RegistryLock> for RegistryRatchets {
 enum RegistrySignatureStateSerde {
     NotRequired,
     RequiredUnpinned,
-    RequiredLegacy,
     RequiredCurrent,
 }
 
@@ -1603,10 +1493,6 @@ enum RegistrySignatureStateSerde {
 #[serde(deny_unknown_fields)]
 struct RegistrySignatureProtectionSerde {
     signature_state: RegistrySignatureStateSerde,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_certificate_identity: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_certificate_oidc_issuer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_oidc_issuer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1625,40 +1511,25 @@ impl TryFrom<RegistrySignatureProtectionSerde> for RegistrySignatureProtection {
     fn try_from(value: RegistrySignatureProtectionSerde) -> Result<Self, Self::Error> {
         let RegistrySignatureProtectionSerde {
             signature_state,
-            legacy_certificate_identity,
-            legacy_certificate_oidc_issuer,
             source_oidc_issuer,
             source_repository_owner_id,
             source_repository_id,
             stable_workflow,
             prerelease_workflow,
         } = value;
-        let has_legacy =
-            legacy_certificate_identity.is_some() || legacy_certificate_oidc_issuer.is_some();
         let has_current = source_oidc_issuer.is_some()
             || source_repository_owner_id.is_some()
             || source_repository_id.is_some()
             || stable_workflow.is_some()
             || prerelease_workflow.is_some();
         let state = match signature_state {
-            RegistrySignatureStateSerde::NotRequired if !has_legacy && !has_current => {
+            RegistrySignatureStateSerde::NotRequired if !has_current => {
                 return Ok(Self::NotRequired);
             }
-            RegistrySignatureStateSerde::RequiredUnpinned if !has_legacy && !has_current => {
+            RegistrySignatureStateSerde::RequiredUnpinned if !has_current => {
                 SignerPinState::Unpinned
             }
-            RegistrySignatureStateSerde::RequiredLegacy if !has_current => {
-                let (Some(certificate_san), Some(oidc_issuer)) =
-                    (legacy_certificate_identity, legacy_certificate_oidc_issuer)
-                else {
-                    return Err(RegistryLockError::InconsistentSignature);
-                };
-                SignerPinState::Legacy(LegacySignerPin {
-                    certificate_san,
-                    oidc_issuer,
-                })
-            }
-            RegistrySignatureStateSerde::RequiredCurrent if !has_legacy => {
+            RegistrySignatureStateSerde::RequiredCurrent => {
                 let (Some(oidc_issuer), Some(repository_owner_id), Some(repository_id)) = (
                     source_oidc_issuer,
                     source_repository_owner_id,
@@ -1685,9 +1556,7 @@ impl TryFrom<RegistrySignatureProtectionSerde> for RegistrySignatureProtection {
                 })
             }
             RegistrySignatureStateSerde::NotRequired
-            | RegistrySignatureStateSerde::RequiredUnpinned
-            | RegistrySignatureStateSerde::RequiredLegacy
-            | RegistrySignatureStateSerde::RequiredCurrent => {
+            | RegistrySignatureStateSerde::RequiredUnpinned => {
                 return Err(RegistryLockError::InconsistentSignature);
             }
         };
@@ -1700,8 +1569,6 @@ impl From<RegistrySignatureProtection> for RegistrySignatureProtectionSerde {
         match value {
             RegistrySignatureProtection::NotRequired => Self {
                 signature_state: RegistrySignatureStateSerde::NotRequired,
-                legacy_certificate_identity: None,
-                legacy_certificate_oidc_issuer: None,
                 source_oidc_issuer: None,
                 source_repository_owner_id: None,
                 source_repository_id: None,
@@ -1710,18 +1577,6 @@ impl From<RegistrySignatureProtection> for RegistrySignatureProtectionSerde {
             },
             RegistrySignatureProtection::Required(SignerPinState::Unpinned) => Self {
                 signature_state: RegistrySignatureStateSerde::RequiredUnpinned,
-                legacy_certificate_identity: None,
-                legacy_certificate_oidc_issuer: None,
-                source_oidc_issuer: None,
-                source_repository_owner_id: None,
-                source_repository_id: None,
-                stable_workflow: None,
-                prerelease_workflow: None,
-            },
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(pin)) => Self {
-                signature_state: RegistrySignatureStateSerde::RequiredLegacy,
-                legacy_certificate_identity: Some(pin.certificate_san),
-                legacy_certificate_oidc_issuer: Some(pin.oidc_issuer),
                 source_oidc_issuer: None,
                 source_repository_owner_id: None,
                 source_repository_id: None,
@@ -1732,8 +1587,6 @@ impl From<RegistrySignatureProtection> for RegistrySignatureProtectionSerde {
                 let (stable_workflow, prerelease_workflow) = pins.workflows.into_options();
                 Self {
                     signature_state: RegistrySignatureStateSerde::RequiredCurrent,
-                    legacy_certificate_identity: None,
-                    legacy_certificate_oidc_issuer: None,
                     source_oidc_issuer: Some(pins.source.oidc_issuer),
                     source_repository_owner_id: Some(pins.source.repository_owner_id),
                     source_repository_id: Some(pins.source.repository_id),
@@ -1829,10 +1682,6 @@ struct RegistryRatchetsSerde {
     yanked_versions: BTreeSet<String>,
     signature_state: RegistrySignatureStateSerde,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_certificate_identity: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_certificate_oidc_issuer: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     source_oidc_issuer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_repository_owner_id: Option<String>,
@@ -1855,8 +1704,6 @@ impl TryFrom<RegistryRatchetsSerde> for RegistryRatchets {
             valid_until_present,
             yanked_versions,
             signature_state,
-            legacy_certificate_identity,
-            legacy_certificate_oidc_issuer,
             source_oidc_issuer,
             source_repository_owner_id,
             source_repository_id,
@@ -1867,8 +1714,6 @@ impl TryFrom<RegistryRatchetsSerde> for RegistryRatchets {
         let sequence = sequence_from_wire(sequence_present, sequence)?;
         let signature = RegistrySignatureProtectionSerde {
             signature_state,
-            legacy_certificate_identity,
-            legacy_certificate_oidc_issuer,
             source_oidc_issuer,
             source_repository_owner_id,
             source_repository_id,
@@ -1894,8 +1739,6 @@ impl From<RegistryRatchets> for RegistryRatchetsSerde {
         };
         let RegistrySignatureProtectionSerde {
             signature_state,
-            legacy_certificate_identity,
-            legacy_certificate_oidc_issuer,
             source_oidc_issuer,
             source_repository_owner_id,
             source_repository_id,
@@ -1908,8 +1751,6 @@ impl From<RegistryRatchets> for RegistryRatchetsSerde {
             valid_until_present: value.valid_until_present,
             yanked_versions: value.yanked_versions.into_serialized(),
             signature_state,
-            legacy_certificate_identity,
-            legacy_certificate_oidc_issuer,
             source_oidc_issuer,
             source_repository_owner_id,
             source_repository_id,
@@ -1948,10 +1789,6 @@ struct RegistryLockSerde {
     yanked_versions: BTreeSet<String>,
     signature_state: RegistrySignatureStateSerde,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_certificate_identity: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    legacy_certificate_oidc_issuer: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     source_oidc_issuer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source_repository_owner_id: Option<String>,
@@ -1978,8 +1815,6 @@ impl TryFrom<RegistryLockSerde> for RegistryLock {
             valid_until_present,
             yanked_versions,
             signature_state,
-            legacy_certificate_identity,
-            legacy_certificate_oidc_issuer,
             source_oidc_issuer,
             source_repository_owner_id,
             source_repository_id,
@@ -1996,8 +1831,6 @@ impl TryFrom<RegistryLockSerde> for RegistryLock {
         validate_sequence_anchor(&sequence, sequence_anchor)?;
         let signature = RegistrySignatureProtectionSerde {
             signature_state,
-            legacy_certificate_identity,
-            legacy_certificate_oidc_issuer,
             source_oidc_issuer,
             source_repository_owner_id,
             source_repository_id,
@@ -2027,8 +1860,6 @@ impl From<RegistryLock> for RegistryLockSerde {
             sequence_anchor_to_wire(value.sequence_anchor);
         let RegistrySignatureProtectionSerde {
             signature_state,
-            legacy_certificate_identity,
-            legacy_certificate_oidc_issuer,
             source_oidc_issuer,
             source_repository_owner_id,
             source_repository_id,
@@ -2045,8 +1876,6 @@ impl From<RegistryLock> for RegistryLockSerde {
             valid_until_present: value.valid_until_present,
             yanked_versions: value.yanked_versions.into_serialized(),
             signature_state,
-            legacy_certificate_identity,
-            legacy_certificate_oidc_issuer,
             source_oidc_issuer,
             source_repository_owner_id,
             source_repository_id,
@@ -2072,7 +1901,7 @@ impl fmt::Display for RegistryLockError {
             ),
             Self::InconsistentSignature => write!(
                 f,
-                "registry lock is inconsistent: legacy certificate_identity and certificate_oidc_issuer must appear together, while current signer pins require exactly one source and at least one workflow"
+                "registry lock is inconsistent: signer pins require exactly one source and at least one workflow"
             ),
         }
     }
@@ -2105,9 +1934,6 @@ impl RegistrySignatureProtection {
 
     fn established_pins(&self) -> Option<DiscardedSignerPins> {
         match self {
-            Self::Required(SignerPinState::Legacy(pin)) => {
-                Some(DiscardedSignerPins::Legacy(pin.clone()))
-            }
             Self::Required(SignerPinState::Current(pins)) => {
                 Some(DiscardedSignerPins::Current(pins.clone()))
             }
@@ -2123,7 +1949,6 @@ impl RegistrySignatureProtection {
             (None, None) => None,
         };
         Ok(match pins {
-            Some(DiscardedSignerPins::Legacy(pin)) => Self::Required(SignerPinState::Legacy(pin)),
             Some(DiscardedSignerPins::Current(pins)) => {
                 Self::Required(SignerPinState::Current(pins))
             }
@@ -2169,227 +1994,6 @@ impl RegistryLock {
     }
 }
 
-/// Why a raw lock entry could not be represented by the current typed schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LegacyReason {
-    GithubDirectVersionWithoutTag {
-        version: String,
-        sha256: String,
-    },
-    RevisionWithoutArtifactId {
-        revision: String,
-        resolved_sha: CommitSha,
-        sha256: String,
-    },
-}
-
-impl fmt::Display for LegacyReason {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::GithubDirectVersionWithoutTag { version, sha256: _ } => write!(
-                formatter,
-                "GitHub direct version entry {version} without an exact release tag"
-            ),
-            Self::RevisionWithoutArtifactId {
-                revision,
-                resolved_sha,
-                sha256: _,
-            } => write!(
-                formatter,
-                "GitHub revision entry {revision} at {resolved_sha} without an artifact ID"
-            ),
-        }
-    }
-}
-
-/// A raw legacy lock entry retained for safe migration or a typed error.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LegacyLockEntry {
-    pub source: String,
-    pub reason: LegacyReason,
-    raw: toml::Table,
-}
-
-impl LegacyLockEntry {
-    fn error(&self, project_dir: &ResolvedPath) -> LegacyLockEntryError {
-        LegacyLockEntryError {
-            source: self.source.clone(),
-            reason: self.reason.clone(),
-            project_dir: project_dir.source_label(),
-        }
-    }
-}
-
-/// Why a GitHub-direct legacy table could not be retained safely.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LegacyLockEntryParseError {
-    /// A checksum or version pin was absent or was not a TOML string.
-    MissingStringField { source: String, field: &'static str },
-    /// The legacy version pin is not a semantic version.
-    InvalidVersion { source: String, version: String },
-    /// The legacy revision pin does not contain a canonical Git commit SHA.
-    InvalidResolvedSha { source: String, value: String },
-}
-
-impl fmt::Display for LegacyLockEntryParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingStringField { source, field } => write!(
-                formatter,
-                "legacy GitHub version entry for '{source}' is missing string field '{field}'"
-            ),
-            Self::InvalidVersion { source, version } => write!(
-                formatter,
-                "legacy GitHub version entry for '{source}' has invalid semantic version '{version}'"
-            ),
-            Self::InvalidResolvedSha { source, value } => write!(
-                formatter,
-                "legacy GitHub revision entry for '{source}' has invalid resolved SHA '{value}'"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for LegacyLockEntryParseError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegacyLockEntryError {
-    pub source: String,
-    pub reason: LegacyReason,
-    project_dir: PathBuf,
-}
-
-impl fmt::Display for LegacyLockEntryError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "carina-providers.lock contains a legacy entry for '{}' ({}). Run `{}` to re-resolve it and rewrite the lock.",
-            self.source,
-            self.reason,
-            ProjectCommand::new("init", &self.project_dir)
-        )
-    }
-}
-
-impl std::error::Error for LegacyLockEntryError {}
-
-fn github_direct_version_without_tag(
-    entry: &toml::Table,
-) -> Result<Option<(String, LegacyReason)>, LegacyLockEntryParseError> {
-    if entry.get("mode").and_then(toml::Value::as_str) != Some("version") {
-        return Ok(None);
-    }
-    let Some(source) = entry.get("source").and_then(toml::Value::as_str) else {
-        return Ok(None);
-    };
-    if !matches!(
-        source.parse::<ProviderSource>(),
-        Ok(ProviderSource::Remote(RemoteSource::GithubDirect(_)))
-    ) {
-        return Ok(None);
-    }
-    let required = |field: &'static str| {
-        entry
-            .get(field)
-            .and_then(toml::Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| LegacyLockEntryParseError::MissingStringField {
-                source: source.to_string(),
-                field,
-            })
-    };
-    let version = required("version")?;
-    Version::parse(&version).map_err(|_| LegacyLockEntryParseError::InvalidVersion {
-        source: source.to_string(),
-        version: version.clone(),
-    })?;
-    Ok(Some((
-        source.to_string(),
-        LegacyReason::GithubDirectVersionWithoutTag {
-            version,
-            sha256: required("sha256")?,
-        },
-    )))
-}
-
-fn revision_without_artifact_id(
-    entry: &toml::Table,
-) -> Result<Option<(String, LegacyReason)>, LegacyLockEntryParseError> {
-    const REQUIRED_KEYS: [&str; 6] = [
-        "name",
-        "source",
-        "mode",
-        "revision",
-        "resolved_sha",
-        "sha256",
-    ];
-
-    if entry.get("mode").and_then(toml::Value::as_str) != Some("revision") {
-        return Ok(None);
-    }
-    let Some(source) = entry.get("source").and_then(toml::Value::as_str) else {
-        return Ok(None);
-    };
-    if !matches!(
-        source.parse::<ProviderSource>(),
-        Ok(ProviderSource::Remote(RemoteSource::GithubDirect(_)))
-    ) {
-        return Ok(None);
-    }
-    let expected_len = REQUIRED_KEYS.len() + usize::from(entry.contains_key("registry"));
-    if entry.len() != expected_len || !REQUIRED_KEYS.iter().all(|key| entry.contains_key(*key)) {
-        return Ok(None);
-    }
-    let required = |field: &'static str| {
-        entry
-            .get(field)
-            .and_then(toml::Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| LegacyLockEntryParseError::MissingStringField {
-                source: source.to_string(),
-                field,
-            })
-    };
-    let resolved_sha = required("resolved_sha")?;
-    let resolved_sha = CommitSha::new(resolved_sha.clone()).map_err(|_| {
-        LegacyLockEntryParseError::InvalidResolvedSha {
-            source: source.to_string(),
-            value: resolved_sha,
-        }
-    })?;
-    Ok(Some((
-        source.to_string(),
-        LegacyReason::RevisionWithoutArtifactId {
-            revision: required("revision")?,
-            resolved_sha,
-            sha256: required("sha256")?,
-        },
-    )))
-}
-
-/// Split migratable legacy entries from tables accepted by the typed schema.
-pub(crate) fn split_legacy_entries(
-    entries: Vec<toml::Table>,
-) -> Result<(Vec<toml::Table>, Vec<LegacyLockEntry>), LegacyLockEntryParseError> {
-    let mut retained = Vec::with_capacity(entries.len());
-    let mut legacy = Vec::new();
-    for entry in entries {
-        let classified =
-            github_direct_version_without_tag(&entry)?.or(revision_without_artifact_id(&entry)?);
-        match classified {
-            Some((source, reason)) => {
-                legacy.push(LegacyLockEntry {
-                    source,
-                    reason,
-                    raw: entry,
-                });
-            }
-            None => retained.push(entry),
-        }
-    }
-    Ok((retained, legacy))
-}
-
 /// The full carina-providers.lock file.
 ///
 /// `LockFile` deliberately implements neither `Serialize` nor `Deserialize`.
@@ -2402,7 +2006,6 @@ pub struct LockFile {
     registry_host: BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
     pub provider: Vec<LockEntry<RegistryLock>>,
     egress: BTreeMap<EgressArtifactKey, crate::EgressLockRecord>,
-    legacy: Vec<LegacyLockEntry>,
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
 }
 
@@ -2425,11 +2028,6 @@ impl EgressArtifactKey {
     }
 }
 
-enum SourceLockEntry<'a> {
-    Typed(&'a LockEntry<RegistryLock>),
-    Legacy(&'a LegacyLockEntry),
-}
-
 /// The crate-internal serialization view of [`LockFile`]. Field order and
 /// omission rules are part of the lock-file byte format and must stay aligned
 /// with the former direct `LockFile` serialization.
@@ -2438,16 +2036,9 @@ struct SerializableLockFile<'a> {
     version: &'a u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     registry_host: &'a BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
-    provider: Vec<SerializableProviderEntry<'a>>,
+    provider: Vec<SerializableCurrentProviderEntry<'a>>,
     #[serde(default, skip_serializing_if = "UnpinnedRegistryRatchets::is_empty")]
     unpinned_registry_ratchets: &'a UnpinnedRegistryRatchets,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum SerializableProviderEntry<'a> {
-    Current(SerializableCurrentProviderEntry<'a>),
-    Legacy(&'a toml::Table),
 }
 
 #[derive(Serialize)]
@@ -2581,381 +2172,157 @@ struct UncheckedLockFile {
     unpinned_registry_ratchets: UnpinnedRegistryRatchets,
 }
 
+/// Source and pin are decoded together: registry version pins cannot represent
+/// a GitHub artifact, and GitHub pins always contain an exact artifact ID.
 #[derive(Deserialize)]
 struct CurrentProviderEntry {
+    name: String,
     #[serde(flatten)]
-    entry: LockEntry<RegistryLock>,
+    pin: CurrentProviderPin,
+    sha256: String,
+    #[serde(default)]
+    registry: Option<RegistryLock>,
     #[serde(default)]
     egress: Option<crate::EgressLockRecord>,
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UncheckedLockFileV4 {
-    #[serde(rename = "version")]
-    _version: u32,
-    #[serde(default)]
-    registry_host: BTreeMap<String, RegistryHostLock>,
-    #[serde(default)]
-    provider: Vec<LockEntry<RegistryLock>>,
-    #[serde(default)]
-    unpinned_registry_ratchets: UnpinnedRegistryRatchets,
+#[serde(tag = "mode", rename_all = "lowercase")]
+enum CurrentProviderPin {
+    Version {
+        #[serde(deserialize_with = "decode_registry_source")]
+        source: RegistrySource,
+        version: String,
+        #[serde(default)]
+        constraint: Option<String>,
+    },
+    Release {
+        #[serde(deserialize_with = "decode_github_source")]
+        source: GithubSource,
+        version: Version,
+        tag: ReleaseTag,
+        asset_id: AssetId,
+        #[serde(default)]
+        constraint: Option<String>,
+    },
+    Revision {
+        #[serde(deserialize_with = "decode_github_source")]
+        source: GithubSource,
+        revision: String,
+        resolved_sha: CommitSha,
+        artifact_id: ArtifactId,
+    },
+    RegistryRevision {
+        #[serde(deserialize_with = "decode_registry_source")]
+        source: RegistrySource,
+        revision: String,
+        version: String,
+    },
+    File {
+        #[serde(deserialize_with = "decode_file_source")]
+        source: FileSource,
+    },
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UncheckedLockFileV3 {
-    #[serde(rename = "version")]
-    _version: u32,
-    #[serde(default)]
-    registry_host: BTreeMap<String, RegistryHostLock>,
-    #[serde(default)]
-    provider: Vec<LockEntry<RegistryLockV3>>,
-    #[serde(default)]
-    unpinned_registry_ratchets: UnpinnedRegistryRatchetsV3,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UncheckedLockFileV2 {
-    #[serde(rename = "version")]
-    _version: u32,
-    #[serde(default)]
-    registry_host: BTreeMap<String, LegacyRegistryHostLock>,
-    #[serde(default)]
-    provider: Vec<LockEntry<RegistryLockV3>>,
-    #[serde(default)]
-    unpinned_registry_ratchets: UnpinnedRegistryRatchetsV3,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UncheckedLockFileV1 {
-    #[serde(rename = "version")]
-    _version: u32,
-    #[serde(default)]
-    provider: Vec<LockEntry<RegistryLockV1>>,
-    #[serde(default)]
-    unpinned_registry_yanks: UnpinnedRegistryYanksV1,
-    #[serde(default)]
-    unpinned_registry_ratchets: UnpinnedRegistryRatchetsV3,
-}
-
-/// The registry entry shape used by lock format v1. Discovery pins were still
-/// provider-owned; v2 moved the first two fields to a host-owned record.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegistryLockV1 {
-    resolved_hostname: CanonicalRegistryHostname,
-    api_base_url: String,
-    discovery_sha256: String,
-    sequence_present: bool,
-    #[serde(default)]
-    sequence: Option<u64>,
-    #[serde(default)]
-    sequence_anchor_established: Option<bool>,
-    #[serde(default)]
-    sequence_anchor: Option<u64>,
-    valid_until_present: bool,
-    #[serde(default)]
-    yanked_versions: BTreeSet<String>,
-    signature_present: bool,
-    #[serde(default)]
-    certificate_identity: Option<String>,
-    #[serde(default)]
-    certificate_oidc_issuer: Option<String>,
-    transparency_log_present: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegistryLockV3 {
-    resolved_hostname: CanonicalRegistryHostname,
-    sequence_present: bool,
-    #[serde(default)]
-    sequence: Option<u64>,
-    sequence_anchor_established: bool,
-    #[serde(default)]
-    sequence_anchor: Option<u64>,
-    valid_until_present: bool,
-    #[serde(default)]
-    yanked_versions: BTreeSet<String>,
-    signature_present: bool,
-    #[serde(default)]
-    certificate_identity: Option<String>,
-    #[serde(default)]
-    certificate_oidc_issuer: Option<String>,
-    transparency_log_present: bool,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RegistryRatchetsV3 {
-    sequence_present: bool,
-    #[serde(default)]
-    sequence: Option<u64>,
-    valid_until_present: bool,
-    #[serde(default)]
-    yanked_versions: BTreeSet<String>,
-    signature_present: bool,
-    #[serde(default)]
-    certificate_identity: Option<String>,
-    #[serde(default)]
-    certificate_oidc_issuer: Option<String>,
-    transparency_log_present: bool,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(transparent)]
-struct UnpinnedRegistryRatchetsV3(BTreeMap<String, RegistryRatchetsV3>);
-
-/// Yank observations written by 3a080a0d before v1 generalized the root-level
-/// storage into `unpinned_registry_ratchets`.
-#[derive(Default, Deserialize)]
-#[serde(transparent)]
-struct UnpinnedRegistryYanksV1(BTreeMap<String, BTreeSet<String>>);
-
-impl RegistryLockV1 {
-    fn into_v3(
-        self,
-    ) -> (
-        CanonicalRegistryHostname,
-        LegacyRegistryDiscoveryPin,
-        RegistryLockV3,
-    ) {
-        let Self {
-            resolved_hostname,
-            api_base_url,
-            discovery_sha256,
-            sequence_present,
-            sequence,
-            sequence_anchor_established,
-            sequence_anchor,
-            valid_until_present,
-            yanked_versions,
-            signature_present,
-            certificate_identity,
-            certificate_oidc_issuer,
-            transparency_log_present,
-        } = self;
-        let (sequence_anchor_established, sequence_anchor) = match sequence_anchor_established {
-            Some(established) => (established, sequence_anchor),
-            // Before 7ef946a9, `sequence` itself was both the greatest
-            // observation and the rollback/fast-forward baseline.
-            None if sequence_anchor.is_none() => (sequence_present, sequence),
-            // This combination was never emitted. Preserve it as an
-            // inconsistent wire pair so the shared v3 validator rejects it.
-            None => (false, sequence_anchor),
-        };
-        let discovery_pin = LegacyRegistryDiscoveryPin {
-            api_base_url,
-            discovery_sha256,
-        };
-        let registry = RegistryLockV3 {
-            resolved_hostname: resolved_hostname.clone(),
-            sequence_present,
-            sequence,
-            sequence_anchor_established,
-            sequence_anchor,
-            valid_until_present,
-            yanked_versions,
-            signature_present,
-            certificate_identity,
-            certificate_oidc_issuer,
-            transparency_log_present,
-        };
-        (resolved_hostname, discovery_pin, registry)
-    }
-}
-
-struct MigratedV1ProviderEntries {
-    registry_host: BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
-    discarded_discovery_pins: BTreeMap<CanonicalRegistryHostname, LegacyRegistryDiscoveryPins>,
-    provider: Vec<LockEntry<RegistryLockV3>>,
-}
-
-fn migrate_v1_provider_entries(
-    entries: Vec<LockEntry<RegistryLockV1>>,
-) -> MigratedV1ProviderEntries {
-    let mut discovery_pins: BTreeMap<CanonicalRegistryHostname, LegacyRegistryDiscoveryPins> =
-        BTreeMap::new();
-    let mut provider = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let registry = match entry.registry {
-            Some(registry) => {
-                let (hostname, discovery_pin, registry) = registry.into_v3();
-                discovery_pins
-                    .entry(hostname)
-                    .and_modify(|pins| pins.insert(discovery_pin.clone()))
-                    .or_insert_with(|| discovery_pin.into());
-                Some(registry)
-            }
-            None => None,
-        };
-        provider.push(LockEntry {
-            name: entry.name,
-            source: entry.source,
-            kind: entry.kind,
-            sha256: entry.sha256,
-            registry,
-        });
-    }
-    let registry_host = discovery_pins
-        .iter()
-        .map(|(hostname, pins)| {
-            (
-                hostname.clone(),
-                RegistryHostLock {
-                    discovery: RegistryDiscoveryPinState::MigrationPendingAuthorization(
-                        pins.clone(),
-                    ),
-                },
-            )
-        })
-        .collect();
-    MigratedV1ProviderEntries {
-        registry_host,
-        discarded_discovery_pins: discovery_pins,
-        provider,
-    }
-}
-
-fn merge_v1_unpinned_registry_yanks(
-    yanks: UnpinnedRegistryYanksV1,
-    mut ratchets: UnpinnedRegistryRatchetsV3,
-) -> UnpinnedRegistryRatchetsV3 {
-    for (source, yanked_versions) in yanks.0 {
-        ratchets
-            .0
-            .entry(source)
-            .or_default()
-            .yanked_versions
-            .extend(yanked_versions);
-    }
-    ratchets
-}
-
-fn signature_from_v3(
-    signature_present: bool,
-    certificate_identity: Option<String>,
-    certificate_oidc_issuer: Option<String>,
-) -> Result<RegistrySignatureProtection, RegistryLockError> {
-    match (
-        signature_present,
-        certificate_identity,
-        certificate_oidc_issuer,
-    ) {
-        (false, None, None) => Ok(RegistrySignatureProtection::NotRequired),
-        (true, None, None) => Ok(RegistrySignatureProtection::Required(
-            SignerPinState::Unpinned,
+fn decode_registry_source<'de, D>(deserializer: D) -> Result<RegistrySource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match ProviderSource::deserialize(deserializer)? {
+        ProviderSource::Remote(RemoteSource::Registry(source)) => Ok(source),
+        _ => Err(serde::de::Error::custom(
+            "registry pin requires a registry source",
         )),
-        (true, Some(certificate_san), Some(oidc_issuer)) => Ok(
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
-                certificate_san,
-                oidc_issuer,
-            })),
-        ),
-        _ => Err(RegistryLockError::InconsistentSignature),
     }
 }
 
-impl TryFrom<RegistryLockV3> for RegistryLock {
-    type Error = RegistryLockError;
-
-    fn try_from(value: RegistryLockV3) -> Result<Self, Self::Error> {
-        let sequence = sequence_from_wire(value.sequence_present, value.sequence)?;
-        let sequence_anchor = sequence_anchor_from_wire(
-            value.sequence_anchor_established,
-            false,
-            value.sequence_anchor,
-        )?;
-        validate_sequence_anchor(&sequence, sequence_anchor)?;
-        Ok(Self {
-            resolved_hostname: value.resolved_hostname,
-            sequence,
-            sequence_anchor,
-            valid_until_present: value.valid_until_present,
-            yanked_versions: YankedRegistryVersions::from_serialized(value.yanked_versions),
-            signature: signature_from_v3(
-                value.signature_present,
-                value.certificate_identity,
-                value.certificate_oidc_issuer,
-            )?,
-            transparency_log_present: value.transparency_log_present,
-        })
+fn decode_github_source<'de, D>(deserializer: D) -> Result<GithubSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match ProviderSource::deserialize(deserializer)? {
+        ProviderSource::Remote(RemoteSource::GithubDirect(source)) => Ok(source),
+        _ => Err(serde::de::Error::custom(
+            "GitHub pin requires a GitHub source",
+        )),
     }
 }
 
-impl TryFrom<RegistryRatchetsV3> for RegistryRatchets {
-    type Error = RegistryLockError;
-
-    fn try_from(value: RegistryRatchetsV3) -> Result<Self, Self::Error> {
-        Ok(Self {
-            sequence: sequence_from_wire(value.sequence_present, value.sequence)?,
-            valid_until_present: value.valid_until_present,
-            yanked_versions: YankedRegistryVersions::from_serialized(value.yanked_versions),
-            signature: signature_from_v3(
-                value.signature_present,
-                value.certificate_identity,
-                value.certificate_oidc_issuer,
-            )?,
-            transparency_log_present: value.transparency_log_present,
-        })
+fn decode_file_source<'de, D>(deserializer: D) -> Result<FileSource, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match ProviderSource::deserialize(deserializer)? {
+        ProviderSource::File(source) => Ok(source),
+        _ => Err(serde::de::Error::custom("file pin requires a file source")),
     }
 }
 
-fn migrate_v3_provider_entries(
-    entries: Vec<LockEntry<RegistryLockV3>>,
-) -> Result<Vec<LockEntry<RegistryLock>>, RegistryLockError> {
-    entries
-        .into_iter()
-        .map(|entry| {
-            Ok(LockEntry {
-                name: entry.name,
-                source: entry.source,
-                kind: entry.kind,
-                sha256: entry.sha256,
-                registry: entry.registry.map(TryInto::try_into).transpose()?,
-            })
-        })
-        .collect()
-}
-
-fn migrate_v3_ratchets(
-    ratchets: UnpinnedRegistryRatchetsV3,
-) -> Result<UnpinnedRegistryRatchets, RegistryLockError> {
-    ratchets
-        .0
-        .into_iter()
-        .map(|(source, ratchets)| Ok((source, ratchets.try_into()?)))
-        .collect::<Result<BTreeMap<_, _>, RegistryLockError>>()
-        .map(UnpinnedRegistryRatchets)
-}
-
-fn migrate_legacy_registry_hosts(
-    legacy_hosts: BTreeMap<CanonicalRegistryHostname, LegacyRegistryHostLock>,
-) -> (
-    BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
-    BTreeMap<CanonicalRegistryHostname, LegacyRegistryDiscoveryPins>,
-) {
-    let mut discarded_discovery_pins = BTreeMap::new();
-    let registry_host = legacy_hosts
-        .into_iter()
-        .map(|(host, legacy_host)| {
-            let discovery = match legacy_host.discovery {
-                LegacyRegistryDiscoveryPinState::Pinned(pin) => {
-                    let pins = LegacyRegistryDiscoveryPins::from(pin);
-                    discarded_discovery_pins.insert(host.clone(), pins.clone());
-                    RegistryDiscoveryPinState::MigrationPendingAuthorization(pins)
-                }
-                LegacyRegistryDiscoveryPinState::Unpinned => {
-                    RegistryDiscoveryPinState::Unpinned(UnconsumedDiscoveryValues::default())
-                }
-            };
-            (host, RegistryHostLock { discovery })
-        })
-        .collect();
-    (registry_host, discarded_discovery_pins)
+impl CurrentProviderEntry {
+    fn into_entry(self) -> (LockEntry<RegistryLock>, Option<crate::EgressLockRecord>) {
+        let (source, kind) = match self.pin {
+            CurrentProviderPin::Version {
+                source,
+                version,
+                constraint,
+            } => (
+                source.to_string(),
+                LockEntryKind::Version {
+                    version,
+                    constraint,
+                },
+            ),
+            CurrentProviderPin::Release {
+                source,
+                version,
+                tag,
+                asset_id,
+                constraint,
+            } => (
+                source.to_string(),
+                LockEntryKind::GithubRelease {
+                    version,
+                    tag,
+                    asset_id,
+                    constraint,
+                },
+            ),
+            CurrentProviderPin::Revision {
+                source,
+                revision,
+                resolved_sha,
+                artifact_id,
+            } => (
+                source.to_string(),
+                LockEntryKind::Revision {
+                    revision,
+                    resolved_sha,
+                    artifact_id,
+                },
+            ),
+            CurrentProviderPin::RegistryRevision {
+                source,
+                revision,
+                version,
+            } => (
+                source.to_string(),
+                LockEntryKind::RegistryRevision { revision, version },
+            ),
+            CurrentProviderPin::File { source } => {
+                (format!("file://{}", source.path()), LockEntryKind::File)
+            }
+        };
+        (
+            LockEntry {
+                name: self.name,
+                source,
+                kind,
+                sha256: self.sha256,
+                registry: self.registry,
+            },
+            self.egress,
+        )
+    }
 }
 
 fn canonicalize_registry_host_keys<T>(
@@ -2983,275 +2350,6 @@ where
         path: path.to_path_buf(),
         source,
     })
-}
-
-fn parse_lock_table<T>(table: &toml::Table, path: &Path) -> Result<T, LockFileError>
-where
-    T: DeserializeOwned,
-{
-    toml::Value::Table(table.clone())
-        .try_into()
-        .map_err(|source| LockFileError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-fn split_lock_table_legacy_entries(
-    content: &str,
-    path: &Path,
-) -> Result<(toml::Table, Vec<LegacyLockEntry>), LockFileError> {
-    let mut table: toml::Table = parse_lock_toml(content, path)?;
-    let entries = match table.remove("provider") {
-        Some(value) => {
-            value
-                .try_into::<Vec<toml::Table>>()
-                .map_err(|source| LockFileError::Parse {
-                    path: path.to_path_buf(),
-                    source,
-                })?
-        }
-        None => Vec::new(),
-    };
-    let (retained, legacy) =
-        split_legacy_entries(entries).map_err(|source| LockFileError::LegacyEntryParse {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    table.insert(
-        "provider".to_string(),
-        toml::Value::Array(retained.into_iter().map(toml::Value::Table).collect()),
-    );
-    Ok((table, legacy))
-}
-
-/// Details of a provider-lock migration applied in memory.
-///
-/// The event carries every legacy discovery pin that now requires operator
-/// authorization before it can be discarded, plus legacy GitHub sources that
-/// remain verbatim until successful resolution replaces them. The load
-/// operation itself never rewrites the on-disk file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockFileMigration {
-    project_dir: PathBuf,
-    from: u32,
-    to: u32,
-    discarded_discovery_pins: BTreeMap<CanonicalRegistryHostname, LegacyRegistryDiscoveryPins>,
-    legacy_sources: Vec<String>,
-}
-
-impl LockFileMigration {
-    pub fn discarded_discovery_pins(
-        &self,
-        host: &str,
-    ) -> Option<impl ExactSizeIterator<Item = &LegacyRegistryDiscoveryPin>> {
-        let host = CanonicalRegistryHostname::from(host);
-        self.discarded_discovery_pins
-            .get(host.as_str())
-            .map(LegacyRegistryDiscoveryPins::iter)
-    }
-
-    fn fmt_with_discovery_repin(
-        &self,
-        f: &mut fmt::Formatter<'_>,
-        repinned_host: Option<&str>,
-    ) -> fmt::Result {
-        writeln!(
-            f,
-            "Provider lock format migration: version {} -> version {}",
-            self.from, self.to
-        )?;
-        writeln!(
-            f,
-            "Lock file: {}",
-            provider_lock_path(&self.project_dir).display()
-        )?;
-        if !self.legacy_sources.is_empty() {
-            writeln!(f, "Legacy GitHub entries retained for conversion:")?;
-            for source in &self.legacy_sources {
-                writeln!(f, "  {source}")?;
-            }
-            writeln!(
-                f,
-                "Each entry remains verbatim until a successful `{}` replaces it with an exact release tag and asset ID or a revision artifact ID.",
-                ProjectCommand::new("init", &self.project_dir)
-            )?;
-        }
-        if self.discarded_discovery_pins.is_empty() {
-            if self.from <= 2 {
-                writeln!(
-                    f,
-                    "Migration found no v{} discovery pins requiring operator authorization.",
-                    self.from
-                )?;
-            } else if self.from == 4 && self.to == 5 {
-                writeln!(
-                    f,
-                    "Version 5 adds only the optional reset-pending sequence-anchor marker; existing v4 lock state is unchanged."
-                )?;
-            } else if self.from < self.to {
-                writeln!(
-                    f,
-                    "Existing signer state is preserved; any legacy signer pin remains gated until verified conversion."
-                )?;
-            }
-            writeln!(
-                f,
-                "All provider entries and provider security state will be retained."
-            )?;
-            return write!(
-                f,
-                "The on-disk lock remains unchanged until Carina next saves it."
-            );
-        }
-        for (host, pins) in &self.discarded_discovery_pins {
-            writeln!(f, "Registry host: {host}")?;
-            if repinned_host == Some(host.as_str()) {
-                for pin in pins.iter() {
-                    writeln!(
-                        f,
-                        "Discarding v{} pinned discovery API base: {}",
-                        self.from, pin.api_base_url
-                    )?;
-                    writeln!(
-                        f,
-                        "Discarding v{} discovery document SHA-256: {}",
-                        self.from, pin.discovery_sha256
-                    )?;
-                }
-            } else {
-                for pin in pins.iter() {
-                    writeln!(
-                        f,
-                        "Retaining v{} pinned discovery API base pending authorization: {}",
-                        self.from, pin.api_base_url
-                    )?;
-                    writeln!(
-                        f,
-                        "Retaining v{} discovery document SHA-256 pending authorization: {}",
-                        self.from, pin.discovery_sha256
-                    )?;
-                }
-                let refusal = RegistryRefusal::DiscoveryMigrationAuthorizationRequired {
-                    target: HostRefusalTarget::new(host.as_str(), &self.project_dir),
-                };
-                writeln!(f, "{refusal}")?;
-            }
-        }
-        writeln!(
-            f,
-            "All provider entries and provider security state will be retained."
-        )?;
-        write!(
-            f,
-            "The on-disk lock remains unchanged until Carina next saves it."
-        )
-    }
-}
-
-impl fmt::Display for LockFileMigration {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.fmt_with_discovery_repin(f, None)
-    }
-}
-
-struct ParsedLegacyLockBody {
-    registry_host: BTreeMap<CanonicalRegistryHostname, RegistryHostLock>,
-    provider: Vec<LockEntry<RegistryLockV3>>,
-    unpinned_registry_ratchets: UnpinnedRegistryRatchetsV3,
-    discarded_discovery_pins: BTreeMap<CanonicalRegistryHostname, LegacyRegistryDiscoveryPins>,
-}
-
-fn finish_legacy_lock_migration(
-    from: u32,
-    body: ParsedLegacyLockBody,
-    legacy: Vec<LegacyLockEntry>,
-    path: &Path,
-    project_dir: &ResolvedPath,
-) -> Result<LoadedLockFile, LockFileError> {
-    let legacy_sources = legacy.iter().map(|entry| entry.source.clone()).collect();
-    let ParsedLegacyLockBody {
-        registry_host,
-        provider,
-        unpinned_registry_ratchets,
-        discarded_discovery_pins,
-    } = body;
-    let provider = migrate_v3_provider_entries(provider).map_err(|error| {
-        LockFileError::InvalidRegistryState {
-            path: path.to_path_buf(),
-            detail: error.to_string(),
-        }
-    })?;
-    let unpinned_registry_ratchets =
-        migrate_v3_ratchets(unpinned_registry_ratchets).map_err(|error| {
-            LockFileError::InvalidRegistryState {
-                path: path.to_path_buf(),
-                detail: error.to_string(),
-            }
-        })?;
-    let lock_file = LockFile::from_parts(
-        registry_host,
-        provider,
-        BTreeMap::new(),
-        unpinned_registry_ratchets,
-        legacy,
-        path,
-        project_dir,
-    )?;
-    let migration = LockFileMigration {
-        project_dir: project_dir.source_label(),
-        from,
-        to: LockFile::CURRENT_VERSION,
-        discarded_discovery_pins,
-        legacy_sources,
-    };
-    Ok(LoadedLockFile::Migrated {
-        lock_file,
-        migration,
-    })
-}
-
-/// A provider lock tagged with whether load migrated its wire format.
-///
-/// Production callers destructure this result so retained legacy security
-/// state can be surfaced alongside the in-memory current-format lock.
-#[derive(Debug)]
-pub enum LoadedLockFile {
-    Pristine(LockFile),
-    Migrated {
-        lock_file: LockFile,
-        migration: LockFileMigration,
-    },
-}
-
-impl LoadedLockFile {
-    pub fn into_parts(self) -> (LockFile, Option<LockFileMigration>) {
-        match self {
-            Self::Pristine(lock_file) => (lock_file, None),
-            Self::Migrated {
-                lock_file,
-                migration,
-            } => (lock_file, Some(migration)),
-        }
-    }
-
-    #[cfg(test)]
-    fn into_lock_file(self) -> LockFile {
-        self.into_parts().0
-    }
-
-    fn into_resolution_lock_file(self, notices: &mut impl FnMut(ProviderLoadNotice)) -> LockFile {
-        match self {
-            Self::Pristine(lock_file) => lock_file,
-            Self::Migrated {
-                lock_file,
-                migration,
-            } => {
-                notices(ProviderLoadNotice::migration(migration));
-                lock_file
-            }
-        }
-    }
 }
 
 /// Keep the complete error variant set and its rendered-message samples in one
@@ -3293,6 +2391,15 @@ define_lock_file_error! {
         found: LockFile::CURRENT_VERSION + 1,
         supported: LockFile::CURRENT_VERSION,
     },
+    UnsupportedVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    } => Self::UnsupportedVersion {
+        path: PathBuf::from("carina-providers.lock"),
+        found: 4,
+        supported: LockFile::CURRENT_VERSION,
+    },
     InvalidVersion {
         found: u32,
     } => Self::InvalidVersion {
@@ -3327,16 +2434,6 @@ define_lock_file_error! {
             source,
         }
     },
-    LegacyEntryParse {
-        path: PathBuf,
-        source: LegacyLockEntryParseError,
-    } => Self::LegacyEntryParse {
-        path: PathBuf::from("carina-providers.lock"),
-        source: LegacyLockEntryParseError::MissingStringField {
-            source: "github.com/acme/widget".into(),
-            field: "sha256",
-        },
-    },
     InvalidGithubReleasePin {
         path: PathBuf,
         source: String,
@@ -3348,13 +2445,6 @@ define_lock_file_error! {
         version: "1.0.0".into(),
         tag: ReleaseTag::from_lock("v2.0.0".into()),
     },
-    InvalidRegistryState {
-        path: PathBuf,
-        detail: String,
-    } => Self::InvalidRegistryState {
-        path: PathBuf::from("carina-providers.lock"),
-        detail: "inconsistent migrated registry state".into(),
-    },
     RegistryIdentityPinConflict {
         path: PathBuf,
         provider: String,
@@ -3363,13 +2453,21 @@ define_lock_file_error! {
         path: PathBuf::from("carina-providers.lock"),
         provider: "carina-rs/aws".into(),
         source: Box::new(RegistryIdentityPinConflict {
-            left: Box::new(DiscardedSignerPins::Legacy(LegacySignerPin {
-                certificate_san: "identity-a".into(),
-                oidc_issuer: "issuer-a".into(),
+            left: Box::new(DiscardedSignerPins::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "issuer-a".into(),
+                    repository_owner_id: "owner".into(),
+                    repository_id: "identity-a".into(),
+                },
+                workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
             })),
-            right: Box::new(DiscardedSignerPins::Legacy(LegacySignerPin {
-                certificate_san: "identity-b".into(),
-                oidc_issuer: "issuer-b".into(),
+            right: Box::new(DiscardedSignerPins::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "issuer-b".into(),
+                    repository_owner_id: "owner".into(),
+                    repository_id: "identity-b".into(),
+                },
+                workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
             })),
         }),
     },
@@ -3386,16 +2484,6 @@ impl fmt::Display for LockFileError {
                 "Lock file {} has no format version and predates lock format versioning. It cannot be distinguished from a lock whose protection fields were stripped by an older Carina binary. Because automatic migration is unsafe, restore this file from version control or backup so its recorded protection state remains intact; if no trustworthy copy exists, preserve it for manual inspection and make any decision to move it aside explicitly.",
                 path.display()
             ),
-            Self::InvalidRegistryState { path, detail } => write!(
-                f,
-                "Failed to migrate registry security state from {}: {detail}",
-                path.display()
-            ),
-            Self::LegacyEntryParse { path, source } => write!(
-                f,
-                "Failed to parse legacy provider entry in {}: {source}",
-                path.display()
-            ),
             Self::InvalidGithubReleasePin {
                 path,
                 source,
@@ -3410,6 +2498,22 @@ impl fmt::Display for LockFileError {
                 f,
                 "Lock file version {found} is newer than supported version {supported}. Please upgrade Carina."
             ),
+            Self::UnsupportedVersion {
+                path,
+                found,
+                supported,
+            } => {
+                let dir = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                write!(
+                    f,
+                    "Lock file {} uses format version {found}, but this Carina reads only version {supported}. Rewrite it with Carina v0.15.0, the last release that converts older lock formats: run `{}` with v0.15.0, and if it reports a required recovery command (such as `carina providers repin-discovery` or `carina providers repin-identity`), run that first, then `carina init` again.",
+                    path.display(),
+                    ProjectCommand::new("init", dir)
+                )
+            }
             Self::InvalidVersion { found } => write!(
                 f,
                 "Lock file version {found} is not a valid lock format. Restore a valid lock from version control or backup, or preserve this file for manual recovery."
@@ -3455,7 +2559,6 @@ impl std::error::Error for LockFileError {}
 #[derive(Debug)]
 pub enum LockConstraintError {
     LockFile(LockFileError),
-    LegacyEntry(Box<LegacyLockEntryError>),
     ConstraintMismatch {
         provider: String,
         locked_version: String,
@@ -3468,7 +2571,6 @@ impl fmt::Display for LockConstraintError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LockFile(error) => error.fmt(f),
-            Self::LegacyEntry(error) => error.fmt(f),
             Self::ConstraintMismatch {
                 provider,
                 locked_version,
@@ -3498,7 +2600,6 @@ impl Default for LockFile {
             registry_host: BTreeMap::new(),
             provider: Vec::new(),
             egress: BTreeMap::new(),
-            legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         }
     }
@@ -3575,43 +2676,7 @@ impl fmt::Display for PreparedRegistryDiscoveryRepin<'_> {
     }
 }
 
-struct PreparedRegistryDiscoveryRepinDisplay<'preview, 'lock> {
-    prepared: &'preview PreparedRegistryDiscoveryRepin<'lock>,
-    migration: Option<&'preview LockFileMigration>,
-}
-
-impl fmt::Display for PreparedRegistryDiscoveryRepinDisplay<'_, '_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let PreparedRegistryDiscoveryRepinState::MigrationPending(prepared_pins) =
-            &self.prepared.discarded
-            && let Some(migration) = self.migration
-            && migration
-                .discarded_discovery_pins
-                .get(self.prepared.hostname.as_str())
-                == Some(prepared_pins)
-        {
-            return migration.fmt_with_discovery_repin(f, Some(&self.prepared.hostname));
-        }
-        self.prepared.fmt(f)
-    }
-}
-
 impl PreparedRegistryDiscoveryRepin<'_> {
-    /// Render this recovery with an explicit load-time migration report.
-    ///
-    /// Callers that did not just load a migrated lock can use this type's
-    /// ordinary [`fmt::Display`] implementation, which uses generic legacy
-    /// wording without inventing stale version context.
-    pub fn display_with_migration<'a>(
-        &'a self,
-        migration: Option<&'a LockFileMigration>,
-    ) -> impl fmt::Display + 'a {
-        PreparedRegistryDiscoveryRepinDisplay {
-            prepared: self,
-            migration,
-        }
-    }
-
     /// Clear the consumed values without touching provider-owned state or
     /// pinned discovery values this client does not consume.
     pub fn commit(self) {
@@ -3659,54 +2724,11 @@ pub(crate) fn replace_lock_file_for_test(
 }
 
 impl LockFile {
-    /// v5 adds an explicit reset-pending sequence-anchor state to pinned
-    /// registry records. v4 locks migrate with an unestablished or established
-    /// anchor exactly as encoded; pre-pin observations carry no anchor state.
-    ///
-    /// v4 stores signer source and per-channel workflow pins extracted from
-    /// verified certificates. v3 full-SAN pins migrate losslessly into the
-    /// explicit legacy state and are converted only by a matching signature.
-    ///
-    /// v3: Registry discovery pins contain the resolved values the client
-    /// consumes, keyed by discovery field. The open map preserves values an
-    /// older client does not consume.
-    ///
-    /// v1 and v2 pinned both the resolved API base and a hash of the discovery
-    /// document bytes. Loading either format preserves every provider-owned
-    /// record and retains each legacy host pin in a resolution-blocking state
-    /// because neither value can truthfully be reinterpreted as a v3 pin. Only
-    /// an operator-authorized discovery re-pin can leave that state.
+    /// The only supported provider lock format.
     pub const CURRENT_VERSION: u32 = 5;
 
     fn registry_host_lock(&self, hostname: &str) -> Option<&RegistryHostLock> {
         self.registry_host.get(hostname)
-    }
-
-    fn legacy_github_version_pin(&self, source: &RemoteSourceKey) -> Option<(String, String)> {
-        self.legacy.iter().find_map(|entry| match &entry.reason {
-            _ if !Self::sources_match(&entry.source, source.as_str()) => None,
-            LegacyReason::GithubDirectVersionWithoutTag { version, sha256 } => {
-                Some((version.clone(), sha256.clone()))
-            }
-            LegacyReason::RevisionWithoutArtifactId { .. } => None,
-        })
-    }
-
-    pub(crate) fn legacy_revision_pin(
-        &self,
-        source: &RemoteSourceKey,
-        revision: &str,
-    ) -> Option<(CommitSha, String)> {
-        self.legacy.iter().find_map(|entry| match &entry.reason {
-            _ if !Self::sources_match(&entry.source, source.as_str()) => None,
-            LegacyReason::RevisionWithoutArtifactId {
-                revision: locked_revision,
-                resolved_sha,
-                sha256,
-            } if locked_revision == revision => Some((resolved_sha.clone(), sha256.clone())),
-            LegacyReason::GithubDirectVersionWithoutTag { .. }
-            | LegacyReason::RevisionWithoutArtifactId { .. } => None,
-        })
     }
 
     fn sources_match(existing: &str, requested: &str) -> bool {
@@ -3716,9 +2738,6 @@ impl LockFile {
     /// Load `carina-providers.lock`.
     ///
     /// Returns `Ok(None)` when the file is absent (normal first-run case).
-    /// A present file is tagged as pristine or migrated so callers can surface
-    /// retained legacy security state and any discovery material awaiting
-    /// operator authorization.
     /// Parse errors — including an entry that can't be discriminated into a
     /// [`LockEntryKind`] variant — surface as `Err` rather than being silently
     /// collapsed into a default-empty lock.
@@ -3726,7 +2745,7 @@ impl LockFile {
     /// `project_dir` is also the user-facing project argument used in
     /// remediation commands; callers must not derive it from a canonicalized
     /// lock path.
-    pub fn load(project_dir: &ResolvedPath) -> Result<Option<LoadedLockFile>, LockFileError> {
+    pub fn load(project_dir: &ResolvedPath) -> Result<Option<LockFile>, LockFileError> {
         let project = project_dir.clone();
         let path = project
             .join(PROVIDER_LOCK_FILE_NAME)
@@ -3752,7 +2771,7 @@ impl LockFile {
     }
 
     #[cfg(test)]
-    fn load_from_path(path: &Path) -> Result<Option<LoadedLockFile>, LockFileError> {
+    fn load_from_path(path: &Path) -> Result<Option<LockFile>, LockFileError> {
         let Some(content) = Self::read_from_path(&ResolvedPath::new(path).map_err(|source| {
             LockFileError::Read {
                 path: path.to_path_buf(),
@@ -3773,146 +2792,33 @@ impl LockFile {
         .map(Some)
     }
 
-    /// Validated parse seam. It is private so callers cannot deserialize a
-    /// `LockFile` around the version gate or lose the typed migration event.
+    /// The single decode seam: reject unsupported headers before reading the body.
     fn parse_toml_str(
         content: &str,
         path: &Path,
         project_dir: &ResolvedPath,
-    ) -> Result<LoadedLockFile, LockFileError> {
+    ) -> Result<LockFile, LockFileError> {
         let version: LockFileVersion = parse_lock_toml(content, path)?;
         let version = version
             .version
             .ok_or_else(|| LockFileError::MissingVersion {
                 path: path.to_path_buf(),
             })?;
-        if version > Self::CURRENT_VERSION {
-            return Err(LockFileError::VersionTooNew {
-                found: version,
-                supported: Self::CURRENT_VERSION,
-            });
-        }
-        let (table, legacy_entries) = split_lock_table_legacy_entries(content, path)?;
-
         match version {
             Self::CURRENT_VERSION => {
-                let unchecked: UncheckedLockFile = parse_lock_table(&table, path)?;
-                let legacy_sources = legacy_entries
-                    .iter()
-                    .map(|entry| entry.source.clone())
-                    .collect::<Vec<_>>();
-                let lock_file = Self::from_unchecked(unchecked, legacy_entries, path, project_dir)?;
-                if legacy_sources.is_empty() {
-                    Ok(LoadedLockFile::Pristine(lock_file))
-                } else {
-                    Ok(LoadedLockFile::Migrated {
-                        lock_file,
-                        migration: LockFileMigration {
-                            project_dir: project_dir.source_label(),
-                            from: version,
-                            to: Self::CURRENT_VERSION,
-                            discarded_discovery_pins: BTreeMap::new(),
-                            legacy_sources,
-                        },
-                    })
-                }
+                let unchecked: UncheckedLockFile = parse_lock_toml(content, path)?;
+                Self::from_unchecked(unchecked, path, project_dir)
             }
-            4 => {
-                let unchecked: UncheckedLockFileV4 = parse_lock_table(&table, path)?;
-                if let Some(entry) = unchecked.provider.iter().find(|entry| {
-                    entry.registry.as_ref().is_some_and(|registry| {
-                        registry.sequence_anchor == RegistrySequenceAnchor::ResetPending
-                    })
-                }) {
-                    return Err(LockFileError::InvalidRegistryState {
-                        path: path.to_path_buf(),
-                        detail: format!(
-                            "lock format v4 cannot contain a reset-pending sequence anchor for provider {:?}",
-                            entry.source
-                        ),
-                    });
-                }
-                let legacy_sources = legacy_entries
-                    .iter()
-                    .map(|entry| entry.source.clone())
-                    .collect();
-                let registry_host = canonicalize_registry_host_keys(unchecked.registry_host, path)?;
-                let lock_file = Self::from_parts(
-                    registry_host,
-                    unchecked.provider,
-                    BTreeMap::new(),
-                    unchecked.unpinned_registry_ratchets,
-                    legacy_entries,
-                    path,
-                    project_dir,
-                )?;
-                Ok(LoadedLockFile::Migrated {
-                    lock_file,
-                    migration: LockFileMigration {
-                        project_dir: project_dir.source_label(),
-                        from: version,
-                        to: Self::CURRENT_VERSION,
-                        discarded_discovery_pins: BTreeMap::new(),
-                        legacy_sources,
-                    },
-                })
-            }
-            3 => {
-                let legacy: UncheckedLockFileV3 = parse_lock_table(&table, path)?;
-                let registry_host = canonicalize_registry_host_keys(legacy.registry_host, path)?;
-                finish_legacy_lock_migration(
-                    version,
-                    ParsedLegacyLockBody {
-                        registry_host,
-                        provider: legacy.provider,
-                        unpinned_registry_ratchets: legacy.unpinned_registry_ratchets,
-                        discarded_discovery_pins: BTreeMap::new(),
-                    },
-                    legacy_entries,
-                    path,
-                    project_dir,
-                )
-            }
-            2 => {
-                let legacy: UncheckedLockFileV2 = parse_lock_table(&table, path)?;
-
-                let legacy_hosts = canonicalize_registry_host_keys(legacy.registry_host, path)?;
-                let (registry_host, discarded_discovery_pins) =
-                    migrate_legacy_registry_hosts(legacy_hosts);
-                finish_legacy_lock_migration(
-                    version,
-                    ParsedLegacyLockBody {
-                        registry_host,
-                        provider: legacy.provider,
-                        unpinned_registry_ratchets: legacy.unpinned_registry_ratchets,
-                        discarded_discovery_pins,
-                    },
-                    legacy_entries,
-                    path,
-                    project_dir,
-                )
-            }
-            1 => {
-                let legacy: UncheckedLockFileV1 = parse_lock_table(&table, path)?;
-                let migrated = migrate_v1_provider_entries(legacy.provider);
-                let unpinned_registry_ratchets = merge_v1_unpinned_registry_yanks(
-                    legacy.unpinned_registry_yanks,
-                    legacy.unpinned_registry_ratchets,
-                );
-                finish_legacy_lock_migration(
-                    version,
-                    ParsedLegacyLockBody {
-                        registry_host: migrated.registry_host,
-                        provider: migrated.provider,
-                        unpinned_registry_ratchets,
-                        discarded_discovery_pins: migrated.discarded_discovery_pins,
-                    },
-                    legacy_entries,
-                    path,
-                    project_dir,
-                )
-            }
-            _ => Err(LockFileError::InvalidVersion { found: version }),
+            1..=4 => Err(LockFileError::UnsupportedVersion {
+                path: path.to_path_buf(),
+                found: version,
+                supported: Self::CURRENT_VERSION,
+            }),
+            found if found > Self::CURRENT_VERSION => Err(LockFileError::VersionTooNew {
+                found,
+                supported: Self::CURRENT_VERSION,
+            }),
+            found => Err(LockFileError::InvalidVersion { found }),
         }
     }
 
@@ -3923,12 +2829,10 @@ impl LockFile {
             path,
             &ResolvedPath::new(resolve_parent(path)).unwrap(),
         )
-        .map(LoadedLockFile::into_lock_file)
     }
 
     fn from_unchecked(
         unchecked: UncheckedLockFile,
-        legacy: Vec<LegacyLockEntry>,
         path: &Path,
         project_dir: &ResolvedPath,
     ) -> Result<Self, LockFileError> {
@@ -3943,10 +2847,11 @@ impl LockFile {
         let provider = provider
             .into_iter()
             .map(|current| {
-                if let Some(record) = current.egress {
-                    egress.insert(EgressArtifactKey::from_entry(&current.entry), record);
+                let (entry, record) = current.into_entry();
+                if let Some(record) = record {
+                    egress.insert(EgressArtifactKey::from_entry(&entry), record);
                 }
-                current.entry
+                entry
             })
             .collect();
         Self::from_parts(
@@ -3954,7 +2859,6 @@ impl LockFile {
             provider,
             egress,
             unpinned_registry_ratchets,
-            legacy,
             path,
             project_dir,
         )
@@ -3965,7 +2869,6 @@ impl LockFile {
         provider: Vec<LockEntry<RegistryLock>>,
         egress: BTreeMap<EgressArtifactKey, crate::EgressLockRecord>,
         unpinned_registry_ratchets: UnpinnedRegistryRatchets,
-        legacy: Vec<LegacyLockEntry>,
         path: &Path,
         project_dir: &ResolvedPath,
     ) -> Result<Self, LockFileError> {
@@ -4030,7 +2933,6 @@ impl LockFile {
             registry_host,
             provider,
             egress,
-            legacy,
             unpinned_registry_ratchets,
         };
         lock.attach_unpinned_registry_ratchets()
@@ -4046,17 +2948,10 @@ impl LockFile {
         let provider = self
             .provider
             .iter()
-            .map(|entry| {
-                SerializableProviderEntry::Current(SerializableCurrentProviderEntry {
-                    entry,
-                    egress: self.egress.get(&EgressArtifactKey::from_entry(entry)),
-                })
+            .map(|entry| SerializableCurrentProviderEntry {
+                entry,
+                egress: self.egress.get(&EgressArtifactKey::from_entry(entry)),
             })
-            .chain(
-                self.legacy
-                    .iter()
-                    .map(|entry| SerializableProviderEntry::Legacy(&entry.raw)),
-            )
             .collect();
         toml::to_string_pretty(&SerializableLockFile {
             version: &self.version,
@@ -4257,14 +3152,6 @@ impl LockFile {
     /// Find a lock entry selected by a validated remote provider source.
     pub fn find_by_source_key(&self, source: &RemoteSourceKey) -> Option<&LockEntry<RegistryLock>> {
         self.find_by_source(source.as_str())
-    }
-
-    fn find_source_entry(&self, source: &RemoteSourceKey) -> Option<SourceLockEntry<'_>> {
-        self.legacy
-            .iter()
-            .find(|entry| Self::sources_match(&entry.source, source.as_str()))
-            .map(SourceLockEntry::Legacy)
-            .or_else(|| self.find_by_source_key(source).map(SourceLockEntry::Typed))
     }
 
     fn resolve_registry_recovery(
@@ -4556,38 +3443,6 @@ impl LockFile {
         Ok(())
     }
 
-    fn replace_legacy_signer_pin(
-        &mut self,
-        source: &str,
-        next: SignerPinState,
-    ) -> Result<(), String> {
-        let SignerPinState::Current(_) = next else {
-            return Err("legacy signer conversion did not produce current signer pins".into());
-        };
-        let source_key = canonical_lock_source(source);
-        let signature = self
-            .provider
-            .iter_mut()
-            .find(|entry| Self::sources_match(&entry.source, &source_key))
-            .and_then(|entry| entry.registry.as_mut())
-            .map(|registry| &mut registry.signature)
-            .or_else(|| {
-                self.unpinned_registry_ratchets
-                    .0
-                    .get_mut(&source_key)
-                    .map(|ratchets| &mut ratchets.signature)
-            })
-            .ok_or_else(|| "legacy signer conversion lost its persisted pin state".to_string())?;
-        if !matches!(
-            signature,
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
-        ) {
-            return Err("legacy signer conversion lost its legacy pin before commit".into());
-        }
-        *signature = RegistrySignatureProtection::Required(next);
-        Ok(())
-    }
-
     pub fn upsert(&mut self, entry: LockEntry<NoRegistryLock>) {
         self.upsert_entry(entry.into_stored());
     }
@@ -4609,8 +3464,6 @@ impl LockFile {
     }
 
     fn upsert_entry(&mut self, entry: LockEntry<RegistryLock>) {
-        self.legacy
-            .retain(|legacy| !Self::sources_match(&legacy.source, &entry.source));
         if entry.registry.is_some() {
             self.unpinned_registry_ratchets
                 .remove(&canonical_lock_source(&entry.source));
@@ -4676,26 +3529,18 @@ impl std::error::Error for LockedEgressLoadError {
 pub fn load_locked_egress(
     project_dir: &ResolvedPath,
     load: &VerifiedLoad,
-    _notices: &mut impl FnMut(ProviderLoadNotice),
 ) -> Result<Option<crate::LockedEgress>, LockedEgressLoadError> {
     let Some(loaded) = LockFile::load(project_dir).map_err(LockedEgressLoadError::LockFile)? else {
         return Ok(None);
     };
-    let (lock_file, _migration) = loaded.into_parts();
+    let lock_file = loaded;
     let source = crate::CanonicalSource::from_load(load);
     Ok(lock_file.locked_egress_for_artifact(&source, load.artifact().sha256(), project_dir))
 }
 
-fn load_lock_file(
-    project_dir: &ResolvedPath,
-    notices: &mut impl FnMut(ProviderLoadNotice),
-) -> Result<Option<LockFile>, LockFileError> {
-    Ok(LockFile::load(project_dir)?.map(|loaded| loaded.into_resolution_lock_file(notices)))
-}
-
 #[cfg(test)]
 fn load_lock_file_for_test(path: &Path) -> Result<Option<LockFile>, LockFileError> {
-    LockFile::load_from_path(path).map(|loaded| loaded.map(LoadedLockFile::into_lock_file))
+    LockFile::load_from_path(path)
 }
 
 /// The non-ratchet fields and validated sequence proof needed for a final
@@ -4854,14 +3699,9 @@ impl<'borrow, 'lock> PersistentLockFile<'borrow, 'lock> {
         source: &RemoteSourceKey,
         acceptance: SignerAcceptance,
     ) -> Result<(), String> {
-        let SignerAcceptance { next, transition } = acceptance;
-        if transition == SignerTransition::LegacyConverted {
-            return self.persist_lock_file_update("verified signature", |persisted| {
-                persisted.replace_legacy_signer_pin(source.as_str(), next)
-            });
-        }
+        let next = acceptance.next;
         let verified = RegistryRatchets {
-            signature: RegistrySignatureProtection::Required(next.clone()),
+            signature: RegistrySignatureProtection::Required(next),
             ..RegistryRatchets::default()
         };
         self.persist_registry_ratchets(source, "verified signature", |ratchets| {
@@ -5480,14 +4320,12 @@ fn missing_locked_artifact_error(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FindInstalledProviderError {
-    LegacyEntry(LegacyLockEntryError),
     Other(String),
 }
 
 impl fmt::Display for FindInstalledProviderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LegacyEntry(error) => error.fmt(formatter),
             Self::Other(message) => formatter.write_str(message),
         }
     }
@@ -5905,16 +4743,6 @@ enum RegistryRefusal {
         resolved: String,
         target: HostRefusalTarget,
     },
-    LegacyShasumPinMismatch {
-        version: String,
-        locked: String,
-        resolved: String,
-        target: ProviderRefusalTarget,
-    },
-    LegacySignatureMissing {
-        version: String,
-        target: ProviderRefusalTarget,
-    },
     ShasumPinMismatch {
         version: String,
         locked: String,
@@ -5980,16 +4808,6 @@ impl RegistryRefusal {
                 cause: HostLockState::DiscoveryPin,
                 target,
             },
-            // Identity re-pin would bypass legacy conversion, but it does not
-            // clear changed immutable-version content and is not its recovery.
-            Self::LegacyShasumPinMismatch { target, .. } => ScopedRegistryRefusal::Provider {
-                cause: ProviderLockState::ShasumPin,
-                target,
-            },
-            Self::LegacySignatureMissing { target, .. } => ScopedRegistryRefusal::Provider {
-                cause: ProviderLockState::SignaturePresence,
-                target,
-            },
             Self::ShasumPinMismatch { target, .. } => ScopedRegistryRefusal::Provider {
                 cause: ProviderLockState::ShasumPin,
                 target,
@@ -6013,9 +4831,9 @@ impl RegistryRefusal {
                     SignerRejection::StableSourceRef { .. } => {
                         ProviderLockState::StableSourceRefRule
                     }
-                    SignerRejection::LegacyIdentity
-                    | SignerRejection::SourceMismatch { .. }
-                    | SignerRejection::Workflow { .. } => ProviderLockState::SignerPins,
+                    SignerRejection::SourceMismatch { .. } | SignerRejection::Workflow { .. } => {
+                        ProviderLockState::SignerPins
+                    }
                 };
                 ScopedRegistryRefusal::Provider { cause, target }
             }
@@ -6075,21 +4893,6 @@ impl RegistryRefusal {
                 formatter,
                 "registry pinned discovery values mismatch for host {}: pinned providers.v1 was {pinned}; resolved providers.v1 is {resolved}",
                 target.host
-            ),
-            Self::LegacyShasumPinMismatch {
-                version,
-                locked,
-                resolved,
-                target,
-            } => write!(
-                formatter,
-                "registry shasum for the legacy-pinned version {}@{version} differs from carina-providers.lock: lock has {locked}, registry returned {resolved}",
-                target.source_key
-            ),
-            Self::LegacySignatureMissing { version, target } => write!(
-                formatter,
-                "legacy-pinned version {}@{version} was obtained without its required registry signature",
-                target.source_key
             ),
             Self::ShasumPinMismatch {
                 version,
@@ -7576,203 +6379,6 @@ fn bind_registry_revision(
     )
 }
 
-enum LegacyFetch<T> {
-    Available(T),
-    Unavailable,
-}
-
-fn fetch_registry_download_for_legacy_conversion<H: RegistryHttp>(
-    registry: &ResolvedRegistry,
-    source: &RegistrySource,
-    version: &str,
-    http: &H,
-) -> Result<LegacyFetch<RegistryDownload>, String> {
-    let url = join_registry_url(
-        registry.api_base_url(),
-        &format!(
-            "/{}/{}/{version}/download",
-            source.namespace(),
-            source.name()
-        ),
-    );
-    let url = parse_registry_resource_url(&url, "registry download metadata URL")?;
-    let body = match http.get(RegistryHttpRequest::Resource(&url)) {
-        Ok(HttpResponse::Success { body }) => body,
-        Ok(HttpResponse::Failure { status: 404 }) | Err(_) => {
-            return Ok(LegacyFetch::Unavailable);
-        }
-        Ok(HttpResponse::Failure { status }) => {
-            return Err(format!(
-                "cannot fetch legacy-pinned version metadata from {} (HTTP {status})",
-                url.as_str()
-            ));
-        }
-    };
-    serde_json::from_slice(&body)
-        .map(LegacyFetch::Available)
-        .map_err(|error| {
-            format!(
-                "Failed to parse registry JSON from {}: {error}",
-                url.as_str()
-            )
-        })
-}
-
-fn fetch_signature_bundle_for_legacy_conversion<H: RegistryHttp>(
-    signature: &RegistrySignature,
-    http: &H,
-) -> Result<LegacyFetch<Vec<u8>>, String> {
-    let bundle_url = parse_registry_resource_url(&signature.bundle_url, "signature bundle URL")
-        .map_err(signing::verification_failure)?;
-    let body = match http.get(RegistryHttpRequest::Resource(&bundle_url)) {
-        Ok(HttpResponse::Success { body }) => body,
-        Ok(HttpResponse::Failure { status: 404 }) | Err(_) => {
-            return Ok(LegacyFetch::Unavailable);
-        }
-        Ok(HttpResponse::Failure { status }) => {
-            return Err(signing::verification_failure(format!(
-                "cannot fetch legacy-pinned signature bundle from {} (HTTP {status})",
-                signature.bundle_url
-            )));
-        }
-    };
-    if body.len() > MAX_SIGNATURE_BUNDLE_BYTES {
-        return Err(signing::verification_failure(format!(
-            "signature bundle from {} is {} bytes, exceeding the {MAX_SIGNATURE_BUNDLE_BYTES}-byte limit",
-            signature.bundle_url,
-            body.len()
-        )));
-    }
-    Ok(LegacyFetch::Available(body))
-}
-
-fn convert_obtainable_legacy_signer_pin<H: RegistryHttp>(
-    user_dirs: &UserDirs,
-    registry: &ResolvedRegistry,
-    source: &RegistrySource,
-    source_key: &RemoteSourceKey,
-    candidate_version: Option<&str>,
-    lock_file: &mut PersistentLockFile<'_, '_>,
-    http: &H,
-) -> Result<(), String> {
-    let Some((locked_name, locked_version, locked_sha256, legacy_pin)) = lock_file
-        .lock_file()
-        .find_by_source_key(source_key)
-        .and_then(|entry| {
-            let locked_version = entry.kind.resolved_version()?;
-            let registry = entry.registry.as_ref()?;
-            let RegistrySignatureProtection::Required(SignerPinState::Legacy(pin)) =
-                &registry.signature
-            else {
-                return None;
-            };
-            Some((
-                entry.name.clone(),
-                locked_version.to_string(),
-                entry.sha256.clone(),
-                pin.clone(),
-            ))
-        })
-    else {
-        return Ok(());
-    };
-    if candidate_version == Some(locked_version.as_str()) {
-        return Ok(());
-    }
-
-    let download = match fetch_registry_download_for_legacy_conversion(
-        registry,
-        source,
-        &locked_version,
-        http,
-    )? {
-        LegacyFetch::Available(download) => download,
-        LegacyFetch::Unavailable => return Ok(()),
-    };
-    if download.shasum != locked_sha256 {
-        return Err(RegistryRefusal::LegacyShasumPinMismatch {
-            version: locked_version.clone(),
-            locked: locked_sha256.clone(),
-            resolved: download.shasum.clone(),
-            target: ProviderRefusalTarget::new(
-                source_key.as_str(),
-                lock_file.install_lock().project_dir().source_label(),
-            ),
-        }
-        .to_string());
-    }
-    let signature = download.signature.as_ref().ok_or_else(|| {
-        RegistryRefusal::LegacySignatureMissing {
-            version: locked_version.clone(),
-            target: ProviderRefusalTarget::new(
-                source_key.as_str(),
-                lock_file.install_lock().project_dir().source_label(),
-            ),
-        }
-        .to_string()
-    })?;
-    signing::ensure_supported_signature_type(&signature.r#type)?;
-    let download_url = parse_registry_resource_url(
-        &download.download_url,
-        "legacy-pinned registry download URL",
-    )?;
-    let artifact_context =
-        format!("legacy-pinned registry provider '{locked_name}' ({source_key}@{locked_version})");
-    let artifact = match obtain_registry_artifact(
-        RegistryArtifactRequest {
-            user_dirs,
-            install_lock: lock_file.install_lock(),
-            source: source_key,
-            version: &locked_version,
-            download_url: &download_url,
-            expected_shasum: &locked_sha256,
-            context: &artifact_context,
-        },
-        http,
-    ) {
-        Ok(artifact) => artifact,
-        Err(RegistryArtifactError::Unavailable(_)) => return Ok(()),
-        Err(RegistryArtifactError::Invalid(error)) => {
-            return Err(format!(
-                "legacy-pinned version {source_key}@{locked_version}: {error}"
-            ));
-        }
-    };
-    let bundle = match fetch_signature_bundle_for_legacy_conversion(signature, http)? {
-        LegacyFetch::Available(bundle) => bundle,
-        LegacyFetch::Unavailable => return Ok(()),
-    };
-    let version = ListedVersion::parse(&locked_version)?;
-    let expected_signer = SignerPinState::Legacy(legacy_pin);
-    let (_, acceptance) = match verify_and_decide_signer(
-        artifact.digest(),
-        &bundle,
-        &expected_signer,
-        &version,
-        source_key.as_str(),
-        lock_file.install_lock().project_dir(),
-        http,
-    ) {
-        Ok(verified) => verified,
-        Err(error) => {
-            artifact.remove_if_cached();
-            return Err(format!(
-                "legacy-pinned version {source_key}@{locked_version}: {error}"
-            ));
-        }
-    };
-    debug_assert_eq!(acceptance.transition, SignerTransition::LegacyConverted);
-    let artifact_path = artifact.path().display().clone();
-    artifact.publish().map_err(|error| {
-        format!(
-            "legacy-pinned version {source_key}@{locked_version}: Failed to publish provider artifact {}: {error}",
-            artifact_path
-        )
-    })?;
-    lock_file.record_signer_acceptance(source_key, acceptance)?;
-    Ok(())
-}
-
 /// Resolve the global cache path for a WASM provider.
 fn global_cache_path_wasm(
     user_dirs: &carina_core::UserDirs,
@@ -8219,15 +6825,6 @@ fn resolve_registry_provider_with_http<H: RegistryHttp>(
         versions,
         validated_sequence,
     } = fetch_registry_versions(&registry, source, source_key, &mut persistent_lock, http)?;
-    convert_obtainable_legacy_signer_pin(
-        user_dirs,
-        &registry,
-        source,
-        source_key,
-        Some(version),
-        &mut persistent_lock,
-        http,
-    )?;
     let listed_version = require_listed_registry_version(
         &versions,
         version,
@@ -8307,29 +6904,11 @@ fn resolve_registry_revision_with_http<H: RegistryHttp>(
             })
     };
     let (listed_version, download, selection) = if let Some(locked_version) = locked_version {
-        convert_obtainable_legacy_signer_pin(
-            user_dirs,
-            &registry,
-            source,
-            &source_key,
-            Some(&locked_version),
-            &mut persistent_lock,
-            http,
-        )?;
         let listed_version =
             require_listed_registry_version(&versions, &locked_version, source_key.as_str(), true)?;
         let download = fetch_registry_download(&registry, source, &locked_version, http)?;
         (listed_version, download, RegistryRevisionSelection::Locked)
     } else {
-        convert_obtainable_legacy_signer_pin(
-            user_dirs,
-            &registry,
-            source,
-            &source_key,
-            None,
-            &mut persistent_lock,
-            http,
-        )?;
         let response = fetch_registry_revision_download(&registry, source, revision, http)?;
         let listed_version = require_listed_registry_version(
             &versions,
@@ -8836,9 +7415,8 @@ pub fn resolve_single_config(
     user_dirs: &UserDirs,
     install_lock: &ProviderInstallLock,
     config: &ProviderConfig,
-    notices: &mut impl FnMut(ProviderLoadNotice),
 ) -> Result<WasmArtifactPath, String> {
-    resolve_single_config_with_http(user_dirs, install_lock, config, &UreqRegistryHttp, notices)
+    resolve_single_config_with_http(user_dirs, install_lock, config, &UreqRegistryHttp)
 }
 
 fn resolve_single_config_with_http<H: RegistryHttp>(
@@ -8846,7 +7424,6 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
     install_lock: &ProviderInstallLock,
     config: &ProviderConfig,
     http: &H,
-    notices: &mut impl FnMut(ProviderLoadNotice),
 ) -> Result<WasmArtifactPath, String> {
     let source = config
         .source
@@ -8856,7 +7433,6 @@ fn resolve_single_config_with_http<H: RegistryHttp>(
     let mut lock_file = install_lock
         .load_lock_file_or_default()
         .map_err(|error| error.to_string())?;
-    lock_file.report_migration(notices);
 
     let artifact_path = resolve_config_with_http(
         user_dirs,
@@ -8943,7 +7519,6 @@ where
             .map(Ok)
             .unwrap_or_else(|| {
                 resolve_registry_version_with_http(
-                    user_dirs,
                     registry_source,
                     &source_key,
                     &config.name,
@@ -9058,7 +7633,6 @@ fn file_provider_cache_path(
 pub fn find_file_provider_source(
     base_dir: &ResolvedPath,
     config: &ProviderConfig,
-    _notices: &mut impl FnMut(ProviderLoadNotice),
 ) -> Result<InstalledProvider, String> {
     let source = config
         .source
@@ -9221,31 +7795,13 @@ fn select_locked_artifact<'lock, P: PlaceholderKind, B: BindingAddress>(
     remote_source: &RemoteSource,
     lock_file: &'lock LockFile,
 ) -> Result<Option<LockArtifactSelection<'lock>>, FindInstalledProviderError> {
-    select_locked_entry(base_dir, config, remote_source, lock_file)?
+    lock_file
+        .find_by_remote_config(config, remote_source)
         .map(|lock_entry| {
             lock_artifact_selection(base_dir, lock_entry, &config.name)
                 .map_err(FindInstalledProviderError::from)
         })
         .transpose()
-}
-
-fn select_locked_entry<'lock, P: PlaceholderKind, B: BindingAddress>(
-    base_dir: &ResolvedPath,
-    config: &ProviderConfig<P, B>,
-    remote_source: &RemoteSource,
-    lock_file: &'lock LockFile,
-) -> Result<Option<&'lock LockEntry<RegistryLock>>, FindInstalledProviderError> {
-    let source_key = remote_source.source_key();
-    if let Some(legacy) = lock_file
-        .legacy
-        .iter()
-        .find(|entry| LockFile::sources_match(&entry.source, source_key.as_str()))
-    {
-        return Err(FindInstalledProviderError::LegacyEntry(
-            legacy.error(base_dir),
-        ));
-    }
-    Ok(lock_file.find_by_remote_config(config, remote_source))
 }
 
 fn installed_provider_from_lock(
@@ -9306,8 +7862,7 @@ fn file_metadata_fingerprint(path: &ResolvedPath) -> Option<FileMetadataFingerpr
 pub fn provider_artifact_fingerprint(
     base_dir: &ResolvedPath,
     config: &ProviderConfig,
-    notices: &mut impl FnMut(ProviderLoadNotice),
-) -> Result<ProviderArtifactFingerprint, LegacyLockEntryError> {
+) -> ProviderArtifactFingerprint {
     let lock_file = base_dir
         .join(PROVIDER_LOCK_FILE_NAME)
         .ok()
@@ -9324,24 +7879,23 @@ pub fn provider_artifact_fingerprint(
                 })
         }
         Some(ProviderSource::Remote(remote_source)) => {
-            let Some(loaded_lock) = load_lock_file(base_dir, notices).ok().flatten() else {
-                return Ok(ProviderArtifactFingerprint {
+            let Some(loaded_lock) = LockFile::load(base_dir).ok().flatten() else {
+                return ProviderArtifactFingerprint {
                     artifact: None,
                     lock_file,
-                });
+                };
             };
             match select_locked_artifact(base_dir, config, remote_source, &loaded_lock) {
                 Ok(Some(selection)) => file_metadata_fingerprint(&selection.path),
                 Ok(None) | Err(FindInstalledProviderError::Other(_)) => None,
-                Err(FindInstalledProviderError::LegacyEntry(error)) => return Err(error),
             }
         }
         None => None,
     };
-    Ok(ProviderArtifactFingerprint {
+    ProviderArtifactFingerprint {
         artifact,
         lock_file,
-    })
+    }
 }
 
 /// Find an already-installed provider without downloading.
@@ -9351,11 +7905,9 @@ pub fn provider_artifact_fingerprint(
 /// provenance that selected it. This is used by the LSP to avoid
 /// editor-triggered downloads as well as by CLI load paths after `carina init`
 /// has installed the artifact.
-/// Find an installed artifact while retaining informational loader events.
 pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
     base_dir: &ResolvedPath,
     config: &ProviderConfig<P, B>,
-    notices: &mut impl FnMut(ProviderLoadNotice),
 ) -> Result<InstalledProvider, FindInstalledProviderError> {
     let io_base = base_dir.clone();
     let base_dir = &io_base;
@@ -9387,7 +7939,7 @@ pub fn find_installed_provider<P: PlaceholderKind, B: BindingAddress>(
         }
         ProviderSource::Remote(remote_source) => remote_source,
     };
-    let lock_file = load_lock_file(&io_base, notices)
+    let lock_file = LockFile::load(&io_base)
         .map_err(|error| FindInstalledProviderError::Other(error.to_string()))?
         .unwrap_or_default();
 
@@ -9523,58 +8075,6 @@ fn resolve_github_release<G: GithubHttp + ?Sized>(
         return Ok(release);
     }
 
-    if mode == LockMode::Normal
-        && let Some((legacy_version, legacy_sha256)) =
-            lock_file.legacy_github_version_pin(&source_key)
-    {
-        if let Some(constraint) = constraint
-            && !constraint.matches(&legacy_version).unwrap_or(false)
-        {
-            return Err(mismatch_error(
-                provider_name,
-                &format!("version = '{legacy_version}'"),
-                &format!("constraint = '{}'", constraint.raw),
-                lock_file.project_dir(),
-            )
-            .to_string());
-        }
-        let version = Version::parse(&legacy_version).map_err(|error| {
-            format!(
-                "Invalid semantic version '{}' in legacy GitHub release lock entry for {}: {error}",
-                legacy_version, source_key
-            )
-        })?;
-        let releases = fetch_releases_with_api(source, github)?;
-        let release = resolve_release_at_version(&releases, &version)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| {
-                let available = releases
-                    .iter()
-                    .map(|release| release.tag().as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "No release of '{}' has the legacy-pinned version '{}'. Available: {}",
-                    provider_name, legacy_version, available
-                )
-            })?;
-        let resolved = ResolvedGithubRelease::from_selected_release(repo.clone(), release)
-            .map_err(|error| error.to_string())?;
-        lock_file.upsert(LockEntry {
-            name: provider_name.to_string(),
-            source: source_key.to_string(),
-            kind: LockEntryKind::GithubRelease {
-                version: resolved.version().clone(),
-                tag: resolved.tag().clone(),
-                asset_id: resolved.asset_id(),
-                constraint: constraint.map(|constraint| constraint.raw.clone()),
-            },
-            sha256: legacy_sha256,
-            registry: None,
-        });
-        return Ok(resolved);
-    }
-
     match constraint {
         Some(constraint) => {
             let releases = fetch_releases_with_api(source, github)?;
@@ -9603,7 +8103,6 @@ fn resolve_github_release<G: GithubHttp + ?Sized>(
 }
 
 fn resolve_registry_version_with_http<H: RegistryHttp>(
-    user_dirs: &UserDirs,
     source: &RegistrySource,
     source_key: &RemoteSourceKey,
     provider_name: &str,
@@ -9617,18 +8116,7 @@ fn resolve_registry_version_with_http<H: RegistryHttp>(
     let registry = resolve_registry(source, existing_host.as_ref(), project_dir, http)?;
     let RecordedRegistryListing { versions, .. } = {
         let mut persistent_lock = PersistentLockFile::new(lock_file);
-        let listing =
-            fetch_registry_versions(&registry, source, source_key, &mut persistent_lock, http)?;
-        convert_obtainable_legacy_signer_pin(
-            user_dirs,
-            &registry,
-            source,
-            source_key,
-            None,
-            &mut persistent_lock,
-            http,
-        )?;
-        listing
+        fetch_registry_versions(&registry, source, source_key, &mut persistent_lock, http)?
     };
     let candidates = SelectableRegistryVersions::from_listing(&versions.versions);
     select_registry_version(&candidates, provider_name, constraint)
@@ -9651,14 +8139,12 @@ pub enum LockMode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockMismatchError {
-    LegacyEntry(LegacyLockEntryError),
     Mismatch(String),
 }
 
 impl fmt::Display for LockMismatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LegacyEntry(error) => error.fmt(formatter),
             Self::Mismatch(message) => formatter.write_str(message),
         }
     }
@@ -9713,7 +8199,6 @@ impl From<String> for ResolveAllError {
 
 #[derive(Debug)]
 pub enum EgressInitializationError {
-    Installed(FindInstalledProviderError),
     Artifact(Box<ProviderArtifactLoadError<crate::EgressSectionError>>),
     LockedConsent(crate::EgressConsentError),
     Consent(crate::EgressConsentError),
@@ -9725,7 +8210,6 @@ pub enum EgressInitializationError {
 impl fmt::Display for EgressInitializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Installed(source) => source.fmt(formatter),
             Self::Artifact(source) => source.fmt(formatter),
             Self::LockedConsent(source) => write!(
                 formatter,
@@ -9750,7 +8234,6 @@ impl fmt::Display for EgressInitializationError {
 impl std::error::Error for EgressInitializationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Installed(source) => source.source(),
             Self::Artifact(source) => source.source(),
             Self::Consent(source) => source.source(),
             Self::LockedConsent(_)
@@ -9798,67 +8281,10 @@ pub fn check_lock_mismatch(
         };
         let source_key = remote_source.source_key();
 
-        let lock_entry = match lock_file.find_source_entry(&source_key) {
-            Some(SourceLockEntry::Typed(first_entry)) => lock_file
+        let lock_entry = match lock_file.find_by_source_key(&source_key) {
+            Some(first_entry) => lock_file
                 .find_by_remote_config(config, remote_source)
                 .unwrap_or(first_entry),
-            Some(SourceLockEntry::Legacy(entry)) => {
-                match &entry.reason {
-                    LegacyReason::GithubDirectVersionWithoutTag {
-                        version: legacy_version,
-                        sha256: _,
-                    } => {
-                        if let Some(crn_revision) = &config.revision {
-                            return Err(mismatch_error(
-                                &config.name,
-                                &format!("version = '{legacy_version}'"),
-                                &format!("revision = '{crn_revision}'"),
-                            ));
-                        }
-                        if let Some(constraint) = &config.version
-                            && !constraint.matches(legacy_version).unwrap_or(false)
-                        {
-                            return Err(mismatch_error(
-                                &config.name,
-                                &format!("version = '{legacy_version}'"),
-                                &format!("constraint = '{}'", constraint.raw),
-                            ));
-                        }
-                    }
-                    LegacyReason::RevisionWithoutArtifactId {
-                        revision: locked_revision,
-                        resolved_sha: _,
-                        sha256: _,
-                    } => match &config.revision {
-                        Some(crn_revision) if crn_revision == locked_revision => {}
-                        Some(crn_revision) => {
-                            return Err(mismatch_error(
-                                &config.name,
-                                &format!("revision = '{locked_revision}'"),
-                                &format!("revision = '{crn_revision}'"),
-                            ));
-                        }
-                        None => {
-                            let crn_shape = config.version.as_ref().map_or_else(
-                                || {
-                                    "(no revision, no version constraint — version mode)"
-                                        .to_string()
-                                },
-                                |constraint| format!("version constraint = '{}'", constraint.raw),
-                            );
-                            return Err(mismatch_error(
-                                &config.name,
-                                &format!("revision = '{locked_revision}'"),
-                                &crn_shape,
-                            ));
-                        }
-                    },
-                }
-                if mode == LockMode::Locked {
-                    return Err(LockMismatchError::LegacyEntry(entry.error(project_dir)));
-                }
-                continue;
-            }
             None => {
                 if mode == LockMode::Locked {
                     return Err(LockMismatchError::Mismatch(format!(
@@ -10264,7 +8690,6 @@ where
     let mut lock_file = install_lock
         .load_lock_file_or_default()
         .map_err(|error| error.to_string())?;
-    lock_file.report_migration(notices);
     let previous_lock_file = lock_file.clone();
 
     // Fail before installing any provider artifact or rewriting the lock if it
@@ -10545,8 +8970,8 @@ fn installed_provider_from_resolved(
         )
         .map_err(ResolveAllError::Other),
         ProviderSource::Remote(remote_source) => {
-            let entry = select_locked_entry(base_dir, config, remote_source, lock_file)
-                .map_err(EgressInitializationError::Installed)?
+            let entry = lock_file
+                .find_by_remote_config(config, remote_source)
                 .ok_or_else(|| {
                     ResolveAllError::Other(format!(
                         "resolved provider source {} has no matching lock entry",
@@ -10642,13 +9067,11 @@ fn print_any_depth_warning(patterns: &BTreeSet<crate::HostPattern>) {
 ///
 /// Called before plan/apply to catch cases where the lock file and constraints have
 /// drifted out of sync (e.g., the user tightened a constraint after last `carina init`).
-/// Validate lock constraints while retaining informational loader events.
 pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
     base_dir: &ResolvedPath,
     providers: &[ProviderConfig<P, B>],
-    notices: &mut impl FnMut(ProviderLoadNotice),
 ) -> Result<(), LockConstraintError> {
-    let lock_file = match load_lock_file(base_dir, notices)? {
+    let lock_file = match LockFile::load(base_dir)? {
         Some(lf) => lf,
         None => return Ok(()),
     };
@@ -10660,22 +9083,15 @@ pub fn validate_lock_constraints<P: PlaceholderKind, B: BindingAddress>(
         };
         let source_key = remote_source.source_key();
 
-        let lock_entry = match lock_file.find_source_entry(&source_key) {
-            Some(SourceLockEntry::Typed(first_entry)) => Some(
+        let lock_entry = lock_file
+            .find_by_source_key(&source_key)
+            .map(|first_entry| {
                 lock_file
                     .find_by_remote_config(config, remote_source)
-                    .unwrap_or(first_entry),
-            ),
-            Some(SourceLockEntry::Legacy(entry)) => {
-                return Err(LockConstraintError::LegacyEntry(Box::new(
-                    entry.error(base_dir),
-                )));
-            }
-            None => None,
-        };
+                    .unwrap_or(first_entry)
+            });
 
-        // Revision-based providers do not use semver constraints, but a
-        // legacy version entry for the same source must still surface above.
+        // Revision-based providers do not use semver constraints.
         if config.revision.is_some() {
             continue;
         }
@@ -10750,18 +9166,12 @@ mod tests {
     const SIGNED_FIXTURE_ARTIFACT: &[u8] = include_bytes!("signing/testdata/a.txt");
     const SIGNED_FIXTURE_BUNDLE: &[u8] = include_bytes!("signing/testdata/bundle.sigstore.json");
     const SIGNED_FIXTURE_IDENTITY: &str = "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml@refs/heads/main";
+    const SIGNED_FIXTURE_WORKFLOW: &str = "https://github.com/sigstore-conformance/extremely-dangerous-public-oidc-beacon/.github/workflows/extremely-dangerous-oidc-beacon.yml";
     const SIGNED_FIXTURE_ISSUER: &str = "https://token.actions.githubusercontent.com";
     const SIGNED_FIXTURE_BUNDLE_URL: &str = "https://downloads.example.test/aws.sigstore.json";
     const SIGNED_FIXTURE_VERSION: &str = "0.0.0-main.1";
-    const SIGNED_FIXTURE_CANDIDATE_VERSION: &str = "0.0.0-main.2";
     const SIGNED_FIXTURE_DOWNLOAD_URL: &str =
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.1/download";
-    const SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL: &str =
-        "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/0.0.0-main.2/download";
-    const SIGNED_FIXTURE_LOCKED_ARTIFACT_URL: &str =
-        "https://downloads.example.test/aws-main-1.wasm";
-    const SIGNED_FIXTURE_CANDIDATE_ARTIFACT_URL: &str =
-        "https://downloads.example.test/aws-main-2.wasm";
     const REGISTRY_VERSIONS_URL: &str =
         "https://registry.carina-rs.dev/v1/providers/carina-rs/aws/versions";
     const REGISTRY_DOWNLOAD_URL: &str =
@@ -10799,163 +9209,6 @@ mod tests {
 
     fn artifact_id(value: u64) -> ArtifactId {
         ArtifactId::from_lock(value)
-    }
-
-    #[test]
-    fn split_legacy_entries_removes_only_github_direct_version_entries() {
-        let github = toml::from_str::<toml::Table>(
-            r#"name = "widget"
-source = "github.com/acme/widget"
-mode = "version"
-version = "0.1.0"
-sha256 = "abc"
-"#,
-        )
-        .unwrap();
-        let registry = toml::from_str::<toml::Table>(
-            r#"name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.7.0"
-sha256 = "def"
-"#,
-        )
-        .unwrap();
-
-        let (retained, legacy) =
-            split_legacy_entries(vec![github.clone(), registry.clone()]).unwrap();
-
-        assert_eq!(retained, vec![registry]);
-        assert_eq!(legacy.len(), 1);
-        assert_eq!(legacy[0].source, "github.com/acme/widget");
-        assert!(matches!(
-            &legacy[0].reason,
-            LegacyReason::GithubDirectVersionWithoutTag { version, sha256 }
-                if version == "0.1.0" && sha256 == "abc"
-        ));
-        assert_eq!(legacy[0].raw, github);
-    }
-
-    #[test]
-    fn split_legacy_entries_rejects_missing_pinned_fields() {
-        for (field, body) in [
-            (
-                "version",
-                r#"name = "widget"
-source = "github.com/acme/widget"
-mode = "version"
-sha256 = "abc"
-"#,
-            ),
-            (
-                "sha256",
-                r#"name = "widget"
-source = "github.com/acme/widget"
-mode = "version"
-version = "0.1.0"
-"#,
-            ),
-        ] {
-            let entry = toml::from_str::<toml::Table>(body).unwrap();
-
-            let error = split_legacy_entries(vec![entry]).unwrap_err();
-
-            assert!(matches!(
-                error,
-                LegacyLockEntryParseError::MissingStringField {
-                    source,
-                    field: missing,
-                } if source == "github.com/acme/widget" && missing == field
-            ));
-        }
-    }
-
-    #[test]
-    fn split_legacy_entries_rejects_non_semver_version_pins() {
-        for version in ["%2e%2e", "..", "/", "?", "#", "%2F", " ", ""] {
-            let entry = toml::from_str::<toml::Table>(&format!(
-                r#"name = "widget"
-source = "github.com/acme/widget"
-mode = "version"
-version = {version:?}
-sha256 = "abc"
-"#
-            ))
-            .unwrap();
-
-            let error = split_legacy_entries(vec![entry]).unwrap_err();
-
-            assert!(matches!(
-                error,
-                LegacyLockEntryParseError::InvalidVersion {
-                    source,
-                    version: invalid,
-                } if source == "github.com/acme/widget" && invalid == version
-            ));
-        }
-    }
-
-    #[test]
-    fn current_lock_with_legacy_entry_reports_an_in_memory_migration() {
-        let loaded = LockFile::parse_toml_str(
-            r#"version = 5
-
-[[provider]]
-name = "widget"
-source = "github.com/acme/widget"
-mode = "version"
-version = "0.1.0"
-sha256 = "abc"
-"#,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .unwrap();
-        let (_, migration) = loaded.into_parts();
-        let migration = migration.expect("filtering must produce a migration event");
-
-        assert_eq!(migration.legacy_sources, ["github.com/acme/widget"]);
-        let report = migration.to_string();
-        assert!(report.contains("github.com/acme/widget"), "{report}");
-        assert!(
-            report.contains("exact release tag and asset ID"),
-            "{report}"
-        );
-    }
-
-    #[test]
-    fn saving_loaded_lock_preserves_complete_legacy_provider_table() {
-        let project = tempfile::tempdir().unwrap();
-        let lock_path = provider_lock_path(project.path());
-        fs::write(
-            &lock_path,
-            r#"version = 5
-
-[[provider]]
-name = "widget"
-source = "github.com/acme/widget"
-mode = "version"
-version = "0.1.0"
-sha256 = "abc"
-future_protection_field = "retain-me"
-"#,
-        )
-        .unwrap();
-        let lock = load_lock_file_for_test(&lock_path).unwrap().unwrap();
-
-        lock.save(&lock_path).unwrap();
-
-        let saved = fs::read_to_string(&lock_path).unwrap();
-        assert!(
-            saved.contains("source = \"github.com/acme/widget\""),
-            "{saved}"
-        );
-        assert!(saved.contains("version = \"0.1.0\""), "{saved}");
-        assert!(saved.contains("sha256 = \"abc\""), "{saved}");
-        assert!(
-            saved.contains("future_protection_field = \"retain-me\""),
-            "{saved}"
-        );
     }
 
     #[test]
@@ -11033,86 +9286,6 @@ sha256 = "abc"
             }
         }
         assert_rejected("asset_id", "\"1.0.0\"", "\"v1.0.0\"", "\"%2F\"");
-    }
-
-    #[test]
-    fn v1_parse_path_splits_legacy_github_version_entry() {
-        let loaded = LockFile::parse_toml_str(
-            r#"version = 1
-
-[[provider]]
-name = "widget"
-source = "github.com/acme/widget"
-mode = "version"
-version = "0.1.0"
-sha256 = "abc"
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.7.0"
-sha256 = "def"
-"#,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .unwrap();
-        let (lock, migration) = loaded.into_parts();
-
-        assert_eq!(migration.unwrap().from, 1);
-        assert_eq!(lock.provider.len(), 1);
-        assert_eq!(lock.provider[0].source, "carina-rs/aws");
-        assert_eq!(lock.legacy.len(), 1);
-        assert_eq!(lock.legacy[0].source, "github.com/acme/widget");
-        assert!(matches!(
-            &lock.legacy[0].reason,
-            LegacyReason::GithubDirectVersionWithoutTag { version, sha256 }
-                if version == "0.1.0" && sha256 == "abc"
-        ));
-    }
-
-    #[test]
-    fn legacy_filter_applies_to_v1_v2_and_v3_parse_paths() {
-        for version in [1, 2, 3] {
-            let content = format!(
-                r#"version = {version}
-
-[[provider]]
-name = "widget"
-source = "github.com/acme/widget"
-mode = "version"
-version = "0.1.0"
-sha256 = "abc"
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.7.0"
-sha256 = "def"
-"#
-            );
-
-            let loaded = LockFile::parse_toml_str(
-                &content,
-                Path::new("carina-providers.lock"),
-                &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-            )
-            .unwrap();
-            let (lock, migration) = loaded.into_parts();
-
-            assert_eq!(migration.unwrap().from, version);
-            assert_eq!(lock.provider.len(), 1);
-            assert_eq!(lock.provider[0].source, "carina-rs/aws");
-            assert_eq!(lock.legacy.len(), 1);
-            assert_eq!(lock.legacy[0].source, "github.com/acme/widget");
-            assert!(matches!(
-                &lock.legacy[0].reason,
-                LegacyReason::GithubDirectVersionWithoutTag { version, sha256 }
-                    if version == "0.1.0" && sha256 == "abc"
-            ));
-        }
     }
 
     fn github_source(source: &str) -> GithubSource {
@@ -11346,7 +9519,6 @@ sha256 = "def"
         base_dir: &Path,
         config: &ProviderConfig,
         http: &H,
-        _notices: &mut impl FnMut(ProviderLoadNotice),
     ) -> Result<WasmArtifactPath, String> {
         let install_lock =
             ProviderInstallLock::acquire(&carina_core::paths::ResolvedPath::new(base_dir).unwrap())
@@ -11458,9 +9630,7 @@ sha256 = "def"
 
     // This test adapter mirrors the resolver entry point while adding the
     // project path needed to acquire its real install lock.
-    #[allow(clippy::too_many_arguments)]
     fn resolve_registry_version_with_http<H: RegistryHttp>(
-        user_dirs: &UserDirs,
         base_dir: &Path,
         source: &RegistrySource,
         source_key: &RemoteSourceKey,
@@ -11474,7 +9644,6 @@ sha256 = "def"
                 .unwrap();
         with_guarded_lock_file(&install_lock, lock_file, |lock_file| {
             super::resolve_registry_version_with_http(
-                user_dirs,
                 source,
                 source_key,
                 provider_name,
@@ -11502,79 +9671,6 @@ sha256 = "def"
 
     fn captured_identity(bundle: &[u8]) -> signing::VerifiedSignerIdentity {
         signing::extract_signer_identity_from_bundle_for_test(bundle).unwrap()
-    }
-
-    fn signed_fixture_download(version: &str, artifact_url: &str) -> Vec<u8> {
-        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
-        serde_json::to_vec(&serde_json::json!({
-            "protocols": ["1"],
-            "filename": format!("carina-provider-aws-v{version}.wasm"),
-            "download_url": artifact_url,
-            "shasum": shasum,
-            "shasum_authored_by": "registry",
-            "signature": {
-                "type": "sigstore-bundle",
-                "certificate_identity": "deliberately-wrong-response-value",
-                "certificate_oidc_issuer": "https://wrong.example.test",
-                "bundle_url": SIGNED_FIXTURE_BUNDLE_URL,
-            },
-        }))
-        .unwrap()
-    }
-
-    fn signed_fixture_registry() -> FixtureRegistryHttp {
-        FixtureRegistryHttp::default()
-            .json(
-                "https://registry.carina-rs.dev/.well-known/carina.json",
-                r#"{"providers.v1":"/v1/providers/"}"#,
-            )
-            .json(
-                REGISTRY_VERSIONS_URL,
-                format!(
-                    r#"{{"sequence":7,"valid_until":"2999-01-01T00:00:00Z","versions":[{{"version":"{SIGNED_FIXTURE_VERSION}","protocols":["1"]}},{{"version":"{SIGNED_FIXTURE_CANDIDATE_VERSION}","protocols":["1"]}}]}}"#
-                ),
-            )
-            .json(
-                SIGNED_FIXTURE_DOWNLOAD_URL,
-                signed_fixture_download(
-                    SIGNED_FIXTURE_VERSION,
-                    SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
-                ),
-            )
-            .json(
-                SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL,
-                signed_fixture_download(
-                    SIGNED_FIXTURE_CANDIDATE_VERSION,
-                    SIGNED_FIXTURE_CANDIDATE_ARTIFACT_URL,
-                ),
-            )
-            .response(SIGNED_FIXTURE_BUNDLE_URL, 200, SIGNED_FIXTURE_BUNDLE)
-            .downloadable_bytes(
-                SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
-                SIGNED_FIXTURE_ARTIFACT.to_vec(),
-            )
-            .downloadable_bytes(
-                SIGNED_FIXTURE_CANDIDATE_ARTIFACT_URL,
-                SIGNED_FIXTURE_ARTIFACT.to_vec(),
-            )
-    }
-
-    fn signed_fixture_legacy_lock(user_dirs: &UserDirs, base_dir: &Path) -> LockFile {
-        let mut lock = LockFile::default();
-        resolve_provider_with_http(
-            user_dirs,
-            base_dir,
-            &provider_source("carina-rs/aws"),
-            SIGNED_FIXTURE_VERSION,
-            "aws",
-            &mut lock,
-            &signed_fixture_registry(),
-        )
-        .unwrap();
-        lock.provider[0].registry.as_mut().unwrap().signature =
-            signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER);
-        lock.save(&base_dir.join(PROVIDER_LOCK_FILE_NAME)).unwrap();
-        lock
     }
 
     fn resolve_registry<H: RegistryHttp>(
@@ -11639,15 +9735,26 @@ sha256 = "def"
         result
     }
 
-    fn signature_pin(identity: &str, issuer: &str) -> RegistrySignatureProtection {
-        RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
-            certificate_san: identity.into(),
-            oidc_issuer: issuer.into(),
+    fn signature_pin(repository_id: &str, issuer: &str) -> RegistrySignatureProtection {
+        RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+            source: SourcePin {
+                oidc_issuer: issuer.into(),
+                repository_owner_id: "owner".into(),
+                repository_id: repository_id.into(),
+            },
+            workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
         }))
     }
 
     fn signed_fixture_pin() -> RegistrySignatureProtection {
-        signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER)
+        RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+            source: SourcePin {
+                oidc_issuer: SIGNED_FIXTURE_ISSUER.into(),
+                repository_owner_id: "131804563".into(),
+                repository_id: "632596897".into(),
+            },
+            workflows: WorkflowPins::Prerelease(WorkflowPin(SIGNED_FIXTURE_WORKFLOW.into())),
+        }))
     }
 
     fn verified_signer(
@@ -11785,32 +9892,6 @@ sha256 = "def"
     }
 
     #[test]
-    fn signer_decision_converts_legacy_pin_without_parsing_it() {
-        let legacy = SignerPinState::Legacy(LegacySignerPin {
-            certificate_san: "https://example.test/ci.yml@refs/heads/main".into(),
-            oidc_issuer: "https://issuer.example".into(),
-        });
-        let identity = verified_signer(
-            "https://example.test/ci.yml@refs/heads/main",
-            "https://issuer.example",
-            "owner-1",
-            "repo-1",
-            "refs/heads/main",
-            "https://example.test/ci.yml",
-        );
-
-        let accepted = decide_signer(
-            &legacy,
-            &identity,
-            &ListedVersion::parse("0.0.0-main.1").unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(accepted.transition, SignerTransition::LegacyConverted);
-        assert!(matches!(accepted.next, SignerPinState::Current(_)));
-    }
-
-    #[test]
     fn captured_stable_certificate_is_accepted_from_exact_v_tag() {
         let identity = captured_identity(CAPTURED_AWS_STABLE_BUNDLE);
         let accepted = decide_signer(
@@ -11922,381 +10003,6 @@ sha256 = "def"
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn legacy_pin_converts_from_locked_version_artifact_before_candidate_is_evaluated() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let dir = tempfile::tempdir().unwrap();
-        let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
-        fs::remove_file(cache_path_wasm(
-            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
-            &source_key("carina-rs/aws"),
-            SIGNED_FIXTURE_VERSION,
-        ))
-        .unwrap();
-
-        let http = signed_fixture_registry();
-        resolve_provider_with_http(
-            &user_dirs,
-            dir.path(),
-            &provider_source("carina-rs/aws"),
-            SIGNED_FIXTURE_CANDIDATE_VERSION,
-            "aws",
-            &mut lock,
-            &http,
-        )
-        .unwrap();
-
-        let requests = http.requested_urls();
-        let legacy_metadata = requests
-            .iter()
-            .position(|url| url == SIGNED_FIXTURE_DOWNLOAD_URL)
-            .unwrap();
-        let legacy_artifact = requests
-            .iter()
-            .position(|url| url == SIGNED_FIXTURE_LOCKED_ARTIFACT_URL)
-            .unwrap();
-        let legacy_bundle = requests
-            .iter()
-            .position(|url| url == SIGNED_FIXTURE_BUNDLE_URL)
-            .unwrap();
-        let candidate_metadata = requests
-            .iter()
-            .position(|url| url == SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL)
-            .unwrap();
-        assert!(legacy_metadata < legacy_artifact, "{requests:#?}");
-        assert!(legacy_artifact < legacy_bundle, "{requests:#?}");
-        assert!(legacy_bundle < candidate_metadata, "{requests:#?}");
-
-        let RegistrySignatureProtection::Required(SignerPinState::Current(pins)) = lock
-            .known_registry_ratchets("carina-rs/aws")
-            .unwrap()
-            .signature
-        else {
-            panic!("legacy state must be replaced by current pins");
-        };
-        let identity = captured_identity(SIGNED_FIXTURE_BUNDLE);
-        assert_eq!(pins.source.oidc_issuer, identity.source().oidc_issuer);
-        assert_eq!(
-            pins.source.repository_owner_id,
-            identity.source().repository_owner_id
-        );
-        assert_eq!(pins.source.repository_id, identity.source().repository_id);
-        assert!(matches!(
-            pins.workflows,
-            WorkflowPins::Prerelease(WorkflowPin(ref workflow)) if workflow == identity.workflow()
-        ));
-        assert_eq!(
-            lock.find_by_source("carina-rs/aws")
-                .unwrap()
-                .kind
-                .resolved_version()
-                .as_deref(),
-            Some(SIGNED_FIXTURE_CANDIDATE_VERSION)
-        );
-    }
-
-    #[test]
-    fn unavailable_legacy_metadata_bundle_or_artifact_keeps_the_legacy_gate() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let shasum = sha256_bytes(SIGNED_FIXTURE_ARTIFACT);
-        let unsigned_candidate = serde_json::to_vec(&serde_json::json!({
-            "protocols": ["1"],
-            "filename": "carina-provider-aws-v0.0.0-main.2.wasm",
-            "download_url": SIGNED_FIXTURE_CANDIDATE_ARTIFACT_URL,
-            "shasum": shasum,
-            "shasum_authored_by": "registry",
-        }))
-        .unwrap();
-        let scenarios = [
-            signed_fixture_registry().transport_error(SIGNED_FIXTURE_DOWNLOAD_URL, "offline"),
-            signed_fixture_registry().response(SIGNED_FIXTURE_DOWNLOAD_URL, 404, b"not found"),
-            signed_fixture_registry().transport_error(SIGNED_FIXTURE_BUNDLE_URL, "offline"),
-            signed_fixture_registry().response(SIGNED_FIXTURE_BUNDLE_URL, 404, b"not found"),
-            signed_fixture_registry()
-                .transport_error(SIGNED_FIXTURE_LOCKED_ARTIFACT_URL, "offline"),
-            signed_fixture_registry().response(
-                SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
-                404,
-                b"not found",
-            ),
-        ];
-
-        for http in scenarios
-            .into_iter()
-            .map(|http| http.json(SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL, &unsigned_candidate))
-        {
-            let dir = tempfile::tempdir().unwrap();
-            let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
-            fs::remove_file(cache_path_wasm(
-                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
-                &source_key("carina-rs/aws"),
-                SIGNED_FIXTURE_VERSION,
-            ))
-            .unwrap();
-
-            let error = resolve_provider_with_http(
-                &user_dirs,
-                dir.path(),
-                &provider_source("carina-rs/aws"),
-                SIGNED_FIXTURE_CANDIDATE_VERSION,
-                "aws",
-                &mut lock,
-                &http,
-            )
-            .unwrap_err();
-
-            assert!(error.contains("signature"), "{error}");
-            assert!(matches!(
-                lock.known_registry_ratchets("carina-rs/aws")
-                    .unwrap()
-                    .signature,
-                RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn downloaded_legacy_artifact_hash_mismatch_fails_closed_and_removes_cache_file() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let dir = tempfile::tempdir().unwrap();
-        let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
-        let locked_path = cache_path_wasm(
-            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
-            &source_key("carina-rs/aws"),
-            SIGNED_FIXTURE_VERSION,
-        );
-        fs::remove_file(&locked_path).unwrap();
-        let http = signed_fixture_registry()
-            .downloadable_bytes(SIGNED_FIXTURE_LOCKED_ARTIFACT_URL, b"tampered".to_vec());
-
-        let error = resolve_provider_with_http(
-            &user_dirs,
-            dir.path(),
-            &provider_source("carina-rs/aws"),
-            SIGNED_FIXTURE_CANDIDATE_VERSION,
-            "aws",
-            &mut lock,
-            &http,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("SHA256 mismatch"), "{error}");
-        assert!(!locked_path.exists());
-        assert!(
-            !http
-                .requested_urls()
-                .iter()
-                .any(|url| url == SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL),
-            "candidate metadata was requested after the locked digest failed verification"
-        );
-        assert!(matches!(
-            lock.known_registry_ratchets("carina-rs/aws")
-                .unwrap()
-                .signature,
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
-        ));
-    }
-
-    #[test]
-    fn cached_legacy_artifact_is_hash_checked_before_signature_verification() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let dir = tempfile::tempdir().unwrap();
-        let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
-        let locked_path = cache_path_wasm(
-            &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
-            &source_key("carina-rs/aws"),
-            SIGNED_FIXTURE_VERSION,
-        );
-        fs::write(&locked_path, b"tampered cached artifact").unwrap();
-        let http = signed_fixture_registry();
-
-        let error = resolve_provider_with_http(
-            &user_dirs,
-            dir.path(),
-            &provider_source("carina-rs/aws"),
-            SIGNED_FIXTURE_CANDIDATE_VERSION,
-            "aws",
-            &mut lock,
-            &http,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("SHA256 mismatch"), "{error}");
-        assert!(!locked_path.exists());
-        assert!(
-            !http
-                .requested_urls()
-                .iter()
-                .any(|url| url == SIGNED_FIXTURE_LOCKED_ARTIFACT_URL)
-        );
-        assert!(matches!(
-            lock.known_registry_ratchets("carina-rs/aws")
-                .unwrap()
-                .signature,
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
-        ));
-    }
-
-    #[test]
-    fn obtained_invalid_legacy_evidence_fails_before_candidate_evaluation() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let mut invalid_metadata: serde_json::Value = serde_json::from_slice(
-            &signed_fixture_download(SIGNED_FIXTURE_VERSION, SIGNED_FIXTURE_LOCKED_ARTIFACT_URL),
-        )
-        .unwrap();
-        let mut missing_signature: serde_json::Value = invalid_metadata.clone();
-        missing_signature
-            .as_object_mut()
-            .unwrap()
-            .remove("signature");
-        let mut unsupported_signature: serde_json::Value = invalid_metadata.clone();
-        unsupported_signature["signature"]["type"] = serde_json::json!("unsupported");
-        invalid_metadata["shasum"] = serde_json::json!("00".repeat(32));
-        let scenarios = [
-            (
-                signed_fixture_registry().json(
-                    SIGNED_FIXTURE_DOWNLOAD_URL,
-                    serde_json::to_vec(&invalid_metadata).unwrap(),
-                ),
-                "differs from carina-providers.lock",
-            ),
-            (
-                signed_fixture_registry().json(
-                    SIGNED_FIXTURE_DOWNLOAD_URL,
-                    serde_json::to_vec(&missing_signature).unwrap(),
-                ),
-                "without its required registry signature",
-            ),
-            (
-                signed_fixture_registry().json(
-                    SIGNED_FIXTURE_DOWNLOAD_URL,
-                    serde_json::to_vec(&unsupported_signature).unwrap(),
-                ),
-                "unsupported registry signature type",
-            ),
-            (
-                signed_fixture_registry().response(SIGNED_FIXTURE_BUNDLE_URL, 200, b"not a bundle"),
-                "cannot parse Sigstore bundle JSON",
-            ),
-            (
-                signed_fixture_registry().response(
-                    SIGNED_FIXTURE_DOWNLOAD_URL,
-                    500,
-                    b"server error",
-                ),
-                "HTTP 500",
-            ),
-            (
-                signed_fixture_registry().response(SIGNED_FIXTURE_BUNDLE_URL, 500, b"server error"),
-                "HTTP 500",
-            ),
-            (
-                signed_fixture_registry().response(
-                    SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
-                    500,
-                    b"server error",
-                ),
-                "status 500",
-            ),
-        ];
-
-        for (http, expected_error) in scenarios {
-            let dir = tempfile::tempdir().unwrap();
-            let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
-            fs::remove_file(cache_path_wasm(
-                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
-                &source_key("carina-rs/aws"),
-                SIGNED_FIXTURE_VERSION,
-            ))
-            .unwrap();
-
-            let error = resolve_provider_with_http(
-                &user_dirs,
-                dir.path(),
-                &provider_source("carina-rs/aws"),
-                SIGNED_FIXTURE_CANDIDATE_VERSION,
-                "aws",
-                &mut lock,
-                &http,
-            )
-            .unwrap_err();
-
-            assert!(error.contains(expected_error), "{error}");
-            assert!(
-                !http
-                    .requested_urls()
-                    .iter()
-                    .any(|url| url == SIGNED_FIXTURE_CANDIDATE_DOWNLOAD_URL),
-                "candidate metadata was requested after invalid locked-version evidence"
-            );
-            assert!(matches!(
-                lock.known_registry_ratchets("carina-rs/aws")
-                    .unwrap()
-                    .signature,
-                RegistrySignatureProtection::Required(SignerPinState::Legacy(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn legacy_locked_content_refusals_name_no_recovery_operation() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let locked_download: serde_json::Value = serde_json::from_slice(&signed_fixture_download(
-            SIGNED_FIXTURE_VERSION,
-            SIGNED_FIXTURE_LOCKED_ARTIFACT_URL,
-        ))
-        .unwrap();
-        let mut missing_signature = locked_download.clone();
-        missing_signature
-            .as_object_mut()
-            .unwrap()
-            .remove("signature");
-        let mut changed_shasum = locked_download;
-        changed_shasum["shasum"] = serde_json::json!("00".repeat(32));
-        let scenarios = [
-            (missing_signature, "without its required registry signature"),
-            (changed_shasum, "differs from carina-providers.lock"),
-        ];
-
-        for (download, expected_reason) in scenarios {
-            let dir = tempfile::tempdir().unwrap();
-            let mut lock = signed_fixture_legacy_lock(&user_dirs, dir.path());
-            fs::remove_file(cache_path_wasm(
-                &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
-                &source_key("carina-rs/aws"),
-                SIGNED_FIXTURE_VERSION,
-            ))
-            .unwrap();
-            let http = signed_fixture_registry().json(
-                SIGNED_FIXTURE_DOWNLOAD_URL,
-                serde_json::to_vec(&download).unwrap(),
-            );
-
-            let error = resolve_provider_with_http(
-                &user_dirs,
-                dir.path(),
-                &provider_source("carina-rs/aws"),
-                SIGNED_FIXTURE_CANDIDATE_VERSION,
-                "aws",
-                &mut lock,
-                &http,
-            )
-            .expect_err("changed immutable legacy-version content must be refused");
-            assert!(error.contains(expected_reason), "{error}");
-            assert!(
-                error.contains("No sanctioned recovery operation clears this refusal."),
-                "{error}"
-            );
-            for command in [
-                "carina providers re-bootstrap",
-                "carina providers repin-identity",
-                "carina providers repin-discovery",
-            ] {
-                assert!(!error.contains(command), "{error}");
-            }
-        }
     }
 
     #[test]
@@ -12773,57 +10479,6 @@ sha256 = "def"
         }
     }
 
-    /// The lock-file shape from commit cd228086. In particular, this predates
-    /// signing-identity pins and the top-level lock format version.
-    #[derive(Serialize, Deserialize)]
-    struct Cd228086LockFile {
-        #[serde(default)]
-        provider: Vec<Cd228086LockEntry>,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct Cd228086LockEntry {
-        name: String,
-        source: String,
-        #[serde(flatten)]
-        kind: Cd228086LockEntryKind,
-        sha256: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        registry: Option<Cd228086RegistryLock>,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    #[serde(tag = "mode", rename_all = "lowercase")]
-    enum Cd228086LockEntryKind {
-        Version {
-            version: String,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            constraint: Option<String>,
-        },
-        Revision {
-            revision: String,
-            resolved_sha: String,
-        },
-        File,
-    }
-
-    #[derive(Serialize, Deserialize)]
-    struct Cd228086RegistryLock {
-        resolved_hostname: String,
-        api_base_url: String,
-        discovery_sha256: String,
-        #[serde(default)]
-        sequence_present: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sequence: Option<u64>,
-        #[serde(default)]
-        valid_until_present: bool,
-        #[serde(default)]
-        signature_present: bool,
-        #[serde(default)]
-        transparency_log_present: bool,
-    }
-
     fn fully_protected_lock_toml() -> String {
         let mut lock = LockFile::default();
         lock.upsert_registry(
@@ -12860,11 +10515,13 @@ sha256 = "def"
         lock.to_toml_string().unwrap()
     }
 
-    fn fully_protected_v2_lock_toml() -> &'static str {
-        r#"version = 2
+    fn pending_discovery_lock_toml() -> &'static str {
+        r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
-discovery_pin_present = true
+discovery_pin_present = false
+
+[[registry_host."registry.carina-rs.dev".migration_pending_discovery_pins]]
 api_base_url = "https://registry.carina-rs.dev/v1/providers/"
 discovery_sha256 = "legacy-discovery-sha256"
 
@@ -12884,67 +10541,13 @@ sequence_anchor_established = true
 sequence_anchor = 5
 valid_until_present = true
 yanked_versions = ["0.3.0", "0.4.0"]
-signature_present = true
-certificate_identity = "identity-a"
-certificate_oidc_issuer = "issuer-a"
+signature_state = "required_current"
+source_oidc_issuer = "issuer-a"
+source_repository_owner_id = "owner"
+source_repository_id = "identity-a"
+stable_workflow = "release.yml"
 transparency_log_present = true
 "#
-    }
-
-    fn fully_protected_v1_lock_toml() -> &'static str {
-        r#"version = 1
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-constraint = "^0.5"
-sha256 = "pinned-provider-sha256"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "legacy-discovery-sha256"
-sequence_present = true
-sequence = 7
-sequence_anchor_established = true
-sequence_anchor = 5
-valid_until_present = true
-yanked_versions = ["0.3.0", "0.4.0"]
-signature_present = true
-certificate_identity = "identity-a"
-certificate_oidc_issuer = "issuer-a"
-transparency_log_present = true
-"#
-    }
-
-    fn v1_lock_with_second_registry_pin(api_base_url: &str, discovery_sha256: &str) -> String {
-        format!(
-            "{}{}",
-            fully_protected_v1_lock_toml(),
-            format_args!(
-                r#"
-
-[[provider]]
-name = "random"
-source = "carina-rs/random"
-mode = "version"
-version = "1.0.0"
-sha256 = "other-pinned-provider-sha256"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = {api_base_url:?}
-discovery_sha256 = {discovery_sha256:?}
-sequence_present = false
-sequence_anchor_established = false
-valid_until_present = false
-signature_present = false
-transparency_log_present = false
-"#
-            )
-        )
     }
 
     fn pending_discovery_pins_in(serialized: &str, hostname: &str) -> Vec<toml::Value> {
@@ -12955,48 +10558,6 @@ transparency_log_present = false
             .and_then(toml::Value::as_array)
             .expect("migrated hosts must serialize a pending-pin array")
             .clone()
-    }
-
-    fn unpinned_v2_lock_toml() -> String {
-        fully_protected_v2_lock_toml().replace(
-            r#"discovery_pin_present = true
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "legacy-discovery-sha256""#,
-            "discovery_pin_present = false",
-        )
-    }
-
-    fn two_host_v2_lock_toml() -> String {
-        let mut lock = fully_protected_v2_lock_toml().replace(
-            "\n[[provider]]",
-            r#"
-
-[registry_host."registry.example.test"]
-discovery_pin_present = true
-api_base_url = "https://registry.example.test/v1/providers/"
-discovery_sha256 = "other-legacy-discovery-sha256"
-
-[[provider]]"#,
-        );
-        lock.push_str(
-            r#"
-[[provider]]
-name = "random"
-source = "registry.example.test/carina-rs/random"
-mode = "version"
-version = "1.0.0"
-sha256 = "other-pinned-provider-sha256"
-
-[provider.registry]
-resolved_hostname = "registry.example.test"
-sequence_present = false
-sequence_anchor_established = false
-valid_until_present = false
-signature_present = false
-transparency_log_present = false
-"#,
-        );
-        lock
     }
 
     fn lock_with_registry_security_state(signature: RegistrySignatureProtection) -> LockFile {
@@ -13030,7 +10591,6 @@ transparency_log_present = false
                 }),
             }],
             egress: BTreeMap::new(),
-            legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         }
     }
@@ -13154,131 +10714,6 @@ transparency_log_present = false
     }
 
     #[test]
-    fn legacy_revision_lock_is_reselected_in_normal_mode_and_rejected_in_locked_mode() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let source = "github.com/carina-rs/carina-provider-awscc";
-        let serialized = format!(
-            r#"version = {}
-
-[[provider]]
-name = "awscc"
-source = "{source}"
-mode = "revision"
-revision = "main"
-resolved_sha = "{TEST_COMMIT_SHA}"
-sha256 = "legacy"
-"#,
-            LockFile::CURRENT_VERSION
-        );
-        let lock =
-            LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock")).unwrap();
-        let config = provider_config(source, Some("main"));
-
-        assert!(lock.provider.is_empty());
-        check_lock_mismatch(std::slice::from_ref(&config), &lock, LockMode::Normal).unwrap();
-        let error = check_lock_mismatch(&[config], &lock, LockMode::Locked).unwrap_err();
-        assert!(matches!(
-            &error,
-            LockMismatchError::LegacyEntry(LegacyLockEntryError {
-                source: locked_source,
-                reason: LegacyReason::RevisionWithoutArtifactId {
-                    revision,
-                    resolved_sha,
-                    sha256,
-                },
-                project_dir: _,
-            }) if locked_source == source
-                && revision == "main"
-                && resolved_sha == &commit_sha(TEST_COMMIT_SHA)
-                && sha256 == "legacy"
-        ));
-        let rendered = error.to_string();
-        assert!(rendered.contains(source), "{rendered}");
-        assert!(rendered.contains("carina init"), "{rendered}");
-        assert!(
-            lock.to_toml_string()
-                .unwrap()
-                .contains("mode = \"revision\"")
-        );
-
-        let project = tempfile::tempdir().unwrap();
-        fs::write(provider_lock_path(project.path()), &serialized).unwrap();
-        let install_lock = ProviderInstallLock::acquire(
-            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-        )
-        .unwrap();
-        let error = resolve_all(
-            &user_dirs,
-            &install_lock,
-            &[provider_config(source, Some("main"))],
-            LockMode::Locked,
-            &mut |_| {},
-        )
-        .unwrap_err();
-        assert!(matches!(
-            &error,
-            ResolveAllError::LockMismatch(LockMismatchError::LegacyEntry(
-                LegacyLockEntryError {
-                    source: locked_source,
-                    reason: LegacyReason::RevisionWithoutArtifactId {
-                        revision,
-                        resolved_sha,
-                        sha256,
-                    },
-                    project_dir: _,
-                }
-            )) if locked_source == source
-                && revision == "main"
-                && resolved_sha == &commit_sha(TEST_COMMIT_SHA)
-                && sha256 == "legacy"
-        ));
-        let rendered = error.to_string();
-        assert!(rendered.contains(source), "{rendered}");
-        assert!(rendered.contains("carina init"), "{rendered}");
-    }
-
-    #[test]
-    fn legacy_revision_filter_requires_exact_keys_and_allows_registry() {
-        let mut entry = toml::Table::new();
-        for (key, value) in [
-            ("name", "awscc"),
-            ("source", "github.com/carina-rs/carina-provider-awscc"),
-            ("mode", "revision"),
-            ("revision", "main"),
-            ("resolved_sha", TEST_COMMIT_SHA),
-            ("sha256", "legacy"),
-        ] {
-            entry.insert(key.to_string(), toml::Value::String(value.to_string()));
-        }
-
-        let (retained, legacy) = split_legacy_entries(vec![entry.clone()]).unwrap();
-        assert!(retained.is_empty());
-        assert!(matches!(
-            legacy.as_slice(),
-            [LegacyLockEntry {
-                source,
-                reason: LegacyReason::RevisionWithoutArtifactId {
-                    revision,
-                    resolved_sha,
-                    sha256,
-                },
-                raw: _,
-            }] if source == "github.com/carina-rs/carina-provider-awscc"
-                && revision == "main"
-                && resolved_sha == &commit_sha(TEST_COMMIT_SHA)
-                && sha256 == "legacy"
-        ));
-        entry.insert("registry".into(), toml::Value::Table(toml::Table::new()));
-        let (retained, legacy) = split_legacy_entries(vec![entry.clone()]).unwrap();
-        assert!(retained.is_empty());
-        assert_eq!(legacy.len(), 1);
-        entry.insert("artifact_ld".into(), toml::Value::Integer(42));
-        let (retained, legacy) = split_legacy_entries(vec![entry.clone()]).unwrap();
-        assert_eq!(retained, vec![entry]);
-        assert!(legacy.is_empty());
-    }
-
-    #[test]
     fn malformed_revision_artifact_id_is_a_parse_error() {
         let serialized = format!(
             r#"version = {}
@@ -13360,42 +10795,6 @@ sha256 = "malformed"
                 .expect("malformed resolved SHA must not panic")
                 .expect_err("malformed resolved SHA must fail lock parsing");
             assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
-        }
-    }
-
-    #[test]
-    fn malformed_legacy_revision_shas_return_typed_parse_errors() {
-        for invalid in [
-            "../..",
-            "日本語",
-            "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
-        ] {
-            let serialized = format!(
-                r#"version = {}
-
-[[provider]]
-name = "awscc"
-source = "github.com/carina-rs/carina-provider-awscc"
-mode = "revision"
-revision = "main"
-resolved_sha = {invalid:?}
-sha256 = "malformed"
-"#,
-                LockFile::CURRENT_VERSION
-            );
-
-            let error = LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock"))
-                .expect_err("malformed legacy resolved SHA must fail lock parsing");
-            assert!(matches!(
-                error,
-                LockFileError::LegacyEntryParse {
-                    source: LegacyLockEntryParseError::InvalidResolvedSha {
-                        source,
-                        value,
-                    },
-                    path: _,
-                } if source == "github.com/carina-rs/carina-provider-awscc" && value == invalid
-            ));
         }
     }
 
@@ -13607,7 +11006,6 @@ sha256 = "malformed"
                 registry: None,
             }],
             egress: BTreeMap::new(),
-            legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let toml_str = lock.to_toml_string().unwrap();
@@ -13640,7 +11038,6 @@ sha256 = "malformed"
                 registry: None,
             }],
             egress: BTreeMap::new(),
-            legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
 
@@ -13692,7 +11089,6 @@ sha256 = "abc"
                 registry: None,
             }],
             egress: BTreeMap::new(),
-            legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let toml_str = lock.to_toml_string().unwrap();
@@ -13723,7 +11119,6 @@ sha256 = "abc"
                 "81b6910fb34e84784daac2a02c915e821b2da570",
             )],
             egress: BTreeMap::new(),
-            legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let toml_str = lock.to_toml_string().unwrap();
@@ -13754,7 +11149,6 @@ sha256 = "abc"
                 registry: None,
             }],
             egress: BTreeMap::new(),
-            legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let toml_str = lock.to_toml_string().unwrap();
@@ -13835,10 +11229,18 @@ hosts = ["z.example.com", "**.example.com", "a.example.com"]
         let source = source_key("carina-rs/aws");
         let sha256 = sha256_bytes(&bytes);
         let user_dirs = carina_core::TestUserDirs::new();
-        let signer = signature_pin(
-            "https://github.com/carina-rs/carina-provider-aws/.github/workflows/ci.yml@refs/heads/main",
-            "https://token.actions.githubusercontent.com",
-        );
+        let signer =
+            RegistrySignatureProtection::Required(SignerPinState::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "https://token.actions.githubusercontent.com".into(),
+                    repository_owner_id: "260157389".into(),
+                    repository_id: "123".into(),
+                },
+                workflows: WorkflowPins::Prerelease(WorkflowPin(
+                    "https://github.com/carina-rs/carina-provider-aws/.github/workflows/ci.yml"
+                        .into(),
+                )),
+            }));
         let verified_signer = verified_signer(
             "https://github.com/carina-rs/carina-provider-aws/.github/workflows/ci.yml@refs/heads/main",
             "https://token.actions.githubusercontent.com",
@@ -14024,7 +11426,6 @@ hosts = ["z.example.com", "**.example.com", "a.example.com"]
             let locked = load_locked_egress(
                 &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
                 load,
-                &mut |_| {},
             )
             .unwrap()
             .expect("each artifact has its own egress record");
@@ -14299,7 +11700,7 @@ hosts = ["api.example.com"]
     }
 
     #[test]
-    fn missing_or_migrated_egress_subtable_has_no_consent() {
+    fn missing_egress_subtable_has_no_consent() {
         let without_egress = r#"version = 5
 
 [[provider]]
@@ -14311,13 +11712,6 @@ sha256 = "abc"
         let current =
             LockFile::from_toml_str(without_egress, Path::new("carina-providers.lock")).unwrap();
         assert!(current.egress.is_empty());
-
-        let v4_with_ignored_egress = without_egress.replacen("version = 5", "version = 4", 1)
-            + "\n[provider.egress]\nconsent = \"explicit\"\nhosts = []\nunexpected = true\n";
-        let migrated =
-            LockFile::from_toml_str(&v4_with_ignored_egress, Path::new("carina-providers.lock"))
-                .unwrap();
-        assert!(migrated.egress.is_empty());
     }
 
     /// A lock file with an unknown or missing `mode` tag fails to parse instead
@@ -14330,7 +11724,7 @@ sha256 = "abc"
         let lock_path = dir.path().join("carina-providers.lock");
         fs::write(
             &lock_path,
-            r#"version = 3
+            r#"version = 5
 
 [[provider]]
 name = "awscc"
@@ -14355,7 +11749,7 @@ sha256 = "abc"
     #[test]
     fn lock_load_rejects_set_shaped_unpinned_yanks() {
         let error = LockFile::from_toml_str(
-            r#"version = 3
+            r#"version = 5
 
 [unpinned_registry_yanks]
 "carina-rs/aws" = ["0.4.0"]
@@ -15140,16 +12534,6 @@ sha256 = "abc"
     }
 
     #[test]
-    fn v3_host_pins_cannot_be_silently_read_by_cd228086() {
-        let error = match toml::from_str::<Cd228086LockFile>(&fully_protected_lock_toml()) {
-            Ok(_) => panic!("the old per-entry schema must not consume a v3 host-owned pin"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("api_base_url"), "{error}");
-    }
-
-    #[test]
     fn lock_load_rejects_newer_format_with_typed_error() {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
@@ -15178,6 +12562,9 @@ sha256 = "abc"
         for found in 1..=4 {
             let error = LockFile::from_toml_str(&format!("version = {found}\n"), path)
                 .expect_err("only the current lock format may be loaded");
+            assert!(
+                matches!(&error, LockFileError::UnsupportedVersion { path: actual, found: actual_found, supported: LockFile::CURRENT_VERSION } if actual == path && *actual_found == found)
+            );
             let rendered = error.to_string();
             assert!(rendered.contains(&path.display().to_string()), "{rendered}");
             assert!(rendered.contains(&format!("version {found}")), "{rendered}");
@@ -15217,656 +12604,21 @@ sha256 = "abc"
             include_str!("../tests/fixtures/rejected-provider-signer.toml"),
             include_str!("../tests/fixtures/rejected-unpinned-signer.toml"),
         ] {
-            let error = LockFile::from_toml_str(fixture, path)
-                .expect_err("signer pins must use the current identity schema");
-            assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
-            assert!(error.to_string().contains("hint:"), "{error}");
+            for fixture in [
+                fixture.to_string(),
+                fixture.replace("required_legacy", "required_unpinned"),
+            ] {
+                let error = LockFile::from_toml_str(&fixture, path)
+                    .expect_err("signer pins must use the current identity schema");
+                assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+                assert!(error.to_string().contains("hint:"), "{error}");
+            }
         }
     }
 
     #[test]
     fn reset_pending_anchor_lock_format_is_v5() {
         assert_eq!(LockFile::CURRENT_VERSION, 5);
-    }
-
-    #[test]
-    fn v4_lock_migrates_to_v5_without_changing_registry_security_state() {
-        let v4 = fully_protected_lock_toml().replacen("version = 5\n", "version = 4\n", 1);
-        assert!(v4.starts_with("version = 4\n"), "{v4}");
-
-        let LoadedLockFile::Migrated {
-            lock_file,
-            migration,
-        } = LockFile::parse_toml_str(
-            &v4,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .unwrap()
-        else {
-            panic!("v4 must produce an explicit v4-to-v5 migration event");
-        };
-
-        assert_eq!(migration.from, 4);
-        assert_eq!(migration.to, 5);
-        let report = migration.to_string();
-        assert!(
-            report.contains(
-                "Version 5 adds only the optional reset-pending sequence-anchor marker; existing v4 lock state is unchanged."
-            ),
-            "{report}"
-        );
-        assert!(
-            !report.contains("legacy signer pin remains gated until verified conversion"),
-            "{report}"
-        );
-        let registry = lock_file.provider[0].registry.as_ref().unwrap();
-        assert_eq!(registry.sequence, RegistrySequence::Present(7));
-        assert_eq!(
-            registry.sequence_anchor,
-            RegistrySequenceAnchor::Established(7)
-        );
-        assert!(registry.valid_until_present);
-        assert_eq!(registry.signature, signed_fixture_pin());
-        assert!(registry.transparency_log_present);
-        let v5 = lock_file.to_toml_string().unwrap();
-        assert!(v5.starts_with("version = 5\n"), "{v5}");
-        let reparsed = LockFile::from_toml_str(&v5, Path::new("carina-providers.lock")).unwrap();
-        assert_eq!(reparsed.to_toml_string().unwrap(), v5);
-    }
-
-    #[test]
-    fn v4_lock_rejects_the_v5_reset_pending_marker() {
-        let mislabeled = reset_pending_lock_toml().replacen("version = 5\n", "version = 4\n", 1);
-        let error = LockFile::from_toml_str(&mislabeled, Path::new("carina-providers.lock"))
-            .expect_err("the v5 reset marker must not be accepted under a v4 header");
-
-        assert!(
-            matches!(error, LockFileError::InvalidRegistryState { .. }),
-            "{error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("lock format v4 cannot contain a reset-pending sequence anchor"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn v3_signature_pin_migrates_losslessly_to_opaque_legacy_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("carina-providers.lock");
-        let opaque_san = "https://example.test/a@b@refs/tags/v0.5.0";
-        let v3 = format!(
-            r#"version = 3
-
-[registry_host."registry.carina-rs.dev"]
-discovery_pin_present = true
-
-[registry_host."registry.carina-rs.dev".discovery_values]
-"providers.v1" = "https://registry.carina-rs.dev/v1/providers/"
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-sha256 = "abc"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-sequence_present = false
-sequence_anchor_established = false
-valid_until_present = false
-signature_present = true
-certificate_identity = {opaque_san:?}
-certificate_oidc_issuer = "issuer-a"
-transparency_log_present = false
-"#
-        );
-        fs::write(&lock_path, v3).unwrap();
-
-        let LoadedLockFile::Migrated {
-            lock_file,
-            migration,
-        } = LockFile::load(&carina_core::paths::ResolvedPath::new(dir.path()).unwrap())
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("v3 must produce an explicit v3-to-v5 migration event");
-        };
-        assert_eq!(migration.from, 3);
-        assert_eq!(migration.to, 5);
-        let report = migration.to_string();
-        assert!(
-            report.contains("any legacy signer pin remains gated until verified conversion"),
-            "{report}"
-        );
-        assert!(!report.contains("v2 discovery pins"), "{report}");
-        assert_eq!(
-            lock_file
-                .known_registry_ratchets("carina-rs/aws")
-                .unwrap()
-                .signature,
-            RegistrySignatureProtection::Required(SignerPinState::Legacy(LegacySignerPin {
-                certificate_san: opaque_san.into(),
-                oidc_issuer: "issuer-a".into(),
-            }))
-        );
-        let migrated = lock_file.to_toml_string().unwrap();
-        assert!(migrated.starts_with("version = 5\n"), "{migrated}");
-        assert!(
-            migrated.contains(&format!("legacy_certificate_identity = {opaque_san:?}")),
-            "{migrated}"
-        );
-    }
-
-    #[test]
-    fn v1_github_revision_without_artifact_id_is_retained_for_conversion() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("carina-providers.lock");
-        fs::write(
-            &lock_path,
-            r#"version = 1
-
-[[provider]]
-name = "awscc"
-source = "github.com/carina-rs/carina-provider-awscc"
-mode = "revision"
-revision = "main"
-resolved_sha = "97c9fd97d9501443fd9b6ad7a12e883703e81add"
-sha256 = "e943c0046f5bc517fa224373e82570d6a3a912a2be544320d6f96b12bde38762"
-"#,
-        )
-        .unwrap();
-
-        let LoadedLockFile::Migrated {
-            lock_file,
-            migration,
-        } = LockFile::load(&carina_core::paths::ResolvedPath::new(dir.path()).unwrap())
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("v1 must produce an explicit v1-to-v5 migration event");
-        };
-        assert_eq!(migration.from, 1);
-        assert_eq!(migration.to, 5);
-        assert!(migration.discarded_discovery_pins.is_empty());
-        let report = migration.to_string();
-        assert!(
-            report.contains("Legacy GitHub entries retained for conversion"),
-            "{report}"
-        );
-        assert!(
-            report.contains("github.com/carina-rs/carina-provider-awscc"),
-            "{report}"
-        );
-        assert_eq!(
-            report
-                .lines()
-                .find(|line| line.starts_with("Migration found")),
-            Some("Migration found no v1 discovery pins requiring operator authorization.")
-        );
-        assert!(lock_file.provider.is_empty());
-        assert!(matches!(
-            lock_file.legacy.as_slice(),
-            [LegacyLockEntry {
-                source,
-                reason: LegacyReason::RevisionWithoutArtifactId {
-                    revision,
-                    resolved_sha,
-                    sha256,
-                },
-                raw: _,
-            }] if source == "github.com/carina-rs/carina-provider-awscc"
-                && revision == "main"
-                && resolved_sha.as_str() == "97c9fd97d9501443fd9b6ad7a12e883703e81add"
-                && sha256 == "e943c0046f5bc517fa224373e82570d6a3a912a2be544320d6f96b12bde38762"
-        ));
-
-        lock_file.save(&lock_path).unwrap();
-        let saved = fs::read_to_string(&lock_path).unwrap();
-        assert!(saved.starts_with("version = 5\n"), "{saved}");
-        assert!(saved.contains("mode = \"revision\""), "{saved}");
-        assert!(!saved.contains("artifact_id"), "{saved}");
-    }
-
-    #[test]
-    fn v1_registry_entry_migrates_discovery_pin_and_provider_security_state() {
-        let loaded = LockFile::parse_toml_str(
-            fully_protected_v1_lock_toml(),
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("v1 registry state must migrate losslessly");
-        let (lock, migration) = loaded.into_parts();
-        let migration = migration.expect("v1 load must expose migration details");
-
-        assert_eq!(migration.from, 1);
-        assert_eq!(migration.to, 5);
-        let discarded = migration
-            .discarded_discovery_pins("registry.carina-rs.dev")
-            .expect("the per-entry v1 discovery pin must be reported")
-            .collect::<Vec<_>>();
-        assert_eq!(discarded.len(), 1);
-        let discarded_pin = discarded[0];
-        assert_eq!(
-            discarded_pin.api_base_url,
-            "https://registry.carina-rs.dev/v1/providers/"
-        );
-        assert_eq!(discarded_pin.discovery_sha256, "legacy-discovery-sha256");
-        assert!(matches!(
-            lock.registry_host
-                .get("registry.carina-rs.dev")
-                .map(|host| &host.discovery),
-            Some(RegistryDiscoveryPinState::MigrationPendingAuthorization(pins))
-                if pins.iter().eq(discarded.iter().copied())
-        ));
-
-        let entry = &lock.provider[0];
-        let registry = entry
-            .registry
-            .as_ref()
-            .expect("registry state must survive");
-        assert_eq!(registry.sequence, RegistrySequence::Present(7));
-        assert_eq!(
-            registry.sequence_anchor,
-            RegistrySequenceAnchor::Established(5)
-        );
-        assert!(registry.valid_until_present);
-        assert!(registry.yanked_versions.contains("0.3.0"));
-        assert!(registry.yanked_versions.contains("0.4.0"));
-        assert_eq!(registry.signature, signature_pin("identity-a", "issuer-a"));
-        assert!(registry.transparency_log_present);
-    }
-
-    #[test]
-    fn v1_initial_registry_shape_migrates_sequence_as_established_anchor() {
-        // Exact `toml::to_string_pretty` output from e47cd15b's v1 serializer.
-        let loaded = LockFile::parse_toml_str(
-            r#"version = 1
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-sha256 = "abc"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "def"
-sequence_present = true
-sequence = 7
-valid_until_present = true
-signature_present = true
-certificate_identity = "identity-a"
-certificate_oidc_issuer = "issuer-a"
-transparency_log_present = false
-"#,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("the initial v1 registry shape must migrate");
-        let (lock, migration) = loaded.into_parts();
-
-        assert_eq!(migration.unwrap().from, 1);
-        let registry = lock.provider[0].registry.as_ref().unwrap();
-        assert_eq!(registry.sequence, RegistrySequence::Present(7));
-        assert_eq!(
-            registry.sequence_anchor,
-            RegistrySequenceAnchor::Established(7),
-            "pre-anchor v1 used sequence itself as the rollback floor"
-        );
-        assert!(registry.valid_until_present);
-        assert_eq!(registry.signature, signature_pin("identity-a", "issuer-a"));
-    }
-
-    #[test]
-    fn v1_initial_registry_shape_without_sequence_stays_unestablished() {
-        // Exact `toml::to_string_pretty` output from e47cd15b's v1 serializer
-        // when no sequence had been observed.
-        let loaded = LockFile::parse_toml_str(
-            r#"version = 1
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-sha256 = "abc"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "def"
-sequence_present = false
-valid_until_present = false
-signature_present = false
-transparency_log_present = false
-"#,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("the initial unsequenced v1 shape must migrate");
-        let lock = loaded.into_lock_file();
-        let registry = lock.provider[0].registry.as_ref().unwrap();
-
-        assert_eq!(registry.sequence, RegistrySequence::Absent);
-        assert_eq!(
-            registry.sequence_anchor,
-            RegistrySequenceAnchor::Unestablished
-        );
-    }
-
-    #[test]
-    fn v1_sequence_anchor_without_established_flag_is_rejected() {
-        let invalid =
-            fully_protected_v1_lock_toml().replace("sequence_anchor_established = true\n", "");
-
-        let error = LockFile::from_toml_str(&invalid, Path::new("carina-providers.lock"))
-            .expect_err("v1 never emitted sequence_anchor without its presence flag");
-
-        assert!(
-            matches!(error, LockFileError::InvalidRegistryState { .. }),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn v1_yank_aware_shape_migrates_provider_and_unpinned_yanks() {
-        // Exact non-default output from 3a080a0d's v1 serializer.
-        let loaded = LockFile::parse_toml_str(
-            r#"version = 1
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-sha256 = "abc"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "def"
-sequence_present = true
-sequence = 7
-valid_until_present = true
-yanked_versions = ["0.4.0"]
-signature_present = false
-transparency_log_present = false
-
-[unpinned_registry_yanks]
-"carina-rs/random" = ["0.2.0", "0.3.0"]
-"#,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("the yank-aware v1 shape must migrate");
-        let lock = loaded.into_lock_file();
-
-        let registry = lock.provider[0].registry.as_ref().unwrap();
-        assert_eq!(registry.sequence, RegistrySequence::Present(7));
-        assert_eq!(
-            registry.sequence_anchor,
-            RegistrySequenceAnchor::Established(7)
-        );
-        assert!(registry.yanked_versions.contains("0.4.0"));
-        let unpinned = lock
-            .known_registry_ratchets("carina-rs/random")
-            .expect("unpinned yank observations must survive migration");
-        assert_eq!(unpinned.sequence, RegistrySequence::Absent);
-        assert!(unpinned.yanked_versions.contains("0.2.0"));
-        assert!(unpinned.yanked_versions.contains("0.3.0"));
-        assert_eq!(unpinned.signature, RegistrySignatureProtection::NotRequired);
-    }
-
-    #[test]
-    fn v1_atomic_ratchet_shape_migrates_explicit_anchor_and_unpinned_ratchets() {
-        // Exact non-default output from 7ef946a9's v1 serializer.
-        let loaded = LockFile::parse_toml_str(
-            r#"version = 1
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-sha256 = "abc"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "def"
-sequence_present = true
-sequence = 9
-sequence_anchor_established = true
-sequence_anchor = 7
-valid_until_present = true
-yanked_versions = ["0.4.0"]
-signature_present = true
-certificate_identity = "identity-a"
-certificate_oidc_issuer = "issuer-a"
-transparency_log_present = true
-
-[unpinned_registry_ratchets."carina-rs/random"]
-sequence_present = true
-sequence = 11
-valid_until_present = true
-yanked_versions = ["0.2.0"]
-signature_present = true
-certificate_identity = "identity-b"
-certificate_oidc_issuer = "issuer-b"
-transparency_log_present = true
-"#,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("the atomic-ratchet v1 shape must migrate");
-        let lock = loaded.into_lock_file();
-
-        let registry = lock.provider[0].registry.as_ref().unwrap();
-        assert_eq!(registry.sequence, RegistrySequence::Present(9));
-        assert_eq!(
-            registry.sequence_anchor,
-            RegistrySequenceAnchor::Established(7),
-            "an explicit observation/anchor split must survive migration"
-        );
-        let unpinned = lock
-            .known_registry_ratchets("carina-rs/random")
-            .expect("unpinned ratchets must survive migration");
-        assert_eq!(unpinned.sequence, RegistrySequence::Present(11));
-        assert!(unpinned.valid_until_present);
-        assert!(unpinned.yanked_versions.contains("0.2.0"));
-        assert_eq!(unpinned.signature, signature_pin("identity-b", "issuer-b"));
-        assert!(unpinned.transparency_log_present);
-    }
-
-    #[test]
-    fn v1_typed_recovery_shape_migrates_required_unpinned_signature() {
-        // Exact non-default output from 08e6ac20's v1 serializer after an
-        // identity re-pin recovery was committed.
-        let loaded = LockFile::parse_toml_str(
-            r#"version = 1
-
-[[provider]]
-name = "aws"
-source = "carina-rs/aws"
-mode = "version"
-version = "0.5.0"
-sha256 = "abc"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "def"
-sequence_present = true
-sequence = 7
-sequence_anchor_established = true
-sequence_anchor = 5
-valid_until_present = true
-signature_present = true
-transparency_log_present = true
-"#,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("the typed-recovery v1 shape must migrate");
-        let lock = loaded.into_lock_file();
-
-        assert_eq!(
-            lock.provider[0].registry.as_ref().unwrap().signature,
-            RegistrySignatureProtection::Required(SignerPinState::Unpinned)
-        );
-    }
-
-    #[test]
-    fn v1_registry_entries_with_distinct_api_bases_keep_both_pending_pins() {
-        let distinct = v1_lock_with_second_registry_pin(
-            "https://registry.carina-rs.dev/v2/providers/",
-            "legacy-discovery-sha256",
-        );
-
-        let loaded = LockFile::parse_toml_str(
-            &distinct,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("reachable v1 pins with distinct API bases must both migrate");
-        let (lock, migration) = loaded.into_parts();
-        let migration = migration.unwrap();
-        let saved = lock.to_toml_string().unwrap();
-
-        assert_eq!(lock.provider.len(), 2);
-        assert_eq!(
-            pending_discovery_pins_in(&saved, "registry.carina-rs.dev").len(),
-            2
-        );
-        let report = migration.to_string();
-        assert!(
-            report.contains("https://registry.carina-rs.dev/v1/providers/"),
-            "{report}"
-        );
-        assert!(
-            report.contains("https://registry.carina-rs.dev/v2/providers/"),
-            "{report}"
-        );
-    }
-
-    #[test]
-    fn v1_registry_entries_with_distinct_discovery_hashes_keep_both_pending_pins() {
-        let distinct = v1_lock_with_second_registry_pin(
-            "https://registry.carina-rs.dev/v1/providers/",
-            "newer-discovery-sha256",
-        );
-
-        let loaded = LockFile::parse_toml_str(
-            &distinct,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("reachable v1 pins with distinct discovery hashes must both migrate");
-        let (lock, migration) = loaded.into_parts();
-        let migration = migration.unwrap();
-        let saved = lock.to_toml_string().unwrap();
-
-        assert_eq!(lock.provider.len(), 2);
-        assert_eq!(
-            pending_discovery_pins_in(&saved, "registry.carina-rs.dev").len(),
-            2
-        );
-        let report = migration.to_string();
-        assert!(report.contains("legacy-discovery-sha256"), "{report}");
-        assert!(report.contains("newer-discovery-sha256"), "{report}");
-    }
-
-    #[test]
-    fn v1_registry_entries_with_identical_discovery_pins_share_one_pending_host() {
-        let identical = format!(
-            "{}{}",
-            fully_protected_v1_lock_toml(),
-            r#"
-
-[[provider]]
-name = "random"
-source = "carina-rs/random"
-mode = "version"
-version = "1.0.0"
-sha256 = "other-pinned-provider-sha256"
-
-[provider.registry]
-resolved_hostname = "registry.carina-rs.dev"
-api_base_url = "https://registry.carina-rs.dev/v1/providers/"
-discovery_sha256 = "legacy-discovery-sha256"
-sequence_present = false
-sequence_anchor_established = false
-valid_until_present = false
-signature_present = false
-transparency_log_present = false
-"#
-        );
-
-        let loaded = LockFile::parse_toml_str(
-            &identical,
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("identical per-entry host pins must coalesce without dropping providers");
-        let (lock, migration) = loaded.into_parts();
-
-        assert_eq!(lock.provider.len(), 2);
-        assert_eq!(lock.registry_host.len(), 1);
-        assert!(lock.provider.iter().all(|entry| entry.registry.is_some()));
-        assert!(matches!(
-            lock.registry_host
-                .get("registry.carina-rs.dev")
-                .map(|host| &host.discovery),
-            Some(RegistryDiscoveryPinState::MigrationPendingAuthorization(_))
-        ));
-        let migration = migration.unwrap();
-        assert_eq!(migration.discarded_discovery_pins.len(), 1);
-        assert_eq!(
-            pending_discovery_pins_in(&lock.to_toml_string().unwrap(), "registry.carina-rs.dev")
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn v1_lock_rejects_unknown_fields() {
-        let error = LockFile::from_toml_str(
-            "version = 1\nfuture_security_state = \"must not be ignored\"\n",
-            Path::new("carina-providers.lock"),
-        )
-        .expect_err("the dedicated v1 reader must reject unknown fields");
-
-        assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
-        assert!(error.to_string().contains("unknown field"), "{error}");
-        assert!(
-            error.to_string().contains("future_security_state"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn v1_lock_rejects_unknown_registry_fields() {
-        let invalid = fully_protected_v1_lock_toml().replace(
-            "transparency_log_present = true",
-            "transparency_log_present = true\nfuture_registry_security_state = \"must not be ignored\"",
-        );
-
-        let error = LockFile::from_toml_str(&invalid, Path::new("carina-providers.lock"))
-            .expect_err("the dedicated v1 registry reader must reject unknown fields");
-
-        assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
-        assert!(error.to_string().contains("unknown field"), "{error}");
-        assert!(
-            error.to_string().contains("future_registry_security_state"),
-            "{error}"
-        );
     }
 
     #[test]
@@ -15885,7 +12637,7 @@ transparency_log_present = false
     #[test]
     fn lock_load_rejects_registry_entry_whose_host_record_is_absent() {
         let error = LockFile::from_toml_str(
-            r#"version = 3
+            r#"version = 5
 
 [[provider]]
 name = "aws"
@@ -15899,7 +12651,7 @@ resolved_hostname = "registry.carina-rs.dev"
 sequence_present = false
 sequence_anchor_established = false
 valid_until_present = false
-signature_present = false
+signature_state = "not_required"
 transparency_log_present = false
 "#,
             Path::new("infra/foo/carina-providers.lock"),
@@ -15947,80 +12699,29 @@ transparency_log_present = false
     }
 
     #[test]
-    fn lock_load_migrates_v2_and_preserves_all_provider_security_state() {
-        let lock = LockFile::from_toml_str(
-            fully_protected_v2_lock_toml(),
-            Path::new("carina-providers.lock"),
-        )
-        .expect("v2 must migrate because every provider-owned field is carryable");
-
-        assert_eq!(lock.version, LockFile::CURRENT_VERSION);
-        assert_eq!(lock.provider.len(), 1);
-        let entry = &lock.provider[0];
-        assert_eq!(entry.name, "aws");
-        assert_eq!(entry.source, "carina-rs/aws");
-        assert_eq!(entry.sha256, "pinned-provider-sha256");
-        assert_eq!(
-            entry.kind,
-            LockEntryKind::Version {
-                version: "0.5.0".into(),
-                constraint: Some("^0.5".into()),
-            }
-        );
-
-        let registry = entry
-            .registry
-            .as_ref()
-            .expect("registry state must survive");
-        assert_eq!(registry.resolved_hostname(), "registry.carina-rs.dev");
-        assert_eq!(registry.sequence, RegistrySequence::Present(7));
-        assert_eq!(
-            registry.sequence_anchor,
-            RegistrySequenceAnchor::Established(5)
-        );
-        assert!(registry.valid_until_present);
-        assert!(registry.yanked_versions.contains("0.3.0"));
-        assert!(registry.yanked_versions.contains("0.4.0"));
-        assert_eq!(registry.signature, signature_pin("identity-a", "issuer-a"));
-        assert!(registry.transparency_log_present);
-
-        let host = lock
-            .registry_host
-            .get("registry.carina-rs.dev")
-            .expect("the host record itself must survive");
-        assert!(
-            matches!(
-                &host.discovery,
-                RegistryDiscoveryPinState::MigrationPendingAuthorization(pins)
-                    if pins.len() == 1
-                        && pins.iter().any(|pin| {
-                            pin.api_base_url == "https://registry.carina-rs.dev/v1/providers/"
-                                && pin.discovery_sha256 == "legacy-discovery-sha256"
-                        })
-            ),
-            "the v2 pin must remain blocked pending explicit operator authorization"
-        );
-    }
-
-    #[test]
-    fn v2_migration_canonicalizes_mixed_case_registry_host_keys() {
-        let serialized = fully_protected_v2_lock_toml()
+    fn current_lock_canonicalizes_mixed_case_registry_host_keys() {
+        let serialized = pending_discovery_lock_toml()
             .replace(
-                "[registry_host.\"registry.carina-rs.dev\"]",
-                "[registry_host.\"Registry.Carina-RS.dev\"]",
+                "registry_host.\"registry.carina-rs.dev\"",
+                "registry_host.\"Registry.Carina-RS.dev\"",
             )
             .replace(
                 "resolved_hostname = \"registry.carina-rs.dev\"",
                 "resolved_hostname = \"Registry.Carina-RS.dev\"",
             );
 
+        assert!(serialized.contains("[registry_host.\"Registry.Carina-RS.dev\"]"));
+        assert!(serialized.contains(
+            "[[registry_host.\"Registry.Carina-RS.dev\".migration_pending_discovery_pins]]"
+        ));
+
         let loaded = LockFile::parse_toml_str(
             &serialized,
             Path::new("carina-providers.lock"),
             &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
-        .expect("migration must canonicalize a v2 host key before validating references");
-        let (lock, migration) = loaded.into_parts();
+        .expect("decode must canonicalize a host key before validating references");
+        let lock = loaded;
 
         assert_eq!(
             lock.registry_host
@@ -16035,20 +12736,19 @@ transparency_log_present = false
                 .map(|host| &host.discovery),
             Some(RegistryDiscoveryPinState::MigrationPendingAuthorization(_))
         ));
-        assert!(
-            migration
-                .expect("v2 load must expose migration details")
-                .discarded_discovery_pins("Registry.Carina-RS.dev")
-                .is_some()
+        assert_eq!(
+            pending_discovery_pins_in(&lock.to_toml_string().unwrap(), "registry.carina-rs.dev")
+                .len(),
+            1
         );
     }
 
     #[test]
-    fn v2_migration_rejects_case_colliding_registry_host_keys() {
-        let serialized = fully_protected_v2_lock_toml()
+    fn current_lock_rejects_case_colliding_registry_host_keys() {
+        let serialized = pending_discovery_lock_toml()
             .replace(
-                "[registry_host.\"registry.carina-rs.dev\"]",
-                "[registry_host.\"Registry.Carina-RS.dev\"]",
+                "registry_host.\"registry.carina-rs.dev\"",
+                "registry_host.\"Registry.Carina-RS.dev\"",
             )
             .replace(
                 "\n[[provider]]",
@@ -16058,6 +12758,11 @@ discovery_pin_present = false
 
 [[provider]]"#,
             );
+
+        assert!(serialized.contains("[registry_host.\"Registry.Carina-RS.dev\"]"));
+        assert!(serialized.contains(
+            "[[registry_host.\"Registry.Carina-RS.dev\".migration_pending_discovery_pins]]"
+        ));
 
         let error = LockFile::parse_toml_str(
             &serialized,
@@ -16078,133 +12783,13 @@ discovery_pin_present = false
     }
 
     #[test]
-    fn v2_unpinned_host_migrates_without_authorization_gate() {
-        let loaded = LockFile::parse_toml_str(
-            &unpinned_v2_lock_toml(),
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .expect("an unpinned v2 host must migrate");
-        let (lock, migration) = loaded.into_parts();
-        let migration = migration.expect("v2 load must expose migration details");
-
-        assert!(
-            migration.discarded_discovery_pins.is_empty(),
-            "an unpinned v2 host has no discovery material to discard"
-        );
-        assert!(matches!(
-            lock.registry_host
-                .get("registry.carina-rs.dev")
-                .map(|host| &host.discovery),
-            Some(RegistryDiscoveryPinState::Unpinned(additional)) if additional.is_empty()
-        ));
-
-        let report = migration.to_string();
-        assert!(
-            report.contains("no v2 discovery pins requiring operator authorization"),
-            "{report}"
-        );
-        assert!(
-            !report.contains("Registry resolution is blocked"),
-            "an empty migration must not claim resolution is blocked: {report}"
-        );
-        assert!(
-            !report.contains("repin-discovery"),
-            "an empty migration must not prescribe authorization: {report}"
-        );
-
-        let source = registry_source("carina-rs/aws");
-        let http = FakeRegistryHttp::default().json(
-            "https://registry.carina-rs.dev/.well-known/carina.json",
-            r#"{"providers.v1":"/v2/providers/"}"#,
-        );
-        let resolved = resolve_registry(
-            &source,
-            lock.registry_host.get("registry.carina-rs.dev"),
-            &http,
-        )
-        .expect("an unpinned v2 host must pass the authorization gate");
-        assert_eq!(
-            resolved.api_base_url(),
-            "https://registry.carina-rs.dev/v2/providers/"
-        );
-    }
-
-    #[test]
-    fn v2_multi_host_migration_report_lists_every_discarded_pin_once() {
-        let loaded = LockFile::parse_toml_str(
-            &two_host_v2_lock_toml(),
-            Path::new("infra/foo/carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new("infra/foo")).unwrap(),
-        )
-        .expect("a multi-host v2 lock must migrate");
-        let (_, migration) = loaded.into_parts();
-        let migration = migration.expect("v2 load must expose migration details");
-
-        assert_eq!(migration.discarded_discovery_pins.len(), 2);
-        assert_eq!(
-            migration
-                .discarded_discovery_pins("registry.carina-rs.dev")
-                .map(|pins| pins
-                    .map(|pin| pin.discovery_sha256.as_str())
-                    .collect::<Vec<_>>()),
-            Some(vec!["legacy-discovery-sha256"])
-        );
-        assert_eq!(
-            migration
-                .discarded_discovery_pins("registry.example.test")
-                .map(|pins| pins
-                    .map(|pin| pin.discovery_sha256.as_str())
-                    .collect::<Vec<_>>()),
-            Some(vec!["other-legacy-discovery-sha256"])
-        );
-
-        let report = migration.to_string();
-        assert!(
-            report.contains("Lock file: infra/foo/carina-providers.lock"),
-            "{report}"
-        );
-        assert_eq!(
-            report.matches("Registry host:").count(),
-            2,
-            "each migrated host must have one report section: {report}"
-        );
-        let first = report
-            .find("Registry host: registry.carina-rs.dev")
-            .expect("default host must be reported");
-        let second = report
-            .find("Registry host: registry.example.test")
-            .expect("second host must be reported");
-        assert!(
-            first < second,
-            "host reporting order must be stable: {report}"
-        );
-        assert!(report.contains("legacy-discovery-sha256"), "{report}");
-        assert!(report.contains("other-legacy-discovery-sha256"), "{report}");
-        assert!(
-            report.contains("`carina providers repin-discovery registry.carina-rs.dev infra/foo`"),
-            "{report}"
-        );
-        assert!(
-            report.contains("`carina providers repin-discovery registry.example.test infra/foo`"),
-            "{report}"
-        );
-        assert_eq!(
-            report.matches("carina providers repin-discovery").count(),
-            2,
-            "each migrated host must have one concrete recovery command: {report}"
-        );
-        assert!(!report.contains("<host>"), "{report}");
-    }
-
-    #[test]
-    fn migrated_v2_discovery_pin_requires_operator_authorization_before_resolution() {
+    fn pending_discovery_pin_requires_operator_authorization_before_resolution() {
         let project_dir = tempfile::tempdir().unwrap();
         let lock = LockFile::from_toml_str(
-            fully_protected_v2_lock_toml(),
+            pending_discovery_lock_toml(),
             Path::new("carina-providers.lock"),
         )
-        .expect("v2 migration must keep recovery commands reachable");
+        .expect("pending discovery must keep recovery commands reachable");
         let source = registry_source("carina-rs/aws");
         let http = FakeRegistryHttp::default().json(
             "https://registry.carina-rs.dev/.well-known/carina.json",
@@ -16243,68 +12828,8 @@ discovery_pin_present = false
     }
 
     #[test]
-    fn migrated_v2_lock_saves_as_v5_without_rewriting_during_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("carina-providers.lock");
-        let original = fully_protected_v2_lock_toml();
-        fs::write(&lock_path, original).unwrap();
-
-        let loaded = LockFile::load(&carina_core::paths::ResolvedPath::new(dir.path()).unwrap())
-            .expect("v2 load must succeed")
-            .expect("lock must be present");
-        let (lock, migration) = loaded.into_parts();
-        let migration = migration.expect("v2 load must expose its in-memory migration");
-        assert_eq!(migration.from, 2);
-        assert_eq!(migration.to, 5);
-        let discarded = migration
-            .discarded_discovery_pins("registry.carina-rs.dev")
-            .expect("the legacy pinned host must be reported")
-            .collect::<Vec<_>>();
-        assert_eq!(discarded.len(), 1);
-        let discarded = discarded[0];
-        assert_eq!(
-            discarded.api_base_url,
-            "https://registry.carina-rs.dev/v1/providers/"
-        );
-        assert_eq!(discarded.discovery_sha256, "legacy-discovery-sha256");
-        assert_eq!(
-            fs::read_to_string(&lock_path).unwrap(),
-            original,
-            "read-only load must not rewrite the v2 file"
-        );
-
-        lock.save(&lock_path).unwrap();
-        let saved = fs::read_to_string(&lock_path).unwrap();
-        assert!(saved.starts_with("version = 5\n"), "{saved}");
-        assert!(saved.contains("discovery_pin_present = false"), "{saved}");
-        assert!(
-            saved.contains("migration_pending_discovery_pins"),
-            "{saved}"
-        );
-        assert!(saved.contains("api_base_url"), "{saved}");
-        assert!(saved.contains("discovery_sha256"), "{saved}");
-        assert!(!saved.contains("discovery_values"), "{saved}");
-        assert!(saved.contains("yanked_versions = ["), "{saved}");
-        assert!(saved.contains("\"0.3.0\""), "{saved}");
-        assert!(saved.contains("\"0.4.0\""), "{saved}");
-        assert!(saved.contains("sequence_anchor = 5"), "{saved}");
-        assert!(saved.contains("legacy_certificate_identity = \"identity-a\""));
-
-        let reloaded = load_lock_file_for_test(&lock_path)
-            .expect("saved v5 lock must parse")
-            .expect("saved v5 lock must remain present");
-        assert!(matches!(
-            reloaded
-                .registry_host
-                .get("registry.carina-rs.dev")
-                .map(|host| &host.discovery),
-            Some(RegistryDiscoveryPinState::MigrationPendingAuthorization(_))
-        ));
-    }
-
-    #[test]
-    fn v4_old_single_pending_discovery_pin_loads_and_normalizes_to_an_array() {
-        let serialized = r#"version = 4
+    fn v5_single_pending_discovery_pin_loads_and_normalizes_to_an_array() {
+        let serialized = r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = false
@@ -16319,16 +12844,8 @@ discovery_sha256 = "legacy-discovery-sha256"
             Path::new("carina-providers.lock"),
             &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
-        .expect("v4 locks written with the old single-pin key must remain readable");
-        let LoadedLockFile::Migrated {
-            lock_file: lock,
-            migration,
-        } = loaded
-        else {
-            panic!("a v4 compatibility read must produce a v4-to-v5 migration");
-        };
-        assert_eq!(migration.from, 4);
-        assert_eq!(migration.to, 5);
+        .expect("v5 locks with the single-pin alias must remain readable");
+        let lock = loaded;
         let normalized = lock.to_toml_string().unwrap();
         assert!(normalized.starts_with("version = 5\n"), "{normalized}");
         let normalized: toml::Value = toml::from_str(&normalized).unwrap();
@@ -16347,9 +12864,9 @@ discovery_sha256 = "legacy-discovery-sha256"
     }
 
     #[test]
-    fn v4_empty_pending_discovery_pin_array_is_rejected() {
+    fn v5_empty_pending_discovery_pin_array_is_rejected() {
         let error = LockFile::from_toml_str(
-            r#"version = 4
+            r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = false
@@ -16370,7 +12887,7 @@ migration_pending_discovery_pins = []
 
     #[test]
     fn one_registry_host_pin_round_trips_for_multiple_provider_entries() {
-        let serialized = r#"version = 3
+        let serialized = r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = true
@@ -16390,7 +12907,7 @@ resolved_hostname = "registry.carina-rs.dev"
 sequence_present = false
 sequence_anchor_established = false
 valid_until_present = false
-signature_present = false
+signature_state = "not_required"
 transparency_log_present = false
 
 [[provider]]
@@ -16405,7 +12922,7 @@ resolved_hostname = "registry.carina-rs.dev"
 sequence_present = false
 sequence_anchor_established = false
 valid_until_present = false
-signature_present = false
+signature_state = "not_required"
 transparency_log_present = false
 "#;
 
@@ -16841,22 +13358,26 @@ sha256 = "3bd19254ba60717dabdc12c663ef96e0be72e5a2fbc192cf3a5d15ef6578f14f"
     #[test]
     fn identity_pin_conflict_error_names_the_offending_provider_records() {
         let error = LockFile::from_toml_str(
-            r#"version = 3
+            r#"version = 5
 
 [unpinned_registry_ratchets."carina-rs/aws"]
 sequence_present = false
 valid_until_present = false
-signature_present = true
-certificate_identity = "identity-a"
-certificate_oidc_issuer = "issuer-a"
+signature_state = "required_current"
+source_oidc_issuer = "issuer-a"
+source_repository_owner_id = "owner"
+source_repository_id = "identity-a"
+stable_workflow = "release.yml"
 transparency_log_present = false
 
 [unpinned_registry_ratchets."registry.carina-rs.dev/carina-rs/aws"]
 sequence_present = false
 valid_until_present = false
-signature_present = true
-certificate_identity = "identity-b"
-certificate_oidc_issuer = "issuer-b"
+signature_state = "required_current"
+source_oidc_issuer = "issuer-b"
+source_repository_owner_id = "owner"
+source_repository_id = "identity-b"
+stable_workflow = "release.yml"
 transparency_log_present = false
 "#,
             Path::new("carina-providers.lock"),
@@ -16913,11 +13434,12 @@ transparency_log_present = false
         let stripped = fully_protected_lock_toml()
             .lines()
             .filter(|line| {
-                !line.starts_with("legacy_certificate_identity")
-                    && !line.starts_with("legacy_certificate_oidc_issuer")
+                !line.starts_with("source_")
+                    && !line.starts_with("stable_workflow")
+                    && !line.starts_with("prerelease_workflow")
             })
             .map(|line| {
-                if line == "signature_state = \"required_legacy\"" {
+                if line == "signature_state = \"required_current\"" {
                     "signature_state = \"required_unpinned\""
                 } else {
                     line
@@ -16938,7 +13460,7 @@ transparency_log_present = false
     #[test]
     fn lock_load_rejects_identity_when_signature_is_not_required() {
         let contradictory = fully_protected_lock_toml().replace(
-            "signature_state = \"required_legacy\"\n",
+            "signature_state = \"required_current\"\n",
             "signature_state = \"not_required\"\n",
         );
         assert_lock_toml_is_rejected(&contradictory);
@@ -16948,23 +13470,21 @@ transparency_log_present = false
     fn lock_load_rejects_partial_signature_identity_pin() {
         let contradictory = fully_protected_lock_toml()
             .lines()
-            .filter(|line| !line.starts_with("legacy_certificate_oidc_issuer"))
+            .filter(|line| !line.starts_with("source_oidc_issuer"))
             .collect::<Vec<_>>()
             .join("\n");
         assert_lock_toml_is_rejected(&contradictory);
     }
 
     #[test]
-    fn v4_lock_load_rejects_misspelled_signer_field() {
-        let misspelled = fully_protected_lock_toml()
-            .replacen("version = 5\n", "version = 4\n", 1)
-            .replace(
-                "transparency_log_present = true\n",
-                "stable_workflw = \"release.yml\"\ntransparency_log_present = true\n",
-            );
+    fn v5_lock_load_rejects_misspelled_signer_field() {
+        let misspelled = fully_protected_lock_toml().replace(
+            "transparency_log_present = true\n",
+            "stable_workflw = \"release.yml\"\ntransparency_log_present = true\n",
+        );
 
         let error = LockFile::from_toml_str(&misspelled, Path::new("carina-providers.lock"))
-            .expect_err("unknown v4 signer fields must not silently become absent pins");
+            .expect_err("unknown signer fields must not silently become absent pins");
 
         assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
         assert!(error.to_string().contains("stable_workflw"), "{error}");
@@ -16972,8 +13492,8 @@ transparency_log_present = false
     }
 
     #[test]
-    fn v4_unpinned_registry_ratchet_rejects_misspelled_signer_field() {
-        let misspelled = r#"version = 4
+    fn v5_unpinned_registry_ratchet_rejects_misspelled_signer_field() {
+        let misspelled = r#"version = 5
 
 [unpinned_registry_ratchets."carina-rs/aws"]
 sequence_present = false
@@ -16994,7 +13514,7 @@ transparency_log_present = false
     #[test]
     fn lock_load_rejects_stripped_signature_presence() {
         let stripped =
-            fully_protected_lock_toml().replace("signature_state = \"required_legacy\"\n", "");
+            fully_protected_lock_toml().replace("signature_state = \"required_current\"\n", "");
         assert_lock_toml_is_rejected(&stripped);
     }
 
@@ -17112,12 +13632,11 @@ transparency_log_present = false
                     sequence_anchor: RegistrySequenceAnchor::Established(7),
                     valid_until_present: true,
                     yanked_versions: YankedRegistryVersions::default(),
-                    signature: signature_pin(SIGNED_FIXTURE_IDENTITY, SIGNED_FIXTURE_ISSUER),
+                    signature: signed_fixture_pin(),
                     transparency_log_present: false,
                 }),
             }],
             egress: BTreeMap::new(),
-            legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let expected = format!(
@@ -17143,9 +13662,11 @@ sequence = 7
 sequence_anchor_established = true
 sequence_anchor = 7
 valid_until_present = true
-signature_state = "required_legacy"
-legacy_certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}
-legacy_certificate_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}
+signature_state = "required_current"
+source_oidc_issuer = {SIGNED_FIXTURE_ISSUER:?}
+source_repository_owner_id = "131804563"
+source_repository_id = "632596897"
+prerelease_workflow = {SIGNED_FIXTURE_WORKFLOW:?}
 transparency_log_present = false
 "#
         );
@@ -17223,8 +13744,6 @@ transparency_log_present = false
             valid_until_present: false,
             yanked_versions: BTreeSet::new(),
             signature_state: RegistrySignatureStateSerde::RequiredCurrent,
-            legacy_certificate_identity: None,
-            legacy_certificate_oidc_issuer: None,
             source_oidc_issuer: Some("issuer-a".into()),
             source_repository_owner_id: Some("owner-a".into()),
             source_repository_id: Some("repo-a".into()),
@@ -17237,14 +13756,12 @@ transparency_log_present = false
             Err(RegistryLockError::InconsistentSignature)
         ));
 
-        let legacy_and_current = RegistryRatchetsSerde {
+        let unpinned_with_current = RegistryRatchetsSerde {
             sequence_present: false,
             sequence: None,
             valid_until_present: false,
             yanked_versions: BTreeSet::new(),
-            signature_state: RegistrySignatureStateSerde::RequiredCurrent,
-            legacy_certificate_identity: Some("legacy-san".into()),
-            legacy_certificate_oidc_issuer: Some("legacy-issuer".into()),
+            signature_state: RegistrySignatureStateSerde::RequiredUnpinned,
             source_oidc_issuer: Some("issuer-a".into()),
             source_repository_owner_id: Some("owner-a".into()),
             source_repository_id: Some("repo-a".into()),
@@ -17253,7 +13770,7 @@ transparency_log_present = false
             transparency_log_present: false,
         };
         assert!(matches!(
-            RegistryRatchets::try_from(legacy_and_current),
+            RegistryRatchets::try_from(unpinned_with_current),
             Err(RegistryLockError::InconsistentSignature)
         ));
     }
@@ -17285,14 +13802,14 @@ transparency_log_present = false
         let encoded = toml::to_string(&RegistryRatchets::default()).unwrap();
         assert!(!encoded.contains("sequence_anchor"), "{encoded}");
 
-        for version in [4, LockFile::CURRENT_VERSION] {
-            for anchor_fields in [
-                "sequence_anchor_established = false\n",
-                "sequence_anchor_reset_pending = true\n",
-                "sequence_anchor_established = true\nsequence_anchor = 7\n",
-            ] {
-                let serialized = format!(
-                    r#"version = {version}
+        let version = LockFile::CURRENT_VERSION;
+        for anchor_fields in [
+            "sequence_anchor_established = false\n",
+            "sequence_anchor_reset_pending = true\n",
+            "sequence_anchor_established = true\nsequence_anchor = 7\n",
+        ] {
+            let serialized = format!(
+                r#"version = {version}
 
 [unpinned_registry_ratchets."carina-rs/aws"]
 sequence_present = false
@@ -17300,14 +13817,12 @@ sequence_present = false
 signature_state = "not_required"
 transparency_log_present = false
 "#
-                );
-                let error =
-                    LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock"))
-                        .expect_err("unpinned observations must not accept sequence-anchor state");
+            );
+            let error = LockFile::from_toml_str(&serialized, Path::new("carina-providers.lock"))
+                .expect_err("unpinned observations must not accept sequence-anchor state");
 
-                assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
-                assert!(error.to_string().contains("unknown field"), "{error}");
-            }
+            assert!(matches!(error, LockFileError::Parse { .. }), "{error}");
+            assert!(error.to_string().contains("unknown field"), "{error}");
         }
     }
 
@@ -17411,14 +13926,14 @@ transparency_log_present = false
         let recovery = lock
             .prepare_registry_identity_repin("carina-rs/aws")
             .unwrap();
-        let RegistrySignatureProtection::Required(SignerPinState::Legacy(before_pin)) =
+        let RegistrySignatureProtection::Required(SignerPinState::Current(before_pin)) =
             &before.signature
         else {
-            panic!("fixture must carry a legacy signer pin");
+            panic!("fixture must carry a current signer pin");
         };
         assert_eq!(
             recovery.identity_pin(),
-            &DiscardedSignerPins::Legacy(before_pin.clone())
+            &DiscardedSignerPins::Current(before_pin.clone())
         );
         recovery.commit().unwrap();
 
@@ -17488,9 +14003,13 @@ transparency_log_present = false
         let preview = recovery.identity_pin().clone();
         assert_eq!(
             preview,
-            DiscardedSignerPins::Legacy(LegacySignerPin {
-                certificate_san: "identity-a".into(),
-                oidc_issuer: "issuer-a".into(),
+            DiscardedSignerPins::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "issuer-a".into(),
+                    repository_owner_id: "owner".into(),
+                    repository_id: "identity-a".into(),
+                },
+                workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
             })
         );
         recovery.commit().unwrap();
@@ -17538,38 +14057,12 @@ transparency_log_present = false
     #[test]
     fn migrated_discovery_repin_commit_is_the_authorization_transition() {
         let loaded = LockFile::parse_toml_str(
-            fully_protected_v2_lock_toml(),
+            pending_discovery_lock_toml(),
             Path::new("carina-providers.lock"),
             &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
         )
         .unwrap();
-        let (mut lock, migration) = loaded.into_parts();
-        let migration = migration.unwrap();
-        let migration_report = migration.to_string();
-        assert!(
-            migration_report.contains(
-                "verifying out of band that discarding this host's legacy discovery values is intended"
-            ),
-            "{migration_report}"
-        );
-        assert!(
-            !migration_report.contains("change to the pinned discovery values"),
-            "{migration_report}"
-        );
-        assert_eq!(
-            migration_report
-                .matches("lock-format migration requires operator authorization")
-                .count(),
-            1,
-            "{migration_report}"
-        );
-        assert!(
-            !migration_report.contains(
-                "Registry resolution is blocked for each migrated host until its legacy pin"
-            ),
-            "{migration_report}"
-        );
-
+        let mut lock = loaded;
         let prepared = lock
             .prepare_registry_discovery_repin("Registry.Carina-RS.dev")
             .expect("the bounded recovery must remain reachable after migration");
@@ -17579,19 +14072,13 @@ transparency_log_present = false
                 if pins.len() == 1
                     && pins.iter().any(|pin| pin.discovery_sha256 == "legacy-discovery-sha256")
         ));
-        let preview = prepared
-            .display_with_migration(Some(&migration))
-            .to_string();
+        let preview = prepared.to_string();
         assert!(
-            preview.contains("Provider lock format migration: version 2 -> version 5"),
+            preview.contains("Discarding migrated legacy discovery API base"),
             "{preview}"
         );
         assert!(
-            preview.contains("Discarding v2 pinned discovery API base"),
-            "{preview}"
-        );
-        assert!(
-            preview.contains("Discarding v2 discovery document SHA-256"),
+            preview.contains("Discarding migrated legacy discovery document SHA-256"),
             "{preview}"
         );
         drop(prepared);
@@ -17616,7 +14103,7 @@ transparency_log_present = false
     #[test]
     fn migrated_discovery_repin_without_load_context_uses_generic_wording() {
         let mut lock = LockFile::from_toml_str(
-            fully_protected_v2_lock_toml(),
+            pending_discovery_lock_toml(),
             Path::new("carina-providers.lock"),
         )
         .unwrap();
@@ -18438,13 +14925,13 @@ transparency_log_present = false
         assert_eq!(
             changed_provider_lock_states(&before, &after),
             expected,
-            "legacy and current signer-pin forms must clear the same state"
+            "all current signer pins must clear together"
         );
         for state in HostLockState::ALL {
             assert_eq!(
                 observe_host_lock_state(&after, state),
                 observe_host_lock_state(&before, state),
-                "legacy identity re-pin changed host state {state:?}"
+                "identity re-pin changed host state {state:?}"
             );
         }
 
@@ -18468,7 +14955,7 @@ transparency_log_present = false
         );
 
         let before = LockFile::from_toml_str(
-            fully_protected_v2_lock_toml(),
+            pending_discovery_lock_toml(),
             Path::new("carina-providers.lock"),
         )
         .unwrap();
@@ -18565,8 +15052,6 @@ transparency_log_present = false
         ValidUntilFieldDisappeared,
         DiscoveryMigrationAuthorizationRequired,
         DiscoveryPinMismatch,
-        LegacyShasumPinMismatch,
-        LegacySignatureMissing,
         ShasumPinMismatch,
         HostnamePinMismatch,
         SignatureFieldDisappeared,
@@ -18600,12 +15085,6 @@ transparency_log_present = false
             RegistryRefusal::DiscoveryPinMismatch { .. } => {
                 RegistryRefusalVariantIndex::DiscoveryPinMismatch as usize
             }
-            RegistryRefusal::LegacyShasumPinMismatch { .. } => {
-                RegistryRefusalVariantIndex::LegacyShasumPinMismatch as usize
-            }
-            RegistryRefusal::LegacySignatureMissing { .. } => {
-                RegistryRefusalVariantIndex::LegacySignatureMissing as usize
-            }
             RegistryRefusal::ShasumPinMismatch { .. } => {
                 RegistryRefusalVariantIndex::ShasumPinMismatch as usize
             }
@@ -18629,8 +15108,6 @@ transparency_log_present = false
             | RegistryRefusal::SequenceFastForward { .. } => Some(RecoveryKind::Rebootstrap),
             RegistryRefusal::YankedFlagDisappeared { .. }
             | RegistryRefusal::ValidUntilFieldDisappeared { .. }
-            | RegistryRefusal::LegacyShasumPinMismatch { .. }
-            | RegistryRefusal::LegacySignatureMissing { .. }
             | RegistryRefusal::ShasumPinMismatch { .. }
             | RegistryRefusal::HostnamePinMismatch { .. }
             | RegistryRefusal::SignatureFieldDisappeared { .. }
@@ -18639,9 +15116,9 @@ transparency_log_present = false
             | RegistryRefusal::DiscoveryPinMismatch { .. } => Some(RecoveryKind::DiscoveryRepin),
             RegistryRefusal::Signer { rejection, .. } => match rejection {
                 SignerRejection::StableSourceRef { .. } => None,
-                SignerRejection::LegacyIdentity
-                | SignerRejection::SourceMismatch { .. }
-                | SignerRejection::Workflow { .. } => Some(RecoveryKind::IdentityRepin),
+                SignerRejection::SourceMismatch { .. } | SignerRejection::Workflow { .. } => {
+                    Some(RecoveryKind::IdentityRepin)
+                }
             },
         }
     }
@@ -18688,16 +15165,6 @@ transparency_log_present = false
                 resolved: "https://registry.carina-rs.dev/v2/providers/".into(),
                 target: host_target,
             },
-            RegistryRefusal::LegacyShasumPinMismatch {
-                version: "0.5.0".into(),
-                locked: "locked-shasum".into(),
-                resolved: "resolved-shasum".into(),
-                target: provider_target.clone(),
-            },
-            RegistryRefusal::LegacySignatureMissing {
-                version: "0.5.0".into(),
-                target: provider_target.clone(),
-            },
             RegistryRefusal::ShasumPinMismatch {
                 version: "0.5.0".into(),
                 locked: "locked-shasum".into(),
@@ -18737,10 +15204,6 @@ transparency_log_present = false
         );
         let mut samples = inventory_samples;
         samples.extend([
-            RegistryRefusal::Signer {
-                rejection: SignerRejection::LegacyIdentity,
-                target: provider_target.clone(),
-            },
             RegistryRefusal::Signer {
                 rejection: SignerRejection::Workflow {
                     channel: ReleaseChannel::Stable,
@@ -18901,7 +15364,11 @@ transparency_log_present = false
         }
 
         let default = RegistryRefusal::Signer {
-            rejection: SignerRejection::LegacyIdentity,
+            rejection: SignerRejection::Workflow {
+                channel: ReleaseChannel::Stable,
+                expected: WorkflowPin("before.yml".into()),
+                actual: WorkflowPin("after.yml".into()),
+            },
             target: ProviderRefusalTarget::new("carina-rs/aws", "."),
         }
         .to_string();
@@ -18914,7 +15381,7 @@ transparency_log_present = false
 
     #[test]
     fn registry_ratchet_storage_load_attaches_unpinned_to_provider() {
-        let serialized = r#"version = 3
+        let serialized = r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = true
@@ -18934,7 +15401,7 @@ resolved_hostname = "registry.carina-rs.dev"
 sequence_present = false
 sequence_anchor_established = false
 valid_until_present = false
-signature_present = false
+signature_state = "not_required"
 transparency_log_present = false
 
 [unpinned_registry_ratchets."carina-rs/aws"]
@@ -18942,9 +15409,11 @@ sequence_present = true
 sequence = 7
 valid_until_present = true
 yanked_versions = ["0.4.0"]
-signature_present = true
-certificate_identity = "identity-a"
-certificate_oidc_issuer = "issuer-a"
+signature_state = "required_current"
+source_oidc_issuer = "issuer-a"
+source_repository_owner_id = "owner"
+source_repository_id = "identity-a"
+stable_workflow = "release.yml"
 transparency_log_present = true
 "#;
 
@@ -19189,16 +15658,24 @@ transparency_log_present = true
             .expect_err("a conflicting identity pin must be rejected");
         assert_eq!(
             *hostile.left,
-            DiscardedSignerPins::Legacy(LegacySignerPin {
-                certificate_san: "EVIL".into(),
-                oidc_issuer: "EVIL-issuer".into(),
+            DiscardedSignerPins::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "EVIL-issuer".into(),
+                    repository_owner_id: "owner".into(),
+                    repository_id: "EVIL".into()
+                },
+                workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
             })
         );
         assert_eq!(
             *hostile.right,
-            DiscardedSignerPins::Legacy(LegacySignerPin {
-                certificate_san: "id-a".into(),
-                oidc_issuer: "issuer-a".into(),
+            DiscardedSignerPins::Current(CurrentSignerPins {
+                source: SourcePin {
+                    oidc_issuer: "issuer-a".into(),
+                    repository_owner_id: "owner".into(),
+                    repository_id: "id-a".into()
+                },
+                workflows: WorkflowPins::Stable(WorkflowPin("release.yml".into())),
             })
         );
 
@@ -19435,7 +15912,7 @@ transparency_log_present = true
     }
 
     #[test]
-    fn upgrade_retains_unconfigured_provider_legacy_and_egress_records() {
+    fn upgrade_retains_unconfigured_provider_and_egress_records() {
         let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
         let configured = project.path().join("configured.wasm");
@@ -19453,14 +15930,6 @@ sha256 = "orphan-sha"
 [provider.egress]
 consent = "explicit"
 hosts = ["api.example.com"]
-
-[[provider]]
-name = "legacy"
-source = "github.com/example/legacy"
-mode = "version"
-version = "1.0.0"
-sha256 = "legacy-sha"
-future_protection_field = "retain-me"
 "#,
         )
         .unwrap();
@@ -19483,14 +15952,6 @@ future_protection_field = "retain-me"
         assert!(lock.contains("source = \"file://orphan.wasm\""), "{lock}");
         assert!(lock.contains("[provider.egress]"), "{lock}");
         assert!(lock.contains("hosts = [\"api.example.com\"]"), "{lock}");
-        assert!(
-            lock.contains("source = \"github.com/example/legacy\""),
-            "{lock}"
-        );
-        assert!(
-            lock.contains("future_protection_field = \"retain-me\""),
-            "{lock}"
-        );
     }
 
     #[test]
@@ -19666,7 +16127,6 @@ future_protection_field = "retain-me"
         let direct_error = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .expect_err("a direct file lookup must reject native binaries");
         assert_eq!(direct_error, expected);
@@ -19674,7 +16134,6 @@ future_protection_field = "retain-me"
         let installed_error = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .expect_err("an installed file lookup must reject native binaries");
         assert_eq!(installed_error.to_string(), expected);
@@ -20192,7 +16651,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &config,
             &signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200),
-            &mut |_| {},
         )
         .unwrap();
 
@@ -20254,7 +16712,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &config,
             &signed_registry_http(SIGNED_FIXTURE_BUNDLE, 200),
-            &mut |_| {},
         )
         .unwrap();
 
@@ -20277,14 +16734,8 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":10000000,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let path = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &unsigned_http,
-            &mut |_| {},
-        )
-        .expect("manual entry deletion demonstrates why recovery must preserve ratchets");
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &unsigned_http)
+            .expect("manual entry deletion demonstrates why recovery must preserve ratchets");
 
         assert_eq!(fs::read(path.as_path()).unwrap(), SIGNED_FIXTURE_ARTIFACT);
         assert_eq!(
@@ -20311,7 +16762,6 @@ future_protection_field = "retain-me"
                 dir.path(),
                 &provider_config("carina-rs/aws", None),
                 &http,
-                &mut |_| {},
             )
             .unwrap_or_else(|error| {
                 panic!("honest first contact at sequence {sequence} was refused: {error}")
@@ -20337,14 +16787,7 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":0,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &baseline_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
             Some(RegistrySequenceAnchor::Established(0))
@@ -20355,14 +16798,8 @@ future_protection_field = "retain-me"
             r#"{{"sequence":{hostile_sequence},"versions":[{{"version":"0.5.0","protocols":["1"]}}]}}"#
         );
         let hostile_http = registry_http_with_listing(ARTIFACT, &shasum, &listing);
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &hostile_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+            .unwrap_err();
 
         assert!(error.contains("sequence fast-forward"), "{error}");
         assert_eq!(
@@ -20412,14 +16849,8 @@ future_protection_field = "retain-me"
             )
             .json(REGISTRY_VERSIONS_URL, &hostile_listing);
 
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &hostile_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+            .unwrap_err();
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
             Some(hostile_sequence),
@@ -20439,14 +16870,8 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":42,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let path = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &honest_http,
-            &mut |_| {},
-        )
-        .expect("an unpinned observation must not become a rollback floor");
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &honest_http)
+            .expect("an unpinned observation must not become a rollback floor");
         assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
         assert_eq!(
             saved_registry_sequence_anchor(dir.path()),
@@ -20493,36 +16918,16 @@ future_protection_field = "retain-me"
             )
             .json(REGISTRY_VERSIONS_URL, listing);
 
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &failed_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &failed_http)
+            .unwrap_err();
         assert!(error.contains("unexpected test URL"), "{error}");
         assert_eq!(failed_http.request_count(REGISTRY_VERSIONS_URL), 2);
         assert!(saved_registry_ratchets(dir.path()).valid_until_present);
 
         let shasum = sha256_bytes(ARTIFACT);
         let successful_http = registry_http_with_listing(ARTIFACT, &shasum, listing);
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &successful_http,
-            &mut |_| {},
-        )
-        .unwrap();
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &successful_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &successful_http).unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &successful_http).unwrap();
     }
 
     #[test]
@@ -20538,14 +16943,7 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":7,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &baseline_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let mut lock = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         lock.prepare_registry_rebootstrap("carina-rs/aws")
@@ -20567,14 +16965,8 @@ future_protection_field = "retain-me"
                 REGISTRY_VERSIONS_URL,
                 r#"{"sequence":11,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
             );
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &failed_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &failed_http)
+            .unwrap_err();
 
         assert!(error.contains("unexpected test URL"), "{error}");
         assert_eq!(
@@ -20600,14 +16992,7 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":10,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &baseline_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let accepted_sequence = 10 + MAX_SEQUENCE_FAST_FORWARD;
         let accepted_listing = format!(
@@ -20616,14 +17001,9 @@ future_protection_field = "retain-me"
         let hostile_shasum = sha256_bytes(b"hostile accepted observation");
         let accepted_http =
             registry_http_with_listing(ARTIFACT, &hostile_shasum, &accepted_listing);
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &accepted_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error =
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &accepted_http)
+                .unwrap_err();
         assert!(error.contains("shasum pin mismatch"), "{error}");
 
         for attempt in 1..=4 {
@@ -20633,14 +17013,9 @@ future_protection_field = "retain-me"
             );
             let hostile_http = registry_http_with_listing(ARTIFACT, &hostile_shasum, &listing);
 
-            let error = resolve_single_config_with_http(
-                &user_dirs,
-                dir.path(),
-                &config,
-                &hostile_http,
-                &mut |_| {},
-            )
-            .unwrap_err();
+            let error =
+                resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+                    .unwrap_err();
             assert!(
                 error.contains("sequence fast-forward"),
                 "attempt {attempt}: {error}"
@@ -20671,14 +17046,7 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":10,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &baseline_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let accepted_sequence = 10 + MAX_SEQUENCE_FAST_FORWARD;
         let first_listing = format!(
@@ -20686,14 +17054,8 @@ future_protection_field = "retain-me"
         );
         let hostile_shasum = sha256_bytes(b"hostile cumulative shasum");
         let first_http = registry_http_with_listing(ARTIFACT, &hostile_shasum, &first_listing);
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &first_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &first_http)
+            .unwrap_err();
         assert!(error.contains("shasum pin mismatch"), "{error}");
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
@@ -20711,14 +17073,8 @@ future_protection_field = "retain-me"
             r#"{{"sequence":{walked_sequence},"versions":[{{"version":"0.5.0","protocols":["1"]}}]}}"#
         );
         let second_http = registry_http_with_listing(ARTIFACT, &hostile_shasum, &second_listing);
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &second_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &second_http)
+            .unwrap_err();
         assert!(error.contains("sequence fast-forward"), "{error}");
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
@@ -20743,14 +17099,9 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":100,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let cached_path = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &baseline_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        let cached_path =
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http)
+                .unwrap();
         fs::remove_file(cached_path.as_path()).unwrap();
 
         let failed_http = registry_http_with_listing(
@@ -20759,14 +17110,8 @@ future_protection_field = "retain-me"
             r#"{"sequence":101,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
 
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &failed_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &failed_http)
+            .unwrap_err();
         assert!(error.contains("SHA256 mismatch"), "{error}");
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
@@ -20784,14 +17129,9 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":99,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &rollback_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error =
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &rollback_http)
+                .unwrap_err();
 
         assert!(error.contains("sequence rollback"), "{error}");
         assert!(error.contains("previous 100, got 99"), "{error}");
@@ -20807,28 +17147,15 @@ future_protection_field = "retain-me"
             REGISTRY_VERSIONS_URL,
             r#"{"sequence":100,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &baseline_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let failed_http = signed_registry_http(b"bundle unavailable", 503).json(
             REGISTRY_VERSIONS_URL,
             r#"{"sequence":101,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.0.0-main.1","protocols":["1"]}]}"#,
         );
 
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &failed_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &failed_http)
+            .unwrap_err();
         assert!(error.contains("HTTP 503"), "{error}");
         assert_eq!(
             saved_registry_ratchets(dir.path()).sequence.value(),
@@ -20847,14 +17174,9 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":99,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &rollback_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error =
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &rollback_http)
+                .unwrap_err();
 
         assert!(error.contains("sequence rollback"), "{error}");
         assert!(error.contains("previous 100, got 99"), "{error}");
@@ -20872,28 +17194,15 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":100,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &baseline_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let hostile_sequence = 100 + MAX_SEQUENCE_FAST_FORWARD + 1;
         let hostile_listing = format!(
             r#"{{"sequence":{hostile_sequence},"valid_until":"2999-01-01T00:00:00Z","versions":[{{"version":"0.5.0","protocols":["1"]}}]}}"#
         );
         let hostile_http = registry_http_with_listing(ARTIFACT, &shasum, &hostile_listing);
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &hostile_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+            .unwrap_err();
         assert!(error.contains("sequence fast-forward"), "{error}");
 
         let lock_path = dir.path().join("carina-providers.lock");
@@ -20911,14 +17220,7 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":101,"valid_until":"2999-01-01T00:00:00Z","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &legitimate_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &legitimate_http).unwrap();
         let lock_file = load_lock_file_for_test(&lock_path).unwrap().unwrap();
         let registry = lock_file
             .find_by_source("carina-rs/aws")
@@ -20941,14 +17243,7 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":100,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &baseline_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let rollback_with_valid_until = registry_http_with_listing(
             ARTIFACT,
@@ -20960,7 +17255,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &config,
             &rollback_with_valid_until,
-            &mut |_| {},
         )
         .unwrap_err();
         assert!(error.contains("sequence rollback"), "{error}");
@@ -20989,7 +17283,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &config,
             &accepted_sequence_missing_valid_until,
-            &mut |_| {},
         )
         .expect("the rejected listing must not install valid_until presence");
 
@@ -21025,7 +17318,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &initial_http,
-            &mut |_| {},
         )
         .unwrap_err();
         assert!(error.contains("SHA256 mismatch"), "{error}");
@@ -21044,7 +17336,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &missing_http,
-            &mut |_| {},
         )
         .unwrap_err();
         assert!(error.contains("valid_until field disappeared"), "{error}");
@@ -21071,7 +17362,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &malformed_http,
-            &mut |_| {},
         )
         .unwrap_err();
         assert!(
@@ -21103,14 +17393,9 @@ future_protection_field = "retain-me"
             r#"{"valid_until":"not-a-timestamp","versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
 
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &malformed_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error =
+            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &malformed_http)
+                .unwrap_err();
         assert!(
             error.contains("Invalid registry valid_until timestamp"),
             "{error}"
@@ -21121,14 +17406,8 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let path = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &honest_http,
-            &mut |_| {},
-        )
-        .expect("the malformed timestamp must not poison the next listing");
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &honest_http)
+            .expect("the malformed timestamp must not poison the next listing");
         assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
     }
 
@@ -21149,7 +17428,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &expired_http,
-            &mut |_| {},
         )
         .unwrap_err();
         assert!(error.contains("valid_until is expired"), "{error}");
@@ -21168,7 +17446,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &honest_http,
-            &mut |_| {},
         )
         .expect("the expired listing must not poison an honest listing without valid_until");
     }
@@ -21194,7 +17471,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &initial_http,
-            &mut |_| {},
         )
         .unwrap_err();
         assert!(error.contains("SHA256 mismatch"), "{error}");
@@ -21213,7 +17489,6 @@ future_protection_field = "retain-me"
             dir.path(),
             &provider_config("carina-rs/aws", None),
             &missing_http,
-            &mut |_| {},
         )
         .unwrap_err();
         assert!(
@@ -21238,14 +17513,7 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":10,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &baseline_http,
-            &mut |_| {},
-        )
-        .unwrap();
+        resolve_single_config_with_http(&user_dirs, dir.path(), &config, &baseline_http).unwrap();
 
         let hostile_shasum = sha256_bytes(b"hostile transparency-log shasum");
         let hostile_download = format!(
@@ -21257,14 +17525,8 @@ future_protection_field = "retain-me"
             r#"{"sequence":11,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         )
         .json(REGISTRY_DOWNLOAD_URL, &hostile_download);
-        let error = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &hostile_http,
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let error = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &hostile_http)
+            .unwrap_err();
         assert!(error.contains("shasum pin mismatch"), "{error}");
         let ratchets = saved_registry_ratchets(dir.path());
         assert_eq!(ratchets.sequence.value(), Some(11));
@@ -21278,14 +17540,8 @@ future_protection_field = "retain-me"
             &shasum,
             r#"{"sequence":11,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
-        let path = resolve_single_config_with_http(
-            &user_dirs,
-            dir.path(),
-            &config,
-            &honest_http,
-            &mut |_| {},
-        )
-        .expect("the rejected download response must not poison the honest registry");
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &honest_http)
+            .expect("the rejected download response must not poison the honest registry");
         assert_eq!(fs::read(path.as_path()).unwrap(), ARTIFACT);
     }
 
@@ -21338,7 +17594,6 @@ future_protection_field = "retain-me"
 
     #[test]
     fn registry_sequence_observation_is_durable_from_version_selection_entry_point() {
-        let user_dirs = carina_core::TestUserDirs::new();
         const ARTIFACT: &[u8] = b"version-selection ratchet artifact";
         let dir = tempfile::tempdir().unwrap();
         let shasum = sha256_bytes(ARTIFACT);
@@ -21353,7 +17608,6 @@ future_protection_field = "retain-me"
         );
 
         let selected = resolve_registry_version_with_http(
-            &user_dirs,
             dir.path(),
             &source,
             &source_key("carina-rs/aws"),
@@ -21379,7 +17633,6 @@ future_protection_field = "retain-me"
             r#"{"sequence":5,"versions":[{"version":"0.5.0","protocols":["1"]}]}"#,
         );
         let selected = resolve_registry_version_with_http(
-            &user_dirs,
             dir.path(),
             &source,
             &source_key("carina-rs/aws"),
@@ -21434,7 +17687,6 @@ future_protection_field = "retain-me"
                 dir.path(),
                 &provider_config("carina-rs/aws", None),
                 &http,
-                &mut |_| {},
             )
             .unwrap();
 
@@ -21649,7 +17901,6 @@ future_protection_field = "retain-me"
         );
 
         let selected = resolve_registry_version_with_http(
-            &user_dirs,
             dir.path(),
             &source,
             &source_key("carina-rs/aws"),
@@ -21748,7 +17999,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -22103,7 +18353,6 @@ future_protection_field = "retain-me"
                 }),
             }],
             egress: BTreeMap::new(),
-            legacy: Vec::new(),
             unpinned_registry_ratchets: UnpinnedRegistryRatchets::default(),
         };
         let before = lock_file.to_toml_string().unwrap();
@@ -22509,7 +18758,7 @@ future_protection_field = "retain-me"
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join("carina-providers.lock");
         let one_sided_pin = format!(
-            r#"version = 3
+            r#"version = 5
 
 [registry_host."registry.carina-rs.dev"]
 discovery_pin_present = true
@@ -22531,8 +18780,8 @@ sequence = 7
 sequence_anchor_established = true
 sequence_anchor = 7
 valid_until_present = true
-signature_present = true
-certificate_identity = {SIGNED_FIXTURE_IDENTITY:?}
+signature_state = "required_current"
+source_repository_id = {SIGNED_FIXTURE_IDENTITY:?}
 transparency_log_present = false
 "#
         );
@@ -22549,7 +18798,7 @@ transparency_log_present = false
         let error = load_lock_file_for_test(&lock_path).unwrap_err();
         let rendered = error.to_string();
         assert!(rendered.contains("inconsistent"), "{error}");
-        assert!(rendered.contains("certificate_identity"), "{error}");
+        assert!(rendered.contains("source"), "{error}");
     }
 
     #[test]
@@ -23205,9 +19454,7 @@ transparency_log_present = false
             binding: None,
         };
 
-        let path =
-            resolve_single_config_with_http(&user_dirs, dir.path(), &config, &http, &mut |_| {})
-                .unwrap();
+        let path = resolve_single_config_with_http(&user_dirs, dir.path(), &config, &http).unwrap();
 
         assert_eq!(fs::read(path.as_path()).unwrap(), body);
         assert!(http.was_requested("/.well-known/carina.json"));
@@ -24121,7 +20368,6 @@ transparency_log_present = false
             let found_path = find_installed_provider(
                 &carina_core::paths::ResolvedPath::new(dir.path()).unwrap(),
                 &provider_config(requested_source, None),
-                &mut |_| {},
             )
             .unwrap();
 
@@ -24172,7 +20418,6 @@ transparency_log_present = false
                 dir.path(),
                 &versioned_config(requested_source, "~0.5.0"),
                 &http,
-                &mut |_| {},
             )
             .unwrap();
             let saved_lock = load_lock_file_for_test(&dir.path().join("carina-providers.lock"))
@@ -24829,280 +21074,6 @@ transparency_log_present = false
     }
 
     #[test]
-    fn normal_init_re_resolves_legacy_github_lock_at_exact_pinned_version() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let project = tempfile::tempdir().unwrap();
-        let global = user_dirs.plugin_cache_dir();
-        std::fs::create_dir_all(global).unwrap();
-        let source = "github.com/acme/widget";
-        let legacy_bytes = b"legacy-pinned provider";
-        let mut lock = LockFile::default();
-        lock.upsert(LockEntry {
-            name: "widget".into(),
-            source: source.into(),
-            kind: LockEntryKind::Version {
-                version: "0.1.0".into(),
-                constraint: Some("^0.1".into()),
-            },
-            sha256: sha256_bytes(legacy_bytes),
-            registry: None,
-        });
-        lock.save(&provider_lock_path(project.path())).unwrap();
-        let releases_url = "https://api.github.com/repos/acme/widget/releases?per_page=100";
-        let github_http = FixtureGithubHttp::default()
-            .json(
-                releases_url,
-                r#"[
-                    {"tag_name":"0.2.0","assets":[{"name":"newer.wasm","id":99}]},
-                    {"tag_name":"0.1.0","assets":[{"name":"custom-build.wasm","id":42}]}
-                ]"#,
-            )
-            .bytes(
-                "https://api.github.com/repos/acme/widget/releases/assets/42",
-                legacy_bytes,
-            )
-            .bytes(
-                "https://api.github.com/repos/acme/widget/releases/assets/99",
-                b"newer provider",
-            );
-        let github = GithubApi::new(&github_http, None);
-
-        let resolved = resolve_all_with_github_in(
-            &user_dirs,
-            project.path(),
-            &[versioned_config(source, "^0")],
-            LockMode::Normal,
-            &FixtureRegistryHttp::default(),
-            &github,
-        )
-        .unwrap();
-
-        let saved = load_lock_file_for_test(&provider_lock_path(project.path()))
-            .unwrap()
-            .unwrap();
-        assert!(saved.legacy.is_empty());
-        assert!(matches!(
-            &saved.find_by_source(source).unwrap().kind,
-            LockEntryKind::GithubRelease {
-                version,
-                tag,
-                asset_id,
-                constraint: Some(constraint),
-            } if version.to_string() == "0.1.0" && tag.as_str() == "0.1.0" && asset_id.get() == 42 && constraint == "^0"
-        ));
-        assert_eq!(fs::read(resolved["awscc"].as_path()).unwrap(), legacy_bytes);
-        let requests = github_http.requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].url(), releases_url);
-        assert_eq!(
-            requests[1].url(),
-            "https://api.github.com/repos/acme/widget/releases/assets/42"
-        );
-        assert_eq!(requests[1].accept(), "application/octet-stream");
-        assert_eq!(requests[1].authorization(), None);
-    }
-
-    #[test]
-    fn orphan_legacy_entry_survives_normal_init_save() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let project = tempfile::tempdir().unwrap();
-        let lock_path = provider_lock_path(project.path());
-        let legacy_source = "github.com/acme/orphan";
-        fs::write(
-            &lock_path,
-            format!(
-                r#"version = 4
-
-[[provider]]
-name = "orphan"
-source = "{legacy_source}"
-mode = "version"
-version = "0.1.0"
-sha256 = "abc"
-future_protection_field = "retain-me"
-"#
-            ),
-        )
-        .unwrap();
-        let local_wasm = project.path().join("local.wasm");
-        fs::write(&local_wasm, b"local provider").unwrap();
-        let local_source = format!("file://{}", local_wasm.display());
-
-        resolve_all_with_http(
-            &user_dirs,
-            project.path(),
-            &[provider_config(&local_source, None)],
-            LockMode::Normal,
-            &FakeRegistryHttp::default(),
-        )
-        .unwrap();
-
-        let saved = fs::read_to_string(&lock_path).unwrap();
-        assert!(saved.contains(legacy_source), "{saved}");
-        assert!(
-            saved.contains("future_protection_field = \"retain-me\""),
-            "{saved}"
-        );
-        assert!(saved.contains(&local_source), "{saved}");
-    }
-
-    #[test]
-    fn failed_github_step_does_not_drop_legacy_entry_after_registry_persistence() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let project = tempfile::tempdir().unwrap();
-        let global = user_dirs.plugin_cache_dir();
-        std::fs::create_dir_all(global).unwrap();
-        let lock_path = provider_lock_path(project.path());
-        let legacy_source = "github.com/acme/widget";
-        fs::write(
-            &lock_path,
-            format!(
-                r#"version = 4
-
-[[provider]]
-name = "widget"
-source = "{legacy_source}"
-mode = "version"
-version = "0.1.0"
-sha256 = "abc"
-future_protection_field = "retain-me"
-"#
-            ),
-        )
-        .unwrap();
-        let registry_bytes = b"registry provider";
-        let registry_sha256 = sha256_bytes(registry_bytes);
-        let registry = registry_http(registry_bytes, &registry_sha256);
-        let github_http = FixtureGithubHttp::default();
-        let github = GithubApi::new(&github_http, None);
-
-        resolve_all_with_github_in(
-            &user_dirs,
-            project.path(),
-            &[
-                versioned_config("carina-rs/aws", "^0.5"),
-                versioned_config(legacy_source, "^0.1"),
-            ],
-            LockMode::Normal,
-            &registry,
-            &github,
-        )
-        .expect_err("the GitHub fixture intentionally has no release-list response");
-
-        let saved = fs::read_to_string(&lock_path).unwrap();
-        assert!(saved.contains(legacy_source), "{saved}");
-        assert!(
-            saved.contains("future_protection_field = \"retain-me\""),
-            "{saved}"
-        );
-        assert!(saved.contains("unpinned_registry_ratchets"), "{saved}");
-    }
-
-    #[test]
-    fn normal_init_rejects_changed_bytes_against_legacy_checksum() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let project = tempfile::tempdir().unwrap();
-        let global = user_dirs.plugin_cache_dir();
-        std::fs::create_dir_all(global).unwrap();
-        let source = "github.com/acme/widget";
-        let mut lock = LockFile::default();
-        lock.upsert(LockEntry {
-            name: "widget".into(),
-            source: source.into(),
-            kind: LockEntryKind::Version {
-                version: "0.1.0".into(),
-                constraint: Some("^0".into()),
-            },
-            sha256: sha256_bytes(b"original legacy bytes"),
-            registry: None,
-        });
-        let lock_path = provider_lock_path(project.path());
-        lock.save(&lock_path).unwrap();
-        let lock_before = fs::read(&lock_path).unwrap();
-        let releases_url = "https://api.github.com/repos/acme/widget/releases?per_page=100";
-        let asset_url = "https://api.github.com/repos/acme/widget/releases/assets/42";
-        let github_http = FixtureGithubHttp::default()
-            .json(
-                releases_url,
-                r#"[{"tag_name":"0.1.0","assets":[{"name":"provider.wasm","id":42}]}]"#,
-            )
-            .bytes(asset_url, b"changed legacy bytes");
-        let github = GithubApi::new(&github_http, None);
-
-        let error = resolve_all_with_github_in(
-            &user_dirs,
-            project.path(),
-            &[versioned_config(source, "^0")],
-            LockMode::Normal,
-            &FixtureRegistryHttp::default(),
-            &github,
-        )
-        .expect_err("legacy checksum must remain authoritative during migration");
-
-        assert!(
-            error.contains("does not match the sha256 pinned"),
-            "{error}"
-        );
-        assert_eq!(fs::read(&lock_path).unwrap(), lock_before);
-    }
-
-    #[test]
-    fn upgrade_may_move_legacy_github_lock_to_newer_version() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let project = tempfile::tempdir().unwrap();
-        let global = user_dirs.plugin_cache_dir();
-        std::fs::create_dir_all(global).unwrap();
-        let source = "github.com/acme/widget";
-        let mut lock = LockFile::default();
-        lock.upsert(LockEntry {
-            name: "widget".into(),
-            source: source.into(),
-            kind: LockEntryKind::Version {
-                version: "0.1.0".into(),
-                constraint: Some("^0".into()),
-            },
-            sha256: sha256_bytes(b"legacy bytes"),
-            registry: None,
-        });
-        lock.save(&provider_lock_path(project.path())).unwrap();
-        let releases_url = "https://api.github.com/repos/acme/widget/releases?per_page=100";
-        let asset_url = "https://api.github.com/repos/acme/widget/releases/assets/99";
-        let github_http = FixtureGithubHttp::default()
-            .json(
-                releases_url,
-                r#"[
-                    {"tag_name":"0.2.0","assets":[{"name":"newer.wasm","id":99}]},
-                    {"tag_name":"0.1.0","assets":[{"name":"legacy.wasm","id":42}]}
-                ]"#,
-            )
-            .bytes(asset_url, b"newer provider bytes");
-        let github = GithubApi::new(&github_http, None);
-
-        resolve_all_with_github_in(
-            &user_dirs,
-            project.path(),
-            &[versioned_config(source, "^0")],
-            LockMode::Upgrade,
-            &FixtureRegistryHttp::default(),
-            &github,
-        )
-        .unwrap();
-
-        let saved = load_lock_file_for_test(&provider_lock_path(project.path()))
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            &saved.find_by_source(source).unwrap().kind,
-            LockEntryKind::GithubRelease {
-                version,
-                tag,
-                asset_id,
-                constraint: Some(constraint),
-            } if version.to_string() == "0.2.0" && tag.as_str() == "0.2.0" && asset_id.get() == 99 && constraint == "^0"
-        ));
-    }
-
-    #[test]
     fn latest_github_release_downloads_single_wasm_asset_by_id() {
         let user_dirs = carina_core::TestUserDirs::new();
         let project = tempfile::tempdir().unwrap();
@@ -25459,7 +21430,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let class = block_on(installed.load_with(
@@ -26060,7 +22030,6 @@ future_protection_field = "retain-me"
         let err = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             &config,
-            &mut |_| {},
         )
         .expect_err("missing local .carina/ must not be masked by a global-cache hit");
         assert!(err.to_string().contains("carina init"), "got: {err}");
@@ -26092,7 +22061,6 @@ future_protection_field = "retain-me"
         let err = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             &config,
-            &mut |_| {},
         )
         .expect_err("missing local .carina/ must not be masked by a global-cache hit");
         assert!(err.to_string().contains("carina init"), "got: {err}");
@@ -26129,9 +22097,7 @@ future_protection_field = "retain-me"
         let fingerprint = provider_artifact_fingerprint(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &provider_config(source, None),
-            &mut |_| {},
-        )
-        .unwrap();
+        );
         assert!(
             fingerprint.artifact.is_some(),
             "the drift probe must observe artifact metadata without hashing provider bytes"
@@ -26143,7 +22109,6 @@ future_protection_field = "retain-me"
         let error = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &provider_config(source, None),
-            &mut |_| {},
         )
         .expect_err("the runtime loader must verify lock-controlled provider bytes");
 
@@ -26171,20 +22136,16 @@ future_protection_field = "retain-me"
         assert!(
             provider_artifact_fingerprint(
                 &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &provider_config(&format!("file://{}", wasm.display()), None),
-                &mut |_| {}
+                &provider_config(&format!("file://{}", wasm.display()), None)
             )
-            .unwrap()
             .artifact
             .is_some()
         );
         assert!(
             provider_artifact_fingerprint(
                 &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &provider_config(&format!("file://{}", native.display()), None),
-                &mut |_| {}
+                &provider_config(&format!("file://{}", native.display()), None)
             )
-            .unwrap()
             .artifact
             .is_none()
         );
@@ -26192,10 +22153,8 @@ future_protection_field = "retain-me"
         assert!(
             provider_artifact_fingerprint(
                 &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &provider_config(&format!("file://{}", wasm.display()), None),
-                &mut |_| {}
+                &provider_config(&format!("file://{}", wasm.display()), None)
             )
-            .unwrap()
             .artifact
             .is_none()
         );
@@ -26279,7 +22238,7 @@ future_protection_field = "retain-me"
                 });
                 lock.save(&provider_lock_path(&directory)).unwrap();
 
-                let installed = find_installed_provider(&project, &config, &mut |_| {}).unwrap();
+                let installed = find_installed_provider(&project, &config).unwrap();
                 assert_eq!(installed.artifact_bytes().as_bytes(), bytes);
                 assert_eq!(installed.path().as_path(), artifact.as_path());
                 assert_eq!(
@@ -26352,10 +22311,10 @@ future_protection_field = "retain-me"
         lock.save(&provider_lock_path(&directory)).unwrap();
         let config = provider_config(source, None);
 
-        let installed = find_installed_provider(&project, &config, &mut |_| {})
+        let installed = find_installed_provider(&project, &config)
             .expect("a complete cache locator must not be joined to infra again");
         assert_eq!(installed.path().as_path(), artifact.as_path());
-        let fingerprint = provider_artifact_fingerprint(&project, &config, &mut |_| {}).unwrap();
+        let fingerprint = provider_artifact_fingerprint(&project, &config);
         assert!(
             fingerprint.artifact.is_some(),
             "drift polling must inspect the same artifact"
@@ -26394,7 +22353,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &provider_config(source, None),
-            &mut |_| {},
         )
         .expect("the lock-matching provider should be loadable");
 
@@ -26446,7 +22404,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &provider_config(source, None),
-            &mut |_| {},
         )
         .expect("the lock-matching provider should be loadable");
         fs::write(&wasm_path, swapped_bytes).unwrap();
@@ -26489,7 +22446,6 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .expect("the file provider should be loadable at lookup");
         fs::write(&source_path, swapped_bytes).unwrap();
@@ -26518,7 +22474,7 @@ future_protection_field = "retain-me"
         fs::write(&source, b"owned provider bytes").unwrap();
         let project = ResolvedPath::new(directory.path()).unwrap();
         let config = provider_config(&format!("file://{}", source.display()), None);
-        let installed = find_file_provider_source(&project, &config, &mut |_| {}).unwrap();
+        let installed = find_file_provider_source(&project, &config).unwrap();
         let grants =
             TrustedLocalGrants::parse(&[format!("{}=aws", source.display())], None).unwrap();
         let mut notices = Vec::<ProviderLoadNotice>::new();
@@ -26572,7 +22528,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let loaded = installed
@@ -26618,7 +22573,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let grants =
@@ -26653,7 +22607,6 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         fs::write(&source_path, b"different bytes after lookup").unwrap();
@@ -26880,8 +22833,8 @@ future_protection_field = "retain-me"
         fs::write(&source, b"replacement provider").unwrap();
 
         assert!(LockFile::load(&pinned).unwrap().is_none());
-        validate_lock_constraints(&pinned, std::slice::from_ref(&config), &mut |_| {}).unwrap();
-        let installed = find_installed_provider(&pinned, &config, &mut |_| {}).unwrap();
+        validate_lock_constraints(&pinned, std::slice::from_ref(&config)).unwrap();
+        let installed = find_installed_provider(&pinned, &config).unwrap();
         let load = installed
             .load_with(&user_dirs, &grants, &mut |_| {}, |verified| async {
                 Ok::<_, std::convert::Infallible>(verified)
@@ -26890,11 +22843,7 @@ future_protection_field = "retain-me"
             .unwrap();
         assert_eq!(load.bytes().as_bytes(), b"original provider");
         assert_eq!(load.identity().trust().class(), ProviderTrustClass::Aws);
-        assert!(
-            load_locked_egress(&pinned, &load, &mut |_| {})
-                .unwrap()
-                .is_none()
-        );
+        assert!(load_locked_egress(&pinned, &load).unwrap().is_none());
         assert!(installed.path().as_path().starts_with(&alias));
     }
 
@@ -26909,7 +22858,6 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let grants =
@@ -26942,7 +22890,6 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
 
@@ -27044,7 +22991,6 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let grants =
@@ -27089,7 +23035,6 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let grants =
@@ -27126,7 +23071,6 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(relative_root.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let grants =
@@ -27194,7 +23138,6 @@ future_protection_field = "retain-me"
         let installed = find_file_provider_source(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let grants =
@@ -27254,7 +23197,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &provider_config(source, None),
-            &mut |_| {},
         )
         .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -27311,7 +23253,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -27389,7 +23330,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -27471,7 +23411,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -27545,7 +23484,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -27609,7 +23547,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
         let loader_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -27669,7 +23606,6 @@ future_protection_field = "retain-me"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
             &config,
-            &mut |_| {},
         )
         .unwrap();
 
@@ -27709,150 +23645,11 @@ future_protection_field = "retain-me"
         let error = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             &provider_config(source, None),
-            &mut |_| {},
         )
         .expect_err("a stale native cache entry must not count as an installed provider");
 
         assert!(error.to_string().contains("artifact is missing"), "{error}");
         assert!(error.to_string().contains("carina init"), "{error}");
-    }
-
-    #[test]
-    fn legacy_lock_boundary_is_typed_error_for_installed_artifact_lookup() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path();
-        let source = "github.com/carina-rs/carina-provider-awscc";
-        let mut lock = LockFile::default();
-        lock.upsert(version_entry(source, "0.1.0"));
-        lock.save(&provider_lock_path(base)).unwrap();
-
-        let error = find_installed_provider(
-            &carina_core::paths::ResolvedPath::new(base).unwrap(),
-            &provider_config(source, None),
-            &mut |_| {},
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            &error,
-            FindInstalledProviderError::LegacyEntry(LegacyLockEntryError {
-                source: locked_source,
-                reason: LegacyReason::GithubDirectVersionWithoutTag {
-                    version: _,
-                    sha256: _,
-                },
-                project_dir: _
-            }) if locked_source == source
-        ));
-        assert!(error.to_string().contains("carina init"));
-    }
-
-    #[test]
-    fn legacy_entry_for_one_source_does_not_block_installed_lookup_for_another() {
-        let project = tempfile::tempdir().unwrap();
-        let legacy_source = "github.com/acme/legacy";
-        let installed_source = "github.com/acme/installed";
-        let installed_version = "0.2.0";
-        let bytes = b"installed provider";
-        fs::write(
-            provider_lock_path(project.path()),
-            format!(
-                r#"version = 4
-
-[[provider]]
-name = "legacy"
-source = "{legacy_source}"
-mode = "version"
-version = "0.1.0"
-sha256 = "abc"
-
-[[provider]]
-name = "installed"
-source = "{installed_source}"
-mode = "release"
-version = "{installed_version}"
-tag = "v{installed_version}"
-asset_id = 42
-sha256 = "{}"
-"#,
-                sha256_bytes(bytes)
-            ),
-        )
-        .unwrap();
-        let installed_path = cache_path_wasm(
-            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-            &source_key(installed_source),
-            installed_version,
-        );
-        fs::create_dir_all(installed_path.parent().unwrap()).unwrap();
-        fs::write(&installed_path, bytes).unwrap();
-
-        let installed = find_installed_provider(
-            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-            &provider_config(installed_source, None),
-            &mut |_| {},
-        )
-        .expect("an unrelated legacy source must not block this installed provider");
-
-        assert_eq!(installed.path().as_path(), installed_path.as_path());
-    }
-
-    #[test]
-    fn provider_artifact_fingerprint_returns_typed_error_for_matching_legacy_source() {
-        let project = tempfile::tempdir().unwrap();
-        let source = "github.com/acme/legacy";
-        let mut lock = LockFile::default();
-        lock.upsert(version_entry(source, "0.1.0"));
-        lock.save(&provider_lock_path(project.path())).unwrap();
-
-        let error = provider_artifact_fingerprint(
-            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-            &provider_config(source, None),
-            &mut |_| {},
-        )
-        .unwrap_err();
-
-        assert_eq!(error.source, source);
-        assert!(matches!(
-            error.reason,
-            LegacyReason::GithubDirectVersionWithoutTag {
-                version,
-                sha256: _,
-            } if version == "0.1.0"
-        ));
-    }
-
-    #[test]
-    fn legacy_lock_boundary_is_typed_error_for_constraint_validation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let source = "github.com/carina-rs/carina-provider-awscc";
-        let mut lock = LockFile::default();
-        lock.upsert(version_entry(source, "0.1.0"));
-        lock.save(&provider_lock_path(tmp.path())).unwrap();
-
-        let error = validate_lock_constraints(
-            &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
-            &[versioned_config(source, "^0.1")],
-            &mut |_| {},
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            &error,
-            LockConstraintError::LegacyEntry(error)
-                if matches!(
-                    error.as_ref(),
-                    LegacyLockEntryError {
-                        source: locked_source,
-                        reason: LegacyReason::GithubDirectVersionWithoutTag {
-                            version: _,
-                            sha256: _,
-                        },
-                        project_dir: _
-                    } if locked_source == source
-                )
-        ));
-        assert!(error.to_string().contains("carina init"));
     }
 
     #[test]
@@ -27870,7 +23667,6 @@ sha256 = "{}"
         let error = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             &provider_config(source, Some(revision)),
-            &mut |_| {},
         )
         .expect_err("the locked revision artifact was deliberately not installed");
         let rendered = error.to_string();
@@ -27945,7 +23741,6 @@ sha256 = "{}"
         let error = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             &provider_config(source, None),
-            &mut |_| {},
         )
         .expect_err("the locked version artifact was deliberately not installed");
         let rendered = error.to_string();
@@ -28040,8 +23835,7 @@ sha256 = "{}"
         assert_eq!(
             find_installed_provider(
                 &carina_core::paths::ResolvedPath::new(base).unwrap(),
-                &config,
-                &mut |_| {}
+                &config
             )
             .unwrap()
             .path()
@@ -28075,7 +23869,6 @@ sha256 = "{}"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             &provider_config(source, Some(revision)),
-            &mut |_| {},
         )
         .expect("revision provider should resolve");
         assert_eq!(installed.path().as_path(), wasm_path.as_path());
@@ -28145,7 +23938,6 @@ sha256 = "{}"
         let installed = find_installed_provider(
             &carina_core::paths::ResolvedPath::new(base).unwrap(),
             &provider_config(&source, None),
-            &mut |_| {},
         )
         .expect("file provider should resolve");
         assert_eq!(installed.path().as_path(), installed_path);
@@ -28177,26 +23969,6 @@ sha256 = "{}"
         }
     }
 
-    fn legacy_github_lock(source: &str, version: &str, sha256: &str) -> LockFile {
-        LockFile::parse_toml_str(
-            &format!(
-                r#"version = 4
-
-[[provider]]
-name = "legacy"
-source = "{source}"
-mode = "version"
-version = "{version}"
-sha256 = "{sha256}"
-"#
-            ),
-            Path::new("carina-providers.lock"),
-            &carina_core::paths::ResolvedPath::new(Path::new(".")).unwrap(),
-        )
-        .unwrap()
-        .into_lock_file()
-    }
-
     const SRC: &str = "github.com/carina-rs/carina-provider-awscc";
 
     #[test]
@@ -28224,19 +23996,6 @@ sha256 = "{sha256}"
     }
 
     #[test]
-    fn check_mismatch_detects_legacy_constraint_unsatisfied() {
-        let lock = legacy_github_lock(SRC, "0.1.0", "abc");
-        let cfg = versioned_config(SRC, "^0.2");
-
-        let error = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
-            .expect_err("legacy 0.1.0 must not bypass a ^0.2 constraint");
-
-        assert!(error.to_string().contains("0.1.0"), "{error}");
-        assert!(error.to_string().contains("^0.2"), "{error}");
-        assert!(matches!(error, LockMismatchError::Mismatch(_)));
-    }
-
-    #[test]
     fn check_mismatch_detects_version_to_revision_switch() {
         let mut lock = LockFile::default();
         lock.upsert(github_release_entry(SRC, "0.5.2"));
@@ -28248,19 +24007,6 @@ sha256 = "{sha256}"
         assert!(err.to_string().contains("revision"), "{err}");
         assert!(err.to_string().contains("version"), "{err}");
         assert!(err.to_string().contains("--upgrade"), "{err}");
-    }
-
-    #[test]
-    fn check_mismatch_detects_legacy_version_to_revision_switch() {
-        let lock = legacy_github_lock(SRC, "0.1.0", "abc");
-        let cfg = provider_config(SRC, Some("main"));
-
-        let error = check_lock_mismatch(&[cfg], &lock, LockMode::Normal)
-            .expect_err("a legacy version pin cannot satisfy revision mode");
-
-        assert!(error.to_string().contains("version"), "{error}");
-        assert!(error.to_string().contains("revision"), "{error}");
-        assert!(matches!(error, LockMismatchError::Mismatch(_)));
     }
 
     #[test]
@@ -28398,52 +24144,6 @@ sha256 = "{sha256}"
         let cfg = versioned_config(SRC, "~0.5.0");
 
         assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Normal).is_ok());
-    }
-
-    #[test]
-    fn locked_init_returns_typed_error_for_filtered_legacy_entry() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let project = tempfile::tempdir().unwrap();
-        let mut lock = LockFile::default();
-        lock.upsert(version_entry(SRC, "0.5.2"));
-        lock.save(&provider_lock_path(project.path())).unwrap();
-        let install_lock = ProviderInstallLock::acquire(
-            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-        )
-        .unwrap();
-
-        let error = resolve_all(
-            &user_dirs,
-            &install_lock,
-            &[versioned_config(SRC, "~0.5.0")],
-            LockMode::Locked,
-            &mut |_| {},
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            &error,
-            ResolveAllError::LockMismatch(LockMismatchError::LegacyEntry(
-                LegacyLockEntryError {
-                    source,
-                    reason: LegacyReason::GithubDirectVersionWithoutTag {
-                        version: _,
-                        sha256: _,
-                    },
-                    project_dir: _
-                }
-            )) if source == SRC
-        ));
-        assert!(error.to_string().contains("carina init"));
-    }
-
-    #[test]
-    fn locked_mode_tolerates_orphan_legacy_entry() {
-        let mut lock = legacy_github_lock("github.com/acme/orphan", "0.1.0", "abc");
-        lock.upsert(github_release_entry(SRC, "0.5.2"));
-        let cfg = versioned_config(SRC, "~0.5.0");
-
-        assert!(check_lock_mismatch(&[cfg], &lock, LockMode::Locked).is_ok());
     }
 
     #[test]

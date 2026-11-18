@@ -957,44 +957,6 @@ fn local_trust_and_unwritable_cache_notices_belong_to_the_report() {
 }
 
 #[test]
-fn legacy_lock_migration_notices_belong_to_the_report() {
-    for remote in [false, true] {
-        let fixture = tempfile::tempdir().unwrap();
-        std::fs::write(
-            fixture.path().join("main.crn"),
-            if remote {
-                "provider broken { source = 'github.com/example/carina-provider-broken' }\n"
-            } else {
-                "provider mock {}\n"
-            },
-        )
-        .unwrap();
-        std::fs::write(
-            fixture.path().join("carina-providers.lock"),
-            "version = 1\nprovider = []\n",
-        )
-        .unwrap();
-        let human = validate(fixture.path(), false);
-        let text = String::from_utf8(human.stderr).unwrap();
-        assert_eq!(
-            text.matches("Provider lock format migration:").count(),
-            if remote { 2 } else { 1 },
-            "{text}"
-        );
-        let output = validate(fixture.path(), true);
-        assert_eq!(output.status, human.status);
-        assert!(
-            output.stderr.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(json["status"], if remote { "error" } else { "ok" });
-        assert!(!json.to_string().contains("Provider lock format migration"));
-    }
-}
-
-#[test]
 fn malformed_lock_diagnostics_never_serialize_source_snippets_or_values() {
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.crn"), "provider mock {}\n").unwrap();
