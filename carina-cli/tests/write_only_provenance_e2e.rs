@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 
 use carina_cli::commands::plan::PlanFile;
 use carina_core::resource::{ConcreteValue, Value};
-use carina_state::check_and_migrate;
+use carina_state::load_state;
 use tempfile::TempDir;
 
 struct Scenario {
@@ -349,9 +349,7 @@ fn failed_update_does_not_acknowledge_write_only_value_and_next_plan_retries_it(
 
     let state_text = fs::read_to_string(scenario.project.join("carina.state.json"))
         .expect("read state after failed update");
-    let state = check_and_migrate(&state_text)
-        .expect("state after failed update must decode")
-        .into_state();
+    let state = load_state(&state_text).expect("state after failed update must decode");
     let password = state
         .find_resource("mock", "test.resource", "r1")
         .and_then(|row| row.persisted_attributes())
@@ -394,9 +392,7 @@ fn adding_and_changing_updatable_write_only_value_converges() {
 
     let state_text = fs::read_to_string(scenario.project.join("carina.state.json"))
         .expect("read state after adding password");
-    let state = check_and_migrate(&state_text)
-        .expect("state after adding password must decode")
-        .into_state();
+    let state = load_state(&state_text).expect("state after adding password must decode");
     assert_eq!(
         state
             .find_resource("mock", "test.resource", "r1")
@@ -467,9 +463,7 @@ fn normal_update_reasserts_unchanged_write_only_value_and_converges() {
 
     let state_text = fs::read_to_string(scenario.project.join("carina.state.json"))
         .expect("read state after reasserting password");
-    let state = check_and_migrate(&state_text)
-        .expect("state after reasserting password must decode")
-        .into_state();
+    let state = load_state(&state_text).expect("state after reasserting password must decode");
     let row = state
         .find_resource("mock", "test.resource", "r1")
         .expect("r1 state row");
@@ -667,9 +661,8 @@ fn secret_write_only_refresh_and_saved_plan_apply_converge_without_sending_hash(
         "write-only secret must be persisted as a RedactedSecret hash: {state:#}"
     );
     let state_bytes = fs::read(&state_path).expect("read state bytes");
-    let decoded = check_and_migrate(std::str::from_utf8(&state_bytes).unwrap())
-        .expect("current state decodes")
-        .into_state();
+    let decoded =
+        load_state(std::str::from_utf8(&state_bytes).unwrap()).expect("current state decodes");
     assert_eq!(
         carina_core::utils::pretty_with_newline_bytes(&decoded).unwrap(),
         state_bytes
@@ -978,38 +971,5 @@ fn saved_plan_apply_re_resolves_tampered_authored_ignore_paths() {
         rendered
             .contains("ignore_changes path `does_not_exist` does not exist in the resource schema"),
         "apply must reject the edited authored path through the shared resolver:\n{rendered}"
-    );
-}
-
-#[test]
-fn v33_saved_plan_is_rejected_after_deferred_value_stage_format_bump() {
-    let scenario = Scenario::new();
-    scenario.write_readable_ignore_config("configured", None);
-    assert_success("carina init", &scenario.init());
-    assert_success(
-        "current saved plan",
-        &scenario.save_plan_with_refresh("old.json"),
-    );
-
-    let path = scenario.project.join("old.json");
-    let mut saved: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&path).expect("read current saved plan"))
-            .expect("parse current saved plan");
-    saved["version"] = serde_json::json!(33);
-    fs::write(
-        &path,
-        serde_json::to_vec_pretty(&saved).expect("serialize old saved plan"),
-    )
-    .expect("write old saved plan");
-
-    let apply = scenario.apply_plan("old.json");
-    let rendered = output_text(&apply);
-    assert!(
-        !apply.status.success(),
-        "v33 saved plan applied:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("Unsupported plan file version: 33") && rendered.contains("plan --out"),
-        "old plan must fail with replan guidance:\n{rendered}"
     );
 }

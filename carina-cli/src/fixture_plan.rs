@@ -21,7 +21,7 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, DslTransform, ResourceSchema, SchemaRegistry, StructField,
     TypeIdentity, ValidatedResourceSchema,
 };
-use carina_state::{PublishedExports, StateFile, check_and_migrate};
+use carina_state::{PublishedExports, StateFile, load_state};
 
 use crate::commands::plan::compute_export_diffs;
 use crate::commands::shared::state_writeback::persisted_directive_changes;
@@ -450,12 +450,8 @@ where
     let provider_configs = canonical_resources.parsed().providers.clone();
     let mut state_file: Option<StateFile> = if state_path.exists() {
         let json = std::fs::read_to_string(&state_path).unwrap();
-        // Go through check_and_migrate so v5 fixtures (with the legacy
-        // `desired_keys` array) are lifted into v6 `explicit` trees on
-        // load. Direct `serde_json::from_str` would silently drop the
-        // legacy field and leave `explicit` empty, breaking the
-        // moved_prev_keys snapshot test.
-        Some(check_and_migrate(&json).unwrap().into_state())
+        // Fixtures use the same current-state loader as backend reads.
+        Some(load_state(&json).unwrap())
     } else {
         None
     };
@@ -817,12 +813,8 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
-                legacy_dependency_classification: _,
-                migrated_legacy_state,
             } = artifacts;
-            if let Some(migrated) = migrated_legacy_state {
-                state_file = Some(migrated);
-            }
+
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");
@@ -886,12 +878,8 @@ where
                 moved_origins,
                 prev_explicit,
                 wait_aliases: _,
-                legacy_dependency_classification: _,
-                migrated_legacy_state,
             } = artifacts;
-            if let Some(migrated) = migrated_legacy_state {
-                state_file = Some(migrated);
-            }
+
             let (checked, references) = match plan {
                 crate::wiring::PlannedPlan::Unrendered { plan, references } => {
                     (plan.into_checked(), FixtureReferences(references))

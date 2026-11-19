@@ -7,7 +7,7 @@ use crate::provider::{
 };
 use crate::resource::{
     AbsoluteBindingAddress, Current, DeposedKey, PartialReadMarker, PersistedDestroyDependencies,
-    PersistedDirectives, ResolvedResourceId, ResourceId, ResourceIdentity, ResourceIdentityError,
+    PersistedDirectives, ResolvedResourceId, ResourceIdentity, ResourceIdentityError,
     SnapshotState,
 };
 use crate::value::PersistedExportValue;
@@ -17,46 +17,45 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub const CURRENT_STATE_VERSION: u32 = 21;
 pub const CURRENT_EXPORTS_VERSION: u32 = 1;
-pub const EXPORTS_VERSION_INTRODUCED: u32 = 17;
 
-/// Version gate shared by the full decoder and the state's legacy migrations.
-#[derive(Debug, Deserialize)]
-pub struct StateDocumentVersion {
-    pub version: u32,
-    pub exports_version: Option<u32>,
-}
-impl StateDocumentVersion {
-    pub fn read(bytes: &[u8]) -> Result<Self, StateDocumentDecodeError> {
-        let header: Self =
-            serde_json::from_slice(bytes).map_err(StateDocumentDecodeError::json_at_root)?;
-        if header.version > CURRENT_STATE_VERSION {
-            return Err(StateDocumentDecodeError::StateVersionTooNew {
-                found: header.version,
-                supported: CURRENT_STATE_VERSION,
-            });
-        }
-        classify_exports_version(header.version, header.exports_version)?;
-        Ok(header)
+/// Check the state body version before exports-version validation or row decoding.
+fn validate_state_header(bytes: &[u8]) -> Result<(), StateDocumentDecodeError> {
+    #[derive(Deserialize)]
+    struct StateHeader {
+        version: u32,
+        exports_version: Option<u32>,
     }
+    let header: StateHeader =
+        serde_json::from_slice(bytes).map_err(StateDocumentDecodeError::json_at_root)?;
+    if header.version < CURRENT_STATE_VERSION {
+        return Err(StateDocumentDecodeError::StateVersionTooOld {
+            found: header.version,
+            supported: CURRENT_STATE_VERSION,
+        });
+    }
+    if header.version > CURRENT_STATE_VERSION {
+        return Err(StateDocumentDecodeError::StateVersionTooNew {
+            found: header.version,
+            supported: CURRENT_STATE_VERSION,
+        });
+    }
+    validate_exports_version(header.exports_version)
 }
 
 /// A complete, typed document. Observation authority can only be minted by
 /// decoding bytes, never by passing caller-built parts back to the owner.
 #[derive(Debug, Clone)]
 pub struct DecodedStateDocument {
-    pub version: u32,
     pub serial: u64,
     pub lineage: String,
     pub carina_version: String,
     pub resources: Vec<DecodedResourceState>,
     pub exports: HashMap<String, PersistedExportValue>,
-    pub legacy_dependencies: BTreeMap<ResolvedResourceId, LegacyRowDependencies>,
     pub wire_order: std::sync::Arc<crate::json_field_order::JsonFieldOrder>,
 }
 
 #[derive(Deserialize)]
 struct UncheckedStateFile {
-    version: u32,
     serial: u64,
     lineage: String,
     carina_version: String,
@@ -86,6 +85,10 @@ pub enum StateDocumentDecodeError {
         source: serde_json::Error,
     },
     ExportsVersionTooNew {
+        found: u32,
+        supported: u32,
+    },
+    StateVersionTooOld {
         found: u32,
         supported: u32,
     },
@@ -140,23 +143,10 @@ impl StateDocumentDecodeError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExportsVersionClassification {
-    Current,
-    Legacy,
-}
-
-pub fn classify_exports_version(
-    state_version: u32,
+pub fn validate_exports_version(
     exports_version: Option<u32>,
-) -> Result<ExportsVersionClassification, StateDocumentDecodeError> {
+) -> Result<(), StateDocumentDecodeError> {
     match exports_version {
-        Some(_) if state_version < EXPORTS_VERSION_INTRODUCED => {
-            Err(StateDocumentDecodeError::Validation(format!(
-                "top-level exports_version is invalid before state version {}",
-                EXPORTS_VERSION_INTRODUCED
-            )))
-        }
         Some(found) if found > CURRENT_EXPORTS_VERSION => {
             Err(StateDocumentDecodeError::ExportsVersionTooNew {
                 found,
@@ -169,13 +159,10 @@ pub fn classify_exports_version(
                 CURRENT_EXPORTS_VERSION
             )))
         }
-        Some(_) => Ok(ExportsVersionClassification::Current),
-        None if state_version >= EXPORTS_VERSION_INTRODUCED => {
-            Err(StateDocumentDecodeError::Validation(
-                "missing required top-level exports_version".to_string(),
-            ))
-        }
-        None => Ok(ExportsVersionClassification::Legacy),
+        Some(_) => Ok(()),
+        None => Err(StateDocumentDecodeError::Validation(
+            "missing required top-level exports_version".to_string(),
+        )),
     }
 }
 
@@ -197,155 +184,9 @@ pub fn decode_persisted_exports(
         .collect()
 }
 
-/// Binding texts retained from the kind-blind dependency snapshot written by
-/// state v20 and older.
-///
-/// Arbitrary name sets cannot be promoted through a public conversion.
-///
-/// ```compile_fail,E0277
-/// use carina_core::state_document::LegacyDependencyNames;
-/// use std::collections::BTreeSet;
-/// let names: LegacyDependencyNames = BTreeSet::from([String::from("target")]).into();
-/// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyDependencyNames(BTreeSet<String>);
-
-impl LegacyDependencyNames {
-    pub fn iter(&self) -> impl Iterator<Item = &str> {
-        self.0.iter().map(String::as_str)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyRowDependencies {
-    pub value_dependencies: LegacyDependencyNames,
-    pub explicit_dependencies: LegacyDependencyNames,
-    pub deposed_dependencies: HashMap<DeposedKey, LegacyDependencyNames>,
-}
-
-impl LegacyRowDependencies {
-    pub fn is_empty(&self) -> bool {
-        self.value_dependencies.is_empty()
-            && self.explicit_dependencies.is_empty()
-            && self
-                .deposed_dependencies
-                .values()
-                .all(LegacyDependencyNames::is_empty)
-    }
-
-    pub fn all_names(&self) -> LegacyDependencyNames {
-        LegacyDependencyNames(
-            self.value_dependencies
-                .0
-                .iter()
-                .chain(self.explicit_dependencies.0.iter())
-                .chain(
-                    self.deposed_dependencies
-                        .values()
-                        .flat_map(|names| names.0.iter()),
-                )
-                .cloned()
-                .collect(),
-        )
-    }
-}
-
-fn take_legacy_dependency_names(
-    owner: &mut serde_json::Value,
-    field: &str,
-    location: &str,
-) -> Result<LegacyDependencyNames, StateDocumentDecodeError> {
-    use crate::utils::canonicalize_map_key_address;
-
-    let Some(object) = owner.as_object_mut() else {
-        return Err(StateDocumentDecodeError::Validation(format!(
-            "{location} owner must be an object"
-        )));
-    };
-    let Some(value) = object.remove(field) else {
-        return Ok(LegacyDependencyNames::default());
-    };
-    let values = value.as_array().ok_or_else(|| {
-        StateDocumentDecodeError::Validation(format!("{location} must be an array"))
-    })?;
-    let names = values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            value
-                .as_str()
-                .map(canonicalize_map_key_address)
-                .ok_or_else(|| {
-                    StateDocumentDecodeError::Validation(format!(
-                        "{location}[{index}] must be a string in pre-v21 state"
-                    ))
-                })
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    Ok(LegacyDependencyNames(names))
-}
-
-fn extract_legacy_row_dependencies(
-    row: &mut serde_json::Value,
-    row_index: usize,
-) -> Result<LegacyRowDependencies, StateDocumentDecodeError> {
-    let value_dependencies = take_legacy_dependency_names(
-        row,
-        "dependency_bindings",
-        &format!("resources[{row_index}].dependency_bindings"),
-    )?;
-    let explicit_dependencies = match row.get_mut("directives") {
-        Some(directives) => take_legacy_dependency_names(
-            directives,
-            "depends_on",
-            &format!("resources[{row_index}].directives.depends_on"),
-        )?,
-        None => LegacyDependencyNames::default(),
-    };
-    let mut deposed_dependencies = HashMap::new();
-    if let Some(deposed) = row.get_mut("deposed") {
-        let deposed = deposed.as_array_mut().ok_or_else(|| {
-            StateDocumentDecodeError::Validation(format!(
-                "resources[{row_index}].deposed must be an array"
-            ))
-        })?;
-        for (generation_index, generation) in deposed.iter_mut().enumerate() {
-            let names = take_legacy_dependency_names(
-                generation,
-                "dependency_bindings",
-                &format!("resources[{row_index}].deposed[{generation_index}].dependency_bindings"),
-            )?;
-            if !names.is_empty() {
-                let key = generation
-                    .get("key")
-                    .cloned()
-                    .ok_or_else(|| {
-                        StateDocumentDecodeError::Validation(format!(
-                            "resources[{row_index}].deposed[{generation_index}].key is missing"
-                        ))
-                    })
-                    .and_then(|value| {
-                        serde_json::from_value::<DeposedKey>(value)
-                            .map_err(StateDocumentDecodeError::json_at_root)
-                    })?;
-                deposed_dependencies.insert(key, names);
-            }
-        }
-    }
-    Ok(LegacyRowDependencies {
-        value_dependencies,
-        explicit_dependencies,
-        deposed_dependencies,
-    })
-}
-
 /// The mutually exclusive state of a row's current resource instance.
 ///
-/// The tagged shape is the persistence invariant for state v15: an applied
+/// The tagged shape is the persistence invariant: an applied
 /// identifier and provider continuation token cannot be represented together.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -489,10 +330,7 @@ pub struct DecodedResourceState {
     /// shape so server-side default fields the user never wrote stop
     /// appearing as spurious removals (refs awscc#206).
     ///
-    /// Replaces the flat `desired_keys: Vec<String>` (state ≤ v5);
-    /// the v5 reader lifts each top-level key to a `Leaf` child of
-    /// the root `Struct`. Later writes rebuild a full tree from the resource's
-    /// authored `Value` via an evidence-specific aligned builder.
+    /// Writes rebuild this tree from authored values using an aligned builder.
     pub explicit: ExplicitFields,
     /// The binding name for this resource (from `let` bindings in DSL).
     /// Stored so orphan Delete effects can have tree structure.
@@ -501,9 +339,7 @@ pub struct DecodedResourceState {
     /// Stored so orphan Delete effects can have tree structure.
     ///
     /// Set semantics are provided by
-    /// [`crate::resource::ResolvedDependencies`]. State v20 and
-    /// older string arrays are converted by the version-gated raw migration
-    /// before this current representation is deserialized.
+    /// [`crate::resource::ResolvedDependencies`].
     pub dependency_bindings: PersistedDestroyDependencies,
 }
 
@@ -702,11 +538,11 @@ pub(crate) fn decode_state_document(
     let content = std::str::from_utf8(bytes).map_err(|error| {
         StateDocumentDecodeError::Validation(format!("State file is not valid UTF-8: {error}"))
     })?;
-    StateDocumentVersion::read(content.as_bytes())?;
+    validate_state_header(content.as_bytes())?;
     let mut deserializer = serde_json::Deserializer::from_str(content);
     let mut path = serde_path_to_error::Track::new();
     let mut wire_order = crate::json_field_order::JsonFieldOrder::default();
-    let mut unchecked: UncheckedStateFile = wire_order
+    let unchecked: UncheckedStateFile = wire_order
         .deserialize(serde_path_to_error::Deserializer::new(
             &mut deserializer,
             &mut path,
@@ -715,16 +551,6 @@ pub(crate) fn decode_state_document(
     deserializer
         .end()
         .map_err(StateDocumentDecodeError::json_at_root)?;
-    let legacy_rows = if unchecked.version <= 20 {
-        unchecked
-            .resources
-            .iter_mut()
-            .enumerate()
-            .map(|(index, row)| extract_legacy_row_dependencies(row, index))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        vec![LegacyRowDependencies::default(); unchecked.resources.len()]
-    };
     let resources = unchecked
         .resources
         .into_iter()
@@ -774,32 +600,13 @@ pub(crate) fn decode_state_document(
         })
         .collect::<Result<Vec<DecodedResourceState>, StateDocumentDecodeError>>()?;
     let exports = decode_persisted_exports(unchecked.exports)?;
-    let legacy_dependencies = resources
-        .iter()
-        .zip(legacy_rows)
-        .filter_map(|(row, dependencies)| {
-            (!dependencies.is_empty()).then(|| {
-                (
-                    ResolvedResourceId::new(ResourceId::with_provider_identity(
-                        &row.provider,
-                        &row.resource_type,
-                        row.identity.clone(),
-                        row.directives.provider_instance.clone(),
-                    )),
-                    dependencies,
-                )
-            })
-        })
-        .collect();
     let state = DecodedStateDocument {
-        version: unchecked.version,
         wire_order: std::sync::Arc::new(wire_order),
         serial: unchecked.serial,
         lineage: unchecked.lineage,
         carina_version: unchecked.carina_version,
         resources,
         exports,
-        legacy_dependencies,
     };
     validate_resource_identities(state.resources.iter().map(|row| {
         (

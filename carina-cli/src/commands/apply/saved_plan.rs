@@ -321,19 +321,6 @@ pub(super) enum ReloadedProviderBoundPlanFile {
     },
 }
 
-impl ReloadedProviderBoundPlanFile {
-    pub(super) fn legacy_dependency_classification(
-        &self,
-    ) -> Option<&carina_state::LegacyDependencyClassification> {
-        match self {
-            Self::Verified { plan, .. } => plan.plan_file.legacy_dependency_classification(),
-            Self::NeedsSecretVerification { plan, .. } => {
-                plan.plan_file.legacy_dependency_classification()
-            }
-        }
-    }
-}
-
 /// Placeholder-free saved plan awaiting provider-schema verification.
 pub(super) struct ReloadedVerifiedPlanFile {
     plan_file: UnresolvedReloadedPlanFile,
@@ -527,7 +514,7 @@ fn saved_orphan_from_current(current: Current, row: &ResourceState) -> Orphan {
             Orphan::missing_identifier(state, row.binding.clone(), row.directives.clone())
         }
     };
-    orphan.set_destroy_metadata(row.dependency_bindings.clone(), row.directives.clone());
+    orphan.set_dependency_bindings(row.dependency_bindings.clone());
     orphan
 }
 
@@ -1624,7 +1611,6 @@ mod tests {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -2284,7 +2270,6 @@ mod tests {
             sorted_resources: Vec::new(),
             sorted_value_destroy_dependencies: Vec::new(),
             sorted_explicit_destroy_dependencies: Vec::new(),
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: (vec![data_source.clone().into_value_snapshot()])

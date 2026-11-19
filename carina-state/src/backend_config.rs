@@ -353,11 +353,6 @@ pub(crate) struct NativeFileAddress {
     path: ResolvedPath,
 }
 impl LocalBackendLocation {
-    pub(crate) fn for_file(
-        path: impl AsRef<std::path::Path>,
-    ) -> Result<Self, LocalStateLocateError> {
-        Self::native_file(path).map_err(LocalStateLocateError::from)
-    }
     pub(crate) fn for_address(
         path: impl AsRef<std::path::Path>,
     ) -> Result<Self, LocalStateLocateError> {

@@ -136,46 +136,6 @@ fn export_state_url_json_prints_the_sorted_decoded_map() {
 }
 
 #[test]
-fn export_state_url_warns_when_legacy_exports_are_migrated() {
-    let fixture = tempfile::tempdir().expect("legacy exports fixture tempdir");
-    let state_path = fixture.path().join("legacy.state.json");
-    let legacy_version = carina_state::StateFile::EXPORTS_VERSION_INTRODUCED - 1;
-    let state = serde_json::json!({
-        "version": legacy_version,
-        "serial": 1,
-        "lineage": "legacy-exports-e2e",
-        "carina_version": "legacy",
-        "resources": [],
-        "exports": { "account_id": "123456789012" }
-    });
-    fs::write(
-        &state_path,
-        serde_json::to_vec_pretty(&state).expect("serialize legacy state fixture"),
-    )
-    .expect("write legacy state fixture");
-
-    let output = carina(&[
-        "export",
-        "account_id",
-        "--raw",
-        "--state-url",
-        &state_path.display().to_string(),
-    ]);
-    assert!(
-        output.status.success(),
-        "export failed.\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let migration_marker = format!("is v{legacy_version} on disk");
-    assert!(
-        stderr.contains(&migration_marker) && stderr.contains("will be rewritten"),
-        "legacy exports read must emit the state migration warning: {stderr}"
-    );
-}
-
-#[test]
 fn export_project_backend_uses_the_exports_only_path() {
     let fixture = future_exports_fixture();
     let output = Command::new(env!("CARGO_BIN_EXE_carina"))

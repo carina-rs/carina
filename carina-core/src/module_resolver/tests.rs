@@ -11512,12 +11512,6 @@ let child = consumer_module {}
         .resolve_wait_binding(&wait)
         .expect("wait dependency resolves to the complete managed group");
     assert_eq!(resolved_wait.explicit_dependencies, expected);
-
-    let live_projection = index
-        .project_legacy_dependency("child.records", "legacy loop-group fixture")
-        .expect("the v20 collection spelling projects through the live graph")
-        .into_dependencies();
-    assert_eq!(live_projection.to_resolved_dependencies(), expected);
 }
 
 #[test]

@@ -1,3 +1,19 @@
+fn test_registry_source(value: &str) -> carina_core::provider_source::RegistrySource {
+    use carina_core::provider_source::{ProviderSource, RemoteSource};
+    let ProviderSource::Remote(RemoteSource::Registry(source)) = value.parse().unwrap() else {
+        panic!("expected registry source: {value}");
+    };
+    source
+}
+
+fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource {
+    use carina_core::provider_source::{ProviderSource, RemoteSource};
+    let ProviderSource::Remote(RemoteSource::GithubDirect(source)) = value.parse().unwrap() else {
+        panic!("expected github source: {value}");
+    };
+    source
+}
+
 use super::*;
 
 #[tokio::test]
@@ -886,12 +902,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         &[],
     );
     let resources = canonical_unresolved(Vec::new(), context.schemas());
-    let materialization =
-        DeferredForExpansionWitness::after_expansion(resources.parsed().deferred_for_expressions());
-    let expanded_resources = ExpandedCanonicalResources {
-        resources,
-        materialization,
-    };
+    let expanded_resources = ExpandedCanonicalResources { resources };
     let residual_deferred_for = expanded_resources
         .parsed()
         .deferred_for_expressions()
@@ -1284,11 +1295,10 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -1380,11 +1390,10 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -1498,11 +1507,10 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
         serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
     )
     .expect("write real state fixture");
-    let state_file = carina_state::state::check_and_migrate(
+    let state_file = carina_state::state::load_state(
         &std::fs::read_to_string(&state_path).expect("read real state fixture"),
     )
-    .expect("decode real state fixture")
-    .into_state();
+    .expect("decode real state fixture");
     let state_origin =
         ResolvedResourceId::with_provider_identity("test", "thing", STATE_ORIGIN, None);
     let projected_hash =
@@ -1602,11 +1610,10 @@ let first = test.thing {
         )
         .expect("write real state fixture");
         let state_file = Some(
-            carina_state::state::check_and_migrate(
+            carina_state::state::load_state(
                 &std::fs::read_to_string(&state_path).expect("read real state fixture"),
             )
-            .expect("decode real state fixture")
-            .into_state(),
+            .expect("decode real state fixture"),
         );
 
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -1729,11 +1736,10 @@ let direct = awscc.ec2.Route {
         )
         .expect("write real state fixture");
         let state_file = Some(
-            carina_state::state::check_and_migrate(
+            carina_state::state::load_state(
                 &std::fs::read_to_string(&state_path).expect("read real state fixture"),
             )
-            .expect("decode real state fixture")
-            .into_state(),
+            .expect("decode real state fixture"),
         );
 
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -3191,7 +3197,6 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
-        &mut |_| {},
     )
     .unwrap();
 
@@ -3334,8 +3339,8 @@ async fn unverified_official_factory_load_case() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "aws".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            source: test_github_source(source),
             version: version.parse().unwrap(),
             tag: serde_json::from_str(&format!("\"v{version}\"")).unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),
@@ -6768,9 +6773,9 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
 
     let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
     let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
-    let state = carina_state::check_and_migrate(
+    let state = carina_state::load_state(
         &serde_json::json!({
-            "version": 20,
+            "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
             "serial": 1,
             "lineage": "import-unknown",
@@ -6779,6 +6784,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
                 "resource_type": "test.Resource",
                 "identity": "unknown",
                 "provider": "mock",
+                "dependency_bindings": [],
                 "current": {
                     "kind": "create_outcome_unknown",
                     "started_at": "2026-10-23T08:00:00Z"
@@ -6788,8 +6794,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
         })
         .to_string(),
     )
-    .unwrap()
-    .into_state();
+    .unwrap();
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: address.clone(),
@@ -6890,9 +6895,9 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
         "shared",
         Some("unknown".to_string()),
     );
-    let state = carina_state::check_and_migrate(
+    let state = carina_state::load_state(
         &serde_json::json!({
-            "version": 20,
+            "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
             "serial": 1,
             "lineage": "import-other-instance",
@@ -6901,6 +6906,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
                 "resource_type": "test.Resource",
                 "identity": "shared",
                 "provider": "mock",
+                "dependency_bindings": [],
                 "current": {
                     "kind": "create_outcome_unknown",
                     "started_at": "2026-10-23T08:00:00Z"
@@ -6911,8 +6917,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
         })
         .to_string(),
     )
-    .unwrap()
-    .into_state();
+    .unwrap();
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("mock", "test.Resource", "shared"),
@@ -8366,11 +8371,10 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let canonical_resources = canonical_pair_from_resolved(
@@ -8625,11 +8629,10 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let canonical_resources = canonical_pair_from_resolved(
@@ -14138,8 +14141,8 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Revision {
+            source: test_github_source(source),
             revision: revision.into(),
             resolved_sha: resolved_sha.clone(),
             artifact_id: test_artifact_id(42),
@@ -14216,8 +14219,8 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Revision {
+            source: test_github_source(source),
             revision: revision.into(),
             resolved_sha,
             artifact_id: test_artifact_id(42),
@@ -14283,8 +14286,8 @@ async fn registry_source_reaches_cli_artifact_loader() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Version {
+            source: test_registry_source(source),
             version: version.into(),
             constraint: None,
         },
@@ -14345,8 +14348,8 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Version {
+            source: test_registry_source(source),
             version: version.into(),
             constraint: None,
         },
@@ -14416,7 +14419,6 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
-        &mut |_| {},
     )
     .unwrap();
 
@@ -14452,8 +14454,8 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            source: test_github_source(source),
             version: "1.0.0".parse().unwrap(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),
@@ -14610,8 +14612,8 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            source: test_github_source(source),
             version: "1.0.0".parse().unwrap(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),

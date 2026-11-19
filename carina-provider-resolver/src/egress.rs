@@ -68,11 +68,16 @@ impl CanonicalSource {
         }
     }
 
-    pub(crate) fn from_lock_source(source: &str, project_dir: &ResolvedPath) -> Option<Self> {
-        match source
-            .parse::<carina_core::provider_source::ProviderSource>()
-            .ok()?
-        {
+    #[cfg(test)]
+    fn from_lock_source(source: &str, project_dir: &ResolvedPath) -> Option<Self> {
+        Self::from_provider_source(source.parse().ok()?, project_dir)
+    }
+
+    pub(crate) fn from_provider_source(
+        source: carina_core::provider_source::ProviderSource,
+        project_dir: &ResolvedPath,
+    ) -> Option<Self> {
+        match source {
             carina_core::provider_source::ProviderSource::File(source) => {
                 // Authored file:// paths retain their process-CWD semantics.
                 let display = DisplayPath::new(source.path()).ok()?;

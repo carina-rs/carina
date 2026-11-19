@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use carina_core::parser::ProviderConfig;
 use carina_core::provider::ProviderFactory;
 use carina_core::provider_source::ProviderSource;
+use carina_provider_resolver::ProviderArtifactFingerprint;
 
 use crate::backend::FactoryBuildResult;
 
@@ -43,15 +44,11 @@ fn resolve_install(
         .ok_or(InstallRejection::MissingSource)?;
     let installed = match source {
         ProviderSource::File(_) => {
-            carina_provider_resolver::find_file_provider_source(source_dir, config, &mut |notice| {
-                eprintln!("{notice}")
-            })
+            carina_provider_resolver::find_file_provider_source(source_dir, config)
         }
         ProviderSource::Remote(_) => {
-            carina_provider_resolver::find_installed_provider(source_dir, config, &mut |notice| {
-                eprintln!("{notice}")
-            })
-            .map_err(|error| error.to_string())
+            carina_provider_resolver::find_installed_provider(source_dir, config)
+                .map_err(|error| error.to_string())
         }
     }
     .map_err(|error| InstallRejection::ResolutionFailed {
@@ -66,14 +63,8 @@ pub fn install_prober() -> crate::backend::ProviderInstallProber {
     std::sync::Arc::new(|path, config| {
         carina_core::paths::ResolvedPath::new(path)
             .ok()
-            .map(|root| {
-                carina_provider_resolver::provider_artifact_fingerprint(
-                    &root,
-                    config,
-                    &mut |notice| eprintln!("{notice}"),
-                )
-            })
-            .unwrap_or_else(|| Ok(Default::default()))
+            .map(|root| carina_provider_resolver::provider_artifact_fingerprint(&root, config))
+            .unwrap_or_default()
     })
 }
 
@@ -144,7 +135,7 @@ mod loader {
     ) -> FactoryBuildResult {
         let mut factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
         let mut errors: BTreeMap<String, String> = BTreeMap::new();
-        let mut fingerprint: Vec<(String, crate::backend::ProviderInstallFingerprint)> =
+        let mut fingerprint: Vec<(String, ProviderArtifactFingerprint)> =
             Vec::with_capacity(providers.len());
 
         for (source_dir, config) in providers {
@@ -157,11 +148,7 @@ mod loader {
             };
             fingerprint.push((
                 config.name.clone(),
-                carina_provider_resolver::provider_artifact_fingerprint(
-                    &project,
-                    config,
-                    &mut |notice| eprintln!("{notice}"),
-                ),
+                carina_provider_resolver::provider_artifact_fingerprint(&project, config),
             ));
             let installed = match resolve_install(&project, config) {
                 Ok(installed) => installed,
@@ -243,9 +230,25 @@ pub fn trusted_local_grants_from_env(
 
 #[cfg(test)]
 mod tests {
+    fn test_registry_source(value: &str) -> carina_core::provider_source::RegistrySource {
+        use carina_core::provider_source::{ProviderSource, RemoteSource};
+        let ProviderSource::Remote(RemoteSource::Registry(source)) = value.parse().unwrap() else {
+            panic!("expected registry source: {value}");
+        };
+        source
+    }
+
+    fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource {
+        use carina_core::provider_source::{ProviderSource, RemoteSource};
+        let ProviderSource::Remote(RemoteSource::GithubDirect(source)) = value.parse().unwrap()
+        else {
+            panic!("expected github source: {value}");
+        };
+        source
+    }
+
     use super::*;
     use carina_core::parser::ProviderConfig;
-    use carina_provider_resolver::ProviderArtifactFingerprint;
 
     use std::path::PathBuf;
 
@@ -344,10 +347,7 @@ mod tests {
         );
         assert_eq!(
             fingerprint,
-            vec![(
-                "mock".to_string(),
-                Ok(ProviderArtifactFingerprint::default()),
-            )]
+            vec![("mock".to_string(), ProviderArtifactFingerprint::default(),)]
         );
     }
 
@@ -426,8 +426,8 @@ mod tests {
         let mut lock = carina_provider_resolver::LockFile::default();
         lock.upsert(carina_provider_resolver::LockEntry {
             name: "awscc".into(),
-            source: source.into(),
             kind: carina_provider_resolver::LockEntryKind::Version {
+                source: test_registry_source(source),
                 version: version.into(),
                 constraint: None,
             },
@@ -471,8 +471,8 @@ mod tests {
         let mut lock = carina_provider_resolver::LockFile::default();
         lock.upsert(carina_provider_resolver::LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+                source: test_github_source(source),
                 version: version.parse().unwrap(),
                 tag: serde_json::from_str(&format!("\"v{version}\"")).unwrap(),
                 asset_id: serde_json::from_str("42").unwrap(),
@@ -529,8 +529,8 @@ mod tests {
         let mut lock = carina_provider_resolver::LockFile::default();
         lock.upsert(carina_provider_resolver::LockEntry {
             name: "aws".into(),
-            source: source.into(),
             kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+                source: test_github_source(source),
                 version: version.parse().unwrap(),
                 tag: serde_json::from_str("\"v0.5.0\"").unwrap(),
                 asset_id: serde_json::from_str("42").unwrap(),
@@ -550,11 +550,11 @@ mod tests {
         let probed = install_prober()(tmp.path(), &config);
 
         assert!(
-            probed.as_ref().unwrap().artifact.is_some(),
+            probed.artifact.is_some(),
             "the drift probe observes artifact metadata without hashing"
         );
         assert!(
-            probed.as_ref().unwrap().lock_file.is_some(),
+            probed.lock_file.is_some(),
             "the drift probe observes lock-file metadata"
         );
         assert_eq!(fingerprint, vec![("aws".to_string(), probed)]);
@@ -574,9 +574,9 @@ mod tests {
         let (_, config) = cfg("local", Some(&format!("file://{}", wasm.display())), None);
         let prober = install_prober();
 
-        let before = prober(tmp.path(), &config).unwrap();
+        let before = prober(tmp.path(), &config);
         std::fs::write(&wasm, b"replacement with a different length").unwrap();
-        let after = prober(tmp.path(), &config).unwrap();
+        let after = prober(tmp.path(), &config);
 
         assert!(before.artifact.is_some());
         assert!(after.artifact.is_some());
@@ -584,7 +584,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let before_rename = prober(tmp.path(), &config).unwrap();
+            let before_rename = prober(tmp.path(), &config);
             let before_artifact = before_rename.artifact.as_ref().unwrap();
             let replacement = tmp.path().join("local-provider-replacement.wasm");
             std::fs::write(
@@ -601,7 +601,7 @@ mod tests {
                 .unwrap();
             std::fs::rename(&replacement, &wasm).unwrap();
 
-            let after_rename = prober(tmp.path(), &config).unwrap();
+            let after_rename = prober(tmp.path(), &config);
             let after_artifact = after_rename.artifact.as_ref().unwrap();
             assert_eq!(before_artifact.len, after_artifact.len);
             assert_eq!(before_artifact.modified, after_artifact.modified);

@@ -1,35 +1,43 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "required-by-dependents",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "required-by-dependents",
   "resources": [
     {
-      "resource_type": "acm.Certificate",
-      "identity": "cert",
-      "provider": "aws",
-      "identifier": "cert-old",
-      "attributes": {
-        "domain_name": "old.example.com",
-        "arn": "arn:old"
-      },
-      "protected": false,
-      "directives": {
-        "force_delete": false,
-        "create_before_destroy": false
-      },
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "cert",
+      "current": {
+        "attributes": {
+          "arn": "arn:old",
+          "domain_name": "old.example.com"
+        },
+        "identifier": "cert-old",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "create_before_destroy": false,
+        "force_delete": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "domain_name": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "cert",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "aws",
+      "resource_type": "acm.Certificate"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

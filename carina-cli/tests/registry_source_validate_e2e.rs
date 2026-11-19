@@ -1,3 +1,11 @@
+fn test_registry_source(value: &str) -> carina_core::provider_source::RegistrySource {
+    use carina_core::provider_source::{ProviderSource, RemoteSource};
+    let ProviderSource::Remote(RemoteSource::Registry(source)) = value.parse().unwrap() else {
+        panic!("expected registry source: {value}");
+    };
+    source
+}
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -55,8 +63,8 @@ fn directory_validate_loads_registry_source_from_lock_and_cache() {
     let mut lock = LockFile::default();
     lock.upsert(LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: LockEntryKind::Version {
+            source: test_registry_source(source),
             version: version.into(),
             constraint: Some(version.into()),
         },
@@ -122,8 +130,8 @@ fn directory_validate_rejects_allowlisted_registry_source_without_trust_record()
     let mut lock = LockFile::default();
     lock.upsert(LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: LockEntryKind::Version {
+            source: test_registry_source(source),
             version: version.into(),
             constraint: Some(version.into()),
         },
@@ -199,8 +207,8 @@ fn directory_validate_rejects_artifact_that_mismatches_lock_sha256() {
     let mut lock = LockFile::default();
     lock.upsert(LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: LockEntryKind::Version {
+            source: test_registry_source(source),
             version: version.into(),
             constraint: Some(version.into()),
         },

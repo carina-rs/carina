@@ -323,13 +323,14 @@ fn apply_locked_reload_keeps_symlink_project_path_in_unknown_outcome_hint() {
         serde_json::from_slice(&fs::read(project.root.join("reviewed-plan.json")).unwrap())
             .unwrap();
     assert_eq!(saved["source_path"], project.root.to_str().unwrap());
-    // Version rejection uses the header's source locator for a replan hint.
+    // Current-plan decode errors use the header's source locator for a replan hint.
     let plan_path = project.root.join("reviewed-plan.json");
-    saved["version"] = serde_json::json!(0);
+    saved["plan"] = serde_json::json!("malformed current payload");
     fs::write(&plan_path, serde_json::to_vec(&saved).unwrap()).unwrap();
     let apply = project.run(&["apply", plan_path.to_str().unwrap(), "--auto-approve"]);
     assert!(!apply.status.success());
     let stderr = stderr_text(&apply);
+    assert!(stderr.contains("corrupted"), "{stderr}");
     let replan = carina_core::hint::ProjectCommand::new("plan --out", &project.root)
         .with_path_argument(&plan_path)
         .to_string();

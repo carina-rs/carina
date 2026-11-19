@@ -1,48 +1,59 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-lineage-map-diff",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-map-diff",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "awscc_ec2_vpc_0bc2a2bb",
-      "provider": "awscc",
-      "identifier": "vpc-0123456789abcdef0",
-      "attributes": {
-        "cidr_block": "10.0.0.0/16",
-        "enable_dns_support": true,
-        "enable_dns_hostnames": true,
-        "vpc_id": "vpc-0123456789abcdef0",
-        "tags": {
-          "Name": "main",
-          "Environment": "staging",
-          "OldTag": "remove-me"
-        }
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "awscc_ec2_vpc_0bc2a2bb",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "enable_dns_hostnames": true,
+          "enable_dns_support": true,
+          "tags": {
+            "Environment": "staging",
+            "Name": "main",
+            "OldTag": "remove-me"
+          },
+          "vpc_id": "vpc-0123456789abcdef0"
+        },
+        "identifier": "vpc-0123456789abcdef0",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "cidr_block": {
-            "kind": "leaf"
-          },
-          "enable_dns_support": {
             "kind": "leaf"
           },
           "enable_dns_hostnames": {
             "kind": "leaf"
           },
+          "enable_dns_support": {
+            "kind": "leaf"
+          },
           "tags": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "awscc_ec2_vpc_0bc2a2bb",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

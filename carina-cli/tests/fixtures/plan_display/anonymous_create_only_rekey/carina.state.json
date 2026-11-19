@@ -1,29 +1,28 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-anonymous-create-only-rekey",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-anonymous-create-only-rekey",
   "resources": [
     {
-      "resource_type": "test.Widget",
-      "identity": "test_test_widget_11111111",
-      "provider": "test",
-      "identifier": "widget-live",
-      "attributes": {
-        "external_name": "old",
-        "legacy_token": "shared"
-      },
-      "protected": false,
-      "directives": {
-        "force_delete": false,
-        "create_before_destroy": false
-      },
-      "prefixes": {},
-      "name_overrides": {},
       "binding": null,
+      "current": {
+        "attributes": {
+          "external_name": "old",
+          "legacy_token": "shared"
+        },
+        "identifier": "widget-live",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "create_before_destroy": false,
+        "force_delete": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "external_name": {
             "kind": "leaf"
@@ -31,8 +30,17 @@
           "legacy_token": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "test_test_widget_11111111",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "test",
+      "resource_type": "test.Widget"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

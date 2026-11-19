@@ -610,7 +610,7 @@ async fn create_bucket_error_preserves_aws_operation_bucket_and_service_details(
 
 // carina#3336: end-to-end exercise of `--state-url s3://...`'s
 // happy path. Seeds an object into the in-process mock S3, reads it
-// back through the same `S3Backend::read_state` + LoadedState→StateFile
+// back through the same `S3Backend::read_state`
 // path that `load_state_from_url` walks for the `StateUrl::S3` arm. The
 // only difference between this test's setup and the production URL
 // loader is which `aws_sdk_s3::Client` is in the backend
@@ -637,13 +637,12 @@ async fn url_loader_s3_path_reads_seeded_state() {
         .unwrap();
 
     // Replicates the body of `load_state_from_url` for the `StateUrl::S3`
-    // arm: read_state, unwrap into_state, error on None.
+    // arm: read_state and error on None.
     let loaded = backend
         .read_state()
         .await
         .unwrap()
-        .expect("seeded object should be readable")
-        .into_state();
+        .expect("seeded object should be readable");
     assert_eq!(loaded.serial, seeded.serial);
     assert_eq!(loaded.lineage, seeded.lineage);
 }
@@ -677,8 +676,7 @@ async fn write_then_read_state_round_trips() {
         .read_state()
         .await
         .unwrap()
-        .expect("state written above should be readable")
-        .into_state();
+        .expect("state written above should be readable");
     // `StateFile` has no `PartialEq`; compare the fields that prove the
     // bytes round-tripped through S3 unchanged. `lineage` is preserved
     // (not regenerated) so it pins identity across the write/read.
@@ -686,10 +684,6 @@ async fn write_then_read_state_round_trips() {
     assert_eq!(
         read_back.lineage, written.lineage,
         "lineage must round-trip unchanged",
-    );
-    assert_eq!(
-        read_back.version, written.version,
-        "version must round-trip",
     );
     assert_eq!(
         read_back.resources().len(),
@@ -739,7 +733,7 @@ async fn lower_serial_same_lineage_write_replaces_remote_state() {
     backend.write_state(&newer).await.unwrap();
     backend.write_state(&older).await.unwrap();
 
-    let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+    let persisted = backend.read_state().await.unwrap().unwrap();
     assert_eq!(persisted.lineage, older.lineage);
     assert_eq!(persisted.serial, older.serial);
 }
@@ -765,7 +759,7 @@ async fn abandoned_older_put_cannot_overwrite_a_completed_newer_put() {
     );
     create_bucket_and_seed_empty_state(&backend).await;
 
-    let initial = backend.read_state().await.unwrap().unwrap().into_state();
+    let initial = backend.read_state().await.unwrap().unwrap();
     state_puts.store(0, Ordering::SeqCst);
     state_heads.store(0, Ordering::SeqCst);
     let mut older = initial.clone();
@@ -785,7 +779,7 @@ async fn abandoned_older_put_cannot_overwrite_a_completed_newer_put() {
 
     backend.write_state(&newer).await.unwrap();
 
-    let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+    let persisted = backend.read_state().await.unwrap().unwrap();
     assert_eq!(persisted.lineage, newer.lineage);
     assert_eq!(persisted.serial, newer.serial);
     assert_eq!(
@@ -815,7 +809,7 @@ async fn repeated_state_write_conflicts_are_bounded() {
     })
     .await;
     create_bucket_and_seed_empty_state(&backend).await;
-    let mut state = backend.read_state().await.unwrap().unwrap().into_state();
+    let mut state = backend.read_state().await.unwrap().unwrap();
     state.increment_serial();
     enabled.store(true, Ordering::SeqCst);
 
@@ -856,7 +850,7 @@ async fn cleanup_state_put_timeout_retains_an_unconfirmed_outcome_after_commit()
     );
     create_bucket_and_seed_empty_state(&backend).await;
     let lock = backend.acquire_lock("apply").await.unwrap();
-    let mut state = backend.read_state().await.unwrap().unwrap().into_state();
+    let mut state = backend.read_state().await.unwrap().unwrap();
     state.increment_serial();
     let (trigger, shutdown) = carina_core::shutdown::testing::shutdown_channel();
     let published = crate::PublishedBackend::for_test(backend.clone(), &shutdown);
@@ -873,16 +867,7 @@ async fn cleanup_state_put_timeout_retains_an_unconfirmed_outcome_after_commit()
     );
     release.add_permits(1);
     completed.notified().await;
-    assert_eq!(
-        backend
-            .read_state()
-            .await
-            .unwrap()
-            .unwrap()
-            .into_state()
-            .serial,
-        1
-    );
+    assert_eq!(backend.read_state().await.unwrap().unwrap().serial, 1);
     published.release_lock_for_cleanup(&lock).await.unwrap();
     let next = backend.acquire_lock("verify release").await.unwrap();
     assert_ne!(next.id(), lock.id());
@@ -921,7 +906,7 @@ async fn cleanup_locked_write_with_cached_state_etag_uses_three_s3_calls() {
         false,
         true,
     );
-    let mut state = backend.read_state().await.unwrap().unwrap().into_state();
+    let mut state = backend.read_state().await.unwrap().unwrap();
     let lock = backend.acquire_lock("apply").await.unwrap();
     state.increment_serial();
 
@@ -1130,7 +1115,7 @@ async fn write_state_locked_succeeds_for_held_lock() {
     state.increment_serial();
     backend.write_state_locked(&state, &lock).await.unwrap();
 
-    let read_back = backend.read_state().await.unwrap().unwrap().into_state();
+    let read_back = backend.read_state().await.unwrap().unwrap();
     assert_eq!(
         read_back.lineage, state.lineage,
         "locked write must persist the state we passed in",
@@ -1165,7 +1150,7 @@ async fn locked_state_conflict_rechecks_ownership_before_retrying() {
     let raw_client = Client::new(&sdk_config);
     create_bucket_and_seed_empty_state(backend.as_ref()).await;
 
-    let initial = backend.read_state().await.unwrap().unwrap().into_state();
+    let initial = backend.read_state().await.unwrap().unwrap();
     let held_lock = backend.acquire_lock("apply").await.unwrap();
 
     // Advance the object behind the backend's cached ETag so its next state
@@ -1226,7 +1211,7 @@ async fn locked_state_conflict_rechecks_ownership_before_retrying() {
         "expected LockNotHeld after replacement, got {error:?}"
     );
 
-    let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+    let persisted = backend.read_state().await.unwrap().unwrap();
     assert_eq!(persisted.serial, competing_state.serial);
     assert_eq!(persisted.lineage, competing_state.lineage);
 }
@@ -1249,7 +1234,7 @@ async fn cancellation_cleanup_write_and_release_preserve_the_lock_protocol() {
         .unwrap();
     backend.release_lock_for_cleanup(&lock).await.unwrap();
 
-    let persisted = backend.read_state().await.unwrap().unwrap().into_state();
+    let persisted = backend.read_state().await.unwrap().unwrap();
     assert_eq!(persisted.lineage, state.lineage);
     assert_eq!(persisted.serial, state.serial);
     assert!(

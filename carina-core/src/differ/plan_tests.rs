@@ -796,10 +796,8 @@ fn provider_ready<S: Clone, D: Clone + Default>(
     )
 }
 
-/// Build an `ExplicitFields::Struct` whose children are all `Leaf` —
-/// the shape `state v5 → v6` reads produce, and a convenient way to
-/// express "user previously authored these top-level keys" in tests
-/// that pre-date the nested authoring tree.
+/// Build an `ExplicitFields::Struct` whose `Leaf` children record the
+/// top-level keys previously authored by the user.
 fn explicit_top_level(keys: &[&str]) -> ExplicitFields {
     ExplicitFields::Struct {
         children: keys
