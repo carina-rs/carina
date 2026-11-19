@@ -44,6 +44,278 @@ impl ForLoopElement {
     }
 }
 
+/// A child binding minted only by for-loop address admission.
+///
+/// Raw bindings and historical serialized addresses cannot grant admission.
+///
+/// ```compile_fail,E0451
+/// use carina_core::resource::{BoundForAddress, RelativeBindingName};
+/// let _ = BoundForAddress { binding: RelativeBindingName::new("rs[0]") };
+/// ```
+///
+/// ```compile_fail,E0277
+/// use carina_core::resource::{BoundForAddress, RelativeBindingName};
+/// let _: BoundForAddress<RelativeBindingName> = serde_json::from_str("\"rs[0]\"").unwrap();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use carina_core::resource::{BoundForAddress, RelativeBindingName};
+/// let _: BoundForAddress<RelativeBindingName> = RelativeBindingName::new("rs[0]").into();
+/// ```
+#[derive(Debug, Clone)]
+pub struct BoundForAddress<B: super::BindingAddress> {
+    binding: B,
+}
+
+impl<B: super::BindingAddress> BoundForAddress<B> {
+    pub(crate) fn binding_address(&self) -> &B {
+        &self.binding
+    }
+
+    pub(crate) fn identity(&self) -> ResourceIdentity {
+        ResourceIdentity::new(self.binding.as_str())
+    }
+}
+
+/// Key material is obtainable only from an unflagged String classification.
+struct ValueKey(String);
+
+impl ValueKey {
+    fn from_string(value: &super::ValueString) -> Result<Self, ForKeyError> {
+        value
+            .diagnostic_literal()
+            .map(|key| Self(key.to_owned()))
+            .ok_or(ForKeyError::Protected)
+    }
+}
+
+/// Safe, core-owned diagnostics for value-key admission. Ordinals are one-based.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ForKeyError {
+    #[error("Element {element} must be a String. Rewrite as strings or use `for (i, x) in ...`.")]
+    NonString { element: usize },
+    #[error("Elements {first} and {second} produce the same key. Use `for (i, x) in ...`.")]
+    Duplicate { first: usize, second: usize },
+    #[error("Protected values cannot be value keys. Use `for (i, x) in ...`.")]
+    Protected,
+    #[error("Element {element} is not known before apply. Use `for (i, x) in ...`.")]
+    NotKnownBeforeApply { element: usize },
+    #[error("Element {element} is still unknown during expansion. Use `for (i, x) in ...`.")]
+    PlanPending { element: usize },
+    #[error("Element {element} is still unknown during expansion. Use `for (i, x) in ...`.")]
+    UnknownDuringExpansion { element: usize },
+    #[error(
+        "Element type {kind} cannot be a value key. Rewrite as strings or use `for (i, x) in ...`."
+    )]
+    ElementType { kind: &'static str },
+    #[error(
+        "This loop is value-keyed; use a string subscript, or `for (i, x) in ...` for index addressing."
+    )]
+    NumericSubscript,
+    #[error("expected {expected} iterable, got {got}")]
+    Shape {
+        expected: &'static str,
+        got: &'static str,
+    },
+}
+
+/// Unresolved nominal declarations retain their explicit lack of scalar evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForKeyEligibility {
+    String,
+    Unjudged,
+}
+
+/// Static eligibility is exhaustive: adding a TypeExpr must decide this contract.
+pub(crate) fn classify_for_key_type(
+    ty: &crate::parser::TypeExpr,
+) -> Result<ForKeyEligibility, ForKeyError> {
+    use crate::parser::TypeExpr;
+    let reject = |kind| Err(ForKeyError::ElementType { kind });
+    match ty {
+        TypeExpr::String => Ok(ForKeyEligibility::String),
+        TypeExpr::StringLiteral(_) => Ok(ForKeyEligibility::String),
+        TypeExpr::Simple(name) => {
+            if matches!(
+                name.declaration().raw_shape(),
+                crate::schema::RawShape::String { .. }
+            ) {
+                Ok(ForKeyEligibility::String)
+            } else {
+                reject("non-String refinement")
+            }
+        }
+        TypeExpr::SchemaType { owned } => {
+            if owned.scalar_kind() == crate::schema::RefinedScalarKind::String {
+                Ok(ForKeyEligibility::String)
+            } else {
+                reject("non-String refinement")
+            }
+        }
+        TypeExpr::Union(members) => {
+            let mut result = ForKeyEligibility::String;
+            for member in members {
+                if classify_for_key_type(member)? == ForKeyEligibility::Unjudged {
+                    result = ForKeyEligibility::Unjudged;
+                }
+            }
+            Ok(result)
+        }
+        TypeExpr::UnloadedSchemaType(_) => Ok(ForKeyEligibility::Unjudged),
+        TypeExpr::DottedUnresolved(_) => Ok(ForKeyEligibility::Unjudged),
+        TypeExpr::Bool => reject("Bool"),
+        TypeExpr::Int => reject("Int"),
+        TypeExpr::Float => reject("Float"),
+        TypeExpr::Duration => reject("Duration"),
+        TypeExpr::List(_) => reject("List"),
+        TypeExpr::Map(_) => reject("Map"),
+        TypeExpr::Ref(_) => reject("Ref"),
+        TypeExpr::Struct { .. } => reject("Struct"),
+    }
+}
+
+/// Admit every child before returning any address. List order is retained;
+/// map keys retain their existing sorted traversal and spelling.
+pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: super::BindingAddress>(
+    binding: &crate::parser::ForBinding,
+    target: &crate::parser::BoundDeferredTarget<B>,
+    members: super::knowledge::ClassifiedRef<'_, '_, P, B>,
+) -> Result<Vec<BoundForAddress<B>>, ForKeyError> {
+    use super::ConcreteValueRef;
+    use super::knowledge::ClassifiedRef;
+    use crate::parser::ForBinding;
+    let base = target.binding_address();
+    let got = match members.concrete() {
+        Some(ConcreteValueRef::List(_) | ConcreteValueRef::StringList(_)) => "list",
+        Some(ConcreteValueRef::Map(_)) => "map",
+        Some(ConcreteValueRef::String(_)) => "string",
+        Some(ConcreteValueRef::EnumIdentifier(_) | ConcreteValueRef::CanonicalEnum(_)) => "enum",
+        Some(ConcreteValueRef::Int(_)) => "int",
+        Some(ConcreteValueRef::Float(_)) => "float",
+        Some(ConcreteValueRef::Bool(_)) => "bool",
+        Some(ConcreteValueRef::Duration(_)) => "duration",
+        None => "unresolved",
+    };
+    match binding {
+        ForBinding::Simple(_) => {
+            if members.is_protected() {
+                return Err(ForKeyError::Protected);
+            }
+            let items = if let Some(items) = members.list() {
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let element = index + 1;
+                        if item.is_protected() {
+                            return Err(ForKeyError::Protected);
+                        }
+                        match item.concrete() {
+                            Some(ConcreteValueRef::String(value)) => ValueKey::from_string(value),
+                            Some(_) => Err(ForKeyError::NonString { element }),
+                            None => Err(match item {
+                                ClassifiedRef::Pending(pending) => match pending.phase() {
+                                    super::knowledge::Phase::Plan => {
+                                        ForKeyError::PlanPending { element }
+                                    }
+                                    super::knowledge::Phase::Apply => {
+                                        ForKeyError::NotKnownBeforeApply { element }
+                                    }
+                                },
+                                ClassifiedRef::Failed(_) => ForKeyError::PlanPending { element },
+                                ClassifiedRef::Shape(_) | ClassifiedRef::Known(_) => {
+                                    ForKeyError::NonString { element }
+                                }
+                            }),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            } else if let Some(ConcreteValueRef::StringList(strings)) = members.concrete() {
+                strings.iter().map(ValueKey::from_string).collect()
+            } else {
+                return Err(ForKeyError::Shape {
+                    expected: "list",
+                    got,
+                });
+            };
+            if items
+                .iter()
+                .any(|item| matches!(item, Err(ForKeyError::Protected)))
+            {
+                return Err(ForKeyError::Protected);
+            }
+            let mut seen = std::collections::BTreeMap::new();
+            let mut keys = Vec::with_capacity(items.len());
+            let mut pending = None;
+            for (index, item) in items.into_iter().enumerate() {
+                let element = index + 1;
+                let key = match item {
+                    Ok(key) => key,
+                    Err(error @ ForKeyError::PlanPending { .. }) => {
+                        if pending.is_none() {
+                            pending = Some(error);
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(first) = seen.insert(key.0.clone(), element) {
+                    return Err(ForKeyError::Duplicate {
+                        first,
+                        second: element,
+                    });
+                }
+                keys.push(key);
+            }
+            if let Some(error) = pending {
+                return Err(error);
+            }
+            Ok(keys
+                .into_iter()
+                .map(|key| BoundForAddress {
+                    binding: super::binding_with_map_key(base, &key.0.into()),
+                })
+                .collect())
+        }
+        ForBinding::Indexed(_, _) => {
+            let len = if let Some(items) = members.list() {
+                items.len()
+            } else if let Some(ConcreteValueRef::StringList(strings)) = members.concrete() {
+                strings.len()
+            } else {
+                return Err(ForKeyError::Shape {
+                    expected: "list",
+                    got,
+                });
+            };
+            Ok((0..len)
+                .map(|index| BoundForAddress {
+                    binding: super::binding_with_index(
+                        base,
+                        index
+                            .try_into()
+                            .expect("loop index fits in signed address domain"),
+                    ),
+                })
+                .collect())
+        }
+        ForBinding::Map(_, _) => {
+            let items = members.map().ok_or(ForKeyError::Shape {
+                expected: "map",
+                got,
+            })?;
+            let mut keys: Vec<_> = items.keys().copied().collect();
+            keys.sort();
+            Ok(keys
+                .into_iter()
+                .map(|key| BoundForAddress {
+                    binding: super::binding_with_map_key(base, &key.into()),
+                })
+                .collect())
+        }
+    }
+}
+
 /// The precise branch or collection element that produced a resource.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -719,10 +991,9 @@ impl UnboundLoopTemplate {
     }
 
     pub(crate) fn matches_legacy_binding(&self, binding: &str) -> bool {
-        binding == self.legacy_base.exact_state_name()
-            || binding
-                .strip_prefix(self.legacy_base.exact_state_name())
-                .is_some_and(|suffix| suffix.starts_with(['[', '.']))
+        super::decompose_binding_address(binding).is_some_and(|address| {
+            address.is_self_or_descendant_of(self.legacy_base.exact_state_name())
+        })
     }
 
     pub(crate) fn set_display_file(&mut self, file: &str) {
@@ -755,4 +1026,132 @@ pub(crate) fn replace_identity_prefix(value: &str, from: &str, to: &str) -> Opti
         return None;
     }
     Some(format!("{to}{suffix}"))
+}
+
+#[cfg(test)]
+mod for_key_type_tests {
+    use super::*;
+    use crate::parser::{ResourceTypePath, TypeExpr};
+
+    #[test]
+    fn for_value_keys_failed_member_is_not_apply_evidence() {
+        use crate::resource::{
+            ConcreteValue, DeferredValue, NoPlaceholder, RelativeBindingName, Value,
+        };
+        let value: Value<NoPlaceholder, RelativeBindingName> = Value::Concrete(
+            ConcreteValue::List(vec![Value::Deferred(DeferredValue::Unavailable {
+                name: crate::builtins::BuiltinFunction::env,
+                args: vec![],
+                reason: crate::resource::UnavailableReason::from_builtin_error(
+                    "unavailable".into(),
+                ),
+                source_line: 0.into(),
+            })]),
+        );
+        let classified = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification();
+        let target =
+            crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("rs")).unwrap();
+        let error = admit_bound_for_addresses(
+            &crate::parser::ForBinding::Simple("x".into()),
+            &target,
+            crate::resource::knowledge::ClassifiedRef::from(&classified),
+        )
+        .unwrap_err();
+        assert!(
+            !matches!(error, ForKeyError::NotKnownBeforeApply { .. }),
+            "a failed evaluation supplies no apply-phase evidence: {error}"
+        );
+    }
+
+    #[test]
+    fn for_value_keys_refinement_eligibility() {
+        use crate::parser::{BuiltinTypeName, OwnedTypeIdentity, UnloadedSchemaType};
+        use crate::schema::{RefinedScalarKind, TypeIdentity};
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::Simple(
+                BuiltinTypeName::lookup("ipv4_cidr").unwrap()
+            )),
+            Ok(ForKeyEligibility::String)
+        );
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::Simple(
+                BuiltinTypeName::lookup("positive_int").unwrap()
+            )),
+            Err(ForKeyError::ElementType {
+                kind: "non-String refinement"
+            })
+        );
+        for (scalar, expected) in [
+            (RefinedScalarKind::String, Ok(ForKeyEligibility::String)),
+            (
+                RefinedScalarKind::Int,
+                Err(ForKeyError::ElementType {
+                    kind: "non-String refinement",
+                }),
+            ),
+            (
+                RefinedScalarKind::Float,
+                Err(ForKeyError::ElementType {
+                    kind: "non-String refinement",
+                }),
+            ),
+        ] {
+            let owned = OwnedTypeIdentity::provider(
+                "mock",
+                TypeIdentity::new(Some("mock"), ["test"], "Refinement"),
+                scalar,
+            );
+            assert_eq!(
+                classify_for_key_type(&TypeExpr::SchemaType {
+                    owned: owned.unbounded_witness_for_test()
+                }),
+                expected
+            );
+        }
+        let unloaded =
+            UnloadedSchemaType::try_from(TypeIdentity::new(Some("mock"), ["test"], "Unknown"))
+                .unwrap();
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::UnloadedSchemaType(unloaded)),
+            Ok(ForKeyEligibility::Unjudged)
+        );
+    }
+
+    #[test]
+    fn for_value_keys_static_classifier() {
+        for ty in [
+            TypeExpr::String,
+            TypeExpr::StringLiteral("TYPE_LITERAL_CANARY".into()),
+            TypeExpr::Union(vec![
+                TypeExpr::StringLiteral("a".into()),
+                TypeExpr::StringLiteral("b".into()),
+            ]),
+        ] {
+            assert_eq!(classify_for_key_type(&ty), Ok(ForKeyEligibility::String));
+        }
+        let unknown = TypeExpr::DottedUnresolved(ResourceTypePath::new("mock", "Unknown"));
+        assert_eq!(
+            classify_for_key_type(&unknown),
+            Ok(ForKeyEligibility::Unjudged)
+        );
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::Union(vec![unknown.clone(), TypeExpr::String])),
+            Ok(ForKeyEligibility::Unjudged)
+        );
+        let error = classify_for_key_type(&TypeExpr::Union(vec![
+            unknown,
+            TypeExpr::Bool,
+            TypeExpr::StringLiteral("TYPE_LITERAL_CANARY".into()),
+        ]))
+        .unwrap_err();
+        assert_eq!(error, ForKeyError::ElementType { kind: "Bool" });
+        assert!(!error.to_string().contains("TYPE_LITERAL_CANARY"));
+        assert_eq!(
+            classify_for_key_type(&TypeExpr::Ref(ResourceTypePath::new("mock", "Resource"))),
+            Err(ForKeyError::ElementType { kind: "Ref" })
+        );
+    }
 }

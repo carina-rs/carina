@@ -68,7 +68,10 @@ use crate::schema::{
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use binding_address::absolute_binding_address_for_test;
-pub use binding_address::{AbsoluteBindingAddress, BindingAddress, RelativeBindingName};
+pub use binding_address::{
+    AbsoluteBindingAddress, BindingAddress, CheckedBindingAddress, RelativeBindingName,
+    decompose_binding_address,
+};
 pub(crate) use binding_address::{
     binding_with_index, binding_with_map_key, module_argument_placeholder,
 };
@@ -88,10 +91,12 @@ pub use ignore_changes::{
     ResolvedIgnorePath, resolve_ignore_changes,
 };
 pub use loop_origin::{
-    ForLoopElement, LoopElementOrigin, LoopKind, LoopOriginKind, LoopProvenance, LoopSource,
-    UnboundLoopTemplate,
+    BoundForAddress, ForKeyError, ForLoopElement, LoopElementOrigin, LoopKind, LoopOriginKind,
+    LoopProvenance, LoopSource, UnboundLoopTemplate,
 };
-pub(crate) use loop_origin::{LegacyLoopAddress, LoopModulePrefixOrigin};
+pub(crate) use loop_origin::{
+    LegacyLoopAddress, LoopModulePrefixOrigin, admit_bound_for_addresses, classify_for_key_type,
+};
 
 /// Resolver for names authored in the root directory.
 ///

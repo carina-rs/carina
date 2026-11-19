@@ -158,7 +158,7 @@ pub(crate) use entry::{
 };
 pub use error::{
     DeferredForBodyKind, DeferredForBodyUnsupportedError, DeferredForIterableResolution,
-    FloatLiteralError, ParseError, ParseWarning, ParseWarningSpan,
+    FloatLiteralError, ForKeyDiagnostic, ParseError, ParseWarning, ParseWarningSpan,
     SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE, UnresolvedTypeToken, WarningKind,
 };
 pub(crate) use expressions::string_literal::{
@@ -203,7 +203,7 @@ pub(crate) use util::eval_type_name;
 pub use util::{pascal_to_snake, snake_to_pascal};
 
 pub use grammar::Rule;
-pub(crate) use grammar::{PreprocessedFile, preprocess_file};
+pub(crate) use grammar::{PreprocessedFile, indexed_bound_loop_rewrite, preprocess_file};
 
 pub(crate) use blocks::module_call::parse_module_call;
 pub(crate) use blocks::resource::{

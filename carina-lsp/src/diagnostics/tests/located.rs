@@ -1015,7 +1015,7 @@ fn depends_on_belongs_to_sibling_for_body() {
         ("main.crn", MAIN),
         (
             "sibling.crn",
-            "let items = for item in [1] {\n  aws.acm.Certificate {\n    domain_name = 'loop'\n    directives { depends_on = [missing] }\n  }\n}\n",
+            "let items = for (_, item) in [1] {\n  aws.acm.Certificate {\n    domain_name = 'loop'\n    directives { depends_on = [missing] }\n  }\n}\n",
         ),
     ]);
     directory.assert_sibling_owner(

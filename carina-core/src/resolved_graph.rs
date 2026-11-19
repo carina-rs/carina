@@ -1144,29 +1144,16 @@ pub fn wait_scheduler_id(binding: &AbsoluteBindingAddress) -> ResolvedResourceId
 }
 
 pub fn loop_group_bindings<B: BindingAddress>(binding: &B) -> Vec<B> {
-    let mut groups = Vec::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, character) in binding.as_str().char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match character {
-            '"' => in_string = true,
-            '[' if index > 0 => groups.push(crate::resource::binding_address::binding_collection(
-                binding, index,
-            )),
-            _ => {}
-        }
-    }
-    groups
+    crate::resource::decompose_binding_address(binding.as_str())
+        .map(|address| {
+            address
+                .candidate_ancestors()
+                .map(|ancestor| {
+                    crate::resource::binding_address::binding_collection(binding, ancestor.len())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn resolve_pending_output(
@@ -1511,7 +1498,10 @@ impl<E, D> From<File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>>
 /// ```
 pub fn resolve_expanded_graph<E, D>(
     configuration: ConfiguredGraphInput<E, D>,
-) -> Result<ResolvedExpandedGraph<E, D>, ExpandedGraphResolutionError> {
+) -> Result<ResolvedExpandedGraph<E, D>, ExpandedGraphResolutionError>
+where
+    D: crate::parser::DeferredForPhaseTraversal<NoPlaceholder, LoopSlot, AbsoluteBindingAddress>,
+{
     resolve_expanded_graph_for_legacy_classification(configuration)?.validate()
 }
 
@@ -1521,7 +1511,10 @@ pub fn resolve_expanded_graph<E, D>(
 /// validation consumes this graph before any migrated state is released.
 pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
     configuration: ConfiguredGraphInput<E, D>,
-) -> Result<LegacyClassificationGraph<E, D>, ExpandedGraphResolutionError> {
+) -> Result<LegacyClassificationGraph<E, D>, ExpandedGraphResolutionError>
+where
+    D: crate::parser::DeferredForPhaseTraversal<NoPlaceholder, LoopSlot, AbsoluteBindingAddress>,
+{
     let ConfiguredGraphInput {
         configuration: mut parsed,
         prior_orphans,
@@ -1540,6 +1533,11 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
         .filter(|(_binding, handle)| handle.is_for_binding())
         .map(|(binding, _handle)| (binding.clone(), ResolvedDependencies::default()))
         .collect::<HashMap<_, _>>();
+    for site in parsed.deferred_for_sites() {
+        if let Some(binding) = site.target.bound_binding_address() {
+            managed_groups.entry(binding.clone()).or_default();
+        }
+    }
     let mut managed_ids = HashSet::new();
     for resource in &parsed.resources {
         let id = require_resolved_id(&resource.id)?;
@@ -1554,7 +1552,9 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
         if let Some(binding) = &resource.binding {
             targets.insert_binding(binding.clone(), target.clone())?;
             for group in loop_group_bindings(binding) {
-                managed_groups.entry(group).or_default().insert(id.clone());
+                if let Some(members) = managed_groups.get_mut(&group) {
+                    members.insert(id.clone());
+                }
             }
         }
         targets.insert_identity(id.binding_address(), target)?;
@@ -2012,5 +2012,97 @@ mod tests {
             .compile_deferred_for(template)
             .expect("upstream loop compiles");
         assert!(template.dependencies().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod for_value_keys_membership_tests {
+    use super::*;
+    use crate::resource::RelativeBindingName;
+
+    #[test]
+    fn for_value_keys_membership_boundaries() {
+        for (binding, expected) in [
+            ("rs.a", vec!["rs"]),
+            ("rs['a.b']", vec!["rs"]),
+            ("rs['a[b].c']", vec!["rs"]),
+            ("rs[0].child", vec!["rs", "rs[0]"]),
+            ("module.rs.a", vec!["module", "module.rs"]),
+            ("rs_extra.a", vec!["rs_extra"]),
+        ] {
+            let groups = loop_group_bindings(&RelativeBindingName::new(binding));
+            assert_eq!(
+                groups
+                    .iter()
+                    .map(|group| group.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn for_value_keys_membership_resolves_actual_loop_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("child")).unwrap();
+        for (file, source) in [
+            ("providers.crn", "provider mock {}\n"),
+            (
+                "calls.crn",
+                "let child = use { source = './child' }\nlet ordinary = child {}\n",
+            ),
+            (
+                "resources.crn",
+                "let rs = for x in ['a'] { mock.test.resource { name = x } }\n",
+            ),
+            (
+                "child/main.crn",
+                "arguments { name: String = 'ordinary' }\nlet resource = mock.test.resource { name = name }\nlet nested = for x in ['b'] { mock.test.resource { name = x } }\n",
+            ),
+        ] {
+            std::fs::write(directory.path().join(file), source).unwrap();
+        }
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let loaded = crate::config_loader::load_configuration_with_config(
+            &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+            &context,
+            &SchemaRegistry::new(),
+        )
+        .unwrap();
+        let resolved =
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                crate::module_resolver::resolve_modules_with_providerless_config(
+                    loaded.parsed,
+                    &crate::paths::ResolvedPath::new(directory.path()).unwrap(),
+                    session,
+                    &SchemaRegistry::new(),
+                )
+                .map_err(Box::new)
+            })
+            .unwrap();
+        let tree = crate::parser::AnalysisTree::try_from(&resolved).unwrap();
+        assert!(tree.is_loop_group("rs"));
+        assert!(tree.is_loop_group("ordinary.nested"));
+        assert!(!tree.is_loop_group("ordinary"));
+        assert!(!tree.is_loop_group("ordinary.resource"));
+    }
+
+    #[test]
+    fn for_value_keys_deferred_old_index_rows() {
+        let target = crate::parser::DeferredForTarget::Bound(
+            crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("rs")).unwrap(),
+        );
+        for binding in ["rs[0]", "rs.a", "rs['a.b']"] {
+            assert!(crate::differ::binding_matches_deferred_template(
+                &RelativeBindingName::new(binding),
+                &target
+            ));
+        }
+        for binding in ["rs_extra[0]", "rs.a.child", "rs['a.b'].child", "rs[0][1]"] {
+            assert!(!crate::differ::binding_matches_deferred_template(
+                &RelativeBindingName::new(binding),
+                &target
+            ));
+        }
     }
 }

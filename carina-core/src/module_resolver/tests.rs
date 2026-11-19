@@ -411,7 +411,7 @@ fn module_argument_resource_output_cannot_become_a_directive_default() {
 #[test]
 fn module_loop_directives_are_strictly_resolved_for_each_child() {
     let fixture = ModuleResolutionFixture::new();
-    fixture.write("module/main.crn", "arguments { flags: list(Bool) }\nlet children = for flag in flags {\n  mock.test.resource { name = 'child' directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } }\n}\n");
+    fixture.write("module/main.crn", "arguments { flags: list(Bool) }\nlet children = for (_, flag) in flags {\n  mock.test.resource { name = 'child' directives { prevent_destroy = flag force_delete = flag create_before_destroy = flag } }\n}\n");
     fixture.write("main.crn", "let source = mock.test.resource { name = 'source' }\nlet m = use { source = './module' }\nlet instance = m { flags = source.flags }\n");
     let expanded = fixture
         .resolve_caller("main.crn")
@@ -2097,7 +2097,7 @@ fn identical_loop_generated_module_calls_emit_one_complete_loop_rewrite() {
         "one authored loop must produce one error: {rendered}",
     );
     assert!(
-        rendered.contains("let network_2 = for label in ['same', 'same', 'other']"),
+        rendered.contains("let network_2 = for (_, label) in ['same', 'same', 'other']"),
         "the module use binding must remain available inside the rewritten loop: {rendered}",
     );
     for index in 0..3 {
@@ -2218,7 +2218,7 @@ fn loop_inside_module_is_reported_once_across_instances_with_local_name_scope() 
         "the authored module loop must be reported once: {rendered}",
     );
     assert!(
-        rendered.contains("let leaf = for value in ['same', 'same']"),
+        rendered.contains("let leaf = for (_, value) in ['same', 'same']"),
         "a root binding must not reserve a module-local suggestion: {rendered}",
     );
     assert!(!rendered.contains("let leaf_2 = for"));
@@ -11493,7 +11493,10 @@ let child = consumer_module {}
                 .binding
                 .as_ref()
                 .map(|binding| binding.as_str())
-                .is_some_and(|binding| binding.starts_with("child.records["))
+                .is_some_and(|binding| {
+                    crate::resource::decompose_binding_address(binding)
+                        .is_some_and(|address| address.is_direct_child_of("child.records"))
+                })
         })
         .filter_map(|resource| crate::resource::ResolvedResourceId::try_new(resource.id.clone()))
         .collect::<crate::resource::ResolvedDependencies>();

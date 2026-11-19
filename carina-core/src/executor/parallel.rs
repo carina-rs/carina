@@ -1531,10 +1531,10 @@ mod tests {
         let template = crate::parser::DeferredForExpression::new(
             None,
             0,
-            "for value in []".into(),
+            "for (_, value) in []".into(),
             crate::parser::DeferredForTarget::bound(absolute("children")).unwrap(),
             crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(Vec::new())),
-            crate::parser::ForBinding::Simple("value".into()),
+            crate::parser::ForBinding::Indexed("_".into(), "value".into()),
             crate::resource::Resource::<crate::resource::ModuleSource, crate::resource::LoopSlot>::with_provider(
                 "mock", "test.Child", "children", None,
             ),

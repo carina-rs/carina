@@ -752,6 +752,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
             line: self.line(),
             header: &self.header,
             binding: &self.binding,
+            target: &self.target,
             iterable: &self.iterable,
             iterable_location: self
                 .location
@@ -819,12 +820,36 @@ impl<P: ValueKind, B: BindingAddress> DeferredForBody<P, B> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedDeferredForIterableState {
     Deferred,
-    DependsOnEnclosingModuleArgument,
+    ValueKeysPending,
+    DependsOnEnclosingModuleArgument { value_keys_pending: bool },
     UndefinedIdentifier { name: String },
+}
+
+impl ParsedDeferredForIterableState {
+    pub(crate) fn value_keys_pending(&self) -> bool {
+        match self {
+            Self::ValueKeysPending => true,
+            Self::DependsOnEnclosingModuleArgument { value_keys_pending } => *value_keys_pending,
+            Self::Deferred | Self::UndefinedIdentifier { .. } => false,
+        }
+    }
+
+    pub(crate) fn checks_scope(&self) -> bool {
+        match self {
+            Self::Deferred | Self::ValueKeysPending => true,
+            Self::DependsOnEnclosingModuleArgument { .. } | Self::UndefinedIdentifier { .. } => {
+                false
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub(crate) enum DeferredForResourceExpressionError {
+    Admission {
+        file: Option<String>,
+        error: Box<super::Located<ParseError>>,
+    },
     UndefinedIterable(ParseError),
     Unsupported {
         file: Option<String>,
@@ -1023,16 +1048,14 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
             line: self.line(),
             header: &self.header,
             binding: &self.binding,
+            target: &self.target,
             iterable: &self.iterable,
             iterable_location: self
                 .location
                 .iterable
                 .elements()
                 .get(super::elements::ElementKind::Iterable),
-            checks_scope: matches!(
-                self.iterable_state,
-                ParsedDeferredForIterableState::Deferred
-            ),
+            checks_scope: self.iterable_state.checks_scope(),
         }
     }
 
@@ -1078,11 +1101,13 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
         debug_assert!(matches!(
             iterable_state,
             ParsedDeferredForIterableState::Deferred
-                | ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
+                | ParsedDeferredForIterableState::ValueKeysPending
+                | ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument { .. }
         ));
+        let value_keys_pending = iterable_state.value_keys_pending();
         let iterable_resolution = if matches!(
             iterable_state,
-            ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
+            ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument { .. }
         ) || super::functions::contains_module_argument(&iterable)
         {
             DeferredForIterableResolution::DependsOnEnclosingModuleArgument
@@ -1096,6 +1121,40 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                 | crate::resource::Value::Conversion(never) => match *never {},
             }
         };
+        if let (DeferredForTarget::Bound(bound), ForBinding::Simple(_)) = (&target, &binding)
+            && let Ok(knowledge) =
+                iterable.knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        {
+            let classification = knowledge.into_classification();
+            let members = crate::resource::knowledge::ClassifiedRef::from(&classification);
+            if matches!(
+                classification,
+                crate::resource::knowledge::Classification::Known(_)
+            ) || members.is_protected()
+                || iterable_resolution
+                    == DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
+            {
+                match crate::resource::admit_bound_for_addresses(&binding, bound, members) {
+                    Ok(_) | Err(crate::resource::ForKeyError::PlanPending { .. }) => {}
+                    Err(error) => {
+                        let authored = location
+                            .iterable
+                            .elements()
+                            .get(super::elements::ElementKind::Iterable)
+                            .expect("deferred iterable retains source location");
+                        return Err(DeferredForResourceExpressionError::Admission {
+                            file: location
+                                .source_file()
+                                .map(|file| file.display().to_string()),
+                            error: Box::new(super::Located::new(
+                                authored.clone(),
+                                ParseError::for_key(error, authored),
+                            )),
+                        });
+                    }
+                }
+            }
+        }
         let phase_detail = iterable
             .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
             .map(|proof| proof.into_classification())
@@ -1127,6 +1186,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                                 span,
                                 iterable_resolution,
                                 phase_detail,
+                                value_keys_pending,
                             },
                         )),
                     )),
@@ -1153,6 +1213,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                                 span,
                                 iterable_resolution,
                                 phase_detail,
+                                value_keys_pending,
                             },
                         )),
                     )),
@@ -1288,6 +1349,7 @@ pub struct DeferredForSite<
     pub line: usize,
     pub header: &'a str,
     pub binding: &'a ForBinding,
+    pub target: &'a DeferredForTarget<B>,
     pub iterable: &'a Value<P, B>,
     pub(crate) iterable_location: Option<&'a super::DeclarationLocation>,
     pub(crate) checks_scope: bool,
@@ -1775,6 +1837,8 @@ pub struct ShapeMismatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DeferredForExpansionError {
+    #[error(transparent)]
+    ForKey(#[from] crate::resource::ForKeyError),
     #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
     #[error(transparent)]
@@ -4550,8 +4614,20 @@ impl<P: ValueKind, B: BindingAddress> ModuleCall<P, B> {
         }
     }
 
-    pub(super) fn set_expansion_key(&mut self, expansion_key: String) {
-        self.source.id.expand(expansion_key);
+    pub(super) fn set_expansion_key(&mut self, address: &crate::resource::BoundForAddress<B>) {
+        self.source
+            .id
+            .expand(address.binding_address().as_str().to_string());
+    }
+
+    pub(super) fn set_unbound_expansion_key(
+        &mut self,
+        template: &crate::resource::UnboundLoopTemplate,
+        element: &ForLoopElement,
+    ) {
+        self.source
+            .id
+            .expand(element.address(template.scheduler_key()));
     }
 
     pub(in crate::parser) fn set_loop_origin(
@@ -5106,6 +5182,7 @@ impl SourceSpan {
             pair.as_rule(),
             crate::parser::Rule::module_call
                 | crate::parser::Rule::function_call
+                | crate::parser::Rule::index_access
                 | crate::parser::Rule::for_expr
                 | crate::parser::Rule::if_expr
                 | crate::parser::Rule::resource_expr
@@ -5438,6 +5515,11 @@ impl<B: BindingAddress> ParserBindingMetadata<B> {
     }
     pub(crate) fn structural_handles(&self) -> &IndexMap<B, UnexpandedStructuralHandle<B>> {
         &self.structural_handles
+    }
+
+    pub(crate) fn insert_for_handle(&mut self, binding: B, handle: UnexpandedStructuralHandle<B>) {
+        assert!(handle.is_for_binding());
+        self.structural_handles.insert(binding, handle);
     }
 
     pub(crate) fn insert_resource_source_file(&mut self, id: ResourceId, path: PathBuf) {
@@ -6914,12 +6996,7 @@ impl<E, B: BindingAddress>
         self.deferred_for_phase
             .expressions
             .iter()
-            .filter(|expression| {
-                matches!(
-                    expression.iterable_state,
-                    ParsedDeferredForIterableState::Deferred
-                )
-            })
+            .filter(|expression| expression.iterable_state.checks_scope())
             .map(ParsedDeferredForExpression::site)
     }
 
@@ -8940,7 +9017,7 @@ impl<E> ExpandedFile<E> {
             };
             let miss_policy = bindings.access_miss_policy(&deferred.iterable);
             use crate::resource::knowledge::{Classification, PlanIterable};
-            let iterable = match iterable_value
+            let classification = iterable_value
                 .knowledge(&bindings.knowledge_context())
                 .map(|proof| proof.into_classification())
                 .map_err(|error| {
@@ -8949,7 +9026,18 @@ impl<E> ExpandedFile<E> {
                         crate::value::format_value(&deferred.iterable),
                         error.into(),
                     )
-                })? {
+                })?;
+            if let (DeferredForTarget::Bound(bound), ForBinding::Simple(_)) =
+                (deferred.target(), &deferred.binding)
+                && crate::resource::knowledge::ClassifiedRef::from(&classification).is_protected()
+            {
+                crate::resource::admit_bound_for_addresses(
+                    &deferred.binding,
+                    bound,
+                    crate::resource::knowledge::ClassifiedRef::from(&classification),
+                )?;
+            }
+            let iterable = match classification {
                 Classification::Known(value) => PlanIterable::from_known(value),
                 Classification::ShapeKnown(value) => {
                     Some(PlanIterable::from_shape(value).map_err(|error| {
@@ -8977,16 +9065,17 @@ impl<E> ExpandedFile<E> {
             match (&deferred.binding, &iterable_value) {
                 (
                     ForBinding::Simple(_) | ForBinding::Indexed(_, _),
-                    Value::Concrete(ConcreteValue::List(_)),
+                    Value::Concrete(ConcreteValue::List(_) | ConcreteValue::StringList(_)),
                 )
                 | (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
                     if let Some(iterable) = iterable {
-                        expanded_resources.extend(expand_deferred_children(
-                            deferred,
-                            iterable,
-                            miss_policy,
-                            type_checks,
-                        )?);
+                        match expand_deferred_children(deferred, iterable, miss_policy, type_checks)
+                        {
+                            Err(DeferredForExpansionError::ForKey(
+                                crate::resource::ForKeyError::PlanPending { .. },
+                            )) => continue,
+                            result => expanded_resources.extend(result?),
+                        }
                         resolved_indices.push(idx);
                     }
                 }
@@ -9082,31 +9171,54 @@ pub fn expand_deferred_children<
     miss_policy: crate::resource::AccessMissPolicy,
     type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Vec<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>>, DeferredForExpansionError> {
-    let iterable_value = iterable.for_expansion();
+    let admitted = match deferred.target() {
+        DeferredForTarget::Bound(target) => Some(
+            crate::resource::admit_bound_for_addresses(
+                &deferred.binding,
+                target,
+                iterable.classified(),
+            )
+            .map_err(|error| match error {
+                crate::resource::ForKeyError::Shape { expected, got } => {
+                    DeferredForExpansionError::ShapeMismatch(ShapeMismatch::new(expected, got))
+                }
+                error => DeferredForExpansionError::ForKey(error),
+            })?,
+        ),
+        DeferredForTarget::Unbound { .. } => None,
+    };
+    let iterable_value = match iterable.for_expansion() {
+        Value::Concrete(ConcreteValue::StringList(strings)) => {
+            Value::Concrete(ConcreteValue::List(
+                strings
+                    .into_iter()
+                    .map(|value| Value::Concrete(ConcreteValue::String(value)))
+                    .collect(),
+            ))
+        }
+        other => other,
+    };
     match (&deferred.binding, &iterable_value) {
-        (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(items))) => items
+        (
+            ForBinding::Simple(_) | ForBinding::Indexed(_, _),
+            Value::Concrete(ConcreteValue::List(items)),
+        ) => items
             .iter()
             .enumerate()
             .map(|(index, item)| {
+                let child = match deferred.target() {
+                    DeferredForTarget::Bound(_) => ExpandedForChild::Bound(
+                        &admitted.as_ref().expect("bound list admitted")[index],
+                    ),
+                    DeferredForTarget::Unbound { template } => ExpandedForChild::Unbound {
+                        template,
+                        element: ForLoopElement::Index(index),
+                    },
+                };
                 build_expanded_child(
                     deferred,
-                    ForLoopElement::Index(index),
-                    None,
-                    None,
-                    item,
-                    miss_policy,
-                    type_checks,
-                )
-            })
-            .collect(),
-        (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(items))) => items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                build_expanded_child(
-                    deferred,
-                    ForLoopElement::Index(index),
-                    Some(index as i64),
+                    child,
+                    matches!(deferred.binding, ForBinding::Indexed(_, _)).then_some(index as i64),
                     None,
                     item,
                     miss_policy,
@@ -9118,10 +9230,20 @@ pub fn expand_deferred_children<
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
             keys.into_iter()
-                .map(|key| {
+                .enumerate()
+                .map(|(index, key)| {
+                    let child = match deferred.target() {
+                        DeferredForTarget::Bound(_) => ExpandedForChild::Bound(
+                            &admitted.as_ref().expect("bound map admitted")[index],
+                        ),
+                        DeferredForTarget::Unbound { template } => ExpandedForChild::Unbound {
+                            template,
+                            element: ForLoopElement::Key(key.clone()),
+                        },
+                    };
                     build_expanded_child(
                         deferred,
-                        ForLoopElement::Key(key.clone()),
+                        child,
                         None,
                         Some(key),
                         &map[key],
@@ -9138,6 +9260,15 @@ pub fn expand_deferred_children<
             Err(ShapeMismatch::new("map", deferred_iterable_kind(other)).into())
         }
     }
+}
+
+/// Only the bound arm carries child-address authority.
+enum ExpandedForChild<'a> {
+    Bound(&'a crate::resource::BoundForAddress<AbsoluteBindingAddress>),
+    Unbound {
+        template: &'a crate::resource::UnboundLoopTemplate,
+        element: ForLoopElement,
+    },
 }
 
 fn deferred_iterable_kind(value: &Value) -> &'static str {
@@ -9179,34 +9310,22 @@ fn build_expanded_child<
     D: crate::resource::DeferredDependencyPhase<AbsoluteBindingAddress>,
 >(
     deferred: &DeferredForExpression<S, NoPlaceholder, LoopSlot, AbsoluteBindingAddress, D>,
-    element: ForLoopElement,
+    child: ExpandedForChild<'_>,
     index: Option<i64>,
     key: Option<&str>,
     item: &Value,
     miss_policy: crate::resource::AccessMissPolicy,
     type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>, DeferredForExpansionError> {
-    let mut resource = match deferred.target() {
-        DeferredForTarget::Bound(target) => {
-            let address = element.address(target.binding());
+    let mut resource = match child {
+        ExpandedForChild::Bound(address) => {
             let mut resource = deferred
                 .template_resource
-                .instantiate_with_identity(ResourceIdentity::new(address.clone()));
-            resource.binding = Some(match &element {
-                ForLoopElement::Index(index) => crate::resource::binding_with_index(
-                    target.binding_address(),
-                    (*index)
-                        .try_into()
-                        .expect("for-loop index fits in the signed address domain"),
-                ),
-                ForLoopElement::Key(key) => crate::resource::binding_with_map_key(
-                    target.binding_address(),
-                    &key.as_str().into(),
-                ),
-            });
+                .instantiate_with_identity(address.identity());
+            resource.binding = Some(address.binding_address().clone());
             resource
         }
-        DeferredForTarget::Unbound { template } => {
+        ExpandedForChild::Unbound { template, element } => {
             let mut resource = deferred.template_resource.instantiate();
             resource.binding = None;
             resource.loop_provenance =

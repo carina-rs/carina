@@ -171,13 +171,26 @@ pub(crate) fn parse_postfix_path_segment(
 pub(crate) fn apply_postfix_path_segment(
     value: EvalValue,
     step: PathSegment,
-    line: usize,
+    location: &crate::parser::DeclarationLocation,
 ) -> Result<EvalValue, ParseError> {
+    let line = location.span().start_line();
     let base = match value {
         EvalValue::User(base) => base,
         EvalValue::UnexpandedStructuralHandle(handle) => {
             let binding = handle.canonical_binding_name();
             if let PathSegment::Subscript { index } = &step {
+                if matches!(
+                    handle.kind(),
+                    crate::eval_value::UnexpandedStructuralHandleKind::For(
+                        crate::parser::ForBinding::Simple(_)
+                    )
+                ) && matches!(index, Subscript::Int { .. })
+                {
+                    return Err(ParseError::for_key(
+                        crate::resource::ForKeyError::NumericSubscript,
+                        location,
+                    ));
+                }
                 let binding = match index {
                     Subscript::Int { index } => ValueString::plain(format!("{binding}[{index}]")),
                     Subscript::Str { key } => ValueString::derived_from(
@@ -253,11 +266,11 @@ pub(crate) fn apply_postfix_steps<'i>(
 ) -> Result<EvalValue, ParseError> {
     for pair in steps {
         let evaluation = ctx.evaluation_site(&pair);
-        let line = pair.line_col().0;
+        let location = ctx.declaration_location(&pair);
         value = evaluation
             .evaluate(|| {
                 let step = parse_postfix_path_segment(pair, ctx)?;
-                apply_postfix_path_segment(value, step, line)
+                apply_postfix_path_segment(value, step, &location)
             })
             .map_err(ParseError::from)?;
     }
@@ -404,7 +417,6 @@ fn parse_namespaced_id_value(
     ctx: &ParseContext,
     trailing_segments: Vec<PathSegment>,
 ) -> Result<EvalValue, ParseError> {
-    let line = pair.line_col().0;
     let full_str = pair.as_str();
     let parts: Vec<&str> = full_str.split('.').collect();
     // Pest's `namespaced_id = @{ identifier ~ ("." ~ ...)+ }` rule
@@ -468,11 +480,12 @@ fn parse_namespaced_id_value(
                     PathSegment::Field {
                         name: (*field).to_string(),
                     },
-                    line,
+                    &ctx.declaration_location(&pair),
                 )?;
             }
             for segment in trailing_segments {
-                value = apply_postfix_path_segment(value, segment, line)?;
+                value =
+                    apply_postfix_path_segment(value, segment, &ctx.declaration_location(&pair))?;
             }
             return Ok(value);
         }
@@ -943,7 +956,9 @@ fn parse_primary_eval_with_mode_inner(
                         );
                     }
                     ParseBindingRef::Structural(handle)
-                        if handle.is_parameter_handle() || handle.alias_name().is_some() =>
+                        if handle.is_parameter_handle()
+                            || handle.is_for_binding()
+                            || handle.alias_name().is_some() =>
                     {
                         return apply_postfix_steps(
                             EvalValue::structural_handle(handle.clone()),

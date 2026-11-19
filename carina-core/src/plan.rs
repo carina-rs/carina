@@ -2359,13 +2359,13 @@ mod tests {
         let deferred = crate::parser::DeferredForExpression::new(
             None,
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             template_resource,
         );
         let mut plan = Plan::new();
@@ -2397,13 +2397,13 @@ mod tests {
         let template = DeferredForExpression::new(
             None,
             1,
-            "for opt in cert.domain_validation_options".to_string(),
+            "for (_, opt) in cert.domain_validation_options".to_string(),
             crate::parser::DeferredForTarget::bound(
                 crate::resource::absolute_binding_address_for_test("validation_records"),
             )
             .expect("fixture binding is valid"),
             Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-            ForBinding::Simple("opt".to_string()),
+            ForBinding::Indexed("_".into(), "opt".to_string()),
             template_resource,
         );
         let deletes = (0..3)

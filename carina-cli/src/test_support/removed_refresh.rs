@@ -387,7 +387,7 @@ async fn removed_no_refresh_deferred_child_collision() {
             name = "parent"
             rules = [{ action = "child" }]
         }
-        let children = for rule in parent.rules {
+        let children = for (_, rule) in parent.rules {
             mock.test.resource { name = rule.action }
         }
         removed { from = mock.test.resource 'children[0]' }

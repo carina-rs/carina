@@ -267,13 +267,13 @@ fn validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExp
     crate::parser::DeferredForExpression::new(
         Some("main.crn".to_string()),
         1,
-        "for opt in cert.domain_validation_options".to_string(),
+        "for (_, opt) in cert.domain_validation_options".to_string(),
         crate::parser::DeferredForTarget::bound(
             crate::resource::absolute_binding_address_for_test("validation_records"),
         )
         .expect("fixture binding is valid"),
         Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-        crate::parser::ForBinding::Simple("opt".to_string()),
+        crate::parser::ForBinding::Indexed("_".into(), "opt".to_string()),
         template_resource,
     )
 }
@@ -8290,7 +8290,7 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
     let provider = MockProvider::new();
     let mut parsed = crate::parser::parse(
         r#"
-            let roles = for n in [0] {
+            let roles = for (_, n) in [0] {
                 mock.test.Thing { name = "role" }
             }
             let r0 = roles[0]
@@ -14511,10 +14511,10 @@ async fn deferred_reversed_history(coexisting_child: bool) {
     let template = crate::parser::DeferredForExpression::new(
         None,
         1,
-        "for opt in cert.domain_validation_options".into(),
+        "for (_, opt) in cert.domain_validation_options".into(),
         crate::parser::DeferredForTarget::bound(absolute_binding("validation_records")).unwrap(),
         Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
-        crate::parser::ForBinding::Simple("opt".into()),
+        crate::parser::ForBinding::Indexed("_".into(), "opt".into()),
         resource,
     );
     let gate = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(

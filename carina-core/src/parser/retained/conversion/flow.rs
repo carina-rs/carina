@@ -68,7 +68,7 @@ impl PlacementRole {
             | ExprKind::Access(_)
             | ExprKind::Integer { .. }
             | ExprKind::Iterable
-            | ExprKind::For
+            | ExprKind::For { .. }
             | ExprKind::Wait
             | ExprKind::Compose
             | ExprKind::DynamicAccess

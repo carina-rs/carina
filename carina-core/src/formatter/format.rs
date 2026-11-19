@@ -1154,11 +1154,11 @@ mod tests {
 
     #[test]
     fn test_format_for_expression() {
-        let input = "let subnets = for subnet in subnets {\n  awscc.ec2.Subnet {\n    cidr_block = subnet.cidr\n  }\n}\n";
+        let input = "let subnets = for (_, subnet) in subnets {\n  awscc.ec2.Subnet {\n    cidr_block = subnet.cidr\n  }\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
         assert!(
-            result.contains("for subnet in subnets"),
+            result.contains("for (_, subnet) in subnets"),
             "Expected for expression in:\n{}",
             result
         );
@@ -1221,7 +1221,7 @@ mod tests {
                      let paren = ({ a = 'z' }).a\n\
                      let chain = { a = { b = 'z' } }.a.b\n\
                      \n\
-                     let generated = for item in [{ a = 'z' }] {\n\
+                     let generated = for (_, item) in [{ a = 'z' }] {\n\
                        mock.test.Thing { name = ({ a = item.a }).a }\n\
                      }\n";
         let config = FormatConfig::default();
@@ -1256,7 +1256,7 @@ mod tests {
                         \x20 }\n\
                         }.a.b\n\
                         \n\
-                        let generated = for item in [{\n\
+                        let generated = for (_, item) in [{\n\
                         \x20 a = 'z'\n\
                         }] {\n\
                         \x20 mock.test.Thing {\n\

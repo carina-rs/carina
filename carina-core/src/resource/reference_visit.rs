@@ -67,8 +67,9 @@ impl<B: BindingAddress> DependencyKey<B> {
     pub fn matches_name(&self, name: &str) -> bool {
         self.0.as_str() == name
     }
-    pub fn starts_with(&self, prefix: &str) -> bool {
-        self.0.as_str().starts_with(prefix)
+    pub fn is_descendant_of(&self, ancestor: &B) -> bool {
+        super::decompose_binding_address(self.0.as_str())
+            .is_some_and(|address| address.is_descendant_of(ancestor.as_str()))
     }
     pub fn lookup_by_name<'a, V>(&self, keys: &'a HashMap<String, V>) -> Option<&'a V> {
         keys.get(self.0.as_str())

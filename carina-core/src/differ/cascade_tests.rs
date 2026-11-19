@@ -1197,7 +1197,7 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
     use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
     use crate::resource::{LoopSlot, ModuleSource};
     for binding in [
-        ForBinding::Simple("vpc".into()),
+        ForBinding::Indexed("_".into(), "vpc".into()),
         ForBinding::Indexed("vpc".into(), "value".into()),
         ForBinding::Map("key".into(), "vpc".into()),
     ] {
@@ -1230,7 +1230,7 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
         let deferred = DeferredForExpression::new(
             None,
             1,
-            "for vpc in other.items".into(),
+            "for (_, vpc) in other.items".into(),
             DeferredForTarget::bound(absolute_binding("subnets")).unwrap(),
             ref_value("other", "items"),
             binding,
@@ -1310,10 +1310,10 @@ fn deferred_create_cbd_plan(
     let deferred = DeferredForExpression::new(
         Some("main.crn".into()),
         2,
-        format!("for subnet in {producer_binding}.subnets"),
+        format!("for (_, subnet) in {producer_binding}.subnets"),
         target,
         ref_value(producer_binding, "subnets"),
-        ForBinding::Simple("subnet".into()),
+        ForBinding::Indexed("_".into(), "subnet".into()),
         template,
     );
     let (schemas, provider) = crate::provider::comparison_fixture_for_test(

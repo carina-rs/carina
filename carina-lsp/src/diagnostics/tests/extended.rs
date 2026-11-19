@@ -1083,7 +1083,7 @@ fn anonymous_loop_attribute_derived_diagnostic_has_exact_range() {
             "identified safely because multiple 'mock.test.Thing' elements derive identity ",
             "from mutable attributes.\n",
             "Rewrite the loop with a binding and migrate its existing state addresses:\n\n",
-            "let thing = for name in ['alpha', 'beta'] {\n",
+            "let thing = for (_, name) in ['alpha', 'beta'] {\n",
             "  mock.test.Thing {\n",
             "    name = name\n",
             "  }\n",
@@ -1185,7 +1185,7 @@ fn anonymous_loop_identical_identity_diagnostic_has_exact_range() {
     assert!(
         diagnostic
             .message
-            .contains("let resource = for name in ['same', 'same']")
+            .contains("let resource = for (_, name) in ['same', 'same']")
     );
     assert!(
         diagnostic

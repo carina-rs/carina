@@ -173,7 +173,7 @@ fn live_apply_and_cached_plan_match_refreshing_plan_for_state_materialized_child
   name = "certificate"
 }
 
-let validation_records = for rule in cert.generated_rules {
+let validation_records = for (_, rule) in cert.generated_rules {
   mock.test.resource {
     name    = rule.action
     comment = "before"
@@ -189,7 +189,7 @@ let validation_records = for rule in cert.generated_rules {
   name = "certificate"
 }
 
-let validation_records = for rule in cert.generated_rules {
+let validation_records = for (_, rule) in cert.generated_rules {
   mock.test.resource {
     name    = rule.action
     comment = "after"
@@ -279,7 +279,7 @@ fn live_apply_uses_apply_mode_for_upstream_value_on_materialized_child() {
   name = "certificate"
 }
 
-let validation_records = for rule in cert.generated_rules {
+let validation_records = for (_, rule) in cert.generated_rules {
   mock.test.resource {
     name    = rule.action
     comment = "before"
@@ -325,7 +325,7 @@ import {
   id = "${up.child_comment}"
 }
 
-let validation_records = for rule in cert.generated_rules {
+let validation_records = for (_, rule) in cert.generated_rules {
   mock.test.resource {
     name    = rule.action
     comment = "after"

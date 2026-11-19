@@ -11064,11 +11064,11 @@ fn deferred_block_name_conflict_reports_materialized_template_address() {
     let deferred = carina_core::parser::DeferredForExpression::new(
         Some("main.crn".to_string()),
         4,
-        "for item in pending.items".to_string(),
+        "for (_, item) in pending.items".to_string(),
         carina_core::parser::DeferredForTarget::bound(absolute_binding("rs"))
             .expect("fixture binding is valid"),
         Value::resource_ref("pending", "items", Vec::new()).resolve_root_for_test(),
-        carina_core::parser::ForBinding::Simple("item".to_string()),
+        carina_core::parser::ForBinding::Indexed("_".into(), "item".to_string()),
         template_resource,
     );
     let unresolved = carina_core::parser::ParsedFile::default();

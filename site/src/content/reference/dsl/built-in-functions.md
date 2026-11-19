@@ -130,6 +130,8 @@ flatten([[1, [2, 3]]])  # => [1, [2, 3]]
 
 Returns the number of elements in a list or map, or the length of a string in bytes (UTF-8).
 
+A resource loop binding is a structural handle, so `length(rs)` is invalid. Select attributes into an explicitly authored value collection instead. Counting a list with pending members does not make those members eligible as value keys: a simple bound loop needs distinct public Strings; use `(i, x)` for index addresses.
+
 ```
 length(value: list(Any) | map(Any) | String) -> Int
 ```
@@ -176,7 +178,7 @@ envs |> map('.cidr')  # => { dev = '10.0.0.0/16', stg = '10.1.0.0/16' }
 
 ### `keys`
 
-Returns the keys of a map as a sorted list of strings.
+Returns the keys of a map as a sorted list of strings. It accepts a map value, not a resource-loop handle; `keys(rs)` is invalid for a bound loop. Simple list and map loop instances use String subscripts when selecting attributes.
 
 ```
 keys(map: map(Any)) -> list(String)

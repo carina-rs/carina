@@ -5,6 +5,107 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use super::ValueString;
 
+/// A checked decomposition of an existing binding spelling. This grants no
+/// authority to construct a new resource address.
+#[derive(Debug)]
+pub struct CheckedBindingAddress<'a> {
+    spelling: &'a str,
+    ends: Vec<usize>,
+}
+
+impl<'a> CheckedBindingAddress<'a> {
+    pub fn candidate_ancestors(&self) -> impl Iterator<Item = &'a str> + '_ {
+        self.ends[..self.ends.len() - 1]
+            .iter()
+            .map(|&end| &self.spelling[..end])
+    }
+
+    pub fn is_direct_child_of(&self, parent: &str) -> bool {
+        self.ends.len() > 1 && &self.spelling[..self.ends[self.ends.len() - 2]] == parent
+    }
+
+    pub fn is_descendant_of(&self, ancestor: &str) -> bool {
+        self.candidate_ancestors()
+            .any(|candidate| candidate == ancestor)
+    }
+
+    pub fn is_self_or_descendant_of(&self, ancestor: &str) -> bool {
+        self.spelling == ancestor || self.is_descendant_of(ancestor)
+    }
+}
+
+/// Decompose dot fields, numeric subscripts, and existing quoted-key spelling.
+/// Key contents are opaque: this neither escapes nor normalizes them.
+pub fn decompose_binding_address(spelling: &str) -> Option<CheckedBindingAddress<'_>> {
+    let bytes = spelling.as_bytes();
+    let root_end = bytes
+        .iter()
+        .position(|b| matches!(b, b'.' | b'['))
+        .unwrap_or(bytes.len());
+    if root_end == 0 {
+        return None;
+    }
+    // A closing quote may itself be key content. Keep only closures whose
+    // remaining suffix is a valid address, without interpreting key escapes.
+    let mut next = vec![None; bytes.len() + 1];
+    next[bytes.len()] = Some(bytes.len());
+    let mut single_closures = Vec::new();
+    let mut double_closures = Vec::new();
+    for cursor in (root_end..bytes.len()).rev() {
+        next[cursor] = match bytes[cursor] {
+            b'.' => {
+                let start = cursor + 1;
+                let mut end = start;
+                while end < bytes.len() && !matches!(bytes[end], b'.' | b'[') {
+                    end += 1;
+                }
+                (crate::utils::is_identifier_safe(&spelling[start..end]) && next[end].is_some())
+                    .then_some(end)
+            }
+            b'[' => match bytes.get(cursor + 1).copied() {
+                Some(quote @ (b'\'' | b'"')) => {
+                    let closures = if quote == b'\'' {
+                        &single_closures
+                    } else {
+                        &double_closures
+                    };
+                    closures
+                        .iter()
+                        .rev()
+                        .find(|&&closing| closing >= cursor + 2)
+                        .map(|closing| closing + 2)
+                }
+                Some(b'0'..=b'9') => {
+                    let mut end = cursor + 1;
+                    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                        end += 1;
+                    }
+                    (bytes.get(end) == Some(&b']') && next[end + 1].is_some()).then_some(end + 1)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if matches!(bytes[cursor], b'\'' | b'"')
+            && bytes.get(cursor + 1) == Some(&b']')
+            && next[cursor + 2].is_some()
+        {
+            if bytes[cursor] == b'\'' {
+                single_closures.push(cursor);
+            } else {
+                double_closures.push(cursor);
+            }
+        }
+    }
+    let mut ends = vec![root_end];
+    let mut cursor = root_end;
+    while cursor < bytes.len() {
+        cursor = next[cursor]?;
+        ends.push(cursor);
+    }
+    Some(CheckedBindingAddress { spelling, ends })
+}
+
 mod private {
     use super::ValueString;
 
@@ -489,6 +590,17 @@ pub(crate) fn binding_collection<B: BindingAddress>(binding: &B, index: usize) -
 #[cfg(test)]
 mod tests {
     use super::AbsoluteBindingAddress;
+
+    #[test]
+    fn for_value_keys_membership_opaque_quoted_keys() {
+        for key in ["a']x", "a[b].c", "a'b", "a\\", ""] {
+            let spelling = crate::utils::map_key_address("rs", key);
+            let checked = super::decompose_binding_address(&spelling)
+                .unwrap_or_else(|| panic!("existing key spelling must be recognized: {spelling}"));
+            assert!(checked.is_direct_child_of("rs"), "{spelling}");
+            assert_eq!(checked.candidate_ancestors().collect::<Vec<_>>(), ["rs"]);
+        }
+    }
 
     #[test]
     fn persisted_absolute_binding_address_rejects_empty_spelling() {

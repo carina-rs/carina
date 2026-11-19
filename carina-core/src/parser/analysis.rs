@@ -165,6 +165,8 @@ impl DeclarationLocation {
                 | Rule::variable_ref
                 | Rule::postfix_expr
                 | Rule::subscripted_id
+                | Rule::index_access
+                | Rule::field_access
                 | Rule::validate_additive_expr
                 | Rule::validate_multiplicative_expr
                 | Rule::validate_primary
@@ -1003,6 +1005,10 @@ impl<'a, P: ValueKind, B: BindingAddress> AnalysisForRef<'a, P, B> {
     pub fn binding(&self) -> &'a super::ForBinding {
         self.site.binding
     }
+    pub fn target(&self) -> &'a super::DeferredForTarget<B> {
+        self.site.target
+    }
+
     pub fn header(&self) -> &'a str {
         self.site.header
     }
@@ -2282,19 +2288,10 @@ where
             .filter(|(_, handle)| handle.is_for_binding())
             .map(|(binding, _)| binding.to_string())
             .collect();
-        for resource in file.iter_all_resources() {
-            if matches!(
-                resource,
-                ResourceRef::Resource(_) | ResourceRef::Deferred { .. }
-            ) && let Some(binding) = resource.binding_address()
-            {
-                loop_groups.extend(
-                    crate::resolved_graph::loop_group_bindings(binding)
-                        .into_iter()
-                        .map(|group| group.to_string()),
-                );
-            }
-        }
+        loop_groups.extend(
+            file.deferred_for_sites()
+                .filter_map(|site| site.target.bound_binding_address().map(ToString::to_string)),
+        );
         for export in &file.export_params {
             if let Some(value) = export.value() {
                 collect_value_references(

@@ -434,7 +434,7 @@ impl<'s, B: BindingAddress> AuthoredUse<'s, B> {
             | ExprKind::Integer { .. }
             | ExprKind::Iterable
             | ExprKind::Resource { .. }
-            | ExprKind::For
+            | ExprKind::For { .. }
             | ExprKind::Wait
             | ExprKind::Compose
             | ExprKind::DynamicAccess
@@ -1507,7 +1507,7 @@ impl<B: BindingAddress> ExpressionReport<B> {
                 | ExprKind::Iterable
                 | ExprKind::Resource { .. }
                 | ExprKind::Sink { .. }
-                | ExprKind::For
+                | ExprKind::For { .. }
                 | ExprKind::Wait
                 | ExprKind::Compose
                 | ExprKind::ModuleCall

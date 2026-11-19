@@ -350,7 +350,7 @@ fn validate_reports_runtime_deferred_module_call_body_at_resolution_seam() {
             "main.crn",
             "let child = use { source = './child' }\n\
              let cert = aws.acm.Certificate { domain_name = 'example.com' }\n\
-             let items = for item in cert.domain_validation_options { child { item = item } }\n",
+             let items = for (_, item) in cert.domain_validation_options { child { item = item } }\n",
         ),
     ]);
     std::fs::create_dir(fixture.path().join("child")).expect("child directory");
@@ -366,7 +366,7 @@ fn validate_reports_runtime_deferred_module_call_body_at_resolution_seam() {
     );
     assert!(
         errors.iter().any(|error| {
-            error.contains("for item in cert.domain_validation_options")
+            error.contains("for (_, item) in cert.domain_validation_options")
                 && error.contains("module call `child`")
                 && error.contains("line 3")
                 && error.contains("still unresolved after module expansion")
@@ -382,7 +382,7 @@ fn validate_reports_runtime_deferred_read_body_at_resolution_seam() {
         (
             "main.crn",
             "let cert = aws.acm.Certificate { domain_name = 'example.com' }\n\
-             let items = for item in cert.domain_validation_options {\n\
+             let items = for (_, item) in cert.domain_validation_options {\n\
                read aws.route53.RecordSet { name = item }\n\
              }\n",
         ),
@@ -394,7 +394,7 @@ fn validate_reports_runtime_deferred_read_body_at_resolution_seam() {
     );
     assert!(
         errors.iter().any(|error| {
-            error.contains("for item in cert.domain_validation_options")
+            error.contains("for (_, item) in cert.domain_validation_options")
                 && error.contains("read `aws.route53.RecordSet`")
                 && error.contains("line 2")
                 && error.contains("still unresolved after module expansion")
@@ -450,11 +450,11 @@ fn validate_reports_every_rejected_loop_across_files() {
         ),
         (
             "first.crn",
-            "let first = for item in cert.domain_validation_options { child { item = item } }\n",
+            "let first = for (_, item) in cert.domain_validation_options { child { item = item } }\n",
         ),
         (
             "second.crn",
-            "let second = for item in cert.domain_validation_options { child { item = item } }\n",
+            "let second = for (_, item) in cert.domain_validation_options { child { item = item } }\n",
         ),
     ]);
     std::fs::create_dir(fixture.path().join("child")).expect("child directory");

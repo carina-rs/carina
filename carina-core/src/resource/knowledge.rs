@@ -2215,6 +2215,13 @@ impl<P: PlaceholderKind, B: BindingAddress> SiteSource<B> for ApplyPending<'_, P
     }
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress> PlanIterable<'a, P, B> {
+    pub(crate) fn classified(&self) -> ClassifiedRef<'_, 'a, P, B> {
+        match self.node.as_ref() {
+            kernel::IterableNode::Known { value, .. } => ClassifiedRef::Known(value),
+            kernel::IterableNode::Shape(value) => ClassifiedRef::Shape(value),
+        }
+    }
+
     pub(crate) fn for_expansion(&self) -> Value<P, B> {
         match self.node.as_ref() {
             kernel::IterableNode::Known { value, .. } => value.to_value(),

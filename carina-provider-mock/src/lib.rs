@@ -335,6 +335,13 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
             )
             .attribute(
                 AttributeSchema::provider_populated(
+                    "generated_strings",
+                    AttributeType::list(AttributeType::string()),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::provider_populated(
                     "generated_rules",
                     AttributeType::list(AttributeType::struct_(
                         "GeneratedRule",
@@ -1395,6 +1402,25 @@ impl MockProvider {
             }
         };
 
+        let generated_strings = if id.resource_type == "test.deferred_source" {
+            match self
+                .behavior
+                .generated_strings
+                .as_deref()
+                .map(serde_json::from_str::<Vec<String>>)
+                .transpose()
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    return Err(attempt.not_created(ProviderError::invalid_input(
+                        "mock generated_strings control must be a JSON String list",
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         if let Some(delay) = self
             .behavior
             .create_delay
@@ -1425,6 +1451,17 @@ impl MockProvider {
         let identifier = Self::mint_identifier();
 
         let mut persisted_values = resource.resolved_attributes();
+        if let Some(strings) = generated_strings {
+            persisted_values.insert(
+                "generated_strings".into(),
+                Value::Concrete(ConcreteValue::List(
+                    strings
+                        .into_iter()
+                        .map(|value| Value::Concrete(ConcreteValue::String(value.into())))
+                        .collect(),
+                )),
+            );
+        }
         if let Err(error) = self.canonicalize_mock_reference_write(&id, &mut persisted_values) {
             return Err(attempt.not_created(error));
         }
@@ -3912,6 +3949,41 @@ mod tests {
 
         outcome.unwrap();
         assert_eq!(elapsed, Duration::from_millis(25));
+    }
+    #[tokio::test]
+    async fn for_value_keys_generated_strings_schema_and_controls() {
+        let schemas = builtin_schemas();
+        let schema = schemas
+            .iter()
+            .find(|schema| schema.as_schema().resource_type() == "test.deferred_source")
+            .unwrap();
+        assert!(
+            schema.effective_attribute("generated_strings").is_some(),
+            "apply-time String-list source must be provider-populated"
+        );
+        let environment = carina_core::EnvironmentSnapshot::new([(
+            "CARINA_MOCK_GENERATED_STRINGS".to_string(),
+            "[\"a\",\"b\"]".into(),
+        )]);
+        let controls = crate::behavior::decode_controls(&environment);
+        let provider =
+            ConfiguredBuiltinMock::new(controls.behavior, MockScope::memory()).create_provider();
+        let resource = Resource::with_provider("mock", "test.deferred_source", "source", None)
+            .with_attribute("name", string_value("producer"));
+        let id = resource.id.clone();
+        let identifier =
+            created_identifier(dispatch_mock_create(&provider, resource).await.unwrap());
+        let state = provider
+            .read(&id, &identifier, ReadRequest)
+            .await
+            .unwrap()
+            .into_state();
+        let expected: carina_core::resource::SnapshotValue =
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("a".into())),
+                Value::Concrete(ConcreteValue::String("b".into())),
+            ]));
+        assert_eq!(state.attributes["generated_strings"], expected);
     }
 }
 

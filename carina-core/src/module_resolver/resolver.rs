@@ -460,6 +460,7 @@ impl ResidualModuleResolutionError {
                 | ParseError::Evaluation { .. }
                 | ParseError::UnavailableSecret(_)
                 | ParseError::InvalidFloatLiteral { line: _, source: _ }
+                | ParseError::ForKey(_)
                 | ParseError::InvalidExpression {
                     line: _,
                     message: _,
@@ -2527,7 +2528,8 @@ fn deferred_for_resource_expression_error(
         crate::parser::DeferredForResourceExpressionError::UndefinedIterable(error) => {
             parse_error_to_module_error(error)
         }
-        crate::parser::DeferredForResourceExpressionError::Unsupported { file, error } => {
+        crate::parser::DeferredForResourceExpressionError::Admission { file, error }
+        | crate::parser::DeferredForResourceExpressionError::Unsupported { file, error } => {
             let error = ParseError::AtElement(error);
             match file {
                 Some(path) => ModuleError::ParseInFile {

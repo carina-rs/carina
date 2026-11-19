@@ -291,6 +291,42 @@ pub(crate) fn preprocess_file(input: &str) -> Result<PreprocessedFile, ParseErro
     Ok(PreprocessedFile::from_preprocessed(preprocess_result))
 }
 
+/// Keep an anonymous loop's suggested numeric moves consistent with the
+/// suggested bound syntax, without changing its authored source or identity.
+pub(crate) fn indexed_bound_loop_rewrite(source: &str) -> std::borrow::Cow<'_, str> {
+    let Ok(file) = preprocess_file(source) else {
+        return source.into();
+    };
+    let Some(statement) = file.parse().ok().and_then(|mut pairs| {
+        pairs
+            .next()?
+            .into_inner()
+            .find(|pair| pair.as_rule() == Rule::statement)
+    }) else {
+        return source.into();
+    };
+    let Some(expression) = statement
+        .into_inner()
+        .next()
+        .filter(|pair| pair.as_rule() == Rule::for_expr)
+    else {
+        return source.into();
+    };
+    let binding = expression.into_inner().next().expect("for binding grammar");
+    let Ok(super::ForBinding::Simple(value)) =
+        super::expressions::for_expr::parse_for_binding(binding.clone())
+    else {
+        return source.into();
+    };
+    let range = binding.as_span();
+    let mut rewritten = source.to_string();
+    rewritten.replace_range(
+        file.original_byte(range.start())..file.original_byte(range.end()),
+        &format!("(_, {value})"),
+    );
+    rewritten.into()
+}
+
 pub(super) fn parse_type_expr_fragment(
     input: &str,
 ) -> Result<Pairs<'_, Rule>, pest::error::Error<Rule>> {

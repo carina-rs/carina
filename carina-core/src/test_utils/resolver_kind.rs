@@ -328,6 +328,9 @@ pub(crate) fn same_parse_error(
         }};
     }
     match a {
+        ParseError::ForKey(diagnostic) => {
+            matches!(b, ParseError::ForKey(other) if diagnostic == other)
+        }
         ParseError::Located { path, error } => {
             if let ParseError::Located {
                 path: other_path,

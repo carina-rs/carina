@@ -952,6 +952,7 @@ impl std::fmt::Display for LoopAnonymousIdentityConflict {
         let Some(source) = self.origin.source().source_text() else {
             return Ok(());
         };
+        let source = crate::parser::indexed_bound_loop_rewrite(source);
         write!(
             formatter,
             "\nRewrite the loop with a binding and migrate its existing state addresses:\n\n\

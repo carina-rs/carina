@@ -268,11 +268,10 @@ impl UnexpandedDependencies<RelativeBindingName> {
                     RelativeBindingName::new(name.as_str())
                 }
             };
-            let selected_prefix = format!("{}[", binding.as_str());
             if !bindings.contains(&crate::resource::DependencyKey::new(binding.clone()))
                 && !bindings
                     .iter()
-                    .any(|binding| binding.starts_with(&selected_prefix))
+                    .any(|selected| selected.is_descendant_of(&binding))
             {
                 continue;
             }

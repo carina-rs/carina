@@ -1091,7 +1091,7 @@ impl<B: BindingAddress> Owner<'_, B> {
                 | ExprKind::If
                 | ExprKind::Function { .. }
                 | ExprKind::Resource { .. }
-                | ExprKind::For
+                | ExprKind::For { .. }
                 | ExprKind::ModuleCall
                 | ExprKind::ProviderDeclaration
                 | ExprKind::RequireCondition
@@ -2486,7 +2486,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         resource_type: _,
                         read: _,
                     }
-                    | ExprKind::For
+                    | ExprKind::For { .. }
                     | ExprKind::ModuleCall
                     | ExprKind::ProviderDeclaration
                     | ExprKind::RequireCondition

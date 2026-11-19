@@ -1137,7 +1137,7 @@ fn loop_selection(id: &'static str, construct: &'static str, x: &'static str, y:
     let mut row = Row::new(id, construct, x, "Sink", "");
     row.second_source = Some(y);
     row.main =
-        "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+        "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             .into();
 
     measure(row);

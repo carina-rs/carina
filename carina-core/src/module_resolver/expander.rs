@@ -1194,6 +1194,20 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         *expanded_parser_metadata.syntax = instance.parser_binding_metadata.syntax().clone();
         expanded_parser_metadata.directive_findings =
             instance.parser_binding_metadata.directive_findings.clone();
+        for (binding, handle) in module
+            .parser_binding_metadata
+            .structural_handles()
+            .iter()
+            .chain(selected.parser_binding_metadata.structural_handles())
+            .filter(|(_, handle)| handle.is_for_binding())
+        {
+            expanded_parser_metadata.insert_for_handle(
+                module_scope_resolver.scope.resolve(binding.clone()),
+                handle
+                    .clone()
+                    .resolve_bindings(&mut |binding| module_scope_resolver.scope.resolve(binding)),
+            );
+        }
         let mut expanded_binding_uses =
             resolve_module_binding_uses::<P>(module, &module_scope_resolver)
                 .map_err(contextualize_access_error)?;
@@ -4038,7 +4052,7 @@ fn expand_parsed_deferred_for_expression(
             crate::parser::DeferredForTarget::Unbound { template }
         }
     };
-    let iterable_state = if matches!(iterable_state, ParsedDeferredForIterableState::Deferred)
+    let iterable_state = if iterable_state.checks_scope()
         && crate::parser::contains_module_argument_matching(iterable, &mut |name| {
             resolver
                 .arguments
@@ -4046,7 +4060,9 @@ fn expand_parsed_deferred_for_expression(
                 .get(name)
                 .is_some_and(|argument| argument.forwarded_from_enclosing_parameter)
         }) {
-        ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument
+        ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument {
+            value_keys_pending: iterable_state.value_keys_pending(),
+        }
     } else {
         iterable_state.clone()
     };
@@ -4791,7 +4807,7 @@ mod tests {
                 let config =
                     crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
                 let module = crate::parser::parse_file(
-                    "arguments { flags: list(Bool) = [false] }\nlet inner = use { source = '../inner' }\nlet children = for flag in flags { inner { protect = flag literal = false } }\n",
+                    "arguments { flags: list(Bool) = [false] }\nlet inner = use { source = '../inner' }\nlet children = for (_, flag) in flags { inner { protect = flag literal = false } }\n",
                     std::path::Path::new("outer/main.crn"),
                     &config,
                 ).unwrap();

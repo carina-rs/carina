@@ -274,7 +274,7 @@ fn migration_check_expands_same_config_for_from_copied_state_without_provider_re
     .expect("write state-backed iterable source");
     fs::write(
         project.join("children.crn"),
-        r#"let children = for rule in source.generated_rules {
+        r#"let children = for (_, rule) in source.generated_rules {
   mock.test.resource { name = rule.action }
 }
 "#,

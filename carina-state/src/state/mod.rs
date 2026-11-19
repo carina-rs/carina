@@ -1166,10 +1166,8 @@ impl StateFile {
                         .into_iter()
                         .flatten()
                         .any(|address| {
-                            address == prefix
-                                || address.strip_prefix(prefix).is_some_and(|suffix| {
-                                    suffix.starts_with('[') || suffix.starts_with('.')
-                                })
+                            carina_core::resource::decompose_binding_address(address)
+                                .is_some_and(|address| address.is_self_or_descendant_of(prefix))
                         })
                     });
                 owned_by_residual_loop.then_some(LegacyReadRequiredRow {

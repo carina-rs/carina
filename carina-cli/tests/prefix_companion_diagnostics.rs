@@ -432,7 +432,7 @@ async fn prefix_companion_deferred_for_remains_rejected() {
         ),
         (
             "main.crn",
-            "let children = for item in src.domain_validation_options {\n  mock.test.resource { name_prefix = 'x' }\n}\n",
+            "let children = for (_, item) in src.domain_validation_options {\n  mock.test.resource { name_prefix = 'x' }\n}\n",
         ),
     ]);
     let cli = fixture.cli(false);

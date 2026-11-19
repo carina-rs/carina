@@ -9,9 +9,9 @@ Carina supports `for` and `if` expressions to dynamically generate resources. Th
 
 A `for` expression creates multiple resources by iterating over a list or map.
 
-Expansion needs the collection's length or keys. Its elements can still depend on resources created during apply: `[producer_a.identifier, producer_b.identifier]` has two elements, so its managed-resource loop produces two planned children with the original reference dependencies. Known indices and map keys are available to the body immediately.
+A `let`-bound simple list loop uses each element's String value as its child address. Its length alone is insufficient: each key must be known and public. Indexed loops need the list's length, and map loops need its keys; their element values may still await apply. For example, use `for (i, x) in [producer_a.identifier, producer_b.identifier]` to plan two children before those identifiers are available.
 
-When the collection's membership is unknown, a managed-resource loop remains a deferred block with an unknown count. It does not count as zero children. Module-call and `read` bodies must have their iterable available before module expansion; they cannot be deferred until apply. A provider output's length or keys are not inferred from unrelated inputs.
+When the whole collection is unknown, a managed-resource loop remains a deferred block with an unknown count. It may expand after its producer applies and must then pass the same key checks. A shape-known simple list with unresolved members is deferred until planning; an element that will only become known during apply is rejected. Module-call and `read` bodies cannot remain deferred: for a partial list, use `(i, x)` when its length is already known. A provider output's length or keys are not inferred from unrelated inputs.
 
 ### Iterating over a list
 
@@ -36,11 +36,15 @@ let vpcs = for env in ['dev', 'stg'] {
 }
 ```
 
-This creates two VPCs, one for each environment.
+This creates `vpcs.dev` and `vpcs.stg`. Reordering the list preserves both addresses; inserting or removing a String affects only that child. List traversal still follows the authored order.
+
+The elements must be distinct Strings. Numbers, booleans, durations, enum values, lists, maps, structs, and resource handles cannot be keys. A proven non-String element type is rejected even for an empty typed list. Protected collections, protected members, and diagnostic-sensitive Strings are also rejected; their contents never become addresses or diagnostic text. Rewrite the elements as public Strings or use `for (i, x) in ...`.
+
+These rules apply to `let`-bound loops with resource, `read`, or module bodies. Anonymous loops keep their schema-derived identities and existing struct-list support.
 
 ### Indexed iteration
 
-Use the `(index, value)` form to access the iteration index:
+Use the `(index, value)` form to opt into positional addresses, including when iterating over structs or repeated values:
 
 ```crn
 let vpcs = for (i, env) in ['dev', 'stg'] {
@@ -55,7 +59,7 @@ let vpcs = for (i, env) in ['dev', 'stg'] {
 }
 ```
 
-The index `i` starts at 0. Here it is used with `cidr_subnet` to assign different CIDR blocks to each VPC.
+The index `i` starts at 0, producing `vpcs[0]` and `vpcs[1]`. Here it is also used with `cidr_subnet` to assign different CIDR blocks. Changing list order can change which element occupies each address.
 
 ### Iterating over a map
 
@@ -81,7 +85,9 @@ let vpcs = for name, cidr in cidrs {
 
 ### Accessing for expression results
 
-Iterating over a list produces a list, and iterating over a map produces a map with the same keys. Access individual elements with index syntax — `vpcs[0]` for a list result, `vpcs['dev']` for a map result:
+A bound loop is a structural group. Select an instance attribute with a String subscript for simple list and map loops (`vpcs['dev'].vpc_id`), or an integer subscript for indexed loops (`vpcs[0].vpc_id`). `vpcs[0]` on a simple list loop is an error that points to the indexed form. Bare `length(vpcs)` and bare-value exports of the group remain errors; author an ordinary collection of selected attributes when you need a value.
+
+Keyed child lookup on a deferred loop remains unsupported. Changing a previously eager partial simple list to deferred syntax also removes its parse-time child lookup; use indexed iteration when that lookup is required.
 
 ```crn
 let vpcs = for env in ['dev', 'stg'] {
@@ -94,9 +100,9 @@ let vpcs = for env in ['dev', 'stg'] {
   }
 }
 
-# Reference the first VPC's attributes
+# Reference the VPC keyed by 'dev'
 awscc.ec2.Subnet {
-  vpc_id            = vpcs[0].vpc_id
+  vpc_id            = vpcs['dev'].vpc_id
   cidr_block        = '10.0.1.0/24'
   availability_zone = 'ap-northeast-1a'
 
@@ -105,6 +111,8 @@ awscc.ec2.Subnet {
   }
 }
 ```
+
+Existing index-addressed state needs explicit moves when switching to simple list syntax. See [Migrating index-addressed list loops](/guides/state-management/#migrating-index-addressed-list-loops), including loops that remain deferred. Regenerate saved plans after upgrading.
 
 ### Local variables in for body
 
