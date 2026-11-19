@@ -1,3 +1,4 @@
+use crate::binding_index::ResolvedBindings;
 use crate::parser::{FnParam, TypeExpr, UserFunction};
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, DiagnosticSourceLine, FunctionArgument,
@@ -103,6 +104,7 @@ fn check_declared_annotation<P: PlaceholderKind, B: BindingAddress, V: Annotatio
             AnnotationRequirement::Declared,
         ),
         value,
+        None,
         provider,
         site,
     )
@@ -111,6 +113,7 @@ fn check_declared_annotation<P: PlaceholderKind, B: BindingAddress, V: Annotatio
 fn check_annotation<P: PlaceholderKind, B: BindingAddress, V: AnnotationValue<P, B>>(
     requirement: AnnotationRequirement<'_>,
     value: V,
+    bindings: Option<&ResolvedBindings<P, B>>,
     provider: TypecheckProviderContext<'_>,
     site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
 ) -> Result<AnnotationCheck<V>, crate::validation::typecheck::TypeExprValueError> {
@@ -124,12 +127,32 @@ fn check_annotation<P: PlaceholderKind, B: BindingAddress, V: AnnotationValue<P,
             (Some(expected), requires_concrete_annotation_check(expected))
         }
     };
-    let known = value.value().and_then(|value| {
-        value
-            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+    // Resolve only the selected value for the check. The witness keeps the
+    // authored argument so inlining preserves its references and dependencies.
+    let projected = value.value().and_then(|value| {
+        bindings.and_then(|bindings| {
+            crate::resolver::project_ref_value_status(
+                value,
+                bindings,
+                provider.as_provider_context(),
+            )
             .ok()
-            .and_then(|proof| proof.into_classification().into_known().ok())
+            .and_then(|resolution| match resolution {
+                crate::resolver::ValueResolution::Present(value)
+                | crate::resolver::ValueResolution::Unknown(value) => Some(value),
+                crate::resolver::ValueResolution::Absent(_) => None,
+            })
+        })
     });
+    let known = projected
+        .as_ref()
+        .or_else(|| value.value())
+        .and_then(|value| {
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .ok()
+                .and_then(|proof| proof.into_classification().into_known().ok())
+        });
     let status = if expected.is_some_and(|expected| {
         provider.session().is_none()
             && !provider.as_provider_context().custom_types_loaded()
@@ -178,6 +201,7 @@ fn check_parameter<P: PlaceholderKind, B: BindingAddress>(
     parameter: &FnParam<B>,
     argument: FunctionArgument<P, B>,
     knowledge: ArgumentKnowledge,
+    bindings: Option<&ResolvedBindings<P, B>>,
     provider: TypecheckProviderContext<'_>,
     site: impl FnOnce() -> Option<ProviderTypeCheckSite>,
     context: &str,
@@ -187,6 +211,7 @@ fn check_parameter<P: PlaceholderKind, B: BindingAddress>(
             return check_annotation(
                 AnnotationRequirement::KnownValue(None),
                 argument,
+                bindings,
                 provider,
                 site,
             )
@@ -256,6 +281,7 @@ fn check_parameter<P: PlaceholderKind, B: BindingAddress>(
     check_annotation(
         AnnotationRequirement::KnownValue(Some(&resolved_type.as_type_expr())),
         argument,
+        bindings,
         provider,
         site,
     )
@@ -298,6 +324,7 @@ pub(crate) fn check_parameter_annotation<P: PlaceholderKind, B: BindingAddress>(
         parameter,
         argument,
         ArgumentKnowledge::Unconstrained,
+        None,
         provider,
         site,
         context,
@@ -410,6 +437,7 @@ pub(crate) struct FunctionCompletion<'a, P: PlaceholderKind, B: BindingAddress> 
     checked_arguments: Vec<FunctionArgument<P, B>>,
     pending_check: bool,
     argument_knowledge: ArgumentKnowledge,
+    bindings: Option<Arc<ResolvedBindings<P, B>>>,
     observations: CallObservations,
     retained: RetainedCall<P, B>,
 }
@@ -483,6 +511,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionCompletion<'a, P, B> {
             } else {
                 ArgumentKnowledge::Unconstrained
             },
+            bindings: None,
             observations: CallObservations::default(),
             retained: RetainedCall::new(
                 Arc::clone(function),
@@ -491,6 +520,10 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> FunctionCompletion<'a, P, B> {
                 source_line,
             ),
         })
+    }
+    pub(crate) fn with_bindings(mut self, bindings: Arc<ResolvedBindings<P, B>>) -> Self {
+        self.bindings = Some(bindings);
+        self
     }
     pub(crate) fn retain(self) -> RetainedCall<P, B> {
         self.retained
@@ -551,6 +584,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> ArgumentSlot<'a, P, B> {
             self.parameter,
             argument,
             self.cursor.argument_knowledge,
+            self.cursor.bindings.as_deref(),
             provider,
             site,
             context,
@@ -911,6 +945,46 @@ mod tests {
     }
 
     #[test]
+    fn declared_checks_use_selected_configured_values_without_rewriting_arguments() {
+        let mut resource = crate::parser::ParsedResource::new("Thing", "src");
+        resource.attributes.insert("name".into(), text("r"));
+        let bindings =
+            ResolvedBindings::for_parser_resources(&HashMap::from([("src".into(), resource)]));
+        let configured = AuthoredValue::resource_ref("src", "name", vec![]);
+        let checked = check_annotation(
+            AnnotationRequirement::KnownValue(Some(&TypeExpr::String)),
+            configured.clone(),
+            Some(&bindings),
+            TypecheckProviderContext::for_parser(&config()),
+            || None,
+        )
+        .unwrap();
+        let AnnotationCheck::Discharged(witness) = checked else {
+            panic!("a selected configured attribute is known");
+        };
+        assert_eq!(witness.value, configured);
+        assert!(
+            check_annotation(
+                AnnotationRequirement::KnownValue(Some(&TypeExpr::Int)),
+                configured,
+                Some(&bindings),
+                TypecheckProviderContext::for_parser(&config()),
+                || None,
+            )
+            .is_err()
+        );
+        let checked = check_annotation(
+            AnnotationRequirement::KnownValue(Some(&TypeExpr::String)),
+            unknown(),
+            Some(&bindings),
+            TypecheckProviderContext::for_parser(&config()),
+            || None,
+        )
+        .unwrap();
+        assert!(matches!(checked, AnnotationCheck::AwaitingValue(_)));
+    }
+
+    #[test]
     fn primitive_argument_checks_await_unknown_values() {
         for annotation in [
             TypeExpr::String,
@@ -922,6 +996,7 @@ mod tests {
             let checked = check_annotation(
                 AnnotationRequirement::KnownValue(Some(&annotation)),
                 unknown(),
+                None,
                 TypecheckProviderContext::for_parser(&config()),
                 || None,
             )
@@ -1109,6 +1184,7 @@ mod tests {
                 &function.params[0],
                 FunctionArgument::from_handle(handle),
                 ArgumentKnowledge::Required,
+                None,
                 TypecheckProviderContext::for_session(session),
                 || None,
                 "argument",
@@ -1290,6 +1366,7 @@ mod tests {
             let argument = check_annotation(
                 AnnotationRequirement::KnownValue(Some(&annotation)),
                 failed.clone(),
+                None,
                 TypecheckProviderContext::for_parser(&config()),
                 || None,
             )

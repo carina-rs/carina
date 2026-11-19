@@ -110,6 +110,131 @@ fn lexical_resource_function_iterable_plans_in_a_directory() {
     assert_eq!(names(&plan(fixture.path())), ["pre-r-x", "r"]);
 }
 
+fn primitive_iterable_directory(
+    module: bool,
+    through_body: bool,
+    known: bool,
+) -> tempfile::TempDir {
+    let directory = fixture_files("lexical_resource");
+    let attribute = if known { "name" } else { "identifier" };
+    let functions = fs::read_to_string(directory.path().join("functions.crn")).unwrap();
+    fs::write(
+        directory.path().join("functions.crn"),
+        functions.replace(
+            "prefix(resource.name)",
+            &format!("prefix(resource.{attribute})"),
+        ),
+    )
+    .unwrap();
+    let iterable = if through_body {
+        "names(producer)".to_owned()
+    } else {
+        format!("[\"${{prefix(producer.{attribute})}}-x\"]")
+    };
+    let main = format!(
+        "let producer = mock.test.resource {{ name = 'r' }}\nfor name in {iterable} {{ mock.test.resource {{ name = name }} }}\n"
+    );
+    if module {
+        let child = directory.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::rename(
+            directory.path().join("functions.crn"),
+            child.join("functions.crn"),
+        )
+        .unwrap();
+        fs::write(
+            child.join("main.crn"),
+            format!("arguments {{ label: String }}\n{main}"),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("main.crn"),
+            "let child = use { source = './child' }\nlet instance = child { label = 'module' }\n",
+        )
+        .unwrap();
+    } else {
+        fs::write(directory.path().join("main.crn"), main).unwrap();
+    }
+    success(&run(directory.path(), &["init", "."]));
+    success(&run(directory.path(), &["validate", "."]));
+    directory
+}
+
+fn assert_known_primitive_iterable(module: bool, through_body: bool) {
+    let directory = primitive_iterable_directory(module, through_body, true);
+    let output = run(directory.path(), &["plan", "."]);
+    success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Plan: 2 to add, 0 to change, 0 to destroy.")
+    );
+    let planned = plan(directory.path());
+    assert_eq!(names(&planned), ["pre-r-x", "r"]);
+    assert_eq!(planned.plan.effects().len(), 2);
+    assert!(
+        planned
+            .plan
+            .effects()
+            .iter()
+            .all(|effect| matches!(effect, Effect::Create(_)))
+    );
+}
+
+#[test]
+fn known_primitive_iterable_direct_at_root() {
+    assert_known_primitive_iterable(false, false);
+}
+
+#[test]
+fn known_primitive_iterable_body_at_root() {
+    assert_known_primitive_iterable(false, true);
+}
+
+#[test]
+fn known_primitive_iterable_direct_in_module() {
+    assert_known_primitive_iterable(true, false);
+}
+
+#[test]
+fn known_primitive_iterable_body_in_module() {
+    assert_known_primitive_iterable(true, true);
+}
+
+fn assert_unknown_primitive_iterable_runs_at_apply(module: bool) {
+    let directory = primitive_iterable_directory(module, true, false);
+    let output = run(directory.path(), &["plan", "."]);
+    success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("N records after"), "{stdout}");
+    assert!(stdout.contains("names(producer)"), "{stdout}");
+    success(&run(
+        directory.path(),
+        &["apply", "--auto-approve", "--lock=false", "."],
+    ));
+    let store: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.path().join("mock-provider-state.json")).unwrap(),
+    )
+    .unwrap();
+    let resources = store["states"].as_object().unwrap();
+    assert_eq!(resources.len(), 2);
+    let producer = resources
+        .values()
+        .find(|value| value["name"] == "r")
+        .unwrap();
+    let expected = format!("pre-{}-x", producer["identifier"].as_str().unwrap());
+    assert!(resources.values().any(|value| value["name"] == expected));
+}
+
+#[test]
+fn unknown_primitive_iterable_at_root_runs_at_apply() {
+    assert_unknown_primitive_iterable_runs_at_apply(false);
+}
+
+#[test]
+fn unknown_primitive_iterable_in_module_runs_at_apply() {
+    assert_unknown_primitive_iterable_runs_at_apply(true);
+}
+
 #[test]
 fn sibling_lexical_function_iterable_plans_in_a_directory() {
     let fixture = fixture("lexical_sibling");
@@ -187,24 +312,21 @@ fn unknown_collection_keeps_one_deferred_create_instead_of_zero_children() {
 }
 
 #[test]
-fn saved_plan_keeps_sibling_lexical_calls_for_an_apply_only_argument() {
+fn retained_sibling_lexical_call_refuses_saved_plan_and_applies_directly() {
     let fixture = fixture("lexical_apply");
-    success(&run(fixture.path(), &["plan", "--out", "plan.json", "."]));
-    let saved = fs::read_to_string(fixture.path().join("plan.json")).unwrap();
-    let saved_plan: PlanFile = serde_json::from_str(&saved).unwrap();
+    let output = run(fixture.path(), &["plan", "--out", "plan.json", "."]);
+    assert_eq!(output.status.code(), Some(1));
     assert_eq!(
-        saved_plan
-            .plan
-            .effects()
-            .iter()
-            .filter(|effect| matches!(effect, Effect::Create(_)))
-            .count(),
-        2,
-        "the apply-only argument must preserve both managed resources",
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "Error: Cannot save plan: the plan contains an unevaluated call to the user-defined function 'name'. A saved plan cannot carry this call.\nError: Run `{}` directly on the project, without a saved plan.\n",
+            carina_core::hint::ProjectCommand::new("apply", Path::new(".")),
+        )
     );
+    assert!(!fixture.path().join("plan.json").exists());
     success(&run(
         fixture.path(),
-        &["apply", "--auto-approve", "--lock=false", "plan.json"],
+        &["apply", "--auto-approve", "--lock=false", "."],
     ));
     let state: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(fixture.path().join("mock-provider-state.json")).unwrap(),
@@ -222,7 +344,9 @@ fn saved_plan_keeps_sibling_lexical_calls_for_an_apply_only_argument() {
             .values()
             .any(|attributes| attributes["name"] == expected)
     );
-    assert!(plan(fixture.path()).plan.effects().is_empty());
+    let following = run(fixture.path(), &["plan", "."]);
+    success(&following);
+    assert!(String::from_utf8_lossy(&following.stdout).contains("No changes."));
 }
 
 #[test]
@@ -561,16 +685,33 @@ mod evaluation_timing {
     }
 
     #[test]
-    fn pending_secret_parameter_remains_accepted() {
+    fn pending_secret_parameter_refuses_plan_out_and_applies_directly() {
+        let directory = fixture("secret_parameter");
+        let output = run(directory.path(), &["plan", "--out", "plan.json", "."]);
+        assert_eq!(output.status.code(), Some(1));
         assert_eq!(
-            plan("secret_parameter")
-                .plan
-                .effects()
-                .iter()
-                .filter(|effect| matches!(effect, Effect::Create(_)))
-                .count(),
-            2
+            String::from_utf8_lossy(&output.stderr),
+            format!(
+                "Error: Cannot save plan: the plan contains an unevaluated call to the user-defined function 'identity'. A saved plan cannot carry this call.\nError: Run `{}` directly on the project, without a saved plan.\n",
+                carina_core::hint::ProjectCommand::new("apply", Path::new(".")),
+            )
         );
+        assert!(!directory.path().join("plan.json").exists());
+        let output = run(directory.path(), &["plan", "."]);
+        success(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("Plan: 2 to add, 0 to change, 0 to destroy.")
+        );
+        success(&run(
+            directory.path(),
+            &["apply", "--auto-approve", "--lock=false", "."],
+        ));
+        let state: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.path().join("mock-provider-state.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state["states"].as_object().unwrap().len(), 2);
     }
     #[test]
     fn pending_secret_return_remains_accepted() {

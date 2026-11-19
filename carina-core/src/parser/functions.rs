@@ -228,7 +228,10 @@ fn prepare_user_function_call<'function, 'cfg, Source: super::context::Evaluatio
         args.to_vec(),
         call_line.into(),
     )
-    .map_err(|error| ParseError::UserFunctionError(error.parser_message(fn_name)))?;
+    .map_err(|error| ParseError::UserFunctionError(error.parser_message(fn_name)))?
+    .with_bindings(Arc::new(
+        crate::binding_index::ResolvedBindings::for_parser_resources(&ctx.resource_bindings),
+    ));
     if ctx
         .session
         .is_some_and(|session| session.function_declaration_failed(func))
@@ -1148,11 +1151,28 @@ pub(crate) fn evaluate_resolved_user_function(
         Some(session) => ParseContext::for_evaluation_in_session(session),
         None => ParseContext::for_evaluation(config),
     };
+    evaluate_resolved_user_function_in_context(
+        function,
+        functions,
+        arguments,
+        &mut context,
+        call_line,
+    )
+}
+
+fn evaluate_resolved_user_function_in_context<Source: super::context::EvaluationSource>(
+    function: &Arc<UserFunction>,
+    functions: &Arc<IndexMap<String, UserFunction>>,
+    arguments: &[FunctionArgument],
+    context: &mut ParseContext<'_, Source>,
+    call_line: usize,
+) -> Result<FunctionEvaluation<ParserPlaceholder, crate::resource::RelativeBindingName>, ParseError>
+{
     context.replace_shared_user_functions(Arc::clone(functions));
     if !context.user_functions.contains_key(&function.name) {
         context.insert_user_function(function.name.clone(), function.as_ref().clone());
     }
-    evaluate_user_function(function, arguments, &context, call_line)
+    evaluate_user_function(function, arguments, context, call_line)
 }
 
 fn locate_function_body_error(func: &UserFunction, error: ParseError) -> ParseError {
@@ -1313,12 +1333,11 @@ pub(super) fn try_evaluate_fn_value<Source: super::context::EvaluationSource>(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            evaluate_resolved_user_function(
+            evaluate_resolved_user_function_in_context(
                 &function,
                 &functions,
                 &evaluated_args,
-                ctx.config,
-                ctx.session,
+                &mut ctx.child_scope(),
                 source_line,
             )
             .map(FunctionEvaluation::into_value)

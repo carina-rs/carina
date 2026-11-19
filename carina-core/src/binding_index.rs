@@ -2490,6 +2490,35 @@ impl ResolvedBindings<ParserPlaceholder> {
 }
 
 impl ResolvedBindings<ParserPlaceholder, RelativeBindingName> {
+    pub(crate) fn for_parser_resources(
+        resources: &HashMap<String, crate::parser::ParsedResource>,
+    ) -> Self {
+        let by_name = resources
+            .iter()
+            .map(|(name, resource)| {
+                let attributes: BTreeMap<_, _> = resource
+                    .attributes
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.to_snapshot()))
+                    .collect();
+                let definitive_attributes = attributes.keys().cloned().collect();
+                (
+                    name.clone(),
+                    ResolvedBinding {
+                        attributes,
+                        source: BindingValueSource::Local,
+                        completeness: BindingCompleteness::Incomplete,
+                        definitive_attributes,
+                        changed_attributes: HashSet::new(),
+                        refreshable_attributes: HashSet::new(),
+                        removed_sensitive_attributes: HashSet::new(),
+                    },
+                )
+            })
+            .collect();
+        Self { by_name }
+    }
+
     /// Build the incomplete validation view without crossing the root-binding
     /// expansion seam. Editor/source diagnostics use this view while their
     /// values still carry authored relative names.
