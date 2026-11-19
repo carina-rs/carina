@@ -1,3 +1,19 @@
+fn test_registry_source(value: &str) -> carina_core::provider_source::RegistrySource {
+    use carina_core::provider_source::{ProviderSource, RemoteSource};
+    let ProviderSource::Remote(RemoteSource::Registry(source)) = value.parse().unwrap() else {
+        panic!("expected registry source: {value}");
+    };
+    source
+}
+
+fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource {
+    use carina_core::provider_source::{ProviderSource, RemoteSource};
+    let ProviderSource::Remote(RemoteSource::GithubDirect(source)) = value.parse().unwrap() else {
+        panic!("expected github source: {value}");
+    };
+    source
+}
+
 use super::*;
 
 #[tokio::test]
@@ -3181,7 +3197,6 @@ async fn typed_provider_name_mismatches_map_to_fatal_source_errors() {
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
-        &mut |_| {},
     )
     .unwrap();
 
@@ -3324,8 +3339,8 @@ async fn unverified_official_factory_load_case() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "aws".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            source: test_github_source(source),
             version: version.parse().unwrap(),
             tag: serde_json::from_str(&format!("\"v{version}\"")).unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),
@@ -14126,8 +14141,8 @@ async fn installed_revision_instantiation_error_includes_lock_provenance() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Revision {
+            source: test_github_source(source),
             revision: revision.into(),
             resolved_sha: resolved_sha.clone(),
             artifact_id: test_artifact_id(42),
@@ -14204,8 +14219,8 @@ fn missing_locked_revision_artifact_reaches_cli_with_pin_and_init_hint() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Revision {
+            source: test_github_source(source),
             revision: revision.into(),
             resolved_sha,
             artifact_id: test_artifact_id(42),
@@ -14271,8 +14286,8 @@ async fn registry_source_reaches_cli_artifact_loader() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Version {
+            source: test_registry_source(source),
             version: version.into(),
             constraint: None,
         },
@@ -14333,8 +14348,8 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::Version {
+            source: test_registry_source(source),
             version: version.into(),
             constraint: None,
         },
@@ -14404,7 +14419,6 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     let installed = carina_provider_resolver::find_file_provider_source(
         &carina_core::paths::ResolvedPath::new(tmp.path()).unwrap(),
         &config,
-        &mut |_| {},
     )
     .unwrap();
 
@@ -14440,8 +14454,8 @@ fn formatting_factory_loader_returns_lock_constraint_errors() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            source: test_github_source(source),
             version: "1.0.0".parse().unwrap(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),
@@ -14598,8 +14612,8 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
     let mut lock = carina_provider_resolver::LockFile::default();
     lock.upsert(carina_provider_resolver::LockEntry {
         name: "awscc".into(),
-        source: source.into(),
         kind: carina_provider_resolver::LockEntryKind::GithubRelease {
+            source: test_github_source(source),
             version: "1.0.0".parse().unwrap(),
             tag: serde_json::from_str("\"v1.0.0\"").unwrap(),
             asset_id: serde_json::from_str("42").unwrap(),

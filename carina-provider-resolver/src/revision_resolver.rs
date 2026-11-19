@@ -1279,10 +1279,6 @@ mod verified_revision_artifact {
             &self.path
         }
 
-        pub(super) fn source(&self) -> &RemoteSourceKey {
-            &self.source
-        }
-
         pub(super) fn name(&self) -> &str {
             &self.name
         }
@@ -1460,14 +1456,15 @@ mod verified_revision_artifact {
 use verified_revision_artifact::{PublishedRevisionArtifact, VerifiedRevisionArtifact};
 
 fn revision_lock_entry(
+    source: &GithubSource,
     artifact: &VerifiedRevisionArtifact,
     revision: &str,
     resolved_sha: &CommitSha,
 ) -> crate::provider_resolver::LockEntry {
     crate::provider_resolver::LockEntry {
         name: artifact.name().to_string(),
-        source: artifact.source().to_string(),
         kind: crate::provider_resolver::LockEntryKind::Revision {
+            source: source.clone(),
             revision: revision.to_string(),
             resolved_sha: resolved_sha.clone(),
             artifact_id: artifact.artifact_id(),
@@ -1617,12 +1614,12 @@ where
     let install_lock = lock_file.install_lock();
     let base_dir = install_lock.project_dir();
     let source_key = source.source_key();
-    let legacy_pin = lock_file.legacy_revision_pin(&source_key, revision);
 
     // 1. Resolve revision to SHA
     let sha = if mode != LockMode::Upgrade
         && let Some(lock_entry) = lock_file.find_by_source_key(&source_key)
         && let super::provider_resolver::LockEntryKind::Revision {
+            source: _,
             revision: locked_revision,
             resolved_sha,
             artifact_id: _,
@@ -1630,10 +1627,6 @@ where
         && locked_revision == revision
     {
         // Reuse locked SHA if revision matches (skip on upgrade)
-        resolved_sha.clone()
-    } else if mode != LockMode::Upgrade
-        && let Some((resolved_sha, _sha256)) = &legacy_pin
-    {
         resolved_sha.clone()
     } else {
         eprintln!(
@@ -1643,7 +1636,6 @@ where
         resolve_ref()?
     };
 
-    let legacy_pin = legacy_pin.filter(|(resolved_sha, _sha256)| resolved_sha == &sha);
     let artifact_pin = lookup_revision_artifact_pin(lock_file, &source_key, revision, &sha, name);
     if mode == LockMode::Locked && artifact_pin.pinned(user_dirs).is_none() {
         return Err(format!(
@@ -1680,6 +1672,7 @@ where
         };
         if mode != LockMode::Locked {
             lock_file.upsert(revision_lock_entry(
+                source,
                 &verified,
                 &pin.revision,
                 &pin.resolved_sha,
@@ -1713,6 +1706,7 @@ where
         };
         if mode != LockMode::Locked {
             lock_file.upsert(revision_lock_entry(
+                source,
                 &verified,
                 &pin.revision,
                 &pin.resolved_sha,
@@ -1743,14 +1737,6 @@ where
         &mut artifact_head_sha,
         &mut download_artifact,
     )?;
-    if let Some((_resolved_sha, expected_sha256)) = &legacy_pin {
-        let actual_sha256 = format!("{:x}", Sha256::digest(selected.wasm_bytes()));
-        if &actual_sha256 != expected_sha256 {
-            return Err(format!(
-                "Downloaded provider '{name}' ({source}@{sha}) does not match the sha256 pinned in the legacy carina-providers.lock entry. Expected: {expected_sha256}, got: {actual_sha256}."
-            ));
-        }
-    }
     let unchanged_revision = artifact_pin.pinned(user_dirs).is_some();
     let published = if unchanged_revision {
         verified_revision_artifact::publish_unchanged_revision_download(
@@ -1775,6 +1761,7 @@ where
         PublishedRevisionArtifact::Pinned { artifact, pin } => {
             if mode != LockMode::Locked {
                 lock_file.upsert(revision_lock_entry(
+                    source,
                     &artifact,
                     &pin.revision,
                     &pin.resolved_sha,
@@ -1788,7 +1775,7 @@ where
                     "Locked resolution for provider '{name}' has no matching revision entry"
                 ));
             }
-            lock_file.upsert(revision_lock_entry(&artifact, revision, &sha));
+            lock_file.upsert(revision_lock_entry(source, &artifact, revision, &sha));
             artifact
         }
     };
@@ -1823,6 +1810,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    fn test_github_source(value: &str) -> carina_core::provider_source::GithubSource {
+        use carina_core::provider_source::{ProviderSource, RemoteSource};
+        let ProviderSource::Remote(RemoteSource::GithubDirect(source)) = value.parse().unwrap()
+        else {
+            panic!("expected github source: {value}");
+        };
+        source
+    }
+
     use super::*;
     use crate::github::{FixtureGithubHttp, GithubRequest};
     use crate::provider_resolver::{LockEntry, RegistryLock, sha256_file};
@@ -1996,8 +1992,8 @@ mod tests {
         std::fs::write(&artifact_path, b"actual").unwrap();
         let lock_entry: LockEntry<RegistryLock> = LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2054,8 +2050,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(crate::provider_resolver::LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2116,8 +2112,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2168,8 +2164,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(crate::provider_resolver::LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2266,8 +2262,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(crate::provider_resolver::LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2372,8 +2368,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2463,8 +2459,8 @@ mod tests {
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -2944,8 +2940,8 @@ mod tests {
         .unwrap();
         let lock_entry: LockEntry<RegistryLock> = LockEntry {
             name: "aws".into(),
-            source: source.to_string(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: source.clone(),
                 revision: "main".into(),
                 resolved_sha: sha.clone(),
                 artifact_id: test_artifact_id(42),
@@ -3121,160 +3117,6 @@ mod tests {
     #[test]
     fn revision_resolver_filters_other_head_sha_before_artifact_selection() {
         assert_resolver_ignores_ineligible_workflow_run("carina-rs/carina-provider-aws", OTHER_SHA);
-    }
-
-    #[test]
-    fn normal_mode_reselects_legacy_revision_at_locked_sha_and_records_artifact_id() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let project = tempfile::tempdir().unwrap();
-        let global = user_dirs.plugin_cache_dir();
-        std::fs::create_dir_all(global).unwrap();
-        let wasm = b"legacy pinned provider";
-        let lock_path = crate::provider_resolver::provider_lock_path(project.path());
-        std::fs::write(
-            &lock_path,
-            format!(
-                r#"version = {}
-
-[[provider]]
-name = "aws"
-source = "{TEST_SOURCE}"
-mode = "revision"
-revision = "main"
-resolved_sha = "{TEST_SHA}"
-sha256 = "{}"
-"#,
-                crate::provider_resolver::LockFile::CURRENT_VERSION,
-                sha256_bytes(wasm)
-            ),
-        )
-        .unwrap();
-        let install_lock = ProviderInstallLock::acquire(
-            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-        )
-        .unwrap();
-        let mut lock_file = install_lock.load_lock_file().unwrap().unwrap();
-        let listed_shas = RefCell::new(Vec::new());
-
-        let (installed, resolved_sha) = resolve_provider_by_revision_with(
-            &user_dirs,
-            &mut lock_file,
-            &test_source(),
-            "main",
-            "aws",
-            LockMode::Normal,
-            RevisionGithubOps {
-                resolve_ref: || panic!("legacy migration must not re-resolve the revision ref"),
-                list_runs: |sha: CommitSha| {
-                    listed_shas.borrow_mut().push(sha);
-                    Ok(vec![workflow_run_id(7)])
-                },
-                list_artifacts: |_| Ok(vec![artifact("provider-build", 42, false)]),
-                artifact_head_sha: |_| Ok(Some(test_sha())),
-                download_artifact: |_| Ok(artifact_zip(&[("provider.wasm", wasm)])),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(resolved_sha, test_sha());
-        assert_eq!(listed_shas.into_inner(), vec![test_sha()]);
-        assert_eq!(std::fs::read(installed.as_path()).unwrap(), wasm);
-        let entry = lock_file
-            .find_by_source_key_and_sha(&test_source().source_key(), &test_sha())
-            .expect("legacy entry must be replaced with a typed revision pin");
-        assert!(matches!(
-            &entry.kind,
-            crate::provider_resolver::LockEntryKind::Revision {
-                revision,
-                resolved_sha,
-                artifact_id,
-            } if revision == "main"
-                && resolved_sha == &test_sha()
-                && artifact_id.get() == 42
-        ));
-
-        lock_file.save().unwrap();
-        let saved = std::fs::read_to_string(lock_path).unwrap();
-        assert!(saved.contains("artifact_id = 42"), "{saved}");
-        assert_eq!(saved.matches("[[provider]]").count(), 1, "{saved}");
-    }
-
-    #[test]
-    fn upgrade_mode_rejects_changed_content_at_legacy_locked_sha() {
-        let user_dirs = carina_core::TestUserDirs::new();
-        let project = tempfile::tempdir().unwrap();
-        let global = user_dirs.plugin_cache_dir();
-        std::fs::create_dir_all(global).unwrap();
-        let locked_wasm = b"legacy pinned provider";
-        let lock_path = crate::provider_resolver::provider_lock_path(project.path());
-        std::fs::write(
-            &lock_path,
-            format!(
-                r#"version = {}
-
-[[provider]]
-name = "aws"
-source = "{TEST_SOURCE}"
-mode = "revision"
-revision = "main"
-resolved_sha = "{TEST_SHA}"
-sha256 = "{}"
-"#,
-                crate::provider_resolver::LockFile::CURRENT_VERSION,
-                sha256_bytes(locked_wasm)
-            ),
-        )
-        .unwrap();
-        let install_lock = ProviderInstallLock::acquire(
-            &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-        )
-        .unwrap();
-        let mut lock_file = install_lock.load_lock_file().unwrap().unwrap();
-        let resolved_ref = Cell::new(false);
-
-        let error = resolve_provider_by_revision_with(
-            &user_dirs,
-            &mut lock_file,
-            &test_source(),
-            "main",
-            "aws",
-            LockMode::Upgrade,
-            RevisionGithubOps {
-                resolve_ref: || {
-                    resolved_ref.set(true);
-                    Ok(test_sha())
-                },
-                list_runs: |_: CommitSha| Ok(vec![workflow_run_id(7)]),
-                list_artifacts: |_| Ok(vec![artifact("provider-build", 42, false)]),
-                artifact_head_sha: |_| Ok(Some(test_sha())),
-                download_artifact: |_| {
-                    Ok(artifact_zip(&[(
-                        "provider.wasm",
-                        b"changed provider" as &[u8],
-                    )]))
-                },
-            },
-        )
-        .expect_err("upgrade must retain a legacy content pin while the commit is unchanged");
-
-        assert!(
-            resolved_ref.get(),
-            "upgrade must re-resolve the revision ref"
-        );
-        assert!(
-            error.contains(
-                "does not match the sha256 pinned in the legacy carina-providers.lock entry"
-            ),
-            "{error}"
-        );
-        assert!(
-            !cache_path_revision(
-                &carina_core::paths::ResolvedPath::new(project.path()).unwrap(),
-                &test_source(),
-                &test_sha()
-            )
-            .exists()
-        );
     }
 
     #[test]
@@ -3742,8 +3584,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -3795,8 +3637,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -3850,8 +3692,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -3944,8 +3786,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4131,8 +3973,8 @@ sha256 = "{}"
             let mut lock_file = crate::provider_resolver::LockFile::default();
             lock_file.upsert(LockEntry {
                 name: "aws".into(),
-                source: TEST_SOURCE.into(),
                 kind: crate::provider_resolver::LockEntryKind::Revision {
+                    source: test_github_source(TEST_SOURCE),
                     revision: "main".into(),
                     resolved_sha: test_sha(),
                     artifact_id: test_artifact_id(42),
@@ -4212,6 +4054,7 @@ sha256 = "{}"
             };
             let mut guarded = install_lock.guard_lock_file_for_test(lock_file);
             guarded.upsert(revision_lock_entry(
+                &source,
                 &verified,
                 &verified_pin.revision,
                 &verified_pin.resolved_sha,
@@ -4237,8 +4080,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4288,8 +4131,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4344,8 +4187,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4400,8 +4243,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4467,8 +4310,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4557,8 +4400,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4623,8 +4466,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4679,8 +4522,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4752,8 +4595,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4890,8 +4733,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -4951,8 +4794,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -5022,8 +4865,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -5080,8 +4923,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -5143,8 +4986,8 @@ sha256 = "{}"
             let mut lock_file = crate::provider_resolver::LockFile::default();
             lock_file.upsert(LockEntry {
                 name: "aws".into(),
-                source: TEST_SOURCE.into(),
                 kind: crate::provider_resolver::LockEntryKind::Revision {
+                    source: test_github_source(TEST_SOURCE),
                     revision: "main".into(),
                     resolved_sha: test_sha(),
                     artifact_id: test_artifact_id(42),
@@ -5201,8 +5044,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -5264,8 +5107,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -5305,7 +5148,7 @@ sha256 = "{}"
         assert_eq!(entry.sha256, sha256_bytes(wasm));
         assert!(matches!(
             &entry.kind,
-            crate::provider_resolver::LockEntryKind::Revision {
+            crate::provider_resolver::LockEntryKind::Revision { source: _,
                 revision,
                 resolved_sha,
                 artifact_id,
@@ -5327,8 +5170,8 @@ sha256 = "{}"
         let mut lock_file = crate::provider_resolver::LockFile::default();
         lock_file.upsert(LockEntry {
             name: "aws".into(),
-            source: TEST_SOURCE.into(),
             kind: crate::provider_resolver::LockEntryKind::Revision {
+                source: test_github_source(TEST_SOURCE),
                 revision: "main".into(),
                 resolved_sha: test_sha(),
                 artifact_id: test_artifact_id(42),
@@ -5370,7 +5213,7 @@ sha256 = "{}"
         assert_eq!(entry.sha256, sha256_bytes(moved_wasm));
         assert!(matches!(
             &entry.kind,
-            crate::provider_resolver::LockEntryKind::Revision {
+            crate::provider_resolver::LockEntryKind::Revision { source: _,
                 revision,
                 resolved_sha,
                 artifact_id,

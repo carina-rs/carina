@@ -110,7 +110,7 @@ fn concurrent_resolutions_preserve_both_lock_entries() {
     let loaded = LockFile::load(&carina_core::paths::ResolvedPath::new(project.path()).unwrap())
         .unwrap()
         .unwrap();
-    let (lock_file, _) = loaded.into_parts();
+    let lock_file = loaded;
     let mut names = lock_file
         .provider
         .iter()

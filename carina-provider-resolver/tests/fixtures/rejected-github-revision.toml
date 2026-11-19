@@ -1,0 +1,9 @@
+version = 5
+
+[[provider]]
+name = "widget"
+source = "github.com/acme/widget"
+mode = "revision"
+revision = "main"
+resolved_sha = "0123456789abcdef0123456789abcdef01234567"
+sha256 = "pinned-checksum"
