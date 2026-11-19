@@ -136,7 +136,7 @@ impl ProviderState {
             diagnostic_engine.with_provider_errors(provider_errors.into_iter().collect());
         if let Some((directory, _)) = configs.first() {
             diagnostic_engine = diagnostic_engine.with_directory_providers(
-                PathIdentity::new(directory),
+                directory.clone(),
                 configs
                     .iter()
                     .map(|(_, config)| config.factory_config().clone())
@@ -229,19 +229,10 @@ impl ProviderStates {
         Self {
             discovery_scope: workspace::DiscoveryScope::default(),
             by_dir: HashMap::new(),
-            import_map: Default::default(),
+            import_map: HashMap::new(),
             empty: ProviderState::empty(environment.clone()),
             environment,
         }
-    }
-
-    fn module_callers(&self, file: Option<&Path>) -> Vec<carina_core::paths::ResolvedPath> {
-        file.and_then(Path::parent)
-            .map(|directory| {
-                self.import_map
-                    .caller_directories(&PathIdentity::new(directory))
-            })
-            .unwrap_or_default()
     }
 
     /// Find the ProviderState for a given file path.
@@ -825,14 +816,12 @@ async fn publish_diagnostics_for(
             .and_then(Path::parent)
             .map(|path| guard.state_for_path(path))
             .unwrap_or(&guard.empty);
-        let callers = guard.module_callers(path.as_deref());
         results.push((
             uri.clone(),
             state.diagnostic_engine.analyze_document_snapshot(
                 &entry,
                 path.as_deref(),
                 &open_sources,
-                &callers,
             ),
         ));
     }
@@ -974,13 +963,9 @@ fn analyze_document_with_open_sources(
         .and_then(Path::parent)
         .map(|path| states.state_for_path(path))
         .unwrap_or(&states.empty);
-    let callers = states.module_callers(current_file_path);
-    state.diagnostic_engine.analyze_with_open_sources(
-        document,
-        current_file_path,
-        open_sources,
-        &callers,
-    )
+    state
+        .diagnostic_engine
+        .analyze_with_open_sources(document, current_file_path, open_sources)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1368,6 +1353,114 @@ mod tests {
             vec![],
             carina_core::EnvironmentSnapshot::empty(),
         )
+    }
+
+    #[test]
+    fn deferred_prefix_module_publication_uses_authored_files_whichever_file_is_open() {
+        let sources: serde_json::Value = serde_json::from_str(include_str!(
+            "../../carina-cli/tests/fixtures/deferred_prefix/c/inputs.json"
+        ))
+        .unwrap();
+        for (case, expected) in [
+            (
+                "b3_direct",
+                include_str!("../../carina-cli/tests/fixtures/deferred_prefix/c/b3_direct.json"),
+            ),
+            (
+                "b3_interpolation",
+                include_str!(
+                    "../../carina-cli/tests/fixtures/deferred_prefix/c/b3_interpolation.json"
+                ),
+            ),
+            (
+                "b3_alias",
+                include_str!("../../carina-cli/tests/fixtures/deferred_prefix/c/b3_alias.json"),
+            ),
+            (
+                "b3_nested",
+                include_str!("../../carina-cli/tests/fixtures/deferred_prefix/c/b3_nested.json"),
+            ),
+            (
+                "b1_three_modules",
+                include_str!(
+                    "../../carina-cli/tests/fixtures/deferred_prefix/c/b1_three_modules.json"
+                ),
+            ),
+            (
+                "b2_hop_deferred",
+                include_str!(
+                    "../../carina-cli/tests/fixtures/deferred_prefix/c/b2_hop_deferred.json"
+                ),
+            ),
+            (
+                "b2_hop_literal",
+                include_str!(
+                    "../../carina-cli/tests/fixtures/deferred_prefix/c/b2_hop_literal.json"
+                ),
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let files = sources[case].as_object().unwrap();
+            for (file, text) in files {
+                let path = directory.path().join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text.as_str().unwrap()).unwrap();
+            }
+            let state = builtin_mock_provider_state(directory.path());
+            let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
+            let prefix_inventory = |inventory: &serde_json::Value| {
+                inventory
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|(file, findings)| {
+                        let prefixes = findings
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|finding| {
+                                finding["message"]
+                                    .as_str()
+                                    .unwrap()
+                                    .starts_with("'name_prefix' must be known")
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        (!prefixes.is_empty())
+                            .then(|| (file.clone(), serde_json::Value::Array(prefixes)))
+                    })
+                    .collect::<serde_json::Map<_, _>>()
+            };
+            for (file, text) in files {
+                let path = directory.path().join(file);
+                let document = Document::new_with_path(
+                    text.as_str().unwrap().into(),
+                    path.clone(),
+                    Arc::new(ProviderContext::new(
+                        carina_core::EnvironmentSnapshot::empty(),
+                    )),
+                );
+                let result =
+                    state
+                        .diagnostic_engine
+                        .analyze_document_snapshot(&document, Some(&path), &[]);
+                let inventory = result.documents.into_iter().map(|(path, findings)| {
+                    let file = path.strip_prefix(directory.path()).unwrap().to_string_lossy().into_owned();
+                    let findings = findings.into_iter().map(|finding| {
+                        let diagnostic = finding.diagnostic;
+                        assert!(!diagnostic.message.contains("Required attribute 'name' is missing")
+                            && !diagnostic.message.contains("Unknown attribute 'name_prefix'"), "{case}/{file}: {diagnostic:?}");
+                        serde_json::json!({"message":diagnostic.message,"range":diagnostic.range,"severity":diagnostic.severity})
+                    }).collect::<Vec<_>>();
+                    (file, serde_json::json!(findings))
+                }).collect::<serde_json::Map<_, _>>();
+                assert_eq!(
+                    prefix_inventory(&serde_json::Value::Object(inventory)),
+                    prefix_inventory(&expected["lsp"]),
+                    "{case}, only {file} open"
+                );
+            }
+        }
     }
 
     fn builtin_mock_provider_state(directory: &std::path::Path) -> ProviderState {
@@ -1886,12 +1979,13 @@ let duplicate = mock.test.resource {
         states
             .by_dir
             .insert(PathIdentity::new(&last_caller), provider_state("last_rule"));
-        for caller in [&last_caller, &first_caller] {
-            states.import_map.record(
-                &carina_core::paths::ResolvedPath::new(&module).unwrap(),
-                &carina_core::paths::ResolvedPath::new(caller).unwrap(),
-            );
-        }
+        states.import_map.insert(
+            PathIdentity::new(&module),
+            std::collections::BTreeSet::from([
+                PathIdentity::new(&last_caller),
+                PathIdentity::new(&first_caller),
+            ]),
+        );
 
         let state = states.state_for_path(&module);
         let block_names = collect_all_block_names(&state.schemas);

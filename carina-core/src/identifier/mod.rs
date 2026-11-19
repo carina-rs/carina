@@ -11,9 +11,8 @@ pub use diagnostics::{
 };
 pub use prefix::{
     CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, MatchedResourceProjection,
-    ModuleResolvedFileRead, PrefixArgumentContext, PrefixCanonicalized, PrefixFileRead,
-    ResourceProjection, SuffixSource, canonicalize_file_prefixes,
-    canonicalize_file_prefixes_with_argument_context,
+    ModuleResolvedFileRead, PrefixCanonicalized, PrefixFileRead, ResourceProjection, SuffixSource,
+    canonicalize_file_prefixes,
 };
 pub(crate) use prefix::{CanonicalSchemaInputs, CanonicalSchemaResource, PrefixObligations};
 
@@ -1590,27 +1589,8 @@ impl PrefixFindings {
 /// unrecognized attribute or authorize ordinary required-attribute admission.
 #[derive(Debug, Clone, PartialEq)]
 struct DeferredPrefixDependencies {
-    keys: Vec<PrefixDependencyKey>,
     first: PrefixDependency,
     rest: Vec<PrefixDependency>,
-    argument_call: Option<crate::parser::retained::BareArgumentOwner>,
-}
-
-/// Opaque source identity survives diagnostic redaction and binding typestates.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PrefixDependencyKey {
-    path: PrefixDependencyPath,
-    through: Option<crate::resource::DependencyKey<crate::resource::AbsoluteBindingAddress>>,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PrefixDependencyPath {
-    Resource(
-        crate::resource::DependencyKey<
-            crate::resource::AccessPath<crate::resource::AbsoluteBindingAddress>,
-        >,
-    ),
-    Binding(crate::resource::DependencyKey<crate::resource::AbsoluteBindingAddress>),
-    Loop(crate::resource::LoopSlot),
 }
 
 /// Recognition retains the reference kind even when its name is redacted.
@@ -1679,24 +1659,6 @@ impl std::fmt::Display for AttributePrefixRejection {
 impl std::error::Error for AttributePrefixRejection {}
 
 impl DeferredPrefixFinding {
-    fn same_argument_finding(&self, other: &Self) -> bool {
-        use crate::finding::FindingOwner;
-        matches!(
-            (&self.owner, &other.owner),
-            (
-                FindingOwner::ModuleArgument(_),
-                FindingOwner::ModuleArgument(_)
-            )
-        ) && self.owner == other.owner
-            && self.prefix == other.prefix
-            && self.base == other.base
-            && self.dependencies.keys.len() == other.dependencies.keys.len()
-            && self
-                .dependencies
-                .keys
-                .iter()
-                .all(|key| other.dependencies.keys.contains(key))
-    }
     pub fn owner(&self) -> &crate::finding::FindingOwner {
         &self.owner
     }
@@ -1748,14 +1710,7 @@ fn deferred_prefix_message(
 impl std::fmt::Display for DeferredPrefixFinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = self.diagnostic_message();
-        match &self.owner {
-            crate::finding::FindingOwner::ModuleArgument(call) => {
-                crate::parser::Located::new(call.declaration_location().clone(), message).fmt(f)
-            }
-            crate::finding::FindingOwner::Declaration { .. } => {
-                write!(f, "{}: {message}", self.resource)
-            }
-        }
+        write!(f, "{}: {message}", self.resource)
     }
 }
 impl std::error::Error for DeferredPrefixFinding {}

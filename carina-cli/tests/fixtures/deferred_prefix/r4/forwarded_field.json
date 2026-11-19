@@ -7,24 +7,6 @@
           "file": "mod_a/mod_b/main.crn",
           "range": {
             "end": {
-              "column": 19,
-              "line": 1
-            },
-            "start": {
-              "column": 1,
-              "line": 1
-            }
-          }
-        },
-        "message": "Required attribute 'name' is missing",
-        "severity": "error"
-      },
-      {
-        "code": null,
-        "location": {
-          "file": "mod_a/mod_b/main.crn",
-          "range": {
-            "end": {
               "column": 23,
               "line": 2
             },
@@ -34,7 +16,7 @@
             }
           }
         },
-        "message": "Unknown attribute 'name_prefix'",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
         "severity": "error"
       }
     ],
@@ -47,85 +29,13 @@
   "lsp": {
     "backend.crn": [],
     "lets.crn": [],
-    "main.crn": [
-      {
-        "message": "mock.test.resource.<pending>: Required attribute 'name' is missing",
-        "range": {
-          "end": {
-            "character": 54,
-            "line": 1
-          },
-          "start": {
-            "character": 15,
-            "line": 1
-          }
-        },
-        "severity": 1
-      },
-      {
-        "message": "mock.test.resource.<pending>: Unknown attribute 'name_prefix'",
-        "range": {
-          "end": {
-            "character": 54,
-            "line": 1
-          },
-          "start": {
-            "character": 15,
-            "line": 1
-          }
-        },
-        "severity": 1
-      }
-    ],
+    "main.crn": [],
     "mod_a/arguments.crn": [],
-    "mod_a/main.crn": [
-      {
-        "message": "mock.test.resource.<pending>: Required attribute 'name' is missing",
-        "range": {
-          "end": {
-            "character": 37,
-            "line": 1
-          },
-          "start": {
-            "character": 12,
-            "line": 1
-          }
-        },
-        "severity": 1
-      },
-      {
-        "message": "mock.test.resource.<pending>: Unknown attribute 'name_prefix'",
-        "range": {
-          "end": {
-            "character": 37,
-            "line": 1
-          },
-          "start": {
-            "character": 12,
-            "line": 1
-          }
-        },
-        "severity": 1
-      }
-    ],
+    "mod_a/main.crn": [],
     "mod_a/mod_b/arguments.crn": [],
     "mod_a/mod_b/main.crn": [
       {
-        "message": "Required attribute 'name' is missing",
-        "range": {
-          "end": {
-            "character": 18,
-            "line": 0
-          },
-          "start": {
-            "character": 0,
-            "line": 0
-          }
-        },
-        "severity": 1
-      },
-      {
-        "message": "Unknown attribute 'name_prefix'",
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
         "range": {
           "end": {
             "character": 22,
@@ -141,6 +51,6 @@
     ],
     "providers.crn": []
   },
-  "text": "Validating...\nError: mock.test.resource.<pending>: Required attribute 'name' is missing\nError: mock.test.resource.<pending>: Unknown attribute 'name_prefix'\n",
+  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply\n",
   "text_exit": 1
 }

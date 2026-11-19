@@ -1,0 +1,106 @@
+{
+  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply\n",
+  "text_exit": 1,
+  "json": {
+    "status": "error",
+    "resource_count": 0,
+    "resources": [],
+    "errors": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "mod_b/main.crn",
+          "range": {
+            "start": {
+              "line": 2,
+              "column": 3
+            },
+            "end": {
+              "line": 2,
+              "column": 23
+            }
+          }
+        }
+      },
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "severity": "error",
+        "code": null,
+        "location": {
+          "file": "mod_a/main.crn",
+          "range": {
+            "start": {
+              "line": 3,
+              "column": 3
+            },
+            "end": {
+              "line": 3,
+              "column": 18
+            }
+          }
+        }
+      }
+    ]
+  },
+  "json_exit": 1,
+  "json_stderr": "",
+  "lsp": {
+    "backend.crn": [],
+    "lets.crn": [],
+    "main.crn": [
+      {
+        "message": "Anonymous resource identifier collision: 'mock.test.resource' and 'mock.test.resource' produce the same identifier 'one.mock_test_resource_1b6934ce'. Use `let` bindings to give them distinct names.",
+        "range": {
+          "end": {
+            "character": 34,
+            "line": 2
+          },
+          "start": {
+            "character": 10,
+            "line": 2
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "mod_a/arguments.crn": [],
+    "mod_a/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "range": {
+          "start": {
+            "line": 2,
+            "character": 2
+          },
+          "end": {
+            "line": 2,
+            "character": 17
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "mod_b/arguments.crn": [],
+    "mod_b/main.crn": [
+      {
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'src.identifier', which is known only after apply",
+        "range": {
+          "start": {
+            "line": 1,
+            "character": 2
+          },
+          "end": {
+            "line": 1,
+            "character": 22
+          }
+        },
+        "severity": 1
+      }
+    ],
+    "mod_c/arguments.crn": [],
+    "mod_c/main.crn": [],
+    "providers.crn": []
+  }
+}

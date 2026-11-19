@@ -1,25 +1,23 @@
 {
-  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply\nError: mock.test.resource.<pending>: Unknown attribute 'nope', did you mean 'name'?\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\n",
-  "text_exit": 1,
   "json": {
     "errors": [
       {
         "code": null,
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply",
-        "severity": "error",
         "location": {
           "file": "child/main.crn",
           "range": {
-            "start": {
-              "line": 2,
-              "column": 3
-            },
             "end": {
-              "line": 2,
-              "column": 33
+              "column": 33,
+              "line": 2
+            },
+            "start": {
+              "column": 3,
+              "line": 2
             }
           }
-        }
+        },
+        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply",
+        "severity": "error"
       },
       {
         "code": null,
@@ -67,20 +65,21 @@
   "lsp": {
     "backend.crn": [],
     "child/arguments.crn": [],
+    "child/lets.crn": [],
     "child/main.crn": [
       {
         "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply",
-        "severity": 1,
         "range": {
-          "start": {
-            "line": 1,
-            "character": 2
-          },
           "end": {
-            "line": 1,
-            "character": 32
+            "character": 32,
+            "line": 1
+          },
+          "start": {
+            "character": 2,
+            "line": 1
           }
-        }
+        },
+        "severity": 1
       },
       {
         "message": "Unknown attribute 'bogus'",
@@ -114,20 +113,6 @@
         "severity": 1
       },
       {
-        "message": "'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply",
-        "severity": 1,
-        "range": {
-          "start": {
-            "line": 1,
-            "character": 8
-          },
-          "end": {
-            "line": 1,
-            "character": 28
-          }
-        }
-      },
-      {
         "message": "Unknown attribute 'nope', did you mean 'name'?",
         "range": {
           "end": {
@@ -142,7 +127,8 @@
         "severity": 1
       }
     ],
-    "providers.crn": [],
-    "child/lets.crn": []
-  }
+    "providers.crn": []
+  },
+  "text": "Validating...\nError: mock.test.resource.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'local.identifier', which is known only after apply\nError: mock.test.resource.<pending>: Unknown attribute 'nope', did you mean 'name'?\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\n",
+  "text_exit": 1
 }

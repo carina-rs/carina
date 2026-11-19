@@ -3931,6 +3931,12 @@ impl SourceFileId {
     pub fn path(&self) -> &Path {
         &self.0
     }
+
+    /// Source label for publication, reducing real-directory parent components
+    /// without replacing an authored symlink spelling by its target.
+    pub fn diagnostic_path(&self) -> PathBuf {
+        crate::paths::DisplayPath::for_diagnostics(self.path()).into_source_path()
+    }
 }
 
 /// Parser-owned identity of one lexical binding scope.

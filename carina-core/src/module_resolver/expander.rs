@@ -1002,7 +1002,6 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     (
                         module_instance_scope
                             .resolve(RelativeBindingName::new(argument.name.as_str())),
-                        RelativeBindingName::new(argument.name.as_str()),
                         argument.static_type.clone(),
                     )
                 }),

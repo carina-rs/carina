@@ -390,7 +390,6 @@ enum ParseOwnership {
 }
 /// Source dependency occurrences, before alias substitution and redaction.
 /// Identity and diagnostic spelling remain separate across module expansion.
-#[derive(Clone)]
 pub(crate) enum AuthoredDependency<B: BindingAddress> {
     Binding {
         binding: B,
@@ -402,178 +401,6 @@ pub(crate) enum AuthoredDependency<B: BindingAddress> {
         authored: crate::resource::AccessPath<RelativeBindingName>,
         scope: DiagnosticScope,
     },
-}
-
-/// Proof that every path to a formal argument uses only bare names, aliases
-/// and interpolation. Only the authored-tree traversal can construct it.
-pub(crate) enum PrefixArgumentUses<B: BindingAddress> {
-    Independent,
-    Bare(BareArgumentEvidence<B>),
-    NotBare,
-}
-
-pub(crate) struct BareArgumentEvidence<B: BindingAddress> {
-    routes: Vec<BareArgumentRoute<B>>,
-    awaiting: bool,
-}
-
-pub(crate) struct BareArgumentRoute<B: BindingAddress> {
-    binding: B,
-    owner: BareArgumentOwner,
-    uses: Vec<AuthoredDependency<B>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BareArgumentOwner(super::ModuleCallId);
-impl BareArgumentOwner {
-    pub(crate) fn call(&self) -> &super::ModuleCallId {
-        &self.0
-    }
-}
-#[derive(Clone)]
-pub(crate) struct AwaitingBareArgument(());
-
-impl<B: BindingAddress> BareArgumentEvidence<B> {
-    pub(crate) fn route(
-        &self,
-        binding: &B,
-        call: &super::ModuleCallId,
-    ) -> Option<&BareArgumentRoute<B>> {
-        self.routes
-            .iter()
-            .find(|route| &route.binding == binding && route.owner.call() == call)
-    }
-    pub(crate) fn awaiting(&self) -> Option<AwaitingBareArgument> {
-        self.awaiting.then_some(AwaitingBareArgument(()))
-    }
-}
-impl<B: BindingAddress> BareArgumentRoute<B> {
-    pub(crate) fn owner(&self) -> &BareArgumentOwner {
-        &self.owner
-    }
-    pub(crate) fn uses(&self) -> Vec<AuthoredDependency<B>> {
-        self.uses.clone()
-    }
-}
-
-impl<B: BindingAddress> Expressions<B> {
-    fn prefix_argument_uses(
-        &self,
-        root: &AuthoredExpr<ParserPlaceholder, B>,
-        calls: &[&super::ModuleCallId],
-        bindings: &crate::validation::inference::InferenceBindings,
-    ) -> PrefixArgumentUses<B> {
-        struct Walk<'a, B: BindingAddress> {
-            expressions: &'a Expressions<B>,
-            bindings: &'a crate::validation::inference::InferenceBindings,
-            calls: &'a [&'a super::ModuleCallId],
-            evidence: BareArgumentEvidence<B>,
-            visiting: Vec<B>,
-        }
-        impl<B: BindingAddress> Walk<'_, B> {
-            fn binding(
-                &mut self,
-                binding: &B,
-                bare: bool,
-                index: Option<usize>,
-            ) -> Result<bool, ()> {
-                if self.visiting.contains(binding) {
-                    return Ok(false);
-                }
-                self.visiting.push(binding.clone());
-                let result = if self.expressions.is_module_argument(binding)
-                    || matches!(
-                        crate::resource::DependencyKey::new(binding.clone())
-                            .lookup_by_name(self.bindings),
-                        Some(crate::validation::inference::InferenceBinding::Argument { .. })
-                    ) {
-                    if !bare {
-                        return Err(());
-                    }
-                    if let Some(call) = index.and_then(|index| self.calls.get(index)).copied() {
-                        if let Some(node) = self.expressions.argument_expression(binding, call) {
-                            self.node(node, true, index.and_then(|index| index.checked_sub(1)))?;
-                            let mut uses = Vec::new();
-                            node.dependency_uses(DiagnosticScope::Public, &mut uses);
-                            self.evidence.routes.push(BareArgumentRoute {
-                                binding: binding.clone(),
-                                owner: BareArgumentOwner(call.clone()),
-                                uses,
-                            });
-                        } else {
-                            self.evidence.awaiting = true;
-                        }
-                    } else {
-                        self.evidence.awaiting = true;
-                    }
-                    true
-                } else if let Some(definition) = self.expressions.definitions.get(binding) {
-                    self.node(&definition.authored, bare, index)?
-                } else {
-                    false
-                };
-                self.visiting.pop();
-                Ok(result)
-            }
-            fn node(
-                &mut self,
-                node: &AuthoredExpr<ParserPlaceholder, B>,
-                bare: bool,
-                index: Option<usize>,
-            ) -> Result<bool, ()> {
-                if let AuthoredChildRoles::Sink { value, .. } = node.roles {
-                    return match node.children.iter().find(|child| child.node_id() == value) {
-                        Some(child) => self.node(&child.authored, bare, index),
-                        None => Ok(false),
-                    };
-                }
-                match &node.kind {
-                    ExprKind::Binding {
-                        binding,
-                        authored_binding: _,
-                    } => return self.binding(binding, bare, index),
-                    ExprKind::Reference {
-                        binding,
-                        authored_binding: _,
-                        attribute: _,
-                        segments: _,
-                    } => return self.binding(binding, false, index),
-                    // References to a resource/module output do not inline its
-                    // constructor's inputs into the prefix's authored value.
-                    ExprKind::Resource { .. } | ExprKind::ModuleCall => return Ok(false),
-                    _ => {}
-                }
-                let bare = bare
-                    && matches!(
-                        node.kind,
-                        ExprKind::Interpolation { .. }
-                            | ExprKind::Alias
-                            | ExprKind::Definition
-                            | ExprKind::Sink { .. }
-                    );
-                let mut reaches_argument = false;
-                for child in &node.children {
-                    reaches_argument |= self.node(&child.authored, bare, index)?;
-                }
-                Ok(reaches_argument)
-            }
-        }
-        let mut walk = Walk {
-            expressions: self,
-            bindings,
-            calls,
-            visiting: Vec::new(),
-            evidence: BareArgumentEvidence {
-                routes: Vec::new(),
-                awaiting: false,
-            },
-        };
-        match walk.node(root, true, calls.len().checked_sub(1)) {
-            Ok(false) => PrefixArgumentUses::Independent,
-            Ok(true) => PrefixArgumentUses::Bare(walk.evidence),
-            Err(()) => PrefixArgumentUses::NotBare,
-        }
-    }
 }
 
 impl<P: ValueKind, B: BindingAddress> AuthoredExpr<P, B> {
@@ -1262,20 +1089,13 @@ pub(in crate::parser) fn resource_slots(
 /// let signatures = ResolvedModuleSignatures::default();
 /// let unchecked = ValidationTypeContext::new_providerless(&raw, &config, &signatures);
 /// ```
-#[derive(Clone, PartialEq)]
-struct BoundModuleArgument {
-    name: RelativeBindingName,
-    type_expr: TypeExpr,
-}
-
 #[derive(Clone)]
 pub struct Expressions<B: BindingAddress = RelativeBindingName> {
     roots: Vec<ExprValue<ParserPlaceholder, B>>,
     definitions: IndexMap<B, ExprValue<ParserPlaceholder, B>>,
     binding_names: IndexMap<B, RelativeBindingName>,
-    argument_instances: IndexMap<B, ExpressionInstance>,
     report: Arc<ExpressionReport<B>>,
-    arguments: IndexMap<B, BoundModuleArgument>,
+    arguments: IndexMap<B, TypeExpr>,
     secrecy_arguments: IndexMap<B, Value<ParserPlaceholder, B>>,
     secrecy_argument_modules: IndexMap<B, B>,
     secrecy_argument_roots: IndexMap<ExpressionLocation, String>,
@@ -1295,7 +1115,6 @@ impl<B: BindingAddress> PartialEq for Expressions<B> {
             roots,
             definitions,
             binding_names,
-            argument_instances,
             report,
             arguments,
             secrecy_arguments,
@@ -1311,7 +1130,6 @@ impl<B: BindingAddress> PartialEq for Expressions<B> {
         roots == &other.roots
             && definitions == &other.definitions
             && binding_names == &other.binding_names
-            && argument_instances == &other.argument_instances
             && report == &other.report
             && arguments == &other.arguments
             && secrecy_arguments == &other.secrecy_arguments
@@ -1339,7 +1157,6 @@ impl<B: BindingAddress> Default for Expressions<B> {
             roots: Vec::new(),
             definitions: IndexMap::new(),
             binding_names: IndexMap::new(),
-            argument_instances: IndexMap::new(),
             report: Arc::new(ExpressionReport::empty()),
             arguments: IndexMap::new(),
             secrecy_arguments: IndexMap::new(),
@@ -1488,30 +1305,6 @@ impl<B: BindingAddress> Expressions<B> {
         uses
     }
 
-    /// Retain the argument's declared name separately from its binding address.
-    fn argument_expression(
-        &self,
-        binding: &B,
-        call: &super::ModuleCallId,
-    ) -> Option<&AuthoredExpr<ParserPlaceholder, B>> {
-        let argument = self.arguments.get(binding)?;
-        let location = call.argument_value_location(argument.name.as_str())?;
-        let caller = self.argument_instances.get(binding)?;
-        let mut pending = self
-            .roots
-            .iter()
-            .map(|root| root.authored.as_ref())
-            .collect::<Vec<_>>();
-        while let Some(node) = pending.pop() {
-            let owns_instance = &node.location.instance == caller;
-            if owns_instance && &node.location.authored == location {
-                return Some(node);
-            }
-            pending.extend(node.children.iter().map(|child| child.authored.as_ref()));
-        }
-        None
-    }
-
     /// Read the authored loop at its use; resolved values must not decide
     /// whether an iterable came from a formal argument.
     pub(crate) fn argument_iterable_at(
@@ -1592,7 +1385,6 @@ impl<B: BindingAddress> Expressions<B> {
         self.roots.extend(other.roots);
         self.definitions.extend(other.definitions);
         self.binding_names.extend(other.binding_names);
-        self.argument_instances.extend(other.argument_instances);
         self.arguments.extend(other.arguments);
         self.secrecy_arguments.extend(other.secrecy_arguments);
         self.secrecy_argument_modules
@@ -1652,11 +1444,6 @@ impl<B: BindingAddress> Expressions<B> {
                 .into_iter()
                 .map(|(binding, name)| (map(binding), name))
                 .collect(),
-            argument_instances: self
-                .argument_instances
-                .into_iter()
-                .map(|(binding, instance)| (map(binding), instance))
-                .collect(),
             definitions: self
                 .definitions
                 .into_iter()
@@ -1710,7 +1497,7 @@ impl<B: BindingAddress> Expressions<B> {
     pub(crate) fn bind_arguments(
         &mut self,
         scope: &crate::resource::ModuleInstanceScope,
-        arguments: impl IntoIterator<Item = (B, RelativeBindingName, TypeExpr)>,
+        arguments: impl IntoIterator<Item = (B, TypeExpr)>,
     ) {
         self.set_require_scope(RequireScope::ModuleCall);
         self.instance = ExpressionInstance::for_scope(scope);
@@ -1746,11 +1533,7 @@ impl<B: BindingAddress> Expressions<B> {
         for root in self.definitions.values_mut() {
             qualify(root, &self.instance, &mut memo);
         }
-        self.arguments.extend(
-            arguments.into_iter().map(|(binding, name, type_expr)| {
-                (binding, BoundModuleArgument { name, type_expr })
-            }),
-        );
+        self.arguments.extend(arguments);
         self.report = Arc::new(ExpressionReport::empty());
     }
 }
@@ -1787,12 +1570,6 @@ impl Expressions<crate::resource::AbsoluteBindingAddress> {
             } else {
                 Some(scope)
             };
-            self.argument_instances.insert(
-                scope.resolve(RelativeBindingName::new(name)),
-                reference_scope
-                    .map(ExpressionInstance::for_scope)
-                    .unwrap_or_default(),
-            );
             if let Some(reference_scope) = reference_scope {
                 self.secrecy_argument_modules.insert(
                     scope.resolve(RelativeBindingName::new(name)),
@@ -7030,14 +6807,12 @@ mod judgement {
         }
 
         fn parameter_type(&self, binding: &B) -> Option<&TypeExpr> {
-            self.expressions
-                .arguments
-                .get(binding)
-                .map(|argument| &argument.type_expr)
-                .or_else(|| match self.bindings.get(binding.as_str()) {
+            self.expressions.arguments.get(binding).or_else(|| {
+                match self.bindings.get(binding.as_str()) {
                     Some(InferenceBinding::Argument { type_expr }) => Some(type_expr),
                     _ => None,
-                })
+                }
+            })
         }
 
         fn narrow_declared(

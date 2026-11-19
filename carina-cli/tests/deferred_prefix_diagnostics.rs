@@ -70,6 +70,16 @@ impl Fixture {
     }
 
     async fn observation(&self) -> serde_json::Value {
+        let sources = self
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.clone(),
+                    json!(std::fs::read_to_string(self.root().join(file)).unwrap()),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
         let validate = self.cli(&["validate", "."]);
         let json_output = self.cli(&["validate", ".", "--json"]);
         let observation = json!({
@@ -78,7 +88,15 @@ impl Fixture {
             "json_exit":json_output.status.code(), "json_stderr":String::from_utf8_lossy(&json_output.stderr),
             "lsp":self.editor_inventory().await
         });
-        println!("C4461_R1_OBSERVATION={observation}");
+        println!(
+            "C4461_INPUTS={} {}",
+            std::thread::current().name().unwrap_or("unnamed"),
+            json!(sources)
+        );
+        println!(
+            "C4461_OBSERVATION={} {observation}",
+            std::thread::current().name().unwrap_or("unnamed")
+        );
         observation
     }
 
@@ -264,97 +282,49 @@ async fn deferred_prefix_c2_alias_directory() {
     .await;
 }
 
-async fn assert_module_argument_findings(
+async fn assert_module_declaration_findings(
     fixture: Fixture,
     dependencies: &[&str],
     ranges: &[Range],
 ) {
-    let messages = dependencies.iter().map(|dependency| format!(
-        "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is known only after apply"
-    )).collect::<Vec<_>>();
-    let errors = messages
-        .iter()
-        .zip(ranges)
-        .map(|(message, range)| {
-            json!({
-                "message": message, "severity":"error", "code":null,
-                "location":{"file":"main.crn", "range":{
-                    "start":{"line":range.start.line+1, "column":range.start.character+1},
-                    "end":{"line":range.end.line+1, "column":range.end.character+1}
-                }}
-            })
-        })
-        .collect::<Vec<_>>();
-    let human = messages
-        .iter()
-        .zip(ranges)
-        .map(|(message, range)| {
-            format!(
-                "Error: ./main.crn:{}:{}: {message}\n",
-                range.start.line + 1,
-                range.start.character + 1
-            )
-        })
-        .collect::<String>();
-    let mut lsp = fixture
-        .files
-        .iter()
-        .map(|file| (file.clone(), json!([])))
-        .collect::<serde_json::Map<_, _>>();
-    lsp.insert(
-        "main.crn".into(),
-        json!(
-            messages
-                .iter()
-                .zip(ranges)
-                .map(|(message, range)| json!({
-                    "message":message,"range":range,"severity":1
-                }))
-                .collect::<Vec<_>>()
-        ),
-    );
-    let validate = fixture.cli(&["validate", "."]);
-    let json_output = fixture.cli(&["validate", ".", "--json"]);
+    let human = dependencies.iter().map(|dependency| format!(
+        "Error: {}: 'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is known only after apply\n", fixture.subject
+    )).collect::<String>();
     let plan = fixture.cli(&["plan", "."]);
-    let actual = json!({
-        "text":text(&validate), "text_exit":validate.status.code(),
-        "json":serde_json::from_slice::<serde_json::Value>(&json_output.stdout).unwrap(),
-        "json_exit":json_output.status.code(), "json_stderr":String::from_utf8_lossy(&json_output.stderr),
-        "plan":text(&plan), "plan_exit":plan.status.code(),
-        "lsp":fixture.editor_inventory().await
-    });
-    let expected = json!({
-        "text":format!("Validating...\n{human}"), "text_exit":1,
-        "json":{"status":"error", "resource_count":0,"resources":[],"errors":errors},
-        "json_exit":1,"json_stderr":"", "plan":human,"plan_exit":1,"lsp":lsp
-    });
-    assert_eq!(actual, expected, "full CLI/LSP case-d observation");
+    assert_eq!(plan.status.code(), Some(1));
+    assert_eq!(text(&plan), human);
+    let findings = ranges
+        .iter()
+        .zip(dependencies)
+        .map(|(range, dependency)| ("child/main.crn", *range, *dependency))
+        .collect::<Vec<_>>();
+    assert_forwarded_findings(fixture, &findings).await;
 }
 
 #[tokio::test]
 async fn deferred_prefix_d_module_argument_directory_publication_sites() {
-    assert_module_argument_findings(
+    assert_module_declaration_findings(
         Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = src.identifier\n}\n", SOURCE, true),
         &["'src.identifier'"],
-        &[Range::new(Position::new(2,11), Position::new(4,1))],
+        &[assignment(22)],
     ).await;
 }
 
 #[tokio::test]
 async fn deferred_prefix_d_two_call_sites_have_distinct_owners() {
-    assert_module_argument_findings(
+    assert_module_declaration_findings(
         Fixture::new("let sink_module = use { source = './child' }\n\nlet first = sink_module {\n  prefix = src.identifier\n}\n\nlet second = sink_module {\n  prefix = src.identifier\n}\n", SOURCE, true),
-        &["'src.identifier'", "'src.identifier'"],
-        &[Range::new(Position::new(2,12), Position::new(4,1)), Range::new(Position::new(6,13), Position::new(8,1))],
+        &["'src.identifier'"],
+        &[assignment(22)],
     ).await;
 }
 
 #[tokio::test]
 async fn deferred_prefix_d_caller_alias_is_preserved() {
-    assert_module_argument_findings(
+    assert_module_declaration_findings(
         Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = p\n}\n", &format!("{SOURCE}let p = src.identifier\n"), true),
-        &["'src.identifier' (through 'p')"],
-        &[Range::new(Position::new(2,11), Position::new(4,1))],
+        &["'src.identifier'"],
+        &[assignment(22)],
     ).await;
 }
 
@@ -428,11 +398,7 @@ async fn assert_forwarded_findings(fixture: Fixture, findings: &[(&str, Range, &
         let message = format!(
             "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependency}, which is known only after apply"
         );
-        human.push_str(&format!(
-            "Error: ./{file}:{}:{}: {message}\n",
-            range.start.line + 1,
-            range.start.character + 1
-        ));
+        human.push_str(&format!("Error: {}: {message}\n", fixture.subject));
         errors.push(json!({"message":message,"severity":"error","code":null,"location":{"file":file,"range":{
             "start":{"line":range.start.line+1,"column":range.start.character+1},
             "end":{"line":range.end.line+1,"column":range.end.character+1}
@@ -461,11 +427,7 @@ async fn r1_nested_forwarding_owns_root_argument() {
     );
     assert_forwarded_findings(
         fixture,
-        &[(
-            "main.crn",
-            Range::new(Position::new(2, 8), Position::new(4, 1)),
-            "'src.identifier'",
-        )],
+        &[("mod_a/mod_b/main.crn", assignment(22), "'src.identifier'")],
     )
     .await;
 }
@@ -483,9 +445,9 @@ async fn r1_nested_local_reference_owns_inner_call() {
     assert_forwarded_findings(
         fixture,
         &[(
-            "mod_a/main.crn",
-            Range::new(Position::new(2, 8), Position::new(4, 1)),
-            "'local.identifier'",
+            "mod_a/mod_b/main.crn",
+            assignment(22),
+            "'a.local.identifier'",
         )],
     )
     .await;
@@ -499,18 +461,7 @@ async fn r1_nested_forwarding_keeps_two_root_instances() {
     );
     assert_forwarded_findings(
         fixture,
-        &[
-            (
-                "main.crn",
-                Range::new(Position::new(2, 12), Position::new(4, 1)),
-                "'src.identifier'",
-            ),
-            (
-                "main.crn",
-                Range::new(Position::new(6, 13), Position::new(8, 1)),
-                "'src.identifier'",
-            ),
-        ],
+        &[("mod_a/mod_b/main.crn", assignment(22), "'src.identifier'")],
     )
     .await;
 }
@@ -631,10 +582,10 @@ async fn r1_callee_alias_retains_argument_owner() {
     let fixture=Fixture::new("let sink_module = use { source = './child' }\n\nlet sink = sink_module {\n  prefix = src.identifier\n}\n",SOURCE,true)
         .with_file("child/lets.crn","let forwarded = prefix\n")
         .with_file("child/main.crn","mock.test.resource {\n  name_prefix = forwarded\n}\n");
-    assert_module_argument_findings(
+    assert_module_declaration_findings(
         fixture,
-        &["'src.identifier'"],
-        &[Range::new(Position::new(2, 11), Position::new(4, 1))],
+        &["'src.identifier' (through 'forwarded')"],
+        &[assignment(25)],
     )
     .await;
 }
@@ -696,13 +647,13 @@ async fn assert_awaiting_prefix_keeps_sibling(
         .iter()
         .map(|file| (file.clone(), json!([])))
         .collect::<serde_json::Map<_, _>>();
-    lsp.insert("main.crn".into(),json!([{"message":format!("mock.test.resource.<pending>: {message}"),"severity":1,"range":Range::new(Position::new(1,11),Position::new(1,44))},{"message":prefix_message,"severity":1,"range":Range::new(Position::new(1,11),Position::new(1,44))}]));
-    lsp.insert("child/main.crn".into(),json!([{"message":message,"severity":severity,"range":Range::new(Position::new(2,2),Position::new(2,end))}]));
+    lsp.insert("main.crn".into(),json!([{"message":format!("mock.test.resource.<pending>: {message}"),"severity":1,"range":Range::new(Position::new(1,11),Position::new(1,44))}]));
+    lsp.insert("child/main.crn".into(),json!([{"message":prefix_message,"severity":1,"range":assignment(22)},{"message":message,"severity":severity,"range":Range::new(Position::new(2,2),Position::new(2,end))}]));
     let actual = fixture.observation().await;
     assert_eq!(
         actual,
-        json!({"text":format!("Validating...\nError: ./main.crn:2:12: {prefix_message}\nError: mock.test.resource.<pending>: {message}\n"),"text_exit":1,
-            "json":{"status":"error","resource_count":0,"resources":[],"errors":[{"message":prefix_message,"code":null,"severity":"error","location":{"file":"main.crn","range":{"start":{"line":2,"column":12},"end":{"line":2,"column":45}}}},{"message":message,"code":null,"severity":"error","location":{"file":"child/main.crn","range":{
+        json!({"text":format!("Validating...\nError: mock.test.resource.<pending>: {prefix_message}\nError: mock.test.resource.<pending>: {message}\n"),"text_exit":1,
+            "json":{"status":"error","resource_count":0,"resources":[],"errors":[{"message":prefix_message,"code":null,"severity":"error","location":{"file":"child/main.crn","range":{"start":{"line":2,"column":3},"end":{"line":2,"column":23}}}},{"message":message,"code":null,"severity":"error","location":{"file":"child/main.crn","range":{
                 "start":{"line":3,"column":3},"end":{"line":3,"column":end+1}
             }}}]},"json_exit":1,"json_stderr":"","lsp":lsp
         }),
@@ -748,8 +699,8 @@ async fn r1_awaiting_prefix_keeps_both_siblings() {
         .map(|file| (file.clone(), json!([])))
         .collect::<serde_json::Map<_, _>>();
     lsp.insert("main.crn".into(),json!(messages.iter().map(|message|json!({"message":format!("mock.test.resource.<pending>: {message}"),"severity":1,"range":Range::new(Position::new(1,11),Position::new(1,44))})).collect::<Vec<_>>()));
-    lsp["main.crn"].as_array_mut().unwrap().push(json!({"message":prefix_message,"severity":1,"range":Range::new(Position::new(1,11),Position::new(1,44))}));
     lsp.insert("child/main.crn".into(),json!([
+        {"message":prefix_message,"severity":1,"range":assignment(22)},
         {"message":messages[0],"severity":1,"range":Range::new(Position::new(2,2),Position::new(2,11))},
         {"message":messages[1],"severity":2,"range":Range::new(Position::new(3,2),Position::new(3,9))}
     ]));
@@ -767,9 +718,9 @@ async fn r1_awaiting_prefix_keeps_both_siblings() {
     assert_eq!(
         actual,
         json!({
-            "text":format!("Validating...\nError: ./main.crn:2:12: {prefix_message}\nError: mock.test.resource.<pending>: {}\nError: mock.test.resource.<pending>: {}\n",messages[0],messages[1]),"text_exit":1,
+            "text":format!("Validating...\nError: mock.test.resource.<pending>: {prefix_message}\nError: mock.test.resource.<pending>: {}\nError: mock.test.resource.<pending>: {}\n",messages[0],messages[1]),"text_exit":1,
             "json":{"status":"error","resource_count":0,"resources":[],"errors":[
-                {"message":prefix_message,"code":null,"severity":"error","location":{"file":"main.crn","range":{"start":{"line":2,"column":12},"end":{"line":2,"column":45}}}},
+                {"message":prefix_message,"code":null,"severity":"error","location":{"file":"child/main.crn","range":{"start":{"line":2,"column":3},"end":{"line":2,"column":23}}}},
                 {"message":messages[0],"severity":"error","code":null,"location":{"file":"child/main.crn","range":{"start":{"line":3,"column":3},"end":{"line":3,"column":12}}}},
                 {"message":messages[1],"severity":"error","code":null,"location":{"file":"child/main.crn","range":{"start":{"line":4,"column":3},"end":{"line":4,"column":10}}}}
             ]},"json_exit":1,"json_stderr":"","lsp":lsp
@@ -1071,40 +1022,22 @@ async fn w_assert(case: &str, dependencies: &str) {
 }
 
 async fn assert_wording_fixture(fixture: Fixture, case: &str, dependencies: &str) {
-    let main = std::fs::read_to_string(fixture.root().join("main.crn")).unwrap();
-    let (line, assignment) = main
+    let authored = if case.starts_with("caller_") {
+        "child/main.crn"
+    } else {
+        "main.crn"
+    };
+    let source = std::fs::read_to_string(fixture.root().join(authored)).unwrap();
+    let (line, assignment) = source
         .lines()
         .enumerate()
-        .find(|(_, line)| {
-            line.contains(if case.starts_with("caller_") {
-                "child {"
-            } else {
-                "name_prefix ="
-            })
-        })
+        .find(|(_, line)| line.contains("name_prefix ="))
         .unwrap();
     let range = Range::new(
-        Position::new(
-            line as u32,
-            assignment
-                .find(if case.starts_with("caller_") {
-                    "child {"
-                } else {
-                    "name_prefix"
-                })
-                .unwrap() as u32,
-        ),
+        Position::new(line as u32, assignment.find("name_prefix").unwrap() as u32),
         Position::new(line as u32, assignment.len() as u32),
     );
-    let subject = if case.starts_with("caller_") {
-        format!(
-            "./main.crn:{}:{}",
-            range.start.line + 1,
-            range.start.character + 1
-        )
-    } else {
-        fixture.subject.clone()
-    };
+    let subject = fixture.subject.clone();
     let message = format!(
         "'name_prefix' must be known at plan time to generate 'name', but it depends on {dependencies}"
     );
@@ -1112,7 +1045,7 @@ async fn assert_wording_fixture(fixture: Fixture, case: &str, dependencies: &str
     for file in &fixture.files {
         inventory.insert(
             file.clone(),
-            if file == "main.crn" {
+            if file == authored {
                 json!([{"message":message,"range":range,"severity":1}])
             } else {
                 json!([])
@@ -1135,7 +1068,7 @@ async fn assert_wording_fixture(fixture: Fixture, case: &str, dependencies: &str
         "text_exit":1,"json_exit":1,"json_stderr":"",
         "json":{"status":"error","resource_count":0,"resources":[],"errors":[{
             "message":message,"severity":"error","code":null,
-            "location":{"file":"main.crn","range":{
+            "location":{"file":authored,"range":{
                 "start":{"line":range.start.line+1,"column":range.start.character+1},
                 "end":{"line":range.end.line+1,"column":range.end.character+1}
             }}
@@ -1381,63 +1314,11 @@ r4_main_case!(r4_known_resource_literal_matches_main, "literal_attr");
 #[tokio::test]
 async fn r4_distinct_dependency_sets_at_one_call_stay_distinct() {
     let fixture = r4_fixture("distinct_sets");
-    let main = std::fs::read_to_string(fixture.root().join("main.crn")).unwrap();
-    let call = main.lines().nth(1).unwrap();
-    let range = Range::new(
-        Position::new(1, call.find("c {").unwrap() as u32),
-        Position::new(1, call.len() as u32),
-    );
-    let messages = ["src.identifier", "other.identifier"].map(|path| format!(
-        "'name_prefix' must be known at plan time to generate 'name', but it depends on '{path}', which is known only after apply"
-    ));
-    let errors = messages
-        .iter()
-        .map(|message| {
-            json!({
-                "message":message,"severity":"error","code":null,
-                "location":{"file":"main.crn","range":{
-                    "start":{"line":2,"column":range.start.character+1},
-                    "end":{"line":2,"column":range.end.character+1}
-                }}
-            })
-        })
-        .collect::<Vec<_>>();
-    let lsp = fixture
-        .files
-        .iter()
-        .map(|file| {
-            (
-                file.clone(),
-                if file == "main.crn" {
-                    json!(
-                        messages
-                            .iter()
-                            .map(|message| json!({"message":message,"severity":1,"range":range}))
-                            .collect::<Vec<_>>()
-                    )
-                } else {
-                    json!([])
-                },
-            )
-        })
-        .collect::<serde_json::Map<_, _>>();
-    let text = format!(
-        "Validating...\n{}",
-        messages
-            .iter()
-            .map(|message| format!(
-                "Error: ./main.crn:2:{}: {message}\n",
-                range.start.character + 1
-            ))
-            .collect::<String>()
-    );
-    assert_eq!(
-        fixture.observation().await,
-        json!({
-            "text":text,"text_exit":1,"json_exit":1,"json_stderr":"",
-            "json":{"status":"error","resource_count":0,"resources":[],"errors":errors},"lsp":lsp
-        })
-    );
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/c/distinct_sets.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture.observation().await, expected);
 }
 
 #[tokio::test]
@@ -1499,6 +1380,81 @@ async fn r4b_data_source_iterable_uses_name_generation_clause() {
         "'x'",
         Range::new(Position::new(2, 4), Position::new(2, 19)),
         "not resolved when names are generated",
+    )
+    .await;
+}
+
+fn option_c_fixture(case: &str) -> Fixture {
+    let sources: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/deferred_prefix/c/inputs.json")).unwrap();
+    let source = &sources[case];
+    let mut fixture = Fixture::new(
+        source["main.crn"].as_str().unwrap(),
+        source["lets.crn"].as_str().unwrap(),
+        false,
+    );
+    for (file, text) in source.as_object().unwrap() {
+        fixture = fixture.with_file(file, text.as_str().unwrap());
+    }
+    fixture
+}
+
+macro_rules! option_c_case {
+    ($name:ident, $case:literal) => {
+        #[tokio::test]
+        async fn $name() {
+            let expected: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                "fixtures/deferred_prefix/c/",
+                $case,
+                ".json"
+            )))
+            .unwrap();
+            assert_eq!(
+                option_c_fixture($case).observation().await,
+                expected,
+                "exact validate text/JSON and every opened file's LSP inventory"
+            );
+        }
+    };
+}
+option_c_case!(option_c_bare_direct_is_declaration_owned, "b3_direct");
+option_c_case!(
+    option_c_interpolation_is_declaration_owned,
+    "b3_interpolation"
+);
+option_c_case!(option_c_let_alias_is_declaration_owned, "b3_alias");
+option_c_case!(option_c_nested_forwarding_is_declaration_owned, "b3_nested");
+option_c_case!(
+    option_c_three_modules_agree_in_every_file,
+    "b1_three_modules"
+);
+option_c_case!(option_c_resource_hop_deferred_agrees, "b2_hop_deferred");
+option_c_case!(option_c_resource_hop_literal_agrees, "b2_hop_literal");
+
+#[tokio::test]
+async fn option_c_field_access_is_declaration_owned() {
+    let expected: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/deferred_prefix/c/field_deferred.json"
+    ))
+    .unwrap();
+    assert_eq!(r4_fixture("field_deferred").observation().await, expected);
+}
+
+#[tokio::test]
+async fn option_c_parenthesized_argument_is_declaration_owned() {
+    assert_rejected(
+        Fixture::new(
+            "let c = use { source = './child' }\nlet instance = c { prefix = src.identifier }\n",
+            SOURCE,
+            true,
+        )
+        .with_file(
+            "child/main.crn",
+            "mock.test.resource {\n  name_prefix = (prefix)\n}\n",
+        ),
+        "'src.identifier'",
+        "child/main.crn",
+        assignment(24),
     )
     .await;
 }

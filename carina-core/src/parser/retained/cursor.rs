@@ -1209,15 +1209,6 @@ impl JudgedSlot {
 impl<B: BindingAddress> JudgedSlot<B> {
     /// Diagnostic syntax inventory, independent of the current projection/judgement.
     /// Inlining an alias or substituting a module argument must retain its authored name.
-    pub(crate) fn prefix_argument_uses(
-        &self,
-        expressions: &super::Expressions<B>,
-        calls: &[&crate::parser::ModuleCallId],
-        bindings: &crate::validation::inference::InferenceBindings,
-    ) -> super::PrefixArgumentUses<B> {
-        expressions.prefix_argument_uses(&self.root, calls, bindings)
-    }
-
     pub(crate) fn dependency_uses(&self) -> Vec<super::AuthoredDependency<B>> {
         let mut uses = Vec::new();
         self.root

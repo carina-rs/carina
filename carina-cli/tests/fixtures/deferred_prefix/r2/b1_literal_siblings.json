@@ -1,6 +1,4 @@
 {
-  "text": "Validating...\nError: mock.test.resource.<pending>: Unknown attribute 'nope', did you mean 'name'?\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\n",
-  "text_exit": 1,
   "json": {
     "errors": [
       {
@@ -97,5 +95,7 @@
       }
     ],
     "providers.crn": []
-  }
+  },
+  "text": "Validating...\nError: mock.test.resource.<pending>: Unknown attribute 'nope', did you mean 'name'?\nError: mock.test.resource.<pending>: Unknown attribute 'bogus'\n",
+  "text_exit": 1
 }

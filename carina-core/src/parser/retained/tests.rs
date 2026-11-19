@@ -733,11 +733,7 @@ fn module_parameter_uses_its_declaration_in_every_instance() {
         .expressions_mut()
         .bind_arguments(
             &scope,
-            [(
-                RelativeBindingName::new("input"),
-                RelativeBindingName::new("input"),
-                TypeExpr::String,
-            )],
+            [(RelativeBindingName::new("input"), TypeExpr::String)],
         );
     let report = judge_expressions(&module, &SchemaRegistry::new(), &config());
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
@@ -1094,11 +1090,7 @@ fn module_parameter_judgement_is_independent_of_the_callers_value() {
             .expressions_mut()
             .bind_arguments(
                 &scope,
-                [(
-                    RelativeBindingName::new("input"),
-                    RelativeBindingName::new("input"),
-                    TypeExpr::String,
-                )],
+                [(RelativeBindingName::new("input"), TypeExpr::String)],
             );
         let report = judge_expressions(&module, &SchemaRegistry::new(), &config());
         let result = report.binding(&RelativeBindingName::new("result")).unwrap();
@@ -1127,14 +1119,7 @@ fn resolved_nominal_declarations_fail_closed_at_unrelated_scalars() {
         .parser_binding_metadata
         .syntax
         .expressions_mut()
-        .bind_arguments(
-            &scope,
-            [(
-                RelativeBindingName::new("input"),
-                RelativeBindingName::new("input"),
-                named.clone(),
-            )],
-        );
+        .bind_arguments(&scope, [(RelativeBindingName::new("input"), named.clone())]);
     let report = judge_expressions(&module, &SchemaRegistry::new(), &config());
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     let direct = report.binding(&RelativeBindingName::new("direct")).unwrap();

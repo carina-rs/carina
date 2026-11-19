@@ -11,7 +11,6 @@ mod private {
     pub struct Derivation;
 
     pub trait Sealed: Sized {
-        fn absolute_identity(&self, _authority: Derivation) -> super::AbsoluteBindingAddress;
         fn deferred_template(&self, authority: Derivation) -> Self;
         fn selected_attribute(&self, attribute: &str, authority: Derivation) -> Self;
         fn collection_binding(&self, index: usize, authority: Derivation) -> Self;
@@ -269,9 +268,6 @@ pub trait BindingAddress:
 }
 
 impl private::Sealed for RelativeBindingName {
-    fn absolute_identity(&self, _authority: private::Derivation) -> AbsoluteBindingAddress {
-        super::RootScope::new().resolve(self.clone())
-    }
     fn input_preview<P: super::ValueKind>(value: super::Value<P, Self>) -> super::Value<P> {
         // Parser-owned directories have root-relative bindings. Qualification
         // preserves their structure; preview knowledge never resolves them.
@@ -338,9 +334,6 @@ impl BindingAddress for RelativeBindingName {
 }
 
 impl private::Sealed for AbsoluteBindingAddress {
-    fn absolute_identity(&self, _authority: private::Derivation) -> AbsoluteBindingAddress {
-        self.clone()
-    }
     fn input_preview<P: super::ValueKind>(value: super::Value<P, Self>) -> super::Value<P> {
         value
     }
@@ -491,11 +484,6 @@ pub(crate) fn binding_selected_attribute<B: BindingAddress>(binding: &B, attribu
 }
 pub(crate) fn binding_collection<B: BindingAddress>(binding: &B, index: usize) -> B {
     <B as private::Sealed>::collection_binding(binding, index, private::Derivation)
-}
-
-/// Normalize diagnostic identity through the phase's typed scope resolver.
-pub(crate) fn absolute_identity<B: BindingAddress>(binding: &B) -> AbsoluteBindingAddress {
-    binding.absolute_identity(private::Derivation)
 }
 
 #[cfg(test)]

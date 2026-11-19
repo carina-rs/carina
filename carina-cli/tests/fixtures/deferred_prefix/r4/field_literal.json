@@ -12,40 +12,11 @@
   "lsp": {
     "backend.crn": [],
     "child/arguments.crn": [],
-    "child/main.crn": [
-      {
-        "message": "Required attribute 'name' is missing",
-        "range": {
-          "end": {
-            "character": 18,
-            "line": 0
-          },
-          "start": {
-            "character": 0,
-            "line": 0
-          }
-        },
-        "severity": 1
-      },
-      {
-        "message": "Unknown attribute 'name_prefix'",
-        "range": {
-          "end": {
-            "character": 26,
-            "line": 1
-          },
-          "start": {
-            "character": 2,
-            "line": 1
-          }
-        },
-        "severity": 1
-      }
-    ],
+    "child/main.crn": [],
     "lets.crn": [],
     "main.crn": [],
     "providers.crn": []
   },
-  "text": "Validating...\n✓ 2 resources validated successfully.\n  • mock.test.resource.instance.mock_test_resource_3de7d8b2\n  • _virtual.instance\n",
+  "text": "Validating...\n\u2713 2 resources validated successfully.\n  \u2022 mock.test.resource.instance.mock_test_resource_3de7d8b2\n  \u2022 _virtual.instance\n",
   "text_exit": 0
 }

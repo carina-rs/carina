@@ -223,45 +223,7 @@ fn discover_by_dir_recursive(
 /// the relative paths to absolute module directories, and maps each module
 /// to the directories that import it. This allows module files to inherit
 /// their callers' provider schemas.
-#[derive(Default, Debug, PartialEq, Eq)]
-pub struct ModuleImportMap {
-    imports: HashMap<PathIdentity, BTreeSet<PathIdentity>>,
-    callers: HashMap<PathIdentity, ResolvedPath>,
-}
-impl std::ops::Deref for ModuleImportMap {
-    type Target = HashMap<PathIdentity, BTreeSet<PathIdentity>>;
-    fn deref(&self) -> &Self::Target {
-        &self.imports
-    }
-}
-impl ModuleImportMap {
-    pub(crate) fn record(&mut self, module: &ResolvedPath, caller: &ResolvedPath) {
-        let caller_id = PathIdentity::from(caller.identity());
-        self.callers
-            .entry(caller_id.clone())
-            .or_insert_with(|| caller.clone());
-        self.imports
-            .entry(PathIdentity::from(module.identity()))
-            .or_default()
-            .insert(caller_id);
-    }
-    pub(crate) fn caller_directories(&self, module: &PathIdentity) -> Vec<ResolvedPath> {
-        let mut pending = vec![module.clone()];
-        let mut visited = HashSet::from([module.clone()]);
-        let mut directories = std::collections::BTreeMap::new();
-        while let Some(module) = pending.pop() {
-            for caller in self.imports.get(&module).into_iter().flatten() {
-                if visited.insert(caller.clone()) {
-                    pending.push(caller.clone());
-                    if let Some(path) = self.callers.get(caller) {
-                        directories.insert(caller.clone(), path.clone());
-                    }
-                }
-            }
-        }
-        directories.into_values().collect()
-    }
-}
+pub type ModuleImportMap = HashMap<PathIdentity, BTreeSet<PathIdentity>>;
 
 pub fn discover_import_map(
     workspace_root: &Path,
@@ -275,7 +237,7 @@ pub(crate) fn discover_imports_in_scope(
     environment: &carina_core::EnvironmentSnapshot,
     scope: &DiscoveryScope,
 ) -> ModuleImportMap {
-    let mut result = ModuleImportMap::default();
+    let mut result = ModuleImportMap::new();
     if let Ok(root) = ResolvedPath::new(workspace_root) {
         discover_imports_recursive(&root, &mut result, &mut HashSet::new(), environment, scope);
     }
@@ -333,7 +295,10 @@ fn discover_imports_recursive(
                             module_path
                         }
                     };
-                    result.record(&module_dir, &caller_dir);
+                    result
+                        .entry(PathIdentity::from(module_dir.identity()))
+                        .or_default()
+                        .insert(PathIdentity::from(caller_dir.identity()));
                 }
             }
         }
