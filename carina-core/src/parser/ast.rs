@@ -570,7 +570,7 @@ impl DiagnosticLocation {
 ///     expression.file = Some("unrelated.crn".into());
 /// }
 /// ```
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DeferredForExpression<
     S = ModuleSource,
     P: ValueKind = NoPlaceholder,
@@ -588,9 +588,9 @@ pub struct DeferredForExpression<
     secrecy: TemplateSecrecy,
 }
 
-// Admission metadata is excluded from value equality and diagnostic rendering,
-// just as a resource's authored slots are. Saved-plan round trips keep their
-// existing value semantics even though their in-memory secrecy is unavailable.
+// Admission metadata is excluded from value equality, just as a resource's
+// authored slots are. Saved-plan round trips keep their existing value semantics
+// even though their in-memory secrecy is unavailable.
 impl<S: PartialEq, P: ValueKind, T: ValueKind, B: BindingAddress, D: PartialEq> PartialEq
     for DeferredForExpression<S, P, T, B, D>
 {
@@ -632,32 +632,6 @@ impl<S: PartialEq, P: ValueKind, T: ValueKind, B: BindingAddress, D: PartialEq> 
             other_resource,
             other_effect_id,
         )
-    }
-}
-
-impl<S: std::fmt::Debug, P: ValueKind, T: ValueKind, B: BindingAddress, D: std::fmt::Debug>
-    std::fmt::Debug for DeferredForExpression<S, P, T, B, D>
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self {
-            location,
-            header,
-            target,
-            iterable,
-            binding,
-            template_resource,
-            deferred_effect_id,
-            secrecy: _secrecy,
-        } = self;
-        f.debug_struct("DeferredForExpression")
-            .field("location", location)
-            .field("header", header)
-            .field("target", target)
-            .field("iterable", iterable)
-            .field("binding", binding)
-            .field("template_resource", template_resource)
-            .field("deferred_effect_id", deferred_effect_id)
-            .finish()
     }
 }
 
@@ -9133,7 +9107,8 @@ impl<E> ExpandedFile<E> {
 
         // Insert into a private copy first so a failed hand-over leaves both
         // the file and its attached graph unchanged.
-        if let Some(inputs) = &self.authored_inputs
+        if !expanded_resources.is_empty()
+            && let Some(inputs) = &self.authored_inputs
             && let Ok(graph) = inputs.validated_secrecy()
         {
             let mut graph = graph.clone();

@@ -7,12 +7,12 @@ use crate::schema::{
 use crate::secrecy::SecrecyReport;
 
 mod checked;
-mod round2;
+mod readers;
 
 use crate::parser::{ExpandedDeferredForExpression, ExpandedInferredFile};
 use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
-use crate::secrecy::{Evidence, Secrecy};
-use std::collections::HashMap;
+use crate::secrecy::{ChildSecrecy, Evidence, Secrecy};
+use std::collections::{BTreeMap, HashMap};
 
 const ROOT_LOOP: &str = r#"
 let children = for item in upstream.items {
@@ -40,6 +40,21 @@ fn fixture(
     SchemaRegistry,
     ProviderContext,
 ) {
+    try_fixture(main, module).unwrap()
+}
+
+fn try_fixture(
+    main: &str,
+    module: Option<&str>,
+) -> Result<
+    (
+        tempfile::TempDir,
+        ModuleResolvedInferredFile,
+        SchemaRegistry,
+        ProviderContext,
+    ),
+    String,
+> {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("main.crn"), main).unwrap();
     if let Some(module) = module {
@@ -85,15 +100,15 @@ fn fixture(
     let context = context();
     let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
     let root = crate::config_loader::load_configuration_with_config(&base, &context, &schemas)
-        .unwrap()
+        .map_err(|error| format!("configuration: {error:?}"))?
         .parsed;
     let file = crate::validation::deferred_types::with_session_for_test(&context, |session| {
         crate::module_resolver::resolve_modules_with_providerless_config(
             root, &base, session, &schemas,
         )
-        .unwrap()
-    });
-    (directory, file, schemas, context)
+        .map_err(|error| format!("module resolution: {error:?}"))
+    })?;
+    Ok((directory, file, schemas, context))
 }
 
 fn report(
@@ -112,6 +127,14 @@ fn resolved(
     schemas: &SchemaRegistry,
     context: &ProviderContext,
 ) -> ExpandedInferredFile {
+    resolve_owner(file, schemas, context).into_file()
+}
+
+fn resolve_owner(
+    file: ModuleResolvedInferredFile,
+    schemas: &SchemaRegistry,
+    context: &ProviderContext,
+) -> crate::validation::ResolvedFile<crate::parser::ExpandedInferredExportParam> {
     crate::validation::deferred_types::with_session_for_test(context, |session| {
         crate::validation::resolve_bare_binding_uses_in_session(
             file,
@@ -120,7 +143,6 @@ fn resolved(
             &crate::module_resolver::ResolvedModuleSignatures::default(),
         )
         .unwrap()
-        .into_file()
     })
 }
 
@@ -182,52 +204,58 @@ fn assert_child_row(file: &ExpandedInferredFile, binding: &str) {
     assert_eq!(attributes["name"], Evidence::Leaf(Secrecy::Public));
 }
 
-fn measure(shape: &str, main: &str) {
+fn assert_mixed_resource_iterable_pending(main: &str, attribute: &str, expected: Evidence) {
     let (_directory, file, schemas, context) = directory(main);
     let report = report(&file, &schemas, &context);
-    println!(
-        "T0 {shape}: deferred={}, pending={}, admitted={}, findings={}, rows={:?}",
-        file.deferred_for_expressions().len(),
-        report.is_pending(),
-        report.admitted().is_some(),
-        report.findings().len(),
-        report
-            .rows
-            .iter()
-            .map(|(id, row)| (id.to_string(), &row.attributes))
-            .collect::<Vec<_>>()
-    );
+    assert_eq!(file.deferred_for_expressions().len(), 1);
     assert!(report.is_pending());
+    assert!(report.admitted().is_none());
+    assert!(report.findings().is_empty());
+    assert_eq!(super::attribute(&report, "source", attribute), expected);
 }
 
 #[test]
-fn issue_4516_t0_deferred_for_mixed_resource_map_stays_pending() {
-    measure(
-        "map",
+fn issue_4516_deferred_for_mixed_resource_map_stays_pending() {
+    assert_mixed_resource_iterable_pending(
         r#"
 let source = mock.test.Source { tags = { a = secret("canary") b = "public" } }
 let children = for key, value in source.tags {
     mock.test.Resource { comment = value }
 }
 "#,
+        "tags",
+        Evidence::Map(
+            BTreeMap::from([
+                ("a".into(), Evidence::Leaf(Secrecy::Secret)),
+                ("b".into(), Evidence::Leaf(Secrecy::Public)),
+            ])
+            .into(),
+        ),
     );
 }
 
 #[test]
-fn issue_4516_t0_deferred_for_mixed_resource_list_stays_pending() {
-    measure(
-        "list",
+fn issue_4516_deferred_for_mixed_resource_list_stays_pending() {
+    assert_mixed_resource_iterable_pending(
         r#"
 let source = mock.test.Source { items = [secret("canary"), "public"] }
 let children = for value in source.items {
     mock.test.Resource { comment = value }
 }
 "#,
+        "items",
+        Evidence::List(
+            vec![
+                Evidence::Leaf(Secrecy::Secret),
+                Evidence::Leaf(Secrecy::Public),
+            ]
+            .into(),
+        ),
     );
 }
 
 #[test]
-fn issue_4516_t1_deferred_for_root_children_join_the_directory_graph() {
+fn issue_4516_deferred_for_root_children_join_the_directory_graph() {
     let (_directory, file, schemas, context) = directory(ROOT_LOOP);
     let report = report(&file, &schemas, &context);
     assert!(
@@ -258,7 +286,7 @@ fn issue_4516_t1_deferred_for_root_children_join_the_directory_graph() {
 }
 
 #[test]
-fn issue_4516_t2_deferred_for_module_children_join_the_directory_graph() {
+fn issue_4516_deferred_for_module_children_join_the_directory_graph() {
     let (_directory, file, schemas, context) = fixture(
         "let child = use { source = './child' }\nlet instance = child { items = upstream.items }\n",
         Some(
@@ -293,7 +321,7 @@ fn issue_4516_t2_deferred_for_module_children_join_the_directory_graph() {
 }
 
 #[test]
-fn issue_4516_t3_deferred_for_map_rows_follow_keys_after_removal() {
+fn issue_4516_deferred_for_map_rows_follow_keys_after_removal() {
     let (_directory, file, schemas, context) = directory(
         "let children = for key, item in upstream.items { mock.test.Resource { comment = secret('canary') name = item } }\n",
     );
@@ -314,7 +342,7 @@ fn issue_4516_t3_deferred_for_map_rows_follow_keys_after_removal() {
 }
 
 #[test]
-fn issue_4516_t3_deferred_for_list_rows_follow_indices_after_removal() {
+fn issue_4516_deferred_for_list_rows_follow_indices_after_removal() {
     let (_directory, file, schemas, context) = directory(ROOT_LOOP);
     let report = report(&file, &schemas, &context);
     assert!(
@@ -333,32 +361,12 @@ fn issue_4516_t3_deferred_for_list_rows_follow_indices_after_removal() {
 }
 
 #[test]
-fn issue_4516_t7_deferred_for_anonymous_rows_use_the_produced_id() {
+fn issue_4516_anonymous_deferred_children_keep_child_secrecy_after_identifier_computation() {
     let (_directory, file, schemas, context) = directory(
         "for item in upstream.items { mock.test.Child { comment = secret('canary') identity_input = item } }\n",
     );
-    let report = report(&file, &schemas, &context);
-    assert!(
-        !report.is_pending(),
-        "template report is pending: findings={}, admitted={}",
-        report.findings().len(),
-        report.admitted().is_some()
-    );
     let mut file = resolved(file, &schemas, &context);
     expand(&mut file, list(&["a", "b"]), &context);
-    let before = file
-        .resources
-        .iter()
-        .filter(|resource| resource.binding.is_none())
-        .map(|resource| {
-            assert_eq!(
-                graph(&file).attributes(&resource.id).unwrap()["comment"],
-                Evidence::Leaf(Secrecy::Secret)
-            );
-            resource.id.clone()
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(before.len(), 2);
     crate::identifier::compute_anonymous_identifiers_for_test(
         &mut file.resources,
         &file.providers,
@@ -366,60 +374,177 @@ fn issue_4516_t7_deferred_for_anonymous_rows_use_the_produced_id() {
         &|_| Vec::new(),
     )
     .unwrap();
-    let after = file
+    let children = file
         .resources
         .iter()
         .filter(|resource| resource.binding.is_none())
-        .map(|resource| graph(&file).attributes(&resource.id).is_some())
         .collect::<Vec<_>>();
-    println!(
-        "T7 deferred anonymous: produced_id_rows={}, final_id_rows={after:?}",
-        before.len()
-    );
-}
-
-#[test]
-fn issue_4516_t7_static_anonymous_main_measurement() {
-    let (_directory, file, schemas, context) =
-        directory("mock.test.Child { comment = secret('canary') identity_input = 'static' }\n");
-    let mut file = resolved(file, &schemas, &context);
-    let resource = file
-        .resources
-        .iter()
-        .find(|resource| resource.binding.is_none())
-        .unwrap();
-    let before = graph(&file).attributes(&resource.id).is_some();
-    crate::identifier::compute_anonymous_identifiers_for_test(
-        &mut file.resources,
-        &file.providers,
-        &schemas,
-        &|_| Vec::new(),
-    )
-    .unwrap();
-    let resource = file
-        .resources
-        .iter()
-        .find(|resource| resource.binding.is_none())
-        .unwrap();
-    println!(
-        "T7 static anonymous on main: produced_id_row={before}, final_id_row={}",
-        graph(&file).attributes(&resource.id).is_some()
-    );
-}
-
-#[test]
-fn issue_4516_saved_plan_main_wire_measurement() {
-    for bound in [true, false] {
-        let binding = if bound { "let children = " } else { "" };
-        let (_directory, file, schemas, context) = directory(&format!(
-            "{binding}for item in upstream.items {{ mock.test.Child {{ comment = 'public' identity_input = item }} }}\n"
-        ));
-        let file = file.into_expanded(&schemas, &context).unwrap();
-        let template: ExpandedDeferredForExpression = file.deferred_for_expressions()[0].clone();
-        let template = template.into_compiled();
-        println!(
-            "T6 main wire (bound={bound}): {}",
-            serde_json::to_string(&template).unwrap()
+    assert_eq!(children.len(), 2);
+    for child in children {
+        assert!(child.id.identity().is_some());
+        let Some(ChildSecrecy::Row(row)) = child.child_secrecy() else {
+            panic!("anonymous identity computation must retain the child's row");
+        };
+        assert_eq!(row.attributes().len(), 2);
+        assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Secret));
+        assert_eq!(
+            row.attributes()["identity_input"],
+            Evidence::Leaf(Secrecy::Public)
         );
     }
+}
+
+#[test]
+fn issue_4516_anonymous_graph_keying_matches_main_and_belongs_to_carina_4442() {
+    // Current keying on main retains the pre-identity key for static anonymous
+    // resources too. Rekeying after identity computation belongs to carina#4442.
+    for (main, count) in [
+        (
+            "for item in upstream.items { mock.test.Child { comment = secret('canary') identity_input = item } }\n",
+            2,
+        ),
+        (
+            "mock.test.Child { comment = secret('canary') identity_input = 'static' }\n",
+            1,
+        ),
+    ] {
+        let (_directory, file, schemas, context) = directory(main);
+        let mut file = resolved(file, &schemas, &context);
+        expand(&mut file, list(&["a", "b"]), &context);
+        let before = file
+            .resources
+            .iter()
+            .filter(|resource| resource.binding.is_none())
+            .map(|resource| {
+                (
+                    resource.id.clone(),
+                    graph(&file).attributes(&resource.id).unwrap().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(before.len(), count);
+        crate::identifier::compute_anonymous_identifiers_for_test(
+            &mut file.resources,
+            &file.providers,
+            &schemas,
+            &|_| Vec::new(),
+        )
+        .unwrap();
+        let after = file
+            .resources
+            .iter()
+            .filter(|resource| resource.binding.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(after.len(), count);
+        for (resource, (pre_identity_id, attributes)) in after.into_iter().zip(before) {
+            assert_ne!(resource.id, pre_identity_id);
+            assert!(graph(&file).attributes(&resource.id).is_none());
+            assert_eq!(graph(&file).attributes(&pre_identity_id), Some(&attributes));
+        }
+    }
+}
+
+#[test]
+fn issue_4516_resolved_api_owns_the_cli_expansion_graph() {
+    let (_directory, file, schemas, context) = directory(ROOT_LOOP);
+    let owner = resolve_owner(file, &schemas, &context);
+    let same_graph = std::ptr::eq(owner.validated_secrecy().unwrap(), graph(owner.as_file()));
+    // The CLI consumes ResolvedFile before mutating its ExpandedFile. There is
+    // no mutable ResolvedFile API through which to read the old copy afterward.
+    let mut file = owner.into_file();
+    let (selected, retained) = file.take_deferred_for_expressions().partition(|_| true);
+    file.replace_deferred_for_expressions(selected);
+    expand(&mut file, list(&["a", "b"]), &context);
+    file.deferred_for_expressions_mut()
+        .append_finalized(retained);
+    assert_child_row(&file, "children[0]");
+    assert_child_row(&file, "children[1]");
+    let owner = crate::validation::ResolvedFile::for_test(file);
+    let child = owner
+        .resources
+        .iter()
+        .find(|resource| resource.id.identity_str() == Some("children[0]"))
+        .unwrap();
+    let visible_after_rewrap = owner
+        .validated_secrecy()
+        .is_ok_and(|graph| graph.attributes(&child.id).is_some());
+    assert!(
+        same_graph,
+        "ResolvedFile and its inner file must read one stored graph"
+    );
+    assert!(
+        visible_after_rewrap,
+        "ResolvedFile must read the expanded graph from its inner file"
+    );
+}
+
+fn assert_anonymous_templates(
+    file: ModuleResolvedInferredFile,
+    schemas: &SchemaRegistry,
+    context: &ProviderContext,
+) {
+    let report = report(&file, schemas, context);
+    let pending = report.is_pending();
+    let admitted = report.admitted().is_some();
+    let ids = file
+        .deferred_for_expressions()
+        .iter()
+        .map(|template| template.template_resource_id().clone())
+        .collect::<std::collections::HashSet<_>>();
+    let keys = file
+        .deferred_for_expressions()
+        .iter()
+        .map(|template| {
+            let slots = &template.template_resource().as_resource().authored_slots;
+            (slots.declaration_id().cloned(), slots.instance())
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(file.deferred_for_expressions().len(), 2);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(keys.len(), 2);
+    assert!(report.findings().is_empty());
+    let mut file = resolve_owner(file, schemas, context).into_file();
+    expand(&mut file, list(&["a", "b"]), context);
+    let children = file
+        .resources
+        .iter()
+        .filter(|resource| resource.binding.is_none())
+        .collect::<Vec<_>>();
+    let rows = children
+        .iter()
+        .filter(|child| matches!(child.child_secrecy(), Some(ChildSecrecy::Row(_))))
+        .count();
+    assert!(
+        !pending,
+        "anonymous template identities must not make the directory pending"
+    );
+    assert!(admitted);
+    assert_eq!(children.len(), 4);
+    assert_eq!(rows, children.len());
+    for child in children {
+        let Some(ChildSecrecy::Row(row)) = child.child_secrecy() else {
+            unreachable!()
+        };
+        assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Secret));
+        assert_eq!(graph(&file).attributes(&child.id), Some(row.attributes()));
+    }
+}
+
+#[test]
+fn issue_4516_two_unbound_templates_of_one_type_are_admitted() {
+    let (_directory, file, schemas, context) = directory(
+        "for item in upstream.items { mock.test.Child { comment = secret('first') identity_input = item } }\nfor item in upstream.items { mock.test.Child { comment = secret('second') identity_input = item } }\n",
+    );
+    assert_anonymous_templates(file, &schemas, &context);
+}
+
+#[test]
+fn issue_4516_unbound_module_template_called_twice_is_admitted() {
+    let (_directory, file, schemas, context) = fixture(
+        "let child = use { source = './child' }\nlet first = child { items = upstream.items }\nlet second = child { items = upstream.items }\n",
+        Some(
+            "arguments { items: list(String) }\nfor item in items { mock.test.Child { comment = secret('canary') identity_input = item } }\n",
+        ),
+    );
+    assert_anonymous_templates(file, &schemas, &context);
 }

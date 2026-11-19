@@ -2458,15 +2458,13 @@ fn finish_binding_resolution<E: crate::parser::IntoExpandedExportParam<AbsoluteB
     let schemas = judged.schemas();
     let file = judged.into_file();
     let mut inner = file.into_expanded(schemas, provider_context)?;
-    if let Some(graph) = &secrecy {
+    if let Some(graph) = secrecy
+        && let Some(inputs) = inner.authored_inputs.clone()
+    {
         for template in inner.deferred_for_expressions_mut().iter_mut() {
             let evidence = graph.template_evidence(template)?;
             template.attach_template_evidence(evidence);
         }
-    }
-    if let Some(graph) = secrecy
-        && let Some(inputs) = &inner.authored_inputs
-    {
         inner.attach_authored_inputs(inputs.with_validated_secrecy(graph));
     }
     Ok(ResolvedFile { inner })

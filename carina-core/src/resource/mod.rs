@@ -9681,9 +9681,16 @@ impl<P: ValueKind, B: BindingAddress> Resource<ModuleSource, P, B> {
 impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
     /// The hand-over attached when this resource was produced by deferred-for
     /// expansion. It stays with the resource through identity computation and
-    /// effect materialization and is excluded from serialization.
+    /// effect materialization. It is in-memory only (`#[serde(skip)]`): a resource
+    /// decoded from a saved plan reads `None`. `None` means no checked
+    /// deferred-for judgement is carried.
     pub fn child_secrecy(&self) -> Option<&crate::secrecy::ChildSecrecy> {
-        self.authored_slots.child_secrecy()
+        self.authored_slots
+            .child_secrecy()
+            .filter(|secrecy| match secrecy {
+                crate::secrecy::ChildSecrecy::Row(row) => row.matches_resource(self),
+                crate::secrecy::ChildSecrecy::Unavailable(_) => true,
+            })
     }
 }
 

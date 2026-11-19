@@ -12,7 +12,7 @@ use crate::secrecy::{
 use std::collections::{BTreeSet, HashMap};
 
 #[test]
-fn issue_4516_t6_deferred_for_executor_carries_rows_and_saved_plan_unavailability() {
+fn issue_4516_deferred_for_executor_carries_rows_and_saved_plan_unavailability() {
     for bound in [true, false] {
         let directory = tempfile::tempdir().unwrap();
         let binding = if bound { "let children = " } else { "" };

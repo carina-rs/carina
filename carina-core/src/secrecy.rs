@@ -282,11 +282,12 @@ impl std::error::Error for Finding {}
 #[error("structural secrecy validation is pending")]
 pub struct PendingSecrecy;
 
-/// Non-shipping counters used by depth, visit-budget and memoization regressions.
+/// Non-shipping walk observations used by secrecy regressions.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TraversalStats {
     pub attribute: String,
+    pub evidence: Option<Evidence>,
     pub maximum_depth: usize,
     pub reference_visits: usize,
     pub memo_hits: usize,
@@ -324,18 +325,18 @@ struct Row {
 /// can mint it; neither evaluated children nor provider values are inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateEvidence {
-    declaration: crate::parser::retained::SlotDeclarationId,
-    instance: Option<crate::parser::retained::ExpansionInstanceId>,
-    attributes: IndexMap<String, Evidence>,
+    row: Row,
 }
 
 /// This value is a provisional shape until carina#4442 decides what is recorded
 /// while the judgement is pending. The consumer added by #4442 may change it.
 /// It is never written to state or to a saved plan.
-/// SavedPlan evidence belongs to carina#4515.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `SavedPlan` evidence belongs to carina#4515.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TemplateEvidenceUnavailable {
+    #[error("configuration was not admitted")]
     ConfigurationNotAdmitted,
+    #[error("template was decoded from a saved plan")]
     SavedPlan,
 }
 
@@ -352,12 +353,24 @@ impl Default for TemplateSecrecy {
     }
 }
 
-/// A checked child's payload-free row, paired with its loop element. There is
-/// no public constructor; its attributes always come from template evidence.
+/// A checked child's payload-free row. There is no public constructor; its
+/// attributes always come from template evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildRow {
     row: Row,
-    element: ForLoopElement,
+    provider: String,
+    provider_instance: Option<String>,
+    resource_type: String,
+    element: ChildElement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildElement {
+    Bound(String),
+    Unbound {
+        source: crate::resource::ResourceIdentity,
+        element: ForLoopElement,
+    },
 }
 
 impl ChildRow {
@@ -365,8 +378,31 @@ impl ChildRow {
         &self.row.attributes
     }
 
-    pub fn element(&self) -> &ForLoopElement {
-        &self.element
+    pub(crate) fn matches_resource<S, P: crate::resource::ValueKind, B: BindingAddress, D>(
+        &self,
+        child: &Resource<S, P, B, D>,
+    ) -> bool {
+        child.authored_slots.declaration_id() == Some(&self.row.declaration)
+            && child.authored_slots.instance() == self.row.instance
+            && child.id.provider == self.provider
+            && child.id.provider_instance == self.provider_instance
+            && child.id.resource_type == self.resource_type
+            && match &self.element {
+                ChildElement::Bound(address) => {
+                    child.id.identity_str() == Some(address.as_str())
+                        && child
+                            .binding
+                            .as_ref()
+                            .is_some_and(|binding| binding.as_str() == address)
+                }
+                ChildElement::Unbound { source, element } => {
+                    child.binding.is_none()
+                        && child.loop_provenance.direct_origin().is_some_and(|origin| {
+                            origin.source().scheduler_identity() == source
+                                && matches!(origin.kind(), crate::resource::LoopOriginKind::For { element: actual } if actual == element)
+                        })
+                }
+            }
     }
 }
 
@@ -400,9 +436,11 @@ pub enum TemplateAdmissionError {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChildEvidenceInsertError {
+    #[error("resource was not produced by deferred-for expansion")]
+    NotDeferredChild,
     #[error("secrecy graph already contains deferred child `{id}`")]
     DuplicateChild { id: ResourceId },
-    #[error("deferred child secrecy is unavailable: {0:?}")]
+    #[error("deferred child secrecy is unavailable: {0}")]
     Unavailable(TemplateEvidenceUnavailable),
     #[error("deferred child row belongs to a different declaration or expansion instance")]
     ChildDeclaration,
@@ -413,7 +451,8 @@ impl TemplateEvidence {
         &self,
         slots: &crate::parser::retained::AuthoredSlots<B>,
     ) -> bool {
-        slots.declaration_id() == Some(&self.declaration) && slots.instance() == self.instance
+        slots.declaration_id() == Some(&self.row.declaration)
+            && slots.instance() == self.row.instance
     }
 
     /// Check descent before copying evidence. Child values are deliberately
@@ -427,9 +466,9 @@ impl TemplateEvidence {
         if !self.matches_slots(&template.template_resource().as_resource().authored_slots) {
             return Err(TemplateEvidenceMismatch::TemplateDeclaration);
         }
-        if child.authored_slots.declaration_id() != Some(&self.declaration)
+        if child.authored_slots.declaration_id() != Some(&self.row.declaration)
             || child.authored_slots.instantiation_origin()
-                != Some((&self.declaration, self.instance))
+                != Some((&self.row.declaration, self.row.instance))
         {
             return Err(TemplateEvidenceMismatch::ChildDeclaration);
         }
@@ -442,20 +481,29 @@ impl TemplateEvidence {
         if child.id.resource_type != source.resource_type {
             return Err(TemplateEvidenceMismatch::ResourceType);
         }
-        let matches_element = match template.target() {
+        let (matches_element, element) = match template.target() {
             DeferredForTarget::Bound(target) => {
                 let address = element.address(target.binding());
-                child.id.identity_str() == Some(address.as_str())
-                    && child
-                        .binding
-                        .as_ref()
-                        .is_some_and(|binding| binding.as_str() == address)
+                (
+                    child.id.identity_str() == Some(address.as_str())
+                        && child
+                            .binding
+                            .as_ref()
+                            .is_some_and(|binding| binding.as_str() == address),
+                    ChildElement::Bound(address),
+                )
             }
             DeferredForTarget::Unbound { template } => {
-                child.id.identity().is_none()
-                    && child.binding.is_none()
-                    && child.loop_provenance.direct_origin()
-                        == Some(&template.element_origin(element.clone()))
+                let origin = template.element_origin(element.clone());
+                (
+                    child.id.identity().is_none()
+                        && child.binding.is_none()
+                        && child.loop_provenance.direct_origin() == Some(&origin),
+                    ChildElement::Unbound {
+                        source: template.scheduler_identity().clone(),
+                        element: element.clone(),
+                    },
+                )
             }
         };
         if !matches_element {
@@ -463,11 +511,13 @@ impl TemplateEvidence {
         }
         Ok(ChildRow {
             row: Row {
-                declaration: self.declaration.clone(),
                 instance: child.authored_slots.instance(),
-                attributes: self.attributes.clone(),
+                ..self.row.clone()
             },
-            element: element.clone(),
+            provider: child.id.provider.clone(),
+            provider_instance: child.id.provider_instance.clone(),
+            resource_type: child.id.resource_type.clone(),
+            element,
         })
     }
 }
@@ -486,9 +536,10 @@ impl SecrecyReport {
     }
 
     #[cfg(test)]
-    fn record<B: BindingAddress>(&mut self, walk: &Walk<'_, B>) {
+    fn record<B: BindingAddress>(&mut self, walk: &Walk<'_, B>, evidence: Option<Evidence>) {
         self.traversals.push(TraversalStats {
             attribute: walk.attribute.clone(),
+            evidence,
             maximum_depth: walk.max_depth,
             reference_visits: walk.visits,
             memo_hits: walk.memo_hits,
@@ -533,7 +584,7 @@ impl SecrecyReport {
             environment,
         });
         #[cfg(test)]
-        self.record(&walk);
+        self.record(&walk, evidence.clone());
         self.pending |= walk.pending_validation;
         self.add_findings(walk.findings);
         evidence
@@ -589,18 +640,18 @@ impl ValidatedSecrecyGraph {
         &mut self,
         child: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
     ) -> Result<(), ChildEvidenceInsertError> {
-        let row = match child.child_secrecy() {
-            Some(ChildSecrecy::Row(row)) => &row.row,
+        let row = match child.authored_slots.child_secrecy() {
+            Some(ChildSecrecy::Row(row)) => {
+                if !row.matches_resource(child) {
+                    return Err(ChildEvidenceInsertError::ChildDeclaration);
+                }
+                &row.row
+            }
             Some(ChildSecrecy::Unavailable(reason)) => {
                 return Err(ChildEvidenceInsertError::Unavailable(*reason));
             }
-            None => return Err(ChildEvidenceInsertError::ChildDeclaration),
+            None => return Err(ChildEvidenceInsertError::NotDeferredChild),
         };
-        if child.authored_slots.declaration_id() != Some(&row.declaration)
-            || child.authored_slots.instance() != row.instance
-        {
-            return Err(ChildEvidenceInsertError::ChildDeclaration);
-        }
         if self.rows.contains_key(&child.id) {
             return Err(ChildEvidenceInsertError::DuplicateChild {
                 id: child.id.clone(),
@@ -1573,9 +1624,11 @@ where
                 Arc::make_mut(&mut report.templates).insert(
                     resource.id().clone(),
                     Arc::new(TemplateEvidence {
-                        declaration,
-                        instance,
-                        attributes,
+                        row: Row {
+                            declaration,
+                            instance,
+                            attributes,
+                        },
                     }),
                 );
             }
