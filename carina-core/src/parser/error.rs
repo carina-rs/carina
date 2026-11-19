@@ -233,6 +233,16 @@ pub enum ParseError {
     #[error("{0}")]
     ForKey(ForKeyDiagnostic),
 
+    #[error(
+        "This loop is value-keyed; use a string subscript, or `for (i, x) in ...` for index addressing."
+    )]
+    ValueKeyedSubscript { span: SourceSpan },
+    #[error("{error}")]
+    ForIterableShape {
+        error: super::ShapeMismatch,
+        span: SourceSpan,
+    },
+
     #[error("Invalid expression at line {line}{column}: {diagnostic}", column = .diagnostic.column_suffix())]
     InvalidAuthoredExpression {
         line: usize,
@@ -587,6 +597,9 @@ impl ParseError {
                 end_column: *column + name.chars().count(),
             }),
             Self::ForKey(diagnostic) => Some(from_span(diagnostic.span)),
+            Self::ValueKeyedSubscript { span } | Self::ForIterableShape { span, .. } => {
+                Some(from_span(*span))
+            }
             Self::DeferredForBodyUnsupported(details) => Some(from_span(details.span)),
             Self::DeferredForBodyTemplate { span, .. }
             | Self::UnboundLoopRead {
@@ -707,15 +720,50 @@ impl ParseError {
         }
     }
 
-    pub(in crate::parser) fn for_key(
+    pub(crate) fn into_element_at(
+        self,
+        location: &super::DeclarationLocation,
+    ) -> super::Located<Self> {
+        match self.at(location) {
+            Self::AtElement(finding) => *finding,
+            _ => unreachable!("at always supplies element ownership"),
+        }
+    }
+
+    pub(crate) fn for_admission_failure<B: crate::resource::BindingAddress>(
+        error: crate::resource::ForAdmissionFailure<B>,
+        location: &super::DeclarationLocation,
+    ) -> Self {
+        match error {
+            crate::resource::ForAdmissionFailure::Shape(error) => Self::ForIterableShape {
+                error,
+                span: location.span(),
+            }
+            .at(location),
+            crate::resource::ForAdmissionFailure::Knowledge(error) => {
+                Self::from_resolution(error.into(), location.span().start_line()).at(location)
+            }
+        }
+    }
+
+    pub(crate) fn for_key(
         error: crate::resource::ForKeyError,
         location: &super::DeclarationLocation,
     ) -> Self {
-        Self::ForKey(ForKeyDiagnostic {
-            error,
-            span: location.span(),
-        })
-        .at(location)
+        Self::AtElement(Box::new(Self::for_key_finding(error, location)))
+    }
+
+    pub(in crate::parser) fn for_key_finding(
+        error: crate::resource::ForKeyError,
+        location: &super::DeclarationLocation,
+    ) -> super::Located<Self> {
+        super::Located::new(
+            location.clone(),
+            Self::ForKey(ForKeyDiagnostic {
+                error,
+                span: location.span(),
+            }),
+        )
     }
 
     /// Borrow an existing parser-owned finding without constructing provenance.

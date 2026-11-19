@@ -194,6 +194,7 @@ struct PreparedExpansion<'a> {
     argument_placeholders: HashMap<String, ResolvedArgument<RelativeBindingName>>,
     condition_selections: crate::parser::retained::ConditionRecorder,
     selected_module_ifs: SelectedDeferredIfs,
+    materialized_for_loops: BTreeSet<usize>,
     instance: crate::parser::RootBindingResolvedParsedFile,
     instance_judgements: Arc<CallerJudgements>,
     nested_binding_index: Arc<BindingIndex<'a>>,
@@ -933,7 +934,15 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // resolver accepts exactly these locals, substitutes declared
         // arguments with caller-expanded values, and rejects every other
         // relative name.
-        let intra_module_bindings = intra_module_binding_names(module);
+        let (argument_loop_resources, materialized_for_loops) =
+            materialize_module_argument_loops(module, argument_substitutions)
+                .map_err(contextualize_access_error)?;
+        let mut intra_module_bindings = intra_module_binding_names(module);
+        intra_module_bindings.extend(
+            argument_loop_resources
+                .iter()
+                .filter_map(|resource| resource.binding.clone()),
+        );
         let module_directory = match (expansion_source.directory, module_source.as_deref()) {
             (Some(directory), _) => Some(directory.clone()),
             (None, Some(source)) => Some(self.io_base_dir.join(source)?),
@@ -985,9 +994,13 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         // values have crossed the typed module scope. Selected bodies remain
         // authored/relative until the normal expansion routines below resolve
         // them through `ModuleInstanceScope`.
-        let selected_module_ifs =
+        let mut selected_module_ifs =
             select_deferred_module_ifs(module, &expanded_call, &module_scope_resolver)
                 .map_err(contextualize_access_error)?;
+        selected_module_ifs
+            .contribution
+            .resources
+            .extend(argument_loop_resources);
 
         let mut instance = module
             .clone()
@@ -1067,6 +1080,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             argument_placeholders,
             condition_selections,
             selected_module_ifs,
+            materialized_for_loops,
             instance,
             nested_binding_index,
         })
@@ -1157,6 +1171,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             argument_placeholders,
             condition_selections,
             selected_module_ifs,
+            materialized_for_loops,
             instance,
             instance_judgements: _,
             nested_binding_index: _,
@@ -1471,7 +1486,9 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
         > = module
             .parsed_deferred_for_expressions()
             .iter()
-            .map(|deferred| {
+            .enumerate()
+            .filter(|(index, _)| !materialized_for_loops.contains(index))
+            .map(|(_, deferred)| {
                 let (source_file, dependency_values) = match &deferred.body {
                     DeferredForBody::Resource(resource) => (
                         module
@@ -4014,6 +4031,158 @@ fn resolve_module_constraint_expression(
     })
 }
 
+/// Materialize argument-only loops before lifting module-local references. The
+/// ordinary module resource expander then owns scope, call path and grouping.
+fn materialize_module_argument_loops(
+    module: &ParsedFile,
+    arguments: ArgumentSubstitutions<'_>,
+) -> Result<(Vec<Resource>, BTreeSet<usize>), ArgumentSubstitutionError> {
+    let relative_arguments = arguments
+        .arguments
+        .iter()
+        .map(|(name, argument)| {
+            (
+                name.clone(),
+                ResolvedArgument::<RelativeBindingName> {
+                    argument: ModuleArgument::new(
+                        argument
+                            .walker_value()
+                            .clone()
+                            .map_bindings(&mut |binding| {
+                                RelativeBindingName::new(binding.as_str())
+                            }),
+                    )
+                    .combine_origin(argument.argument.value_origin.clone()),
+                    origin: argument.origin,
+                    caller_reference: None,
+                    forwarded_from_enclosing_parameter: argument.forwarded_from_enclosing_parameter,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let relative = ArgumentSubstitutions {
+        arguments: &relative_arguments,
+        default_line: arguments.default_line,
+        caller_source_file: arguments.caller_source_file,
+        binding_index: None,
+        config: arguments.config,
+    };
+    let mut resources = Vec::new();
+    let mut materialized = BTreeSet::new();
+    for (index, deferred) in module.parsed_deferred_for_expressions().iter().enumerate() {
+        let crate::parser::DeferredForTarget::Bound(target) = deferred.target() else {
+            continue;
+        };
+        let DeferredForBody::Resource(template) = &deferred.body else {
+            continue;
+        };
+        if !matches!(deferred.binding, crate::parser::ForBinding::Simple(_)) {
+            continue;
+        }
+        if !deferred
+            .site()
+            .address_pending
+            .is_some_and(|pending| pending.module_arguments_only())
+        {
+            continue;
+        }
+        let (iterable, iterable_origin) = substitute_argument_value(
+            &deferred.iterable,
+            relative,
+            ArgumentSubstitutionPosition::Value,
+        )?
+        .into_parts();
+        let classified = iterable
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map_err(|error| module_loop_error(deferred, error.into()))?
+            .into_classification();
+        let admission = crate::resource::admit_bound_for_addresses(
+            &deferred.binding,
+            target,
+            crate::resource::knowledge::ClassifiedRef::from(&classified),
+            crate::resource::ForAddressMoment::Validation,
+        )
+        .map_err(|error| {
+            let mut failure = module_loop_error(deferred, error.to_string().into());
+            if let (ArgumentSubstitutionError::Evaluation { parse_error, .. }, Some(location)) =
+                (&mut failure, deferred.site().iterable_location)
+            {
+                *parse_error = Some(Box::new(ParseError::for_admission_failure(error, location)));
+            }
+            failure
+        })?;
+        let addresses = match admission {
+            crate::resource::ForAddressAdmission::Admitted(addresses) => addresses,
+            crate::resource::ForAddressAdmission::Defer(_) => continue,
+            crate::resource::ForAddressAdmission::Reject(error) => {
+                let mut failure = module_loop_error(deferred, error.to_string().into());
+                if let (ArgumentSubstitutionError::Evaluation { parse_error, .. }, Some(location)) =
+                    (&mut failure, deferred.site().iterable_location)
+                {
+                    *parse_error = Some(Box::new(ParseError::for_key(error, location)));
+                }
+                return Err(failure);
+            }
+        };
+        let members = match classified.to_value() {
+            Value::Concrete(ConcreteValue::List(items)) => items,
+            Value::Concrete(ConcreteValue::StringList(items)) => items
+                .into_iter()
+                .map(|item| Value::Concrete(ConcreteValue::String(item)))
+                .collect(),
+            _ => unreachable!("admitted simple loop has list membership"),
+        };
+        for (address, item) in addresses.iter().zip(&members) {
+            let substitute = |value: Value| -> Result<
+                crate::resource::Substituted<Value>,
+                ArgumentSubstitutionError,
+            > {
+                let (value, origin) = substitute_argument_value(
+                    &value,
+                    relative,
+                    ArgumentSubstitutionPosition::Value,
+                )?
+                .into_parts();
+                let mut value = value.try_map_placeholder(&mut |placeholder| {
+                    Ok::<_, ArgumentSubstitutionError>(match placeholder {
+                        ParserPlaceholder::Loop(LoopSlot::Value) => item.clone(),
+                        other => Value::Deferred(DeferredValue::Placeholder(other)),
+                    })
+                })?;
+                value.canonicalize_in_place();
+                Ok(crate::resource::Substituted::new(value, origin))
+            };
+            let mut resource = template.instantiate_bound(address);
+            resource.directives.combine_loop_origin(&iterable_origin);
+            for value in resource.attributes.values_mut() {
+                *value = substitute(value.clone())?.into_parts().0;
+            }
+            resource.directives = resource
+                .directives
+                .try_map_expressions(|_, expression| expression.try_substitute(substitute))?;
+            resource.authored_slots.synchronize(&resource.attributes);
+            resources.push(resource);
+        }
+        materialized.insert(index);
+    }
+    Ok((resources, materialized))
+}
+
+fn module_loop_error(
+    deferred: &ParsedDeferredForExpression,
+    message: crate::resolver::ResolutionError,
+) -> ArgumentSubstitutionError {
+    ArgumentSubstitutionError::Evaluation {
+        source_file: deferred
+            .location()
+            .source_file()
+            .map(std::path::Path::to_path_buf),
+        line: deferred.line(),
+        message,
+        parse_error: None,
+    }
+}
+
 fn expand_parsed_deferred_for_expression(
     deferred: &ParsedDeferredForExpression<ParserPlaceholder, RelativeBindingName>,
     dependency_values: Option<&IndexMap<String, Value>>,
@@ -4371,7 +4540,7 @@ pub(super) fn parse_synthetic_instance_prefix(prefix: &str) -> Option<(&str, Sim
 /// Split a resource name into `(instance_prefix, rest)` at the first `.`, or
 /// return `None` if it has no dot (no module instance prefix at all).
 pub(super) fn split_instance_prefix(name: &str) -> Option<(&str, &str)> {
-    name.split_once('.')
+    crate::resource::decompose_binding_address(name)?.first_field_prefix()
 }
 
 /// Reconcile anonymous module-instance prefixes with existing state.
@@ -4621,9 +4790,8 @@ fn rewrite_binding_prefix(
     binding: &crate::resource::AbsoluteBindingAddress,
     remap: &std::collections::HashMap<(String, SimHash), SimHash>,
 ) -> Option<crate::resource::AbsoluteBindingAddress> {
-    let prefix = binding
-        .as_str()
-        .split_once('.')
+    let prefix = crate::resource::decompose_binding_address(binding.as_str())?
+        .first_field_prefix()
         .map_or(binding.as_str(), |(prefix, _suffix)| prefix);
     let (module, simhash) = parse_synthetic_instance_prefix(prefix)?;
     let target = remap.get(&(module.to_string(), simhash))?;

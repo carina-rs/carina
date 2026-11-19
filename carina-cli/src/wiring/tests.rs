@@ -886,8 +886,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         &[],
     );
     let resources = canonical_unresolved(Vec::new(), context.schemas());
-    let materialization =
-        DeferredForExpansionWitness::after_expansion(resources.parsed().deferred_for_expressions());
+    let materialization = DeferredForExpansionWitness::after_expansion(resources.parsed());
     let expanded_resources = ExpandedCanonicalResources {
         resources,
         materialization,
@@ -8544,7 +8543,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         .iter()
         .find(|deferred| matches!(deferred.target(), DeferredForTarget::Unbound { .. }))
         .expect("fixture has one unbound deferred loop");
-    let mut loop_children = carina_core::validation::deferred_types::with_session_for_test(
+    let loop_children = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
             carina_core::parser::expand_deferred_children(
@@ -8573,6 +8572,9 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         },
     )
     .expect("deferred route loop expands");
+    let carina_core::resource::ForExpansion::Expanded(mut loop_children) = loop_children else {
+        panic!("deferred route fixture must expand");
+    };
     let canonical =
         canonicalize_resources_with_schemas(&mut loop_children, wiring.context().schemas())
             .expect("expanded route canonicalizes");
@@ -11982,6 +11984,9 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         },
     )
     .expect("planning-time upstream map expands");
+    let carina_core::resource::ForExpansion::Expanded(children) = children else {
+        panic!("planning-time upstream map fixture must expand");
+    };
     assert_eq!(children[0].id.identity_str(), None);
 
     let (mut resources, _) = build_override_aware_pair_for_test(

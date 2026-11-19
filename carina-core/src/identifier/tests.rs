@@ -8995,6 +8995,34 @@ fn reconcile_simhash_match_keeps_new_format_identifier_and_emits_move() {
 }
 
 #[test]
+fn for_value_keys_anonymous_rewrite_failure_omits_suggestion() {
+    let mut resources = parse_loop_fixture(
+        "for x in ['same', 'same'] { mock.ec2.Vpc { identity_input = x } }",
+        "anonymous.crn",
+    );
+    let error = compute_anonymous_identifiers_for_test(
+        &mut resources,
+        &[],
+        &loop_identity_registry(true),
+        &|_| Vec::new(),
+    )
+    .unwrap_err();
+    let AnonymousIdentityError::Loop(mut conflict) = error else {
+        panic!("expected loop conflict")
+    };
+    *conflict.origin.source_mut() = crate::resource::LoopSource::authored(
+        std::path::Path::new("anonymous.crn"),
+        crate::parser::SourceSpan::dummy(),
+        "for x in",
+        crate::resource::LoopKind::For,
+    );
+    let text = conflict.to_string();
+    assert!(text.contains("cannot be identified safely"), "{text}");
+    assert!(!text.contains("let vpc ="), "{text}");
+    assert!(!text.contains("moved {"), "{text}");
+}
+
+#[test]
 fn for_value_keys_anonymous_rewrite_uses_indexed_form() {
     for source in [
         "for name in ['same', 'same'] { mock.ec2.Vpc { identity_input = name } }",

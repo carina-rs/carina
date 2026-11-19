@@ -438,6 +438,9 @@ fn snapshot_saved_plan_loop_expansion_uses_checked_conversion() {
         },
     )
     .unwrap();
+    let carina_core::resource::ForExpansion::Expanded(children) = children else {
+        panic!("saved-plan snapshot fixture must expand");
+    };
     assert_eq!(children.len(), 1);
     assert_eq!(
         children[0].get_attr("name"),

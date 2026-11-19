@@ -130,7 +130,7 @@ flatten([[1, [2, 3]]])  # => [1, [2, 3]]
 
 Returns the number of elements in a list or map, or the length of a string in bytes (UTF-8).
 
-A resource loop binding is a structural handle, so `length(rs)` is invalid. Select attributes into an explicitly authored value collection instead. Counting a list with pending members does not make those members eligible as value keys: a simple bound loop needs distinct public Strings; use `(i, x)` for index addresses.
+A resource loop binding is a structural handle, so `length(rs)` is invalid. Select attributes into an explicitly authored value collection instead. Counting a list with pending members does not make those members eligible as value keys: a simple bound loop needs distinct public Strings; use `(i, x)` for index addresses. String keys must also round-trip through state address canonicalization and decomposition; use `(i, x)` for keys rejected until [carina#4552](https://github.com/carina-rs/carina/issues/4552) fixes escaping.
 
 ```
 length(value: list(Any) | map(Any) | String) -> Int

@@ -42,6 +42,50 @@ fn checked_configuration(
 }
 
 #[test]
+fn for_value_keys_upstream_authored_diagnostic_parity() {
+    let snapshot = Arc::new(snapshot());
+    let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["mock".into()]);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("up")).unwrap();
+    for (file, source) in [
+        ("providers.crn", "provider mock {}\n"),
+        (
+            "iterable.crn",
+            "let up = upstream_state { source = './up' }\n",
+        ),
+        ("up/providers.crn", "provider mock {}\n"),
+        ("up/exports.crn", "exports { items: list(Int) = [] }\n"),
+    ] {
+        std::fs::write(directory.path().join(file), source).unwrap();
+    }
+    let path = directory.path().join("resources.crn");
+    let message =
+        "Element type Int cannot be a value key. Rewrite as strings or use `for (i, x) in ...`.";
+    for (iterable, iterable_end) in [("up.items", 26), ("(up.items ?? [1])", 34)] {
+        let source = format!(
+            "let rs = for x in {iterable} {{ mock.test.resource {{ name = 'constant' }} }}\n"
+        );
+        std::fs::write(&path, &source).unwrap();
+        let document = Document::new_with_path(
+            source,
+            path.clone(),
+            Arc::new(snapshot.provider_context().as_provider_context().clone()),
+        );
+        let findings = engine.analyze(&document, Some(&path));
+        let matching = findings
+            .iter()
+            .filter(|d| d.message.contains("cannot be a value key"))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "{findings:#?}");
+        assert_eq!(matching[0].message, message);
+        assert_eq!(
+            matching[0].range,
+            Range::new(Position::new(0, 18), Position::new(0, iterable_end))
+        );
+    }
+}
+
+#[test]
 fn for_value_keys_diagnostic_parity() {
     let snapshot = Arc::new(snapshot());
     let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["mock".into()]);

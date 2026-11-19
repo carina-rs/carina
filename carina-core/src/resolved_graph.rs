@@ -1143,17 +1143,41 @@ pub fn wait_scheduler_id(binding: &AbsoluteBindingAddress) -> ResolvedResourceId
     ResolvedResourceId::with_identity(format!("{SYNTHETIC_TYPE_PREFIX}wait"), identity)
 }
 
-pub fn loop_group_bindings<B: BindingAddress>(binding: &B) -> Vec<B> {
-    crate::resource::decompose_binding_address(binding.as_str())
-        .map(|address| {
-            address
-                .candidate_ancestors()
-                .map(|ancestor| {
-                    crate::resource::binding_address::binding_collection(binding, ancestor.len())
-                })
-                .collect()
+/// Return only authored loop groups that own this existing binding.
+pub fn loop_group_bindings<E, P, T, D, B>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
+    binding: &B,
+) -> Vec<B>
+where
+    P: crate::resource::ValueKind,
+    T: crate::resource::ValueKind,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+{
+    let Some(address) = crate::resource::decompose_binding_address(binding.as_str()) else {
+        return Vec::new();
+    };
+    let actual_groups = parsed
+        .parser_binding_metadata
+        .structural_handles()
+        .iter()
+        .filter(|(_, handle)| handle.is_for_binding())
+        .map(|(binding, _)| binding.clone())
+        .chain(
+            parsed
+                .deferred_for_sites()
+                .filter_map(|site| site.target.bound_binding_address().cloned()),
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+    address
+        .candidate_ancestors()
+        .filter_map(|ancestor| {
+            actual_groups
+                .iter()
+                .find(|group| group.as_str() == ancestor)
+                .cloned()
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn resolve_pending_output(
@@ -1551,7 +1575,7 @@ where
         };
         if let Some(binding) = &resource.binding {
             targets.insert_binding(binding.clone(), target.clone())?;
-            for group in loop_group_bindings(binding) {
+            for group in loop_group_bindings(&parsed, binding) {
                 if let Some(members) = managed_groups.get_mut(&group) {
                     members.insert(id.clone());
                 }
@@ -2030,14 +2054,8 @@ mod for_value_keys_membership_tests {
             ("module.rs.a", vec!["module", "module.rs"]),
             ("rs_extra.a", vec!["rs_extra"]),
         ] {
-            let groups = loop_group_bindings(&RelativeBindingName::new(binding));
-            assert_eq!(
-                groups
-                    .iter()
-                    .map(|group| group.as_str())
-                    .collect::<Vec<_>>(),
-                expected
-            );
+            let address = crate::resource::decompose_binding_address(binding).unwrap();
+            assert_eq!(address.candidate_ancestors().collect::<Vec<_>>(), expected);
         }
     }
 

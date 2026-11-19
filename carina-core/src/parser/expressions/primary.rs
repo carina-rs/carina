@@ -19,7 +19,7 @@ use crate::parser::{
 use crate::resource::{
     AccessMissPolicy, AuthoredAccessPath as AccessPath, AuthoredConcreteValue as ConcreteValue,
     AuthoredDeferredValue as DeferredValue, PathSegment, RelativeBindingName, Subscript,
-    ValuePathSegmentResult, ValueString, apply_value_path_segment,
+    ValuePathSegmentResult, apply_value_path_segment,
 };
 use indexmap::IndexMap;
 
@@ -177,7 +177,6 @@ pub(crate) fn apply_postfix_path_segment(
     let base = match value {
         EvalValue::User(base) => base,
         EvalValue::UnexpandedStructuralHandle(handle) => {
-            let binding = handle.canonical_binding_name();
             if let PathSegment::Subscript { index } = &step {
                 if matches!(
                     handle.kind(),
@@ -186,23 +185,18 @@ pub(crate) fn apply_postfix_path_segment(
                     )
                 ) && matches!(index, Subscript::Int { .. })
                 {
-                    return Err(ParseError::for_key(
-                        crate::resource::ForKeyError::NumericSubscript,
-                        location,
-                    ));
+                    return Err(ParseError::ValueKeyedSubscript {
+                        span: location.span(),
+                    }
+                    .at(location));
                 }
-                let binding = match index {
-                    Subscript::Int { index } => ValueString::plain(format!("{binding}[{index}]")),
-                    Subscript::Str { key } => ValueString::derived_from(
-                        crate::utils::map_key_address(binding, key.expose_plaintext()),
-                        [key],
-                    ),
-                };
-                return Ok(EvalValue::from_value(Value::Deferred(
-                    DeferredValue::BindingRef {
-                        binding: RelativeBindingName::new(binding),
-                    },
-                )));
+                return Ok(EvalValue::from_value(
+                    crate::resource::binding_address::BindingLookup::new(
+                        handle.canonical_binding(),
+                    )
+                    .select(index)
+                    .reference(),
+                ));
             }
             handle.access_base_value()
         }
@@ -988,7 +982,9 @@ fn parse_primary_eval_with_mode_inner(
                 // field after a post-field subscript (e.g.
                 // `a.b[0].c`) is rejected — runtime list-indexing of
                 // arbitrary structs isn't representable today.
-                let mut binding_name = ValueString::plain(first_ident);
+                let mut binding_name = crate::resource::binding_address::BindingLookup::new(
+                    &RelativeBindingName::new(first_ident),
+                );
                 let mut field_names: Vec<String> = Vec::new();
                 let mut subscripts: Vec<Subscript> = Vec::new();
                 let mut in_field_phase = false;
@@ -1004,19 +1000,7 @@ fn parse_primary_eval_with_mode_inner(
                                 // binding name string per the legacy
                                 // convention so `for`-iteration
                                 // addresses round-trip.
-                                binding_name = match subscript {
-                                    Subscript::Int { index } => ValueString::derived_from(
-                                        format!("{}[{index}]", binding_name.expose_plaintext()),
-                                        [&binding_name],
-                                    ),
-                                    Subscript::Str { key } => {
-                                        let address = crate::utils::map_key_address(
-                                            binding_name.expose_plaintext(),
-                                            key.expose_plaintext(),
-                                        );
-                                        ValueString::derived_from(address, [&binding_name, &key])
-                                    }
-                                };
+                                binding_name = binding_name.select(&subscript);
                             }
                         }
                         Rule::field_access => {
@@ -1051,30 +1035,20 @@ fn parse_primary_eval_with_mode_inner(
                         ctx.lookup_binding(first_ident),
                         ParseBindingRef::Structural(_)
                     ) {
-                        return Ok(EvalValue::from_value(Value::Deferred(
-                            DeferredValue::BindingRef {
-                                binding: RelativeBindingName::new(binding_name),
-                            },
-                        )));
+                        return Ok(EvalValue::from_value(binding_name.reference()));
                     }
-                    match ctx.lookup_binding(binding_name.expose_plaintext()) {
+                    match ctx.lookup_binding(binding_name.as_str()) {
                         ParseBindingRef::Value { value, .. } => Ok(value.clone()),
-                        ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => Ok(
-                            EvalValue::from_value(Value::Deferred(DeferredValue::BindingRef {
-                                binding: RelativeBindingName::new(binding_name),
-                            })),
-                        ),
+                        ParseBindingRef::Structural(_) | ParseBindingRef::Unbound => {
+                            Ok(EvalValue::from_value(binding_name.reference()))
+                        }
                     }
                 } else {
                     let attribute_name = field_names.remove(0);
-                    let path = AccessPath::with_fields_and_subscripts(
-                        binding_name.clone(),
+                    Ok(EvalValue::from_value(binding_name.resource_reference(
                         attribute_name,
                         field_names,
                         subscripts,
-                    );
-                    Ok(EvalValue::from_value(Value::Deferred(
-                        DeferredValue::ResourceRef { path },
                     )))
                 }
             }

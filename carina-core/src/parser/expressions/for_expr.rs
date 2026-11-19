@@ -135,9 +135,7 @@ pub(crate) enum ForBodyTarget {
 impl ForBodyTarget {
     fn resource_target(&self) -> ResourceParseTarget {
         match self {
-            Self::Bound(address) => ResourceParseTarget::Bound {
-                binding: address.binding_address().to_string(),
-            },
+            Self::Bound(address) => ResourceParseTarget::LoopChild(address.clone()),
             Self::Template(LoopParseTarget::Bound(target)) => {
                 ResourceParseTarget::DeferredForTemplate {
                     target: target.clone(),
@@ -492,47 +490,32 @@ pub(crate) fn parse_for_expr(
         .knowledge(&KnowledgeContext::validation())
         .map(|proof| proof.into_classification())
         .map_err(|error| ParseError::from_resolution(error.into(), for_line))?;
-    // Whole protection is checked by admission before structural deferral.
-    if let (LoopParseTarget::Bound(bound), ForBinding::Simple(_)) = (&target, &binding)
-        && ClassifiedRef::from(&classified).is_protected()
-    {
-        crate::resource::admit_bound_for_addresses(
+    let admission = match &target {
+        LoopParseTarget::Bound(bound) => Some(crate::resource::admit_bound_for_addresses(
             &binding,
             bound,
             ClassifiedRef::from(&classified),
-        )
-        .map_err(|error| ParseError::for_key(error, &iterable_location))?;
-    }
-    let mut value_keys_pending = false;
-    let iterable_for_expansion = match parser_iterable(&classified) {
-        ParserIterable::List(items)
-            if matches!(
-                (&target, &binding),
-                (LoopParseTarget::Bound(_), ForBinding::Simple(_))
-            ) && items
-                .iter()
-                .any(|item| !matches!(item, ClassifiedRef::Known(_))) =>
-        {
-            value_keys_pending = true;
-            ParserIterable::Deferred
-        }
-        other => other,
+            crate::resource::ForAddressMoment::Parse,
+        )),
+        LoopParseTarget::Unbound(_) => None,
     };
-    let bound_addresses = match (&target, &binding, &iterable_for_expansion) {
-        (
-            LoopParseTarget::Bound(bound),
-            ForBinding::Simple(_) | ForBinding::Indexed(_, _),
-            ParserIterable::List(_),
-        )
-        | (LoopParseTarget::Bound(bound), ForBinding::Map(_, _), ParserIterable::Map(_)) => Some(
-            crate::resource::admit_bound_for_addresses(
-                &binding,
-                bound,
-                ClassifiedRef::from(&classified),
-            )
-            .map_err(|error| ParseError::for_key(error, &iterable_location))?,
-        ),
-        _ => None,
+    let mut address_pending = None;
+    let mut iterable_for_expansion = parser_iterable(&classified);
+    let bound_addresses = match admission {
+        Some(Ok(crate::resource::ForAddressAdmission::Admitted(addresses))) => Some(addresses),
+        Some(Ok(crate::resource::ForAddressAdmission::Defer(pending))) => {
+            address_pending = Some(pending);
+            iterable_for_expansion = ParserIterable::Deferred;
+            None
+        }
+        Some(Ok(crate::resource::ForAddressAdmission::Reject(error))) => {
+            return Err(ParseError::for_key(error, &iterable_location));
+        }
+        // Shape errors retain the parser's existing binding-pattern wording.
+        Some(Err(crate::resource::ForAdmissionFailure::Shape(_))) | None => None,
+        Some(Err(error @ crate::resource::ForAdmissionFailure::Knowledge(_))) => {
+            return Err(ParseError::for_admission_failure(error, &iterable_location));
+        }
     };
     match (&binding, &iterable_for_expansion) {
         (ForBinding::Simple(var), ParserIterable::List(items)) => {
@@ -712,11 +695,10 @@ pub(crate) fn parse_for_expr(
                 declaration.clone(),
                 header,
                 iterable.clone(),
-                if value_keys_pending {
-                    ParsedDeferredForIterableState::ValueKeysPending
-                } else {
-                    ParsedDeferredForIterableState::Deferred
-                },
+                address_pending.map_or(
+                    ParsedDeferredForIterableState::Deferred,
+                    ParsedDeferredForIterableState::AddressPending,
+                ),
             )?;
             // Return empty — the for body produces zero concrete resources
         }

@@ -687,14 +687,14 @@ pub(crate) fn apply_snapshot_path_segment<P: PlaceholderKind, B: BindingAddress>
                 }),
                 PathSegment::Subscript {
                     index: Subscript::Int { index },
-                } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: binding_with_index(&binding, index),
-                }),
+                } => BindingLookup::new(&binding)
+                    .select(&Subscript::Int { index })
+                    .reference(),
                 PathSegment::Subscript {
                     index: Subscript::Str { key },
-                } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: binding_with_map_key(&binding, &key),
-                }),
+                } => BindingLookup::new(&binding)
+                    .select(&Subscript::Str { key })
+                    .reference(),
             };
             return Ok(ValuePathSegmentResult::Deferred(reference));
         }

@@ -461,6 +461,8 @@ impl ResidualModuleResolutionError {
                 | ParseError::UnavailableSecret(_)
                 | ParseError::InvalidFloatLiteral { line: _, source: _ }
                 | ParseError::ForKey(_)
+                | ParseError::ValueKeyedSubscript { .. }
+                | ParseError::ForIterableShape { .. }
                 | ParseError::InvalidExpression {
                     line: _,
                     message: _,

@@ -386,6 +386,38 @@ fn residual_upstream_loop() -> Project {
 }
 
 #[test]
+fn for_value_keys_residual_module_loop_does_not_own_sibling_legacy_row() {
+    let project = Project::new();
+    project.write(
+        "source.crn",
+        "let external = upstream_state { source = '../must-not-be-read' }\n",
+    );
+    project.write(
+        "module.crn",
+        "let child = use { source = './child' }\nlet m = child { items = external.names }\n",
+    );
+    project.write("child/arguments.crn", "arguments { items: list(String) }\n");
+    project.write(
+        "child/resources.crn",
+        "let inner = for x in items { mock.test.resource { name = x } }\n",
+    );
+    project.seed(
+        vec![row(
+            "test.resource",
+            "m.unrelated",
+            json!({"name": "unrelated"}),
+            &["missing_dependency"],
+        )],
+        json!({"version": 3, "states": {"m.unrelated-provider-id": {"name": "unrelated"}}}),
+    );
+    let output = project.run(&["destroy", "--refresh=false", "--auto-approve", "."]);
+    success(&output);
+    let text = rendered(&output);
+    assert!(!text.contains("requires reads"), "{text}");
+    assert!(project.state()["resources"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn destroy_refresh_cannot_claim_planned_materialization_with_residual_upstream_loops() {
     let project = residual_upstream_loop();
     let before = fs::read(project.state_path()).unwrap();

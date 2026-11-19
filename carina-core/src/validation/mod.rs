@@ -6428,8 +6428,34 @@ pub fn validate_for_iterable_types<D, B: BindingAddress, E>(
 where
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
+    validate_authored_for_iterable_types(tree.file().expression_report(), provider_context)
+}
+
+/// Supply declared upstream exports to the same authored-node iterable walk.
+pub fn validate_for_iterable_types_with_upstream<D, B: BindingAddress, E>(
+    tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
+    provider_context: &ProviderContext,
+    schemas: &crate::schema::SchemaRegistry,
+    upstream: &crate::upstream_exports::UpstreamExports<B>,
+) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>
+where
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+{
+    let report = crate::parser::retained::judge_expressions_with_upstream(
+        tree.file(),
+        schemas,
+        provider_context,
+        Some(upstream),
+    );
+    validate_authored_for_iterable_types(&report, provider_context)
+}
+
+fn validate_authored_for_iterable_types<B: BindingAddress>(
+    report: &crate::parser::retained::ExpressionReport<B>,
+    provider_context: &ProviderContext,
+) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();
-    for authored in tree.file().expression_report().authored_for_iterables() {
+    for authored in report.authored_for_iterables() {
         let expected = match authored.binding {
             ForBinding::Simple(_) | ForBinding::Indexed(_, _) => DeferredIterableKind::List,
             ForBinding::Map(_, _) => DeferredIterableKind::Map,
@@ -6555,11 +6581,23 @@ fn validate_for_iterable_operand(
     diagnostics: &mut Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>>,
 ) {
     if let Some(operands) = context.judged.coalesce_operands() {
-        let mut operand_context = context;
-        operand_context.judged = &operands[0];
-        validate_for_iterable_operand(operand_context, diagnostics);
-        operand_context.judged = &operands[1];
-        validate_for_iterable_operand(operand_context, diagnostics);
+        let mut findings: Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> =
+            Vec::new();
+        for operand in operands {
+            let mut operand_context = context;
+            operand_context.judged = operand;
+            let mut operand_findings = Vec::new();
+            validate_for_iterable_operand(operand_context, &mut operand_findings);
+            for finding in operand_findings {
+                if !findings
+                    .iter()
+                    .any(|existing| existing.detail() == finding.detail())
+                {
+                    findings.push(finding);
+                }
+            }
+        }
+        diagnostics.extend(findings);
         return;
     }
 
@@ -11233,7 +11271,7 @@ where
     }
 
     // Return unused binding names, skipping structurally-required bindings
-    // (if/for/read expressions) and for-generated indexed bindings (e.g., vpcs[0])
+    // (if/for/read expressions) and children of actual loop groups.
     defined_bindings
         .into_iter()
         .filter(|(binding, scope)| {
@@ -11246,7 +11284,7 @@ where
                         })
                 })
                 && !parsed.structural_bindings.contains(binding)
-                && !binding.as_str().contains('[')
+                && crate::resolved_graph::loop_group_bindings(parsed, binding).is_empty()
         })
         .map(|(binding, _)| binding.as_str().to_string())
         .collect()

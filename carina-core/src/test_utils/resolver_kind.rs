@@ -328,6 +328,12 @@ pub(crate) fn same_parse_error(
         }};
     }
     match a {
+        ParseError::ValueKeyedSubscript { span } => {
+            matches!(b, ParseError::ValueKeyedSubscript { span: other } if span == other)
+        }
+        ParseError::ForIterableShape { error, span } => {
+            matches!(b, ParseError::ForIterableShape { error: other_error, span: other_span } if error == other_error && span == other_span)
+        }
         ParseError::ForKey(diagnostic) => {
             matches!(b, ParseError::ForKey(other) if diagnostic == other)
         }

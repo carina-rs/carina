@@ -499,7 +499,7 @@ let vpcs = for env in ['dev'] {
 }
 ```
 
-Use the original element values to pair old indices with new keys. When the list is known at plan time, a `moved` block from `rs[0]` to `rs.<key>` carries the existing state row over to the new address. Check `carina plan`, then apply the moves before removing the blocks. Without moves, concrete children appear as destroy/create, with the existing possible-move hint where matching attributes allow it. Update references from `vpcs[0].vpc_id` to `vpcs['dev'].vpc_id`. Non-String or repeated elements require an indexed loop or a rewritten String list; protected values cannot supply keys.
+Use the original element values to pair old indices with new keys. When the list is known at plan time, a `moved` block from `rs[0]` to `rs.<key>` carries the existing state row over to the new address. Check `carina plan`, then apply the moves before removing the blocks. Without moves, concrete children appear as destroy/create, with the existing possible-move hint where matching attributes allow it. Update references from `vpcs[0].vpc_id` to `vpcs['dev'].vpc_id`. Non-String or repeated elements require an indexed loop or a rewritten String list; protected values cannot supply keys. Strings that cannot round-trip through state address canonicalization and decomposition also require `(i, x)` until [carina#4552](https://github.com/carina-rs/carina/issues/4552) fixes key escaping. Map-loop keys are unchanged.
 
 When the iterable is still unknown at plan time, the loop's existing children are replaced. To preserve the old addresses, keep `for (i, x) in list`. Materialize and inspect the collection, then switch to value keys and author moves when the list is known at plan time.
 

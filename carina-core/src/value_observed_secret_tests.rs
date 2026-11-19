@@ -677,8 +677,16 @@ fn for_value_keys_observed_secret_knowledge_plan_apply() {
             &crate::parser::ForBinding::Simple("x".into()),
             &target,
             members,
+            if is_apply {
+                crate::resource::ForAddressMoment::Apply
+            } else {
+                crate::resource::ForAddressMoment::Plan
+            },
         )
-        .unwrap_err();
+        .unwrap();
+        let crate::resource::ForAddressAdmission::Reject(error) = error else {
+            panic!("protected keys must be rejected")
+        };
         assert_eq!(error, crate::resource::ForKeyError::Protected);
         assert!(!format!("{error:?} {error}").contains("OBSERVED_KEY_CANARY"));
     }

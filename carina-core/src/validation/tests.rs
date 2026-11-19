@@ -2746,6 +2746,14 @@ import {
 }
 
 #[test]
+fn for_value_keys_children_are_not_unused_bindings() {
+    let view = authored_binding_view(
+        "let rs = for x in ['a', 'b c'] { mock.test.resource { name = x } }\nlet unused = mock.test.resource { name = 'unused' }\n",
+    );
+    assert_eq!(check_unused_bindings(&view), vec!["unused"]);
+}
+
+#[test]
 fn dotted_string_literal_does_not_count_as_binding_use() {
     let mut parsed = empty_parsed();
 

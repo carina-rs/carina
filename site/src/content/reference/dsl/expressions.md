@@ -34,7 +34,9 @@ A `let`-bound simple list loop uses distinct, public String values as keys: the 
 
 Non-String concrete elements (including enums), duplicate Strings, protected whole collections or members, and diagnostic-sensitive Strings are rejected. Proven non-String element types are rejected even for empty typed lists; String-based refinements are eligible. Unresolved type names are checked when values become available. Key-admission errors identify safe types or element ordinals without printing their values. Use public Strings or `(i, x)` instead.
 
-A partial simple list is recorded as deferred. Planning retries plan-time references, but rejects members known to require apply. A wholly pending collection may expand after its producer applies; unknown members then fail expansion. Newly deferred `read` and module-call bodies are rejected with the indexed-form alternative. Deferred keyed child lookup remains unsupported.
+String keys that do not round-trip through state address canonicalization and decomposition are also rejected. Use `(i, x)` for those elements. This restriction is lifted automatically when [carina#4552](https://github.com/carina-rs/carina/issues/4552) fixes key escaping; map-loop keys keep their existing behavior.
+
+A partial simple list is recorded as deferred. Planning retries plan-time references, but rejects members known to require apply. A wholly pending collection may expand after its producer applies; unknown members then fail expansion. Newly deferred `read` and module-call bodies are rejected with the indexed-form alternative. Deferred keyed child lookup remains unsupported. Managed resource loops whose pending members are only module arguments expand after argument substitution, so their String-keyed children can be referenced inside the module and appear within its plan group.
 
 A loop binding is a structural handle: bare `length(vpcs)` and value exports are invalid. Select an instance attribute or author an explicit value collection. Numeric subscripts on simple list loops receive a diagnostic explaining String subscripts and indexed iteration.
 

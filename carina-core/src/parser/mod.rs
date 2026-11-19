@@ -10,6 +10,9 @@ pub use analysis::{
     DeclarationLocation, DeclarationProvenance, DirectoryScoped, FileScoped, Located,
 };
 mod ast;
+pub(crate) use ast::expand_deferred_children_at_moment;
+#[cfg(test)]
+pub(crate) use ast::expand_deferred_children_for_test;
 mod authored_text;
 mod failed_file;
 pub use failed_file::{

@@ -8520,9 +8520,7 @@ async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTa
                         new_child_ids: HashSet::new(),
                         refreshable_child_ids: RefreshableChildIds::default(),
                         printed_warnings,
-                        _expanded: DeferredForExpansionWitness::after_expansion(
-                            parsed.deferred_for_expressions(),
-                        ),
+                        _expanded: DeferredForExpansionWitness::after_expansion(parsed),
                     });
                 }
 
@@ -8637,9 +8635,7 @@ async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTa
                     new_child_ids,
                     refreshable_child_ids,
                     printed_warnings,
-                    _expanded: DeferredForExpansionWitness::after_expansion(
-                        target.parsed().deferred_for_expressions(),
-                    ),
+                    _expanded: DeferredForExpansionWitness::after_expansion(target.parsed()),
                 })
             },
         )

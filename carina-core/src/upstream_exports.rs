@@ -1233,8 +1233,6 @@ pub struct UpstreamForIterableShapeError {
 /// diagnostic only cares about the shape, not the variable names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForIterableBindingKind {
-    /// A bound simple list loop requires String value keys.
-    ValueKeyedList,
     /// `for x in ...` or `for (i, x) in ...` — both consume a list.
     List,
     /// `for k, v in ...` — consumes a map.
@@ -1242,10 +1240,9 @@ pub enum ForIterableBindingKind {
 }
 
 impl ForIterableBindingKind {
-    fn from_for_binding(binding: &crate::parser::ForBinding, bound: bool) -> Self {
+    fn from_for_binding(binding: &crate::parser::ForBinding) -> Self {
         use crate::parser::ForBinding;
         match binding {
-            ForBinding::Simple(_) if bound => ForIterableBindingKind::ValueKeyedList,
             ForBinding::Simple(_) | ForBinding::Indexed(_, _) => ForIterableBindingKind::List,
             ForBinding::Map(_, _) => ForIterableBindingKind::Map,
         }
@@ -1253,7 +1250,7 @@ impl ForIterableBindingKind {
 
     fn as_str(self) -> &'static str {
         match self {
-            ForIterableBindingKind::List | ForIterableBindingKind::ValueKeyedList => "list",
+            ForIterableBindingKind::List => "list",
             ForIterableBindingKind::Map => "map",
         }
     }
@@ -1261,24 +1258,16 @@ impl ForIterableBindingKind {
 
 impl UpstreamForIterableShapeError {
     pub fn diagnostic_message(&self) -> String {
-        if self.binding_kind == ForIterableBindingKind::ValueKeyedList
-            && let TypeExpr::List(element) = &self.export_type
-            && let Err(error) = crate::resource::classify_for_key_type(element)
-        {
-            return error.to_string();
-        }
         // Suggestion text depends on what the upstream actually exports,
         // not just on what the binding expected: a `for x in scalar` has
         // no valid binding form to suggest at all.
         let suggested = match &self.export_type {
             TypeExpr::List(_) => match self.binding_kind {
-                ForIterableBindingKind::List | ForIterableBindingKind::ValueKeyedList => "",
+                ForIterableBindingKind::List => "",
                 ForIterableBindingKind::Map => "; use `for x in ...` to iterate the list",
             },
             TypeExpr::Map(_) => match self.binding_kind {
-                ForIterableBindingKind::List | ForIterableBindingKind::ValueKeyedList => {
-                    "; use `for k, v in ...` to iterate the map"
-                }
+                ForIterableBindingKind::List => "; use `for k, v in ...` to iterate the map",
                 ForIterableBindingKind::Map => "",
             },
             // Scalar exports can't be iterated at all; saying nothing is
@@ -1360,13 +1349,7 @@ where
 {
     let mut errors: Vec<Located<UpstreamDiagnostic<UpstreamForIterableShapeError>>> = Vec::new();
     for deferred in parsed.for_iterables() {
-        let binding_kind = ForIterableBindingKind::from_for_binding(
-            deferred.binding(),
-            matches!(
-                deferred.target(),
-                crate::parser::DeferredForTarget::Bound(_)
-            ),
-        );
+        let binding_kind = ForIterableBindingKind::from_for_binding(deferred.binding());
         for reference in deferred.result_references() {
             errors.extend(reference.collect_diagnostics(|path, errors| {
                 let Some(fields) = exports.get(path.binding_address()) else {
@@ -1397,11 +1380,9 @@ where
                 };
                 // Scalars feeding a `for` are a different kind of bug; the
                 // shape-check fires on them too because no kind matches.
-                let shape_matches = export_kind == Some(binding_kind)
-                    || (export_kind == Some(ForIterableBindingKind::List) && binding_kind == ForIterableBindingKind::ValueKeyedList);
-                let rejected_key = binding_kind == ForIterableBindingKind::ValueKeyedList
-                    && matches!(export_type, TypeExpr::List(element) if crate::resource::classify_for_key_type(element).is_err());
-                if shape_matches && !rejected_key { return; }
+                if export_kind == Some(binding_kind) {
+                    return;
+                }
                 errors.push(Located::new(
                     reference.prefix_location().clone(),
                     UpstreamDiagnostic::from(UpstreamForIterableShapeError {

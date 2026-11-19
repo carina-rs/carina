@@ -541,6 +541,236 @@ fn for_value_keys_reject_upstream_element_type() {
 }
 
 #[test]
+fn for_value_keys_upstream_authored_type_diagnostic() {
+    let scenario = Scenario::new();
+    fs::create_dir(scenario.project.join("up")).unwrap();
+    scenario.write("up/providers.crn", "provider mock {}\n");
+    scenario.write("up/exports.crn", "exports { items: list(Int) = [] }\n");
+    scenario.write(
+        "iterable.crn",
+        "let up = upstream_state { source = './up' }\n",
+    );
+    let message =
+        "Element type Int cannot be a value key. Rewrite as strings or use `for (i, x) in ...`.";
+    for iterable in ["up.items", "(up.items ?? [1])"] {
+        scenario.write(
+            "resources.crn",
+            &format!(
+                "let rs = for x in {iterable} {{ mock.test.resource {{ name = 'constant' }} }}\n"
+            ),
+        );
+        let output = scenario.carina(&["validate", "."]);
+        assert_rejected(&output, message);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("resources.crn:1:19: {message}")),
+            "{iterable}: {stderr}"
+        );
+        assert!(!stderr.contains("for-expression `"), "{stderr}");
+        assert_eq!(stderr.matches(message).count(), 1, "{stderr}");
+    }
+}
+
+fn partial_argument_module(item: &str) -> Scenario {
+    let scenario = Scenario::new();
+    fs::create_dir(scenario.project.join("child")).unwrap();
+    scenario.write("child/arguments.crn", "arguments { item: String }\n");
+    scenario.write(
+        "child/resources.crn",
+        "let inner = for y in [item, 'z'] { mock.test.resource { name = y } }\n",
+    );
+    scenario.write("modules.crn", "let child = use { source = './child' }\n");
+    scenario.write(
+        "resources.crn",
+        &format!("let m = child {{ item = '{item}' }}\n"),
+    );
+    scenario
+}
+
+#[test]
+fn for_value_keys_module_partial_list_validate() {
+    let scenario = partial_argument_module("a");
+    let output = scenario.carina(&["validate", "."]);
+    success("validate partial module list", &output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("m.inner.a"), "{text}");
+    assert!(text.contains("m.inner.z"), "{text}");
+    assert!(!text.contains("inner[?]"), "{text}");
+}
+
+#[test]
+fn for_value_keys_module_partial_list_reference() {
+    let scenario = partial_argument_module("a");
+    scenario.write(
+        "child/references.crn",
+        "let sink = mock.test.resource { name = 'sink' comment = inner['z'].identifier }\n",
+    );
+    success(
+        "validate module key reference",
+        &scenario.carina(&["validate", "."]),
+    );
+    scenario.apply();
+    let rows = scenario.rows();
+    assert_eq!(
+        rows.keys().cloned().collect::<Vec<_>>(),
+        ["m.inner.a", "m.inner.z", "m.sink"]
+    );
+    let state = scenario.json("carina.state.json");
+    let sink = state["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["binding"] == "m.sink")
+        .unwrap();
+    let child = state["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["binding"] == "m.inner.z")
+        .unwrap();
+    assert_eq!(
+        sink["current"]["attributes"]["comment"].as_str(),
+        Some(
+            child["current"]["attributes"]["identifier"]
+                .as_str()
+                .unwrap()
+        )
+    );
+    scenario.write(
+        "child/references.crn",
+        "let sink = mock.test.resource { name = 'sink' comment = inner[1].identifier }\n",
+    );
+    assert_rejected(
+        &scenario.carina(&["validate", "."]),
+        "This loop is value-keyed; use a string subscript, or `for (i, x) in ...` for index addressing.",
+    );
+}
+
+#[test]
+fn for_value_keys_module_partial_list_plan_group() {
+    let scenario = partial_argument_module("a");
+    scenario.write(
+        "resources.crn",
+        "let ms = for x in ['a'] { child { item = x } }\n",
+    );
+    let output = scenario.carina(&["plan", "."]);
+    success("plan partial module list", &output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let group = text.split_once("module \"ms.a\"").expect(&text).1;
+    let children = group
+        .lines()
+        .filter(|line| line.contains("mock.test.resource ms.a.inner."))
+        .collect::<Vec<_>>();
+    assert_eq!(children.len(), 2, "{text}");
+    assert!(
+        children.iter().any(|line| line.contains("ms.a.inner.a")),
+        "{text}"
+    );
+    assert!(
+        children.iter().any(|line| line.contains("ms.a.inner.z")),
+        "{text}"
+    );
+    assert!(
+        children
+            .iter()
+            .all(|line| line.contains("├─") || line.contains("└─")),
+        "children must render inside the module tree: {text}"
+    );
+}
+
+#[test]
+fn for_value_keys_module_partial_list_duplicate() {
+    let scenario = partial_argument_module("z");
+    assert_rejected(
+        &scenario.carina(&["validate", "."]),
+        "Elements 1 and 2 produce the same key. Use `for (i, x) in ...`.",
+    );
+}
+
+#[test]
+fn for_value_keys_deferred_key_location_once() {
+    let scenario = Scenario::new();
+    fs::create_dir(scenario.project.join("child")).unwrap();
+    scenario.write("child/arguments.crn", "arguments { items: list(String) }\n");
+    scenario.write(
+        "child/resources.crn",
+        "let rs = for x in items { mock.test.resource { name = x } }\n",
+    );
+    scenario.write(
+        "resources.crn",
+        "let child = use { source = './child' }\nlet m = child { items = ['a', 'b', 'a'] }\n",
+    );
+    let output = scenario.carina(&["validate", "."]);
+    let message = "Elements 1 and 3 produce the same key. Use `for (i, x) in ...`.";
+    assert_rejected(&output, message);
+    let text = String::from_utf8_lossy(&output.stderr);
+    let line = text
+        .lines()
+        .find(|line| line.contains(message))
+        .expect(&text);
+    let suffix = line.split_once("resources.crn:1:19: ").expect(line).1;
+    assert_eq!(suffix, message, "{text}");
+}
+
+#[test]
+fn for_value_keys_apply_time_expansion_roundtrip() {
+    let scenario = Scenario::new();
+    scenario.write(
+        "producer.crn",
+        "let producer = mock.test.deferred_source { name = 'producer' }\n",
+    );
+    scenario.write("resources.crn", "let rs = for x in producer.generated_strings { mock.test.resource { name = \"payload-${x}\" } }\n");
+    success(
+        "apply generated keys",
+        &scenario.carina_with(
+            &["apply", "--auto-approve", "--lock=false", "."],
+            &[("CARINA_MOCK_GENERATED_STRINGS", "[\"a\",\"b c\"]")],
+        ),
+    );
+    let before = scenario.rows();
+    assert_eq!(
+        before.keys().cloned().collect::<Vec<_>>(),
+        ["producer", "rs.a", "rs['b c']"]
+    );
+    scenario.clear_operations();
+    let plan = scenario.plan();
+    assert!(
+        plan["plan"]["effects"].as_array().unwrap().is_empty(),
+        "{plan}"
+    );
+    assert_eq!(scenario.rows(), before);
+    assert!(scenario.mutations().is_empty());
+}
+
+#[test]
+fn for_value_keys_reject_non_roundtripping_keys() {
+    let scenario = Scenario::new();
+    for iterable in ["['a[b]']", "[\"q'].z['w\"]"] {
+        scenario.write(
+            "resources.crn",
+            &format!(
+                "let rs = for x in {iterable} {{ mock.test.resource {{ name = 'constant' }} }}\n"
+            ),
+        );
+        let output = scenario.carina(&["validate", "."]);
+        assert_rejected(
+            &output,
+            "Element 1 cannot be used as an address key. Use `for (i, x) in ...`.",
+        );
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !text.contains("a[b]") && !text.contains("q'].z['w"),
+            "{text}"
+        );
+        assert!(scenario.mutations().is_empty());
+    }
+}
+
+#[test]
 fn for_value_keys_plan_phase_member_retries() {
     let upstream = Scenario::new();
     upstream.write(

@@ -84,8 +84,9 @@ impl<B: BindingAddress> BoundDeferredTarget<B> {
         if binding.as_str().is_empty() {
             return Err(ResourceIdentityError::Empty.into());
         }
-        let final_segment = binding.as_str().rsplit('.').next().unwrap_or_default();
-        if final_segment.contains('[') || final_segment.ends_with(']') {
+        if crate::resource::decompose_binding_address(binding.as_str())
+            .is_none_or(|address| address.ends_in_subscript())
+        {
             return Err(BoundDeferredTargetError::TrailingIndex);
         }
         Ok(Self::from_unindexed_binding(binding))
@@ -396,11 +397,13 @@ impl<S: Clone, P: ValueKind, B: BindingAddress, D: Clone> DeferredForTemplateRes
         self.resource.instantiate()
     }
 
-    pub(crate) fn instantiate_with_identity(
+    pub(crate) fn instantiate_bound(
         &self,
-        identity: ResourceIdentity,
+        address: &crate::resource::BoundForAddress<B>,
     ) -> Resource<S, P, B, D> {
-        self.resource.instantiate_with_identity(identity)
+        let mut resource = self.resource.instantiate_with_identity(address.identity());
+        resource.binding = Some(address.binding_address().clone());
+        resource
     }
 }
 
@@ -760,6 +763,7 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
                 .elements()
                 .get(super::elements::ElementKind::Iterable),
             checks_scope: true,
+            address_pending: None,
         }
     }
 }
@@ -820,7 +824,7 @@ impl<P: ValueKind, B: BindingAddress> DeferredForBody<P, B> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedDeferredForIterableState {
     Deferred,
-    ValueKeysPending,
+    AddressPending(crate::resource::ForAddressDefer),
     DependsOnEnclosingModuleArgument { value_keys_pending: bool },
     UndefinedIdentifier { name: String },
 }
@@ -828,7 +832,7 @@ pub(crate) enum ParsedDeferredForIterableState {
 impl ParsedDeferredForIterableState {
     pub(crate) fn value_keys_pending(&self) -> bool {
         match self {
-            Self::ValueKeysPending => true,
+            Self::AddressPending(pending) => pending.element().is_some(),
             Self::DependsOnEnclosingModuleArgument { value_keys_pending } => *value_keys_pending,
             Self::Deferred | Self::UndefinedIdentifier { .. } => false,
         }
@@ -836,7 +840,7 @@ impl ParsedDeferredForIterableState {
 
     pub(crate) fn checks_scope(&self) -> bool {
         match self {
-            Self::Deferred | Self::ValueKeysPending => true,
+            Self::Deferred | Self::AddressPending(_) => true,
             Self::DependsOnEnclosingModuleArgument { .. } | Self::UndefinedIdentifier { .. } => {
                 false
             }
@@ -1056,6 +1060,10 @@ impl<P: ValueKind, B: BindingAddress> ParsedDeferredForExpression<P, B> {
                 .elements()
                 .get(super::elements::ElementKind::Iterable),
             checks_scope: self.iterable_state.checks_scope(),
+            address_pending: match self.iterable_state {
+                ParsedDeferredForIterableState::AddressPending(pending) => Some(pending),
+                _ => None,
+            },
         }
     }
 
@@ -1101,7 +1109,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
         debug_assert!(matches!(
             iterable_state,
             ParsedDeferredForIterableState::Deferred
-                | ParsedDeferredForIterableState::ValueKeysPending
+                | ParsedDeferredForIterableState::AddressPending(_)
                 | ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument { .. }
         ));
         let value_keys_pending = iterable_state.value_keys_pending();
@@ -1121,47 +1129,44 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                 | crate::resource::Value::Conversion(never) => match *never {},
             }
         };
-        if let (DeferredForTarget::Bound(bound), ForBinding::Simple(_)) = (&target, &binding)
-            && let Ok(knowledge) =
-                iterable.knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-        {
-            let classification = knowledge.into_classification();
-            let members = crate::resource::knowledge::ClassifiedRef::from(&classification);
-            if matches!(
-                classification,
-                crate::resource::knowledge::Classification::Known(_)
-            ) || members.is_protected()
-                || iterable_resolution
-                    == DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
-            {
-                match crate::resource::admit_bound_for_addresses(&binding, bound, members) {
-                    Ok(_) | Err(crate::resource::ForKeyError::PlanPending { .. }) => {}
-                    Err(error) => {
-                        let authored = location
-                            .iterable
-                            .elements()
-                            .get(super::elements::ElementKind::Iterable)
-                            .expect("deferred iterable retains source location");
-                        return Err(DeferredForResourceExpressionError::Admission {
-                            file: location
-                                .source_file()
-                                .map(|file| file.display().to_string()),
-                            error: Box::new(super::Located::new(
-                                authored.clone(),
-                                ParseError::for_key(error, authored),
-                            )),
-                        });
-                    }
+        let authored = || {
+            location
+                .iterable
+                .elements()
+                .get(super::elements::ElementKind::Iterable)
+                .expect("deferred iterable retains source location")
+        };
+        let admission_error = |error: ParseError| DeferredForResourceExpressionError::Admission {
+            file: location
+                .source_file()
+                .map(|file| file.display().to_string()),
+            error: Box::new(error.into_element_at(authored())),
+        };
+        let classification = iterable
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map_err(|error| {
+                admission_error(ParseError::from_resolution(error.into(), location.line()))
+            })?
+            .into_classification();
+        if let (DeferredForTarget::Bound(bound), ForBinding::Simple(_)) = (&target, &binding) {
+            match crate::resource::admit_bound_for_addresses(
+                &binding,
+                bound,
+                crate::resource::knowledge::ClassifiedRef::from(&classification),
+                crate::resource::ForAddressMoment::Validation,
+            )
+            .map_err(|error| {
+                admission_error(ParseError::for_admission_failure(error, authored()))
+            })? {
+                crate::resource::ForAddressAdmission::Admitted(_)
+                | crate::resource::ForAddressAdmission::Defer(_) => {}
+                crate::resource::ForAddressAdmission::Reject(error) => {
+                    return Err(admission_error(ParseError::for_key(error, authored())));
                 }
             }
         }
-        let phase_detail = iterable
-            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-            .map(|proof| proof.into_classification())
-            .ok()
-            .and_then(|knowledge| {
-                crate::validation::validate_module_iteration_shape(&knowledge).err()
-            })
+        let phase_detail = crate::validation::validate_module_iteration_shape(&classification)
+            .err()
             .map(|error| error.to_string());
         let template_resource = match body {
             DeferredForBody::Resource(resource) => *resource,
@@ -1353,6 +1358,7 @@ pub struct DeferredForSite<
     pub iterable: &'a Value<P, B>,
     pub(crate) iterable_location: Option<&'a super::DeclarationLocation>,
     pub(crate) checks_scope: bool,
+    pub(crate) address_pending: Option<crate::resource::ForAddressDefer>,
 }
 
 impl<P: ValueKind, B: BindingAddress> DeferredForSite<'_, P, B> {
@@ -1873,6 +1879,19 @@ pub enum DeferredForExpansionError {
 }
 
 impl DeferredForExpansionError {
+    pub(crate) fn admission_failure<B: BindingAddress>(
+        line: usize,
+        expression: String,
+        error: crate::resource::ForAdmissionFailure<B>,
+    ) -> Self {
+        match error {
+            crate::resource::ForAdmissionFailure::Shape(error) => Self::ShapeMismatch(error),
+            crate::resource::ForAdmissionFailure::Knowledge(error) => {
+                Self::resolution(line, expression, error.into())
+            }
+        }
+    }
+
     pub(crate) fn resolution(
         line: usize,
         expression: String,
@@ -1930,7 +1949,7 @@ fn nested_placeholder_error(mut error: PlaceholderAccessError) -> PlaceholderAcc
 }
 
 impl ShapeMismatch {
-    fn new(expected_kind: &'static str, got_kind: &'static str) -> Self {
+    pub(crate) fn new(expected_kind: &'static str, got_kind: &'static str) -> Self {
         Self {
             expected_kind,
             got_kind,
@@ -9027,15 +9046,28 @@ impl<E> ExpandedFile<E> {
                         error.into(),
                     )
                 })?;
-            if let (DeferredForTarget::Bound(bound), ForBinding::Simple(_)) =
-                (deferred.target(), &deferred.binding)
-                && crate::resource::knowledge::ClassifiedRef::from(&classification).is_protected()
-            {
-                crate::resource::admit_bound_for_addresses(
+            if let DeferredForTarget::Bound(bound) = deferred.target() {
+                match crate::resource::admit_bound_for_addresses(
                     &deferred.binding,
                     bound,
                     crate::resource::knowledge::ClassifiedRef::from(&classification),
-                )?;
+                    crate::resource::ForAddressMoment::Plan,
+                ) {
+                    Ok(crate::resource::ForAddressAdmission::Admitted(_)) => {}
+                    Ok(crate::resource::ForAddressAdmission::Defer(_)) => continue,
+                    Ok(crate::resource::ForAddressAdmission::Reject(error)) => {
+                        return Err(error.into());
+                    }
+                    // Existing shape warnings below retain their ownership.
+                    Err(crate::resource::ForAdmissionFailure::Shape(_)) => {}
+                    Err(error @ crate::resource::ForAdmissionFailure::Knowledge(_)) => {
+                        return Err(DeferredForExpansionError::admission_failure(
+                            deferred.line(),
+                            crate::value::format_value(&deferred.iterable),
+                            error,
+                        ));
+                    }
+                }
             }
             let iterable = match classification {
                 Classification::Known(value) => PlanIterable::from_known(value),
@@ -9069,14 +9101,18 @@ impl<E> ExpandedFile<E> {
                 )
                 | (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
                     if let Some(iterable) = iterable {
-                        match expand_deferred_children(deferred, iterable, miss_policy, type_checks)
-                        {
-                            Err(DeferredForExpansionError::ForKey(
-                                crate::resource::ForKeyError::PlanPending { .. },
-                            )) => continue,
-                            result => expanded_resources.extend(result?),
+                        match expand_deferred_children(
+                            deferred,
+                            iterable,
+                            miss_policy,
+                            type_checks,
+                        )? {
+                            crate::resource::ForExpansion::Expanded(children) => {
+                                expanded_resources.extend(children);
+                                resolved_indices.push(idx);
+                            }
+                            crate::resource::ForExpansion::Deferred(_) => continue,
                         }
-                        resolved_indices.push(idx);
                     }
                 }
                 // Shape mismatch: replace the original "not yet available" warning
@@ -9154,6 +9190,11 @@ fn retain_non_matching_deferred_for_warnings(
     warnings.retain(|warning| !deferred.location().matches_deferred_warning(warning));
 }
 
+type ForChildExpansionResult<S, D> = Result<
+    crate::resource::ForExpansion<Vec<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>>>,
+    DeferredForExpansionError,
+>;
+
 /// Expand an exact collection shape, whose leaves may still await apply.
 ///
 /// ```compile_fail,E0308
@@ -9170,21 +9211,60 @@ pub fn expand_deferred_children<
     iterable: crate::resource::knowledge::PlanIterable<'_>,
     miss_policy: crate::resource::AccessMissPolicy,
     type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> ForChildExpansionResult<S, D> {
+    expand_deferred_children_at_moment(
+        deferred,
+        iterable,
+        miss_policy,
+        type_checks,
+        crate::resource::ForAddressMoment::Plan,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn expand_deferred_children_for_test<
+    S: Clone,
+    D: crate::resource::DeferredDependencyPhase<AbsoluteBindingAddress>,
+>(
+    deferred: &DeferredForExpression<S, NoPlaceholder, LoopSlot, AbsoluteBindingAddress, D>,
+    iterable: crate::resource::knowledge::PlanIterable<'_>,
+    miss_policy: crate::resource::AccessMissPolicy,
+    type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Vec<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>>, DeferredForExpansionError> {
+    expand_deferred_children(deferred, iterable, miss_policy, type_checks)
+        .map(crate::resource::ForExpansion::expect_expanded)
+}
+
+pub(crate) fn expand_deferred_children_at_moment<
+    S: Clone,
+    D: crate::resource::DeferredDependencyPhase<AbsoluteBindingAddress>,
+>(
+    deferred: &DeferredForExpression<S, NoPlaceholder, LoopSlot, AbsoluteBindingAddress, D>,
+    iterable: crate::resource::knowledge::PlanIterable<'_>,
+    miss_policy: crate::resource::AccessMissPolicy,
+    type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    moment: crate::resource::ForAddressMoment,
+) -> ForChildExpansionResult<S, D> {
     let admitted = match deferred.target() {
-        DeferredForTarget::Bound(target) => Some(
-            crate::resource::admit_bound_for_addresses(
-                &deferred.binding,
-                target,
-                iterable.classified(),
+        DeferredForTarget::Bound(target) => match crate::resource::admit_bound_for_addresses(
+            &deferred.binding,
+            target,
+            iterable.classified(),
+            moment,
+        )
+        .map_err(|error| {
+            DeferredForExpansionError::admission_failure(
+                deferred.line(),
+                crate::value::format_value(&deferred.iterable),
+                error,
             )
-            .map_err(|error| match error {
-                crate::resource::ForKeyError::Shape { expected, got } => {
-                    DeferredForExpansionError::ShapeMismatch(ShapeMismatch::new(expected, got))
-                }
-                error => DeferredForExpansionError::ForKey(error),
-            })?,
-        ),
+        })? {
+            crate::resource::ForAddressAdmission::Admitted(addresses) => Some(addresses),
+            crate::resource::ForAddressAdmission::Defer(pending) => {
+                return Ok(crate::resource::ForExpansion::Deferred(pending));
+            }
+            crate::resource::ForAddressAdmission::Reject(error) => return Err(error.into()),
+        },
         DeferredForTarget::Unbound { .. } => None,
     };
     let iterable_value = match iterable.for_expansion() {
@@ -9198,68 +9278,71 @@ pub fn expand_deferred_children<
         }
         other => other,
     };
-    match (&deferred.binding, &iterable_value) {
-        (
-            ForBinding::Simple(_) | ForBinding::Indexed(_, _),
-            Value::Concrete(ConcreteValue::List(items)),
-        ) => items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let child = match deferred.target() {
-                    DeferredForTarget::Bound(_) => ExpandedForChild::Bound(
-                        &admitted.as_ref().expect("bound list admitted")[index],
-                    ),
-                    DeferredForTarget::Unbound { template } => ExpandedForChild::Unbound {
-                        template,
-                        element: ForLoopElement::Index(index),
-                    },
-                };
-                build_expanded_child(
-                    deferred,
-                    child,
-                    matches!(deferred.binding, ForBinding::Indexed(_, _)).then_some(index as i64),
-                    None,
-                    item,
-                    miss_policy,
-                    type_checks,
-                )
-            })
-            .collect(),
-        (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(map))) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            keys.into_iter()
+    let resources: Result<Vec<_>, DeferredForExpansionError> =
+        match (&deferred.binding, &iterable_value) {
+            (
+                ForBinding::Simple(_) | ForBinding::Indexed(_, _),
+                Value::Concrete(ConcreteValue::List(items)),
+            ) => items
+                .iter()
                 .enumerate()
-                .map(|(index, key)| {
+                .map(|(index, item)| {
                     let child = match deferred.target() {
                         DeferredForTarget::Bound(_) => ExpandedForChild::Bound(
-                            &admitted.as_ref().expect("bound map admitted")[index],
+                            &admitted.as_ref().expect("bound list admitted")[index],
                         ),
                         DeferredForTarget::Unbound { template } => ExpandedForChild::Unbound {
                             template,
-                            element: ForLoopElement::Key(key.clone()),
+                            element: ForLoopElement::Index(index),
                         },
                     };
                     build_expanded_child(
                         deferred,
                         child,
+                        matches!(deferred.binding, ForBinding::Indexed(_, _))
+                            .then_some(index as i64),
                         None,
-                        Some(key),
-                        &map[key],
+                        item,
                         miss_policy,
                         type_checks,
                     )
                 })
-                .collect()
-        }
-        (ForBinding::Simple(_) | ForBinding::Indexed(_, _), other) => {
-            Err(ShapeMismatch::new("list", deferred_iterable_kind(other)).into())
-        }
-        (ForBinding::Map(_, _), other) => {
-            Err(ShapeMismatch::new("map", deferred_iterable_kind(other)).into())
-        }
-    }
+                .collect(),
+            (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(map))) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                keys.into_iter()
+                    .enumerate()
+                    .map(|(index, key)| {
+                        let child = match deferred.target() {
+                            DeferredForTarget::Bound(_) => ExpandedForChild::Bound(
+                                &admitted.as_ref().expect("bound map admitted")[index],
+                            ),
+                            DeferredForTarget::Unbound { template } => ExpandedForChild::Unbound {
+                                template,
+                                element: ForLoopElement::Key(key.clone()),
+                            },
+                        };
+                        build_expanded_child(
+                            deferred,
+                            child,
+                            None,
+                            Some(key),
+                            &map[key],
+                            miss_policy,
+                            type_checks,
+                        )
+                    })
+                    .collect()
+            }
+            (ForBinding::Simple(_) | ForBinding::Indexed(_, _), other) => {
+                Err(ShapeMismatch::new("list", deferred_iterable_kind(other)).into())
+            }
+            (ForBinding::Map(_, _), other) => {
+                Err(ShapeMismatch::new("map", deferred_iterable_kind(other)).into())
+            }
+        };
+    resources.map(crate::resource::ForExpansion::Expanded)
 }
 
 /// Only the bound arm carries child-address authority.
@@ -9318,13 +9401,7 @@ fn build_expanded_child<
     type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>, DeferredForExpansionError> {
     let mut resource = match child {
-        ExpandedForChild::Bound(address) => {
-            let mut resource = deferred
-                .template_resource
-                .instantiate_with_identity(address.identity());
-            resource.binding = Some(address.binding_address().clone());
-            resource
-        }
+        ExpandedForChild::Bound(address) => deferred.template_resource.instantiate_bound(address),
         ExpandedForChild::Unbound { template, element } => {
             let mut resource = deferred.template_resource.instantiate();
             resource.binding = None;
@@ -10070,7 +10147,7 @@ mod substitute_placeholder_tests {
         let err = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
-                expand_deferred_children(
+                crate::parser::expand_deferred_children_for_test(
                     &deferred,
                     match (Value::Concrete(ConcreteValue::Map(IndexMap::new())))
                         .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
@@ -10125,7 +10202,7 @@ mod substitute_placeholder_tests {
         let children = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
-                expand_deferred_children(
+                crate::parser::expand_deferred_children_for_test(
                     &deferred,
                     match (Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                         ConcreteValue::String("alpha".into()),
@@ -10206,7 +10283,7 @@ mod substitute_placeholder_tests {
         let error = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
-                expand_deferred_children(
+                crate::parser::expand_deferred_children_for_test(
                     &restored,
                     match (Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                         ConcreteValue::String("bad".into()),
@@ -10266,7 +10343,7 @@ mod substitute_placeholder_tests {
         let list_children = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
-                expand_deferred_children(
+                crate::parser::expand_deferred_children_for_test(
                     &list_deferred,
                     match (Value::Concrete(ConcreteValue::List(vec![
                         Value::Concrete(ConcreteValue::String("alpha".into())),
@@ -10305,7 +10382,7 @@ mod substitute_placeholder_tests {
         let map_children = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
-                expand_deferred_children(
+                crate::parser::expand_deferred_children_for_test(
                     &map_deferred,
                     match (Value::Concrete(ConcreteValue::Map(IndexMap::from([
                         (
@@ -10377,7 +10454,7 @@ mod substitute_placeholder_tests {
         let children = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
-                expand_deferred_children(
+                crate::parser::expand_deferred_children_for_test(
                     deferred,
                     match (Value::Concrete(ConcreteValue::List(vec![
                         Value::Concrete(ConcreteValue::String("alpha".into())),

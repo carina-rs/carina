@@ -40,6 +40,8 @@ This creates `vpcs.dev` and `vpcs.stg`. Reordering the list preserves both addre
 
 The elements must be distinct Strings. Numbers, booleans, durations, enum values, lists, maps, structs, and resource handles cannot be keys. A proven non-String element type is rejected even for an empty typed list. Protected collections, protected members, and diagnostic-sensitive Strings are also rejected; their contents never become addresses or diagnostic text. Rewrite the elements as public Strings or use `for (i, x) in ...`.
 
+String keys that do not round-trip through state address canonicalization and decomposition are also rejected. Use `(i, x)` for those elements. This restriction is lifted automatically when [carina#4552](https://github.com/carina-rs/carina/issues/4552) fixes key escaping; map-loop keys keep their existing behavior.
+
 These rules apply to `let`-bound loops with resource, `read`, or module bodies. Anonymous loops keep their schema-derived identities and existing struct-list support.
 
 ### Indexed iteration
@@ -87,7 +89,7 @@ let vpcs = for name, cidr in cidrs {
 
 A bound loop is a structural group. Select an instance attribute with a String subscript for simple list and map loops (`vpcs['dev'].vpc_id`), or an integer subscript for indexed loops (`vpcs[0].vpc_id`). `vpcs[0]` on a simple list loop is an error that points to the indexed form. Bare `length(vpcs)` and bare-value exports of the group remain errors; author an ordinary collection of selected attributes when you need a value.
 
-Keyed child lookup on a deferred loop remains unsupported. Changing a previously eager partial simple list to deferred syntax also removes its parse-time child lookup; use indexed iteration when that lookup is required.
+Keyed child lookup on a deferred loop remains unsupported. Managed resource loops whose pending members are only module arguments expand after argument substitution, so their String-keyed children can be referenced inside the module and appear within its plan group. Changing a previously eager partial simple list to deferred syntax also removes its parse-time child lookup; use indexed iteration when that lookup is required.
 
 ```crn
 let vpcs = for env in ['dev', 'stg'] {

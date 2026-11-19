@@ -642,6 +642,8 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         | ParseError::UnavailableSecret(_)
         | ParseError::InvalidFloatLiteral { .. }
         | ParseError::ForKey(_)
+        | ParseError::ValueKeyedSubscript { .. }
+        | ParseError::ForIterableShape { .. }
         | ParseError::InvalidExpression { .. }
         | ParseError::InvalidAuthoredExpression { .. }
         | ParseError::Evaluation { .. }

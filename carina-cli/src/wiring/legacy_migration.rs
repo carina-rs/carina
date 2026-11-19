@@ -37,7 +37,8 @@ struct ResidualDeferredLoops {
 }
 
 impl ResidualDeferredLoops {
-    fn from_loops(loops: &carina_core::parser::ResolvedDeferredForExpressions) -> Self {
+    fn from_file<E>(parsed: &ExpandedFile<E>) -> Self {
+        let loops = parsed.deferred_for_expressions();
         Self {
             bindings: loops
                 .iter()
@@ -46,7 +47,7 @@ impl ResidualDeferredLoops {
                         let binding = target.binding_address();
                         std::iter::once(binding.to_string())
                             .chain(
-                                loop_group_bindings(binding)
+                                loop_group_bindings(parsed, binding)
                                     .into_iter()
                                     .map(|binding| binding.to_string()),
                             )
@@ -65,11 +66,9 @@ impl ResidualDeferredLoops {
 pub(super) struct DeferredForExpansionWitness(ConfigurationMaterialization);
 
 impl DeferredForExpansionWitness {
-    pub(super) fn after_expansion(
-        loops: &carina_core::parser::ResolvedDeferredForExpressions,
-    ) -> Self {
-        let residual = ResidualDeferredLoops::from_loops(loops);
-        Self(if loops.is_empty() {
+    pub(super) fn after_expansion<E>(parsed: &ExpandedFile<E>) -> Self {
+        let residual = ResidualDeferredLoops::from_file(parsed);
+        Self(if parsed.deferred_for_expressions().is_empty() {
             ConfigurationMaterialization::Planned(CompleteDeferredForMaterialization)
         } else {
             ConfigurationMaterialization::Offline(residual)
@@ -89,7 +88,7 @@ impl<E> MaterializedConfiguration<E> {
     }
 
     pub(super) fn offline(parsed: ExpandedFile<E>) -> Self {
-        let residual_loops = ResidualDeferredLoops::from_loops(parsed.deferred_for_expressions());
+        let residual_loops = ResidualDeferredLoops::from_file(&parsed);
         Self {
             parsed,
             materialization: ConfigurationMaterialization::Offline(residual_loops),

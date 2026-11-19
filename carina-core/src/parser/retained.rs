@@ -3055,7 +3055,6 @@ fn access_step(pair: Pair<'_, Rule>) -> Option<PathSegment> {
 }
 
 use judgement::ConversionEvidence;
-pub(crate) use judgement::judge_expressions;
 pub(in crate::parser) use judgement::unjudged as missing_judgement;
 pub(crate) use judgement::{AdmissionContext, admit_ordinary_with_context, admit_with_context};
 pub use judgement::{
@@ -3063,6 +3062,7 @@ pub use judgement::{
     JudgedExprData, NoConversion, NoTypeProjection, OrdinaryJudgedExpr,
     ProviderAuthorityUnavailable, SinkJudgedExpr, TypeProjection, admit_expression,
 };
+pub(crate) use judgement::{judge_expressions, judge_expressions_with_upstream};
 /// One authored loop's iterable evidence, independent of expansion timing.
 pub(crate) struct AuthoredForIterable<'a> {
     pub binding: &'a super::ForBinding,
@@ -5281,7 +5281,7 @@ mod judgement {
                         .projections
                         .get(&(instance.clone(), operand.node_id()))
                         .map(crate::value::format_value)
-                        .unwrap_or_else(|| iterable.as_str().to_string());
+                        .unwrap_or_else(|| iterable.as_str().trim().to_string());
                     Some(AuthoredForIterable {
                         binding,
                         bound: *bound,
@@ -5504,6 +5504,24 @@ mod judgement {
     where
         D: super::super::DeferredForPhaseTraversal<P, T, B>,
     {
+        judge_expressions_with_upstream(file, schemas, config, None)
+    }
+
+    pub fn judge_expressions_with_upstream<
+        E,
+        P: crate::resource::PlaceholderKind,
+        T: crate::resource::PlaceholderKind,
+        D,
+        B: BindingAddress,
+    >(
+        file: &super::super::File<E, P, T, D, B>,
+        schemas: &crate::schema::SchemaRegistry,
+        config: &super::super::ProviderContext,
+        upstream: Option<&crate::upstream_exports::UpstreamExports<B>>,
+    ) -> ExpressionReport<B>
+    where
+        D: super::super::DeferredForPhaseTraversal<P, T, B>,
+    {
         let expressions = file.parser_binding_metadata.syntax().expressions();
         let mut bindings = inference::bindings_from_parsed(file);
         for wait in &file.wait_bindings {
@@ -5578,6 +5596,7 @@ mod judgement {
             function_errors: Vec::new(),
             operands: HashMap::new(),
             module_attributes: Some(&expressions.report.module_attributes),
+            upstream,
         };
         let mut judged_bindings = IndexMap::new();
         for (name, expression) in &expressions.definitions {
@@ -5758,6 +5777,7 @@ mod judgement {
         function_errors: Vec<Located<InferenceError>>,
         operands: HashMap<ExpressionLocation, [JudgedExpr; 2]>,
         module_attributes: Option<&'a IndexMap<(B, String), JudgedExpr>>,
+        upstream: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
     }
 
     impl<B: BindingAddress> Judge<'_, B> {
@@ -6589,6 +6609,18 @@ mod judgement {
                         let attribute = self.refresh_module_output(attribute);
                         return self.access_path(
                             InferredExpr::from(&attribute),
+                            segments,
+                            binding.as_str(),
+                        );
+                    }
+                    if let Some(ty) = self
+                        .upstream
+                        .and_then(|exports| exports.get(binding))
+                        .and_then(|fields| fields.get(attribute))
+                        .and_then(|entry| entry.static_type.declared_known())
+                    {
+                        return self.access_path(
+                            ordinary(Ok(ty.clone()), false).owned_by_bindings(),
                             segments,
                             binding.as_str(),
                         );

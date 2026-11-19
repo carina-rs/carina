@@ -22177,7 +22177,7 @@ mod for_value_keys_addresses {
             let iterable = crate::resource::knowledge::PlanIterable::from_known(known).unwrap();
             let children =
                 crate::validation::deferred_types::with_session_for_test(&context, |session| {
-                    expand_deferred_children(
+                    expand_deferred_children_for_test(
                         &expanded.deferred_for_expressions()[0],
                         iterable,
                         crate::resource::AccessMissPolicy::Error,
@@ -22264,7 +22264,7 @@ mod for_value_keys_rejections {
         };
         let iterable = crate::resource::knowledge::PlanIterable::from_known(known).unwrap();
         crate::validation::deferred_types::with_session_for_test(&context, |session| {
-            expand_deferred_children(
+            expand_deferred_children_for_test(
                 &expanded.deferred_for_expressions()[0],
                 iterable,
                 crate::resource::AccessMissPolicy::Error,

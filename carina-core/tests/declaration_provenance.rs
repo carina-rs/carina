@@ -251,7 +251,7 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
     let config = context();
     let expanded = expand_directory(root.path());
     let analysis = AnalysisTree::try_from_file(&expanded)?;
-    assert_eq!(analysis.resources().count(), 20);
+    assert_eq!(analysis.resources().count(), 21);
     let child_path = root.path().join("child/sibling.crn");
     let caller_path = root.path().join("sibling.crn");
     for item in analysis.resources() {
@@ -287,9 +287,11 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
                             "read mock.test.Lookup { name = 'then read' }"
                         }
                         "selected_read" => "read mock.test.Lookup { name = 'else read' }",
-                        "generated[?]" => "mock.test.Resource { name = n }",
+                        "generated.a" | "generated.b" | "generated.c" => {
+                            "mock.test.Resource { name = n }"
+                        }
                         "later[?]" => "mock.test.Resource { deferred_name = n }",
-                        "generated_reads[0]" | "generated_reads[1]" => {
+                        "generated_reads.a" | "generated_reads.b" => {
                             "read mock.test.Lookup { name = n }"
                         }
                         other => panic!("unexpected expanded binding {other}"),
@@ -319,8 +321,9 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
             "second.selected_read",
             "read mock.test.Lookup { name = 'else read' }",
         ),
-        ("first.generated[?]", "mock.test.Resource { name = n }"),
-        ("second.generated[?]", "mock.test.Resource { name = n }"),
+        ("first.generated.a", "mock.test.Resource { name = n }"),
+        ("first.generated.b", "mock.test.Resource { name = n }"),
+        ("second.generated.c", "mock.test.Resource { name = n }"),
     ] {
         let item = analysis
             .resources()
@@ -363,12 +366,15 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
             .unwrap()
         })
         .publish(&mut NoTypeErrors);
+        let carina_core::resource::ForExpansion::Expanded(children) = children else {
+            panic!("declaration provenance fixture must expand");
+        };
         let mut child_tree = carina_core::parser::ExpandedParsedFile::default();
         child_tree.resources = children;
         let analysis = AnalysisTree::try_from_file(&child_tree)?;
         let item = analysis.resources().next().unwrap();
         assert_ne!(item.id(), deferred.template_resource_id());
-        let declaration = if item.binding().unwrap().contains(".generated[") {
+        let declaration = if deferred.attributes().contains_key("name") {
             "mock.test.Resource { name = n }"
         } else {
             "mock.test.Resource { deferred_name = n }"

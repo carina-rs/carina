@@ -353,7 +353,7 @@ fn module_directives_resolve_before_deferred_loop_is_saved() {
     let children = crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            crate::parser::expand_deferred_children(
+            crate::parser::expand_deferred_children_for_test(
                 &restored,
                 match (crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(
                     vec![crate::resource::Value::Concrete(
@@ -426,7 +426,7 @@ fn module_loop_directives_are_strictly_resolved_for_each_child() {
         let children = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
-                crate::parser::expand_deferred_children(
+                crate::parser::expand_deferred_children_for_test(
                     deferred,
                     match (Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                         ConcreteValue::Bool(flag),
@@ -482,7 +482,7 @@ fn module_loop_directives_are_strictly_resolved_for_each_child() {
         let error = crate::validation::deferred_types::with_session_for_test(
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| {
-                crate::parser::expand_deferred_children(
+                crate::parser::expand_deferred_children_for_test(
                     deferred,
                     match (Value::Concrete(ConcreteValue::List(vec![value])))
                         .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())

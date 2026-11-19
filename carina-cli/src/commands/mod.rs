@@ -1469,6 +1469,16 @@ fn validate_and_resolve_configuration<'s>(
                 &analysis,
                 &upstream_exports,
             );
+        errors.extend(
+            carina_core::validation::validate_for_iterable_types_with_upstream(
+                &analysis,
+                ctx.provider_context().as_provider_context(),
+                ctx.schemas(),
+                &upstream_exports,
+            )
+            .into_iter()
+            .map(|finding| AppError::Validation(finding.to_string())),
+        );
         // #1894 (option 2): cross-directory `for`-iterable shape check.
         // Surfaces pending `list ↔ map` migrations in the upstream's
         // `exports.crn` before they hit apply.

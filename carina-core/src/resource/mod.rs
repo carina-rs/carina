@@ -69,11 +69,12 @@ use crate::schema::{
 #[cfg(any(test, feature = "test-utils"))]
 pub use binding_address::absolute_binding_address_for_test;
 pub use binding_address::{
-    AbsoluteBindingAddress, BindingAddress, CheckedBindingAddress, RelativeBindingName,
-    decompose_binding_address,
+    AbsoluteBindingAddress, BindingAddress, BoundForAddress, CheckedBindingAddress,
+    ForAddressDefer, ForExpansion, ForKeyError, RelativeBindingName, decompose_binding_address,
 };
 pub(crate) use binding_address::{
-    binding_with_index, binding_with_map_key, module_argument_placeholder,
+    BindingLookup, ForAddressAdmission, ForAddressMoment, ForAdmissionFailure,
+    admit_bound_for_addresses, classify_for_key_type, module_argument_placeholder,
 };
 pub use directive_expr::{
     ArgumentValueOrigin, DirectiveExpr, DirectiveResolutionError, DirectiveResolutionErrors,
@@ -91,12 +92,10 @@ pub use ignore_changes::{
     ResolvedIgnorePath, resolve_ignore_changes,
 };
 pub use loop_origin::{
-    BoundForAddress, ForKeyError, ForLoopElement, LoopElementOrigin, LoopKind, LoopOriginKind,
-    LoopProvenance, LoopSource, UnboundLoopTemplate,
+    ForLoopElement, LoopElementOrigin, LoopKind, LoopOriginKind, LoopProvenance, LoopSource,
+    UnboundLoopTemplate,
 };
-pub(crate) use loop_origin::{
-    LegacyLoopAddress, LoopModulePrefixOrigin, admit_bound_for_addresses, classify_for_key_type,
-};
+pub(crate) use loop_origin::{LegacyLoopAddress, LoopModulePrefixOrigin};
 
 /// Resolver for names authored in the root directory.
 ///
@@ -2781,14 +2780,14 @@ fn select_classified_segment<P: PlaceholderKind, B: BindingAddress>(
                     }),
                     PathSegment::Subscript {
                         index: Subscript::Int { index },
-                    } => Value::Deferred(DeferredValue::BindingRef {
-                        binding: binding_with_index(binding, index),
-                    }),
+                    } => BindingLookup::new(binding)
+                        .select(&Subscript::Int { index })
+                        .reference(),
                     PathSegment::Subscript {
                         index: Subscript::Str { key },
-                    } => Value::Deferred(DeferredValue::BindingRef {
-                        binding: binding_with_map_key(binding, &key),
-                    }),
+                    } => BindingLookup::new(binding)
+                        .select(&Subscript::Str { key })
+                        .reference(),
                 },
                 Value::Deferred(DeferredValue::Secret(_)) => {
                     unreachable!("Secret has an opaque known arm")

@@ -293,30 +293,22 @@ pub(crate) fn preprocess_file(input: &str) -> Result<PreprocessedFile, ParseErro
 
 /// Keep an anonymous loop's suggested numeric moves consistent with the
 /// suggested bound syntax, without changing its authored source or identity.
-pub(crate) fn indexed_bound_loop_rewrite(source: &str) -> std::borrow::Cow<'_, str> {
-    let Ok(file) = preprocess_file(source) else {
-        return source.into();
-    };
-    let Some(statement) = file.parse().ok().and_then(|mut pairs| {
+pub(crate) fn indexed_bound_loop_rewrite(source: &str) -> Option<std::borrow::Cow<'_, str>> {
+    let file = preprocess_file(source).ok()?;
+    let statement = file.parse().ok().and_then(|mut pairs| {
         pairs
             .next()?
             .into_inner()
             .find(|pair| pair.as_rule() == Rule::statement)
-    }) else {
-        return source.into();
-    };
-    let Some(expression) = statement
+    })?;
+    let expression = statement
         .into_inner()
         .next()
-        .filter(|pair| pair.as_rule() == Rule::for_expr)
-    else {
-        return source.into();
-    };
+        .filter(|pair| pair.as_rule() == Rule::for_expr)?;
     let binding = expression.into_inner().next().expect("for binding grammar");
-    let Ok(super::ForBinding::Simple(value)) =
-        super::expressions::for_expr::parse_for_binding(binding.clone())
-    else {
-        return source.into();
+    let binding_form = super::expressions::for_expr::parse_for_binding(binding.clone()).ok()?;
+    let super::ForBinding::Simple(value) = binding_form else {
+        return Some(source.into());
     };
     let range = binding.as_span();
     let mut rewritten = source.to_string();
@@ -324,7 +316,7 @@ pub(crate) fn indexed_bound_loop_rewrite(source: &str) -> std::borrow::Cow<'_, s
         file.original_byte(range.start())..file.original_byte(range.end()),
         &format!("(_, {value})"),
     );
-    rewritten.into()
+    Some(rewritten.into())
 }
 
 pub(super) fn parse_type_expr_fragment(
