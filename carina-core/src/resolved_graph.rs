@@ -1805,11 +1805,11 @@ mod tests {
 
     #[test]
     fn expanded_graph_projects_independent_closures_before_invalid_wait_errors() {
-        let mut parsed = crate::parser::ExpandedInferredFile::default();
         let managed = Resource::with_provider("mock", "test.Managed", "managed", None)
             .with_absolute_binding(absolute("managed"));
         let expected = HashSet::from([ResolvedResourceId::new(managed.id.clone())]);
-        parsed.resources.push(managed);
+        let mut parsed =
+            crate::parser::ExpandedInferredFile::default().with_resources_for_test(vec![managed]);
         parsed.wait_bindings.push(wait("ready", "managed"));
         let mut lookup = DataSource::with_provider("mock", "test.Lookup", "lookup", None)
             .with_attribute("input", binding_value("ready"));
@@ -1849,7 +1849,11 @@ mod tests {
 
     #[test]
     fn expanded_graph_defers_invalid_waits_through_dependent_nodes_and_arguments() {
-        let mut parsed = configuration_with_argument(binding_value("second"));
+        let mut parsed = configuration_with_argument(binding_value("second"))
+            .with_resources_for_test(vec![
+                Resource::with_provider("mock", "test.Managed", "consumer", None)
+                    .with_attribute("input", binding_value("also_missing")),
+            ]);
         parsed.wait_bindings.push(wait("invalid", "missing"));
         for (name, dependency) in [("first", "invalid"), ("second", "first")] {
             let mut source = DataSource::with_provider("mock", "test.Lookup", name, None)
@@ -1857,10 +1861,6 @@ mod tests {
             source.binding = Some(absolute(name));
             parsed.data_sources.push(source);
         }
-        parsed.resources.push(
-            Resource::with_provider("mock", "test.Managed", "consumer", None)
-                .with_attribute("input", binding_value("also_missing")),
-        );
         assert_eq!(
             resolve_expanded_graph(parsed.into()).unwrap_err(),
             ExpandedGraphResolutionError::MissingDependency {
@@ -1873,11 +1873,11 @@ mod tests {
 
     #[test]
     fn expanded_graph_prefers_managed_binding_over_data_source_binding() {
-        let mut parsed = crate::parser::ExpandedInferredFile::default();
         let managed = Resource::with_provider("mock", "test.Managed", "managed", None)
             .with_absolute_binding(absolute("shared"));
         let expected = HashSet::from([ResolvedResourceId::new(managed.id.clone())]);
-        parsed.resources.push(managed);
+        let mut parsed =
+            crate::parser::ExpandedInferredFile::default().with_resources_for_test(vec![managed]);
         let mut lookup = DataSource::with_provider("mock", "test.Lookup", "lookup", None);
         lookup.binding = Some(absolute("shared"));
         parsed.data_sources.push(lookup);
@@ -1895,13 +1895,15 @@ mod tests {
 
     #[test]
     fn scheduler_target_catalog_preserves_managed_identity_precedence_for_unbound_rows() {
-        let mut parsed = crate::parser::ExpandedInferredFile::default();
+        let mut resources = Vec::new();
         let mut expected = HashSet::new();
         for resource_type in ["test.First", "test.Second"] {
             let resource = Resource::with_provider("mock", resource_type, "shared", None);
             expected.insert(ResolvedResourceId::new(resource.id.clone()));
-            parsed.resources.push(resource);
+            resources.push(resource);
         }
+        let mut parsed =
+            crate::parser::ExpandedInferredFile::default().with_resources_for_test(resources);
         let unbound = DataSource::with_provider("mock", "test.Unbound", "shared", None);
         let mut bound = DataSource::with_provider("mock", "test.Bound", "shared", None);
         bound.binding = Some(absolute("lookup"));

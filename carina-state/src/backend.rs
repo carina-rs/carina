@@ -263,7 +263,7 @@ pub enum BackendError {
 
     /// The state file predates the only supported format.
     #[error(
-        "State file version {found} is older than supported version {supported}. Rewrite this state with carina v0.15.0 (run `carina apply` or `carina state refresh` with it), then retry."
+        "State file version {found} is older than supported version {supported}. Rewrite this state with carina v0.15.0 (`apply` or `state refresh`), then retry."
     )]
     StateVersionTooOld { found: u32, supported: u32 },
 

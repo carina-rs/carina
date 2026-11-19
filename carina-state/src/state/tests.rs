@@ -5283,6 +5283,113 @@ fn current_deposed_entries_round_trip() {
 }
 
 #[test]
+fn v21_state_round_trips_enum_and_dollar_keys_in_current_and_deposed_attributes() {
+    use carina_core::resource::EnumValueResolver;
+    use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
+
+    let encoded_tree = serde_json::json!({
+        "nested": [{
+            "mode": {"$enum": {
+                "identity": {
+                    "provider": "aws",
+                    "segments": ["ec2", "Eip"],
+                    "kind": "Domain"
+                },
+                "api_value": "vpc"
+            }},
+            "$$enum": "user enum key",
+            "$$user": "one dollar",
+            "$$$user": "two dollars"
+        }]
+    });
+    let enum_type = AttributeType::enum_(
+        TypeIdentity::new(Some("aws"), ["ec2", "Eip"], "Domain"),
+        Some(vec!["vpc".to_string()]),
+        Vec::new(),
+        None,
+        None,
+    );
+    let enum_value = EnumValueResolver::new(&enum_type)
+        .resolve_state_text("vpc")
+        .expect("fixture enum value resolves");
+    let expected: SnapshotValue = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "nested".to_string(),
+        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+            ConcreteValue::Map(IndexMap::from([
+                (
+                    "mode".to_string(),
+                    Value::Concrete(ConcreteValue::CanonicalEnum(enum_value)),
+                ),
+                (
+                    "$enum".to_string(),
+                    Value::Concrete(ConcreteValue::String("user enum key".into())),
+                ),
+                (
+                    "$user".to_string(),
+                    Value::Concrete(ConcreteValue::String("one dollar".into())),
+                ),
+                (
+                    "$$user".to_string(),
+                    Value::Concrete(ConcreteValue::String("two dollars".into())),
+                ),
+            ])),
+        )])),
+    )])));
+    let json = serde_json::json!({
+        "version": 21,
+        "exports_version": PublishedExports::CURRENT_VERSION,
+        "serial": 1,
+        "lineage": "enum-and-dollar-key-round-trip",
+        "carina_version": "test",
+        "resources": [{
+            "resource_type": "ec2.Eip",
+            "identity": "main",
+            "provider": "aws",
+            "current": {
+                "kind": "applied",
+                "identifier": "current-id",
+                "attributes": {"tree": encoded_tree},
+                "nested_write_only": {}
+            },
+            "deposed": [{
+                "key": "old-generation",
+                "identifier": "old-id",
+                "attributes": {"tree": encoded_tree},
+                "dependency_bindings": []
+            }]
+        }],
+        "exports": {}
+    });
+
+    let state = load_state(&json.to_string()).expect("v21 attribute trees load");
+    let serialized = serde_json::to_value(&state).expect("v21 state serializes");
+    assert_eq!(serialized["version"], 21);
+    assert_eq!(
+        serialized["resources"][0]["current"]["attributes"]["tree"],
+        encoded_tree
+    );
+    assert_eq!(
+        serialized["resources"][0]["deposed"][0]["attributes"]["tree"],
+        encoded_tree
+    );
+    let reloaded = load_state(&serialized.to_string()).expect("serialized v21 state reloads");
+    for state in [&state, &reloaded] {
+        let row = &state.resources()[0];
+        for attributes in [
+            row.persisted_attributes()
+                .expect("current attributes exist"),
+            row.deposed[0].persisted_attributes(),
+        ] {
+            assert_eq!(attributes.get("tree"), Some(expected.clone()));
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(&reloaded).expect("reloaded v21 state serializes"),
+        serialized
+    );
+}
+
+#[test]
 fn load_state_retains_identifier_none_rows_for_typed_classification() {
     use super::load_state;
 
@@ -5755,25 +5862,28 @@ fn published_exports_ignore_older_state_body_version() {
 }
 
 #[test]
-fn published_exports_reject_current_state_without_exports_version() {
-    let json = serde_json::json!({
-        "version": StateFile::CURRENT_VERSION,
-        "serial": 1,
-        "lineage": "invalid-current-state",
-        "carina_version": "current",
-        "resources": [],
-        "exports": { "account_id": "123456789012" }
-    });
+fn published_exports_reject_missing_exports_version_regardless_of_state_body_version() {
+    for version in [16, StateFile::CURRENT_VERSION] {
+        let json = serde_json::json!({
+            "version": version,
+            "serial": 1,
+            "lineage": "missing-exports-version",
+            "carina_version": "test",
+            "resources": [],
+            "exports": { "account_id": "123456789012" }
+        });
 
-    let error = PublishedExports::from_state_bytes(json.to_string().as_bytes())
-        .expect_err("current and newer state must declare exports_version");
-    let BackendError::InvalidState(message) = error else {
-        panic!("expected InvalidState, got {error}");
-    };
-    assert_eq!(
-        message,
-        "Failed to parse state file: missing required top-level exports_version"
-    );
+        let error = PublishedExports::from_state_bytes(json.to_string().as_bytes()).expect_err(
+            "exports reads require exports_version regardless of the state body version",
+        );
+        let BackendError::InvalidState(message) = error else {
+            panic!("body version {version}: expected InvalidState, got {error}");
+        };
+        assert_eq!(
+            message, "Failed to parse state file: missing required top-level exports_version",
+            "body version {version}"
+        );
+    }
 }
 
 #[test]
@@ -6017,7 +6127,7 @@ fn state_versions_0_through_20_are_rejected_before_exports_or_rows() {
             let message = error.to_string();
             assert!(message.contains(&format!("version {found}")), "{message}");
             assert!(message.contains("supported version 21"), "{message}");
-            assert!(message.contains("Rewrite this state with carina v0.15.0 (run `carina apply` or `carina state refresh` with it), then retry."), "{message}");
+            assert!(message.contains("Rewrite this state with carina v0.15.0 (`apply` or `state refresh`), then retry."), "{message}");
         }
     }
     let malformed_rows = r#"{"version":20,"resources":[{"broken":true}]}"#;

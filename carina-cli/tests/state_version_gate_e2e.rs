@@ -1,4 +1,4 @@
-//! Full-state commands reject unsupported state versions without rewriting their bytes.
+//! Plan and apply reject v20 local state without rewriting its bytes.
 //! Destroy and refresh handle retyped bindings with v21 orphans.
 
 use std::fs;
@@ -123,7 +123,13 @@ fn plan_and_apply_reject_v20_local_state_without_rewriting_it() {
         let output = project.run(&args);
         assert!(!output.status.success(), "{}", rendered(&output));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        for required in ["version 20", "21", "carina v0.15.0"] {
+        for required in [
+            "version 20",
+            "supported version 21",
+            "carina v0.15.0",
+            "`apply`",
+            "`state refresh`",
+        ] {
             assert!(stderr.contains(required), "{stderr}");
         }
         assert_eq!(fs::read(project.state_path()).unwrap(), bytes);

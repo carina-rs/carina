@@ -5651,6 +5651,49 @@ mod tests {
     }
 
     #[test]
+    fn completion_old_state_version_is_rejected_without_candidates() {
+        const CHILD_ENV: &str = "CARINA_TEST_OLD_STATE_COMPLETION_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            assert!(complete_state_lookup(OsStr::new("")).is_empty());
+            return;
+        }
+
+        let found = StateFile::CURRENT_VERSION - 1;
+        let mut state = serde_json::to_value(load_fixture_state()).unwrap();
+        state["version"] = json!(found);
+        let contents = state.to_string();
+        let result = parse_local_state_for_completion(&contents);
+        assert!(
+            matches!(
+                result.as_ref(),
+                Err(BackendError::StateVersionTooOld {
+                    found: actual_found,
+                    supported,
+                }) if *actual_found == found && *supported == StateFile::CURRENT_VERSION
+            ),
+            "completion must preserve the typed old-version classification"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("carina.state.json"), contents).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::state::tests::completion_old_state_version_is_rejected_without_candidates",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&format!("version {found}")),
+            "{output:?}"
+        );
+    }
+
+    #[test]
     fn completion_empty_input_returns_all_resource_names() {
         let state = load_fixture_state();
         let candidates = complete_state_lookup_from(&state, "");
