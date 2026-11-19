@@ -1564,13 +1564,17 @@ impl RejectedPrefixValues {
     pub(crate) fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
         self.companions.deferred_findings()
     }
-    pub fn into_parts(self) -> (Vec<AttributePrefixRejection>, PrefixObligations) {
+    pub fn into_live_findings(self) -> Vec<AttributePrefixFinding> {
         let Self {
             first,
             rest,
             companions,
         } = self;
-        (std::iter::once(*first).chain(rest).collect(), companions)
+        PrefixFindings {
+            rejections: std::iter::once(*first).chain(rest).collect(),
+            companions,
+        }
+        .into_live_findings()
     }
 }
 
@@ -1582,7 +1586,15 @@ impl RejectedPrefixValues {
 ///     findings.into_rejections()
 /// }
 /// ```
+/// An owning extractor cannot discard the companion side either:
+/// ```compile_fail,E0599
+/// use carina_core::identifier::{AttributePrefixRejection, PrefixFindings};
+/// fn discard_arguments(findings: PrefixFindings) -> Vec<AttributePrefixRejection> {
+///     findings.into_parts().0
+/// }
+/// ```
 #[derive(Debug, Clone, Default)]
+#[must_use]
 pub struct PrefixFindings {
     rejections: Vec<AttributePrefixRejection>,
     companions: PrefixObligations,
@@ -1591,14 +1603,25 @@ impl PrefixFindings {
     pub fn rejections(&self) -> &[AttributePrefixRejection] {
         &self.rejections
     }
-    pub fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
+    #[cfg(test)]
+    pub(crate) fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
         self.companions.deferred_findings()
     }
-    pub fn into_parts(self) -> (Vec<AttributePrefixRejection>, PrefixObligations) {
-        (self.rejections, self.companions)
+    /// Publish the complete prefix outcome. A Live caller cannot separate and
+    /// discard formal-argument obligations from the findings that replace them.
+    pub fn into_live_findings(self) -> Vec<AttributePrefixFinding> {
+        let Self {
+            rejections,
+            companions,
+        } = self;
+        rejections
+            .into_iter()
+            .map(Into::into)
+            .chain(companions.into_live_findings().into_iter().map(Into::into))
+            .collect()
     }
     pub fn is_empty(&self) -> bool {
-        self.rejections.is_empty() && self.companions.deferred_findings().is_empty()
+        self.rejections.is_empty() && self.companions.is_empty()
     }
 }
 
@@ -1784,15 +1807,13 @@ pub fn resolve_attr_prefixes<
     file: &mut crate::parser::File<X, P, T, D, B>,
     registry: &SchemaRegistry,
 ) -> Result<(), String> {
-    let errors = resolve_attr_prefix_findings(file, registry);
+    let errors = resolve_attr_prefix_findings(file, registry).into_live_findings();
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors
-            .rejections()
             .iter()
             .map(ToString::to_string)
-            .chain(errors.deferred_findings().iter().map(ToString::to_string))
             .collect::<Vec<_>>()
             .join("\n"))
     }

@@ -12999,9 +12999,9 @@ impl<R: PatternForm> PatternResourceSchema<R> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ValueEntryValidation {
-    FullInput,
+#[derive(Clone, Copy)]
+enum ValueEntryValidation<'a> {
+    FullInput(&'a crate::identifier::PrefixObligations),
     KnownWritableOnly,
 }
 
@@ -16568,11 +16568,9 @@ impl PatternResourceSchema<Compiled> {
         }
 
         let values = self.validate_value_entries(
-            entries
-                .into_iter()
-                .filter(|(name, _)| !awaiting.awaits_prefix(name)),
+            entries,
             is_string_literal,
-            ValueEntryValidation::FullInput,
+            ValueEntryValidation::FullInput(awaiting),
             None,
             admission,
         );
@@ -16689,7 +16687,7 @@ impl PatternResourceSchema<Compiled> {
         &self,
         entries: impl IntoIterator<Item = (&'a String, &'a Classification<'v, P, B, T>)>,
         is_string_literal: &dyn Fn(&str) -> bool,
-        mode: ValueEntryValidation,
+        mode: ValueEntryValidation<'_>,
         selected: Option<&HashSet<String>>,
         admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
@@ -16724,7 +16722,7 @@ impl PatternResourceSchema<Compiled> {
                 // `read_only` attributes are provider-populated, so accepting a user
                 // value would silently drop it. Reject before type checking so the
                 // diagnostic reports writability instead of a confusing type error.
-                if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
+                if schema.is_read_only() && matches!(mode, ValueEntryValidation::FullInput(_)) {
                     report
                         .errors
                         .push(SchemaDiagnostic::unlocated(TypeError::ReadOnlyAttribute {
@@ -16764,15 +16762,19 @@ impl PatternResourceSchema<Compiled> {
                     ));
                 }
                 report.insert_attribute(name.clone(), findings);
-            } else if mode == ValueEntryValidation::FullInput {
+            } else if let ValueEntryValidation::FullInput(companions) = mode {
                 if let Some(admit) = admission.unknown {
                     report.insert_attribute(name.clone(), admit(name, value));
                 }
-                report.errors.push(SchemaDiagnostic::from_value(
-                    name,
-                    LeafPath::from_segments([]),
-                    TypeError::unknown_attribute(name, &known, &aliases),
-                ));
+                // A recognized companion still admits its expression, including
+                // reference/resolution errors. Only its unknown-key judgement waits.
+                if !companions.awaits_prefix(name) {
+                    report.errors.push(SchemaDiagnostic::from_value(
+                        name,
+                        LeafPath::from_segments([]),
+                        TypeError::unknown_attribute(name, &known, &aliases),
+                    ));
+                }
             }
         }
 

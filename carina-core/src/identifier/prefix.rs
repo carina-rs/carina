@@ -14,8 +14,8 @@ use crate::parser::{
 };
 use crate::resource::{
     AccessPath, BindingAddress, ConcreteValue, DependencyKey, DiagnosticScope, LoopSlot,
-    ModuleSource, ParserPlaceholder, PlaceholderKind, ReferencePath, Resource, ResourceId, Value,
-    ValueString,
+    ModuleSource, ParserPlaceholder, PlaceholderKind, ReferencePath, RelativeBindingName, Resource,
+    ResourceId, Value, ValueString,
 };
 use crate::schema::{OwnerBoundResourceSchema, SchemaKind, SchemaRegistry};
 use crate::validation::admission::{DeclarationIdentity, attributes::declaration_identity};
@@ -105,16 +105,16 @@ struct OwnerVisit {
     owner: OwnerAddress,
     state: PrefixAdmission,
 }
-/// Recognition supplies these keys together with dependencies. Only an
-/// unexpanded formal argument retains bare keys as suppression authority.
+/// Recognition supplies these keys together with the dependency evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PrefixCompanionKeys {
     prefix: String,
     base: String,
 }
 
-/// Template obligations have no diagnostic owner or dependency. Publishing
-/// accepts concrete findings, never this type.
+/// Template obligations retain typed formal-argument evidence until expansion
+/// binds it. They cannot be extracted from their suppression authority; a Live
+/// boundary must convert the complete obligation into a finding instead.
 ///
 /// ```compile_fail,E0277
 /// use carina_core::identifier::{AttributePrefixFinding, AwaitingPrefixArguments};
@@ -123,15 +123,84 @@ struct PrefixCompanionKeys {
 /// }
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AwaitingPrefixArguments(Vec<PrefixCompanionKeys>);
+pub struct AwaitingPrefixArguments(Vec<AwaitingPrefixArgument>);
 impl AwaitingPrefixArguments {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct PrefixArgumentDependency {
+    name: RelativeBindingName,
+    through: Option<RelativeBindingName>,
+    scope: DiagnosticScope,
+}
+impl std::fmt::Debug for PrefixArgumentDependency {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = self.scope.path(ReferencePath::Binding(self.name.clone()));
+        let through = self
+            .through
+            .as_ref()
+            .map(|name| self.scope.path(ReferencePath::Binding(name.clone())));
+        formatter
+            .debug_struct("PrefixArgumentDependency")
+            .field("name", &name)
+            .field("through", &through)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrefixArgumentDependencies {
+    first: PrefixArgumentDependency,
+    rest: Vec<PrefixArgumentDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AwaitingPrefixArgument {
+    keys: PrefixCompanionKeys,
+    resource: ResourceId,
+    owner: crate::finding::FindingOwner,
+    dependencies: PrefixArgumentDependencies,
+}
+impl AwaitingPrefixArgument {
+    fn into_live_finding(self) -> DeferredPrefixFinding {
+        let Self {
+            keys,
+            resource,
+            owner,
+            dependencies,
+        } = self;
+        let dependency = |argument: PrefixArgumentDependency| PrefixDependency {
+            path: argument
+                .scope
+                .path(ReferencePath::Binding(argument.name))
+                .to_dot_string(),
+            through: argument.through.map(|name| {
+                argument
+                    .scope
+                    .path(ReferencePath::Binding(name))
+                    .to_dot_string()
+            }),
+            kind: PrefixDependencyKind::UnresolvedReference,
+        };
+        DeferredPrefixFinding {
+            resource,
+            owner,
+            prefix: keys.prefix,
+            base: keys.base,
+            dependencies: Box::new(DeferredPrefixDependencies {
+                first: dependency(dependencies.first),
+                rest: dependencies.rest.into_iter().map(dependency).collect(),
+            }),
+        }
+    }
+}
+
 /// Authority to suppress a companion's required/unknown checks. A deferred
-/// companion IS its finding; only an unexpanded template stores bare keys.
+/// companion IS its finding; an unexpanded template retains the typed evidence
+/// needed to publish it if a Live boundary has no caller to bind its arguments.
 /// Its private representation prevents constructing suppression separately
 /// from the replacement finding.
 ///
@@ -141,7 +210,16 @@ impl AwaitingPrefixArguments {
 ///     PrefixObligations { deferred: Vec::new(), arguments: Default::default() }
 /// }
 /// ```
+/// A Live consumer cannot extract deferred findings while dropping argument obligations:
+/// ```compile_fail,E0599
+/// use carina_core::identifier::{DeferredPrefixFinding, PrefixObligations};
+/// fn drop_arguments(prefixes: PrefixObligations) -> Vec<DeferredPrefixFinding> {
+///     let (deferred, _arguments) = prefixes.into_parts();
+///     deferred
+/// }
+/// ```
 #[derive(Debug, Clone, Default, PartialEq)]
+#[must_use]
 pub struct PrefixObligations {
     deferred: Vec<DeferredPrefixFinding>,
     arguments: AwaitingPrefixArguments,
@@ -153,7 +231,7 @@ impl PrefixObligations {
                 .arguments
                 .0
                 .iter()
-                .any(|obligation| obligation.prefix == name)
+                .any(|obligation| obligation.keys.prefix == name)
     }
     pub(crate) fn awaits_base(&self, name: &str) -> bool {
         self.deferred.iter().any(|finding| finding.base == name)
@@ -161,18 +239,31 @@ impl PrefixObligations {
                 .arguments
                 .0
                 .iter()
-                .any(|obligation| obligation.base == name)
+                .any(|obligation| obligation.keys.base == name)
     }
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.deferred.is_empty() && self.arguments.is_empty()
     }
+    #[cfg(test)]
     pub(crate) fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
         &self.deferred
     }
-    /// Extraction exposes both publication-ready findings and unpublishable
-    /// template obligations. There is no value-only or rejection-only exit.
-    pub fn into_parts(self) -> (Vec<DeferredPrefixFinding>, AwaitingPrefixArguments) {
-        (self.deferred, self.arguments)
+    /// At a Live boundary, no caller remains to bind a formal argument. Every
+    /// suppression obligation becomes a finding; there is no argument-only exit.
+    pub fn into_live_findings(self) -> Vec<DeferredPrefixFinding> {
+        let Self {
+            deferred,
+            arguments,
+        } = self;
+        deferred
+            .into_iter()
+            .chain(
+                arguments
+                    .0
+                    .into_iter()
+                    .map(AwaitingPrefixArgument::into_live_finding),
+            )
+            .collect()
     }
     pub(crate) fn admit<T>(self, value: T) -> PrefixAdmitted<T> {
         PrefixAdmitted {
@@ -233,8 +324,17 @@ impl PrefixJudgements {
                         source,
                     ));
             }
-            RecognizedPrefixDependencies::AwaitingArguments => {
-                self.findings.companions.arguments.0.push(obligation);
+            RecognizedPrefixDependencies::AwaitingArguments(dependencies) => {
+                self.findings
+                    .companions
+                    .arguments
+                    .0
+                    .push(AwaitingPrefixArgument {
+                        owner: prefix_finding_owner(&obligation.prefix, source),
+                        resource: source.id.clone(),
+                        keys: obligation,
+                        dependencies,
+                    });
             }
         }
     }
@@ -1598,18 +1698,24 @@ fn deferred_companion_finding<P: PlaceholderKind, B: BindingAddress>(
     source: &PrefixSource<'_, P, B>,
 ) -> DeferredPrefixFinding {
     let authored = prefix_companion_attribute(&base);
-    let owner = crate::finding::FindingOwner::Declaration {
-        authored: source
-            .declaration
-            .and_then(|declaration| declaration.attribute_key_finding_location(&authored)),
-        module_call: None,
-    };
     DeferredPrefixFinding {
         resource: source.id.clone(),
-        owner,
+        owner: prefix_finding_owner(&authored, source),
         prefix: authored,
         base,
         dependencies: Box::new(dependencies),
+    }
+}
+
+fn prefix_finding_owner<P: PlaceholderKind, B: BindingAddress>(
+    authored: &str,
+    source: &PrefixSource<'_, P, B>,
+) -> crate::finding::FindingOwner {
+    crate::finding::FindingOwner::Declaration {
+        authored: source
+            .declaration
+            .and_then(|declaration| declaration.attribute_key_finding_location(authored)),
+        module_call: None,
     }
 }
 
@@ -1617,7 +1723,7 @@ enum RecognizedPrefixDependencies {
     Named(DeferredPrefixDependencies),
     /// A template's value is not available until module expansion. The same
     /// obligation suppresses only companion/base admission and admits siblings.
-    AwaitingArguments,
+    AwaitingArguments(PrefixArgumentDependencies),
 }
 
 enum DependencyRecognition {
@@ -1644,8 +1750,8 @@ struct PrefixDependencies<'s, 'a, V: PlaceholderKind, B: BindingAddress> {
     actual: Vec<crate::resource::ScopedResourceOrigin<B>>,
     // Each authored occurrence has its owner before full-key de-duplication.
     named: Vec<NamedPrefixDependency<B>>,
-    unbound_arguments: Vec<crate::resource::RelativeBindingName>,
-    awaiting: bool,
+    unbound_arguments: Vec<(RelativeBindingName, DiagnosticScope)>,
+    arguments: Vec<PrefixArgumentDependency>,
     visiting: Vec<B>,
     allow_unprojected: bool,
     attributed: Vec<DependencyKey<AccessPath<B>>>,
@@ -1907,12 +2013,12 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
     }
 
     fn binding(&mut self, binding: &B, through: Option<&B>, scope: DiagnosticScope) {
-        if self
+        if let Some((name, local)) = self
             .unbound_arguments
             .iter()
-            .any(|name| binding.as_str() == name.as_str())
+            .find(|(name, _scope)| binding.as_str() == name.as_str())
         {
-            self.awaiting = true;
+            self.argument(name.clone(), through, protected_scope(scope, *local));
             return;
         }
         if self.visiting.contains(binding) {
@@ -1943,6 +2049,19 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
         self.visiting.pop();
     }
 
+    fn argument(&mut self, name: RelativeBindingName, through: Option<&B>, scope: DiagnosticScope) {
+        let dependency = PrefixArgumentDependency {
+            name,
+            through: through
+                .and_then(|binding| self.source.expressions.authored_binding_name(binding))
+                .cloned(),
+            scope,
+        };
+        if !self.arguments.contains(&dependency) {
+            self.arguments.push(dependency);
+        }
+    }
+
     fn binding_value<P: PlaceholderKind>(
         &mut self,
         value: &Value<P, B>,
@@ -1970,6 +2089,13 @@ impl<V: PlaceholderKind, B: BindingAddress> PrefixDependencies<'_, '_, V, B> {
             self.push(DependencyIdentity::Resource(key), through, path, alias);
         });
         value.visit_placeholders(&mut |placeholder, local| {
+            if let Some(name) = placeholder.module_argument_name() {
+                self.argument(
+                    RelativeBindingName::new(name),
+                    through,
+                    protected_scope(scope, local),
+                );
+            }
             if let Some(slot) = placeholder.loop_slot() {
                 self.loop_variable(slot, protected_scope(scope, local), through);
             }
@@ -2010,7 +2136,7 @@ fn deferred_prefix_dependencies<P: PlaceholderKind, V: PlaceholderKind, B: Bindi
     let mut loops = Vec::new();
     value.visit_placeholders(&mut |placeholder, scope| {
         if let Some(name) = placeholder.module_argument_name() {
-            unbound_arguments.push(crate::resource::RelativeBindingName::new(name));
+            unbound_arguments.push((RelativeBindingName::new(name), scope));
         }
         if let Some(slot) = placeholder.loop_slot() {
             loops.push((slot, scope));
@@ -2029,7 +2155,7 @@ fn deferred_prefix_dependencies<P: PlaceholderKind, V: PlaceholderKind, B: Bindi
         actual,
         named: Vec::new(),
         attributed: Vec::new(),
-        awaiting: !unbound_arguments.is_empty(),
+        arguments: Vec::new(),
         unbound_arguments,
         visiting: Vec::new(),
         allow_unprojected,
@@ -2074,6 +2200,17 @@ fn deferred_prefix_dependencies<P: PlaceholderKind, V: PlaceholderKind, B: Bindi
             dependencies.push(key, None, reference.diagnostic_path().to_dot_string(), None);
         }
     }
+    // Programmatic projections may have no retained expression. The value's
+    // typed placeholders still supply every unbound formal dependency.
+    for (name, scope) in dependencies.unbound_arguments.clone() {
+        if !dependencies
+            .arguments
+            .iter()
+            .any(|argument| argument.name == name)
+        {
+            dependencies.argument(name, None, scope);
+        }
+    }
     let mut named = dependencies.named.into_iter();
     if let Some(first) = named.next() {
         DependencyRecognition::Companion(RecognizedPrefixDependencies::Named(
@@ -2082,10 +2219,17 @@ fn deferred_prefix_dependencies<P: PlaceholderKind, V: PlaceholderKind, B: Bindi
                 rest: named.map(|named| named.dependency).collect(),
             },
         ))
-    } else if dependencies.awaiting {
-        DependencyRecognition::Companion(RecognizedPrefixDependencies::AwaitingArguments)
     } else {
-        DependencyRecognition::Absent
+        let mut arguments = dependencies.arguments.into_iter();
+        match arguments.next() {
+            Some(first) => DependencyRecognition::Companion(
+                RecognizedPrefixDependencies::AwaitingArguments(PrefixArgumentDependencies {
+                    first,
+                    rest: arguments.collect(),
+                }),
+            ),
+            None => DependencyRecognition::Absent,
+        }
     }
 }
 
@@ -2141,6 +2285,20 @@ mod tests {
                 .unwrap(),
         );
         schemas
+    }
+
+    #[test]
+    fn r7b_resolve_attr_prefixes_rejects_unbound_formal_arguments() {
+        let mut parsed = crate::parser::parse_and_resolve(
+            "arguments { prefix: String }\nmock.Sink { name_prefix = prefix }\n",
+        )
+        .unwrap();
+        let error = super::super::resolve_attr_prefixes(&mut parsed, &schemas())
+            .expect_err("a Live entry point cannot accept an unbound prefix");
+        assert_eq!(
+            error,
+            "mock.Sink.<pending>: 'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        );
     }
 
     #[test]
@@ -2208,9 +2366,8 @@ mod tests {
                     0,
                     "only the companion/base checks wait"
                 );
-                let (findings, templates) = prefixes.into_parts();
+                let findings = prefixes.into_live_findings();
                 assert_eq!(findings, canonical.deferred_findings());
-                assert!(templates.is_empty());
             }
         });
     }
@@ -2243,9 +2400,7 @@ mod tests {
                 let (_owner, result) = step.into_parts();
                 let (ordinary, prefixes) = result.unwrap().unwrap().into_parts();
                 assert_eq!(ordinary.errors().count(), 0);
-                let (deferred, templates) = prefixes.into_parts();
-                assert!(templates.is_empty());
-                findings.extend(deferred);
+                findings.extend(prefixes.into_live_findings());
             }
             assert_eq!(findings, canonical.deferred_findings());
         });
@@ -2266,9 +2421,14 @@ mod tests {
         assert!(values.awaiting.awaits_base("name"));
         assert!(values.awaiting.awaits_prefix("name_prefix"));
         let (_values, prefixes) = values.into_parts();
-        let (findings, templates) = prefixes.into_parts();
-        assert!(findings.is_empty());
-        assert!(!templates.is_empty());
+        assert!(prefixes.deferred_findings().is_empty());
+        assert!(!prefixes.is_empty());
+        let findings = prefixes.into_live_findings();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].diagnostic_message(),
+            "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
+        );
     }
 
     #[test]
@@ -2334,9 +2494,17 @@ mod tests {
         )
         .unwrap();
         let errors = super::super::resolve_attr_prefix_findings(&mut file, &schemas());
+        assert!(errors.rejections().is_empty());
         assert!(
-            errors.is_empty(),
-            "unbound argument is an obligation, not an error: {errors:?}"
+            errors.deferred_findings().is_empty(),
+            "a template does not publish formal dependencies before Live: {errors:?}"
+        );
+        assert!(!errors.is_empty(), "the report must retain its obligation");
+        let findings = errors.into_live_findings();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].diagnostic_message(),
+            "'name_prefix' must be known at plan time to generate 'name', but it depends on 'prefix', which is not resolved when names are generated"
         );
     }
 

@@ -108,15 +108,11 @@ pub fn admit_resource_attribute_report<
     ) {
         Ok(values) => values,
         Err(errors) => {
-            let (rejections, companions) = errors.into_parts();
-            let (deferred, _unexpanded_arguments) = companions.into_parts();
             return crate::schema::ResourceValueValidation::from_errors(
-                rejections
+                errors
+                    .into_live_findings()
                     .into_iter()
-                    .map(|error| crate::schema::TypeError::AttributePrefix(Box::new(error.into())))
-                    .chain(deferred.into_iter().map(|finding| {
-                        crate::schema::TypeError::AttributePrefix(Box::new(finding.into()))
-                    }))
+                    .map(|error| crate::schema::TypeError::AttributePrefix(Box::new(error)))
                     .collect(),
             );
         }
@@ -134,9 +130,9 @@ pub fn admit_resource_attribute_report<
         >(schema, &id, &attributes, &quoted, session)
     });
     let (mut report, companions) = admitted.into_parts();
-    let (deferred, _unexpanded_arguments) = companions.into_parts();
     report.append_values(crate::schema::ResourceValueValidation::from_errors(
-        deferred
+        companions
+            .into_live_findings()
             .into_iter()
             .map(|finding| crate::schema::TypeError::AttributePrefix(Box::new(finding.into())))
             .collect(),

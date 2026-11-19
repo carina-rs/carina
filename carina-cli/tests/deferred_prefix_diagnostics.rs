@@ -1458,3 +1458,6 @@ async fn option_c_parenthesized_argument_is_declaration_owned() {
     )
     .await;
 }
+
+#[path = "deferred_prefix_diagnostics/r7b.rs"]
+mod r7b;

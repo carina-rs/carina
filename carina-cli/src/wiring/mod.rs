@@ -3869,15 +3869,9 @@ pub fn resolve_attr_prefixes_with_ctx<
 ) -> Vec<AppError> {
     let findings = identifier::resolve_attr_prefix_findings(file, ctx.schemas());
     findings
-        .rejections()
-        .iter()
-        .map(|error| AppError::AttributePrefix(Box::new(error.into())))
-        .chain(
-            findings
-                .deferred_findings()
-                .iter()
-                .map(|error| AppError::AttributePrefix(Box::new(error.into()))),
-        )
+        .into_live_findings()
+        .into_iter()
+        .map(|error| AppError::AttributePrefix(Box::new(error)))
         .collect()
 }
 
