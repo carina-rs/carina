@@ -1,7 +1,7 @@
 use super::*;
 use crate::resource::{AccessMissPolicy, ForLoopElement, Resource};
 use crate::secrecy::{
-    ChildEvidenceInsertError, ChildSecrecy, TemplateAdmissionError, TemplateEvidenceMismatch,
+    ChildEvidenceInsertError, ChildSecrecyRead, TemplateAdmissionError, TemplateEvidenceMismatch,
     TemplateEvidenceUnavailable, TemplateSecrecy,
 };
 
@@ -57,8 +57,13 @@ fn issue_4516_deferred_for_child_rows_keep_element_identity() {
                 .iter()
                 .find(|child| child.id.identity_str() == Some(address.as_str()))
                 .unwrap();
-            let Some(ChildSecrecy::Row(row)) = child.child_secrecy() else {
-                panic!("admitted child's row");
+            let row = match child.child_secrecy() {
+                ChildSecrecyRead::Row(row) => row,
+                unexpected @ (ChildSecrecyRead::NotLoopChild
+                | ChildSecrecyRead::Unavailable(_)
+                | ChildSecrecyRead::RowMismatch) => {
+                    panic!("expected admitted child's row, got {unexpected:?}")
+                }
             };
             assert_eq!(child.id.identity_str(), Some(address.as_str()));
             assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Secret));
@@ -85,12 +90,17 @@ fn issue_4516_deferred_for_pending_directory_carries_unavailable() {
         TemplateSecrecy::Unavailable(TemplateEvidenceUnavailable::ConfigurationNotAdmitted)
     ));
     for child in children(template, list(&["a", "b"]), &context) {
-        assert!(matches!(
-            child.child_secrecy(),
-            Some(ChildSecrecy::Unavailable(
+        match child.child_secrecy() {
+            ChildSecrecyRead::Unavailable(reason) => assert_eq!(
+                reason,
                 TemplateEvidenceUnavailable::ConfigurationNotAdmitted
-            ))
-        ));
+            ),
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Row(_)
+            | ChildSecrecyRead::RowMismatch) => {
+                panic!("expected unavailable child evidence, got {unexpected:?}")
+            }
+        }
     }
     expand(&mut file, list(&["a", "b"]), &context);
     assert!(file.deferred_for_expressions().is_empty());
@@ -107,12 +117,17 @@ fn issue_4516_deferred_for_without_admission_still_expands() {
         TemplateSecrecy::Unavailable(TemplateEvidenceUnavailable::ConfigurationNotAdmitted)
     ));
     for child in children(template, list(&["a", "b"]), &context) {
-        assert!(matches!(
-            child.child_secrecy(),
-            Some(ChildSecrecy::Unavailable(
+        match child.child_secrecy() {
+            ChildSecrecyRead::Unavailable(reason) => assert_eq!(
+                reason,
                 TemplateEvidenceUnavailable::ConfigurationNotAdmitted
-            ))
-        ));
+            ),
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Row(_)
+            | ChildSecrecyRead::RowMismatch) => {
+                panic!("expected unavailable child evidence, got {unexpected:?}")
+            }
+        }
     }
     expand(&mut file, list(&["a", "b"]), &context);
     assert_eq!(file.resources.len(), 3);
@@ -179,7 +194,14 @@ fn issue_4516_insert_child_rejects_resource_not_produced_by_deferred_for() {
         directory("let ordinary = mock.test.Resource { comment = 'public' }\n");
     let file = resolved(file, &schemas, &context);
     let resource = file.resources.first().unwrap();
-    assert!(resource.child_secrecy().is_none());
+    match resource.child_secrecy() {
+        ChildSecrecyRead::NotLoopChild => {}
+        unexpected @ (ChildSecrecyRead::Row(_)
+        | ChildSecrecyRead::Unavailable(_)
+        | ChildSecrecyRead::RowMismatch) => {
+            panic!("expected a static resource, got {unexpected:?}")
+        }
+    }
     let mut graph = graph(&file).clone();
     let error = graph.insert_child(resource).unwrap_err();
     assert_eq!(error, ChildEvidenceInsertError::NotDeferredChild);
@@ -259,12 +281,17 @@ fn issue_4516_without_authored_inputs_keeps_templates_unavailable_and_reader_pen
             .identity_str()
             .is_some_and(|id| id.starts_with("children["))
     }) {
-        assert!(matches!(
-            child.child_secrecy(),
-            Some(ChildSecrecy::Unavailable(
+        match child.child_secrecy() {
+            ChildSecrecyRead::Unavailable(reason) => assert_eq!(
+                reason,
                 TemplateEvidenceUnavailable::ConfigurationNotAdmitted
-            ))
-        ));
+            ),
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Row(_)
+            | ChildSecrecyRead::RowMismatch) => {
+                panic!("expected unavailable child evidence, got {unexpected:?}")
+            }
+        }
     }
 }
 
@@ -276,10 +303,17 @@ fn issue_4516_child_row_rejects_transplanted_authored_slots() {
     let mut other = Resource::with_provider("mock", "test.Resource", "other", None);
     other.authored_slots = child.authored_slots.clone();
     let mut graph = graph(&file).clone();
-    let observed = (other.child_secrecy().is_none(), graph.insert_child(&other));
+    match other.child_secrecy() {
+        ChildSecrecyRead::RowMismatch => {}
+        unexpected @ (ChildSecrecyRead::NotLoopChild
+        | ChildSecrecyRead::Row(_)
+        | ChildSecrecyRead::Unavailable(_)) => {
+            panic!("expected transplanted row mismatch, got {unexpected:?}")
+        }
+    }
     assert_eq!(
-        observed,
-        (true, Err(ChildEvidenceInsertError::ChildDeclaration))
+        graph.insert_child(&other),
+        Err(ChildEvidenceInsertError::ChildDeclaration)
     );
     assert!(graph.attributes(&other.id).is_none());
 }
@@ -291,10 +325,17 @@ fn issue_4516_child_row_rejects_mutated_provider() {
     let mut child = children(&file.deferred_for_expressions()[0], list(&["a"]), &context).remove(0);
     child.id.provider = "foreign".into();
     let mut graph = graph(&file).clone();
-    let observed = (child.child_secrecy().is_none(), graph.insert_child(&child));
+    match child.child_secrecy() {
+        ChildSecrecyRead::RowMismatch => {}
+        unexpected @ (ChildSecrecyRead::NotLoopChild
+        | ChildSecrecyRead::Row(_)
+        | ChildSecrecyRead::Unavailable(_)) => {
+            panic!("expected provider row mismatch, got {unexpected:?}")
+        }
+    }
     assert_eq!(
-        observed,
-        (true, Err(ChildEvidenceInsertError::ChildDeclaration))
+        graph.insert_child(&child),
+        Err(ChildEvidenceInsertError::ChildDeclaration)
     );
     assert!(graph.attributes(&child.id).is_none());
 }
@@ -317,10 +358,18 @@ fn issue_4516_child_row_rejects_mutated_provider_instance_type_and_element() {
             _ => unreachable!(),
         }
         let mut graph = graph(&file).clone();
+        match child.child_secrecy() {
+            ChildSecrecyRead::RowMismatch => {}
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Row(_)
+            | ChildSecrecyRead::Unavailable(_)) => {
+                panic!("{mutation}: expected row mismatch, got {unexpected:?}")
+            }
+        }
         assert_eq!(
-            (child.child_secrecy().is_none(), graph.insert_child(&child)),
-            (true, Err(ChildEvidenceInsertError::ChildDeclaration)),
-            "{mutation}",
+            graph.insert_child(&child),
+            Err(ChildEvidenceInsertError::ChildDeclaration),
+            "{mutation}"
         );
     }
 }
@@ -346,9 +395,17 @@ fn issue_4516_child_row_rejects_anonymous_element_after_identifier_computation()
     children[1].authored_slots = children[0].authored_slots.clone();
     let child = &children[1];
     let mut graph = graph(&file).clone();
+    match child.child_secrecy() {
+        ChildSecrecyRead::RowMismatch => {}
+        unexpected @ (ChildSecrecyRead::NotLoopChild
+        | ChildSecrecyRead::Row(_)
+        | ChildSecrecyRead::Unavailable(_)) => {
+            panic!("expected anonymous row mismatch, got {unexpected:?}")
+        }
+    }
     assert_eq!(
-        (child.child_secrecy().is_none(), graph.insert_child(child)),
-        (true, Err(ChildEvidenceInsertError::ChildDeclaration)),
+        graph.insert_child(child),
+        Err(ChildEvidenceInsertError::ChildDeclaration)
     );
 }
 
@@ -379,8 +436,13 @@ async fn issue_4516_deferred_for_normalization_retains_checked_child() {
         .await
         .unwrap();
         let child = normalized.as_resource();
-        let Some(ChildSecrecy::Row(row)) = child.child_secrecy() else {
-            panic!("normalization must retain the checked child's row");
+        let row = match child.child_secrecy() {
+            ChildSecrecyRead::Row(row) => row,
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Unavailable(_)
+            | ChildSecrecyRead::RowMismatch) => {
+                panic!("normalization must retain the checked child's row, got {unexpected:?}")
+            }
         };
         assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Secret));
         graph(&file).clone().insert_child(child).unwrap();
@@ -470,7 +532,14 @@ fn issue_4516_static_resource_has_no_child_judgement() {
     let file = resolved(file, &schemas, &context);
     assert!(file.deferred_for_expressions().is_empty());
     for resource in &file.resources {
-        assert!(resource.child_secrecy().is_none());
+        match resource.child_secrecy() {
+            ChildSecrecyRead::NotLoopChild => {}
+            unexpected @ (ChildSecrecyRead::Row(_)
+            | ChildSecrecyRead::Unavailable(_)
+            | ChildSecrecyRead::RowMismatch) => {
+                panic!("expected a static resource, got {unexpected:?}")
+            }
+        }
     }
 }
 
@@ -493,7 +562,14 @@ fn issue_4516_static_for_child_has_no_child_judgement() {
         .collect::<Vec<_>>();
     assert_eq!(children.len(), 2);
     for child in children {
-        assert!(child.child_secrecy().is_none());
+        match child.child_secrecy() {
+            ChildSecrecyRead::NotLoopChild => {}
+            unexpected @ (ChildSecrecyRead::Row(_)
+            | ChildSecrecyRead::Unavailable(_)
+            | ChildSecrecyRead::RowMismatch) => panic!(
+                "expected an eagerly expanded child without a deferred judgement, got {unexpected:?}"
+            ),
+        }
     }
 }
 
@@ -507,8 +583,22 @@ fn issue_4516_deferred_child_has_judgement_and_reinstance_clears_it() {
         .iter()
         .find(|resource| resource.id.identity_str() == Some("children[0]"))
         .unwrap();
-    assert!(matches!(child.child_secrecy(), Some(ChildSecrecy::Row(_))));
-    assert!(child.instantiate().child_secrecy().is_none());
+    match child.child_secrecy() {
+        ChildSecrecyRead::Row(_) => {}
+        unexpected @ (ChildSecrecyRead::NotLoopChild
+        | ChildSecrecyRead::Unavailable(_)
+        | ChildSecrecyRead::RowMismatch) => {
+            panic!("expected deferred child's row, got {unexpected:?}")
+        }
+    }
+    match child.instantiate().child_secrecy() {
+        ChildSecrecyRead::NotLoopChild => {}
+        unexpected @ (ChildSecrecyRead::Row(_)
+        | ChildSecrecyRead::Unavailable(_)
+        | ChildSecrecyRead::RowMismatch) => {
+            panic!("reinstantiation must clear the child judgement, got {unexpected:?}")
+        }
+    }
 }
 
 #[test]
@@ -567,4 +657,141 @@ fn issue_4516_admitted_file_rejects_deferred_child_without_template_evidence() {
         assert_eq!(file.resources.len(), 1);
         assert_eq!(file.deferred_for_expressions().len(), 1);
     }
+}
+
+fn assert_foreign_template_rejected(entry_point: &str) {
+    let (_directory_a, file_a, schemas_a, context_a) = directory(ROOT_LOOP);
+    let file_a = resolved(file_a, &schemas_a, &context_a);
+    let (_directory_b, file_b, schemas_b, context_b) = directory(ROOT_LOOP);
+    let mut file_b = resolved(file_b, &schemas_b, &context_b);
+    assert!(matches!(
+        file_a.deferred_for_expressions()[0].secrecy(),
+        TemplateSecrecy::Derived(_)
+    ));
+    match entry_point {
+        "append_finalized" => {
+            file_b.take_deferred_for_expressions();
+            file_b
+                .deferred_for_expressions_mut()
+                .append_finalized(file_a.into_deferred_for_expressions());
+        }
+        "replace_deferred_for_expressions" => {
+            file_b.replace_deferred_for_expressions(file_a.into_deferred_for_expressions());
+        }
+        "deferred_for_expressions_mut" => {
+            *file_b
+                .deferred_for_expressions_mut()
+                .iter_mut()
+                .next()
+                .unwrap() = file_a.deferred_for_expressions()[0].clone();
+        }
+        _ => unreachable!(),
+    }
+    let before = file_b.clone();
+    // Unresolved loop-slot values deliberately compare unequal. Compare the
+    // structural representation and check the retained capability separately.
+    let template_before = format!("{:?}", file_b.deferred_for_expressions()[0]);
+    let bindings = crate::binding_index::IterableBindings::from_upstream_only(
+        crate::upstream_exports::remote_bindings_for_test(HashMap::from([(
+            "upstream".into(),
+            HashMap::from([("items".into(), list(&["a", "b"]))]),
+        )])),
+    );
+    let error = crate::validation::deferred_types::with_session_for_test(&context_b, |session| {
+        file_b.expand_deferred_for_expressions(&bindings, session)
+    })
+    .expect_err("a template from another admission must not supply this graph's child evidence");
+    let template_id = before.deferred_for_expressions()[0].template_resource_id();
+    assert!(matches!(
+        &error,
+        crate::parser::DeferredForExpansionError::ChildSecrecy(
+            ChildEvidenceInsertError::ForeignTemplate { template }
+        ) if template == template_id
+    ));
+    assert_eq!(
+        error.to_string(),
+        format!("deferred child secrecy belongs to foreign template `{template_id}`")
+    );
+    assert_eq!(file_b.resources, before.resources);
+    assert_eq!(file_b.warnings, before.warnings);
+    assert_eq!(
+        file_b.deferred_for_expressions().len(),
+        before.deferred_for_expressions().len()
+    );
+    assert_eq!(
+        format!("{:?}", file_b.deferred_for_expressions()[0]),
+        template_before
+    );
+    assert!(matches!(
+        (
+            file_b.deferred_for_expressions()[0].secrecy(),
+            before.deferred_for_expressions()[0].secrecy()
+        ),
+        (TemplateSecrecy::Derived(after), TemplateSecrecy::Derived(before))
+            if std::sync::Arc::ptr_eq(after, before)
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        file_b.authored_inputs.as_ref().unwrap(),
+        before.authored_inputs.as_ref().unwrap()
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &graph(&file_b).rows,
+        &graph(&before).rows
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &graph(&file_b).templates,
+        &graph(&before).templates
+    ));
+}
+
+#[test]
+fn issue_4516_foreign_template_via_append_finalized_is_rejected() {
+    assert_foreign_template_rejected("append_finalized");
+}
+
+#[test]
+fn issue_4516_foreign_template_via_replace_is_rejected() {
+    assert_foreign_template_rejected("replace_deferred_for_expressions");
+}
+
+#[test]
+fn issue_4516_foreign_template_via_mutation_is_rejected() {
+    assert_foreign_template_rejected("deferred_for_expressions_mut");
+}
+
+#[test]
+fn issue_4516_own_template_expands_with_cloned_graph() {
+    let (_directory, file, schemas, context) = directory(ROOT_LOOP);
+    let file = resolved(file, &schemas, &context);
+    let before = graph(&file).clone();
+    let mut expanded = file.clone();
+    expand(&mut expanded, list(&["a", "b"]), &context);
+    assert!(expanded.deferred_for_expressions().is_empty());
+    assert_child_row(&expanded, "children[0]");
+    assert_child_row(&expanded, "children[1]");
+    assert!(std::sync::Arc::ptr_eq(&before.rows, &graph(&file).rows));
+    assert!(!std::sync::Arc::ptr_eq(
+        &before.rows,
+        &graph(&expanded).rows
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &before.templates,
+        &graph(&expanded).templates
+    ));
+}
+
+#[test]
+fn issue_4516_foreign_template_evidence_cannot_replace_derived_evidence() {
+    let (_directory, file, schemas, context) = directory(ROOT_LOOP);
+    let file = resolved(file, &schemas, &context);
+    let mut template = file.deferred_for_expressions()[0].clone();
+    let TemplateSecrecy::Derived(evidence) = template.secrecy() else {
+        panic!("admitted template must carry evidence");
+    };
+    // Equal slots and equal evidence are insufficient: admission owns the Arc.
+    template.attach_template_evidence(std::sync::Arc::new(evidence.as_ref().clone()));
+    assert!(matches!(
+        graph(&file).template_evidence(&template),
+        Err(TemplateAdmissionError::MissingTemplateEvidence { .. })
+    ));
 }

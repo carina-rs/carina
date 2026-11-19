@@ -9317,18 +9317,29 @@ impl<P: ValueKind, B: BindingAddress> Resource<ModuleSource, P, B> {
 }
 
 impl<S, P: ValueKind, B: BindingAddress, D> Resource<S, P, B, D> {
-    /// The hand-over attached when this resource was produced by deferred-for
-    /// expansion. It stays with the resource through identity computation and
-    /// effect materialization. It is in-memory only (`#[serde(skip)]`): a resource
-    /// decoded from a saved plan reads `None`. `None` means no checked
-    /// deferred-for judgement is carried.
-    pub fn child_secrecy(&self) -> Option<&crate::secrecy::ChildSecrecy> {
-        self.authored_slots
-            .child_secrecy()
-            .filter(|secrecy| match secrecy {
-                crate::secrecy::ChildSecrecy::Row(row) => row.matches_resource(self),
-                crate::secrecy::ChildSecrecy::Unavailable(_) => true,
-            })
+    /// The only secrecy reader for anonymous and executor-produced deferred-for
+    /// children. The hand-over survives identity computation and effect
+    /// materialization; an attached row that no longer matches reads
+    /// `ChildSecrecyRead::RowMismatch`.
+    ///
+    /// A child expanded from a decoded saved-plan template reads
+    /// `ChildSecrecyRead::Unavailable(TemplateEvidenceUnavailable::SavedPlan)`.
+    /// Authored metadata is in-memory only (`#[serde(skip)]`), so decoding a
+    /// resource directly instead reads `ChildSecrecyRead::NotLoopChild`.
+    /// The shape of the unavailable case is provisional until carina#4442.
+    pub fn child_secrecy(&self) -> crate::secrecy::ChildSecrecyRead<'_> {
+        use crate::secrecy::{ChildSecrecy, ChildSecrecyRead};
+        match self.authored_slots.child_secrecy() {
+            Some(ChildSecrecy::Row(row)) => {
+                if row.matches_resource(self) {
+                    ChildSecrecyRead::Row(row)
+                } else {
+                    ChildSecrecyRead::RowMismatch
+                }
+            }
+            Some(ChildSecrecy::Unavailable(reason)) => ChildSecrecyRead::Unavailable(*reason),
+            None => ChildSecrecyRead::NotLoopChild,
+        }
     }
 }
 

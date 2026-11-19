@@ -1,11 +1,12 @@
 use super::*;
 
-mod deferred_children;
 use crate::parser::ProviderContext;
 use crate::schema::{
     PatternAttributeSchema as Attribute, PatternAttributeType as Type,
     PatternResourceSchema as Schema,
 };
+
+mod deferred_children;
 
 fn context() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())

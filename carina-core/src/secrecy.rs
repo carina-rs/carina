@@ -354,10 +354,13 @@ impl Default for TemplateSecrecy {
 }
 
 /// A checked child's payload-free row. There is no public constructor; its
-/// attributes always come from template evidence.
+/// attributes always come from template evidence. It retains the exact template
+/// capability so the owning graph can check pointer identity before insertion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildRow {
     row: Row,
+    template: ResourceId,
+    template_evidence: Arc<TemplateEvidence>,
     provider: String,
     provider_instance: Option<String>,
     resource_type: String,
@@ -414,6 +417,21 @@ pub enum ChildSecrecy {
     Unavailable(TemplateEvidenceUnavailable),
 }
 
+/// The deferred-for hand-over checked against the resource carrying it.
+/// Every outcome must be handled explicitly, including an attached row that no
+/// longer matches. The unavailable shape is provisional until carina#4442.
+#[derive(Debug)]
+pub enum ChildSecrecyRead<'a> {
+    /// No deferred-for hand-over is attached to this resource.
+    NotLoopChild,
+    /// The checked row still belongs to this resource and loop element.
+    Row(&'a ChildRow),
+    /// Expansion could not obtain admitted template evidence.
+    Unavailable(TemplateEvidenceUnavailable),
+    /// A row is attached, but it no longer matches this resource.
+    RowMismatch,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum TemplateEvidenceMismatch {
     #[error("secrecy evidence belongs to a different deferred-for template declaration")]
@@ -444,6 +462,8 @@ pub enum ChildEvidenceInsertError {
     Unavailable(TemplateEvidenceUnavailable),
     #[error("deferred child row belongs to a different declaration or expansion instance")]
     ChildDeclaration,
+    #[error("deferred child secrecy belongs to foreign template `{template}`")]
+    ForeignTemplate { template: ResourceId },
 }
 
 impl TemplateEvidence {
@@ -458,7 +478,7 @@ impl TemplateEvidence {
     /// Check descent before copying evidence. Child values are deliberately
     /// never consulted: substitution and provider population cannot mint proof.
     pub(crate) fn instantiate_child<S, D>(
-        &self,
+        self: &Arc<Self>,
         template: &DeferredForExpression<S, NoPlaceholder, LoopSlot, AbsoluteBindingAddress, D>,
         element: &ForLoopElement,
         child: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
@@ -514,6 +534,8 @@ impl TemplateEvidence {
                 instance: child.authored_slots.instance(),
                 ..self.row.clone()
             },
+            template: source.clone(),
+            template_evidence: Arc::clone(self),
             provider: child.id.provider.clone(),
             provider_instance: child.id.provider_instance.clone(),
             resource_type: child.id.resource_type.clone(),
@@ -616,6 +638,12 @@ impl ValidatedSecrecyGraph {
         self.rows.get(resource).map(|row| &row.attributes)
     }
 
+    fn owns_template(&self, template: &ResourceId, evidence: &Arc<TemplateEvidence>) -> bool {
+        self.templates
+            .get(template)
+            .is_some_and(|owned| Arc::ptr_eq(owned, evidence))
+    }
+
     pub(crate) fn template_evidence<
         S,
         P: crate::resource::ValueKind,
@@ -629,7 +657,15 @@ impl ValidatedSecrecyGraph {
         let slots = &template.template_resource().as_resource().authored_slots;
         self.templates
             .get(template.template_resource_id())
-            .filter(|evidence| evidence.matches_slots(slots))
+            .filter(|evidence| {
+                evidence.matches_slots(slots)
+                    && match template.secrecy() {
+                        TemplateSecrecy::Derived(evidence) => {
+                            self.owns_template(template.template_resource_id(), evidence)
+                        }
+                        TemplateSecrecy::Unavailable(_) => true,
+                    }
+            })
             .cloned()
             .ok_or_else(|| TemplateAdmissionError::MissingTemplateEvidence {
                 resource: template.template_resource_id().clone(),
@@ -640,24 +676,29 @@ impl ValidatedSecrecyGraph {
         &mut self,
         child: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
     ) -> Result<(), ChildEvidenceInsertError> {
-        let row = match child.authored_slots.child_secrecy() {
-            Some(ChildSecrecy::Row(row)) => {
-                if !row.matches_resource(child) {
-                    return Err(ChildEvidenceInsertError::ChildDeclaration);
-                }
-                &row.row
+        let row = match child.child_secrecy() {
+            ChildSecrecyRead::Row(row) => row,
+            ChildSecrecyRead::Unavailable(reason) => {
+                return Err(ChildEvidenceInsertError::Unavailable(reason));
             }
-            Some(ChildSecrecy::Unavailable(reason)) => {
-                return Err(ChildEvidenceInsertError::Unavailable(*reason));
+            ChildSecrecyRead::NotLoopChild => {
+                return Err(ChildEvidenceInsertError::NotDeferredChild);
             }
-            None => return Err(ChildEvidenceInsertError::NotDeferredChild),
+            ChildSecrecyRead::RowMismatch => {
+                return Err(ChildEvidenceInsertError::ChildDeclaration);
+            }
         };
+        if !self.owns_template(&row.template, &row.template_evidence) {
+            return Err(ChildEvidenceInsertError::ForeignTemplate {
+                template: row.template.clone(),
+            });
+        }
         if self.rows.contains_key(&child.id) {
             return Err(ChildEvidenceInsertError::DuplicateChild {
                 id: child.id.clone(),
             });
         }
-        Arc::make_mut(&mut self.rows).insert(child.id.clone(), row.clone());
+        Arc::make_mut(&mut self.rows).insert(child.id.clone(), row.row.clone());
         Ok(())
     }
 }

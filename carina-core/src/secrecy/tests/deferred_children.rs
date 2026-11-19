@@ -11,7 +11,7 @@ mod readers;
 
 use crate::parser::{ExpandedDeferredForExpression, ExpandedInferredFile};
 use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
-use crate::secrecy::{ChildSecrecy, Evidence, Secrecy};
+use crate::secrecy::{ChildSecrecyRead, Evidence, Secrecy};
 use std::collections::{BTreeMap, HashMap};
 
 const ROOT_LOOP: &str = r#"
@@ -200,6 +200,16 @@ fn assert_child_row(file: &ExpandedInferredFile, binding: &str) {
     let attributes = graph(file)
         .attributes(&child.id)
         .unwrap_or_else(|| panic!("missing child row for {}", child.id));
+    let row = match child.child_secrecy() {
+        ChildSecrecyRead::Row(row) => row,
+        unexpected @ (ChildSecrecyRead::NotLoopChild
+        | ChildSecrecyRead::Unavailable(_)
+        | ChildSecrecyRead::RowMismatch) => panic!(
+            "expected matching child row for {}, got {unexpected:?}",
+            child.id
+        ),
+    };
+    assert_eq!(attributes, row.attributes());
     assert_eq!(attributes["comment"], Evidence::Leaf(Secrecy::Secret));
     assert_eq!(attributes["name"], Evidence::Leaf(Secrecy::Public));
 }
@@ -335,10 +345,19 @@ fn issue_4516_deferred_for_map_rows_follow_keys_after_removal() {
     let file = resolved(file, &schemas, &context);
     let mut both = file.clone();
     expand(&mut both, map(&["a", "b"]), &context);
+    assert_child_row(&both, "children.a");
     assert_child_row(&both, "children.b");
+    let removed_id = both
+        .resources
+        .iter()
+        .find(|child| child.id.identity_str() == Some("children.a"))
+        .unwrap()
+        .id
+        .clone();
     let mut only_b = file;
     expand(&mut only_b, map(&["b"]), &context);
     assert_child_row(&only_b, "children.b");
+    assert!(graph(&only_b).attributes(&removed_id).is_none());
 }
 
 #[test]
@@ -354,10 +373,19 @@ fn issue_4516_deferred_for_list_rows_follow_indices_after_removal() {
     let file = resolved(file, &schemas, &context);
     let mut both = file.clone();
     expand(&mut both, list(&["a", "b"]), &context);
+    assert_child_row(&both, "children[0]");
     assert_child_row(&both, "children[1]");
+    let old_index_id = both
+        .resources
+        .iter()
+        .find(|child| child.id.identity_str() == Some("children[1]"))
+        .unwrap()
+        .id
+        .clone();
     let mut only_b = file;
     expand(&mut only_b, list(&["b"]), &context);
     assert_child_row(&only_b, "children[0]");
+    assert!(graph(&only_b).attributes(&old_index_id).is_none());
 }
 
 #[test]
@@ -382,8 +410,13 @@ fn issue_4516_anonymous_deferred_children_keep_child_secrecy_after_identifier_co
     assert_eq!(children.len(), 2);
     for child in children {
         assert!(child.id.identity().is_some());
-        let Some(ChildSecrecy::Row(row)) = child.child_secrecy() else {
-            panic!("anonymous identity computation must retain the child's row");
+        let row = match child.child_secrecy() {
+            ChildSecrecyRead::Row(row) => row,
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Unavailable(_)
+            | ChildSecrecyRead::RowMismatch) => panic!(
+                "anonymous identity computation must retain the child's row, got {unexpected:?}"
+            ),
         };
         assert_eq!(row.attributes().len(), 2);
         assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Secret));
@@ -482,6 +515,7 @@ fn assert_anonymous_templates(
     file: ModuleResolvedInferredFile,
     schemas: &SchemaRegistry,
     context: &ProviderContext,
+    expected: [Secrecy; 2],
 ) {
     let report = report(&file, schemas, context);
     let pending = report.is_pending();
@@ -504,6 +538,18 @@ fn assert_anonymous_templates(
     assert_eq!(keys.len(), 2);
     assert!(report.findings().is_empty());
     let mut file = resolve_owner(file, schemas, context).into_file();
+    let expected_by_template = file
+        .deferred_for_expressions()
+        .iter()
+        .zip(expected)
+        .map(|(template, secrecy)| {
+            let slots = &template.template_resource().as_resource().authored_slots;
+            (
+                (slots.declaration_id().unwrap().clone(), slots.instance()),
+                secrecy,
+            )
+        })
+        .collect::<HashMap<_, _>>();
     expand(&mut file, list(&["a", "b"]), context);
     let children = file
         .resources
@@ -512,7 +558,14 @@ fn assert_anonymous_templates(
         .collect::<Vec<_>>();
     let rows = children
         .iter()
-        .filter(|child| matches!(child.child_secrecy(), Some(ChildSecrecy::Row(_))))
+        .filter(|child| match child.child_secrecy() {
+            ChildSecrecyRead::Row(_) => true,
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Unavailable(_)
+            | ChildSecrecyRead::RowMismatch) => {
+                panic!("expected anonymous child's row, got {unexpected:?}")
+            }
+        })
         .count();
     assert!(
         !pending,
@@ -522,10 +575,17 @@ fn assert_anonymous_templates(
     assert_eq!(children.len(), 4);
     assert_eq!(rows, children.len());
     for child in children {
-        let Some(ChildSecrecy::Row(row)) = child.child_secrecy() else {
-            unreachable!()
+        let row = match child.child_secrecy() {
+            ChildSecrecyRead::Row(row) => row,
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Unavailable(_)
+            | ChildSecrecyRead::RowMismatch) => {
+                panic!("expected anonymous child's row, got {unexpected:?}")
+            }
         };
-        assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Secret));
+        let (declaration, instance) = child.authored_slots.instantiation_origin().unwrap();
+        let expected = expected_by_template[&(declaration.clone(), instance)];
+        assert_eq!(row.attributes()["comment"], Evidence::Leaf(expected));
         assert_eq!(graph(&file).attributes(&child.id), Some(row.attributes()));
     }
 }
@@ -533,9 +593,9 @@ fn assert_anonymous_templates(
 #[test]
 fn issue_4516_two_unbound_templates_of_one_type_are_admitted() {
     let (_directory, file, schemas, context) = directory(
-        "for item in upstream.items { mock.test.Child { comment = secret('first') identity_input = item } }\nfor item in upstream.items { mock.test.Child { comment = secret('second') identity_input = item } }\n",
+        "for item in upstream.items { mock.test.Child { comment = secret('first') identity_input = item } }\nfor item in upstream.items { mock.test.Child { comment = 'second' identity_input = item } }\n",
     );
-    assert_anonymous_templates(file, &schemas, &context);
+    assert_anonymous_templates(file, &schemas, &context, [Secrecy::Secret, Secrecy::Public]);
 }
 
 #[test]
@@ -546,5 +606,5 @@ fn issue_4516_unbound_module_template_called_twice_is_admitted() {
             "arguments { items: list(String) }\nfor item in items { mock.test.Child { comment = secret('canary') identity_input = item } }\n",
         ),
     );
-    assert_anonymous_templates(file, &schemas, &context);
+    assert_anonymous_templates(file, &schemas, &context, [Secrecy::Secret, Secrecy::Secret]);
 }

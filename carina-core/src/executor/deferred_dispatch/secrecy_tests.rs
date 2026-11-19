@@ -7,7 +7,7 @@ use crate::schema::{
     PatternResourceSchema as Schema,
 };
 use crate::secrecy::{
-    ChildSecrecy, Evidence, Secrecy, TemplateEvidenceUnavailable, TemplateSecrecy,
+    ChildSecrecyRead, Evidence, Secrecy, TemplateEvidenceUnavailable, TemplateSecrecy,
 };
 use std::collections::{BTreeSet, HashMap};
 
@@ -132,8 +132,13 @@ fn issue_4516_deferred_for_executor_carries_rows_and_saved_plan_unavailability()
                 let Effect::Create(child) = child else {
                     panic!("materialization produces creates");
                 };
-                let Some(ChildSecrecy::Row(row)) = child.child_secrecy() else {
-                    panic!("admitted child must carry a row");
+                let row = match child.child_secrecy() {
+                    ChildSecrecyRead::Row(row) => row,
+                    unexpected @ (ChildSecrecyRead::NotLoopChild
+                    | ChildSecrecyRead::Unavailable(_)
+                    | ChildSecrecyRead::RowMismatch) => {
+                        panic!("admitted child must carry a row, got {unexpected:?}")
+                    }
                 };
                 assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Public));
                 assert_eq!(
@@ -141,17 +146,32 @@ fn issue_4516_deferred_for_executor_carries_rows_and_saved_plan_unavailability()
                     Evidence::Leaf(Secrecy::Public)
                 );
                 assert!(child.id.identity().is_some());
+                let decoded: crate::resource::SavedResource =
+                    serde_json::from_value(serde_json::to_value(child.as_resource()).unwrap())
+                        .unwrap();
+                match decoded.child_secrecy() {
+                    ChildSecrecyRead::NotLoopChild => {}
+                    unexpected @ (ChildSecrecyRead::Row(_)
+                    | ChildSecrecyRead::Unavailable(_)
+                    | ChildSecrecyRead::RowMismatch) => {
+                        panic!("direct resource decode has no child hand-over, got {unexpected:?}")
+                    }
+                }
             }
             for child in &saved_children {
                 let Effect::Create(child) = child else {
                     panic!("materialization produces creates");
                 };
-                assert!(matches!(
-                    child.child_secrecy(),
-                    Some(ChildSecrecy::Unavailable(
-                        TemplateEvidenceUnavailable::SavedPlan
-                    ))
-                ));
+                match child.child_secrecy() {
+                    ChildSecrecyRead::Unavailable(reason) => {
+                        assert_eq!(reason, TemplateEvidenceUnavailable::SavedPlan)
+                    }
+                    unexpected @ (ChildSecrecyRead::NotLoopChild
+                    | ChildSecrecyRead::Row(_)
+                    | ChildSecrecyRead::RowMismatch) => {
+                        panic!("expected SavedPlan unavailability, got {unexpected:?}")
+                    }
+                }
             }
             let (secret_template, secret_dependencies) = graph
                 .compile_deferred_for(file.deferred_for_expressions()[1].clone())
@@ -163,12 +183,18 @@ fn issue_4516_deferred_for_executor_carries_rows_and_saved_plan_unavailability()
                 &identity_inputs,
             )
             .unwrap();
+            assert_eq!(secret_children.len(), 2);
             for child in &secret_children {
                 let Effect::Create(child) = child else {
                     panic!("materialization produces creates");
                 };
-                let Some(ChildSecrecy::Row(row)) = child.child_secrecy() else {
-                    panic!("admitted child must carry a row");
+                let row = match child.child_secrecy() {
+                    ChildSecrecyRead::Row(row) => row,
+                    unexpected @ (ChildSecrecyRead::NotLoopChild
+                    | ChildSecrecyRead::Unavailable(_)
+                    | ChildSecrecyRead::RowMismatch) => {
+                        panic!("admitted child must carry a row, got {unexpected:?}")
+                    }
                 };
                 assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Secret));
             }

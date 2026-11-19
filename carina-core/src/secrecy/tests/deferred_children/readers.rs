@@ -198,6 +198,48 @@ fn assert_reader_protected(
                 matches!(expected, Admitted),
                 "{label}: expected {expected:?} after binding resolution"
             );
+            if matches!(expected, Admitted) && export {
+                let mut file = resolved.into_file();
+                expand(&mut file, list(&["a", "b"]), &context);
+                assert!(file.deferred_for_expressions().is_empty(), "{label}");
+                assert_eq!(
+                    file.resources.len(),
+                    3,
+                    "{label}: two children and unrelated"
+                );
+                let bindings = crate::binding_index::ResolvedBindings::pre_apply_live(
+                    crate::binding_index::LivePreApplyInputs {
+                        managed: &file.resources,
+                        compositions: &file.compositions,
+                        managed_current: &HashMap::new(),
+                        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+                        remote_bindings: &crate::upstream_exports::remote_bindings_for_test(
+                            HashMap::new(),
+                        ),
+                        wait_aliases: &[],
+                    },
+                );
+                let errors =
+                    crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                        crate::validation::check_export_values_for_validation(
+                            &file.export_params,
+                            &bindings,
+                            session,
+                        )
+                        .expect_ordinary_for_test()
+                    })
+                    .expect_err("list child export must be rejected as SecretExport");
+                assert_eq!(errors.len(), 1, "{label}: {errors:?}");
+                assert!(
+                    matches!(errors[0].detail(), ParameterValueFinding::SecretExport { name } if name == "output"),
+                    "{label}: expected SecretExport(output), got {errors:?}"
+                );
+                assert_eq!(
+                    errors[0].detail().to_string(),
+                    "export 'output' cannot hold a secret value",
+                    "{label}"
+                );
+            }
         }
     }
 }
