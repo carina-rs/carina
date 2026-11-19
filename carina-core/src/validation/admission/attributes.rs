@@ -439,7 +439,7 @@ pub(crate) fn admit_validation_attributes<
     );
     *coverage = visits.into_inner();
     ResourceAdmissionOutcome {
-        values: missing.finish(findings, coverage),
+        values: findings.map_value(|findings| missing.finish(findings, coverage)),
         classification_diagnostics,
     }
 }
@@ -456,14 +456,14 @@ pub(crate) fn admit_value_only_attributes<
     values: &crate::identifier::CanonicalAttributeValues<P, B>,
     quoted: &std::collections::HashSet<String>,
     session: &dyn ProviderTypeCheckContext,
-) -> crate::schema::ResourceValueValidation {
+) -> crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation> {
     let mut classification_errors = Vec::new();
     let attributes = crate::resource::knowledge::collect_classified_attributes(
         values.iter().map(|(name, value)| (name.clone(), value)),
         &crate::resource::knowledge::KnowledgeContext::validation(),
         |name, error| classification_errors.push((name.to_owned(), TypeError::from(error))),
     );
-    let mut report = admit_classified_value_only_attributes::<K, P, B>(
+    let report = admit_classified_value_only_attributes::<K, P, B>(
         schema,
         id,
         &attributes,
@@ -471,10 +471,12 @@ pub(crate) fn admit_value_only_attributes<
         session,
         &values.awaiting,
     );
-    for (name, error) in classification_errors {
-        report.push_attribute_error(&name, error);
-    }
-    report
+    report.map_value(|mut report| {
+        for (name, error) in classification_errors {
+            report.push_attribute_error(&name, error);
+        }
+        report
+    })
 }
 
 // Both callers classified a witnessed map, never an arbitrary authored map.
@@ -489,7 +491,7 @@ fn admit_classified_value_only_attributes<
     quoted: &std::collections::HashSet<String>,
     session: &dyn ProviderTypeCheckContext,
     awaiting: &crate::identifier::PrefixObligations,
-) -> crate::schema::ResourceValueValidation {
+) -> crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation> {
     schema
         .schema()
         .as_schema()
@@ -569,7 +571,7 @@ fn admit_validation_attributes_with_input<
     >,
     awaiting: &crate::identifier::PrefixObligations,
     input: ValidationInput<'v, P, B>,
-) -> crate::schema::ResourceValueValidation {
+) -> crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation> {
     let admit_attribute = |name: &str,
                            proof: &crate::resource::knowledge::Classification<'v, P, B>,
                            destination: &Destination<K>| {
@@ -873,7 +875,7 @@ where
                 )
             };
             *coverage = visits.into_inner();
-            missing.finish(findings, coverage)
+            findings.map_value(|findings| missing.finish(findings, coverage))
         });
     ResourceAdmissionOutcome {
         values,
@@ -973,7 +975,7 @@ fn typed_resource_attribute_admissions<
     bindings: &BindingIndex<'_, B>,
     session: &dyn ProviderTypeCheckContext,
     coverage: &std::cell::RefCell<crate::schema::value_validation::WalkCoverage>,
-) -> crate::schema::ResourceValueValidation {
+) -> crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation> {
     use crate::resource::{DeferredValue, ParserPlaceholder};
     let report = inputs.report(parsed.expression_report());
     let attribute_input = |name: &str| {

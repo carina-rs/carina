@@ -16524,13 +16524,16 @@ impl PatternResourceSchema<Compiled> {
         is_string_literal: &dyn Fn(&str) -> bool,
         admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
-        self.validate_admission_report_with_obligations(
-            attributes,
-            entries,
-            is_string_literal,
-            admission,
-            &Default::default(),
-        )
+        let (report, _empty_prefixes) = self
+            .validate_admission_report_with_obligations(
+                attributes,
+                entries,
+                is_string_literal,
+                admission,
+                &Default::default(),
+            )
+            .into_parts();
+        report
     }
 
     pub(crate) fn validate_admission_report_with_obligations<
@@ -16546,7 +16549,7 @@ impl PatternResourceSchema<Compiled> {
         is_string_literal: &dyn Fn(&str) -> bool,
         admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
         awaiting: &crate::identifier::PrefixObligations,
-    ) -> ResourceValueValidation {
+    ) -> crate::identifier::PrefixAdmitted<ResourceValueValidation> {
         let mut report = ResourceValueValidation::default();
 
         // Check required attributes
@@ -16613,7 +16616,7 @@ impl PatternResourceSchema<Compiled> {
             );
         }
 
-        report
+        awaiting.clone().admit(report)
     }
 
     pub(crate) fn validate_resolved_admission_report<

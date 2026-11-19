@@ -76,12 +76,11 @@ fn check_report_selection(reported: bool) {
                     &mut coverage,
                 );
                 assert!(outcome.classification_diagnostics.0.is_empty());
-                outcome
-                    .values
+                let (values, _prefixes_for_test) = outcome.values.into_parts();
+                values
                     .errors()
                     .chain(
-                        outcome
-                            .values
+                        values
                             .symbolic_errors()
                             .map(|(_, _, diagnostic)| diagnostic.error()),
                     )
@@ -235,12 +234,14 @@ fn canonical_lsp_caller_values_remain_open_but_keys_are_witnessed() {
         carina_core::test_utils::load_canonical_buffer_configuration(&parsed, &schemas, &config);
     let tree = configuration.analysis_tree().unwrap();
     let owner = tree.resources().next().unwrap();
-    let values = owner
-        .with_values(&IndexMap::from([(
+    let values = carina_core::test_utils::canonical_caller_values(
+        owner,
+        &IndexMap::from([(
             "input".into(),
             Value::Concrete(ConcreteValue::String("bad".into())),
-        )]))
-        .unwrap();
+        )]),
+    )
+    .unwrap();
     let inputs = ResourceAttributeInputs::from_report(owner, &values, configuration.report());
     let bindings = configuration.parsed().binding_index(&config);
     carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
@@ -258,9 +259,9 @@ fn canonical_lsp_caller_values_remain_open_but_keys_are_witnessed() {
                 configuration.report(),
             );
         let outcome = validation.admit_resource(request);
+        let (values, _prefixes_for_test) = outcome.values.into_parts();
         assert!(
-            outcome
-                .values
+            values
                 .errors()
                 .any(|error| error.to_string().contains("expected Int, got String"))
         );

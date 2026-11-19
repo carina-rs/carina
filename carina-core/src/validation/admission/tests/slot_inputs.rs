@@ -172,7 +172,8 @@ fn review_seam_producer_materialization_keeps_a_real_projection_pairing() {
                 &mut coverage,
             );
             assert!(outcome.classification_diagnostics.0.is_empty());
-            outcome.values
+            let (values, _prefixes_for_test) = outcome.values.into_parts();
+            values
         };
         assert_eq!(findings.errors().count(), 0, "{findings:?}");
         let usage = source.cursor().unwrap();

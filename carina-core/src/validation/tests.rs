@@ -222,15 +222,18 @@ fn missing_authored_root_keeps_the_resource_invariant_and_other_findings() {
                 )
             })
             .collect();
-        let report = schema.as_schema().validate_admission_report(
-            &classified,
-            classified.iter(),
-            &|_| false,
-            &crate::schema::value_validation::AttributeAdmission {
-                known: &|_, _, _| Default::default(),
-                unknown: None,
-            },
-        );
+        let report = schema
+            .as_schema()
+            .validate_admission_report_with_obligations(
+                &classified,
+                classified.iter(),
+                &|_| false,
+                &crate::schema::value_validation::AttributeAdmission {
+                    known: &|_, _, _| Default::default(),
+                    unknown: None,
+                },
+                &Default::default(),
+            );
         admissions.insert((resource.id().clone(), resource.location().clone()), report);
     }
     let judged = loaded.judged();

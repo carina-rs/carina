@@ -10,11 +10,12 @@ pub use diagnostics::{
     legacy_loop_move_target_diagnostics,
 };
 pub use prefix::{
-    CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource, MatchedResourceProjection,
-    ModuleResolvedFileRead, PrefixCanonicalized, PrefixFileRead, ResourceProjection, SuffixSource,
+    AwaitingPrefixArguments, CanonicalAnalysisTree, CanonicalAttributeValues, CanonicalResource,
+    MatchedResourceProjection, ModuleResolvedFileRead, PrefixAdmitted, PrefixCanonicalized,
+    PrefixFileRead, PrefixObligations, ResourceProjection, SuffixSource,
     canonicalize_file_prefixes,
 };
-pub(crate) use prefix::{CanonicalSchemaInputs, CanonicalSchemaResource, PrefixObligations};
+pub(crate) use prefix::{CanonicalSchemaInputs, CanonicalSchemaResource};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) use prefix::canonicalize_fixture_prefix_values;
@@ -1553,35 +1554,51 @@ impl From<&DeferredPrefixFinding> for AttributePrefixFinding {
 pub struct RejectedPrefixValues {
     first: Box<AttributePrefixRejection>,
     rest: Vec<AttributePrefixRejection>,
-    deferred: Vec<DeferredPrefixFinding>,
+    companions: PrefixObligations,
 }
 impl RejectedPrefixValues {
     pub fn rejections(&self) -> impl Iterator<Item = &AttributePrefixRejection> {
         std::iter::once(self.first.as_ref()).chain(&self.rest)
     }
-    pub fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
-        &self.deferred
+    #[cfg(test)]
+    pub(crate) fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
+        self.companions.deferred_findings()
+    }
+    pub fn into_parts(self) -> (Vec<AttributePrefixRejection>, PrefixObligations) {
+        let Self {
+            first,
+            rest,
+            companions,
+        } = self;
+        (std::iter::once(*first).chain(rest).collect(), companions)
     }
 }
 
-/// Recognition has one result with two disjoint diagnostic collections.
+/// Recognition retains rejections and companion obligations together.
+/// Consuming a prefix outcome exposes its deferred/argument side too.
+/// ```compile_fail,E0599
+/// use carina_core::identifier::{AttributePrefixRejection, PrefixFindings};
+/// fn discard_deferred(findings: PrefixFindings) -> Vec<AttributePrefixRejection> {
+///     findings.into_rejections()
+/// }
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct PrefixFindings {
     rejections: Vec<AttributePrefixRejection>,
-    deferred: Vec<DeferredPrefixFinding>,
+    companions: PrefixObligations,
 }
 impl PrefixFindings {
     pub fn rejections(&self) -> &[AttributePrefixRejection] {
         &self.rejections
     }
     pub fn deferred_findings(&self) -> &[DeferredPrefixFinding] {
-        &self.deferred
+        self.companions.deferred_findings()
     }
-    pub fn into_rejections(self) -> Vec<AttributePrefixRejection> {
-        self.rejections
+    pub fn into_parts(self) -> (Vec<AttributePrefixRejection>, PrefixObligations) {
+        (self.rejections, self.companions)
     }
     pub fn is_empty(&self) -> bool {
-        self.rejections.is_empty() && self.deferred.is_empty()
+        self.rejections.is_empty() && self.companions.deferred_findings().is_empty()
     }
 }
 

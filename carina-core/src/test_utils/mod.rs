@@ -59,6 +59,28 @@ where
     crate::validation::admission::attributes::resource_attribute_admissions(request, coverage)
 }
 
+/// Supply caller projections in tests while retaining the canonical owner's
+/// metadata and the replacement findings. This API exists only in test-utils.
+pub fn canonical_caller_values<X, D, B: crate::resource::BindingAddress>(
+    owner: &crate::identifier::CanonicalResource<'_, X, D, B>,
+    values: &indexmap::IndexMap<
+        String,
+        crate::resource::Value<crate::resource::ParserPlaceholder, B>,
+    >,
+) -> Result<
+    crate::identifier::CanonicalAttributeValues<crate::resource::ParserPlaceholder, B>,
+    crate::identifier::RejectedPrefixValues,
+>
+where
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+{
+    owner.with_values(values)
+}
+
 /// Run resource value fixtures through production validation admission.
 pub fn admit_resource_attribute_report<
     P: crate::resource::PlaceholderKind,
@@ -86,11 +108,13 @@ pub fn admit_resource_attribute_report<
     ) {
         Ok(values) => values,
         Err(errors) => {
+            let (rejections, companions) = errors.into_parts();
+            let (deferred, _unexpanded_arguments) = companions.into_parts();
             return crate::schema::ResourceValueValidation::from_errors(
-                errors
-                    .rejections()
+                rejections
+                    .into_iter()
                     .map(|error| crate::schema::TypeError::AttributePrefix(Box::new(error.into())))
-                    .chain(errors.deferred_findings().iter().map(|finding| {
+                    .chain(deferred.into_iter().map(|finding| {
                         crate::schema::TypeError::AttributePrefix(Box::new(finding.into()))
                     }))
                     .collect(),
@@ -102,18 +126,18 @@ pub fn admit_resource_attribute_report<
         .filter(|name| is_string_literal(name))
         .cloned()
         .collect();
-    let mut report =
-        crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-            crate::validation::admission::attributes::admit_value_only_attributes::<
-                crate::validation::admission::kind::ResourceAttribute,
-                P,
-                B,
-            >(schema, &id, &attributes, &quoted, session)
-        });
+    let admitted = crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        crate::validation::admission::attributes::admit_value_only_attributes::<
+            crate::validation::admission::kind::ResourceAttribute,
+            P,
+            B,
+        >(schema, &id, &attributes, &quoted, session)
+    });
+    let (mut report, companions) = admitted.into_parts();
+    let (deferred, _unexpanded_arguments) = companions.into_parts();
     report.append_values(crate::schema::ResourceValueValidation::from_errors(
-        attributes
-            .deferred_findings()
-            .iter()
+        deferred
+            .into_iter()
             .map(|finding| crate::schema::TypeError::AttributePrefix(Box::new(finding.into())))
             .collect(),
     ));

@@ -1586,6 +1586,7 @@ where
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn prefix_declaration(&self) -> Option<&'a super::DeclarationProvenance> {
         match self.resource {
             ResourceRef::Resource(resource) => Some(&resource.declaration),
@@ -1595,6 +1596,7 @@ where
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn loop_iterable(&self) -> Option<&'a Value<P, B>> {
         match self.resource {
             ResourceRef::Deferred { deferred, .. } => Some(D::deferred_iterable(deferred)),
@@ -1602,6 +1604,7 @@ where
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn loop_binding(&self) -> Option<&'a super::ForBinding> {
         match self.resource {
             ResourceRef::Deferred { deferred, .. } => Some(D::deferred_binding(deferred)),

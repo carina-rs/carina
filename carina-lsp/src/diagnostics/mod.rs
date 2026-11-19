@@ -727,7 +727,12 @@ impl<'a> ExpandedDiagnosticValidationInputs<'a> {
             carina_core::validation::admission::attributes::SlotPrechecks::Unreported,
             session,
         )
-        .map(|outcome| outcome.map(|outcome| outcome.values))
+        .map(|outcome| {
+            outcome.map(|outcome| {
+                let (values, _prefixes_for_test) = outcome.values.into_parts();
+                values
+            })
+        })
     }
 
     fn admit_owner<F: carina_core::validation::ValidationClientError>(
@@ -1190,7 +1195,9 @@ impl DiagnosticRun<'_> {
                 format!("{}: {}", resource_id, finding.detail()),
             ));
         }
-        let mut value_validation = outcome.values;
+        // The canonical-file publication seam reports all prefix findings once,
+        // including owners outside this resource's per-document projection.
+        let (mut value_validation, _prefixes_reported_by_file) = outcome.values.into_parts();
         diagnostics.extend(render_classification_diagnostics(
             doc,
             rref,
@@ -2990,7 +2997,8 @@ impl DiagnosticRun<'_> {
                         replay_coverage::declined_outcome(false);
                         continue;
                     };
-                    for error in report.values.errors() {
+                    let (values, _prefixes_reported_by_file) = report.values.as_parts();
+                    for error in values.errors() {
                         let finding = carina_core::parser::Located::new(
                             call.declaration_location().clone(),
                             error,

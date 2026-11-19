@@ -1087,7 +1087,7 @@ pub struct ClassificationDiagnostics<B: BindingAddress>(pub Vec<(String, Knowled
 /// Owned findings and classification failures from the consumed product.
 #[derive(Debug)]
 pub struct ResourceAdmissionOutcome<B: BindingAddress> {
-    pub values: crate::schema::ResourceValueValidation,
+    pub values: crate::identifier::PrefixAdmitted<crate::schema::ResourceValueValidation>,
     pub classification_diagnostics: ClassificationDiagnostics<B>,
 }
 

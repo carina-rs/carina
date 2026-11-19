@@ -309,10 +309,16 @@ impl<E, P: PlaceholderKind, T: PlaceholderKind> CanonicalResourcePair<E, P, T> {
     pub(crate) fn resolve_attr_prefixes_report(
         mut self,
         registry: &carina_core::schema::SchemaRegistry,
-    ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixRejection>> {
-        let errors =
+    ) -> Result<Self, Vec<carina_core::identifier::AttributePrefixFinding>> {
+        let (rejections, companions) =
             carina_core::identifier::resolve_attr_prefix_findings(&mut self.parsed, registry)
-                .into_rejections();
+                .into_parts();
+        let (deferred, _unexpanded_arguments) = companions.into_parts();
+        let errors = rejections
+            .into_iter()
+            .map(Into::into)
+            .chain(deferred.into_iter().map(Into::into))
+            .collect::<Vec<_>>();
         if errors.is_empty() {
             Ok(self)
         } else {
