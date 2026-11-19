@@ -11,8 +11,7 @@ pub use github::{GitHubBackend, GitHubError};
 pub use local::LocalBackend;
 pub use s3::{S3AutoCreate, S3AutoCreateDisabled, S3Backend, S3Bootstrap, S3BootstrapInfo};
 pub use url::{
-    GitHubUrlError, LocalStateFile, StateUrl, load_encoded_published_exports_from_url,
-    load_local_state_file, load_state_from_url,
+    GitHubUrlError, StateUrl, load_encoded_published_exports_from_url, load_state_from_url,
 };
 
 use carina_core::paths::ResolvedPath;

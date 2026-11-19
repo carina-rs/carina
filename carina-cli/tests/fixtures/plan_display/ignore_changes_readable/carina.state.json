@@ -1,71 +1,93 @@
 {
-  "version": 19,
-  "exports_version": 1,
-  "serial": 1,
-  "lineage": "test-ignore-changes-readable",
   "carina_version": "0.7.1",
+  "exports": {
+    "ignored_only_comment": "desired",
+    "sibling_update_comment": "desired"
+  },
+  "exports_version": 1,
+  "lineage": "test-ignore-changes-readable",
   "resources": [
     {
-      "resource_type": "test.resource",
-      "identity": "ignored_only",
-      "provider": "mock",
+      "binding": "ignored_only",
       "current": {
-        "kind": "applied",
-        "identifier": "ignored-only",
         "attributes": {
-          "name": "ignored-only",
-          "comment": "external"
+          "comment": "external",
+          "name": "ignored-only"
         },
+        "identifier": "ignored-only",
+        "kind": "applied",
         "nested_write_only": {}
       },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "name": { "kind": "leaf" },
-          "comment": { "kind": "leaf" }
-        }
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
       },
-      "binding": "ignored_only",
-      "dependency_bindings": []
+      "explicit": {
+        "children": {
+          "comment": {
+            "kind": "leaf"
+          },
+          "name": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "ignored_only",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "mock",
+      "resource_type": "test.resource"
     },
     {
-      "resource_type": "test.resource",
-      "identity": "sibling_update",
-      "provider": "mock",
+      "binding": "sibling_update",
       "current": {
-        "kind": "applied",
-        "identifier": "sibling-update",
         "attributes": {
-          "name": "sibling-update",
           "comment": "external",
+          "name": "sibling-update",
           "tags": {
             "Owner": "old"
           }
         },
+        "identifier": "sibling-update",
+        "kind": "applied",
         "nested_write_only": {}
       },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
-      "explicit": {
-        "kind": "struct",
-        "children": {
-          "name": { "kind": "leaf" },
-          "comment": { "kind": "leaf" },
-          "tags": { "kind": "leaf" }
-        }
+      "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
       },
-      "binding": "sibling_update",
-      "dependency_bindings": []
+      "explicit": {
+        "children": {
+          "comment": {
+            "kind": "leaf"
+          },
+          "name": {
+            "kind": "leaf"
+          },
+          "tags": {
+            "kind": "leaf"
+          }
+        },
+        "kind": "struct"
+      },
+      "identity": "sibling_update",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "mock",
+      "resource_type": "test.resource"
     }
   ],
-  "exports": {
-    "ignored_only_comment": "desired",
-    "sibling_update_comment": "desired"
-  }
+  "serial": 1,
+  "version": 21
 }

@@ -1,53 +1,62 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-state-blocks",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-state-blocks",
   "resources": [
     {
-      "resource_type": "ec2.Subnet",
-      "identity": "legacy-subnet",
-      "provider": "awscc",
-      "identifier": "subnet-0abc123",
-      "attributes": {
-        "subnet_id": "subnet-0abc123",
-        "vpc_id": "vpc-old123",
-        "cidr_block": "10.0.1.0/24"
-      },
-      "protected": false,
-      "directives": {
-        "force_delete": false,
-        "create_before_destroy": false
-      },
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "legacy_subnet",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.1.0/24",
+          "subnet_id": "subnet-0abc123",
+          "vpc_id": "vpc-old123"
+        },
+        "identifier": "subnet-0abc123",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
-      "explicit": {
-        "kind": "leaf"
-      }
+      "directives": {
+        "create_before_destroy": false,
+        "force_delete": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "identity": "legacy-subnet",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Subnet"
     },
     {
-      "resource_type": "ec2.SecurityGroup",
-      "identity": "old-sg",
-      "provider": "awscc",
-      "identifier": "sg-0abc123",
-      "attributes": {
-        "group_id": "sg-0abc123",
-        "group_description": "Old security group"
-      },
-      "protected": false,
-      "directives": {
-        "force_delete": false,
-        "create_before_destroy": false
-      },
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "old_sg",
+      "current": {
+        "attributes": {
+          "group_description": "Old security group",
+          "group_id": "sg-0abc123"
+        },
+        "identifier": "sg-0abc123",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
-      "explicit": {
-        "kind": "leaf"
-      }
+      "directives": {
+        "create_before_destroy": false,
+        "force_delete": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "identity": "old-sg",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.SecurityGroup"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

@@ -28,35 +28,12 @@ fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
     );
     assert_success("save literal constraint", &scenario.plan());
     let original = read_json(&scenario.project.join("plan.json"));
-    let current_version = original["version"].clone();
-    assert_eq!(current_version, PlanFile::CURRENT_VERSION);
-    let previous_version = PlanFile::CURRENT_VERSION - 1;
-    let old_version_error = format!(
-        "Unsupported plan file version: {previous_version} (expected {})",
-        PlanFile::CURRENT_VERSION
-    );
+    assert_eq!(original["version"], PlanFile::CURRENT_VERSION);
     let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
     let provider_before = fs::read(&scenario.mock_state).ok();
 
-    for (version, string, expected) in [
-        (
-            Value::from(previous_version),
-            "${secret('CANARY_4386')}",
-            old_version_error.as_str(),
-        ),
-        (
-            current_version.clone(),
-            "${secret('CANARY_4386')}",
-            "invalid validation string literal",
-        ),
-        (
-            current_version,
-            "\"${secret('CANARY_4386')}\"",
-            "invalid validation string literal",
-        ),
-    ] {
+    for string in ["${secret('CANARY_4386')}", "\"${secret('CANARY_4386')}\""] {
         let mut document = original.clone();
-        document["version"] = version;
         document["compositions"][0]["pending_constraints"][0]["expression"]["Compare"]["rhs"]["String"] =
             Value::from(string);
         let decode = serde_json::from_value::<PlanFile>(document.clone()).unwrap_err();
@@ -76,7 +53,10 @@ fn saved_plan_rejects_legacy_or_interpolated_constraint_strings_before_apply() {
         let output = scenario.apply_plan();
         let rendered = output_text(&output);
         assert!(!output.status.success());
-        assert!(rendered.contains(expected), "{rendered}");
+        assert!(
+            rendered.contains("invalid validation string literal"),
+            "{rendered}"
+        );
         let command = ProjectCommand::new("plan --out", &scenario.project)
             .with_path_argument(Path::new("plan.json"))
             .to_string();
@@ -2389,39 +2369,6 @@ let consumer = mock.test.resource {
 }
 
 #[test]
-fn v16_saved_plan_requires_replan() {
-    let scenario = Scenario::new(
-        r#"backend local { path = "carina.state.json" }
-provider mock {}
-
-mock.test.resource {
-  name = "version-check"
-}
-"#,
-    );
-    assert_success("carina plan --out", &scenario.plan());
-    let plan_path = scenario.project.join("plan.json");
-    let mut plan = read_json(&plan_path);
-    plan["version"] = Value::from(16);
-    fs::write(
-        &plan_path,
-        serde_json::to_vec_pretty(&plan).expect("serialize legacy plan"),
-    )
-    .expect("write legacy plan");
-
-    let apply = scenario.apply_plan();
-    let rendered = output_text(&apply);
-    assert!(
-        !apply.status.success(),
-        "v16 saved plan applied:\n{rendered}"
-    );
-    assert!(
-        rendered.contains("Unsupported plan file version: 16") && rendered.contains("plan --out"),
-        "v16 format must fail with replan guidance:\n{rendered}",
-    );
-}
-
-#[test]
 fn validate_and_plan_reject_secret_derived_backend_attribute() {
     let temp = tempfile::tempdir().expect("tempdir");
     fs::write(
@@ -3519,8 +3466,8 @@ fn current_saved_plan_root_and_nested_hashes_round_trip_byte_for_byte() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, SnapshotLeaf, Value as SnapshotTree,
     };
-    assert_eq!(PlanFile::CURRENT_VERSION, 46);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v46.plan.json");
+    assert_eq!(PlanFile::CURRENT_VERSION, 47);
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v47.plan.json");
     let plan: PlanFile = serde_json::from_str(fixture).unwrap();
     assert_eq!(
         carina_core::utils::pretty_with_newline(&plan).unwrap(),

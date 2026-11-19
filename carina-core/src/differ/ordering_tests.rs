@@ -107,14 +107,13 @@ fn issue_4491_orphan_order_retains_persisted_dependencies_without_an_applied_sna
         1,
     ));
     let mut child = Orphan::create_in_flight(pending, None, PersistedDirectives::default());
-    child.set_destroy_metadata(
+    child.set_dependency_bindings(
         PersistedDestroyDependencies::decode_persisted(
             [crate::resource::ResolvedResourceId::new(id("beta"))]
                 .into_iter()
                 .collect(),
         )
         .unwrap(),
-        PersistedDirectives::default(),
     );
     orphans.insert(crate::resource::ResolvedResourceId::new(id("zulu")), child);
     assert_eq!(
@@ -337,7 +336,7 @@ fn issue_4491_stateless_orphan_dependencies_survive_current_round_trip() {
         Orphan::create_in_flight(pending, None, PersistedDirectives::default()),
         Orphan::create_outcome_unknown(unknown, None, PersistedDirectives::default()),
     ] {
-        orphan.set_destroy_metadata(dependencies.clone(), PersistedDirectives::default());
+        orphan.set_dependency_bindings(dependencies.clone());
         let restored = match orphan.into_current() {
             Current::CreateInFlight(pending) => {
                 Orphan::create_in_flight(pending, None, PersistedDirectives::default())

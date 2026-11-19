@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_state::{StateFile, check_and_migrate};
+use carina_state::{StateFile, load_state};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -48,11 +48,10 @@ impl Scenario {
     }
 
     fn state(&self) -> StateFile {
-        check_and_migrate(
+        load_state(
             &fs::read_to_string(self.project.join("carina.state.json")).expect("read local state"),
         )
         .expect("load local state")
-        .into_state()
     }
 
     fn budget_identity(&self) -> String {

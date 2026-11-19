@@ -715,19 +715,12 @@ fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_has
     legacy_argon2()
         .hash_password_into(plaintext, salt, &mut output)
         .expect("hash legacy fixture");
-    let marker = format!(
-        "{}{}",
-        RedactedSecretHash::LEGACY_MARKER_PREFIX,
+    let matching = RedactedSecretHash::from_encoded_digest(&format!(
+        "argon2-legacy:{}:{}",
+        hex::encode(salt),
         hex::encode(output)
-    );
-    let matching = RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
-        &marker,
-        "mock.test.resource",
-        "legacy",
-        "comment",
-    )
-    .expect("legacy salt is representable")
-    .expect("upgrade legacy fixture");
+    ))
+    .expect("valid explicit legacy fixture");
     assert!(matching.verify(plaintext));
     assert_eq!(
         matching.encoded_digest(),
@@ -740,19 +733,12 @@ fn explicit_legacy_digest_verification_distinguishes_matching_and_mismatched_has
     );
 
     output[0] ^= 1;
-    let mismatched_marker = format!(
-        "{}{}",
-        RedactedSecretHash::LEGACY_MARKER_PREFIX,
+    let mismatched = RedactedSecretHash::from_encoded_digest(&format!(
+        "argon2-legacy:{}:{}",
+        hex::encode(salt),
         hex::encode(output)
-    );
-    let mismatched = RedactedSecretHash::upgrade_raw_legacy_marker_for_state_row(
-        &mismatched_marker,
-        "mock.test.resource",
-        "legacy",
-        "comment",
-    )
-    .expect("legacy salt is representable")
-    .expect("upgrade mismatched legacy fixture");
+    ))
+    .expect("valid mismatched legacy fixture");
     assert!(!mismatched.verify(plaintext));
 }
 

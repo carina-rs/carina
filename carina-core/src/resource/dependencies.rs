@@ -236,31 +236,6 @@ where
     PersistedDestroyDependencies::decode_persisted(dependencies).map_err(serde::de::Error::custom)
 }
 
-/// Exhaustive result of projecting one expanded graph source to state rows.
-///
-/// External/upstream values and literal module arguments deliberately produce
-/// `NoLocalDestroyEdge`; they are not represented by an accidental empty
-/// lookup or a silently dropped scheduler node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PersistedDestroyDependencyProjection {
-    Managed(
-        #[serde(deserialize_with = "deserialize_persisted_destroy_dependencies")]
-        PersistedDestroyDependencies,
-    ),
-    NoLocalDestroyEdge,
-}
-
-impl PersistedDestroyDependencyProjection {
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn into_dependencies(self) -> PersistedDestroyDependencies {
-        match self {
-            Self::Managed(dependencies) => dependencies,
-            Self::NoLocalDestroyEdge => PersistedDestroyDependencies::default(),
-        }
-    }
-}
-
 /// Attribute-level provenance for value-reference dependency edges.
 ///
 /// This is scheduler metadata, never a provider/state value. `Unknown` is

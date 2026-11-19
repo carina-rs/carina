@@ -2479,6 +2479,7 @@ async fn create_instance_with_http(
 /// credentials, and its HTTP hook rejects every destination. Linking the same
 /// host imports as the HTTP runtime world lets current and released providers
 /// instantiate without granting metadata calls credentials or network access.
+#[cfg(any(test, feature = "test-utils"))]
 async fn create_schema_only_bindings(
     engine: &Engine,
     component: &Component,
@@ -3702,6 +3703,7 @@ pub struct WasmProviderFactory {
 /// and identity methods are usable, while the runtime constructor fails
 /// closed. In particular, loading it calls neither `initialize` nor any CRUD
 /// export, and the kind-less guest store receives no provider credentials.
+#[cfg(any(test, feature = "test-utils"))]
 pub struct SchemaOnlyWasmProviderFactory {
     name: String,
     display_name: DiagnosticText,
@@ -4203,6 +4205,7 @@ impl WasmProviderFactory {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl SchemaOnlyWasmProviderFactory {
     /// Load only schema metadata from resolver-verified provider bytes.
     pub async fn from_bytes(
@@ -4213,9 +4216,8 @@ impl SchemaOnlyWasmProviderFactory {
         (async {
             let configured = ConfiguredProvider::new(load.identity());
             let engine = WasmProviderFactory::create_engine()?;
-            // A migration check is a literal read-only operation. Do not reuse the
-            // ordinary precompile cache: a cold cache would create directories and
-            // publish native code even though the command promises no writes.
+            // Schema-only loading performs no filesystem writes. A cold
+            // precompile cache would create directories and publish native code.
             let component =
                 WasmProviderFactory::load_component_from_bytes(&engine, load.bytes().as_bytes())?;
             Self::bring_up_component(engine, component, configured, notices).await
@@ -4346,6 +4348,7 @@ fn verify_provider_version(
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl ProviderFactory for SchemaOnlyWasmProviderFactory {
     fn name(&self) -> &str {
         &self.name

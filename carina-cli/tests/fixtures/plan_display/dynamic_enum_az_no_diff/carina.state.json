@@ -1,31 +1,42 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-lineage-dynamic-enum-az-no-diff",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-lineage-dynamic-enum-az-no-diff",
   "resources": [
     {
-      "resource_type": "network.Subnet",
-      "identity": "subnet",
-      "provider": "fixture",
-      "identifier": "subnet-fixture",
-      "attributes": {
-        "availability_zone": "ap-northeast-1a"
-      },
-      "protected": false,
-      "directives": {},
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "subnet",
+      "current": {
+        "attributes": {
+          "availability_zone": "ap-northeast-1a"
+        },
+        "identifier": "subnet-fixture",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "prevent_destroy": {
+          "kind": "unspecified"
+        },
+        "create_before_destroy": false,
+        "force_delete": false
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "availability_zone": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "subnet",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "fixture",
+      "resource_type": "network.Subnet"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }

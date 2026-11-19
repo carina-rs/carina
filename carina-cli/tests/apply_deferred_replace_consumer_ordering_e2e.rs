@@ -447,7 +447,6 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
             })
             .collect(),
         sorted_explicit_destroy_dependencies: vec![Default::default(); sorted_resources.len()],
-        legacy_dependency_classification: None,
         unresolved_resources: sorted_resources
             .into_iter()
             .map(Resource::into_value_snapshot)
@@ -510,9 +509,8 @@ fn review10_4283_promoted_deferred_child_keeps_authored_directives() {
     let plan_path = scenario.write_plan(&state);
     assert_success("carina apply plan", &scenario.apply_plan(&plan_path));
 
-    let state = carina_state::check_and_migrate(&fs::read_to_string(&scenario.state_path).unwrap())
-        .unwrap()
-        .into_state();
+    let state =
+        carina_state::load_state(&fs::read_to_string(&scenario.state_path).unwrap()).unwrap();
     let child = state
         .find_resource("mock", "test.resource", "validation_records[0]")
         .unwrap();

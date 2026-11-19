@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_state::check_and_migrate;
+use carina_state::load_state;
 use tempfile::TempDir;
 
 struct Scenario {
@@ -222,11 +222,10 @@ let roles = read mock.iam.Roles {
     }
 
     fn state_resource_count(&self) -> usize {
-        let state = check_and_migrate(
+        let state = load_state(
             &fs::read_to_string(self.project.join("carina.state.json")).expect("read state"),
         )
-        .expect("load state")
-        .into_state();
+        .expect("load state");
         state.resources().len()
     }
 }
@@ -523,11 +522,10 @@ fn removed_then_import_recovers_missing_identifier_with_and_without_refresh() {
             "apply import recovery",
             &scenario.carina(&["apply", ".", "--auto-approve", "--lock=false"]),
         );
-        let state = check_and_migrate(
+        let state = load_state(
             &fs::read_to_string(scenario.project.join("carina.state.json")).expect("read state"),
         )
-        .expect("load imported state")
-        .into_state();
+        .expect("load imported state");
         let row = state
             .find_resource("mock", "test.resource", "r1")
             .expect("imported row must exist");

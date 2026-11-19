@@ -323,11 +323,9 @@ async fn read_only_operand(target: &str) {
         assert_eq!(init["ok"], true, "{init}");
         let seed = binary(&fixture, &["apply", "--auto-approve", "--lock=false"]);
         assert_eq!(seed["ok"], true, "{seed}");
-        let mut baseline = carina_state::check_and_migrate(
-            &serde_json::to_string(&saved_state(&fixture)).unwrap(),
-        )
-        .unwrap()
-        .into_state();
+        let mut baseline =
+            carina_state::load_state(&serde_json::to_string(&saved_state(&fixture)).unwrap())
+                .unwrap();
         let q_identifier = baseline
             .find_resource("mock", "iam.Roles", "q")
             .unwrap()

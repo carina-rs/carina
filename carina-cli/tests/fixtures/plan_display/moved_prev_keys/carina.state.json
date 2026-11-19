@@ -1,35 +1,34 @@
 {
-  "version": 7,
-  "serial": 1,
-  "lineage": "test-moved-prev-keys",
   "carina_version": "0.1.0",
+  "exports_version": 1,
+  "lineage": "test-moved-prev-keys",
   "resources": [
     {
-      "resource_type": "ec2.Vpc",
-      "identity": "old_vpc",
-      "provider": "awscc",
-      "identifier": "vpc-old123",
-      "attributes": {
-        "vpc_id": "vpc-old123",
-        "cidr_block": "10.0.0.0/16",
-        "tags": [
-          {
-            "key": "Name",
-            "value": "old"
-          }
-        ]
-      },
-      "protected": false,
-      "directives": {
-        "force_delete": false,
-        "create_before_destroy": false
-      },
-      "prefixes": {},
-      "name_overrides": {},
       "binding": "old_vpc",
+      "current": {
+        "attributes": {
+          "cidr_block": "10.0.0.0/16",
+          "tags": [
+            {
+              "key": "Name",
+              "value": "old"
+            }
+          ],
+          "vpc_id": "vpc-old123"
+        },
+        "identifier": "vpc-old123",
+        "kind": "applied",
+        "nested_write_only": {}
+      },
       "dependency_bindings": [],
+      "directives": {
+        "create_before_destroy": false,
+        "force_delete": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
       "explicit": {
-        "kind": "struct",
         "children": {
           "cidr_block": {
             "kind": "leaf"
@@ -37,8 +36,17 @@
           "tags": {
             "kind": "leaf"
           }
-        }
-      }
+        },
+        "kind": "struct"
+      },
+      "identity": "old_vpc",
+      "name_overrides": {},
+      "prefixes": {},
+      "protected": false,
+      "provider": "awscc",
+      "resource_type": "ec2.Vpc"
     }
-  ]
+  ],
+  "serial": 1,
+  "version": 21
 }
