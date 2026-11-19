@@ -359,7 +359,6 @@ impl Default for TemplateSecrecy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildRow {
     row: Row,
-    template: ResourceId,
     template_evidence: Arc<TemplateEvidence>,
     provider: String,
     provider_instance: Option<String>,
@@ -462,8 +461,10 @@ pub enum ChildEvidenceInsertError {
     Unavailable(TemplateEvidenceUnavailable),
     #[error("deferred child row belongs to a different declaration or expansion instance")]
     ChildDeclaration,
-    #[error("deferred child secrecy belongs to foreign template `{template}`")]
-    ForeignTemplate { template: ResourceId },
+    #[error(
+        "deferred child `{child}` carries secrecy evidence from a template this configuration did not admit"
+    )]
+    ForeignTemplate { child: ResourceId },
 }
 
 impl TemplateEvidence {
@@ -534,7 +535,6 @@ impl TemplateEvidence {
                 instance: child.authored_slots.instance(),
                 ..self.row.clone()
             },
-            template: source.clone(),
             template_evidence: Arc::clone(self),
             provider: child.id.provider.clone(),
             provider_instance: child.id.provider_instance.clone(),
@@ -638,10 +638,11 @@ impl ValidatedSecrecyGraph {
         self.rows.get(resource).map(|row| &row.attributes)
     }
 
-    fn owns_template(&self, template: &ResourceId, evidence: &Arc<TemplateEvidence>) -> bool {
+    fn owns_template(&self, evidence: &Arc<TemplateEvidence>) -> bool {
+        // ponytail: O(templates) per child; upgrade to a pointer-keyed set.
         self.templates
-            .get(template)
-            .is_some_and(|owned| Arc::ptr_eq(owned, evidence))
+            .values()
+            .any(|owned| Arc::ptr_eq(owned, evidence))
     }
 
     pub(crate) fn template_evidence<
@@ -655,17 +656,12 @@ impl ValidatedSecrecyGraph {
         template: &DeferredForExpression<S, P, T, B, D>,
     ) -> Result<Arc<TemplateEvidence>, TemplateAdmissionError> {
         let slots = &template.template_resource().as_resource().authored_slots;
-        self.templates
-            .get(template.template_resource_id())
-            .filter(|evidence| {
-                evidence.matches_slots(slots)
-                    && match template.secrecy() {
-                        TemplateSecrecy::Derived(evidence) => {
-                            self.owns_template(template.template_resource_id(), evidence)
-                        }
-                        TemplateSecrecy::Unavailable(_) => true,
-                    }
-            })
+        let evidence = match template.secrecy() {
+            TemplateSecrecy::Derived(evidence) => self.owns_template(evidence).then_some(evidence),
+            TemplateSecrecy::Unavailable(_) => self.templates.get(template.template_resource_id()),
+        };
+        evidence
+            .filter(|evidence| evidence.matches_slots(slots))
             .cloned()
             .ok_or_else(|| TemplateAdmissionError::MissingTemplateEvidence {
                 resource: template.template_resource_id().clone(),
@@ -688,9 +684,9 @@ impl ValidatedSecrecyGraph {
                 return Err(ChildEvidenceInsertError::ChildDeclaration);
             }
         };
-        if !self.owns_template(&row.template, &row.template_evidence) {
+        if !self.owns_template(&row.template_evidence) {
             return Err(ChildEvidenceInsertError::ForeignTemplate {
-                template: row.template.clone(),
+                child: child.id.clone(),
             });
         }
         if self.rows.contains_key(&child.id) {

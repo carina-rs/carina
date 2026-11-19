@@ -30,6 +30,63 @@ fn children(
 }
 
 #[test]
+fn issue_4516_anonymous_module_remapped_template_keeps_owned_child_evidence() {
+    let (_directory, file, schemas, context) = fixture(
+        "let child = use { source = './child' }\nchild { items = upstream.items }\n",
+        Some(
+            "arguments { items: list(String) }\nlet children = for item in items { mock.test.Resource { comment = secret('canary') name = item } }\n",
+        ),
+    );
+    let mut file = resolve_owner(file, &schemas, &context).into_file();
+    let template = &file.deferred_for_expressions()[0];
+    let original_id = template.template_resource_id().clone();
+    let TemplateSecrecy::Derived(evidence) = template.secrecy() else {
+        panic!("admitted template must carry evidence");
+    };
+    let evidence = std::sync::Arc::clone(evidence);
+    let (prefix, _) = original_id.identity_str().unwrap().split_once('.').unwrap();
+    let (module, hash) = prefix.rsplit_once('_').unwrap();
+    let hash = crate::identifier::SimHash::parse_16_hex(hash).unwrap();
+    let state_prefix = format!("{module}_{:016x}", hash.with_flipped_mask_for_test(1));
+
+    // The CLI reconciles state addresses after admission, before expansion.
+    crate::module_resolver::reconcile_anonymous_module_instances(
+        &mut file,
+        &|_, _| vec![format!("{state_prefix}.module_unrelated")],
+        &crate::identifier::StateBlockClaims::empty(),
+    );
+    let remapped = file.deferred_for_expressions()[0].clone();
+    assert_ne!(remapped.template_resource_id(), &original_id);
+    assert_eq!(
+        remapped.template_resource_id().identity_str(),
+        Some(format!("{state_prefix}.children[?]").as_str())
+    );
+    assert!(graph(&file).templates.contains_key(&original_id));
+    assert!(
+        !graph(&file)
+            .templates
+            .contains_key(remapped.template_resource_id())
+    );
+    let TemplateSecrecy::Derived(remapped_evidence) = remapped.secrecy() else {
+        panic!("remapping must retain admitted evidence");
+    };
+    assert!(std::sync::Arc::ptr_eq(&evidence, remapped_evidence));
+
+    let (selected, retained) = file.take_deferred_for_expressions().partition(|_| true);
+    file.replace_deferred_for_expressions(selected);
+    expand(&mut file, list(&["a", "b"]), &context);
+    file.deferred_for_expressions_mut()
+        .append_finalized(retained);
+    assert!(file.deferred_for_expressions().is_empty());
+    assert_child_row(&file, &format!("{state_prefix}.children[0]"));
+    assert_child_row(&file, &format!("{state_prefix}.children[1]"));
+    assert!(std::sync::Arc::ptr_eq(
+        &graph(&file).template_evidence(&remapped).unwrap(),
+        &evidence
+    ));
+}
+
+#[test]
 fn issue_4516_deferred_for_child_rows_keep_element_identity() {
     for (main, both, only_b, first_element, second_element) in [
         (
@@ -701,16 +758,24 @@ fn assert_foreign_template_rejected(entry_point: &str) {
         file_b.expand_deferred_for_expressions(&bindings, session)
     })
     .expect_err("a template from another admission must not supply this graph's child evidence");
-    let template_id = before.deferred_for_expressions()[0].template_resource_id();
+    let child_id = children(
+        &before.deferred_for_expressions()[0],
+        list(&["a"]),
+        &context_b,
+    )
+    .remove(0)
+    .id;
     assert!(matches!(
         &error,
         crate::parser::DeferredForExpansionError::ChildSecrecy(
-            ChildEvidenceInsertError::ForeignTemplate { template }
-        ) if template == template_id
+            ChildEvidenceInsertError::ForeignTemplate { child }
+        ) if child == &child_id
     ));
     assert_eq!(
         error.to_string(),
-        format!("deferred child secrecy belongs to foreign template `{template_id}`")
+        format!(
+            "deferred child `{child_id}` carries secrecy evidence from a template this configuration did not admit"
+        )
     );
     assert_eq!(file_b.resources, before.resources);
     assert_eq!(file_b.warnings, before.warnings);
