@@ -180,9 +180,9 @@ where
 /// ```
 ///
 /// ```compile_fail
-/// use carina_core::{resource::{SnapshotValue,AccessMissPolicy},parser::{DeferredForExpression,expand_deferred_children}};
-/// fn cannot_expand(snapshot: SnapshotValue, template: DeferredForExpression, context: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext) {
-///     expand_deferred_children(&template, &snapshot, AccessMissPolicy::Error, context);
+/// use carina_core::{resource::SnapshotValue,parser::ExpandedParsedFile};
+/// fn cannot_expand(snapshot: SnapshotValue, file: &mut ExpandedParsedFile, context: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext) {
+///     file.expand_deferred_for_expressions(&snapshot, context);
 /// }
 /// ```
 ///

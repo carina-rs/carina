@@ -340,35 +340,27 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
                 "materialized".into(),
             )),
         ]));
+    let iterables = carina_core::binding_index::IterableBindings::from_upstream_only(
+        carina_core::upstream_exports::remote_bindings_for_test(std::collections::HashMap::from([
+            (
+                "remote".into(),
+                std::collections::HashMap::from([("items".into(), concrete)]),
+            ),
+        ])),
+    );
     for deferred in expanded.deferred_for_expressions().iter() {
         let children = TypeCheckSession::run(&config, |session| {
-            carina_core::parser::expand_deferred_children(
-                deferred,
-                match concrete
-                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .unwrap()
-                {
-                    carina_core::resource::knowledge::Classification::Known(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::Pending(_)
-                    | carina_core::resource::knowledge::Classification::Failed(_) => {
-                        panic!("fixture collection has exact shape")
-                    }
-                },
-                carina_core::resource::AccessMissPolicy::Error,
-                session,
-            )
-            .unwrap()
+            let mut file = carina_core::parser::ExpandedParsedFile::default();
+            file.replace_deferred_for_expressions(
+                carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    deferred.clone(),
+                ]),
+            );
+            file.expand_deferred_for_expressions(&iterables, session)
+                .unwrap();
+            file.resources
         })
         .publish(&mut NoTypeErrors);
-        let carina_core::resource::ForExpansion::Expanded(children) = children else {
-            panic!("declaration provenance fixture must expand");
-        };
         let mut child_tree = carina_core::parser::ExpandedParsedFile::default();
         child_tree.resources = children;
         let analysis = AnalysisTree::try_from_file(&child_tree)?;

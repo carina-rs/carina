@@ -501,7 +501,7 @@ pub(crate) fn parse_for_expr(
     };
     let mut address_pending = None;
     let mut iterable_for_expansion = parser_iterable(&classified);
-    let bound_addresses = match admission {
+    let bound_members = match admission {
         Some(Ok(crate::resource::ForAddressAdmission::Admitted(addresses))) => Some(addresses),
         Some(Ok(crate::resource::ForAddressAdmission::Defer(pending))) => {
             address_pending = Some(pending);
@@ -517,17 +517,90 @@ pub(crate) fn parse_for_expr(
             return Err(ParseError::for_admission_failure(error, &iterable_location));
         }
     };
-    match (&binding, &iterable_for_expansion) {
-        (ForBinding::Simple(var), ParserIterable::List(items)) => {
+    if let Some(members) = bound_members {
+        for (position, member) in members.iter().enumerate() {
+            let child = ForBodyTarget::Bound(member.address().clone());
+            let mut iter_ctx = ctx.child_scope();
+            match &binding {
+                ForBinding::Simple(value) | ForBinding::Indexed(_, value) => {
+                    if let ForBinding::Indexed(index, _) = &binding {
+                        bind(
+                            &mut iter_ctx,
+                            index,
+                            Value::Concrete(ConcreteValue::Int(
+                                member.index().expect("indexed binding"),
+                            )),
+                        );
+                    }
+                    let metadata = match structural_handle_metadata.as_ref() {
+                        Some(UnexpandedStructuralHandleMetadata::List(items)) => {
+                            items.get(position).cloned().flatten()
+                        }
+                        Some(
+                            UnexpandedStructuralHandleMetadata::Handle { .. }
+                            | UnexpandedStructuralHandleMetadata::Map(_)
+                            | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
+                        )
+                        | None => None,
+                    };
+                    bind_eval(
+                        &mut iter_ctx,
+                        value,
+                        EvalValue::computed(member.value().clone(), metadata),
+                    );
+                }
+                ForBinding::Map(key, value) => {
+                    let member_key = member.key().expect("map binding");
+                    bind(
+                        &mut iter_ctx,
+                        key,
+                        Value::Concrete(ConcreteValue::String(member_key.into())),
+                    );
+                    let metadata = match structural_handle_metadata.as_ref() {
+                        Some(UnexpandedStructuralHandleMetadata::Map(entries)) => {
+                            entries.get(member_key).cloned()
+                        }
+                        Some(
+                            UnexpandedStructuralHandleMetadata::Handle { .. }
+                            | UnexpandedStructuralHandleMetadata::List(_)
+                            | UnexpandedStructuralHandleMetadata::ExpressionOperands(_),
+                        )
+                        | None => None,
+                    };
+                    bind_eval(
+                        &mut iter_ctx,
+                        value,
+                        EvalValue::computed(member.value().clone(), metadata),
+                    );
+                }
+            }
+            let result = parse_for_body(
+                body_pair.clone(),
+                &iter_ctx,
+                &child,
+                preprocessed_file,
+                source_file,
+            )?;
+            collect(
+                result,
+                &child,
+                &mut resources,
+                &mut data_sources,
+                &mut module_calls,
+            );
+        }
+        return Ok((resources, data_sources, module_calls));
+    }
+    match (&target, &binding, &iterable_for_expansion) {
+        (
+            LoopParseTarget::Unbound(template),
+            ForBinding::Simple(var),
+            ParserIterable::List(items),
+        ) => {
             for (i, item) in items.iter().enumerate() {
-                let child = match &target {
-                    LoopParseTarget::Bound(_) => ForBodyTarget::Bound(
-                        bound_addresses.as_ref().expect("bound list admitted")[i].clone(),
-                    ),
-                    LoopParseTarget::Unbound(template) => ForBodyTarget::Unbound {
-                        template: template.clone(),
-                        element: ForLoopElement::Index(i),
-                    },
+                let child = ForBodyTarget::Unbound {
+                    template: template.clone(),
+                    element: ForLoopElement::Index(i),
                 };
                 let mut iter_ctx = ctx.child_scope();
                 let metadata = match structural_handle_metadata.as_ref() {
@@ -562,16 +635,15 @@ pub(crate) fn parse_for_expr(
                 );
             }
         }
-        (ForBinding::Indexed(idx_var, val_var), ParserIterable::List(items)) => {
+        (
+            LoopParseTarget::Unbound(template),
+            ForBinding::Indexed(idx_var, val_var),
+            ParserIterable::List(items),
+        ) => {
             for (i, item) in items.iter().enumerate() {
-                let child = match &target {
-                    LoopParseTarget::Bound(_) => ForBodyTarget::Bound(
-                        bound_addresses.as_ref().expect("bound list admitted")[i].clone(),
-                    ),
-                    LoopParseTarget::Unbound(template) => ForBodyTarget::Unbound {
-                        template: template.clone(),
-                        element: ForLoopElement::Index(i),
-                    },
+                let child = ForBodyTarget::Unbound {
+                    template: template.clone(),
+                    element: ForLoopElement::Index(i),
                 };
                 let mut iter_ctx = ctx.child_scope();
                 bind(
@@ -611,20 +683,19 @@ pub(crate) fn parse_for_expr(
                 );
             }
         }
-        (ForBinding::Map(key_var, val_var), ParserIterable::Map(map)) => {
+        (
+            LoopParseTarget::Unbound(template),
+            ForBinding::Map(key_var, val_var),
+            ParserIterable::Map(map),
+        ) => {
             // Sort keys for deterministic output
             let mut keys: Vec<&str> = map.keys().copied().collect();
             keys.sort();
-            for (i, key) in keys.into_iter().enumerate() {
+            for key in keys {
                 let val = &map[key];
-                let child = match &target {
-                    LoopParseTarget::Bound(_) => ForBodyTarget::Bound(
-                        bound_addresses.as_ref().expect("bound map admitted")[i].clone(),
-                    ),
-                    LoopParseTarget::Unbound(template) => ForBodyTarget::Unbound {
-                        template: template.clone(),
-                        element: ForLoopElement::Key(key.to_owned()),
-                    },
+                let child = ForBodyTarget::Unbound {
+                    template: template.clone(),
+                    element: ForLoopElement::Key(key.to_owned()),
                 };
                 let mut iter_ctx = ctx.child_scope();
                 bind(
@@ -668,7 +739,7 @@ pub(crate) fn parse_for_expr(
         // replayed at plan/apply time. In particular, `ref ?? default` must
         // not collapse to the default before the reference snapshot is known
         // to be complete.
-        (_, ParserIterable::Deferred) => {
+        (_, _, ParserIterable::Deferred) => {
             let iterable_surface = match &iterable {
                 Value::Deferred(
                     DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })
@@ -850,7 +921,8 @@ pub(crate) fn parse_for_binding(
 ///
 /// When the iterable is a function call with all statically-known arguments,
 /// the function is eagerly evaluated at parse time. If any argument depends on
-/// a runtime value (e.g. ResourceRef), a clear error is returned.
+/// a runtime value (e.g. ResourceRef), a clear error is returned. Module
+/// arguments remain substitution inputs until the module call is resolved.
 struct ParsedForIterable {
     value: Value,
     bare_unbound_identifier: Option<String>,
@@ -896,8 +968,13 @@ fn parse_for_iterable(
         .into_value()
         .map_err(|error| ParseError::from_eval_value(error, line))?;
     let value = crate::parser::functions::try_evaluate_fn_value(value, ctx, line)?;
+    let value = if crate::parser::functions::contains_module_argument(&value) {
+        value
+    } else {
+        evaluate_static_value(value, ctx.config)?
+    };
     Ok(ParsedForIterable {
-        value: evaluate_static_value(value, ctx.config)?,
+        value,
         bare_unbound_identifier,
         structural_for_binding,
         provisional_binding,

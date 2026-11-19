@@ -386,11 +386,9 @@ fn snapshot_state_unresolved_filter_uses_checked_conversion() {
 
 #[test]
 fn snapshot_saved_plan_loop_expansion_uses_checked_conversion() {
-    use carina_core::parser::{
-        DeferredForExpression, DeferredForTarget, ForBinding, expand_deferred_children,
-    };
+    use carina_core::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
     use carina_core::resource::{
-        AccessMissPolicy, LoopSlot, ModuleSource, Resource, absolute_binding_address_for_test,
+        LoopSlot, ModuleSource, Resource, absolute_binding_address_for_test,
     };
     let mut template: Resource<ModuleSource, LoopSlot> = Resource::new("mock.Target", "children");
     template.binding = Some(absolute_binding_address_for_test("children"));
@@ -411,36 +409,28 @@ fn snapshot_saved_plan_loop_expansion_uses_checked_conversion() {
     let saved: SnapshotValue =
         serde_json::from_slice(&serde_json::to_vec(&historical_siblings()).unwrap()).unwrap();
     let items = resolve_historical_field("items").unwrap();
+    let iterables = carina_core::binding_index::IterableBindings::from_upstream_only(
+        carina_core::upstream_exports::remote_bindings_for_test(std::collections::HashMap::from([
+            (
+                "state".into(),
+                std::collections::HashMap::from([("items".into(), items)]),
+            ),
+        ])),
+    );
     let children = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |session| {
-            expand_deferred_children(
-                &deferred,
-                match items
-                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .unwrap()
-                {
-                    carina_core::resource::knowledge::Classification::Known(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::Pending(_)
-                    | carina_core::resource::knowledge::Classification::Failed(_) => {
-                        panic!("fixture collection has exact shape")
-                    }
-                },
-                AccessMissPolicy::Error,
-                session,
-            )
+            let mut file = carina_core::parser::ExpandedParsedFile::default();
+            file.replace_deferred_for_expressions(
+                carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    deferred.clone(),
+                ]),
+            );
+            file.expand_deferred_for_expressions(&iterables, session)
+                .map(|()| file.resources)
         },
     )
     .unwrap();
-    let carina_core::resource::ForExpansion::Expanded(children) = children else {
-        panic!("saved-plan snapshot fixture must expand");
-    };
     assert_eq!(children.len(), 1);
     assert_eq!(
         children[0].get_attr("name"),

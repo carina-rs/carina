@@ -194,11 +194,16 @@ struct PreparedExpansion<'a> {
     argument_placeholders: HashMap<String, ResolvedArgument<RelativeBindingName>>,
     condition_selections: crate::parser::retained::ConditionRecorder,
     selected_module_ifs: SelectedDeferredIfs,
-    argument_loop_addresses:
-        BTreeMap<usize, Vec<crate::resource::BoundForAddress<AbsoluteBindingAddress>>>,
+    argument_loops: BTreeMap<usize, PreparedModuleForIterable>,
     instance: crate::parser::RootBindingResolvedParsedFile,
     instance_judgements: Arc<CallerJudgements>,
     nested_binding_index: Arc<BindingIndex<'a>>,
+}
+
+struct PreparedModuleForIterable {
+    iterable: crate::resource::Substituted<ModuleResolvedValue>,
+    members:
+        Option<Vec<crate::resource::AdmittedForMember<ParserPlaceholder, AbsoluteBindingAddress>>>,
 }
 
 struct ExpansionFrame<'a> {
@@ -983,21 +988,25 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                 .collect(),
         };
 
-        let argument_loop_addresses = admit_module_argument_loops(module, &module_scope_resolver)
+        let argument_loops = admit_module_argument_loops(module, &module_scope_resolver)
             .map_err(contextualize_access_error)?;
         let scope_prefix = format!("{}.", module_instance_scope.key());
         let mut expanded_intra_module_bindings = intra_module_bindings.clone();
-        expanded_intra_module_bindings.extend(argument_loop_addresses.values().flatten().map(
-            |address| {
-                RelativeBindingName::new(
-                    address
-                        .binding_address()
-                        .as_str()
-                        .strip_prefix(&scope_prefix)
-                        .expect("admitted child belongs to this module instance"),
-                )
-            },
-        ));
+        expanded_intra_module_bindings.extend(
+            argument_loops
+                .values()
+                .flat_map(|prepared| prepared.members.iter().flatten())
+                .map(|member| {
+                    RelativeBindingName::new(
+                        member
+                            .address()
+                            .binding_address()
+                            .as_str()
+                            .strip_prefix(&scope_prefix)
+                            .expect("admitted child belongs to this module instance"),
+                    )
+                }),
+        );
         module_scope_resolver.local_bindings = &expanded_intra_module_bindings;
 
         // A module-argument condition is decided only after the call-site
@@ -1086,7 +1095,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             argument_placeholders,
             condition_selections,
             selected_module_ifs,
-            argument_loop_addresses,
+            argument_loops,
             instance,
             nested_binding_index,
         })
@@ -1177,7 +1186,7 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
             argument_placeholders,
             condition_selections,
             selected_module_ifs,
-            mut argument_loop_addresses,
+            mut argument_loops,
             instance,
             instance_judgements: _,
             nested_binding_index: _,
@@ -1513,31 +1522,20 @@ impl<P: TypeResolutionPolicy> ModuleResolver<'_, P> {
                     ),
                     DeferredForBody::ModuleCall(_) => (None, None),
                 };
+                let (iterable, members) = match argument_loops.remove(&index) {
+                    Some(prepared) => (Some(prepared.iterable), prepared.members),
+                    None => (None, None),
+                };
                 let expanded = expand_parsed_deferred_for_expression(
                     deferred,
+                    iterable,
                     dependency_values,
                     &expanded_call,
                     &module_scope_resolver,
                 )
                 .map_err(|error| error.with_optional_source_file(source_file))?;
-                if let Some(addresses) = argument_loop_addresses.remove(&index) {
-                    resources.extend(expanded.expand_admitted_children(addresses).map_err(
-                        |error| {
-                            let location = expanded
-                                .site()
-                                .iterable_location
-                                .expect("authored iterable");
-                            function_substitution_error(
-                                    ParseError::for_admission_failure(
-                                        crate::resource::ForAdmissionFailure::<
-                                            AbsoluteBindingAddress,
-                                        >::Shape(error),
-                                        location,
-                                    ),
-                                    expanded.line(),
-                                )
-                        },
-                    )?);
+                if let Some(members) = members {
+                    resources.extend(expanded.expand_admitted_children(members));
                     Ok(None)
                 } else {
                     Ok(Some(expanded))
@@ -4066,10 +4064,7 @@ fn resolve_module_constraint_expression(
 fn admit_module_argument_loops(
     module: &ParsedFile,
     resolver: &ModuleScopeResolver<'_>,
-) -> Result<
-    BTreeMap<usize, Vec<crate::resource::BoundForAddress<AbsoluteBindingAddress>>>,
-    ArgumentSubstitutionError,
-> {
+) -> Result<BTreeMap<usize, PreparedModuleForIterable>, ArgumentSubstitutionError> {
     let mut admitted = BTreeMap::new();
     for (index, deferred) in module.parsed_deferred_for_expressions().iter().enumerate() {
         let crate::parser::DeferredForTarget::Bound(target) = deferred.target() else {
@@ -4077,14 +4072,10 @@ fn admit_module_argument_loops(
         };
         if !matches!(&deferred.body, DeferredForBody::Resource(_))
             || !matches!(&deferred.binding, crate::parser::ForBinding::Simple(_))
-            || !deferred
-                .site()
-                .address_pending
-                .is_some_and(|pending| pending.module_arguments_only())
         {
             continue;
         }
-        let (iterable, _) = resolve_module_value(&deferred.iterable, resolver)?.into_parts();
+        let (iterable, origin) = resolve_module_for_iterable(deferred, resolver)?.into_parts();
         let location = deferred
             .site()
             .iterable_location
@@ -4101,17 +4092,15 @@ fn admit_module_argument_loops(
         let target = target
             .clone()
             .map_bindings(&mut |binding| resolver.scope.resolve(binding));
-        match crate::resource::admit_bound_for_addresses(
+        let members = match crate::resource::admit_bound_for_addresses(
             &deferred.binding,
             &target,
             crate::resource::knowledge::ClassifiedRef::from(&classification),
             crate::resource::ForAddressMoment::Validation,
         ) {
-            Ok(crate::resource::ForAddressAdmission::Admitted(addresses)) => {
-                admitted.insert(index, addresses);
-            }
+            Ok(crate::resource::ForAddressAdmission::Admitted(members)) => Some(members),
             Ok(crate::resource::ForAddressAdmission::Defer(_))
-            | Err(crate::resource::ForAdmissionFailure::Shape(_)) => {}
+            | Err(crate::resource::ForAdmissionFailure::Shape(_)) => None,
             Ok(crate::resource::ForAddressAdmission::Reject(error)) => {
                 return Err(function_substitution_error(
                     ParseError::for_key(error, location),
@@ -4124,13 +4113,39 @@ fn admit_module_argument_loops(
                     deferred.line(),
                 ));
             }
-        }
+        };
+        admitted.insert(
+            index,
+            PreparedModuleForIterable {
+                iterable: crate::resource::Substituted::new(iterable, origin),
+                members,
+            },
+        );
     }
     Ok(admitted)
 }
 
+fn resolve_module_for_iterable(
+    deferred: &ParsedDeferredForExpression<ParserPlaceholder, RelativeBindingName>,
+    resolver: &ModuleScopeResolver<'_>,
+) -> Result<crate::resource::Substituted<ModuleResolvedValue>, ArgumentSubstitutionError> {
+    // Retain undefined bare iterables for the source-owned finalization
+    // diagnostic, which collects all such errors in the module.
+    if matches!(
+        deferred.parts().iterable_state,
+        ParsedDeferredForIterableState::UndefinedIdentifier { name: _ }
+    ) {
+        substitute_module_value(&deferred.iterable, resolver.arguments.arguments, |value| {
+            Ok(value.clone().resolve_module(resolver.scope))
+        })
+    } else {
+        resolve_module_value(&deferred.iterable, resolver)
+    }
+}
+
 fn expand_parsed_deferred_for_expression(
     deferred: &ParsedDeferredForExpression<ParserPlaceholder, RelativeBindingName>,
+    resolved_iterable: Option<crate::resource::Substituted<ModuleResolvedValue>>,
     dependency_values: Option<&IndexMap<String, Value>>,
     module_call: &crate::resource::ExpandedCompositionCall,
     resolver: &ModuleScopeResolver<'_>,
@@ -4182,20 +4197,9 @@ fn expand_parsed_deferred_for_expression(
         iterable_state.clone()
     };
 
-    // A bare, unbound iterable is retained specifically so the finalization
-    // seam can emit the parser's source-owned UndefinedIdentifier diagnostic
-    // and collect every such error in the module. It must still cross this
-    // phase as an absolute value, but checking membership here would replace
-    // that diagnostic with the expander's first-error-only "unknown binding".
-    let iterable = if matches!(
-        &iterable_state,
-        ParsedDeferredForIterableState::UndefinedIdentifier { name: _ }
-    ) {
-        substitute_module_value(iterable, resolver.arguments.arguments, |value| {
-            Ok(value.clone().resolve_module(resolver.scope))
-        })?
-    } else {
-        resolve_module_value(iterable, resolver)?
+    let iterable = match resolved_iterable {
+        Some(iterable) => iterable,
+        None => resolve_module_for_iterable(deferred, resolver)?,
     };
     let (iterable, iterable_origin) = iterable.into_parts();
     let mut body = match body {

@@ -1068,12 +1068,6 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             let Some(bound) = site.target.bound_binding_address() else {
                 continue;
             };
-            if !site
-                .address_pending
-                .is_some_and(|pending| pending.module_arguments_only())
-            {
-                continue;
-            }
             let crate::parser::DeferredForTarget::Bound(target) = site.target else {
                 continue;
             };

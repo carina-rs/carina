@@ -587,6 +587,172 @@ fn partial_argument_module(item: &str) -> Scenario {
     scenario
 }
 
+fn expression_argument_module(arguments: &str, iterable: &str, supplied: &str) -> Scenario {
+    let scenario = Scenario::new();
+    fs::create_dir(scenario.project.join("mod")).unwrap();
+    scenario.write(
+        "mod/main.crn",
+        &format!(
+            "{arguments}\nlet inner = for y in {iterable} {{ mock.test.resource {{ name = y }} }}\n"
+        ),
+    );
+    scenario.write(
+        "resources.crn",
+        &format!("let m = use {{ source = './mod' }}\nlet inst = m {{ {supplied} }}\n"),
+    );
+    scenario
+}
+
+fn assert_module_expression_expands(
+    arguments: &str,
+    iterable: &str,
+    supplied: &str,
+    children: &[&str],
+) {
+    let scenario = expression_argument_module(arguments, iterable, supplied);
+    scenario.write(
+        "mod/sink.crn",
+        "let sink = mock.test.resource { name = 'sink' comment = inner['z'].identifier }\n",
+    );
+    let output = scenario.carina(&["validate", "."]);
+    success(
+        "validate module iterable expression and sibling reference",
+        &output,
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    for child in children {
+        assert!(text.contains(child), "missing {child}: {text}");
+    }
+    assert!(!text.contains("inner[?]"), "{text}");
+
+    let output = scenario.carina(&["plan", "--json", "."]);
+    success(
+        "plan module iterable expression and sibling reference",
+        &output,
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).expect("JSON plan");
+    let mut expected = children.to_vec();
+    expected.push("inst.sink");
+    expected.sort();
+    assert_eq!(effect_bindings(&plan, "Create"), expected, "{plan:#}");
+    let sink = plan["plan"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|effect| effect.get("Create"))
+        .find(|resource| resource["binding"] == "inst.sink")
+        .expect("sibling sink");
+    assert_eq!(
+        sink["value_dependencies"][0]["identity"], "inst.inner.z",
+        "{sink:#}"
+    );
+    assert!(
+        sink["attributes"]["comment"]
+            .to_string()
+            .contains("inst.inner.z"),
+        "{sink:#}"
+    );
+}
+
+#[test]
+fn for_value_keys_module_expression_interpolation() {
+    assert_module_expression_expands(
+        "arguments { prefix: String }",
+        r#"["${prefix}-a", 'z']"#,
+        "prefix = 'dev'",
+        &["inst.inner['dev-a']", "inst.inner.z"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_expression_concat() {
+    assert_module_expression_expands(
+        "arguments { names: list(String) }",
+        "concat(names, ['z'])",
+        "names = ['a']",
+        &["inst.inner.a", "inst.inner.z"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_expression_member_function() {
+    assert_module_expression_expands(
+        "arguments { item: String }",
+        "[upper(item), 'z']",
+        "item = 'a'",
+        &["inst.inner.A", "inst.inner.z"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_expression_split() {
+    assert_module_expression_expands(
+        "arguments { csv: String }",
+        "split(',', csv)",
+        "csv = 'a,z'",
+        &["inst.inner.a", "inst.inner.z"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_expression_keys() {
+    assert_module_expression_expands(
+        "arguments { m: map(String) }",
+        "keys(m)",
+        "m = { a = 'first', z = 'last' }",
+        &["inst.inner.a", "inst.inner.z"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_expression_bare_argument() {
+    assert_module_expression_expands(
+        "arguments { names: list(String) }",
+        "names",
+        "names = ['a', 'z']",
+        &["inst.inner.a", "inst.inner.z"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_expression_without_argument() {
+    assert_module_expression_expands(
+        "arguments { marker: String = 'unused' }",
+        "concat(['a'], ['z'])",
+        "",
+        &["inst.inner.a", "inst.inner.z"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_expression_provider_iterable_stays_deferred() {
+    let scenario = expression_argument_module(
+        "arguments { names: list(String) }",
+        "concat(names, ['z'])",
+        "names = seed.generated_strings",
+    );
+    scenario.write(
+        "seed.crn",
+        "let seed = mock.test.deferred_source { name = 'seed' }\n",
+    );
+    let output = scenario.carina(&["validate", "."]);
+    success("validate provider-backed module iterable", &output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("inst.inner[?]"));
+    let output = scenario.carina(&["plan", "--json", "."]);
+    success("plan provider-backed module iterable", &output);
+    let plan: Value = serde_json::from_slice(&output.stdout).expect("JSON plan");
+    assert_eq!(effect_bindings(&plan, "Create"), ["seed"]);
+    assert!(
+        plan["plan"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|effect| effect.get("DeferredCreate").is_some()),
+        "{plan:#}"
+    );
+    assert!(plan.to_string().contains("inst.inner[?]"), "{plan:#}");
+}
+
 fn assert_module_loop_caller_scope(partial: bool, shadowed: bool) {
     let scenario = Scenario::new();
     fs::create_dir(scenario.project.join("child")).unwrap();

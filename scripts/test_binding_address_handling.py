@@ -8,6 +8,14 @@ spec.loader.exec_module(boundary)
 
 
 class BindingAddressBoundaryTests(unittest.TestCase):
+    def test_rejects_quoted_key_consumer_spelling(self):
+        for expression in [
+            'format!("{binding}[\'{key}\']")',
+            'write!(output, "{binding}[\'{key}\']")',
+        ]:
+            with self.subTest(expression=expression):
+                self.assertTrue(boundary.violations("carina-core/src/new_consumer.rs", expression))
+
     def test_external_test_module_does_not_hide_production_code(self):
         for declaration in ["#[cfg(test)]\nmod tests;", "#[cfg(test)] mod tests;"]:
             with self.subTest(declaration=declaration):

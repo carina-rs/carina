@@ -70,10 +70,10 @@ use crate::schema::{
 pub use binding_address::absolute_binding_address_for_test;
 pub use binding_address::{
     AbsoluteBindingAddress, BindingAddress, BoundForAddress, CheckedBindingAddress,
-    ForAddressDefer, ForExpansion, ForKeyError, RelativeBindingName, decompose_binding_address,
+    ForAddressDefer, ForKeyError, RelativeBindingName, decompose_binding_address,
 };
 pub(crate) use binding_address::{
-    BindingLookup, ForAddressAdmission, ForAddressMoment, ForAdmissionFailure,
+    AdmittedForMember, BindingLookup, ForAddressAdmission, ForAddressMoment, ForAdmissionFailure,
     admit_bound_for_addresses, classify_for_key_type, module_argument_placeholder,
 };
 pub use directive_expr::{

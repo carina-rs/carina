@@ -38,6 +38,51 @@ impl<B: super::BindingAddress> BoundForAddress<B> {
     }
 }
 
+/// Admission retains each iterable member with the address minted for it.
+/// Bound expansion accepts this unit; callers cannot pair an address with a
+/// separately resolved iterable.
+#[derive(Debug, Clone)]
+pub(crate) struct AdmittedForMember<P: super::PlaceholderKind, B: BindingAddress> {
+    address: BoundForAddress<B>,
+    value: super::Value<P, B>,
+    index: Option<i64>,
+    key: Option<String>,
+}
+
+impl<P: super::PlaceholderKind, B: BindingAddress> AdmittedForMember<P, B> {
+    pub(crate) fn address(&self) -> &BoundForAddress<B> {
+        &self.address
+    }
+
+    pub(crate) fn value(&self) -> &super::Value<P, B> {
+        &self.value
+    }
+
+    pub(crate) fn index(&self) -> Option<i64> {
+        self.index
+    }
+
+    pub(crate) fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+}
+
+fn admitted_member_value<P: super::PlaceholderKind, B: BindingAddress>(
+    member: super::knowledge::ClassifiedRef<'_, '_, P, B>,
+    moment: ForAddressMoment,
+) -> Result<super::Value<P, B>, ForAdmissionFailure<B>> {
+    use super::knowledge::{ClassifiedRef, PlanIterable};
+    if moment == ForAddressMoment::Parse {
+        return Ok(member.diagnostic_value().clone());
+    }
+    Ok(match member {
+        ClassifiedRef::Known(value) => value.to_value(),
+        ClassifiedRef::Shape(value) => PlanIterable::from_shape(value.clone())?.for_expansion(),
+        ClassifiedRef::Pending(value) => value.to_value(),
+        ClassifiedRef::Failed(value) => return Err(value.error().into()),
+    })
+}
+
 /// Key material is obtainable only from an unflagged String classification.
 struct ValueKey(String);
 
@@ -131,15 +176,11 @@ pub(crate) fn classify_for_key_type(
 pub struct ForAddressDefer {
     phase: super::knowledge::Phase,
     element: Option<usize>,
-    module_arguments_only: bool,
 }
 
 impl ForAddressDefer {
     pub(crate) fn element(&self) -> Option<usize> {
         self.element
-    }
-    pub(crate) fn module_arguments_only(&self) -> bool {
-        self.module_arguments_only
     }
 }
 
@@ -152,8 +193,8 @@ pub(crate) enum ForAddressMoment {
 }
 
 #[derive(Debug)]
-pub(crate) enum ForAddressAdmission<B: BindingAddress> {
-    Admitted(Vec<BoundForAddress<B>>),
+pub(crate) enum ForAddressAdmission<P: super::PlaceholderKind, B: BindingAddress> {
+    Admitted(Vec<AdmittedForMember<P, B>>),
     Defer(ForAddressDefer),
     Reject(ForKeyError),
 }
@@ -166,23 +207,6 @@ pub(crate) enum ForAdmissionFailure<B: BindingAddress> {
     Knowledge(#[from] super::knowledge::KnowledgeError<B>),
 }
 
-/// Exact membership may still be waiting for plan-time String values.
-#[derive(Debug)]
-pub enum ForExpansion<T> {
-    Expanded(T),
-    Deferred,
-}
-
-impl<T> ForExpansion<T> {
-    #[cfg(test)]
-    pub(crate) fn expect_expanded(self) -> T {
-        match self {
-            Self::Expanded(value) => value,
-            Self::Deferred => panic!("expected concrete expansion"),
-        }
-    }
-}
-
 /// Every bound expansion crosses this three-way decision before deferring or
 /// obtaining child-address authority. Protection and knowledge failures are
 /// resolved here, before collection-shape dispatch at any consumer.
@@ -191,9 +215,9 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
     target: &crate::parser::BoundDeferredTarget<B>,
     members: super::knowledge::ClassifiedRef<'_, '_, P, B>,
     moment: ForAddressMoment,
-) -> Result<ForAddressAdmission<B>, ForAdmissionFailure<B>> {
+) -> Result<ForAddressAdmission<P, B>, ForAdmissionFailure<B>> {
     use super::ConcreteValueRef;
-    use super::knowledge::{ClassifiedRef, PendingReason, Phase};
+    use super::knowledge::{ClassifiedRef, Phase};
     use crate::parser::ForBinding;
     use ForAddressAdmission::{Admitted, Defer, Reject};
     let base = target.binding_address();
@@ -205,10 +229,6 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
             return Ok(Defer(ForAddressDefer {
                 phase: pending.phase(),
                 element: None,
-                module_arguments_only: pending.reason() == &PendingReason::ModuleArgument
-                    && pending
-                        .sites()
-                        .all(|site| site.reason() == &PendingReason::ModuleArgument),
             }));
         }
         ClassifiedRef::Failed(failure) => return Err(failure.error().into()),
@@ -230,7 +250,7 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
     match binding {
         ForBinding::Simple(_) => {
             enum Member<B: BindingAddress> {
-                Key(ValueKey),
+                Key(ValueKey, super::ValueString),
                 Pending(ForAddressDefer),
                 Reject(ForKeyError),
                 Failed(super::knowledge::KnowledgeError<B>),
@@ -247,7 +267,7 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
                         match item.concrete() {
                             Some(ConcreteValueRef::String(value)) => {
                                 match ValueKey::from_string(value) {
-                                    Ok(key) => Member::Key(key),
+                                    Ok(key) => Member::Key(key, value.clone()),
                                     Err(error) => Member::Reject(error),
                                 }
                             }
@@ -257,11 +277,6 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
                                     Member::Pending(ForAddressDefer {
                                         phase: pending.phase(),
                                         element: Some(element),
-                                        module_arguments_only: pending.reason()
-                                            == &PendingReason::ModuleArgument
-                                            && pending.sites().all(|site| {
-                                                site.reason() == &PendingReason::ModuleArgument
-                                            }),
                                     })
                                 }
                                 ClassifiedRef::Failed(failure) => Member::Failed(failure.error()),
@@ -276,7 +291,7 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
                 strings
                     .iter()
                     .map(|value| match ValueKey::from_string(value) {
-                        Ok(key) => Member::Key(key),
+                        Ok(key) => Member::Key(key, value.clone()),
                         Err(error) => Member::Reject(error),
                     })
                     .collect()
@@ -296,18 +311,12 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
             }) {
                 return Err(error.into());
             }
-            let module_arguments_only = items.iter().all(|item| match item {
-                Member::Key(_) => true,
-                Member::Pending(pending) => pending.module_arguments_only,
-                Member::Reject(_) | Member::Failed(_) => false,
-            });
             if moment == ForAddressMoment::Parse
-                && let Some(mut pending) = items.iter().find_map(|item| match item {
+                && let Some(pending) = items.iter().find_map(|item| match item {
                     Member::Pending(pending) => Some(*pending),
                     _ => None,
                 })
             {
-                pending.module_arguments_only = module_arguments_only;
                 return Ok(Defer(pending));
             }
             let mut seen = std::collections::BTreeMap::new();
@@ -315,8 +324,8 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
             let mut pending = None;
             for (index, item) in items.into_iter().enumerate() {
                 let element = index + 1;
-                let key = match item {
-                    Member::Key(key) => key,
+                let (key, value) = match item {
+                    Member::Key(key, value) => (key, value),
                     Member::Reject(error) => return Ok(Reject(error)),
                     Member::Failed(error) => return Err(error.into()),
                     Member::Pending(waiting) => {
@@ -351,51 +360,77 @@ pub(crate) fn admit_bound_for_addresses<P: super::PlaceholderKind, B: BindingAdd
                 {
                     return Ok(Reject(ForKeyError::NonRoundTrippingKey { element }));
                 }
-                keys.push(key);
+                keys.push((key, value));
             }
-            if let Some(mut pending) = pending {
-                pending.module_arguments_only = module_arguments_only;
+            if let Some(pending) = pending {
                 return Ok(Defer(pending));
             }
             Ok(Admitted(
                 keys.into_iter()
-                    .map(|key| BoundForAddress {
-                        binding: binding_with_map_key(base, &key.0.into()),
+                    .map(|(key, value)| AdmittedForMember {
+                        address: BoundForAddress {
+                            binding: binding_with_map_key(base, &key.0.into()),
+                        },
+                        value: super::Value::Concrete(super::ConcreteValue::String(value)),
+                        index: None,
+                        key: None,
                     })
                     .collect(),
             ))
         }
         ForBinding::Indexed(_, _) => {
-            let len = if let Some(items) = members.list() {
-                items.len()
+            let items = if let Some(items) = members.list() {
+                items
+                    .into_iter()
+                    .map(|item| admitted_member_value(item, moment))
+                    .collect::<Result<Vec<_>, _>>()?
             } else if let Some(ConcreteValueRef::StringList(strings)) = members.concrete() {
-                strings.len()
+                strings
+                    .iter()
+                    .cloned()
+                    .map(|value| super::Value::Concrete(super::ConcreteValue::String(value)))
+                    .collect()
             } else {
                 return Err(shape("list"));
             };
             Ok(Admitted(
-                (0..len)
-                    .map(|index| BoundForAddress {
-                        binding: binding_with_index(
-                            base,
-                            index
-                                .try_into()
-                                .expect("loop index fits in signed address domain"),
-                        ),
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let index = index
+                            .try_into()
+                            .expect("loop index fits in signed address domain");
+                        AdmittedForMember {
+                            address: BoundForAddress {
+                                binding: binding_with_index(base, index),
+                            },
+                            value,
+                            index: Some(index),
+                            key: None,
+                        }
                     })
                     .collect(),
             ))
         }
         ForBinding::Map(_, _) => {
             let items = members.map().ok_or_else(|| shape("map"))?;
-            let mut keys: Vec<_> = items.keys().copied().collect();
-            keys.sort();
+            let mut items: Vec<_> = items.into_iter().collect();
+            items.sort_by_key(|(key, _)| *key);
             Ok(Admitted(
-                keys.into_iter()
-                    .map(|key| BoundForAddress {
-                        binding: binding_with_map_key(base, &key.into()),
+                items
+                    .into_iter()
+                    .map(|(key, value)| {
+                        Ok(AdmittedForMember {
+                            address: BoundForAddress {
+                                binding: binding_with_map_key(base, &key.into()),
+                            },
+                            value: admitted_member_value(value, moment)?,
+                            index: None,
+                            key: Some(key.to_owned()),
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<_, ForAdmissionFailure<B>>>()?,
             ))
         }
     }

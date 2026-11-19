@@ -359,115 +359,134 @@ pub(super) fn materialize_deferred_create<
                 error.into(),
             ),
         })?;
-    let admitted = if let DeferredForTarget::Bound(bound) = template.target() {
-        match crate::resource::admit_bound_for_addresses(
-            &template.binding,
-            bound,
-            crate::resource::knowledge::ClassifiedRef::from(&classified),
-            crate::resource::ForAddressMoment::Apply,
-        ) {
-            Ok(crate::resource::ForAddressAdmission::Admitted(addresses)) => Some(addresses),
-            Ok(crate::resource::ForAddressAdmission::Defer(_)) => {
+    let require_iterable = |classified| {
+        Ok(match classified {
+            crate::resource::knowledge::Classification::Known(value) => {
+                crate::resource::knowledge::PlanIterable::from_known(value).ok_or_else(|| {
+                    DeferredCreateFailure::IterableUnknown {
+                        file: template.file().map(str::to_owned),
+                        line: template.line(),
+                        binding: Box::new(template.target().clone()),
+                        expression: expression.clone(),
+                        candidates: candidates.clone(),
+                    }
+                })?
+            }
+            crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                crate::resource::knowledge::PlanIterable::from_shape(value).map_err(|_| {
+                    DeferredCreateFailure::IterableUnknown {
+                        file: template.file().map(str::to_owned),
+                        line: template.line(),
+                        binding: Box::new(template.target().clone()),
+                        expression: expression.clone(),
+                        candidates: candidates.clone(),
+                    }
+                })?
+            }
+            crate::resource::knowledge::Classification::Failed(_) => {
                 return Err(DeferredCreateFailure::IterableUnknown {
                     file: template.file().map(str::to_owned),
                     line: template.line(),
                     binding: Box::new(template.target().clone()),
-                    expression,
-                    candidates,
+                    expression: expression.clone(),
+                    candidates: candidates.clone(),
                 });
             }
-            Ok(crate::resource::ForAddressAdmission::Reject(error)) => {
-                return Err(DeferredCreateFailure::ValueAccess {
-                    error: error.into(),
-                });
-            }
-            // The iterable view/expander below owns non-key shape diagnostics.
-            Err(crate::resource::ForAdmissionFailure::Shape(_)) => None,
-            Err(error @ crate::resource::ForAdmissionFailure::Knowledge(_)) => {
-                return Err(DeferredCreateFailure::ValueAccess {
-                    error: DeferredForExpansionError::admission_failure(
-                        template.line(),
-                        expression.clone(),
-                        error,
-                    ),
-                });
-            }
-        }
-    } else {
-        None
-    };
-    let iterable = match classified {
-        crate::resource::knowledge::Classification::Known(value) => {
-            crate::resource::knowledge::PlanIterable::from_known(value).ok_or_else(|| {
-                DeferredCreateFailure::IterableUnknown {
+            crate::resource::knowledge::Classification::Pending(_) => {
+                return Err(DeferredCreateFailure::IterableUnknown {
                     file: template.file().map(str::to_owned),
                     line: template.line(),
                     binding: Box::new(template.target().clone()),
                     expression: expression.clone(),
                     candidates: candidates.clone(),
+                });
+            }
+        })
+    };
+    let members = match template.target() {
+        DeferredForTarget::Bound(bound) => {
+            match crate::resource::admit_bound_for_addresses(
+                &template.binding,
+                bound,
+                crate::resource::knowledge::ClassifiedRef::from(&classified),
+                crate::resource::ForAddressMoment::Apply,
+            ) {
+                Ok(crate::resource::ForAddressAdmission::Admitted(members)) => {
+                    Ok(crate::parser::ForChildMembers::Bound(members))
                 }
-            })?
+                Ok(crate::resource::ForAddressAdmission::Defer(_)) => {
+                    return Err(DeferredCreateFailure::IterableUnknown {
+                        file: template.file().map(str::to_owned),
+                        line: template.line(),
+                        binding: Box::new(template.target().clone()),
+                        expression: expression.clone(),
+                        candidates: candidates.clone(),
+                    });
+                }
+                Ok(crate::resource::ForAddressAdmission::Reject(error)) => {
+                    return Err(DeferredCreateFailure::ValueAccess {
+                        error: error.into(),
+                    });
+                }
+                Err(crate::resource::ForAdmissionFailure::Shape(mismatch)) => {
+                    // Preserve the existing scalar-iterable rejection before the
+                    // collection binding-pattern diagnostic.
+                    require_iterable(classified)?;
+                    Err(DeferredForExpansionError::ShapeMismatch(mismatch))
+                }
+                Err(error @ crate::resource::ForAdmissionFailure::Knowledge(_)) => {
+                    return Err(DeferredCreateFailure::ValueAccess {
+                        error: DeferredForExpansionError::admission_failure(
+                            template.line(),
+                            expression.clone(),
+                            error,
+                        ),
+                    });
+                }
+            }
         }
-        crate::resource::knowledge::Classification::ShapeKnown(value) => {
-            crate::resource::knowledge::PlanIterable::from_shape(value).map_err(|_| {
-                DeferredCreateFailure::IterableUnknown {
+        DeferredForTarget::Unbound { template: origin } => {
+            Ok(crate::parser::ForChildMembers::Unbound {
+                template: origin,
+                binding: &template.binding,
+                iterable: require_iterable(classified)?.for_expansion(),
+            })
+        }
+    };
+    let resources = members
+        .and_then(|members| {
+            crate::parser::expand_deferred_children_with_members(
+                template,
+                members,
+                miss_policy,
+                identity_inputs.type_checks,
+            )
+        })
+        .map_err(|error| match error {
+            DeferredForExpansionError::ShapeMismatch(mismatch) => {
+                DeferredCreateFailure::ShapeMismatch {
                     file: template.file().map(str::to_owned),
                     line: template.line(),
                     binding: Box::new(template.target().clone()),
-                    expression: expression.clone(),
-                    candidates: candidates.clone(),
+                    expression: crate::value::format_value(&template.iterable),
+                    candidates: template.reference_candidates().into_iter().collect(),
+                    mismatch: Box::new(mismatch),
                 }
-            })?
-        }
-        crate::resource::knowledge::Classification::Failed(_) => {
-            return Err(DeferredCreateFailure::IterableUnknown {
-                file: template.file().map(str::to_owned),
-                line: template.line(),
-                binding: Box::new(template.target().clone()),
-                expression: expression.clone(),
-                candidates: candidates.clone(),
-            });
-        }
-        crate::resource::knowledge::Classification::Pending(_) => {
-            return Err(DeferredCreateFailure::IterableUnknown {
-                file: template.file().map(str::to_owned),
-                line: template.line(),
-                binding: Box::new(template.target().clone()),
-                expression: expression.clone(),
-                candidates: candidates.clone(),
-            });
-        }
-    };
-    let resources = crate::parser::expand_deferred_children_with_addresses(
-        template,
-        iterable,
-        admitted,
-        miss_policy,
-        identity_inputs.type_checks,
-    )
-    .map_err(|error| match error {
-        DeferredForExpansionError::ShapeMismatch(mismatch) => {
-            DeferredCreateFailure::ShapeMismatch {
-                file: template.file().map(str::to_owned),
-                line: template.line(),
-                binding: Box::new(template.target().clone()),
-                expression: crate::value::format_value(&template.iterable),
-                candidates: template.reference_candidates().into_iter().collect(),
-                mismatch: Box::new(mismatch),
             }
-        }
-        DeferredForExpansionError::ForKey(error) => DeferredCreateFailure::ValueAccess {
-            error: error.into(),
-        },
-        error @ (DeferredForExpansionError::UnavailableSecret(_)
-        | DeferredForExpansionError::ValueAccess { .. }
-        | DeferredForExpansionError::Resolution { .. }
-        | DeferredForExpansionError::Knowledge { .. }
-        | DeferredForExpansionError::Evaluation { .. }) => {
-            DeferredCreateFailure::ValueAccess { error }
-        }
-        DeferredForExpansionError::Directives(error) => DeferredCreateFailure::Directives { error },
-    })?;
+            DeferredForExpansionError::ForKey(error) => DeferredCreateFailure::ValueAccess {
+                error: error.into(),
+            },
+            error @ (DeferredForExpansionError::UnavailableSecret(_)
+            | DeferredForExpansionError::ValueAccess { .. }
+            | DeferredForExpansionError::Resolution { .. }
+            | DeferredForExpansionError::Knowledge { .. }
+            | DeferredForExpansionError::Evaluation { .. }) => {
+                DeferredCreateFailure::ValueAccess { error }
+            }
+            DeferredForExpansionError::Directives(error) => {
+                DeferredCreateFailure::Directives { error }
+            }
+        })?;
     let mut resources = resources;
     if matches!(
         template.target(),

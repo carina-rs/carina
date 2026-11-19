@@ -833,7 +833,7 @@ mod for_key_type_tests {
                 ));
             }
             if let Ok(ForAddressAdmission::Admitted(addresses)) = admission {
-                let minted = addresses[0].binding_address().as_str();
+                let minted = addresses[0].address().binding_address().as_str();
                 let canonical = crate::utils::canonicalize_map_key_address(minted);
                 assert_eq!(
                     crate::resource::decompose_binding_address(&canonical)

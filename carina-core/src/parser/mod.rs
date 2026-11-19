@@ -12,7 +12,7 @@ pub use analysis::{
 mod ast;
 #[cfg(test)]
 pub(crate) use ast::expand_deferred_children_for_test;
-pub(crate) use ast::expand_deferred_children_with_addresses;
+pub(crate) use ast::{ForChildMembers, expand_deferred_children_with_members};
 mod authored_text;
 mod failed_file;
 pub use failed_file::{
@@ -125,7 +125,7 @@ pub use ast::{
     RootBindingResolvedInferredFile, RootBindingResolvedParsedFile, SavedDeferredForExpression,
     ShapeMismatch, SourceFileId, SourceSpan, StateBlock, StateBlockAddress, TopLevelResourceRef,
     TypeExpr, UntilPredicateAst, UpstreamState, UseStatement, UserFunction, UserFunctionBody,
-    ValidateExpr, ValidationBlock, WaitBinding, expand_deferred_children,
+    ValidateExpr, ValidationBlock, WaitBinding,
 };
 pub(crate) use ast::{
     BareBindingSource, DeclarationSource, DeferredForResourceExpressionError, ParsedBareBindingUse,

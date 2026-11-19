@@ -30,7 +30,7 @@ SPELLING = re.compile(
     r"|\.ends_with\(\s*['\"]\]['\"]\s*\)"
     r'''|\.strip_suffix\(\s*"'\]"\s*\)'''
     r'|(?:format!\s*\(\s*|write!\s*\(\s*[^,\n]+,\s*)"[^"\n]*'
-    r'(?:\{[^}\n]*\}|[A-Za-z_][A-Za-z_0-9]*)\[\{[^}\n]*\}\]'
+    r"(?:\{[^}\n]*\}|[A-Za-z_][A-Za-z_0-9]*)\[(?:\{[^}\n]*\}|'\{[^}\n]*\}')\]"
 )
 KEY_SPELLING = re.compile(r"\bmap_key_address\s*\(")
 KEY_OWNERS = {"carina-core/src/resource/binding_address.rs", "carina-core/src/resource/loop_origin.rs", "carina-core/src/utils.rs"}
