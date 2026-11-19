@@ -1805,7 +1805,7 @@ impl<'a> IntoIterator for &'a SavedAttrs {
 /// `RedactedSecret` values. Persisted strings always remain strings.
 ///
 /// Raw JSON cannot be inserted after construction. State loaders call
-/// [`Self::from_encoded`] after versioned migrations rewrite legacy encodings;
+/// [`Self::from_encoded`] to validate current structural encodings;
 /// callers that already hold validated values use [`Self::from_persisted_values`].
 ///
 /// ```compile_fail
@@ -1975,8 +1975,7 @@ impl PersistedAttributes {
         })
     }
 
-    /// Validate JSON entering through the state-row load seam after versioned
-    /// migrations have rewritten legacy encodings.
+    /// Validate current persisted JSON entering through the state-row load seam.
     pub fn from_encoded(
         encoded: impl IntoIterator<Item = (String, serde_json::Value)>,
     ) -> Result<Self, PersistedAttributesError> {
@@ -12253,53 +12252,20 @@ mod tests {
         argon2::Argon2::default()
             .hash_password_into(material, b"carina-secret-v1", &mut output)
             .expect("hash pre-v12 fallback-salt fixture");
-        let encoded =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(format!("_secret:argon2:{}", hex::encode(output))),
-                "mock.test.resource",
-                "old",
-                "password",
-            )
-            .expect("migrate row-bound legacy digest");
+        let encoded = serde_json::json!({"$secret": format!(
+            "argon2-legacy:{}:{}", hex::encode(b"carina:mock.test.resource:old:password"), hex::encode(output)
+        )});
         let persisted =
-            PersistedValue::from_serialized_json(encoded).expect("migrated structural secret");
+            PersistedValue::from_serialized_json(encoded).expect("structural legacy secret");
         let crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
             crate::resource::SnapshotLeaf::RedactedSecret { hash },
-        )) = persisted.decode().expect("typed migrated secret")
+        )) = persisted.decode().expect("typed legacy secret")
         else {
-            panic!("migration must produce a typed redacted secret")
+            panic!("structural secret must decode as a typed redacted secret")
         };
 
         assert!(hash.verify(material));
         assert!(hash.encoded_digest().starts_with("argon2-legacy:"));
-    }
-
-    #[test]
-    fn state_row_upgrade_rejects_legacy_salt_too_long_for_its_digest_format() {
-        let error =
-            crate::resource::legacy_secret_migration::migrate_legacy_state_attribute_for_test(
-                serde_json::json!(format!("_secret:argon2:{}", "ab".repeat(32))),
-                "mock.test.resource",
-                &"x".repeat(5000),
-                "token",
-            )
-            .expect_err("an upgraded legacy digest must never exceed the parser's salt bound");
-        match error {
-            crate::resource::legacy_secret_migration::LegacySecretMigrationError::StateAttribute {
-                key,
-                source,
-            } => {
-                assert_eq!(key, "token");
-                assert!(matches!(
-                    *source,
-                    crate::resource::legacy_secret_migration::LegacySecretMigrationError::LegacySaltTooLong {
-                        actual,
-                        maximum: 4096,
-                    } if actual > 4096
-                ));
-            }
-            other => panic!("unexpected migration error: {other:?}"),
-        }
     }
 
     #[test]

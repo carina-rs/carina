@@ -2,7 +2,7 @@ use super::*;
 use carina_core::binding_index::LivePreApplyInputs;
 use carina_core::config_loader::get_base_dir;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
-use carina_core::effect::{Effect, ResolvedMovePairs, UnresolvedSavedEffect};
+use carina_core::effect::{Effect, UnresolvedSavedEffect};
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, NoopNormalizer, PatchOp, Provider,
     ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest,
@@ -892,72 +892,6 @@ fn saved_plan_secret_verification_errors_are_typed_and_distinct() {
     );
 }
 
-#[tokio::test]
-async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
-    let color_mode = crate::output_style::ColorMode::Plain;
-    let json = serde_json::json!({
-        "version": 10,
-        "serial": 1,
-        "lineage": "legacy-reserved-drift",
-        "carina_version": "0.4.0",
-        "resources": [{
-            "resource_type": "test.Resource",
-            "identity": "legacy",
-            "provider": "mock",
-            "identifier": "resource-123",
-            "attributes": {
-                "name": "kept",
-                "_binding": "legacy_binding",
-            },
-        }],
-        "exports": {},
-    });
-    let state_file = carina_state::check_and_migrate(&json.to_string())
-        .expect("legacy state should migrate")
-        .into_state();
-    let resource = Resource::with_provider("mock", "test.Resource", "legacy", None)
-        .with_attribute("name", string_value("kept"));
-    let id = resource.id.clone();
-    let planned_state = match state_file.build_state_for_resource(&id) {
-        carina_core::resource::Current::Absent(state) => state.into_state(),
-        carina_core::resource::Current::Present(present) => present.into_parts().0,
-        carina_core::resource::Current::MissingIdentifier(state) => state.into_state(),
-        carina_core::resource::Current::CreateInFlight(_) => {
-            panic!("legacy fixture must not produce an in-flight create")
-        }
-        carina_core::resource::Current::CreateOutcomeUnknown(_) => {
-            panic!("legacy fixture must not produce an unknown create outcome")
-        }
-    };
-    assert_eq!(
-        planned_state.attributes.keys().collect::<Vec<_>>(),
-        vec![&"name".to_string()]
-    );
-
-    let shared = ApplyTimeReadShared::default();
-    shared.created_roles.lock().unwrap().insert(
-        "legacy".to_string(),
-        HashMap::from([("name".to_string(), string_value("kept"))]),
-    );
-    let result = detect_drift_for_test(
-        color_mode,
-        &[resource],
-        &[crate::commands::plan::ReloadedCurrentStateEntry::managed(
-            id,
-            planned_state,
-        )],
-        &HistoricalResourceAddresses::from_plan(&Plan::new()),
-        &crate::provider_text_fixtures::boundary(Box::new(ApplyTimeReadProvider { shared })),
-        None,
-        &carina_core::schema::SchemaRegistry::new(),
-        ApplyTarget::Project(Path::new(".")),
-    )
-    .await
-    .expect("drift check should succeed");
-
-    assert_eq!(result.drift_messages(), None);
-}
-
 fn resolved(resource: Resource) -> ResolvedResource {
     crate::test_support::resolved(resource)
 }
@@ -1234,7 +1168,6 @@ for account_id in orgs.accounts {
 
         sorted_value_destroy_dependencies: vec![Default::default(); 1],
         sorted_explicit_destroy_dependencies: vec![Default::default(); 1],
-        legacy_dependency_classification: None,
     });
 
     let encoded = serde_json::to_value(&plan_file).expect("serialize current-format plan");
@@ -1374,7 +1307,6 @@ async fn run_saved_plan_schema_fingerprint_case(
 
         sorted_value_destroy_dependencies: vec![Default::default(); 1],
         sorted_explicit_destroy_dependencies: vec![Default::default(); 1],
-        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_schemas(contents, planning_schemas);
 
@@ -1640,7 +1572,6 @@ fn saved_plan_schema_check_preserves_current_state_only_references_after_reload(
 
         sorted_value_destroy_dependencies: Vec::new(),
         sorted_explicit_destroy_dependencies: Vec::new(),
-        legacy_dependency_classification: None,
     };
     let plan_file = record_with_test_schemas(contents, &schemas);
 
@@ -1947,7 +1878,6 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
 
         sorted_value_destroy_dependencies: Vec::new(),
         sorted_explicit_destroy_dependencies: Vec::new(),
-        legacy_dependency_classification: None,
     }
     .record_for_test(
         &ValidatedConfig::from_factories_for_test(
@@ -2019,7 +1949,7 @@ async fn saved_configuration_decode_failure_returns_command_error_without_panick
     let runtime = crate::test_support::TestCommandRuntime::new();
     let temp = tempfile::tempdir().unwrap();
     let mut document: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/module_binding_wire_compat/carina.v46.plan.json"
+        "../../../tests/fixtures/module_binding_wire_compat/carina.v47.plan.json"
     ))
     .unwrap();
     document["sorted_resources"] = serde_json::json!("invalid saved configuration");
@@ -2089,7 +2019,6 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
 
         sorted_value_destroy_dependencies: Vec::new(),
         sorted_explicit_destroy_dependencies: Vec::new(),
-        legacy_dependency_classification: None,
     });
     let encoded = serde_json::to_value(plan_file).expect("serialize plan fixture");
     let overlong = "a".repeat(4097);
@@ -2161,333 +2090,8 @@ async fn saved_plan_rejects_invalid_source_root_relative_composition_paths_as_co
     }
 }
 
-#[tokio::test]
-async fn saved_plan_persists_pending_state_migration_before_drift_return() {
-    let mut fixture = ApplyCancellationFixture::new();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let state_path = tmp.path().join("carina.state.json");
-    let mock_state_path = tmp.path().join("mock-provider-state.json");
-    let lineage = "11111111-1111-1111-1111-111111111111";
-    std::fs::write(
-        &state_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 6,
-            "serial": 7,
-            "lineage": lineage,
-            "carina_version": "0.0.0-test",
-            "resources": []
-        }))
-        .expect("serialize v6 state"),
-    )
-    .expect("write v6 state");
-    std::fs::write(
-        &mock_state_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 3, "states": {"mock-id": { "name": "drifted" }}
-        }))
-        .expect("serialize provider state"),
-    )
-    .expect("write provider state");
-
-    let mut resource = Resource::with_provider("mock", "test.resource", "example", None);
-    resource.set_attr("name", string_value("planned"));
-    let id = resource.id.clone();
-    let planned_state = State::<carina_core::resource::NoPlaceholder>::existing(
-        id.clone(),
-        HashMap::from([("name".to_string(), string_value("planned"))]),
-    )
-    .with_identifier("mock-id");
-    let loaded = carina_state::check_and_migrate(
-        &std::fs::read_to_string(&state_path).expect("read legacy state"),
-    )
-    .expect("decode legacy state")
-    .into_state();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
-        let mut configuration = carina_core::parser::ExpandedParsedFile::default();
-        configuration.resources = vec![resource.clone()];
-        configuration.into()
-    })
-    .expect("fixture migration graph");
-    let no_moves: Plan = Plan::new();
-    let moves = ResolvedMovePairs::from_saved_plan(no_moves.move_effects());
-    let migration = match loaded
-        .classify_legacy_graph(graph, &moves, Default::default())
-        .expect("legacy classification")
-    {
-        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
-        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
-            panic!("empty state must not need reads: {rows}")
-        }
-    };
-    let legacy_dependency_classification = Some(
-        migration
-            .report_and_validate(|warning| panic!("unexpected warning: {warning:?}"))
-            .expect("migration graph validates")
-            .classification,
-    );
-    let contents = PlanFileContents {
-        version: PlanFile::CURRENT_VERSION,
-        carina_version: "test".to_string(),
-        timestamp: "2026-10-16T00:00:00Z".to_string(),
-        source_path: carina_core::paths::PersistedPath::new(tmp.path()).unwrap(),
-        source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
-        state_lineage: Some(lineage.to_string()),
-        state_serial: Some(7),
-        provider_configs: saved_provider_configs(vec![ProviderConfig {
-            name: "mock".to_string(),
-            attributes: Default::default(),
-            default_tags: Default::default(),
-            source: None,
-            version: None,
-            revision: None,
-            unresolved_attributes: Default::default(),
-            binding: None,
-        }]),
-        backend_config: crate::commands::plan::SavedBackendConfig::default(),
-        plan: carina_core::plan::SnapshotPlan::default(),
-        sorted_resources: (vec![resolved_inner(resource.clone())])
-            .into_iter()
-            .map(|value| value.to_snapshot())
-            .collect(),
-        sorted_value_destroy_dependencies: vec![Default::default()],
-        sorted_explicit_destroy_dependencies: vec![Default::default()],
-        legacy_dependency_classification,
-        unresolved_resources: vec![resource]
-            .into_iter()
-            .map(|resource| resource.into_value_snapshot())
-            .map(|value| value.to_snapshot())
-            .collect(),
-        compositions: Vec::new(),
-        data_sources: Vec::new(),
-        data_source_origins: Vec::new(),
-        data_source_values: Vec::new(),
-        current_states: vec![crate::commands::plan::CurrentStateEntry::managed(
-            id,
-            planned_state,
-        )],
-        upstream_snapshot: Default::default(),
-        upstream_sources: Vec::new(),
-        wait_bindings: Vec::new(),
-    };
-    let plan_file = record_with_builtin_mock_schemas(contents);
-    let backend =
-        Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
-    fixture.use_mock_file(std::path::PathBuf::from(&mock_state_path));
-
-    let observer_factory = fixture.observer_factory();
-    let result = run_apply_from_plan_locked(
-        fixture.runtime(),
-        inspected_saved_plan(plan_file),
-        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        true,
-        backend,
-        StateLock::disabled_for_test(),
-        ApplyTarget::SavedPlan {
-            plan_file: Path::new("plan.json"),
-            source_dir: tmp.path(),
-        },
-        fixture.cancel_token(),
-        &observer_factory,
-        NonZeroUsize::new(1).expect("non-zero parallelism"),
-        false,
-    )
-    .await;
-
-    let error = result.expect_err("drift must still abort the saved-plan apply");
-    assert!(error.to_string().contains("drift"), "error: {error}");
-    let persisted: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&state_path).expect("read state after drift return"))
-            .expect("parse persisted state");
-    assert_eq!(
-        persisted["version"],
-        serde_json::json!(StateFile::CURRENT_VERSION),
-        "the pending schema migration must be saved before drift can return early"
-    );
-}
-
-#[tokio::test]
-async fn saved_plan_classifies_v20_dependency_names_before_early_migration_write() {
-    let mut fixture = ApplyCancellationFixture::new();
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let state_path = tmp.path().join("carina.state.json");
-    let mock_state_path = tmp.path().join("mock-provider-state.json");
-    let lineage = "22222222-2222-2222-2222-222222222222";
-    std::fs::write(
-        &state_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 20,
-            "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
-            "serial": 9,
-            "lineage": lineage,
-            "carina_version": "0.0.0-test",
-            "resources": [{
-                "resource_type": "test.resource",
-                "identity": "example",
-                "provider": "mock",
-                "binding": "example",
-                "dependency_bindings": ["dependency"],
-                "current": {
-                    "kind": "applied",
-                    "identifier": "example-id",
-                    "attributes": {"name": "planned"},
-                    "nested_write_only": {}
-                }
-            }],
-            "exports": {}
-        }))
-        .expect("serialize v20 state"),
-    )
-    .expect("write v20 state");
-    std::fs::write(
-        &mock_state_path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 3, "states": {"example-id": { "name": "drifted" }}
-        }))
-        .expect("serialize provider state"),
-    )
-    .expect("write provider state");
-
-    let mut dependency = Resource::with_provider("mock", "test.resource", "dependency", None);
-    dependency.binding = Some(absolute_binding("dependency"));
-    dependency.set_attr("name", string_value("dependency"));
-    let dependency_id = dependency.id.clone();
-    let mut example = Resource::with_provider("mock", "test.resource", "example", None);
-    example.binding = Some(absolute_binding("example"));
-    example.set_attr("name", string_value("planned"));
-    let example_id = example.id.clone();
-    let migration_resources = vec![dependency.clone(), example.clone()];
-    let graph_file = carina_core::parser::ExpandedParsedFile::default();
-    let graph = carina_core::resolved_graph::resolve_expanded_graph_for_legacy_classification({
-        let mut configuration = graph_file;
-        configuration.resources = migration_resources.clone();
-        configuration.data_sources = Vec::new();
-        configuration.into()
-    })
-    .expect("saved-plan migration graph resolves");
-    let loaded_state = carina_state::check_and_migrate(
-        &std::fs::read_to_string(&state_path).expect("read v20 classification state"),
-    )
-    .expect("v20 classification state loads")
-    .into_state();
-    let no_move_plan: Plan = Plan::new();
-    let moved_pairs = ResolvedMovePairs::from_saved_plan(no_move_plan.move_effects());
-    let migration = match loaded_state
-        .classify_legacy_graph(graph, &moved_pairs, Default::default())
-        .expect("saved-plan migration classification resolves")
-    {
-        carina_state::LegacyClassificationOutcome::Classified(migration) => migration,
-        carina_state::LegacyClassificationOutcome::RequiresReads(rows) => {
-            panic!("saved-plan fixture unexpectedly requires reads: {rows}")
-        }
-    };
-    let legacy_dependency_classification = Some(
-        migration
-            .report_and_validate(|_| panic!("fixture has no warnings"))
-            .expect("saved-plan migration graph validates")
-            .classification,
-    );
-    let planned_example = State::<carina_core::resource::NoPlaceholder>::existing(
-        example_id.clone(),
-        HashMap::from([("name".to_string(), string_value("planned"))]),
-    )
-    .with_identifier("example-id");
-    let contents = PlanFileContents {
-        version: PlanFile::CURRENT_VERSION,
-        carina_version: "test".to_string(),
-        timestamp: "2026-10-31T00:00:00Z".to_string(),
-        source_path: carina_core::paths::PersistedPath::new(tmp.path()).unwrap(),
-        source_identity: carina_core::paths::CanonicalPath::new(tmp.path()).unwrap(),
-        state_lineage: Some(lineage.to_string()),
-        state_serial: Some(9),
-        provider_configs: saved_provider_configs(vec![ProviderConfig {
-            name: "mock".to_string(),
-            attributes: Default::default(),
-            default_tags: Default::default(),
-            source: None,
-            version: None,
-            revision: None,
-            unresolved_attributes: Default::default(),
-            binding: None,
-        }]),
-        backend_config: crate::commands::plan::SavedBackendConfig::default(),
-        plan: carina_core::plan::SnapshotPlan::default(),
-        sorted_resources: (vec![
-            resolved_inner(dependency.clone()),
-            resolved_inner(example.clone()),
-        ])
-        .into_iter()
-        .map(|value| value.to_snapshot())
-        .collect(),
-        sorted_value_destroy_dependencies: vec![Default::default(), Default::default()],
-        sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
-        legacy_dependency_classification,
-        unresolved_resources: vec![dependency, example]
-            .into_iter()
-            .map(|resource| resource.into_value_snapshot())
-            .map(|value| value.to_snapshot())
-            .collect(),
-        compositions: Vec::new(),
-        data_sources: Vec::new(),
-        data_source_origins: Vec::new(),
-        data_source_values: Vec::new(),
-        current_states: vec![
-            crate::commands::plan::CurrentStateEntry::managed(
-                dependency_id.clone(),
-                State::<carina_core::resource::NoPlaceholder>::not_found(dependency_id.clone()),
-            ),
-            crate::commands::plan::CurrentStateEntry::managed(example_id, planned_example),
-        ],
-        upstream_snapshot: Default::default(),
-        upstream_sources: Vec::new(),
-        wait_bindings: Vec::new(),
-    };
-    let plan_file = record_with_builtin_mock_schemas(contents);
-    let backend =
-        Arc::<dyn StateBackend>::from(crate::commands::local_backend_for_test(state_path.clone()));
-    fixture.use_mock_file(mock_state_path.clone());
-
-    let observer_factory = fixture.observer_factory();
-    let result = run_apply_from_plan_locked(
-        fixture.runtime(),
-        inspected_saved_plan(plan_file),
-        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        true,
-        backend,
-        StateLock::disabled_for_test(),
-        ApplyTarget::SavedPlan {
-            plan_file: Path::new("plan.json"),
-            source_dir: tmp.path(),
-        },
-        fixture.cancel_token(),
-        &observer_factory,
-        NonZeroUsize::new(1).expect("non-zero parallelism"),
-        false,
-    )
-    .await;
-
-    let error = result.expect_err("drift must still abort the saved-plan apply");
-    assert!(error.to_string().contains("drift"), "error: {error}");
-    let persisted: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&state_path).expect("read migrated state"))
-            .expect("parse migrated state");
-    assert_eq!(
-        persisted["version"],
-        serde_json::json!(StateFile::CURRENT_VERSION)
-    );
-    assert_eq!(
-        persisted["resources"][0]["dependency_bindings"],
-        serde_json::json!([{
-            "provider": "mock",
-            "resource_type": "test.resource",
-            "identity": "dependency"
-        }])
-    );
-}
-
 fn state_file_from_json(json: serde_json::Value) -> StateFile {
-    carina_state::check_and_migrate(&json.to_string())
-        .expect("test state should pass the version gate")
-        .into_state()
+    carina_state::load_state(&json.to_string()).expect("test state should pass the version gate")
 }
 
 struct FailBCreateFactory;
@@ -2614,7 +2218,6 @@ async fn saved_plan_apply_reports_provider_load_error_before_artifact_mismatch()
 
         sorted_value_destroy_dependencies: Vec::new(),
         sorted_explicit_destroy_dependencies: Vec::new(),
-        legacy_dependency_classification: None,
     }
     .record_for_test(&planning_context, Vec::new())
     .expect("planning context must record provider evidence");
@@ -2716,7 +2319,6 @@ async fn saved_plan_helper_releases_passed_lock_when_provider_load_hard_fails() 
 
         sorted_value_destroy_dependencies: Vec::new(),
         sorted_explicit_destroy_dependencies: Vec::new(),
-        legacy_dependency_classification: None,
     }
     .record_for_test(&planning_context, Vec::new())
     .expect("planning context must record provider evidence");
@@ -4883,7 +4485,6 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
             ]),
         ],
         sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
-        legacy_dependency_classification: None,
         unresolved_resources: vec![target, consumer]
             .into_iter()
             .map(|resource| resource.into_value_snapshot())
@@ -5057,7 +4658,6 @@ async fn saved_plan_apply_rejects_module_constraint_learned_from_upstream_create
             ]),
         ],
         sorted_explicit_destroy_dependencies: vec![Default::default(), Default::default()],
-        legacy_dependency_classification: None,
         unresolved_resources: (vec![producer.into_value_snapshot(), consumer_for_unresolved])
             .into_iter()
             .map(|value| value.to_snapshot())
@@ -5147,7 +4747,6 @@ async fn saved_plan_noop_rejects_unconsumed_module_constraint() {
         sorted_resources: Vec::new(),
         sorted_value_destroy_dependencies: Vec::new(),
         sorted_explicit_destroy_dependencies: Vec::new(),
-        legacy_dependency_classification: None,
         unresolved_resources: Vec::new(),
         compositions: vec![saved_composition],
         data_sources: Vec::new(),
@@ -5235,7 +4834,6 @@ async fn saved_plan_provider_validation_preserves_typed_source_and_replan_hint()
 
         sorted_value_destroy_dependencies: Vec::new(),
         sorted_explicit_destroy_dependencies: Vec::new(),
-        legacy_dependency_classification: None,
     };
     let loading_configs = contents
         .provider_configs
@@ -5811,7 +5409,6 @@ async fn saved_plan_apply_does_not_save_or_release_after_heartbeat_lock_loss() {
 
         sorted_value_destroy_dependencies: vec![Default::default(); 1],
         sorted_explicit_destroy_dependencies: vec![Default::default(); 1],
-        legacy_dependency_classification: None,
     };
     let plan_file = record_with_builtin_mock_schemas(contents);
     let observer_factory = fixture.observer_factory();
@@ -7591,7 +7188,7 @@ impl StateBackend for BootstrapWriteFailureBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {
+    async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::StateFile>> {
         Ok(None)
     }
 
@@ -7719,8 +7316,7 @@ async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state(
         .read_state()
         .await
         .expect("seed state read")
-        .expect("successful bootstrap must write state")
-        .into_state();
+        .expect("successful bootstrap must write state");
     assert_eq!(state.resources().len(), 1);
     let row = state
         .find_resource_for_id(&id)
@@ -7751,8 +7347,7 @@ async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_stat
         .read_state()
         .await
         .expect("seed state read")
-        .expect("partial-success bootstrap must write state")
-        .into_state();
+        .expect("partial-success bootstrap must write state");
     let row = state
         .find_resource_for_id(&id)
         .expect("partial-success row must be seeded");
@@ -7859,8 +7454,7 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
         .read_state()
         .await
         .expect("seed state read")
-        .expect("successful bootstrap must write state")
-        .into_state();
+        .expect("successful bootstrap must write state");
     let current_state = match state_file.build_state_for_resource(&id) {
         Current::Present(present) => present.into_parts().0,
         current => panic!("seeded bucket must be present, got {current:?}"),
@@ -8256,8 +7850,7 @@ async fn bootstrap_create_identified_seeds_observed_state_before_error() {
         .read_state()
         .await
         .expect("seed state read")
-        .expect("seed state exists")
-        .into_state();
+        .expect("seed state exists");
     let row = state
         .find_resource_for_id(&id)
         .expect("created row must be seeded before the error returns");
@@ -8343,8 +7936,7 @@ async fn bootstrap_unobserved_create_identified_seeds_identifier_and_partial_rea
         .read_state()
         .await
         .expect("seed state read")
-        .expect("seed state exists")
-        .into_state();
+        .expect("seed state exists");
     let row = state
         .find_resource_for_id(&id)
         .expect("unobserved row must be seeded before the error returns");
@@ -8425,8 +8017,7 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
         .read_state()
         .await
         .expect("seed state read")
-        .expect("seed state exists")
-        .into_state();
+        .expect("seed state exists");
     let row = state
         .find_resource_for_id(&id)
         .expect("in-flight row must be seeded before the error returns");
@@ -10835,24 +10426,8 @@ mod apply_deferred_for_parity {
 #[cfg(test)]
 mod saved_plan_version_tests {
 
-    //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 41 requires typed Secret nodes. Version 40 pins the absolute source
-    //! locator to its canonical identity. Version 39 stores typed dependency
-    //! handles. Version 38 retains authored
-    //! directives and default origins. Version 37 requires deferred
-    //! diagnostic locations. Version 36 adds typed
-    //! deferred-for templates and stage-specific placeholder types. Version 35
-    //! stores tri-state prevent-destroy directives and the approved state-only
-    //! directive change set. Version 34 adds Int-only integer arithmetic.
-    //! Version 33 adds typed keyed-list release effects. Version 32 adds mandatory
-    //! provider-instance reference scopes and the create-outcome-unknown marker
-    //! for provider protocol v13. Version 31 persists authored ignore paths;
-    //! version 30 was never emitted. Version 29 persists anonymous loop
-    //! provenance, typed deferred targets, and Move origins (carina#4109).
-    //! Version 26 persists exact provider artifact identities (carina#4045);
-    //! version 25 persists total data-source outcomes (carina#3993); version 24
-    //! removed the wait target schema kind (carina#3916), and version 23 added
-    //! the mandatory provider schema fingerprint snapshot (carina#3983).
+    //! Current saved-plan payload validation and source identity checks.
+
     use carina_core::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
     };
@@ -10865,40 +10440,6 @@ mod saved_plan_version_tests {
         ApplyTarget, PlanFileHeader, resolved, resolved_inner, saved_plan_replan_project_dir,
         saved_provider_configs,
     };
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn secret_origin_4275_v40_secret_calls_fail_by_version_before_decode() {
-        let runtime = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().unwrap();
-        let plan_path = dir.path().join("v40.plan.json");
-        std::fs::write(&plan_path, r#"{"version":40,"timestamp":"x","value":{"FunctionCall":{"name":"secret","args":[{"String":"private-plan"}]}}}"#).unwrap();
-        let error = crate::commands::apply::run_apply_from_plan(
-            &runtime,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(8).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(
-                &error,
-                crate::error::AppError::UnsupportedPlanVersion {
-                    found: 40,
-                    expected: 46,
-                    ..
-                }
-            ),
-            "{error:?}"
-        );
-        assert!(!error.to_string().contains("private-plan"));
-    }
 
     #[tokio::test]
     async fn saved_plan_rejects_repointed_source_symlink_with_display_path() {
@@ -10949,7 +10490,7 @@ mod saved_plan_version_tests {
 
     #[test]
     fn replacement_admission_requests_require_current_plan_format() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 46);
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 47);
     }
 
     #[tokio::test]
@@ -10994,329 +10535,6 @@ mod saved_plan_version_tests {
             "{message}"
         );
         assert!(message.contains("corrupted"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn format_38_saved_plan_is_rejected_before_source_identity_decode() {
-        let current_version = crate::commands::plan::PlanFile::CURRENT_VERSION;
-        let (_dir, plan_path, mut json) = replacement_plan_json();
-        json["version"] = serde_json::json!(38);
-        json.as_object_mut().unwrap().remove("source_identity");
-        let message =
-            rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
-                .await;
-        assert!(
-            message.contains(&format!(
-                "Unsupported plan file version: 38 (expected {current_version})"
-            )),
-            "{message}"
-        );
-        assert!(!message.contains("corrupted"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn format_28_saved_plan_is_rejected_before_deferred_payload_decode() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("format-28.plan.json");
-        let old_plan = serde_json::json!({
-            "version": 28,
-            "timestamp": "2026-10-29T00:00:00Z",
-            "source_path": "infra",
-            "plan": {
-                "effects": [{
-                    "DeferredCreate": {
-                        "template": {
-                            "binding_name": "legacy-format-28-payload"
-                        }
-                    }
-                }]
-            }
-        });
-        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
-            .expect("write format-28 plan");
-
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(1).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("format 28 must be rejected before its old deferred payload is decoded");
-
-        let crate::error::AppError::UnsupportedPlanVersion {
-            found, expected, ..
-        } = error
-        else {
-            panic!("expected typed unsupported plan version error")
-        };
-        assert_eq!(found, 28);
-        assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
-    }
-
-    #[tokio::test]
-    async fn version_25_plan_is_rejected_after_provider_artifacts_become_mandatory() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("reviewed-plan.json");
-        let old_plan = serde_json::json!({
-            "version": 25,
-            "timestamp": "2026-10-28T00:00:00Z",
-            "source_path": "infra",
-        });
-        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap()).expect("write old plan");
-
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(1).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("format 25 must be rejected before its body is decoded");
-
-        let crate::error::AppError::UnsupportedPlanVersion {
-            found, expected, ..
-        } = error
-        else {
-            panic!("expected typed unsupported plan version error")
-        };
-        assert_eq!(
-            (found, expected),
-            (25, crate::commands::plan::PlanFile::CURRENT_VERSION),
-        );
-    }
-
-    /// Format 41 and older predate replacement admission requests; reject their
-    /// headers before attempting to decode any format-specific payload.
-    #[tokio::test]
-    async fn saved_plan_43_is_rejected_before_decoding_layered_constraints() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().unwrap();
-        let plan_path = dir.path().join("format-43.json");
-        std::fs::write(&plan_path, br#"{"version":43,"timestamp":"2026-11-10T00:00:00Z","source_path":"infra","pending_constraints":"invalid old shape"}"#).unwrap();
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(1).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("format 43 must fail its header gate before decoding constraints");
-        assert!(
-            matches!(
-                error,
-                crate::error::AppError::UnsupportedPlanVersion {
-                    found: 43,
-                    expected: 46,
-                    ..
-                }
-            ),
-            "{error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn issue_4418_format_45_fails_gate_before_dependent_payload_decode() {
-        let runtime = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().unwrap();
-        let plan_path = dir.path().join("format-45.json");
-        std::fs::write(&plan_path, br#"{"version":45,"timestamp":"2026-11-14T00:00:00Z","source_path":"infra","plan":{"effects":"invalid old dependent payload"}}"#).unwrap();
-        let error = crate::commands::apply::run_apply_from_plan(
-            &runtime,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(1).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                crate::error::AppError::UnsupportedPlanVersion {
-                    found: 45,
-                    expected: 46,
-                    ..
-                }
-            ),
-            "{error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        assert_eq!(
-            crate::commands::plan::PlanFile::CURRENT_VERSION,
-            46,
-            "carina#4418 requires format 46 for ordered non-empty dependent sets",
-        );
-        let previous = 45;
-
-        for older_version in [previous, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
-            let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
-            let old_plan = serde_json::json!({
-                "version": older_version,
-                "timestamp": "2026-10-29T00:00:00Z",
-                "source_path": "infra",
-                "compositions": "intentionally invalid payload",
-            });
-            std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
-                .expect("write older plan");
-
-            let error = crate::commands::apply::run_apply_from_plan(
-                &user_dirs,
-                &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-                &plan_path,
-                true,
-                false,
-                std::num::NonZeroUsize::new(1).unwrap(),
-                false,
-                &carina_core::parser::ProviderContext::new(
-                    carina_core::EnvironmentSnapshot::empty(),
-                ),
-                carina_core::shutdown::ShutdownToken::running(),
-            )
-            .await
-            .expect_err("an older emitted format must be rejected before decoding its payload");
-
-            let crate::error::AppError::UnsupportedPlanVersion {
-                found, expected, ..
-            } = error
-            else {
-                panic!("expected typed unsupported plan version error")
-            };
-            assert_eq!(found, older_version);
-            assert_eq!(expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
-        }
-    }
-
-    #[tokio::test]
-    async fn version_33_plan_is_rejected_with_regeneration_guidance() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("format-33-plan.json");
-        let old_plan = serde_json::json!({
-            "version": 33,
-            "timestamp": "2026-10-30T00:00:00Z",
-            "source_path": "infra",
-            "compositions": "intentionally invalid payload",
-        });
-        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap())
-            .expect("write format 33 plan");
-
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(1).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("format 33 must be regenerated before its payload is decoded");
-
-        let crate::error::AppError::UnsupportedPlanVersion {
-            found,
-            expected,
-            replan_command,
-            ..
-        } = &error
-        else {
-            panic!("expected typed unsupported plan version error")
-        };
-        assert_eq!(*found, 33);
-        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
-        assert!(replan_command.is_some());
-        assert!(error.to_string().contains("Re-run `carina plan"));
-    }
-
-    #[tokio::test]
-    async fn version_22_plan_without_schema_fingerprints_is_rejected_with_replan_command() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("reviewed-plan.json");
-        let old_plan = serde_json::json!({
-            "version": 22,
-            "carina_version": "0.4.0",
-            "timestamp": "2026-10-27T00:00:00Z",
-            "source_path": "infra",
-            "state_lineage": null,
-            "state_serial": null,
-            "provider_configs": [],
-            "backend_config": null,
-            "plan": { "effects": [] },
-            "sorted_resources": [],
-            "unresolved_resources": [],
-            "compositions": [],
-            "data_sources": [],
-            "data_source_origins": [],
-            "current_states": [],
-            "upstream_snapshot": {},
-            "upstream_sources": [],
-            "wait_bindings": [],
-        });
-        std::fs::write(&plan_path, serde_json::to_vec(&old_plan).unwrap()).expect("write old plan");
-
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(1).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("a plan predating schema fingerprints must be rejected");
-
-        let crate::error::AppError::UnsupportedPlanVersion {
-            found,
-            expected,
-            replan_command,
-            ..
-        } = &error
-        else {
-            panic!("expected typed version error, got {error:?}");
-        };
-        assert_eq!(
-            (*found, *expected),
-            (22, crate::commands::plan::PlanFile::CURRENT_VERSION),
-        );
-        let expected_replan = format!("carina plan --out {} infra", plan_path.display());
-        assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("Re-run `{expected_replan}`"))
-        );
     }
 
     #[tokio::test]
@@ -11415,77 +10633,6 @@ mod saved_plan_version_tests {
         );
     }
 
-    /// A `version: 3` saved plan must be rejected by
-    /// `run_apply_from_plan` with a message that names the expected
-    /// version and points the user at re-running `plan`.
-    ///
-    /// The test writes a minimal v3-shaped JSON to disk and asserts
-    /// the rejection. The plan body is deliberately tiny — the
-    /// version gate runs first, before any field is consumed, so a
-    /// stub `effects: []` / resource arrays are enough.
-    #[tokio::test]
-    async fn version_3_saved_plan_is_rejected() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("plan.json");
-        // A v3 plan: everything required by the pre-#3248 PlanFile
-        // shape, no `compositions` field.
-        let v3 = serde_json::json!({
-            "version": 3,
-            "carina_version": "0.4.0",
-            "timestamp": "2026-05-24T00:00:00Z",
-            "source_path": "infra/nested/main.crn",
-            "state_lineage": null,
-            "state_serial": null,
-            "provider_configs": [],
-            "backend_config": null,
-            "plan": { "effects": [] },
-            "sorted_resources": [],
-            "unresolved_resources": [],
-            "current_states": [],
-            "upstream_snapshot": {},
-            "upstream_sources": [],
-            "wait_bindings": [],
-        });
-        std::fs::write(&plan_path, serde_json::to_string(&v3).unwrap()).expect("write plan");
-
-        let result = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(8).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await;
-
-        let err = result.expect_err("v3 saved plan must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Unsupported plan file version: 3"),
-            "error must name the rejected version, got: {msg}",
-        );
-        let expected = format!(
-            "expected {}",
-            crate::commands::plan::PlanFile::CURRENT_VERSION
-        );
-        assert!(
-            msg.contains(&expected),
-            "error must name the expected version, got: {msg}",
-        );
-        let expected_replan = format!(
-            "Re-run `carina plan --out {} infra/nested`",
-            plan_path.display()
-        );
-        assert!(
-            msg.contains(&expected_replan),
-            "version-mismatch hint must regenerate the same saved plan, got: {msg}",
-        );
-    }
-
     #[test]
     fn old_recorded_crn_source_uses_parent_directory_for_replan_hint() {
         let source_path = Path::new("infra/nested/main.crn");
@@ -11511,388 +10658,6 @@ mod saved_plan_version_tests {
             .replan_command()
             .to_string(),
             "carina plan --out reviewed-plan.json infra/nested/main.crn"
-        );
-    }
-
-    #[tokio::test]
-    async fn version_10_saved_plan_is_rejected_after_constraint_metadata_bump() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("plan.json");
-        let v10 = serde_json::json!({
-            "version": 10,
-            "carina_version": "0.4.0",
-            "timestamp": "2026-07-02T00:00:00Z",
-            "source_path": "infra/nested",
-            "state_lineage": null,
-            "state_serial": null,
-            "provider_configs": [],
-            "backend_config": null,
-            "plan": { "effects": [] },
-            "sorted_resources": [],
-            "unresolved_resources": [],
-            "compositions": [],
-            "data_sources": [],
-            "current_states": [],
-            "upstream_snapshot": {},
-            "upstream_sources": [],
-            "wait_bindings": [],
-        });
-        std::fs::write(&plan_path, serde_json::to_string(&v10).unwrap()).expect("write plan");
-
-        let result = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(8).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await;
-
-        let err = result.expect_err("v10 saved plan must be rejected after format bumps");
-        let crate::error::AppError::UnsupportedPlanVersion {
-            path: error_path,
-            found,
-            expected,
-            replan_command,
-        } = &err
-        else {
-            panic!("expected typed unsupported-version error, got: {err}");
-        };
-        assert_eq!(error_path, &plan_path);
-        assert_eq!(*found, 10);
-        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
-        let expected_replan = format!("carina plan --out {} infra/nested", plan_path.display());
-        assert_eq!(replan_command.as_deref(), Some(expected_replan.as_str()));
-
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Unsupported plan file version: 10"),
-            "error must name the rejected v10 version, got: {msg}",
-        );
-        assert!(
-            msg.contains(&format!(
-                "expected {}",
-                crate::commands::plan::PlanFile::CURRENT_VERSION
-            )),
-            "error must name the current expected version, got: {msg}",
-        );
-        assert!(
-            msg.contains(&format!("Re-run `{expected_replan}`")),
-            "error must include the path-aware re-plan command, got: {msg}",
-        );
-    }
-
-    #[tokio::test]
-    async fn version_13_saved_plan_is_rejected_after_orphan_ownership_change() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("plan.json");
-        let v13 = serde_json::json!({
-            "version": 13,
-            "carina_version": "0.4.0",
-            "timestamp": "2026-10-17T00:00:00Z",
-            "source_path": "infra",
-            "state_lineage": null,
-            "state_serial": null,
-            "provider_configs": [],
-            "backend_config": null,
-            "plan": { "effects": [] },
-            "sorted_resources": [],
-            "unresolved_resources": [],
-            "compositions": [],
-            "data_sources": [],
-            "current_states": [],
-            "upstream_snapshot": {},
-            "upstream_sources": [],
-            "wait_bindings": [],
-        });
-        std::fs::write(&plan_path, serde_json::to_string(&v13).unwrap()).expect("write plan");
-
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(8).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("v13 saved plan must be rejected after the orphan ownership change");
-
-        let crate::error::AppError::UnsupportedPlanVersion {
-            path: error_path,
-            found,
-            expected,
-            replan_command,
-        } = &error
-        else {
-            panic!("expected typed unsupported-version error, got: {error}");
-        };
-        assert_eq!(error_path, &plan_path);
-        assert_eq!(*found, 13);
-        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
-        assert_eq!(
-            replan_command.as_deref(),
-            Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn version_15_saved_plan_is_rejected_after_wait_rhs_typing_change() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("plan.json");
-        let v15 = serde_json::json!({
-            "version": 15,
-            "carina_version": "0.4.0",
-            "timestamp": "2026-10-18T00:00:00Z",
-            "source_path": "infra",
-            "state_lineage": null,
-            "state_serial": null,
-            "provider_configs": [],
-            "backend_config": null,
-            "plan": { "effects": [] },
-            "sorted_resources": [],
-            "unresolved_resources": [],
-            "compositions": [],
-            "data_sources": [],
-            "data_source_origins": [],
-            "current_states": [],
-            "upstream_snapshot": {},
-            "upstream_sources": [],
-            "wait_bindings": [],
-        });
-        std::fs::write(&plan_path, serde_json::to_string(&v15).unwrap()).expect("write plan");
-
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(8).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("v15 saved plans must be regenerated with typed wait RHS values");
-
-        let crate::error::AppError::UnsupportedPlanVersion {
-            found,
-            expected,
-            replan_command,
-            ..
-        } = &error
-        else {
-            panic!("expected typed unsupported-version error, got: {error}");
-        };
-        assert_eq!(*found, 15);
-        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
-        assert_eq!(
-            replan_command.as_deref(),
-            Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn version_18_saved_plan_is_rejected_after_abandoned_generation_shape_change() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("plan.json");
-        let v18 = serde_json::json!({
-            "version": 18,
-            "carina_version": "0.4.0",
-            "timestamp": "2026-10-23T00:00:00Z",
-            "source_path": "infra",
-            "state_lineage": null,
-            "state_serial": null,
-            "provider_configs": [],
-            "backend_config": null,
-            "plan": { "effects": [] },
-            "sorted_resources": [],
-            "unresolved_resources": [],
-            "compositions": [],
-            "data_sources": [],
-            "data_source_origins": [],
-            "current_states": [],
-            "upstream_snapshot": {},
-            "upstream_sources": [],
-            "wait_bindings": [],
-        });
-        std::fs::write(&plan_path, serde_json::to_string(&v18).unwrap()).expect("write plan");
-
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(8).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("v18 saved plans contain the old abandoned-generation shape");
-
-        let crate::error::AppError::UnsupportedPlanVersion {
-            found,
-            expected,
-            replan_command,
-            ..
-        } = &error
-        else {
-            panic!("expected typed unsupported-version error, got: {error}");
-        };
-        assert_eq!(*found, 18);
-        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
-        assert_eq!(
-            replan_command.as_deref(),
-            Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn version_19_saved_plan_is_rejected_after_current_state_tagging_change() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("plan.json");
-        let v19 = serde_json::json!({
-            "version": 19,
-            "carina_version": "0.4.0",
-            "timestamp": "2026-10-23T00:00:00Z",
-            "source_path": "infra",
-            "state_lineage": null,
-            "state_serial": null,
-            "provider_configs": [],
-            "backend_config": null,
-            "plan": { "effects": [] },
-            "sorted_resources": [],
-            "unresolved_resources": [],
-            "compositions": [],
-            "data_sources": [],
-            "data_source_origins": [],
-            "current_states": [],
-            "upstream_snapshot": {},
-            "upstream_sources": [],
-            "wait_bindings": [],
-        });
-        std::fs::write(&plan_path, serde_json::to_string(&v19).unwrap()).expect("write plan");
-
-        let error = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(8).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await
-        .expect_err("v19 saved plans contain the untagged current-state shape");
-
-        let crate::error::AppError::UnsupportedPlanVersion {
-            path: error_path,
-            found,
-            expected,
-            replan_command,
-        } = &error
-        else {
-            panic!("expected typed unsupported-version error, got: {error}");
-        };
-        assert_eq!(error_path, &plan_path);
-        assert_eq!(*found, 19);
-        assert_eq!(*expected, crate::commands::plan::PlanFile::CURRENT_VERSION);
-        assert_eq!(
-            replan_command.as_deref(),
-            Some(format!("carina plan --out {} infra", plan_path.display()).as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn saved_plan_decode_rejects_legacy_import_shape_by_version() {
-        let user_dirs = crate::test_support::TestCommandRuntime::new();
-        let dir = TempDir::new().expect("tempdir");
-        let plan_path = dir.path().join("reviewed-plan");
-        let import_id = carina_core::resource::ResolvedResourceId::new(
-            carina_core::resource::ResourceId::with_identity("mock.test.resource", "legacy"),
-        );
-        let legacy_v4 = serde_json::json!({
-            "version": 4,
-            "carina_version": "0.4.0",
-            "timestamp": "2026-05-24T00:00:00Z",
-            "source_path": "infra/nested",
-            "state_lineage": null,
-            "state_serial": null,
-            "provider_configs": [],
-            "backend_config": null,
-            "plan": {
-                "effects": [{
-                    "Import": {
-                        "id": import_id,
-                        "identifier": "legacy-provider-id"
-                    }
-                }]
-            },
-            "sorted_resources": [],
-            "unresolved_resources": [],
-            "compositions": [],
-            "data_sources": [],
-            "current_states": [],
-            "upstream_snapshot": {},
-            "upstream_sources": [],
-            "wait_bindings": [],
-        });
-        std::fs::write(
-            &plan_path,
-            serde_json::to_string(&legacy_v4).expect("serialize legacy plan"),
-        )
-        .expect("write legacy plan");
-
-        let result = crate::commands::apply::run_apply_from_plan(
-            &user_dirs,
-            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
-            &plan_path,
-            true,
-            false,
-            std::num::NonZeroUsize::new(8).unwrap(),
-            false,
-            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-            carina_core::shutdown::ShutdownToken::running(),
-        )
-        .await;
-
-        let message = result
-            .expect_err("legacy saved plan must be rejected by the version gate")
-            .to_string();
-        let current_version = crate::commands::plan::PlanFile::CURRENT_VERSION;
-        assert!(
-            message.contains(&format!(
-                "Unsupported plan file version: 4 (expected {current_version})"
-            )),
-            "legacy wire shapes must reach the version gate: {message}",
-        );
-        assert!(
-            message.contains(&format!(
-                "Re-run `carina plan --out {} infra/nested`",
-                plan_path.display()
-            )),
-            "version error must include the recorded source path: {message}",
-        );
-        assert!(
-            !message.contains("is not a Carina plan file"),
-            "a recognized older plan must not be called a non-plan file: {message}",
         );
     }
 
@@ -12037,7 +10802,6 @@ mod saved_plan_version_tests {
                 .collect(),
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_classification: None,
             unresolved_resources: vec![resource]
                 .into_iter()
                 .map(|resource| resource.into_value_snapshot())

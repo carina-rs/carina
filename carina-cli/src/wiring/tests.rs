@@ -886,12 +886,7 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
         &[],
     );
     let resources = canonical_unresolved(Vec::new(), context.schemas());
-    let materialization =
-        DeferredForExpansionWitness::after_expansion(resources.parsed().deferred_for_expressions());
-    let expanded_resources = ExpandedCanonicalResources {
-        resources,
-        materialization,
-    };
+    let expanded_resources = ExpandedCanonicalResources { resources };
     let residual_deferred_for = expanded_resources
         .parsed()
         .deferred_for_expressions()
@@ -1284,11 +1279,10 @@ async fn anonymous_to_named_enum_and_int_match_through_multifile_state_wiring() 
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -1380,11 +1374,10 @@ async fn anonymous_to_named_unordered_enum_list_matches_reordered_persisted_stat
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -1498,11 +1491,10 @@ fn anonymous_to_named_fixed_point_uses_state_origin_after_undeclared_hash_projec
         serde_json::to_vec_pretty(&persisted).expect("serialize real state fixture"),
     )
     .expect("write real state fixture");
-    let state_file = carina_state::state::check_and_migrate(
+    let state_file = carina_state::state::load_state(
         &std::fs::read_to_string(&state_path).expect("read real state fixture"),
     )
-    .expect("decode real state fixture")
-    .into_state();
+    .expect("decode real state fixture");
     let state_origin =
         ResolvedResourceId::with_provider_identity("test", "thing", STATE_ORIGIN, None);
     let projected_hash =
@@ -1602,11 +1594,10 @@ let first = test.thing {
         )
         .expect("write real state fixture");
         let state_file = Some(
-            carina_state::state::check_and_migrate(
+            carina_state::state::load_state(
                 &std::fs::read_to_string(&state_path).expect("read real state fixture"),
             )
-            .expect("decode real state fixture")
-            .into_state(),
+            .expect("decode real state fixture"),
         );
 
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -1729,11 +1720,10 @@ let direct = awscc.ec2.Route {
         )
         .expect("write real state fixture");
         let state_file = Some(
-            carina_state::state::check_and_migrate(
+            carina_state::state::load_state(
                 &std::fs::read_to_string(&state_path).expect("read real state fixture"),
             )
-            .expect("decode real state fixture")
-            .into_state(),
+            .expect("decode real state fixture"),
         );
 
         let planned = create_plan_from_parsed_with_upstream_with_ctx(
@@ -6768,7 +6758,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
 
     let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
     let address = StateBlockAddress::new("mock", "test.Resource", "unknown");
-    let state = carina_state::check_and_migrate(
+    let state = carina_state::load_state(
         &serde_json::json!({
             "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
@@ -6789,8 +6779,7 @@ fn import_replaces_only_a_create_outcome_unknown_row() {
         })
         .to_string(),
     )
-    .unwrap()
-    .into_state();
+    .unwrap();
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: address.clone(),
@@ -6891,7 +6880,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
         "shared",
         Some("unknown".to_string()),
     );
-    let state = carina_state::check_and_migrate(
+    let state = carina_state::load_state(
         &serde_json::json!({
             "version": 21,
             "exports_version": carina_state::PublishedExports::CURRENT_VERSION,
@@ -6913,8 +6902,7 @@ fn import_does_not_suppress_unknown_outcome_from_another_provider_instance() {
         })
         .to_string(),
     )
-    .unwrap()
-    .into_state();
+    .unwrap();
     let state_file = Some(state);
     let state_blocks = vec![StateBlock::Import {
         to: StateBlockAddress::new("mock", "test.Resource", "shared"),
@@ -8368,11 +8356,10 @@ async fn prelude_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let canonical_resources = canonical_pair_from_resolved(
@@ -8627,11 +8614,10 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     )
     .expect("write real state fixture");
     let state_file = Some(
-        carina_state::state::check_and_migrate(
+        carina_state::state::load_state(
             &std::fs::read_to_string(&state_path).expect("read real state fixture"),
         )
-        .expect("decode real state fixture")
-        .into_state(),
+        .expect("decode real state fixture"),
     );
 
     let canonical_resources = canonical_pair_from_resolved(

@@ -14,10 +14,9 @@ use crate::parser::{
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, AccessPath, BindingAddress, ConcreteValue,
     DataSource, DeferredValue, InterpolationPart, LiveCompositionAttribute, LoopSlot,
-    NoPlaceholder, PathSegment, PersistedDestroyDependencies, PersistedDestroyDependencyProjection,
-    PlaceholderKind, ResolvedDataSource, ResolvedDependencies, ResolvedDependencyReads,
-    ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity,
-    SYNTHETIC_TYPE_PREFIX, Value, resolve_resource_ignore_changes,
+    NoPlaceholder, PathSegment, PersistedDestroyDependencies, PlaceholderKind, ResolvedDataSource,
+    ResolvedDependencies, ResolvedDependencyReads, ResolvedResource, ResolvedResourceId, Resource,
+    ResourceId, ResourceIdentity, SYNTHETIC_TYPE_PREFIX, Value, resolve_resource_ignore_changes,
 };
 use crate::schema::SchemaRegistry;
 use crate::wait::{ManagedWaitTarget, ResolvedWaitBinding};
@@ -137,8 +136,8 @@ impl ExpandedTarget {
     }
 }
 
-/// Addressable graph targets with the language's lookup precedence encoded
-/// structurally: authored bindings win over identity spellings.
+/// Authored and persisted binding lookups, plus identity-based scheduler targets.
+/// Configured bindings take precedence over persisted orphan aliases.
 #[derive(Debug, Clone, Default)]
 struct ExpandedTargets {
     bindings: HashMap<AbsoluteBindingAddress, ExpandedTarget>,
@@ -158,9 +157,8 @@ impl ExpandedTargets {
             }
             match (existing, &target) {
                 // Preserve the pre-existing address lookup contract: a
-                // managed target wins over a data source within the same
-                // lookup class. Binding-vs-identity precedence is handled by
-                // the separate maps above this method.
+                // managed target wins over a data source at the same
+                // authored binding.
                 (ExpandedTarget::Managed { .. }, ExpandedTarget::DataSource { .. }) => {
                     return Ok(());
                 }
@@ -199,8 +197,9 @@ impl ExpandedTargets {
         target: ExpandedTarget,
     ) -> Result<(), ExpandedGraphResolutionError> {
         let targets = self.identities.entry(identity).or_default();
-        // v20 preferred a managed row over a data source with the same
-        // identity spelling. Same-kind collisions remain ambiguous.
+        // The scheduler catalog keeps managed targets when identity spellings
+        // collide with data sources, including unbound rows. Retain every
+        // distinct target within the selected kind.
         match &target {
             ExpandedTarget::Managed { .. } => {
                 targets.retain(|existing| !matches!(existing, ExpandedTarget::DataSource { .. }))
@@ -281,11 +280,6 @@ pub struct ExpandedBindingIndex {
     composition_dependencies: HashMap<AbsoluteBindingAddress, ResolvedDependencies>,
     /// Managed-row closure for every plan-scoped data-source and wait ID.
     destroy_closures: HashMap<ResolvedResourceId, PersistedDestroyDependencies>,
-    /// Instance-qualified module argument values used only by the v20 state
-    /// migration classifier. Literal arguments are recorded explicitly as a
-    /// no-local-edge projection.
-    legacy_argument_projections:
-        HashMap<AbsoluteBindingAddress, PersistedDestroyDependencyProjection>,
     managed_ids: HashSet<ResolvedResourceId>,
     /// Declared upstream-state bindings are value sources, not scheduler
     /// nodes. They are classified here so value-reference provenance can be
@@ -793,76 +787,6 @@ impl ExpandedBindingIndex {
         Ok(projected)
     }
 
-    /// Classify one legacy binding snapshot against the expanded typed graph.
-    ///
-    /// The result is exhaustive: external values and literal module
-    /// arguments are a typed `NoLocalDestroyEdge`, while managed resources,
-    /// data sources, waits, and compositions produce their managed-row
-    /// closure. Missing names remain errors for the state layer to classify as
-    /// configured-row failures or orphan warnings.
-    pub fn project_legacy_dependency(
-        &self,
-        reference: &str,
-        owner: &str,
-    ) -> Result<PersistedDestroyDependencyProjection, ExpandedGraphResolutionError> {
-        let reference = self
-            .targets
-            .bindings
-            .keys()
-            .chain(self.targets.prior_bindings.keys())
-            .chain(self.targets.identities.keys())
-            .chain(self.handle_outputs.keys())
-            .chain(self.managed_groups.keys())
-            .chain(self.composition_dependencies.keys())
-            .chain(self.legacy_argument_projections.keys())
-            .chain(self.upstream_bindings.iter())
-            .find(|binding| binding.as_str() == reference)
-            .ok_or_else(|| ExpandedGraphResolutionError::MissingDependency {
-                owner: owner.to_owned(),
-                reference: reference.to_owned(),
-            })?;
-        let direct_target = self.targets.get(reference)?;
-        let legacy_target = if direct_target.is_none() {
-            match self.targets.identities.get(reference).map(Vec::as_slice) {
-                Some([target]) => Some(target),
-                Some([_, _, ..]) => {
-                    return Err(ExpandedGraphResolutionError::AmbiguousBinding {
-                        binding: reference.to_string(),
-                    });
-                }
-                Some([]) | None => None,
-            }
-        } else {
-            None
-        };
-        let dependencies = self
-            .handle_outputs
-            .get(reference)
-            .map(|target| std::iter::once(target.id.clone()).collect())
-            .or_else(|| {
-                direct_target
-                    .or(legacy_target)
-                    .map(|target| std::iter::once(target.id().clone()).collect())
-            })
-            .or_else(|| self.managed_groups.get(reference).cloned())
-            .or_else(|| self.composition_dependencies.get(reference).cloned());
-        if let Some(dependencies) = dependencies {
-            return self
-                .project_resolved_dependencies(&dependencies, owner)
-                .map(PersistedDestroyDependencyProjection::Managed);
-        }
-        if let Some(projection) = self.legacy_argument_projections.get(reference) {
-            return Ok(projection.clone());
-        }
-        if self.upstream_bindings.contains(reference) {
-            return Ok(PersistedDestroyDependencyProjection::NoLocalDestroyEdge);
-        }
-        Err(ExpandedGraphResolutionError::MissingDependency {
-            owner: owner.to_string(),
-            reference: reference.to_string(),
-        })
-    }
-
     fn resolve_value_dependencies<'a, P: PlaceholderKind + 'a>(
         &self,
         values: impl Iterator<Item = &'a Value<P>>,
@@ -1347,38 +1271,6 @@ fn require_resolved_id(
     })
 }
 
-/// Configuration-only membership for legacy migration.
-/// State-row candidates can participate in address lookup, but cannot mint
-/// configured membership through this type.
-#[derive(Debug)]
-pub struct ConfiguredResources(HashSet<ResolvedResourceId>);
-
-impl ConfiguredResources {
-    pub fn from_configuration<E, D>(
-        parsed: &File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>,
-    ) -> Self {
-        Self::collect(&parsed.resources)
-    }
-
-    fn collect<S>(resources: &[Resource<S>]) -> Self {
-        Self(
-            resources
-                .iter()
-                .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
-                .collect(),
-        )
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn from_test_resources<S>(resources: &[Resource<S>]) -> Self {
-        Self::collect(resources)
-    }
-
-    pub fn contains(&self, id: &ResolvedResourceId) -> bool {
-        self.0.contains(id)
-    }
-}
-
 /// Read-only configuration metadata retained after its graph input is consumed.
 /// There is deliberately no transition back to a graph-resolution input.
 #[derive(Debug)]
@@ -1397,69 +1289,16 @@ impl<E, D> GraphConfiguration<E, D> {
     }
 }
 
-/// The one constructed graph, before its deferred wait errors are checked.
-pub struct LegacyClassificationGraph<E, D> {
-    configuration: GraphConfiguration<E, D>,
-    configured: ConfiguredResources,
-    index: ExpandedBindingIndex,
-    wait_error: Option<ExpandedGraphResolutionError>,
-}
-
-impl<E, D> LegacyClassificationGraph<E, D> {
-    pub fn classification_index(&self) -> &ExpandedBindingIndex {
-        &self.index
-    }
-
-    pub fn configured(&self) -> &ConfiguredResources {
-        &self.configured
-    }
-
-    pub fn validate(self) -> Result<ResolvedExpandedGraph<E, D>, ExpandedGraphResolutionError> {
-        if let Some(error) = self.wait_error {
-            return Err(error);
-        }
-        for resource in &self.configuration.0.resources {
-            let owner = resource
-                .binding
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| resource.id.to_string());
-            let attributes = resource
-                .attributes
-                .values()
-                .map(|value| rewrite_handle_output_refs(value, &self.index.handle_outputs, &owner))
-                .collect::<Result<Vec<_>, _>>()?;
-            self.index.resolve_value_dependencies(
-                attributes.iter(),
-                resource.dependencies.value_bindings.iter(),
-                &owner,
-            )?;
-            self.index
-                .resolve_explicit_operands(&resource.dependencies.depends_on, &owner)?;
-        }
-        Ok(ResolvedExpandedGraph {
-            configuration: self.configuration,
-            configured: self.configured,
-            index: self.index,
-        })
-    }
-}
-
 /// A strictly validated graph and the metadata produced by that same resolution.
 #[derive(Debug)]
 pub struct ResolvedExpandedGraph<E, D> {
     configuration: GraphConfiguration<E, D>,
-    configured: ConfiguredResources,
     index: ExpandedBindingIndex,
 }
 
 impl<E, D> ResolvedExpandedGraph<E, D> {
     pub fn configuration(&self) -> &File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress> {
         self.configuration.parsed()
-    }
-
-    pub fn configured(&self) -> &ConfiguredResources {
-        &self.configured
     }
 
     pub fn into_parts(self) -> (GraphConfiguration<E, D>, ExpandedBindingIndex) {
@@ -1512,21 +1351,10 @@ impl<E, D> From<File<E, NoPlaceholder, LoopSlot, D, AbsoluteBindingAddress>>
 pub fn resolve_expanded_graph<E, D>(
     configuration: ConfiguredGraphInput<E, D>,
 ) -> Result<ResolvedExpandedGraph<E, D>, ExpandedGraphResolutionError> {
-    resolve_expanded_graph_for_legacy_classification(configuration)?.validate()
-}
-
-/// Build the graph used only to classify legacy state before terminal wait
-/// validation. Invalid waits remain addressable but have no destroy closure,
-/// so legacy references to them fail closed as unresolved names. The strict
-/// validation consumes this graph before any migrated state is released.
-pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
-    configuration: ConfiguredGraphInput<E, D>,
-) -> Result<LegacyClassificationGraph<E, D>, ExpandedGraphResolutionError> {
     let ConfiguredGraphInput {
         configuration: mut parsed,
         prior_orphans,
     } = configuration;
-    let configured = ConfiguredResources::from_configuration(&parsed);
     let upstream_bindings = parsed
         .upstream_states
         .iter()
@@ -1724,7 +1552,6 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
         handle_outputs,
         composition_dependencies,
         destroy_closures: HashMap::new(),
-        legacy_argument_projections: HashMap::new(),
         managed_ids,
         upstream_bindings,
     };
@@ -1801,10 +1628,7 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
         )?;
     }
 
-    // Historical module argument snapshots were sometimes stored without
-    // their instance prefix. The migration layer tries the owning row's scope
-    // first; these qualified aliases map that spelling back to the actual
-    // call-site value and its managed closure.
+    // Validate every module argument before reporting a deferred wait error.
     for composition in &parsed.compositions {
         for (argument_name, argument) in &composition.signature.arguments {
             let reference = composition
@@ -1819,11 +1643,7 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
                 &owner,
             ) {
                 Ok(resolved) => resolved,
-                // This index entry exists only for legacy-state migration.
-                // An otherwise unused unresolved module argument must retain
-                // its normal terminal constraint error; if a legacy row
-                // actually names this argument, the classifier below will
-                // still fail closed because no projection was recorded.
+                // Unused unresolved arguments retain their terminal constraint error.
                 Err(ExpandedGraphResolutionError::MissingDependency { .. }) => continue,
                 Err(error) => return Err(error),
             };
@@ -1833,23 +1653,35 @@ pub fn resolve_expanded_graph_for_legacy_classification<E, D>(
             {
                 continue;
             }
-            let projected = index.project_resolved_dependencies(&dependencies, &owner)?;
-            let projection = if projected.is_empty() {
-                PersistedDestroyDependencyProjection::NoLocalDestroyEdge
-            } else {
-                PersistedDestroyDependencyProjection::Managed(projected)
-            };
-            index
-                .legacy_argument_projections
-                .insert(reference, projection);
+            index.project_resolved_dependencies(&dependencies, &owner)?;
         }
     }
 
-    Ok(LegacyClassificationGraph {
+    if let Some(error) = wait_error {
+        return Err(error);
+    }
+
+    for resource in &parsed.resources {
+        let owner = resource
+            .binding
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| resource.id.to_string());
+        let attributes = resource
+            .attributes
+            .values()
+            .map(|value| rewrite_handle_output_refs(value, &index.handle_outputs, &owner))
+            .collect::<Result<Vec<_>, _>>()?;
+        index.resolve_value_dependencies(
+            attributes.iter(),
+            resource.dependencies.value_bindings.iter(),
+            &owner,
+        )?;
+        index.resolve_explicit_operands(&resource.dependencies.depends_on, &owner)?;
+    }
+    Ok(ResolvedExpandedGraph {
         configuration: GraphConfiguration(parsed),
-        configured,
         index,
-        wait_error,
     })
 }
 
@@ -1891,6 +1723,202 @@ impl crate::resource::InsideSecret for ExpandedGraphResolutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn absolute(name: &str) -> AbsoluteBindingAddress {
+        crate::resource::RootScope::new().resolve(name.into())
+    }
+
+    fn binding_value(name: &str) -> Value {
+        Value::Deferred(DeferredValue::BindingRef {
+            binding: absolute(name),
+        })
+    }
+
+    fn configuration_with_argument(value: Value) -> crate::parser::ExpandedInferredFile {
+        use crate::resource::{LiveComposition, LiveCompositionArgument, LiveCompositionSignature};
+        let mut parsed = crate::parser::ExpandedInferredFile::default();
+        parsed.compositions.push(LiveComposition {
+            id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "example")),
+            signature: LiveCompositionSignature {
+                arguments: IndexMap::from([(
+                    "input".into(),
+                    LiveCompositionArgument::from_value(
+                        value,
+                        crate::validation::resolve_consumer_static_type_for_signature(
+                            &crate::parser::TypeExpr::String,
+                            &crate::parser::ProviderContext::new(
+                                crate::EnvironmentSnapshot::empty(),
+                            ),
+                        ),
+                        crate::parser::ArgumentOrigin::Defaulted,
+                    ),
+                )]),
+                attributes: IndexMap::new(),
+                pending_constraints: Vec::new(),
+            },
+            binding: Some(absolute("example")),
+            dependency_bindings: BTreeSet::new(),
+            module_name: "module".into(),
+            instance: "example".into(),
+            call_path: Default::default(),
+            quoted_string_attrs: HashSet::new(),
+            declaration: Default::default(),
+        });
+        parsed
+    }
+
+    fn wait(binding: &str, target: &str) -> WaitBinding<AbsoluteBindingAddress> {
+        WaitBinding {
+            binding: absolute(binding),
+            target: absolute(target),
+            until_raw: format!("{target}.ready == true"),
+            until_predicate: crate::parser::UntilPredicateAst {
+                root: absolute(target),
+                attribute_segments: vec!["ready".into()],
+                rhs: Value::Concrete(ConcreteValue::Bool(true))
+                    .try_into()
+                    .unwrap(),
+            },
+            timeout_secs: None,
+            depends_on: Default::default(),
+            line: 1,
+            declaration: Default::default(),
+        }
+    }
+
+    #[test]
+    fn expanded_graph_checks_unused_module_arguments_but_defers_missing_dependencies() {
+        let parsed = configuration_with_argument(binding_value("missing"));
+        resolve_expanded_graph(parsed.into()).expect("unused missing arguments are deferred");
+
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(binding_value("private")).into(),
+        ));
+        let mut parsed = configuration_with_argument(secret);
+        parsed.wait_bindings.push(wait("invalid", "missing"));
+        assert_eq!(
+            resolve_expanded_graph(parsed.into()).unwrap_err(),
+            ExpandedGraphResolutionError::InsideSecret,
+            "non-missing module argument errors precede deferred wait errors"
+        );
+    }
+
+    #[test]
+    fn expanded_graph_projects_independent_closures_before_invalid_wait_errors() {
+        let mut parsed = crate::parser::ExpandedInferredFile::default();
+        let managed = Resource::with_provider("mock", "test.Managed", "managed", None)
+            .with_absolute_binding(absolute("managed"));
+        let expected = HashSet::from([ResolvedResourceId::new(managed.id.clone())]);
+        parsed.resources.push(managed);
+        parsed.wait_bindings.push(wait("ready", "managed"));
+        let mut lookup = DataSource::with_provider("mock", "test.Lookup", "lookup", None)
+            .with_attribute("input", binding_value("ready"));
+        lookup.binding = Some(absolute("lookup"));
+        let lookup_id = ResolvedResourceId::new(lookup.id.clone());
+        parsed.data_sources.push(lookup);
+        let (_, index) = resolve_expanded_graph(parsed.clone().into())
+            .unwrap()
+            .into_parts();
+        for id in [wait_scheduler_id(&absolute("ready")), lookup_id] {
+            assert_eq!(
+                index.destroy_closures[&id]
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>(),
+                expected,
+                "wait and data-source closures must retain the managed target"
+            );
+        }
+
+        parsed.wait_bindings.push(wait("invalid", "missing"));
+        for (name, dependency) in [("first", "second"), ("second", "first")] {
+            let mut source = DataSource::with_provider("mock", "test.Lookup", name, None)
+                .with_attribute("input", binding_value(dependency));
+            source.binding = Some(absolute(name));
+            parsed.data_sources.push(source);
+        }
+        let error = resolve_expanded_graph(parsed.into()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExpandedGraphResolutionError::DestroyProjectionCycle { .. }
+            ),
+            "the independent projection error must precede the invalid wait: {error:?}"
+        );
+    }
+
+    #[test]
+    fn expanded_graph_defers_invalid_waits_through_dependent_nodes_and_arguments() {
+        let mut parsed = configuration_with_argument(binding_value("second"));
+        parsed.wait_bindings.push(wait("invalid", "missing"));
+        for (name, dependency) in [("first", "invalid"), ("second", "first")] {
+            let mut source = DataSource::with_provider("mock", "test.Lookup", name, None)
+                .with_attribute("input", binding_value(dependency));
+            source.binding = Some(absolute(name));
+            parsed.data_sources.push(source);
+        }
+        parsed.resources.push(
+            Resource::with_provider("mock", "test.Managed", "consumer", None)
+                .with_attribute("input", binding_value("also_missing")),
+        );
+        assert_eq!(
+            resolve_expanded_graph(parsed.into()).unwrap_err(),
+            ExpandedGraphResolutionError::MissingDependency {
+                owner: "wait 'invalid'".into(),
+                reference: "missing".into(),
+            },
+            "the original wait error precedes module projection and resource validation errors"
+        );
+    }
+
+    #[test]
+    fn expanded_graph_prefers_managed_binding_over_data_source_binding() {
+        let mut parsed = crate::parser::ExpandedInferredFile::default();
+        let managed = Resource::with_provider("mock", "test.Managed", "managed", None)
+            .with_absolute_binding(absolute("shared"));
+        let expected = HashSet::from([ResolvedResourceId::new(managed.id.clone())]);
+        parsed.resources.push(managed);
+        let mut lookup = DataSource::with_provider("mock", "test.Lookup", "lookup", None);
+        lookup.binding = Some(absolute("shared"));
+        parsed.data_sources.push(lookup);
+
+        let (_, index) = resolve_expanded_graph(parsed.into()).unwrap().into_parts();
+        let reference = binding_value("shared");
+        let (dependencies, _) = index
+            .resolve_value_dependencies(std::iter::once(&reference), std::iter::empty(), "consumer")
+            .unwrap();
+        assert_eq!(
+            dependencies.iter().cloned().collect::<HashSet<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn scheduler_target_catalog_preserves_managed_identity_precedence_for_unbound_rows() {
+        let mut parsed = crate::parser::ExpandedInferredFile::default();
+        let mut expected = HashSet::new();
+        for resource_type in ["test.First", "test.Second"] {
+            let resource = Resource::with_provider("mock", resource_type, "shared", None);
+            expected.insert(ResolvedResourceId::new(resource.id.clone()));
+            parsed.resources.push(resource);
+        }
+        let unbound = DataSource::with_provider("mock", "test.Unbound", "shared", None);
+        let mut bound = DataSource::with_provider("mock", "test.Bound", "shared", None);
+        bound.binding = Some(absolute("lookup"));
+        let distinct = DataSource::with_provider("mock", "test.Distinct", "distinct", None);
+        expected.insert(ResolvedResourceId::new(bound.id.clone()));
+        expected.insert(ResolvedResourceId::new(distinct.id.clone()));
+        parsed.data_sources.extend([unbound, bound, distinct]);
+
+        let (_, index) = resolve_expanded_graph(parsed.into()).unwrap().into_parts();
+        assert_eq!(
+            index
+                .scheduler_target_ids()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            expected
+        );
+    }
 
     #[test]
     fn backend_identity_error_retains_typed_source() {

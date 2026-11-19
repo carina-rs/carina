@@ -531,9 +531,9 @@ fn shape_for_projection<'a>(
 ///
 /// This function is intentionally schema-aware and general: it does not name
 /// IAM, `version`, or `effect` anywhere, so any current or future
-/// `Custom`→`Enum` migration is covered without further changes. It is *not* a
-/// validator carve-out — the validator stays strict; old state is migrated in
-/// memory before validation.
+/// `Custom`→`Enum` schema change is covered without further changes. Saved
+/// attributes from current-format state are lifted in memory before strict
+/// validation. This does not convert state document versions.
 ///
 /// Only recognized members are lifted. A string is recognized when it
 /// equals one of the enum's API-canonical `values` or appears on either

@@ -2150,9 +2150,7 @@ mod post_apply_states_tests {
                 }
             ]
         });
-        let state = carina_state::check_and_migrate(&json.to_string())
-            .unwrap()
-            .into_state();
+        let state = carina_state::load_state(&json.to_string()).unwrap();
 
         let managed_current = crate::managed_current_from_states(managed_states);
         let post = PostApplyStates::from_current_and_state(
@@ -5104,9 +5102,7 @@ mod apply_state_save_tests {
 
         assert_aligned(&state);
         let serialized = serde_json::to_string(&state).expect("serialize state");
-        let round_tripped = carina_state::check_and_migrate(&serialized)
-            .expect("deserialize state")
-            .into_state();
+        let round_tripped = carina_state::load_state(&serialized).expect("deserialize state");
         assert_aligned(&round_tripped);
 
         let listener_current = round_tripped.build_state_for_resource(&id);

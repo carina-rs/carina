@@ -99,7 +99,6 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
                 .iter()
                 .map(|resource| resource.persisted_explicit_destroy_dependencies().clone())
                 .collect(),
-            legacy_dependency_classification: None,
             unresolved_resources: planned
                 .unresolved_resources
                 .iter()
@@ -310,7 +309,6 @@ fn saved_plan_layered_scalars_reload_and_validate_both_layers() {
             sorted_resources: vec![resolved(resource).as_inner().to_snapshot()],
             sorted_value_destroy_dependencies: vec![Default::default()],
             sorted_explicit_destroy_dependencies: vec![Default::default()],
-            legacy_dependency_classification: None,
             unresolved_resources: Vec::new(),
             compositions: Vec::new(),
             data_sources: Vec::new(),

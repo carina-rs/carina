@@ -1,5 +1,5 @@
 use carina_core::resource::{ConcreteValue, Value};
-use carina_state::{PublishedExports, StateFile, check_and_migrate_bytes};
+use carina_state::{PublishedExports, StateFile, load_state_bytes};
 
 fn finite(value: f64) -> carina_core::FiniteF64 {
     carina_core::FiniteF64::new(value).unwrap()
@@ -18,7 +18,7 @@ fn state_with_export_json(value: &str) -> Vec<u8> {
 fn overflowing_state_and_published_exports_fail_before_bindings_are_built() {
     for raw in ["1e999", "-1e999", "[1e999]", r#"{"nested":-1e999}"#] {
         let bytes = state_with_export_json(raw);
-        assert!(check_and_migrate_bytes(&bytes).is_err());
+        assert!(load_state_bytes(&bytes).is_err());
         assert!(PublishedExports::from_state_bytes(&bytes).is_err());
     }
 }
@@ -48,6 +48,6 @@ fn finite_published_exports_preserve_signed_zero_when_loading_bindings() {
             panic!("expected float")
         };
         assert_eq!(value.get().to_bits(), raw.to_bits());
-        assert!(check_and_migrate_bytes(&bytes).is_ok());
+        assert!(load_state_bytes(&bytes).is_ok());
     }
 }

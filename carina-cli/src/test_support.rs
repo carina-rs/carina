@@ -36,7 +36,7 @@ impl carina_state::StateBackend for UnavailableStorageBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::LoadedState>> {
+    async fn read_state(&self) -> carina_state::BackendResult<Option<carina_state::StateFile>> {
         panic!("unavailable storage must not be read")
     }
 

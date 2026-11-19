@@ -935,13 +935,7 @@ async fn github_read_write_round_trip_and_raw_exports_do_not_replace_expected_sh
     state.increment_serial();
     writer.write_state(&state).await.unwrap();
     assert_eq!(
-        writer
-            .read_state()
-            .await
-            .unwrap()
-            .unwrap()
-            .into_state()
-            .serial,
+        writer.read_state().await.unwrap().unwrap().serial,
         state.serial
     );
     let mut other = StateFile::new();
@@ -1345,7 +1339,7 @@ async fn github_write_cap_is_checked_before_any_mutation() {
 }
 
 #[tokio::test]
-async fn github_full_reads_migrate_but_raw_exports_have_independent_version_gate() {
+async fn github_full_reads_reject_old_state_but_exports_have_independent_version_gate() {
     let fake = Fake::default();
     let mut value = serde_json::to_value(StateFile::new()).unwrap();
     value["version"] = json!(StateFile::CURRENT_VERSION + 1);
@@ -1360,8 +1354,8 @@ async fn github_full_reads_migrate_but_raw_exports_have_independent_version_gate
     let bytes = serde_json::to_vec(&value).unwrap();
     fake.put("state.json", bytes.clone());
     assert!(matches!(
-        fake.backend().read_state().await.unwrap(),
-        Some(crate::LoadedState::Migrated { .. })
+        fake.backend().read_state().await,
+        Err(BackendError::StateRead { error, .. }) if matches!(*error, BackendError::StateVersionTooOld { found: 20, supported: 21 })
     ));
     assert_eq!(fake.bytes("state.json").unwrap(), bytes);
 }
@@ -1396,14 +1390,7 @@ async fn github_same_sha_update_races_and_renew_takeover_races_are_terminal_for_
             ),
             "{error:?}"
         );
-        let serial = fake
-            .backend()
-            .read_state()
-            .await
-            .unwrap()
-            .unwrap()
-            .into_state()
-            .serial;
+        let serial = fake.backend().read_state().await.unwrap().unwrap().serial;
         assert!(serial == 11 || serial == 22);
 
         let fake = Fake::default();
@@ -2205,13 +2192,7 @@ async fn github_abandoned_and_cleanup_writes_preserve_preconditions_in_both_comp
             // current policy. Cleanup resolves that intent before its save.
             backend.write_state_for_cleanup(&latest).await.unwrap();
             assert_eq!(
-                fake.backend()
-                    .read_state()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .into_state()
-                    .serial,
+                fake.backend().read_state().await.unwrap().unwrap().serial,
                 2
             );
         } else {
@@ -2219,13 +2200,7 @@ async fn github_abandoned_and_cleanup_writes_preserve_preconditions_in_both_comp
             transport.resume.notify_one();
             assert_eq!(receiver.await.unwrap().status, 409);
             assert_eq!(
-                fake.backend()
-                    .read_state()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .into_state()
-                    .serial,
+                fake.backend().read_state().await.unwrap().unwrap().serial,
                 2
             );
         }
@@ -2814,13 +2789,7 @@ async fn github_round2_success_caches_sha_before_a_failed_verification() {
     state.serial = 2;
     backend.write_state(&state).await.unwrap();
     assert_eq!(
-        fake.backend()
-            .read_state()
-            .await
-            .unwrap()
-            .unwrap()
-            .into_state()
-            .serial,
+        fake.backend().read_state().await.unwrap().unwrap().serial,
         2
     );
 }
@@ -4059,12 +4028,7 @@ async fn github_round5_release_cannot_treat_lost_contents_access_as_lease_absenc
 async fn github_round4_existing_state_needs_no_root_probe() {
     let fake = Fake::default();
     fake.put("state.json", serde_json::to_vec(&StateFile::new()).unwrap());
-    fake.backend()
-        .read_state()
-        .await
-        .unwrap()
-        .unwrap()
-        .into_state();
+    fake.backend().read_state().await.unwrap().unwrap();
     assert_eq!(fake.0.lock().unwrap().requests.len(), 2);
 }
 

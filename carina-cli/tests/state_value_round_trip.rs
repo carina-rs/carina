@@ -1,28 +1,14 @@
-//! Phase 1 of RFC #2972 — `Value` codec round-trip guard.
+//! Persisted-value codec round trips for current state fixtures.
 //!
-//! State files persist resource attributes with the typed persisted-value
-//! codec, which lifts them into the rich `Value` enum and lowers them through
-//! `PersistedValue`. When Phase 5 physically
-//! restructures `Value` from the flat 14-variant shape into nested
-//! `Concrete(ConcreteValue) / Deferred(DeferredValue)`, both codec
-//! halves must keep producing/accepting **the same JSON shape** —
-//! end users have on-disk state files in the legacy layout and
-//! cannot be asked to migrate.
-//!
-//! This test exercises every `carina.state.json` fixture in the repo,
-//! pulls each `attributes` JSON value through
-//! `PersistedAttributes::to_values -> PersistedValue::encode_provider_value -> decode` and
-//! asserts the second pass equals the first via `Value::PartialEq`. Typed
-//! `RedactedSecret` values are included because this is the resource-state
-//! codec and must preserve already-protected state without rehashing it.
-//! Today (Phase 1, additive only) this passes trivially; the test
-//! fails the moment a Phase-5 codec change re-shapes the JSON
-//! produced or interpreted by the persisted codec.
+//! Internal Value representation changes must preserve current persisted JSON.
+//! Each fixture's attributes pass through the persisted-value decoder and
+//! encoder twice, and the typed values must remain equal. Structural secret
+//! digests retain their existing bytes without rehashing.
 
 use std::path::{Path, PathBuf};
 
 use carina_core::value::PersistedValue;
-use carina_state::check_and_migrate;
+use carina_state::load_state;
 
 fn find_state_fixtures() -> Vec<PathBuf> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -66,8 +52,8 @@ fn fixture_attributes_round_trip_through_value_codec() {
     for path in &fixtures {
         let raw = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let state = match check_and_migrate(&raw) {
-            Ok(s) => s.into_state(),
+        let state = match load_state(&raw) {
+            Ok(s) => s,
             Err(e) => {
                 failures.push(format!("{}: deserialize StateFile: {e}", path.display()));
                 continue;
@@ -167,13 +153,10 @@ fn current_state_root_and_nested_hashes_round_trip_byte_for_byte() {
             "plain": "still selectable", "list": [{ "token": root }]
         }),
     );
-    let state = check_and_migrate(&serde_json::to_string(&wire).unwrap())
-        .expect("current state fixture passes the production version gate")
-        .into_state();
+    let state = load_state(&serde_json::to_string(&wire).unwrap())
+        .expect("current state fixture passes the production version gate");
     let bytes = carina_core::utils::pretty_with_newline_bytes(&state).unwrap();
-    let reloaded = check_and_migrate(std::str::from_utf8(&bytes).unwrap())
-        .unwrap()
-        .into_state();
+    let reloaded = load_state(std::str::from_utf8(&bytes).unwrap()).unwrap();
     assert_eq!(
         carina_core::utils::pretty_with_newline_bytes(&reloaded).unwrap(),
         bytes

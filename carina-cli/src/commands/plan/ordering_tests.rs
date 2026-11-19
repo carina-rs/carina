@@ -138,8 +138,6 @@ fn try_fixture_document(path: &Path) -> Result<FixtureDocument, String> {
         provider: ProviderRouter::new(),
         sorted_resources: fixture.desired_resources,
         unresolved_resources: fixture.unresolved_resources,
-        legacy_dependency_classification: None,
-        migrated_legacy_state: None,
         compositions: Vec::new(),
         data_sources: Vec::new(),
         managed_current: fixture.managed_current,

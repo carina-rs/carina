@@ -7,9 +7,7 @@ use carina_core::shutdown::ShutdownToken;
 use carina_core::shutdown::testing::{
     TestShutdownTrigger, same_shutdown_channel, shutdown_channel,
 };
-use carina_state::{
-    BackendError, BackendResult, LoadedState, LockInfo, RawState, StateBackend, StateFile,
-};
+use carina_state::{BackendError, BackendResult, LockInfo, RawState, StateBackend, StateFile};
 use tempfile::TempDir;
 
 /// Delegates state I/O to a local backend but simulates another process taking
@@ -62,7 +60,7 @@ impl StateBackend for LockLossBackend {
         carina_core::shutdown::CleanupBudget::TWO_SECOND
     }
 
-    async fn read_state(&self) -> BackendResult<Option<LoadedState>> {
+    async fn read_state(&self) -> BackendResult<Option<StateFile>> {
         self.inner.read_state().await
     }
 
@@ -264,7 +262,6 @@ impl CancellationFixtureBase {
             .await
             .expect("read state")
             .expect("state exists")
-            .into_state()
     }
 
     pub(crate) fn config_path(&self) -> &Path {

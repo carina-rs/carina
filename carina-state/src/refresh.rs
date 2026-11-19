@@ -132,8 +132,7 @@ impl RefreshRow {
             }
         };
         if let Some(dependencies) = dependencies {
-            let directives = orphan.directives().clone();
-            orphan.set_destroy_metadata(dependencies, directives);
+            orphan.set_dependency_bindings(dependencies);
         }
         orphan
     }
@@ -201,7 +200,7 @@ impl RefreshRows {
     ) -> impl Iterator<Item = RefreshableDeposed> + 'a {
         self.deposed.iter().filter_map(move |(row_id, key)| {
             // Selection belongs to the partition. Reload the payload after
-            // dependency migration so refresh cannot write back stale metadata.
+            // state mutations so refresh cannot write back stale metadata.
             let row = state.find_resource_for_id(row_id.as_inner())?;
             let generation = row
                 .deposed
@@ -614,20 +613,20 @@ mod tests {
     }
 
     #[test]
-    fn deposed_targets_reload_migrated_dependency_metadata() {
+    fn deposed_targets_reload_updated_dependency_metadata() {
         let mut state = StateFile::new();
         let mut row = ResourceState::new("test.resource", "historical", "mock");
         row.deposed.push(generation("old", None));
         state.upsert_resource(row.clone()).unwrap();
         let rows =
             PreparedRows::from_state(Some(&state), &ResolvedRemovedClaims::resolve(&[], None));
-        let migrated = carina_core::resource::PersistedDestroyDependencies::from_test_dependencies(
+        let updated = carina_core::resource::PersistedDestroyDependencies::from_test_dependencies(
             [id("dependency", None)],
         );
-        row.deposed[0].dependency_bindings = migrated.clone();
+        row.deposed[0].dependency_bindings = updated.clone();
         state.upsert_resource(row).unwrap();
         let target = rows.refreshable.deposed_targets(&state).next().unwrap();
-        assert_eq!(target.generation().dependency_bindings, migrated);
+        assert_eq!(target.generation().dependency_bindings, updated);
         assert_eq!(
             target.read_target().unwrap().identifier().as_str(),
             "old-identifier"

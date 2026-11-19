@@ -79,18 +79,11 @@ async fn perform_state_migration(
     force: bool,
     project_dir: &carina_core::paths::ResolvedPath,
 ) -> Result<StateFile, AppError> {
-    // `carina init --migrate-state` copies the source state into the
-    // target backend verbatim. The pending schema-migration marker is
-    // discarded here: writing the target state will re-emit the
-    // state at `StateFile::CURRENT_VERSION` on disk regardless, and
-    // the `--migrate-state` command is itself the backend-relocation
-    // path (carina#3315 — schema-migration persistence is handled by
-    // apply/destroy/state-refresh in the source-or-target directory).
+    // Relocate the current state through the source and target capabilities.
     let state = backends
         .read_source_state()
         .await
         .map_err(AppError::Backend)?
-        .map(|loaded| loaded.into_state())
         .ok_or_else(|| {
             AppError::Config(format!(
                 "The locked backend holds no state. There is nothing to migrate; \
@@ -106,7 +99,6 @@ async fn perform_state_migration(
         .read_target_state()
         .await
         .map_err(AppError::Backend)?
-        .map(|loaded| loaded.into_state())
         && (existing.lineage != state.lineage || !existing.resources().is_empty())
         && !force
     {
@@ -132,7 +124,6 @@ async fn perform_state_migration(
         .read_target_state()
         .await
         .map_err(AppError::Backend)?
-        .map(|loaded| loaded.into_state())
         .ok_or_else(|| {
             AppError::Config(
                 "Failed to read state back from the configured backend after \
@@ -219,8 +210,8 @@ pub async fn run_init_migrate_state(
         .map_err(AppError::Backend)?;
     println!("  {} updated backend lock", "✓".green(color_mode));
 
-    // A local source is deleted after the commit (matches the retired
-    // `state migrate`); a remote source is kept as a recoverable backup
+    // A local source is deleted after the backend lock commits;
+    // a remote source is kept as a recoverable backup
     // (remote → remote in this scope). A failure to delete here is *not*
     // fatal: the migration already committed, so a leftover old file is
     // harmless and the next run is a no-op.
@@ -269,7 +260,7 @@ mod tests {
         s.lineage = lineage.to_string();
         for i in 0..n_resources {
             // A current managed instance carries the identifier returned by
-            // its provider mutation. `check_and_migrate` preserves malformed
+            // its provider mutation. `load_state` preserves malformed
             // identifier-less rows so the typed plan boundary can fail closed;
             // historical data-source artifacts are removed only after parsing
             // supplies their exact typed `read` addresses (carina#3266).
@@ -344,7 +335,7 @@ mod tests {
         .unwrap();
         assert_eq!(state.resources().len(), 3);
 
-        let migrated = dst.read_state().await.unwrap().unwrap().into_state();
+        let migrated = dst.read_state().await.unwrap().unwrap();
         assert_eq!(migrated.lineage, "lin-1");
         assert_eq!(migrated.resources().len(), 3);
     }
@@ -377,7 +368,7 @@ mod tests {
             "got: {err:?}"
         );
         // Target must be untouched on refusal.
-        let dst_state = dst.read_state().await.unwrap().unwrap().into_state();
+        let dst_state = dst.read_state().await.unwrap().unwrap();
         assert_eq!(dst_state.lineage, "lin-dst");
     }
 
@@ -404,7 +395,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let dst_state = dst.read_state().await.unwrap().unwrap().into_state();
+        let dst_state = dst.read_state().await.unwrap().unwrap();
         assert_eq!(dst_state.lineage, "lin-src");
         assert_eq!(dst_state.resources().len(), 1);
     }
@@ -448,8 +439,7 @@ mod tests {
             .read_state()
             .await
             .unwrap()
-            .unwrap()
-            .into_state();
+            .unwrap();
         assert_eq!(migrated.lineage, source_state.lineage);
         assert_eq!(migrated.serial, source_state.serial);
         assert_eq!(migrated.resources().len(), 1);
@@ -593,8 +583,7 @@ mod tests {
             .read_state()
             .await
             .unwrap()
-            .unwrap()
-            .into_state();
+            .unwrap();
         assert_eq!(migrated.resources().len(), 2);
 
         // Lock now reflects the configured backend ⇒ a second run is a no-op.

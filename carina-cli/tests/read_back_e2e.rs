@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use carina_core::resource::{ConcreteValue, Value};
-use carina_state::check_and_migrate;
+use carina_state::load_state;
 use tempfile::TempDir;
 
 struct Scenario {
@@ -61,9 +61,7 @@ impl Scenario {
     fn state(&self) -> carina_state::state::StateFile {
         let raw =
             fs::read_to_string(self.project.join("carina.state.json")).expect("read local state");
-        check_and_migrate(&raw)
-            .expect("decode local state")
-            .into_state()
+        load_state(&raw).expect("decode local state")
     }
 }
 
