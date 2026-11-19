@@ -6327,10 +6327,16 @@ fn resource_admission_report<
         diagnostics,
     )?;
 
-    all_errors.extend(validate_for_iterable_types(
-        &parsed.analysis_tree()?,
-        bindings.provider_context(),
-    ));
+    let analysis = parsed.analysis_tree()?;
+    all_errors.extend(match bindings.upstream_exports() {
+        Some(upstream) => validate_for_iterable_types_with_upstream(
+            &analysis,
+            bindings.provider_context(),
+            judged.schemas(),
+            upstream,
+        ),
+        None => validate_for_iterable_types(&analysis, bindings.provider_context()),
+    });
 
     Ok(ResourceAdmissionReport::new(judged, attributes, all_errors))
 }

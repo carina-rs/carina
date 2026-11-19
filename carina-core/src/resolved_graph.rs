@@ -1154,10 +1154,19 @@ where
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
 {
-    let Some(address) = crate::resource::decompose_binding_address(binding.as_str()) else {
-        return Vec::new();
-    };
-    let actual_groups = parsed
+    loop_group_bindings_in(&declared_loop_groups(parsed), binding)
+}
+
+fn declared_loop_groups<E, P, T, D, B>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
+) -> std::collections::BTreeSet<B>
+where
+    P: crate::resource::ValueKind,
+    T: crate::resource::ValueKind,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+{
+    parsed
         .parser_binding_metadata
         .structural_handles()
         .iter()
@@ -1168,7 +1177,16 @@ where
                 .deferred_for_sites()
                 .filter_map(|site| site.target.bound_binding_address().cloned()),
         )
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect()
+}
+
+fn loop_group_bindings_in<B: BindingAddress>(
+    actual_groups: &std::collections::BTreeSet<B>,
+    binding: &B,
+) -> Vec<B> {
+    let Some(address) = crate::resource::decompose_binding_address(binding.as_str()) else {
+        return Vec::new();
+    };
     address
         .candidate_ancestors()
         .filter_map(|ancestor| {
@@ -1550,18 +1568,11 @@ where
         .map(|upstream| upstream.binding.clone())
         .collect::<HashSet<_>>();
     let mut targets = ExpandedTargets::default();
-    let mut managed_groups = parsed
-        .parser_binding_metadata
-        .structural_handles()
+    let loop_groups = declared_loop_groups(&parsed);
+    let mut managed_groups = loop_groups
         .iter()
-        .filter(|(_binding, handle)| handle.is_for_binding())
-        .map(|(binding, _handle)| (binding.clone(), ResolvedDependencies::default()))
+        .map(|binding| (binding.clone(), ResolvedDependencies::default()))
         .collect::<HashMap<_, _>>();
-    for site in parsed.deferred_for_sites() {
-        if let Some(binding) = site.target.bound_binding_address() {
-            managed_groups.entry(binding.clone()).or_default();
-        }
-    }
     let mut managed_ids = HashSet::new();
     for resource in &parsed.resources {
         let id = require_resolved_id(&resource.id)?;
@@ -1575,7 +1586,7 @@ where
         };
         if let Some(binding) = &resource.binding {
             targets.insert_binding(binding.clone(), target.clone())?;
-            for group in loop_group_bindings(&parsed, binding) {
+            for group in loop_group_bindings_in(&loop_groups, binding) {
                 if let Some(members) = managed_groups.get_mut(&group) {
                     members.insert(id.clone());
                 }

@@ -209,7 +209,7 @@ for script in "$repo_root"/scripts/*.sh; do
 printf '%s\n' "${BASH_SOURCE[0]##*/}" >> "$VERIFY_GUARD_TRACE"
 SH
 done
-for tool in cargo cargo-nextest cargo-hack; do
+for tool in cargo cargo-nextest cargo-hack python3; do
     printf '#!/bin/sh\nexit 0\n' > "$fixture/bin/$tool"
     chmod +x "$fixture/bin/$tool"
 done

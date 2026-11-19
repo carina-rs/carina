@@ -794,7 +794,9 @@ mod for_key_type_tests {
         use crate::resource::{ConcreteValue, RelativeBindingName, Value};
         let target =
             crate::parser::BoundDeferredTarget::new(RelativeBindingName::new("m.rs")).unwrap();
-        let mut keys = vec!["a[b]".to_string(), "q'].z['w".to_string()];
+        let ordinary = ["a", "a b", "example.com", "a-b", "/a/b", "2001:db8::1"];
+        let mut keys = ordinary.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        keys.extend(["a[b]".to_string(), "q'].z['w".to_string()]);
         for left in b' '..=b'~' {
             for right in b' '..=b'~' {
                 keys.push(String::from_utf8(vec![left, right]).unwrap());
@@ -809,12 +811,28 @@ mod for_key_type_tests {
                 .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
                 .unwrap()
                 .into_classification();
-            if let Ok(ForAddressAdmission::Admitted(addresses)) = admit_bound_for_addresses(
+            let admission = admit_bound_for_addresses(
                 &crate::parser::ForBinding::Simple("x".into()),
                 &target,
                 crate::resource::knowledge::ClassifiedRef::from(&classified),
                 ForAddressMoment::Validation,
-            ) {
+            );
+            if ordinary.contains(&key.as_str()) {
+                assert!(
+                    matches!(&admission, Ok(ForAddressAdmission::Admitted(addresses)) if addresses.len() == 1),
+                    "ordinary keys must be admitted"
+                );
+            }
+            if key == "a[b]" {
+                // Flip this rejection assertion when carina#4552 fixes escaping.
+                assert!(matches!(
+                    &admission,
+                    Ok(ForAddressAdmission::Reject(
+                        ForKeyError::NonRoundTrippingKey { element: 1 }
+                    ))
+                ));
+            }
+            if let Ok(ForAddressAdmission::Admitted(addresses)) = admission {
                 let minted = addresses[0].binding_address().as_str();
                 let canonical = crate::utils::canonicalize_map_key_address(minted);
                 assert_eq!(

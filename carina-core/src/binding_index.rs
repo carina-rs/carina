@@ -696,6 +696,7 @@ fn suggestion_suffix(unknown: &str, known: &[&str]) -> String {
 #[derive(Debug)]
 pub struct BindingIndex<'a, B: BindingAddress = RelativeBindingName> {
     schemas: &'a SchemaRegistry,
+    upstream_exports: Option<&'a crate::upstream_exports::UpstreamExports<B>>,
     provider_context: crate::parser::ProviderContext,
     session: Option<&'a dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     entries: HashMap<String, BindingEntry<'a, B>>,
@@ -1099,6 +1100,7 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
             }
         }
         Self {
+            upstream_exports,
             schemas: registry,
             provider_context: provider_context.clone(),
             session: None,
@@ -1122,6 +1124,10 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
                     .flatten()
             })
         })
+    }
+
+    pub(crate) fn upstream_exports(&self) -> Option<&crate::upstream_exports::UpstreamExports<B>> {
+        self.upstream_exports
     }
 
     pub(crate) fn provider_context(&self) -> &crate::parser::ProviderContext {

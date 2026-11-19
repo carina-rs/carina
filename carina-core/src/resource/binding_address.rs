@@ -135,9 +135,6 @@ pub struct ForAddressDefer {
 }
 
 impl ForAddressDefer {
-    pub fn phase(&self) -> super::knowledge::Phase {
-        self.phase
-    }
     pub(crate) fn element(&self) -> Option<usize> {
         self.element
     }
@@ -173,7 +170,7 @@ pub(crate) enum ForAdmissionFailure<B: BindingAddress> {
 #[derive(Debug)]
 pub enum ForExpansion<T> {
     Expanded(T),
-    Deferred(ForAddressDefer),
+    Deferred,
 }
 
 impl<T> ForExpansion<T> {
@@ -181,7 +178,7 @@ impl<T> ForExpansion<T> {
     pub(crate) fn expect_expanded(self) -> T {
         match self {
             Self::Expanded(value) => value,
-            Self::Deferred(pending) => panic!("expected concrete expansion, got {pending:?}"),
+            Self::Deferred => panic!("expected concrete expansion"),
         }
     }
 }
@@ -448,7 +445,9 @@ impl<'a> CheckedBindingAddress<'a> {
     }
 
     pub fn is_direct_child_of(&self, parent: &str) -> bool {
-        self.ends.len() > 1 && &self.spelling[..self.ends[self.ends.len() - 2]] == parent
+        self.ends.len() > 1
+            && &self.spelling[..self.ends[self.ends.len() - 2]] == parent
+            && &self.spelling[parent.len()..] != "[?]"
     }
 
     pub fn is_descendant_of(&self, ancestor: &str) -> bool {
@@ -914,7 +913,9 @@ impl BindingAddress for AbsoluteBindingAddress {
     }
 }
 
-/// Lookup spelling cannot be assigned as a Resource binding or converted to B.
+/// Reference lookup spelling. The child-address minting functions are private
+/// to this module; this wrapper does not enforce provenance on Resource.binding.
+/// In-crate reference and origin views can still expose the underlying binding.
 #[derive(Clone)]
 pub(crate) struct BindingLookup<B: BindingAddress> {
     binding: B,
@@ -1081,6 +1082,22 @@ pub(crate) fn binding_selected_attribute<B: BindingAddress>(binding: &B, attribu
 #[cfg(test)]
 mod tests {
     use super::AbsoluteBindingAddress;
+
+    #[test]
+    fn for_value_keys_membership_excludes_deferred_template_addresses() {
+        for spelling in ["rs[0]", "rs[12]", "rs.prod", "rs['?']", "rs['[?]']"] {
+            let address = super::decompose_binding_address(spelling).unwrap();
+            assert!(address.is_direct_child_of("rs"), "{spelling}");
+        }
+        for spelling in ["rs[?]", "rs", "rs[0].nested", "rs_suffix[0]"] {
+            let address = super::decompose_binding_address(spelling).unwrap();
+            assert!(!address.is_direct_child_of("rs"), "{spelling}");
+        }
+        let template = super::decompose_binding_address("m.rs[?]").unwrap();
+        assert!(template.ends_in_subscript());
+        assert_eq!(template.first_field_prefix(), Some(("m", "rs[?]")));
+        assert!(!template.is_direct_child_of("m.rs"));
+    }
 
     #[test]
     fn for_value_keys_membership_opaque_quoted_keys() {

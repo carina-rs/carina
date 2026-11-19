@@ -587,6 +587,89 @@ fn partial_argument_module(item: &str) -> Scenario {
     scenario
 }
 
+fn assert_module_loop_caller_scope(partial: bool, shadowed: bool) {
+    let scenario = Scenario::new();
+    fs::create_dir(scenario.project.join("child")).unwrap();
+    let (arguments, iterable, supplied, children) = if partial {
+        (
+            "item: String tag: String",
+            "[item, 'z']",
+            "item = 'a'",
+            vec!["m.inner.a", "m.inner.z"],
+        )
+    } else {
+        (
+            "names: list(String) tag: String",
+            "names",
+            "names = ['a', 'b c']",
+            vec!["m.inner.a", "m.inner['b c']"],
+        )
+    };
+    scenario.write(
+        "child/arguments.crn",
+        &format!("arguments {{ {arguments} }}\n"),
+    );
+    let local = if shadowed {
+        "let seed = mock.test.resource { name = 'inner-seed' }\n"
+    } else {
+        ""
+    };
+    scenario.write(
+        "child/resources.crn",
+        &format!("{local}let inner = for y in {iterable} {{ mock.test.resource {{ name = y comment = tag }} }}\n"),
+    );
+    scenario.write("modules.crn", "let child = use { source = './child' }\n");
+    scenario.write(
+        "resources.crn",
+        &format!("let seed = mock.test.resource {{ name = 'seed' }}\nlet m = child {{ {supplied} tag = seed.identifier }}\n"),
+    );
+    success(
+        "validate caller-scoped loop argument",
+        &scenario.carina(&["validate", "."]),
+    );
+    let plan = scenario.plan();
+    let creates = plan["plan"]["effects"].as_array().unwrap();
+    for binding in children {
+        let child = creates
+            .iter()
+            .filter_map(|effect| effect.get("Create"))
+            .find(|resource| resource["binding"] == binding)
+            .expect("loop child");
+        let reference = child["attributes"]["comment"].to_string();
+        assert!(reference.contains("\"seed\""), "{binding}: {child:#}");
+        assert!(!reference.contains("m.seed"), "{binding}: {child:#}");
+        assert_eq!(
+            child["value_dependencies"].as_array().unwrap().len(),
+            1,
+            "{child:#}"
+        );
+        assert_eq!(
+            child["value_dependencies"][0]["identity"], "seed",
+            "{child:#}"
+        );
+    }
+}
+
+#[test]
+fn for_value_keys_module_argument_caller_reference() {
+    assert_module_loop_caller_scope(false, false);
+}
+
+#[test]
+fn for_value_keys_module_argument_caller_reference_shadowed() {
+    assert_module_loop_caller_scope(false, true);
+}
+
+#[test]
+fn for_value_keys_module_partial_caller_reference() {
+    assert_module_loop_caller_scope(true, false);
+}
+
+#[test]
+fn for_value_keys_module_partial_caller_reference_shadowed() {
+    assert_module_loop_caller_scope(true, true);
+}
+
 #[test]
 fn for_value_keys_module_partial_list_validate() {
     let scenario = partial_argument_module("a");
