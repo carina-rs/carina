@@ -49,18 +49,27 @@ pub fn recorded_snapshot(plan: &carina_core::plan::Plan) -> carina_core::plan::S
             current: &std::collections::HashMap::new(),
         })
         .unwrap();
-    checked
-        .record_snapshot(
-            &std::collections::HashMap::<
-                _,
-                carina_core::resource::Resource<
-                    carina_core::resource::ModuleSource,
-                    carina_core::resource::SnapshotLeaf,
-                >,
-            >::new(),
-            &observations,
-        )
-        .unwrap()
-        .plan()
-        .clone()
+    let parsed = carina_core::parser::ExpandedInferredFile::default();
+    carina_core::value::SavedDocumentConversion::document(
+        &parsed,
+        &[&**checked.plan()],
+        |conversion| {
+            checked.record_snapshot(
+                conversion,
+                &std::collections::HashMap::<
+                    _,
+                    carina_core::value::Saved<
+                        carina_core::resource::Resource<
+                            carina_core::resource::ModuleSource,
+                            carina_core::resource::SnapshotLeaf,
+                        >,
+                    >,
+                >::new(),
+                &observations,
+            )
+        },
+    )
+    .unwrap()
+    .plan()
+    .clone()
 }

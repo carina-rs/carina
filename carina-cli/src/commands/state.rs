@@ -1715,6 +1715,36 @@ pub async fn run_state_refresh(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
+    run_state_refresh_using(
+        runtime,
+        path,
+        lock,
+        provider_context,
+        cancel,
+        |runtime, providers, base_dir| {
+            ProviderLoad::load(
+                runtime,
+                providers,
+                base_dir,
+                &mut crate::commands::human_provider_notices(runtime.color_mode()),
+            )
+        },
+    )
+    .await
+}
+
+pub(crate) async fn run_state_refresh_using(
+    runtime: &crate::runtime::CommandRuntime,
+    path: &Path,
+    lock: bool,
+    provider_context: &ProviderContext,
+    cancel: ShutdownToken,
+    load: impl FnOnce(
+        &crate::runtime::CommandRuntime,
+        &[carina_core::parser::ProviderConfig<carina_core::resource::ParserPlaceholder>],
+        &carina_core::paths::ResolvedPath,
+    ) -> Result<ProviderLoad, AppError>,
+) -> Result<(), AppError> {
     let project = carina_core::paths::ResolvedPath::new(path)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
@@ -1729,12 +1759,7 @@ pub async fn run_state_refresh(
 
     super::apply::symlink_retarget_test_barrier("CARINA_TEST_STATE_REFRESH_CONFIG_HANDSHAKE_DIR")
         .await;
-    let providers = ProviderLoad::load(
-        runtime,
-        &parsed.providers,
-        base_dir,
-        &mut crate::commands::human_provider_notices(runtime.color_mode()),
-    )?;
+    let providers = load(runtime, &parsed.providers, base_dir)?;
     let validated_config =
         providers.validate_read_only_config(parsed, base_dir, &duplicate_declarations)?;
 

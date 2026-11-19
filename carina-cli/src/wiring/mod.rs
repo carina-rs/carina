@@ -40,10 +40,10 @@
 //! the owner returned by planning.
 //!
 //! ```compile_fail,E0308
-//! use carina_cli::commands::plan::PlanFileContents;
+//! use carina_cli::commands::plan::PlanFileTransport;
 //! use carina_cli::wiring::ProviderLoad;
 //!
-//! fn record_raw_load(contents: PlanFileContents, providers: ProviderLoad) {
+//! fn record_raw_load(contents: PlanFileTransport, providers: ProviderLoad) {
 //!     let _ = contents.record(&providers, Vec::new());
 //! }
 //! ```
@@ -51,10 +51,10 @@
 //! A raw wiring context is not accepted either.
 //!
 //! ```compile_fail,E0308
-//! use carina_cli::commands::plan::PlanFileContents;
+//! use carina_cli::commands::plan::PlanFileTransport;
 //! use carina_cli::wiring::WiringContext;
 //!
-//! fn record_raw_context(contents: PlanFileContents, context: WiringContext) {
+//! fn record_raw_context(contents: PlanFileTransport, context: WiringContext) {
 //!     let _ = contents.record(&context, Vec::new());
 //! }
 //! ```
@@ -508,7 +508,7 @@ impl PlanContext {
 /// its deferred-`for` expansion. Field access dereferences to [`PlanContext`]
 /// so existing plan consumers do not need a second, untyped resource channel.
 ///
-/// The type is public so [`PlanFileContents::record`](crate::commands::plan::PlanFileContents::record)
+/// The type is public so [`PlanFileTransport::record`](crate::commands::plan::PlanFileTransport::record)
 /// can name the required owner state. Its fields and constructors remain
 /// private; production values are returned only by the planning transition.
 pub struct ExpandedPlanContext<E> {
@@ -928,12 +928,12 @@ impl<R> std::ops::Deref for ValidationReady<R> {
 /// the completed-plan owner that retains its validated wiring:
 ///
 /// ```compile_fail,E0308
-/// use carina_cli::commands::plan::PlanFileContents;
+/// use carina_cli::commands::plan::PlanFileTransport;
 /// use carina_cli::wiring::CanonicalResourcePair;
 /// use carina_core::parser::InferredExportParam;
 ///
 /// fn record_unbound(
-///     contents: PlanFileContents,
+///     contents: PlanFileTransport,
 ///     resources: CanonicalResourcePair<InferredExportParam>,
 /// ) {
 ///     let _ = contents.record(&resources, Vec::new());

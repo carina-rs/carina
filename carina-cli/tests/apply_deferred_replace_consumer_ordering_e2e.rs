@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use carina_cli::commands::plan::{CurrentStateEntry, PlanFile, PlanFileContents};
+use carina_cli::commands::plan::{CurrentStateEntry, PlanFile, PlanFileTransport};
 use carina_cli::wiring::{LoadedProviderFactory, ValidatedConfig};
 use carina_core::effect::{DeferredReplaceDelete, DeferredReplacePayload, Effect, NonEmptyDeletes};
 use carina_core::parser::{
@@ -82,7 +82,7 @@ fn mock_saved_provider_configs() -> SavedProviderConfigs {
     SavedProviderConfigs::from(&resolved)
 }
 
-fn record_with_mock_provider(contents: PlanFileContents) -> PlanFile {
+fn record_with_mock_provider(contents: PlanFileTransport) -> PlanFile {
     let configs: [ProviderConfig; 1] = [ProviderConfig {
         name: "mock".to_string(),
         attributes: Default::default(),
@@ -411,7 +411,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         CurrentStateEntry::managed(consumer.id.clone(), consumer_from),
     ];
 
-    let contents = PlanFileContents {
+    let contents = PlanFileTransport {
         version: PlanFile::CURRENT_VERSION,
         carina_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp: "2026-06-25T00:00:00Z".to_string(),
@@ -451,7 +451,8 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
         unresolved_resources: sorted_resources
             .into_iter()
             .map(Resource::into_value_snapshot)
-            .map(|value| value.to_snapshot())
+            .map(carina_core::executor::UnresolvedResource::from_pre_resolve)
+            .map(carina_cli::test_support::saved_authored_resource)
             .collect(),
         compositions: vec![],
         data_sources: vec![],

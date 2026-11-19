@@ -7,6 +7,34 @@ use carina_core::{EnvironmentSnapshot, TestUserDirs};
 use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
 use std::sync::{Arc, OnceLock};
 
+/// Build synthetic admitted values through the production conversion.
+pub fn with_saved_document<T>(
+    build: impl FnOnce(
+        &carina_core::value::SavedDocumentConversion,
+    ) -> Result<T, carina_core::value::SerializationError>,
+) -> Result<T, carina_core::value::SerializationError> {
+    carina_core::value::SavedDocumentConversion::document(
+        &carina_core::parser::ExpandedInferredFile::default(),
+        &[],
+        build,
+    )
+}
+
+/// Capture an authored resource from a synthetic pre-resolution fixture.
+pub fn saved_authored_resource<S: Clone>(
+    source: carina_core::executor::UnresolvedResource<S>,
+) -> carina_core::value::SavedAuthored<
+    carina_core::resource::Resource<
+        S,
+        carina_core::resource::SnapshotLeaf,
+        carina_core::resource::AbsoluteBindingAddress,
+        (),
+    >,
+> {
+    with_saved_document(|conversion| conversion.authored_resource(&source, source.as_resource()))
+        .expect("authored fixture must pass saved-document admission")
+}
+
 /// A confirmed storage failure; every state or lock operation is forbidden.
 #[cfg(test)]
 pub(crate) struct UnavailableStorageBackend {
@@ -658,9 +686,12 @@ pub(crate) fn install_mock_wasm(directory: &std::path::Path) {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap();
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workspace.join("target"));
     let source = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
         .into_iter()
-        .map(|name| workspace.join("target/wasm32-wasip2/debug").join(name))
+        .map(|name| target.join("wasm32-wasip2/debug").join(name))
         .find(|path| path.is_file())
         .expect("the mock WASM fixture must be built");
     std::fs::copy(&source, directory.join("mock.wasm")).unwrap();

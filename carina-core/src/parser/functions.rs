@@ -2,20 +2,25 @@
 //!
 //! Extracted from `parser/mod.rs` per #2263 (part 2/2).
 
-use super::ast::{FnParam, PendingFunctionTypeCheck, TypeExpr, UserFunction, UserFunctionBody};
+use super::ast::{FnParam, PendingFunctionTypeCheck, UserFunction, UserFunctionBody};
 use super::context::{ParseContext, next_pair};
 use super::error::{ParseError, ParseWarning};
 use super::types::parse_type_expr;
 use super::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
 use super::{ProviderContext, Rule, is_static_eval, parse_expression};
 use crate::eval_value::{EvalValue, UnexpandedStructuralHandleKind};
+use crate::function_evaluation::{
+    AnnotationError, ArgumentStep, FunctionBodyCompletion, FunctionCompletion, FunctionEvaluation,
+    LocalStep, ParameterAnnotationCheck, PreparedFunction, RetainedCall,
+    annotation_requires_provider_session, check_parameter_annotation,
+    contains_deferred_user_function_call,
+};
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder, PlaceholderKind,
     Value as GenericValue, ValueString,
 };
 use crate::schema::TypeIdentity;
 use indexmap::IndexMap;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Parse a user-defined function definition
@@ -190,34 +195,26 @@ pub(super) fn parse_fn_def(
     })
 }
 
-enum PreparedUserFunctionCall<'cfg, Source = super::context::AuthoredDiagnosticSource> {
+enum PreparedUserFunctionCall<'function, 'cfg, Source = super::context::AuthoredDiagnosticSource> {
     Ready {
         child_ctx: Box<ParseContext<'cfg, Source>>,
-        substitutions: HashMap<String, FunctionArgument>,
+        completion: FunctionBodyCompletion<
+            'function,
+            ParserPlaceholder,
+            crate::resource::RelativeBindingName,
+        >,
     },
-    Deferred(Vec<FunctionArgument>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum FunctionArgumentTypeCheck {
-    Complete,
-    AwaitingRuntimeValue,
-    RecordedProviderDeferral,
-    AwaitingProviderSession,
-    /// The structural argument is already an explicit handle. Its annotation
-    /// still needs provider classification, but a pure body can run while the
-    /// pending check retains that handle for loaded validation.
-    DeferredHandleAnnotation,
+    Deferred(RetainedCall<ParserPlaceholder, crate::resource::RelativeBindingName>),
 }
 
 /// Prepare a user-defined function call: validate args, build substitutions, and return
 /// the child context with all parameters and local lets resolved.
-fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
-    func: &UserFunction,
+fn prepare_user_function_call<'function, 'cfg, Source: super::context::EvaluationSource>(
+    func: &'function Arc<UserFunction>,
     args: &[FunctionArgument],
     ctx: &ParseContext<'cfg, Source>,
     call_line: usize,
-) -> Result<PreparedUserFunctionCall<'cfg, Source>, ParseError> {
+) -> Result<PreparedUserFunctionCall<'function, 'cfg, Source>, ParseError> {
     let fn_name = &func.name;
 
     // Check recursion
@@ -225,31 +222,24 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
         return Err(ParseError::RecursiveFunction(fn_name.clone()));
     }
 
-    // Validate argument count
-    let required_count = func.params.iter().filter(|p| p.default.is_none()).count();
-    let max_count = func.params.len();
-    if args.len() < required_count {
-        return Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}' expects at least {required_count} argument(s), got {}",
-            args.len()
-        )));
-    }
-    if args.len() > max_count {
-        return Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}' expects at most {max_count} argument(s), got {}",
-            args.len()
-        )));
-    }
-
+    let mut completion = FunctionCompletion::new(
+        func,
+        &ctx.shared_user_function_scope(),
+        args.to_vec(),
+        call_line.into(),
+    )
+    .map_err(|error| ParseError::UserFunctionError(error.parser_message(fn_name)))?
+    .with_bindings(Arc::new(
+        crate::binding_index::ResolvedBindings::for_parser_resources(&ctx.resource_bindings),
+    ));
     if ctx
         .session
         .is_some_and(|session| session.function_declaration_failed(func))
     {
-        return Ok(PreparedUserFunctionCall::Deferred(args.to_vec()));
+        return Ok(PreparedUserFunctionCall::Deferred(completion.retain()));
     }
 
     // Build substitution map: param_name -> value, and type-check annotated params
-    let mut substitutions: HashMap<String, FunctionArgument> = HashMap::new();
     let mut effective_args = Vec::with_capacity(func.params.len());
     let requires_session = ctx.session.is_none()
         && !ctx.config.custom_types_loaded()
@@ -258,12 +248,17 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
             .as_ref()
             .is_some_and(annotation_requires_provider_session);
     let mut has_deferred_type_check = requires_session;
-    let mut defer_value_call = requires_session;
-    for (i, param) in func.params.iter().enumerate() {
-        let argument = if i < args.len() {
-            args[i].clone()
-        } else {
-            FunctionArgument::from_value(param.default.clone().unwrap())
+    let prepared = loop {
+        let slot = match completion.next_argument() {
+            ArgumentStep::Argument(slot) => slot,
+            ArgumentStep::Complete(prepared) => break prepared,
+        };
+        let param = slot.parameter();
+        let argument = match slot.argument() {
+            crate::function_evaluation::ArgumentSource::Provided(argument) => argument.clone(),
+            crate::function_evaluation::ArgumentSource::Default(value) => {
+                FunctionArgument::from_value(value.clone())
+            }
         };
         // Keep nested calls and module-argument placeholders intact until the
         // directory/module resolver has the complete function table and the
@@ -274,40 +269,20 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
         } else {
             argument.try_map_value(|value| try_evaluate_fn_value(value.clone(), ctx, call_line))?
         };
-        // Type-check if the parameter has a type annotation
-        if param.param_type.is_some() {
-            match check_fn_arg_type(func, param, &argument, ctx, call_line, None)? {
-                FunctionArgumentTypeCheck::Complete => {}
-                FunctionArgumentTypeCheck::AwaitingRuntimeValue => {
-                    has_deferred_type_check = true;
-                    defer_value_call = true;
-                }
-                FunctionArgumentTypeCheck::RecordedProviderDeferral
-                | FunctionArgumentTypeCheck::AwaitingProviderSession => {
-                    has_deferred_type_check = true;
-                    defer_value_call = true;
-                }
-                FunctionArgumentTypeCheck::DeferredHandleAnnotation => {
-                    has_deferred_type_check = true;
-                }
-            }
-        }
-        substitutions.insert(param.name.clone(), argument.clone());
+        let (next, report) = slot
+            .check(
+                argument.clone(),
+                ctx.typecheck_provider_context(),
+                || None,
+                &format!("function '{}' parameter '{}'", func.name, param.name),
+            )
+            .map_err(|error| {
+                function_argument_annotation_error(func, param, &argument, call_line, error)
+            })?;
+        completion = next;
+        has_deferred_type_check |= report.needs_recheck();
         effective_args.push(argument);
-    }
-
-    // A sibling- or forward-declared call is not resolvable in this file's
-    // parse context. Keep the *outer* call intact so the directory-merged
-    // resolver can check the same parameter after it learns the nested
-    // callee's result. Evaluating the body now would silently discard an
-    // unused deferred argument (`f(g(1))` where `f` returns a constant).
-    if effective_args.iter().any(|argument| {
-        function_argument_must_remain_deferred(argument)
-            || argument.value().is_some_and(contains_function_call)
-    }) {
-        return Ok(PreparedUserFunctionCall::Deferred(effective_args));
-    }
-
+    };
     if has_deferred_type_check {
         ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
             location: func.body.location.clone(),
@@ -318,27 +293,40 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
             source_column: None,
             source_file: None,
         });
-        if defer_value_call {
-            return Ok(PreparedUserFunctionCall::Deferred(effective_args));
-        }
     }
+    let mut completion = match prepared {
+        PreparedFunction::Retain(call) => return Ok(PreparedUserFunctionCall::Deferred(call)),
+        PreparedFunction::Ready { completion } => {
+            if requires_session
+                || effective_args
+                    .iter()
+                    .any(function_argument_must_remain_deferred)
+            {
+                return Ok(PreparedUserFunctionCall::Deferred(completion.retain()));
+            }
+            completion
+        }
+    };
 
     // Create a child context with recursion tracking
     let mut child_ctx = ctx.child_scope();
     child_ctx.evaluating_functions.push(fn_name.clone());
 
     // Evaluate local lets, substituting and resolving each one
-    for (let_name, let_expr, source_line) in &func.local_lets {
-        let local = crate::value_walk::substitute_function_call_argument(
-            &FunctionArgument::from_value(let_expr.clone()),
-            &substitutions,
-            *source_line,
-        )
-        .map_err(|error| locate_function_body_error(func, error))?
-        .try_map_value(|value| {
-            try_evaluate_fn_value(value.clone(), &child_ctx, *source_line)
-                .map_err(|error| locate_function_body_error(func, error))
-        })?;
+    let completion = loop {
+        let slot = match completion.next_local() {
+            LocalStep::Local(slot) => slot,
+            LocalStep::Body(body) => break body,
+        };
+        let let_name = slot.name().to_owned();
+        let source_line = slot.source_line();
+        let local = slot
+            .substitute_argument()
+            .map_err(|error| locate_function_body_error(func, error))?
+            .try_map_value(|value| {
+                try_evaluate_fn_value(value.clone(), &child_ctx, source_line)
+                    .map_err(|error| locate_function_body_error(func, error))
+            })?;
 
         let local = match local.handle() {
             Some(handle) => {
@@ -353,12 +341,12 @@ fn prepare_user_function_call<'cfg, Source: super::context::EvaluationSource>(
                 local
             }
         };
-        substitutions.insert(let_name.clone(), local);
-    }
+        completion = slot.bind(local);
+    };
 
     Ok(PreparedUserFunctionCall::Ready {
         child_ctx: Box::new(child_ctx),
-        substitutions,
+        completion,
     })
 }
 
@@ -371,71 +359,6 @@ fn function_argument_must_remain_deferred(argument: &FunctionArgument) -> bool {
     argument.value().is_some_and(|value| {
         contains_deferred_user_function_call(value) || contains_module_argument(value)
     })
-}
-
-fn contains_deferred_user_function_call(value: &Value) -> bool {
-    match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
-            .values()
-            .into_iter()
-            .any(contains_deferred_user_function_call),
-        Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
-            crate::builtins::builtin_arity(name).is_none()
-                || args.iter().any(|argument| {
-                    argument
-                        .value()
-                        .is_some_and(contains_deferred_user_function_call)
-                })
-        }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }) => true,
-        Value::Concrete(ConcreteValue::List(values)) => {
-            values.iter().any(contains_deferred_user_function_call)
-        }
-        Value::Concrete(ConcreteValue::Map(values)) => {
-            values.values().any(contains_deferred_user_function_call)
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
-            matches!(
-                part,
-                crate::resource::InterpolationPart::Expr(value)
-                    if contains_deferred_user_function_call(value)
-            )
-        }),
-        Value::Deferred(DeferredValue::Secret(value)) => {
-            value.visit(contains_deferred_user_function_call)
-        }
-        Value::Deferred(DeferredValue::Access(access)) => {
-            contains_deferred_user_function_call(access.base())
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            contains_deferred_user_function_call(value)
-                || contains_deferred_user_function_call(default)
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            contains_deferred_user_function_call(expression.lhs())
-                || contains_deferred_user_function_call(expression.rhs())
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Unavailable { .. }
-            | DeferredValue::Unknown(_)
-            | DeferredValue::Placeholder(_),
-        ) => false,
-        crate::resource::Value::Reference(never) | crate::resource::Value::Conversion(never) => {
-            match *never {}
-        }
-    }
 }
 
 fn function_argument_awaits_module_substitution(argument: &FunctionArgument) -> bool {
@@ -889,69 +812,43 @@ fn check_fn_arg_type<Source: super::context::EvaluationSource>(
     ctx: &ParseContext<'_, Source>,
     call_line: usize,
     site: Option<crate::validation::deferred_types::ProviderTypeCheckSite>,
-) -> Result<FunctionArgumentTypeCheck, ParseError> {
-    let fn_name = &function.name;
-    let param_name = &parameter.name;
-    let Some(type_expr) = &parameter.param_type else {
-        return Ok(FunctionArgumentTypeCheck::Complete);
-    };
-    if argument.pending_parameter().is_some() {
-        return Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue);
+) -> Result<
+    Option<ParameterAnnotationCheck<ParserPlaceholder, crate::resource::RelativeBindingName>>,
+    ParseError,
+> {
+    if parameter.param_type.is_none() {
+        return Ok(None);
     }
-    // An authored resource handle already proves its resource-type identity.
-    // A matching dotted parameter can be checked without querying provider
-    // scalar schemas, preserving pure handle calls in static expressions.
-    if ctx.session.is_none()
-        && !ctx.config.custom_types_loaded()
-        && let (TypeExpr::DottedUnresolved(path), Some(handle)) = (type_expr, argument.handle())
-        && crate::validation::check_handle_sink(
-            handle,
-            &crate::validation::ResolvedParameterType::Handle(path.clone()),
-        )
-        .is_ok()
-    {
-        return Ok(FunctionArgumentTypeCheck::Complete);
-    }
-    if ctx.session.is_none()
-        && !ctx.config.custom_types_loaded()
-        && annotation_requires_provider_session(type_expr)
-    {
-        return Ok(FunctionArgumentTypeCheck::AwaitingProviderSession);
-    }
-    // Function annotations are parsed before provider schemas are necessarily
-    // available, so dotted types intentionally enter the AST unresolved. When
-    // this call runs with an enriched context, resolve the annotation at the
-    // checking seam so provider custom-type validation receives the same
-    // canonical API spelling as module arguments, attributes, and exports.
-    let resolved_type = match crate::validation::resolve_parameter_type_for_check(
-        type_expr, ctx.config,
-    ) {
-        Ok(Some(resolved)) => resolved,
-        Ok(None) => {
-            if let Some(session) = ctx.session {
-                match site {
-                    Some(site) => session.record(type_expr, site),
-                    None => session.record_type(
-                        type_expr,
-                        &format!("function '{fn_name}' parameter '{param_name}'"),
-                    ),
-                }
-            }
-            return Ok(if argument.handle().is_some() {
-                FunctionArgumentTypeCheck::DeferredHandleAnnotation
-            } else {
-                FunctionArgumentTypeCheck::RecordedProviderDeferral
-            });
-        }
-        Err(error) => {
-            // This failure belongs to the authored annotation, even when
-            // evaluation discovers it first. Preserve its typed token so
-            // the shared resolution report can replace the parser backstop.
+    check_parameter_annotation(
+        parameter,
+        argument.clone(),
+        ctx.typecheck_provider_context(),
+        || site,
+        &format!(
+            "function '{}' parameter '{}'",
+            function.name, parameter.name
+        ),
+    )
+    .map(Some)
+    .map_err(|error| {
+        function_argument_annotation_error(function, parameter, argument, call_line, error)
+    })
+}
+
+fn function_argument_annotation_error(
+    function: &UserFunction,
+    parameter: &FnParam,
+    argument: &FunctionArgument,
+    call_line: usize,
+    error: AnnotationError,
+) -> ParseError {
+    match error {
+        AnnotationError::Resolution(error) => {
             let name = match &error {
                     crate::static_type::StaticTypeResolutionError::UnknownCustomType { name }
                     | crate::static_type::StaticTypeResolutionError::UnknownCustomTypeWithSuggestion { name, .. }
                     | crate::static_type::StaticTypeResolutionError::ConflictingScalarKinds { name, .. }
-            | crate::static_type::StaticTypeResolutionError::MissingDeclaration { name, .. } => name,
+                    | crate::static_type::StaticTypeResolutionError::MissingDeclaration { name, .. } => name,
                 };
             let error = match parameter.type_span {
                 Some(span) => {
@@ -964,126 +861,30 @@ fn check_fn_arg_type<Source: super::context::EvaluationSource>(
                 .iter()
                 .find(|annotation| Some(annotation.location().span()) == parameter.type_span)
             {
-                return Err(error.at(annotation.location()));
+                return error.at(annotation.location());
             }
-            return Err(match &function.annotation_source_file {
+            match &function.annotation_source_file {
                 Some(path) => error.in_file(path.clone()),
                 None => error,
-            });
+            }
         }
-    };
-
-    if let Some(handle) = argument.handle() {
-        if let Err(error) = crate::validation::check_handle_sink(handle, &resolved_type) {
-            if error.is_bare_value_sink() {
-                return Err(ParseError::from_eval_value(
+        AnnotationError::Handle(error) => {
+            if error.is_bare_value_sink()
+                && let Some(handle) = argument.handle()
+            {
+                return ParseError::from_eval_value(
                     crate::eval_value::EvalValueError::BareStructuralHandle(handle.bare_error()),
                     call_line,
-                ));
+                );
             }
-            return Err(ParseError::UserFunctionError(format!(
-                "function '{fn_name}': parameter '{param_name}': {error}",
-            )));
+            ParseError::UserFunctionError(format!(
+                "function '{}': parameter '{}': {error}",
+                function.name, parameter.name
+            ))
         }
-        return Ok(FunctionArgumentTypeCheck::Complete);
-    }
-
-    let value = argument.value().expect("non-handle function argument");
-    let type_expr = resolved_type.as_type_expr();
-
-    let provider_context = ctx.typecheck_provider_context();
-    let Some(resolved) = (value)
-        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-        .map(|proof| proof.into_classification())
-        .ok()
-        .and_then(|value| value.into_known().ok())
-    else {
-        return Ok(if requires_concrete_annotation_check(&type_expr) {
-            FunctionArgumentTypeCheck::AwaitingRuntimeValue
-        } else {
-            FunctionArgumentTypeCheck::Complete
-        });
-    };
-    let check = provider_context.check_resolved_constraints(&type_expr, &resolved);
-    let result = finish_function_type_check(check, provider_context, site)
-        .map_err(|mismatch| function_argument_type_error(fn_name, param_name, mismatch))?;
-    Ok(result)
-}
-
-/// Shape-only annotations are checked against the declared source by the
-/// binding pass. Refinements/literals also need the eventual concrete value;
-/// keep their annotated call instead of erasing that remaining obligation.
-fn requires_concrete_annotation_check(expected: &TypeExpr) -> bool {
-    match expected {
-        TypeExpr::Simple(_)
-        | TypeExpr::SchemaType { .. }
-        | TypeExpr::UnloadedSchemaType(_)
-        | TypeExpr::DottedUnresolved(_)
-        | TypeExpr::StringLiteral(_) => true,
-        TypeExpr::List(inner) | TypeExpr::Map(inner) => requires_concrete_annotation_check(inner),
-        TypeExpr::Union(members) => members.iter().any(requires_concrete_annotation_check),
-        TypeExpr::Struct { fields } => fields
-            .iter()
-            .any(|(_, field)| requires_concrete_annotation_check(field)),
-        TypeExpr::String
-        | TypeExpr::Bool
-        | TypeExpr::Int
-        | TypeExpr::Float
-        | TypeExpr::Duration
-        | TypeExpr::Ref(_) => false,
-    }
-}
-
-fn annotation_requires_provider_session(expected: &TypeExpr) -> bool {
-    match expected {
-        TypeExpr::UnloadedSchemaType(_)
-        | TypeExpr::SchemaType { .. }
-        | TypeExpr::DottedUnresolved(_) => true,
-        TypeExpr::List(inner) | TypeExpr::Map(inner) => annotation_requires_provider_session(inner),
-        TypeExpr::Union(members) => members.iter().any(annotation_requires_provider_session),
-        TypeExpr::Struct { fields } => fields
-            .iter()
-            .any(|(_, field)| annotation_requires_provider_session(field)),
-        TypeExpr::String
-        | TypeExpr::Bool
-        | TypeExpr::Int
-        | TypeExpr::Float
-        | TypeExpr::Duration
-        | TypeExpr::Simple(_)
-        | TypeExpr::Ref(_)
-        | TypeExpr::StringLiteral(_) => false,
-    }
-}
-
-fn finish_function_type_check(
-    check: crate::validation::typecheck::TypeExprValueCheck<'_>,
-    provider_context: crate::validation::typecheck::TypecheckProviderContext<'_>,
-    site: Option<crate::validation::deferred_types::ProviderTypeCheckSite>,
-) -> Result<FunctionArgumentTypeCheck, crate::validation::typecheck::TypeExprValueError> {
-    use crate::validation::typecheck::TypeExprValueCheck;
-    match check {
-        TypeExprValueCheck::Assignable => Ok(FunctionArgumentTypeCheck::Complete),
-        TypeExprValueCheck::Mismatch(error) => Err(error),
-        deferred @ TypeExprValueCheck::Deferred(_)
-            if provider_context.requires_provider_schemas() =>
-        {
-            deferred
-                .require_provider_schemas()
-                .map(|()| FunctionArgumentTypeCheck::Complete)
+        AnnotationError::Value(error) => {
+            function_argument_type_error(&function.name, &parameter.name, error)
         }
-        TypeExprValueCheck::Deferred(deferred) => match provider_context.session() {
-            Some(session) => {
-                let check = TypeExprValueCheck::Deferred(deferred);
-                match site {
-                    Some(site) => check.record_at(session, site)?,
-                    None => check.record_deferred(session)?,
-                }
-                Ok(FunctionArgumentTypeCheck::RecordedProviderDeferral)
-            }
-            None => TypeExprValueCheck::Deferred(deferred)
-                .require_provider_schemas()
-                .map(|()| FunctionArgumentTypeCheck::Complete),
-        },
     }
 }
 
@@ -1185,11 +986,12 @@ pub(crate) fn reject_builtin_handle_arguments(
 }
 
 pub(crate) fn evaluate_user_function_eval<Source: super::context::EvaluationSource>(
-    func: &UserFunction,
+    func: &Arc<UserFunction>,
     args: Vec<EvalValue>,
     ctx: &ParseContext<'_, Source>,
     line: usize,
-) -> Result<Value, ParseError> {
+) -> Result<FunctionEvaluation<ParserPlaceholder, crate::resource::RelativeBindingName>, ParseError>
+{
     let arguments = lower_function_arguments(args, line)?;
     evaluate_user_function(func, &arguments, ctx, line)
 }
@@ -1239,14 +1041,13 @@ pub(crate) fn validate_pending_function_type_check(
                     ),
                 );
                 match result {
-                    Ok(FunctionArgumentTypeCheck::Complete)
-                    | Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue)
-                    | Ok(FunctionArgumentTypeCheck::RecordedProviderDeferral)
-                    | Ok(FunctionArgumentTypeCheck::DeferredHandleAnnotation) => {}
-                    Ok(FunctionArgumentTypeCheck::AwaitingProviderSession) => {
-                        return Err(ParseError::UserFunctionError(
-                            "provider annotation check requires its session".into(),
-                        ));
+                    Ok(None) => {}
+                    Ok(Some(check)) => {
+                        if check.requires_provider_session() {
+                            return Err(ParseError::UserFunctionError(
+                                "provider annotation check requires its session".into(),
+                            ));
+                        }
                     }
                     Err(error) => {
                         let located = match error {
@@ -1271,31 +1072,6 @@ pub(crate) fn validate_pending_function_type_check(
         .map_err(Into::into)
 }
 
-/// Check that a function's return value matches the declared return type.
-fn check_fn_return_type(
-    fn_name: &str,
-    type_expr: &TypeExpr,
-    value: &Value,
-    config: crate::validation::typecheck::TypecheckProviderContext<'_>,
-) -> Result<FunctionArgumentTypeCheck, ParseError> {
-    let Some(resolved) = (value)
-        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-        .map(|proof| proof.into_classification())
-        .ok()
-        .and_then(|value| value.into_known().ok())
-    else {
-        return Ok(if requires_concrete_annotation_check(type_expr) {
-            FunctionArgumentTypeCheck::AwaitingRuntimeValue
-        } else {
-            FunctionArgumentTypeCheck::Complete
-        });
-    };
-    let check = config.check_resolved_constraints(type_expr, &resolved);
-    let result = finish_function_type_check(check, config, None)
-        .map_err(|mismatch| function_return_type_error(fn_name, mismatch))?;
-    Ok(result)
-}
-
 fn function_return_type_error(
     fn_name: &str,
     mismatch: crate::validation::typecheck::TypeExprValueError,
@@ -1305,11 +1081,12 @@ fn function_return_type_error(
 
 /// Evaluate a user-defined function call by substituting arguments into the body
 pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
-    func: &UserFunction,
+    func: &Arc<UserFunction>,
     args: &[FunctionArgument],
     ctx: &ParseContext<'_, Source>,
     call_line: usize,
-) -> Result<Value, ParseError> {
+) -> Result<FunctionEvaluation<ParserPlaceholder, crate::resource::RelativeBindingName>, ParseError>
+{
     let prepared =
         prepare_user_function_call(func, args, ctx, call_line).map_err(|error| match error {
             ParseError::UserFunctionError(message) => ParseError::InvalidExpression {
@@ -1318,107 +1095,84 @@ pub(crate) fn evaluate_user_function<Source: super::context::EvaluationSource>(
             },
             other => other,
         })?;
-    let (child_ctx, substitutions) = match prepared {
+    let (child_ctx, completion) = match prepared {
         PreparedUserFunctionCall::Ready {
             child_ctx,
-            substitutions,
-        } => (child_ctx, substitutions),
-        PreparedUserFunctionCall::Deferred(args) => {
-            return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                function: ctx
-                    .resolved_user_function(&func.name)
-                    .unwrap_or_else(|| std::sync::Arc::new(func.clone())),
-                functions: ctx.shared_user_function_scope(),
-                args,
-                source_line: (call_line).into(),
-            }));
-        }
+            completion,
+        } => (child_ctx, completion),
+        PreparedUserFunctionCall::Deferred(call) => return Ok(FunctionEvaluation::Retain(call)),
     };
-
-    let substituted_body = crate::value_walk::substitute_function_parameters(
-        &func.body.value,
-        &substitutions,
-        func.body.source_line,
-        crate::value_walk::RewritePosition::Value,
-    )
-    .map_err(|error| locate_function_body_error(func, error))?;
+    let substituted_body = completion
+        .substitute_body()
+        .map_err(|error| locate_function_body_error(func, error))?;
     let result = try_evaluate_fn_value(substituted_body, &child_ctx, func.body.source_line)
         .map_err(|error| locate_function_body_error(func, error))?
         .canonicalize();
-    // Check return type if annotated
-    if let Some(ref return_type) = func.return_type {
-        let return_check = check_fn_return_type(
-            &func.name,
-            return_type,
-            &result,
-            child_ctx.typecheck_provider_context(),
-        )
-        .map_err(|error| locate_function_body_error(func, error))?;
-        let retain_check = match return_check {
-            FunctionArgumentTypeCheck::RecordedProviderDeferral
-            | FunctionArgumentTypeCheck::AwaitingRuntimeValue => true,
-            FunctionArgumentTypeCheck::Complete
-            | FunctionArgumentTypeCheck::DeferredHandleAnnotation => false,
-            FunctionArgumentTypeCheck::AwaitingProviderSession => {
-                return Err(ParseError::UserFunctionError(
-                    "provider return annotation check requires its session".into(),
-                ));
+    let evaluation = completion
+        .finish(result, child_ctx.typecheck_provider_context(), || None)
+        .map_err(|error| {
+            locate_function_body_error(func, function_return_type_error(&func.name, error))
+        })?;
+    match evaluation {
+        FunctionEvaluation::Inline(value) => Ok(FunctionEvaluation::Inline(value)),
+        FunctionEvaluation::Retain(call) => {
+            if func.return_type.is_some() {
+                ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
+                    location: func.body.location.clone(),
+                    evaluation: ctx.evaluation_site_at(&func.body.location),
+                    function_name: func.name.clone(),
+                    arguments: call.arguments_for_recheck(),
+                    source_line: func.body.source_line,
+                    source_column: None,
+                    source_file: func
+                        .annotation_source_file
+                        .clone()
+                        .or_else(|| func.body.source_file.clone()),
+                });
             }
-        };
-        if retain_check {
-            ctx.record_pending_function_type_check(PendingFunctionTypeCheck {
-                location: func.body.location.clone(),
-                evaluation: ctx.evaluation_site_at(&func.body.location),
-                function_name: func.name.clone(),
-                arguments: func
-                    .params
-                    .iter()
-                    .filter_map(|parameter| substitutions.get(&parameter.name).cloned())
-                    .collect(),
-                source_line: func.body.source_line,
-                source_column: None,
-                source_file: func
-                    .annotation_source_file
-                    .clone()
-                    .or_else(|| func.body.source_file.clone()),
-            });
-            return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                function: ctx
-                    .resolved_user_function(&func.name)
-                    .unwrap_or_else(|| std::sync::Arc::new(func.clone())),
-                functions: ctx.shared_user_function_scope(),
-                args: func
-                    .params
-                    .iter()
-                    .map(|parameter| substitutions[&parameter.name].clone())
-                    .collect(),
-                source_line: call_line.into(),
-            }));
+            Ok(FunctionEvaluation::Retain(call))
         }
     }
-    Ok(result)
 }
 
 /// Evaluate a call that already owns its resolved lexical definition.
 /// Consumers outside the parser use this instead of rebuilding a name lookup
 /// table from their current (and potentially different) module scope.
 pub(crate) fn evaluate_resolved_user_function(
-    function: &UserFunction,
+    function: &Arc<UserFunction>,
     functions: &Arc<IndexMap<String, UserFunction>>,
     arguments: &[FunctionArgument],
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     call_line: usize,
-) -> Result<Value, ParseError> {
+) -> Result<FunctionEvaluation<ParserPlaceholder, crate::resource::RelativeBindingName>, ParseError>
+{
     let mut context = match session {
         Some(session) => ParseContext::for_evaluation_in_session(session),
         None => ParseContext::for_evaluation(config),
     };
+    evaluate_resolved_user_function_in_context(
+        function,
+        functions,
+        arguments,
+        &mut context,
+        call_line,
+    )
+}
+
+fn evaluate_resolved_user_function_in_context<Source: super::context::EvaluationSource>(
+    function: &Arc<UserFunction>,
+    functions: &Arc<IndexMap<String, UserFunction>>,
+    arguments: &[FunctionArgument],
+    context: &mut ParseContext<'_, Source>,
+    call_line: usize,
+) -> Result<FunctionEvaluation<ParserPlaceholder, crate::resource::RelativeBindingName>, ParseError>
+{
     context.replace_shared_user_functions(Arc::clone(functions));
     if !context.user_functions.contains_key(&function.name) {
-        context.insert_user_function(function.name.clone(), function.clone());
+        context.insert_user_function(function.name.clone(), function.as_ref().clone());
     }
-    evaluate_user_function(function, arguments, &context, call_line)
+    evaluate_user_function(function, arguments, context, call_line)
 }
 
 fn locate_function_body_error(func: &UserFunction, error: ParseError) -> ParseError {
@@ -1579,14 +1333,14 @@ pub(super) fn try_evaluate_fn_value<Source: super::context::EvaluationSource>(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            evaluate_resolved_user_function(
+            evaluate_resolved_user_function_in_context(
                 &function,
                 &functions,
                 &evaluated_args,
-                ctx.config,
-                ctx.session,
+                &mut ctx.child_scope(),
                 source_line,
             )
+            .map(FunctionEvaluation::into_value)
         }
         Value::Deferred(DeferredValue::FunctionCall {
             ref name,
@@ -1792,5 +1546,269 @@ mod secret_origin_tests {
             .unwrap();
             assert!(!format!("{value:?}").contains("private-"), "{value:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod declared_check_regressions {
+    use super::*;
+    use crate::parser::TypeExpr;
+
+    fn value(body: &str, argument: &str) -> Value {
+        let source = format!(
+            "fn checked(x: 'allowed') {{ x }}\n{body}\nlet src = test.Thing {{ name = 'src' }}\ntest.Sink {{ value = {argument} }}\n"
+        );
+        let parsed = crate::parser::parse_file(
+            &source,
+            std::path::Path::new("functions.crn"),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut context = ParseContext::for_evaluation(&config);
+        context.replace_shared_user_functions(Arc::new(parsed.user_functions.clone()));
+        try_evaluate_fn_value(
+            parsed.iter_all_resources().last().unwrap().attributes()["value"].clone(),
+            &context,
+            4,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn declared_checks_parser_annotation_predicate_matrix() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "fn g(x) { x }",
+            std::path::Path::new("functions.crn"),
+            &config,
+        )
+        .unwrap();
+        for (annotation, pending) in [
+            (TypeExpr::String, true),
+            (TypeExpr::Bool, true),
+            (TypeExpr::Int, true),
+            (TypeExpr::Float, true),
+            (TypeExpr::Duration, true),
+            (TypeExpr::List(Box::new(TypeExpr::String)), true),
+            (TypeExpr::Map(Box::new(TypeExpr::Int)), true),
+            (
+                TypeExpr::Struct {
+                    fields: vec![("x".into(), TypeExpr::String)],
+                },
+                true,
+            ),
+            (TypeExpr::StringLiteral("allowed".into()), true),
+            (
+                TypeExpr::List(Box::new(TypeExpr::StringLiteral("allowed".into()))),
+                true,
+            ),
+            (
+                TypeExpr::Map(Box::new(TypeExpr::StringLiteral("allowed".into()))),
+                true,
+            ),
+            (
+                TypeExpr::Union(vec![
+                    TypeExpr::String,
+                    TypeExpr::StringLiteral("allowed".into()),
+                ]),
+                true,
+            ),
+            (
+                TypeExpr::Struct {
+                    fields: vec![("x".into(), TypeExpr::StringLiteral("allowed".into()))],
+                },
+                true,
+            ),
+        ] {
+            for parameter in [false, true] {
+                let mut function = parsed.user_functions["g"].clone();
+                if parameter {
+                    function.params[0].param_type = Some(annotation.clone());
+                } else {
+                    function.return_type = Some(annotation.clone());
+                }
+                let context = ParseContext::for_evaluation(&config);
+                let result = evaluate_user_function(
+                    &Arc::new(function),
+                    &[FunctionArgument::from_value(Value::resource_ref(
+                        "src",
+                        "emitted",
+                        vec![],
+                    ))],
+                    &context,
+                    1,
+                )
+                .unwrap();
+                assert_eq!(
+                    matches!(result, FunctionEvaluation::Retain(_)),
+                    pending,
+                    "{annotation:?}, parameter={parameter}: {result:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn declared_checks_retention_preserves_explicit_callee_identity() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parse = |body: &str| {
+            crate::parser::parse_file(
+                &format!("fn g(x: 'allowed'): String {{ '{body}' }}"),
+                std::path::Path::new("functions.crn"),
+                &config,
+            )
+            .unwrap()
+        };
+        let function = Arc::new(parse("callee").user_functions.shift_remove("g").unwrap());
+        let scope = Arc::new(parse("different lexical definition").user_functions);
+        let arguments = [FunctionArgument::from_value(Value::resource_ref(
+            "src",
+            "emitted",
+            vec![],
+        ))];
+        let result =
+            evaluate_resolved_user_function(&function, &scope, &arguments, &config, None, 4)
+                .unwrap();
+        let retained = match result {
+            FunctionEvaluation::Inline(value) => {
+                panic!("pending argument inlined: {:?}", value.into_value())
+            }
+            FunctionEvaluation::Retain(call) => call.into_value(),
+        };
+        let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: retained, ..
+        }) = retained
+        else {
+            panic!("retained call");
+        };
+        assert!(
+            Arc::ptr_eq(&function, &retained),
+            "retention replaced the explicit callee with a definition sharing its label"
+        );
+    }
+    #[test]
+    fn declared_checks_parser_unused_local_retains_outer_call() {
+        let result = value(
+            "fn outer(x) { let unused = checked(x)\n 'const' }",
+            "outer(src.emitted)",
+        );
+        assert!(
+            matches!(result, Value::Deferred(DeferredValue::ResolvedFunctionCall { ref function, .. }) if function.name == "outer"),
+            "{result:?}"
+        );
+    }
+    #[test]
+    fn declared_checks_parser_ignored_argument_retains_outer_call() {
+        let result = value("fn outer(x) { 'const' }", "outer(checked(src.emitted))");
+        assert!(
+            matches!(result, Value::Deferred(DeferredValue::ResolvedFunctionCall { ref function, .. }) if function.name == "outer"),
+            "{result:?}"
+        );
+    }
+    #[test]
+    fn declared_checks_parser_untyped_wrapper_retains_call() {
+        let result = value("fn outer(x) { checked(x) }", "outer(src.emitted)");
+        assert!(
+            matches!(result, Value::Deferred(DeferredValue::ResolvedFunctionCall { ref function, .. }) if function.name == "outer"),
+            "{result:?}"
+        );
+    }
+    #[test]
+    fn declared_checks_parser_primitives_retain_and_untyped_builtins_inline() {
+        for (body, retained) in [
+            ("fn outer(x: String): String { x }", true),
+            ("fn outer(x) { upper(x) }", false),
+        ] {
+            let result = value(body, "outer(src.emitted)");
+            assert_eq!(
+                matches!(
+                    result,
+                    Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+                ),
+                retained,
+                "{result:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod annotation_regressions {
+    use super::*;
+    #[test]
+    fn matching_unloaded_handle_keeps_loaded_recheck() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut parsed = crate::parser::parse_file(
+            "fn f(r: test.Thing): String { 'allowed' }",
+            std::path::Path::new("functions.crn"),
+            &config,
+        )
+        .unwrap();
+        let function = Arc::new(parsed.user_functions.shift_remove("f").unwrap());
+        let handle = crate::eval_value::UnexpandedStructuralHandle::new(
+            UnexpandedStructuralHandleKind::Resource(crate::parser::ResourceTypePath::new(
+                "test", "Thing",
+            )),
+            "db",
+        );
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            let ctx = ParseContext::for_evaluation_in_session(session);
+            evaluate_user_function(&function, &[FunctionArgument::from_handle(handle)], &ctx, 2)
+                .unwrap();
+            assert_eq!(
+                ctx.pending_function_type_checks.borrow().len(),
+                1,
+                "loaded catalog must recheck matching unresolved handles"
+            );
+        });
+    }
+    #[test]
+    fn failed_argument_is_rejected_before_shape_only_inlining() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "fn f(x: String): String { 'ignored' }",
+            std::path::Path::new("functions.crn"),
+            &config,
+        )
+        .unwrap();
+        let failed = Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![],
+            reason: crate::resource::UnavailableReason::from_builtin_error(
+                "attempted fixture failure".into(),
+            ),
+            source_line: 2.into(),
+        });
+        let result = evaluate_user_function(
+            &Arc::new(parsed.user_functions["f"].clone()),
+            &[FunctionArgument::from_value(failed)],
+            &ParseContext::for_evaluation(&config),
+            2,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Invalid expression at line 2: env(): attempted fixture failure"
+        );
+    }
+    #[test]
+    fn return_recheck_keeps_original_argument_when_local_shadows() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file("let other = test.Thing { name = 'other' }\nfn f(x: 'allowed'): 'allowed' { let x = 'bad'\nother.emitted }", std::path::Path::new("functions.crn"), &config).unwrap();
+        let ctx = ParseContext::for_evaluation(&config);
+        let _evaluation = evaluate_user_function(
+            &Arc::new(parsed.user_functions["f"].clone()),
+            &[FunctionArgument::from_value(Value::Concrete(
+                ConcreteValue::String("allowed".into()),
+            ))],
+            &ctx,
+            4,
+        )
+        .unwrap();
+        let pending = ctx.pending_function_type_checks.borrow();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].arguments[0].value().unwrap(),
+            &Value::Concrete(ConcreteValue::String("allowed".into()))
+        );
     }
 }

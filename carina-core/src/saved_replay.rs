@@ -118,19 +118,21 @@ impl AdmittedSavedPlanReplay {
 /// It cannot be constructed from a raw Plan or mutated after redaction.
 ///
 /// ```compile_fail,E0451
-/// use carina_core::{saved_replay::RecordedPlanSnapshot, plan::Plan};
-/// let forged = RecordedPlanSnapshot { plan: Plan::new().to_snapshot() };
+/// use carina_core::{saved_replay::RecordedPlanSnapshot, plan::SnapshotPlan, value::Saved};
+/// fn forge(plan: Saved<SnapshotPlan>) -> RecordedPlanSnapshot {
+///     RecordedPlanSnapshot { plan }
+/// }
 /// ```
 #[derive(Debug)]
 pub struct RecordedPlanSnapshot {
-    plan: crate::plan::SnapshotPlan,
+    plan: crate::value::Saved<crate::plan::SnapshotPlan>,
 }
 impl RecordedPlanSnapshot {
     pub fn plan(&self) -> &crate::plan::SnapshotPlan {
-        &self.plan
+        self.plan.as_inner()
     }
     pub fn into_wire(self) -> UnresolvedSavedPlan {
-        UnresolvedSavedPlan::from_recorded_snapshot(self.plan.into())
+        crate::plan::UnresolvedSavedPlan::from_recorded_snapshot(self.plan.into_inner().into())
     }
 }
 impl InputCheckedPlan {
@@ -139,37 +141,44 @@ impl InputCheckedPlan {
     ///
     /// ```compile_fail,E0308
     /// use std::collections::HashMap;
-    /// use carina_core::{input_rules::InputCheckedPlan, resource::{ResourceId, Resource, SnapshotLeaf, SnapshotState}};
-    /// fn bypass(checked: &InputCheckedPlan, desired: &HashMap<ResourceId, Resource<carina_core::resource::ModuleSource, SnapshotLeaf>>, raw: &HashMap<ResourceId, SnapshotState>) {
-    ///     let _ = checked.record_snapshot(desired, raw);
+    /// use carina_core::{input_rules::InputCheckedPlan, resource::{ResourceId, Resource, SnapshotLeaf, SnapshotState}, value::{Saved, SavedDocumentConversion}};
+    /// fn bypass(checked: &InputCheckedPlan, conversion: &SavedDocumentConversion, desired: &HashMap<ResourceId, Saved<Resource<carina_core::resource::ModuleSource, SnapshotLeaf>>>, raw: &HashMap<ResourceId, SnapshotState>) {
+    ///     let _ = checked.record_snapshot(conversion, desired, raw);
     /// }
     /// ```
     /// Detached subsets cannot replace the complete observation batch.
     ///
     /// ```compile_fail,E0308
     /// use std::collections::HashMap;
-    /// use carina_core::{input_rules::InputCheckedPlan, resource::{ResourceId, Resource, SnapshotLeaf, ModuleSource}, value::ProtectedObservation};
-    /// fn omit(checked: &InputCheckedPlan, desired: &HashMap<ResourceId, Resource<ModuleSource, SnapshotLeaf>>) {
-    ///     let _ = checked.record_snapshot(desired, std::iter::empty::<&ProtectedObservation>());
+    /// use carina_core::{input_rules::InputCheckedPlan, resource::{ResourceId, Resource, SnapshotLeaf, ModuleSource}, value::{ProtectedObservation, Saved, SavedDocumentConversion}};
+    /// fn omit(checked: &InputCheckedPlan, conversion: &SavedDocumentConversion, desired: &HashMap<ResourceId, Saved<Resource<ModuleSource, SnapshotLeaf>>>) {
+    ///     let _ = checked.record_snapshot(conversion, desired, std::iter::empty::<&ProtectedObservation>());
     /// }
     /// ```
-    pub fn record_snapshot<D>(
+    pub fn record_snapshot<D: Clone>(
         &self,
+        conversion: &crate::value::SavedDocumentConversion,
         desired: &HashMap<
             ResourceId,
-            Resource<
-                crate::resource::ModuleSource,
-                SnapshotLeaf,
-                crate::resource::AbsoluteBindingAddress,
-                D,
+            crate::value::Saved<
+                Resource<
+                    crate::resource::ModuleSource,
+                    SnapshotLeaf,
+                    crate::resource::AbsoluteBindingAddress,
+                    D,
+                >,
             >,
         >,
         observations: &crate::value::ProtectedObservations,
     ) -> Result<RecordedPlanSnapshot, crate::value::SerializationError> {
         let plan = observations.protect_plan_history(self.plan())?;
-        let historical = observations.recorded_history()?;
+        let historical = observations
+            .recorded_history()?
+            .into_iter()
+            .map(|(id, state)| conversion.snapshot(state).map(|state| (id, state)))
+            .collect::<Result<HashMap<_, _>, crate::value::SerializationError>>()?;
         Ok(RecordedPlanSnapshot {
-            plan: crate::value::redact_secrets_in_plan_with_desired_and_historical(
+            plan: conversion.redact_secrets_in_plan_with_desired_and_historical(
                 &plan,
                 desired,
                 &historical,

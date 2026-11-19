@@ -277,6 +277,7 @@ pub(crate) fn evaluate_static_value(
                 None,
                 line,
             )
+            .map(crate::function_evaluation::FunctionEvaluation::into_value)
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let base = evaluate_static_value(access.base().clone(), config)?;

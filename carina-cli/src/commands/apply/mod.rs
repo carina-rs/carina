@@ -209,7 +209,7 @@ fn saved_plan_secret_orphan_vanished_error(
     )
 }
 
-fn cli_observer_factory<S: Send + Sync + 'static>(
+pub(crate) fn cli_observer_factory<S: Send + Sync + 'static>(
     color_mode: crate::output_style::ColorMode,
     plan: &carina_core::plan::Plan<S>,
     project_dir: &Path,
@@ -656,11 +656,13 @@ fn saved_plan_unresolved_by_resolved_id<S: Clone, D>(
         carina_core::resource::AbsoluteBindingAddress,
         D,
     >],
-    unresolved_resources: &[carina_core::resource::Resource<
-        S,
-        carina_core::resource::NoPlaceholder,
-        carina_core::resource::AbsoluteBindingAddress,
-        (),
+    unresolved_resources: &[carina_core::value::SavedAuthored<
+        carina_core::resource::Resource<
+            S,
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::AbsoluteBindingAddress,
+            (),
+        >,
     >],
     apply_target: ApplyTarget<'_>,
 ) -> Result<HashMap<ResolvedResourceId, UnresolvedResource<S>>, AppError> {
@@ -687,7 +689,7 @@ fn saved_plan_unresolved_by_resolved_id<S: Clone, D>(
             )));
         }
 
-        let mut source = unresolved.clone();
+        let mut source = unresolved.as_inner().clone();
         source.id = resolved.id.clone();
         let resolved_id = ResolvedResourceId::try_new(resolved.id.clone()).ok_or_else(|| {
             carina_core::resource::PendingResourceIdentityError::new(resolved.id.clone())
@@ -3439,6 +3441,22 @@ trait SavedPlanResourceLike {
     fn attributes(&self) -> &indexmap::IndexMap<String, Value<Self::Stage>>;
 }
 
+impl<T: SavedPlanResourceLike> SavedPlanResourceLike for carina_core::value::SavedAuthored<T> {
+    type Stage = T::Stage;
+
+    fn id(&self) -> &ResourceId {
+        self.as_inner().id()
+    }
+
+    fn binding(&self) -> Option<&str> {
+        self.as_inner().binding()
+    }
+
+    fn attributes(&self) -> &indexmap::IndexMap<String, Value<Self::Stage>> {
+        self.as_inner().attributes()
+    }
+}
+
 impl<S, D, P: carina_core::resource::PlanValueKind> SavedPlanResourceLike
     for carina_core::resource::Resource<S, P, carina_core::resource::AbsoluteBindingAddress, D>
 {
@@ -3752,8 +3770,8 @@ fn rehydrate_desired_plan_file_with_verified_configs(
                     plan_file.unresolved_resources(),
                     &resource_candidates,
                     apply_target,
-                    carina_core::value::rehydrate_resource_secrets,
-                    Resource::to_value_resource,
+                    carina_core::value::SavedAuthored::rehydrate_resource_secrets,
+                    carina_core::value::SavedAuthored::to_value_resource,
                 )?;
 
                 let mut composition_source_identities =
@@ -3846,51 +3864,26 @@ pub async fn run_apply_from_plan(
     provider_context: &ProviderContext,
     cancel: ShutdownToken,
 ) -> Result<(), AppError> {
-    run_apply_from_plan_with_observer_factory(
-        runtime,
-        plan,
-        plan_argument,
-        auto_approve,
-        lock,
-        parallelism,
-        accept_legacy_name_overrides,
-        provider_context,
-        cancel.clone(),
-        &cli_observer_factory,
-    )
-    .await
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[allow(clippy::too_many_arguments)]
-async fn run_apply_from_plan_with_observer_factory(
-    runtime: &crate::runtime::CommandRuntime,
-    plan: &ResolvedPath,
-    plan_argument: &Path,
-    auto_approve: bool,
-    lock: bool,
-    parallelism: NonZeroUsize,
-    accept_legacy_name_overrides: bool,
-    provider_context: &ProviderContext,
-    cancel: ShutdownToken,
-    observer_factory: &ObserverFactory<'_, SavedModuleSource>,
-) -> Result<(), AppError> {
     run_apply_from_plan_using(
-        runtime,
-        plan,
-        plan_argument,
-        auto_approve,
-        lock,
-        parallelism,
-        accept_legacy_name_overrides,
-        provider_context,
-        cancel,
-        observer_factory,
-        |runtime, providers, directory| {
+        SavedApplyInvocation::for_project(
+            runtime,
+            plan,
+            plan_argument,
+            provider_context,
+            SavedApplyOptions {
+                auto_approve,
+                lock,
+                parallelism,
+                accept_legacy_name_overrides,
+                cancel,
+            },
+            &cli_observer_factory,
+        ),
+        |runtime, providers, base_dir| {
             ProviderLoad::load(
                 runtime,
                 providers,
-                directory,
+                base_dir,
                 &mut crate::commands::human_provider_notices(runtime.color_mode()),
             )
         },
@@ -3908,16 +3901,20 @@ pub async fn run_saved_apply_with_factories_for_test(
     let plan = ResolvedPath::new(path).unwrap();
     let context = ProviderContext::new(runtime.environment().clone());
     run_apply_from_plan_using(
-        runtime,
-        &plan,
-        path,
-        true,
-        true,
-        crate::DEFAULT_PARALLELISM,
-        false,
-        &context,
-        ShutdownToken::running(),
-        &cli_observer_factory,
+        SavedApplyInvocation::for_project(
+            runtime,
+            &plan,
+            path,
+            &context,
+            SavedApplyOptions {
+                auto_approve: true,
+                lock: true,
+                parallelism: crate::DEFAULT_PARALLELISM,
+                accept_legacy_name_overrides: false,
+                cancel: ShutdownToken::running(),
+            },
+            &cli_observer_factory,
+        ),
         |runtime, providers, _| {
             Ok(ProviderLoad::for_test_with_provider_phase(
                 runtime, factories, providers,
@@ -3927,27 +3924,80 @@ pub async fn run_saved_apply_with_factories_for_test(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_apply_from_plan_using(
-    runtime: &crate::runtime::CommandRuntime,
-    plan: &ResolvedPath,
-    plan_argument: &Path,
-    auto_approve: bool,
-    lock: bool,
-    parallelism: NonZeroUsize,
-    accept_legacy_name_overrides: bool,
-    provider_context: &ProviderContext,
-    cancel: ShutdownToken,
-    observer_factory: &ObserverFactory<'_, SavedModuleSource>,
-    load_providers: impl FnOnce(
+pub(crate) struct SavedApplyInvocation<'a, 'observer> {
+    pub(crate) runtime: &'a crate::runtime::CommandRuntime,
+    pub(crate) plan: &'a ResolvedPath,
+    pub(crate) plan_argument: &'a Path,
+    pub(crate) auto_approve: bool,
+    pub(crate) lock: bool,
+    pub(crate) parallelism: NonZeroUsize,
+    pub(crate) accept_legacy_name_overrides: bool,
+    pub(crate) provider_context: &'a ProviderContext,
+    pub(crate) cancel: ShutdownToken,
+    observer_factory: &'a ObserverFactory<'observer, SavedModuleSource>,
+}
+pub(crate) struct SavedApplyOptions {
+    pub(crate) auto_approve: bool,
+    pub(crate) lock: bool,
+    pub(crate) parallelism: NonZeroUsize,
+    pub(crate) accept_legacy_name_overrides: bool,
+    pub(crate) cancel: ShutdownToken,
+}
+
+impl<'a> SavedApplyInvocation<'a, 'static> {
+    pub(crate) fn for_project(
+        runtime: &'a crate::runtime::CommandRuntime,
+        plan: &'a ResolvedPath,
+        plan_argument: &'a Path,
+        provider_context: &'a ProviderContext,
+        options: SavedApplyOptions,
+        observer_factory: &'a ObserverFactory<'static, SavedModuleSource>,
+    ) -> Self {
+        let SavedApplyOptions {
+            auto_approve,
+            lock,
+            parallelism,
+            accept_legacy_name_overrides,
+            cancel,
+        } = options;
+        Self {
+            runtime,
+            plan,
+            plan_argument,
+            provider_context,
+            auto_approve,
+            lock,
+            parallelism,
+            accept_legacy_name_overrides,
+            cancel,
+            observer_factory,
+        }
+    }
+}
+
+pub(crate) async fn run_apply_from_plan_using(
+    invocation: SavedApplyInvocation<'_, '_>,
+    load: impl FnOnce(
         &crate::runtime::CommandRuntime,
         &[carina_core::parser::ProviderConfig<
-            carina_core::resource::NoPlaceholder,
+            NoPlaceholder,
             carina_core::resource::AbsoluteBindingAddress,
         >],
         &ResolvedPath,
     ) -> Result<ProviderLoad, AppError>,
 ) -> Result<(), AppError> {
+    let SavedApplyInvocation {
+        runtime,
+        plan,
+        plan_argument,
+        auto_approve,
+        lock,
+        parallelism,
+        accept_legacy_name_overrides,
+        provider_context,
+        cancel,
+        observer_factory,
+    } = invocation;
     let color_mode = runtime.color_mode();
     let plan_path = plan_argument;
     let bytes = plan.read().map_err(|error| AppError::PlanFileRead {
@@ -4163,7 +4213,7 @@ async fn run_apply_from_plan_using(
         .iter()
         .map(carina_core::parser::ProviderConfig::loading_projection)
         .collect::<Vec<_>>();
-    let providers = load_providers(runtime, &loading_configs, base_dir)?.into_complete()?;
+    let providers = load(runtime, &loading_configs, base_dir)?.into_complete()?;
     // Backend drift remains a mutation-safety gate even when the saved plan
     // has no secrets. Loading the syntax tree is deliberately separate from
     // validation and provider-config resolution: placeholder-free plans may

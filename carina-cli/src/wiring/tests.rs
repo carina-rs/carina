@@ -542,11 +542,13 @@ fn state_block_import_propagates_unavailable_historical_secret() {
     let mut source: Resource = Resource::with_provider("mock", "test.resource", "source", None);
     source.binding = Some(absolute_binding("source"));
     let target: Resource = Resource::with_provider("mock", "test.resource", "target", None);
-    let historical =
-        carina_core::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+    let historical = crate::test_support::with_saved_document(|conversion| {
+        conversion.redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String("secret-id".into()))).into(),
         )))
-        .expect("capture historical secret");
+    })
+    .map(carina_core::value::Saved::into_inner)
+    .expect("capture historical secret");
     let state = carina_core::resource::SnapshotState::existing(
         source.id.clone(),
         HashMap::from([("password".into(), historical)]),

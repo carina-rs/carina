@@ -4,11 +4,13 @@
 //! reconciling prefixed names with state, and computing anonymous resource identifiers.
 
 mod diagnostics;
+mod moved_block;
 mod prefix;
 pub use diagnostics::{
     anonymous_identity_diagnostics, attribute_derived_conflict_diagnostics,
     legacy_loop_move_target_diagnostics,
 };
+pub use moved_block::{MovedBlock, MovedBlockAddress};
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) use prefix::canonicalize_prefix_values;
 pub use prefix::{
@@ -959,18 +961,15 @@ impl std::fmt::Display for LoopAnonymousIdentityConflict {
             self.suggested_binding, source,
         )?;
         for migration in &self.moves {
-            let display_type = if migration.provider.is_empty() {
-                migration.resource_type.clone()
-            } else {
-                format!("{}.{}", migration.provider, migration.resource_type)
-            };
             write!(
                 formatter,
-                "\n\nmoved {{\n  from = {} {}\n  to = {} {}\n}}",
-                display_type,
-                crate::parser::display_string_literal(migration.from.exact_state_name()),
-                display_type,
-                crate::parser::display_string_literal(&migration.to),
+                "\n\n{}",
+                MovedBlock::for_loop_rewrite(
+                    &migration.provider,
+                    &migration.resource_type,
+                    migration.from.exact_state_name(),
+                    &migration.to,
+                ),
             )?;
         }
         Ok(())
@@ -3587,6 +3586,8 @@ fn resolve_deferred_create_only_value(
             | crate::resolver::ResolutionError::Knowledge(_)
             | crate::resolver::ResolutionError::AdmissionConstraints(_)
             | crate::resolver::ResolutionError::Context { .. }
+            | crate::resolver::ResolutionError::Expression { .. }
+            | crate::resolver::ResolutionError::InFile { .. }
             | crate::resolver::ResolutionError::InsideSecret { .. },
         ) => Ok(None),
         Err(crate::resolver::ResolutionError::UnavailableSecret(error)) => Err(error),
@@ -4082,29 +4083,67 @@ impl std::error::Error for UnknownIdentityOverrideOrigin {}
 #[derive(Debug, Clone)]
 pub struct UnresolvedDeclaredIdentityMigration {
     resource: ResolvedResourceId,
-    candidate_rows: Vec<ResolvedResourceId>,
+    candidate_rows: Box<UnresolvedIdentityCandidates>,
+}
+
+#[derive(Debug, Clone)]
+enum UnresolvedIdentityCandidates {
+    Single(ResolvedResourceId),
+    Multiple(Vec<ResolvedResourceId>),
 }
 
 impl UnresolvedDeclaredIdentityMigration {
+    /// Construct a diagnostic for a nonempty set of legacy rows.
+    pub fn new(
+        resource: &ResolvedResourceId,
+        mut candidate_rows: Vec<ResolvedResourceId>,
+    ) -> Option<Self> {
+        candidate_rows.sort_by_key(ToString::to_string);
+        let mut rows = candidate_rows.into_iter();
+        let first = rows.next()?;
+        let candidate_rows = match rows.next() {
+            None => UnresolvedIdentityCandidates::Single(first),
+            Some(second) => UnresolvedIdentityCandidates::Multiple(
+                std::iter::once(first)
+                    .chain(std::iter::once(second))
+                    .chain(rows)
+                    .collect(),
+            ),
+        };
+        Some(Self {
+            resource: resource.clone(),
+            candidate_rows: Box::new(candidate_rows),
+        })
+    }
+
     pub fn resource(&self) -> &ResolvedResourceId {
         &self.resource
     }
 
     pub fn candidate_rows(&self) -> &[ResolvedResourceId] {
-        &self.candidate_rows
+        match self.candidate_rows.as_ref() {
+            UnresolvedIdentityCandidates::Single(from) => std::slice::from_ref(from),
+            UnresolvedIdentityCandidates::Multiple(rows) => rows,
+        }
     }
 }
 
 impl std::fmt::Display for UnresolvedDeclaredIdentityMigration {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let candidates = display_candidate_rows(&self.candidate_rows);
+        let candidates = display_candidate_rows(self.candidate_rows());
         write!(
             formatter,
             "Anonymous resource `{}` has an authored declared-identity expression that cannot \
              be evaluated from binding state while unclaimed legacy state rows remain: \
              {candidates}. Add a `moved` block to select the intended state row.",
             self.resource,
-        )
+        )?;
+        match self.candidate_rows.as_ref() {
+            UnresolvedIdentityCandidates::Single(from) => {
+                write!(formatter, "\n\n{}", MovedBlock::new(from, &self.resource))
+            }
+            UnresolvedIdentityCandidates::Multiple(_) => Ok(()),
+        }
     }
 }
 
@@ -4306,7 +4345,7 @@ pub fn reconcile_anonymous_identifiers(
                 .into());
             }
 
-            let mut unresolved_candidate_rows = candidate_outcomes
+            let unresolved_candidate_rows = candidate_outcomes
                 .iter()
                 .filter_map(|(entry, outcome)| match outcome {
                     DeclaredIdentityRowOutcome::Match | DeclaredIdentityRowOutcome::Mismatch => {
@@ -4317,13 +4356,11 @@ pub fn reconcile_anonymous_identifiers(
                         .then(|| entry.origin_id().clone()),
                 })
                 .collect::<Vec<_>>();
-            if !unresolved_candidate_rows.is_empty() {
-                unresolved_candidate_rows.sort_by_key(ToString::to_string);
-                return Err(UnresolvedDeclaredIdentityMigration {
-                    resource: resolved_resource_id,
-                    candidate_rows: unresolved_candidate_rows,
-                }
-                .into());
+            if let Some(error) = UnresolvedDeclaredIdentityMigration::new(
+                &resolved_resource_id,
+                unresolved_candidate_rows,
+            ) {
+                return Err(error.into());
             }
 
             let matches = candidate_outcomes

@@ -1498,6 +1498,35 @@ where
     infallible(directives.try_map(resolve, |_, _, value| Ok(value), |_, _, value| Ok(value)))
 }
 
+impl<P> Directives<AbsoluteBindingAddress, P>
+where
+    P: ValueKind<
+            DirectiveBool<AbsoluteBindingAddress> = LoopDirective<bool, AbsoluteBindingAddress>,
+            DirectivePreventDestroy<AbsoluteBindingAddress> = LoopDirective<
+                PreventDestroy,
+                AbsoluteBindingAddress,
+            >,
+        >,
+{
+    pub(crate) fn try_visit_values<E>(
+        &self,
+        visit: &mut impl FnMut(&Value<LoopSlot>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        fn setting<T, E>(
+            value: &LoopDirective<T, AbsoluteBindingAddress>,
+            visit: &mut impl FnMut(&Value<LoopSlot>) -> Result<(), E>,
+        ) -> Result<(), E> {
+            match value {
+                LoopDirective::Resolved(_) => Ok(()),
+                LoopDirective::PerElement(expression) => visit(&expression.value),
+            }
+        }
+        setting(&self.force_delete, visit)?;
+        setting(&self.create_before_destroy, visit)?;
+        setting(&self.prevent_destroy, visit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

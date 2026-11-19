@@ -31,6 +31,7 @@ mod binding_index_split_tests;
 pub mod builtins;
 pub mod config_loader;
 mod conversion;
+mod function_evaluation;
 pub use conversion::{ConversionError, ConversionErrorKind};
 pub(crate) use conversion::{ConversionChannel, ConversionFindings};
 pub mod data_source_value;

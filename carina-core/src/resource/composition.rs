@@ -2862,6 +2862,121 @@ mod tests {
     }
 }
 
+mod saved_document_tree {
+    use super::*;
+    use crate::value::saved_document::{FunctionNames, sealed::Tree};
+    impl<P: PlanValueKind> Tree for LiveComposition<P> {
+        fn visit(&self, names: &mut FunctionNames) {
+            let Self {
+                id: _,
+                signature,
+                binding: _,
+                dependency_bindings: _,
+                module_name: _,
+                instance: _,
+                call_path: _,
+                quoted_string_attrs: _,
+                declaration: _,
+            } = self;
+            names.tree(signature);
+        }
+    }
+    impl<P: PlanValueKind> Tree for SavedComposition<P> {
+        fn visit(&self, names: &mut FunctionNames) {
+            let Self {
+                id: _,
+                signature,
+                binding: _,
+                dependency_bindings: _,
+                module_name: _,
+                instance: _,
+                origin_id: _,
+            } = self;
+            names.tree(signature);
+        }
+    }
+    impl<P: PlanValueKind> Tree for LiveCompositionSignature<P> {
+        fn visit(&self, names: &mut FunctionNames) {
+            let Self {
+                arguments,
+                attributes,
+                pending_constraints,
+            } = self;
+            names.tree(arguments);
+            names.tree(attributes);
+            names.tree(pending_constraints);
+        }
+    }
+    impl<P: PlanValueKind> Tree for SavedCompositionSignature<P> {
+        fn visit(&self, names: &mut FunctionNames) {
+            let Self {
+                arguments,
+                attributes,
+                pending_constraints,
+            } = self;
+            names.tree(arguments);
+            names.tree(attributes);
+            names.tree(pending_constraints);
+        }
+    }
+    impl<P: PlanValueKind> Tree for LiveCompositionArgument<P> {
+        fn visit(&self, names: &mut FunctionNames) {
+            let Self { operand, metadata } = self;
+            let LiveCompositionArgumentMetadata {
+                declared_type: _,
+                origin: _,
+            } = metadata;
+            // This is exactly the value transported into SavedCompositionArgument.
+            names.value(operand.traversal_value());
+        }
+    }
+    impl<P: PlanValueKind> Tree for SavedCompositionArgument<P> {
+        fn visit(&self, names: &mut FunctionNames) {
+            let Self { value } = self;
+            names.value(value);
+        }
+    }
+    impl<P: PlanValueKind> Tree for LiveCompositionAttribute<P> {
+        fn visit(&self, names: &mut FunctionNames) {
+            let Self {
+                value,
+                declared_type: _,
+                source_argument: _,
+            } = self;
+            match value {
+                LiveCompositionAttributeValue::Derived(value) => names.value(value),
+                LiveCompositionAttributeValue::Forwarded(_path) => {}
+                LiveCompositionAttributeValue::Handle(_id) => {}
+            }
+        }
+    }
+    impl<P: PlanValueKind> Tree for SavedCompositionAttribute<P> {
+        fn visit(&self, names: &mut FunctionNames) {
+            let Self { value } = self;
+            match value {
+                SavedCompositionAttributeValue::Derived(value) => names.value(value),
+                SavedCompositionAttributeValue::Forwarded(_path) => {}
+            }
+        }
+    }
+    impl<P: PlanValueKind> Tree for PendingModuleConstraint<P> {
+        fn visit(&self, names: &mut FunctionNames) {
+            let Self {
+                id: _,
+                expression,
+                message,
+            } = self;
+            match message {
+                ModuleConstraintMessage::Require(_literal) => {}
+                ModuleConstraintMessage::Validation(_text) => {}
+            }
+            for (_argument, _operand, value) in expression.bound_arguments() {
+                names.value(value);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod path_sharing_tests {
     use super::*;

@@ -101,7 +101,7 @@ pub fn validate_diagnostics_with_factories(
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-fn collect_with_factories(
+pub(crate) fn collect_with_factories(
     path: &carina_core::paths::ResolvedPath,
     factories: Vec<crate::wiring::LoadedProviderFactory>,
     load_errors: std::collections::HashMap<String, String>,

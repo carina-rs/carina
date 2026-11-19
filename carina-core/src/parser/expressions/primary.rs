@@ -847,7 +847,7 @@ fn parse_primary_eval_with_mode_inner(
                     && eval_args.iter().all(is_static_eval)
                 {
                     return evaluate_user_function_eval(&user_fn, eval_args, ctx, line)
-                        .map(EvalValue::from_value);
+                        .map(|evaluation| EvalValue::from_value(evaluation.into_value()));
                 }
                 let args = crate::parser::functions::lower_function_arguments(eval_args, line)?;
                 crate::parser::functions::record_deferred_function_type_check(

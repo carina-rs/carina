@@ -51,6 +51,15 @@ impl SavedBackendConfig {
             SavedBackendSource::Recorded(candidate) => Some(candidate),
         }
     }
+    pub(super) fn for_saved_document(
+        &self,
+        conversion: &carina_core::value::SavedDocumentConversion,
+    ) -> Result<
+        carina_core::value::Saved<Option<ExpandedBackendConfig>>,
+        carina_core::value::SerializationError,
+    > {
+        conversion.snapshot(self.candidate().cloned())
+    }
     pub(super) fn into_wire(self) -> Option<ExpandedBackendConfig> {
         match self.source {
             SavedBackendSource::Implicit => None,

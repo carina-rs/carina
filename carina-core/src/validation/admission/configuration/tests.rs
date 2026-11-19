@@ -595,7 +595,9 @@ fn saved_historical_provider_stops_before_configuration_admission() {
     };
     let saved: SavedProviderConfigs =
         serde_json::from_value(serde_json::to_value(vec![config]).unwrap()).unwrap();
-    let saved = saved.redact_secrets().unwrap();
+    let saved = crate::value::with_saved_document(|conversion| saved.redact_secrets(conversion))
+        .unwrap()
+        .into_inner();
     let error = ResolvedProviderConfigs::try_from(saved).unwrap_err();
     assert!(matches!(
         error,
@@ -626,9 +628,10 @@ fn provider_config_declared_fields_preserve_saved_and_protocol_wire_bytes() {
         .transport_iter()
         .map(|(key, value)| (key, value.value(), value.is_secret()))
         .collect();
-    let saved = crate::parser::SavedProviderConfigs::from(&configs)
-        .redact_secrets()
-        .unwrap();
+    let saved = crate::value::with_saved_document(|conversion| {
+        crate::parser::SavedProviderConfigs::from(&configs).redact_secrets(conversion)
+    })
+    .unwrap();
     let actual = serde_json::json!({
         "wire": serde_json::to_string(&wire).unwrap(),
         "saved_provider_configs": serde_json::to_string(&saved).unwrap(),

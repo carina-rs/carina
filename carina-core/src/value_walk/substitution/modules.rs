@@ -122,7 +122,7 @@ impl ParserRewrite<AbsoluteBindingAddress> for ExpandedModuleRewrite<'_> {
     fn resolved_call(
         &mut self,
         function: &Arc<crate::parser::UserFunction<AbsoluteBindingAddress>>,
-        _functions: &Arc<
+        functions: &Arc<
             indexmap::IndexMap<String, crate::parser::UserFunction<AbsoluteBindingAddress>>,
         >,
         args: &[FunctionArgument<ParserPlaceholder, AbsoluteBindingAddress>],
@@ -132,9 +132,16 @@ impl ParserRewrite<AbsoluteBindingAddress> for ExpandedModuleRewrite<'_> {
             return Ok(None);
         };
         let line = source_line.get().unwrap_or(function.body.source_line);
-        crate::resolver::evaluate_module_resolved_user_function(function, args, config, line)
-            .map(Some)
-            .map_err(|error| function_substitution_error(error, line))
+        crate::resolver::evaluate_module_resolved_user_function(
+            function, functions, args, config, line,
+        )
+        .map(|evaluation| match evaluation {
+            crate::function_evaluation::FunctionEvaluation::Inline(value) => {
+                Some(value.into_value())
+            }
+            crate::function_evaluation::FunctionEvaluation::Retain(_call) => None,
+        })
+        .map_err(|error| function_substitution_error(error, line))
     }
 
     fn select(

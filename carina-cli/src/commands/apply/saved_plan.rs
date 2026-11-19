@@ -1298,7 +1298,7 @@ impl<P> RehydratedPlanFile<P> {
         &self.planned_secret_hashes
     }
 
-    fn unresolved_resources(&self) -> &[SavedResource] {
+    fn unresolved_resources(&self) -> &[carina_core::value::SavedAuthored<SavedResource>] {
         self.plan_file.unresolved_resources()
     }
 
@@ -1375,7 +1375,9 @@ impl ExecutablePlanFile {
         self.plan.planned_secret_hashes()
     }
 
-    pub(super) fn unresolved_resources(&self) -> &[SavedResource] {
+    pub(super) fn unresolved_resources(
+        &self,
+    ) -> &[carina_core::value::SavedAuthored<SavedResource>] {
         self.plan.unresolved_resources()
     }
 
@@ -1460,7 +1462,7 @@ mod tests {
     };
     use crate::commands::apply::ApplyTarget;
     use crate::commands::plan::{
-        CurrentStateEntry, PlanFile, PlanFileContents, RecordedProviderArtifact,
+        CurrentStateEntry, PlanFile, PlanFileTransport, RecordedProviderArtifact,
         RecordedProviderScopes, SavedDataSourceValue, SavedManagedCurrent,
     };
     use crate::error::AppError;
@@ -1609,8 +1611,8 @@ mod tests {
         carina_core::parser::SavedProviderConfigs::from(&resolved)
     }
 
-    fn empty_plan_contents(provider_configs: Vec<ExpandedProviderConfig>) -> PlanFileContents {
-        PlanFileContents {
+    fn empty_plan_contents(provider_configs: Vec<ExpandedProviderConfig>) -> PlanFileTransport {
+        PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-28T00:00:00Z".to_string(),
@@ -1761,7 +1763,7 @@ mod tests {
         });
         contents.current_states.push(CurrentStateEntry::Managed {
             id: to,
-            current: SavedManagedCurrent::from_current(current),
+            current: SavedManagedCurrent::for_test(current),
         });
         let mut source_row = ResourceState::try_applied(
             from.resource_type.clone(),
@@ -1813,7 +1815,11 @@ mod tests {
         contents.state_serial = Some(locked_state.serial);
         let desired = Resource::from_id(to.clone()).into_value_snapshot();
         contents.sorted_resources.push(desired.to_snapshot());
-        contents.unresolved_resources.push(desired.to_snapshot());
+        contents
+            .unresolved_resources
+            .push(crate::test_support::saved_authored_resource(
+                carina_core::executor::UnresolvedResource::from_pre_resolve(desired.clone()),
+            ));
         contents
             .sorted_value_destroy_dependencies
             .push(Default::default());
@@ -2269,7 +2275,7 @@ mod tests {
             HashMap::from([("token".to_string(), plaintext.clone())]),
         );
         let plan = Plan::new();
-        let plan_file = PlanFileContents {
+        let plan_file = PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: "test".to_string(),
             timestamp: "2026-10-28T00:00:00Z".to_string(),
@@ -2469,7 +2475,13 @@ mod tests {
                     &recorded,
                 );
                 let mut contents = empty_plan_contents(recorded.clone());
-                contents.provider_configs = contents.provider_configs.redact_secrets().unwrap();
+                contents.provider_configs = carina_core::value::SavedDocumentConversion::document(
+                    &carina_core::parser::ExpandedInferredFile::default(),
+                    &[],
+                    |conversion| contents.provider_configs.redact_secrets(conversion),
+                )
+                .unwrap()
+                .into_inner();
                 let pending = SchemaCheckedPendingPlanFile {
                     plan_file: contents
                         .record_for_test(&context, Vec::new())

@@ -513,13 +513,21 @@ fn observed_secret_recording_rejects_a_batch_owned_by_another_plan() {
             current: &HashMap::new(),
         })
         .unwrap();
-    let result = checked.record_snapshot(
-        &HashMap::<
-            crate::resource::ResourceId,
-            crate::resource::Resource<crate::resource::ModuleSource, crate::resource::SnapshotLeaf>,
-        >::new(),
-        &observations,
-    );
+    let result = with_saved_document(|conversion| {
+        checked.record_snapshot(
+            conversion,
+            &HashMap::<
+                crate::resource::ResourceId,
+                crate::value::Saved<
+                    crate::resource::Resource<
+                        crate::resource::ModuleSource,
+                        crate::resource::SnapshotLeaf,
+                    >,
+                >,
+            >::new(),
+            &observations,
+        )
+    });
     assert!(matches!(
         result,
         Err(SerializationError::ObservationPlanMismatch)

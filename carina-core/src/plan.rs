@@ -1981,6 +1981,53 @@ impl<S> Plan<S> {
     }
 }
 
+impl crate::value::saved_document::sealed::Tree for UnresolvedSavedPlan {
+    fn visit(&self, names: &mut crate::value::saved_document::FunctionNames) {
+        let Self {
+            effects,
+            replacement_inputs,
+            ignored_change_summaries: _ignored,
+            replace_display,
+            permanent_name_overrides: _overrides,
+            errors: _errors,
+            abandoned_deposed: _abandoned,
+            destroy_ordering_notices: _notices,
+        } = self;
+        for effect in effects {
+            names.tree(effect);
+        }
+        names.tree(replacement_inputs);
+        for display in replace_display {
+            names.tree(&display.previous_attributes);
+        }
+    }
+}
+
+impl<S, V: PlanValueKind> crate::value::saved_document::sealed::Tree for Plan<S, V> {
+    fn visit(&self, names: &mut crate::value::saved_document::FunctionNames) {
+        let Self {
+            effects,
+            observation_identity: _,
+            observation_desired: _,
+            replacements: _,
+            replacement_inputs,
+            ignored_change_summaries: _,
+            replace_display,
+            permanent_name_overrides: _,
+            errors: _,
+            abandoned_deposed: _,
+            destroy_ordering_notices: _,
+        } = self;
+        for effect in effects {
+            names.tree(effect);
+        }
+        names.tree(replacement_inputs);
+        for display in replace_display {
+            names.tree(&display.previous_attributes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

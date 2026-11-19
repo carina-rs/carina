@@ -73,7 +73,7 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
             )),
             &configs,
         );
-        let contents = PlanFileContents {
+        let contents = PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: env!("CARGO_PKG_VERSION").into(),
             timestamp: "2026-11-09T00:00:00Z".into(),
@@ -103,7 +103,8 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
             unresolved_resources: planned
                 .unresolved_resources
                 .iter()
-                .map(|resource| resource.as_resource().to_snapshot())
+                .cloned()
+                .map(crate::test_support::saved_authored_resource)
                 .collect(),
             compositions: Vec::new(),
             data_sources: Vec::new(),
@@ -287,7 +288,7 @@ fn saved_plan_layered_scalars_reload_and_validate_both_layers() {
         let resource = Resource::with_provider("mock", "Layered", "value", None)
             .with_attribute("name", string_value(name))
             .with_attribute("count", Value::Concrete(ConcreteValue::Int(count)));
-        let contents = PlanFileContents {
+        let contents = PlanFileTransport {
             version: PlanFile::CURRENT_VERSION,
             carina_version: env!("CARGO_PKG_VERSION").into(),
             timestamp: "2026-11-10T00:00:00Z".into(),

@@ -406,6 +406,12 @@ fn make_tags(env: String, service: String, team: String = 'platform') {
 }
 ```
 
+A function without parameter or return type annotations expands during parsing at both the root and in module bodies, unless it contains another retained user-defined call. A function with any declared parameter or return type, including `String`, `Int`, `Bool`, `Float`, or `Duration`, stays as a call while an argument is unknown. It is inlined when every argument is known and its declared checks pass. Its declared types are checked when values become available, including during apply.
+
+A plan cannot be saved with `carina plan --out` or `carina plan --json` while the project retains a call to a user-defined function, including calls in resource attributes and exports. This also covers an untyped function that wraps a retained call or calls one in its body, and an authored call whose value is already known from state. The error names the retained functions, which may be the outer functions. Run `carina apply` directly on the project, without a saved plan.
+
+Untyped calls with pending builtin arguments now expand at the root too. An anonymous root resource whose address changes as a result moves automatically. At the root or in a module body, an existing anonymous resource whose identity material contains a retained call to a function with primitive annotations can require `moved`, including calls with plain-reference arguments such as `p(src.emitted)`. This applies when an argument is unknown during parsing and state from an older version uses the expanded function body for the address. A schema with a declared identity can stop with an error asking for `moved`. Without declared identity, a proven match moves automatically; otherwise Carina plans to re-create the resource unless you write `moved`. See [anonymous resource upgrades](/reference/dsl/syntax/#anonymous-resources) for the full diagnostic and a `moved` example.
+
 ### Local Bindings in Functions
 
 Functions can contain `let` bindings before the return expression:

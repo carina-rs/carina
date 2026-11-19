@@ -256,7 +256,7 @@ async fn removed_no_refresh_saved_plan_apply() {
         .unwrap();
     let entry = plan::CurrentStateEntry::Managed {
         id,
-        current: plan::SavedManagedCurrent::from_current(
+        current: plan::SavedManagedCurrent::for_test(
             carina_core::resource::Current::from_snapshot(snapshot),
         ),
     };

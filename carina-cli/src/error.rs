@@ -10,6 +10,7 @@ use carina_core::resource::{ResolvedResourceId, ResourceId};
 use carina_state::BackendError;
 
 use crate::commands::shared::state_writeback::PersistedDirectiveChange;
+use crate::output_style::{ColorMode, Colorize};
 
 #[derive(Debug)]
 pub struct SavedPlanSourceResolutionError {
@@ -1170,6 +1171,12 @@ fn validation_finding_display(prefix: Option<&str>, finding: &impl std::fmt::Dis
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
+    #[error("Cannot save plan: {problem}\nRun `{command}` directly on the project, without a saved plan.", command = ProjectCommand::new("apply", project_dir))]
+    RetainedUserFunctionCall {
+        problem: carina_core::value::RetainedUserFunctionCallError,
+        project_dir: PathBuf,
+    },
+
     #[error("{}", .0.message)]
     ProviderTypeCheck(Box<carina_core::parser::ParseWarning>),
     #[error("{0}")]
@@ -1796,6 +1803,10 @@ impl carina_core::validation::ValidationClientError for AppError {
 }
 
 impl AppError {
+    pub fn from_plan_serialization(error: serde_json::Error) -> Self {
+        Self::Config(format!("Failed to serialize plan: {error}"))
+    }
+
     pub(crate) fn invalid_saved_plan_provider_evidence(
         path: carina_core::paths::DisplayPath,
         replan_command: Option<String>,
@@ -1928,6 +1939,27 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
         messages.push(format!("Re-run `{command}` to create a new plan."));
     }
     messages.join("\n")
+}
+
+fn error_prefix(color_mode: ColorMode) -> String {
+    "Error:".red(color_mode).bold(color_mode).to_string()
+}
+
+/// Render ordinary diagnostic lines with the CLI's error prefix.
+pub fn format_error_lines(color_mode: ColorMode, message: &str) -> String {
+    let prefix = error_prefix(color_mode);
+    message
+        .lines()
+        .map(|line| format!("{prefix} {line}\n"))
+        .collect()
+}
+
+/// Leave the typed diagnostic's recovery block ready to paste as source.
+pub fn format_unresolved_declared_identity_migration(
+    color_mode: ColorMode,
+    error: &carina_core::identifier::UnresolvedDeclaredIdentityMigration,
+) -> String {
+    format!("{} {error}\n", error_prefix(color_mode))
 }
 
 impl From<carina_core::resource::ResolvedResourceError> for AppError {
@@ -2100,7 +2132,11 @@ mod tests {
                 ))
                 .into(),
             ));
-        let snapshot = carina_core::value::redact_secrets_in_value(&secret).unwrap();
+        let snapshot = crate::test_support::with_saved_document(|conversion| {
+            conversion.redact_secrets_in_value(&secret)
+        })
+        .map(carina_core::value::Saved::into_inner)
+        .unwrap();
         let unavailable = snapshot.to_value_at(&raw).unwrap_err();
         let replan = "carina plan".to_string();
         for error in [
@@ -2162,7 +2198,11 @@ mod tests {
         let secret: Value = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
         ));
-        let snapshot = carina_core::value::redact_secrets_in_value(&secret).unwrap();
+        let snapshot = crate::test_support::with_saved_document(|conversion| {
+            conversion.redact_secrets_in_value(&secret)
+        })
+        .map(carina_core::value::Saved::into_inner)
+        .unwrap();
         let unavailable = snapshot.to_value_at("loop.items").unwrap_err();
         let error = AppError::from(
             carina_core::parser::DeferredForExpansionError::UnavailableSecret(unavailable),
@@ -3027,6 +3067,19 @@ mod backend_locate_chain_tests {
             rendered.matches("native locate cause").count(),
             1,
             "{rendered}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod retained_call_plan_guidance_tests {
+    use super::*;
+    #[test]
+    fn ordinary_plan_serialization_errors_keep_their_diagnostic() {
+        let error: serde_json::Error = serde::ser::Error::custom("another serialization failure");
+        assert_eq!(
+            AppError::from_plan_serialization(error).to_string(),
+            "Failed to serialize plan: another serialization failure"
         );
     }
 }

@@ -215,19 +215,6 @@ impl<'a> TypecheckProviderContext<'a> {
         )
     }
 
-    pub(crate) fn check_resolved_constraints_at<P: PlaceholderKind, B: BindingAddress>(
-        self,
-        expected: &TypeExpr,
-        value: &crate::resource::knowledge::KnownValue<'_, P, B>,
-        site: super::deferred_types::ProviderTypeCheckSite,
-    ) -> Result<(), TypeExprValueError> {
-        let check = self.check_resolved_constraints(expected, value);
-        match self.session() {
-            Some(session) if !self.requires_provider_schemas() => check.record_at(session, site),
-            _ => check.require_provider_schemas(),
-        }
-    }
-
     pub(crate) fn requires_provider_schemas(self) -> bool {
         self.as_provider_context().custom_types_loaded()
     }
@@ -255,6 +242,15 @@ pub struct TypeExprValueDeferral<'s> {
 }
 
 impl TypeExprValueDeferral<'_> {
+    pub(crate) fn into_error(self) -> TypeExprValueError {
+        TypeExprValueError::CustomTypeValidation {
+            path: self.path,
+            expected: self.expected,
+            actual: self.actual,
+            error: Box::new(self.reason),
+        }
+    }
+
     fn merge(mut self, other: Self) -> Self {
         self.additional.push(other);
         self
@@ -323,12 +319,7 @@ impl<'s> TypeExprValueCheck<'s> {
         match self {
             Self::Assignable => Ok(()),
             Self::Mismatch(error) => Err(error),
-            Self::Deferred(deferred) => Err(TypeExprValueError::CustomTypeValidation {
-                path: deferred.path,
-                expected: deferred.expected,
-                actual: deferred.actual,
-                error: Box::new(deferred.reason),
-            }),
+            Self::Deferred(deferred) => Err(deferred.into_error()),
         }
     }
 
