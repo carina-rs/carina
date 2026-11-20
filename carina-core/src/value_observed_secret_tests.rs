@@ -561,3 +561,133 @@ fn observed_secret_authored_inputs_survive_public_effect_substitution() {
             .unwrap()
     );
 }
+
+#[test]
+fn for_value_keys_observed_secret_knowledge_plan_apply() {
+    use crate::binding_index::{
+        BindingCompleteness, LivePreApplyInputs, ResolvedBindings, SecretPreservingAttributes,
+    };
+    use crate::resource::{Current, RelativeBindingName, Resource, RootScope, SnapshotState};
+    let authored = list(vec![secret()]);
+    let observed = list(vec![string("OBSERVED_KEY_CANARY"), string("public-extra")]);
+    let resource = Resource::new("test.Item", "item")
+        .with_root_binding("item")
+        .with_attribute("payload", authored.clone());
+    let current = SnapshotState::existing(
+        resource.id.clone(),
+        HashMap::from([("payload".into(), observed.to_snapshot())]),
+    )
+    .with_identifier("item-id");
+    let mut document = authority_document();
+    document["resources"][0]["current"]["attributes"]["payload"] = serde_json::to_value(
+        crate::value::PersistedValue::encode_provider_value(&authored, None).unwrap(),
+    )
+    .unwrap();
+    let authority =
+        ObservationState::read_state_file(&serde_json::to_vec(&document).unwrap()).unwrap();
+    let mut plan = crate::plan::Plan::new();
+    plan.add(crate::effect::Effect::Update {
+        identifier: crate::effect::fixture_applied_identifier("item-id"),
+        from: Box::new(current.clone()),
+        to: crate::resource::ResolvedResource::new(resource.clone().into_value_snapshot()),
+        changed_attributes: vec![],
+    });
+    let currents = HashMap::from([(resource.id.clone(), Current::from_snapshot(current.clone()))]);
+    let protected = authority
+        .protect(ObservationInputs::Display {
+            plan: &plan,
+            current: &currents,
+            deleted: &HashMap::new(),
+        })
+        .unwrap();
+    assert!(
+        protected
+            .managed_for(&resource.id)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .attributes["payload"]
+            .verify_secret(&observed)
+            .unwrap(),
+        "output policy protects the whole grown list"
+    );
+    let schemas = crate::schema::SchemaRegistry::new();
+    let managed = [resource.clone()];
+    let current_inputs = crate::resource::into_plan_input_current_map(currents, &schemas, &managed);
+    let planned = ResolvedBindings::pre_apply_live(LivePreApplyInputs {
+        managed: &managed,
+        compositions: &[],
+        managed_current: &current_inputs,
+        data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+        remote_bindings: &Default::default(),
+        wait_aliases: &[],
+    });
+    let provider_values = HashMap::from([("payload".into(), observed.clone())]);
+    let protected_attributes =
+        SecretPreservingAttributes::from_provider_values(&resource.attributes, &provider_values);
+    let mut applied = ResolvedBindings::default();
+    applied.record_applied(
+        Some("item"),
+        &protected_attributes,
+        &current,
+        BindingCompleteness::Complete,
+    );
+    let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    for (is_apply, bindings) in [(false, planned), (true, applied)] {
+        let reference = Value::root_resource_ref("item", "payload", vec![]);
+        let resolved =
+            crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                crate::resolver::resolve_ref_value_status(&reference, &bindings, session)
+            })
+            .unwrap();
+        let value = match resolved {
+            crate::resolver::ValueResolution::Present(value)
+            | crate::resolver::ValueResolution::Unknown(value) => value,
+            crate::resolver::ValueResolution::Absent(_) => panic!("binding must contain payload"),
+        };
+        let classification = if is_apply {
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::apply(
+                    &bindings,
+                ))
+                .unwrap()
+                .into_classification()
+        } else {
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
+                    &bindings,
+                ))
+                .unwrap()
+                .into_classification()
+        };
+        let members = crate::resource::knowledge::ClassifiedRef::from(&classification);
+        assert!(
+            !members.is_protected(),
+            "binding policy retains positional member protection, independently of whole output protection"
+        );
+        assert!(
+            members.list().unwrap()[0].is_protected(),
+            "classification must retain secret member evidence"
+        );
+        let target = crate::parser::BoundDeferredTarget::new(
+            RootScope::new().resolve(RelativeBindingName::new("rs")),
+        )
+        .unwrap();
+        let error = crate::resource::admit_bound_for_addresses(
+            &crate::parser::ForBinding::Simple("x".into()),
+            &target,
+            members,
+            if is_apply {
+                crate::resource::ForAddressMoment::Apply
+            } else {
+                crate::resource::ForAddressMoment::Plan
+            },
+        )
+        .unwrap();
+        let crate::resource::ForAddressAdmission::Reject(error) = error else {
+            panic!("protected keys must be rejected")
+        };
+        assert_eq!(error, crate::resource::ForKeyError::Protected);
+        assert!(!format!("{error:?} {error}").contains("OBSERVED_KEY_CANARY"));
+    }
+}

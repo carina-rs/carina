@@ -5,6 +5,35 @@ use crate::secrecy::{
     TemplateEvidenceUnavailable, TemplateSecrecy,
 };
 
+fn admitted_member(
+    template: &ExpandedDeferredForExpression,
+    key: &str,
+) -> crate::resource::AdmittedForMember<
+    crate::resource::NoPlaceholder,
+    crate::resource::AbsoluteBindingAddress,
+> {
+    let crate::parser::DeferredForTarget::Bound(target) = template.target() else {
+        panic!("fixture is bound");
+    };
+    let iterable = list(&[key]);
+    let classification = iterable
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .unwrap()
+        .into_classification();
+    let crate::resource::ForAddressAdmission::Admitted(mut members) =
+        crate::resource::admit_bound_for_addresses(
+            &template.binding,
+            target,
+            crate::resource::knowledge::ClassifiedRef::from(&classification),
+            crate::resource::ForAddressMoment::Plan,
+        )
+        .unwrap()
+    else {
+        panic!("fixture keys are admitted");
+    };
+    members.remove(0)
+}
+
 fn children(
     template: &ExpandedDeferredForExpression,
     iterable: Value,
@@ -19,7 +48,7 @@ fn children(
         panic!("fixture iterable is known");
     };
     crate::validation::deferred_types::with_session_for_test(context, |session| {
-        crate::parser::expand_deferred_children(
+        crate::parser::expand_deferred_children_for_test(
             template,
             PlanIterable::from_known(known).unwrap(),
             AccessMissPolicy::Error,
@@ -78,8 +107,8 @@ fn issue_4516_anonymous_module_remapped_template_keeps_owned_child_evidence() {
     file.deferred_for_expressions_mut()
         .append_finalized(retained);
     assert!(file.deferred_for_expressions().is_empty());
-    assert_child_row(&file, &format!("{state_prefix}.children[0]"));
-    assert_child_row(&file, &format!("{state_prefix}.children[1]"));
+    assert_child_row(&file, &format!("{state_prefix}.children.a"));
+    assert_child_row(&file, &format!("{state_prefix}.children.b"));
     assert!(std::sync::Arc::ptr_eq(
         &graph(&file).template_evidence(&remapped).unwrap(),
         &evidence
@@ -97,7 +126,7 @@ fn issue_4516_deferred_for_child_rows_keep_element_identity() {
             ForLoopElement::Key("b".into()),
         ),
         (
-            ROOT_LOOP,
+            "let children = for (i, item) in upstream.items { mock.test.Resource { comment = secret('canary') name = item } }\n",
             list(&["a", "b"]),
             list(&["b"]),
             ForLoopElement::Index(1),
@@ -128,6 +157,56 @@ fn issue_4516_deferred_for_child_rows_keep_element_identity() {
             graph.insert_child(child).unwrap();
             assert_eq!(graph.attributes(&child.id), Some(row.attributes()));
         }
+    }
+}
+
+#[test]
+fn for_value_keys_deferred_for_child_rows_keep_element_identity() {
+    let (_directory, file, schemas, context) = directory(ROOT_LOOP);
+    let file = resolved(file, &schemas, &context);
+    let children = children(
+        &file.deferred_for_expressions()[0],
+        list(&["a", "b"]),
+        &context,
+    );
+    assert_eq!(children.len(), 2);
+    let mut graph = graph(&file).clone();
+    for (address, other_address) in [("children.a", "children.b"), ("children.b", "children.a")] {
+        let child = children
+            .iter()
+            .find(|child| child.id.identity_str() == Some(address))
+            .unwrap();
+        let other = children
+            .iter()
+            .find(|child| child.id.identity_str() == Some(other_address))
+            .unwrap();
+        let row = match child.child_secrecy() {
+            ChildSecrecyRead::Row(row) => row,
+            unexpected @ (ChildSecrecyRead::NotLoopChild
+            | ChildSecrecyRead::Unavailable(_)
+            | ChildSecrecyRead::RowMismatch) => {
+                panic!("expected admitted child's row, got {unexpected:?}")
+            }
+        };
+        assert_eq!(row.attributes()["comment"], Evidence::Leaf(Secrecy::Secret));
+        assert_eq!(row.attributes()["name"], Evidence::Leaf(Secrecy::Public));
+        assert!(row.matches_resource(child));
+        assert!(!row.matches_resource(other));
+        graph.insert_child(child).unwrap();
+        assert_eq!(graph.attributes(&child.id), Some(row.attributes()));
+
+        let mut wrong_element = child.clone();
+        wrong_element.id.set_identity(other_address.into());
+        wrong_element.binding = other.binding.clone();
+        assert!(!row.matches_resource(&wrong_element));
+        assert!(matches!(
+            wrong_element.child_secrecy(),
+            ChildSecrecyRead::RowMismatch
+        ));
+        assert_eq!(
+            graph.insert_child(&wrong_element),
+            Err(ChildEvidenceInsertError::ChildDeclaration)
+        );
     }
 }
 
@@ -202,29 +281,51 @@ fn issue_4516_deferred_for_rejects_unrelated_evidence_and_children() {
         panic!("admitted template must carry evidence");
     };
     let child = children(first, list(&["a"]), &context).remove(0);
+    let member = admitted_member(first, "a");
+    let wrong_member = admitted_member(first, "b");
     assert!(matches!(
-        evidence.instantiate_child(second, &ForLoopElement::Index(0), &child),
+        evidence.instantiate_child(
+            second,
+            &crate::parser::ExpandedForChild::Bound(&member),
+            &child
+        ),
         Err(TemplateEvidenceMismatch::TemplateDeclaration)
     ));
     let other_child = children(second, list(&["a"]), &context).remove(0);
     assert!(matches!(
-        evidence.instantiate_child(first, &ForLoopElement::Index(0), &other_child),
+        evidence.instantiate_child(
+            first,
+            &crate::parser::ExpandedForChild::Bound(&member),
+            &other_child
+        ),
         Err(TemplateEvidenceMismatch::ChildDeclaration)
     ));
     let mut wrong_provider = child.clone();
     wrong_provider.id.provider = "other".into();
     assert!(matches!(
-        evidence.instantiate_child(first, &ForLoopElement::Index(0), &wrong_provider),
+        evidence.instantiate_child(
+            first,
+            &crate::parser::ExpandedForChild::Bound(&member),
+            &wrong_provider
+        ),
         Err(TemplateEvidenceMismatch::Provider)
     ));
     let mut wrong_type = child.clone();
     wrong_type.id.resource_type = "test.Other".into();
     assert!(matches!(
-        evidence.instantiate_child(first, &ForLoopElement::Index(0), &wrong_type),
+        evidence.instantiate_child(
+            first,
+            &crate::parser::ExpandedForChild::Bound(&member),
+            &wrong_type
+        ),
         Err(TemplateEvidenceMismatch::ResourceType)
     ));
     assert!(matches!(
-        evidence.instantiate_child(first, &ForLoopElement::Index(1), &child),
+        evidence.instantiate_child(
+            first,
+            &crate::parser::ExpandedForChild::Bound(&wrong_member),
+            &child
+        ),
         Err(TemplateEvidenceMismatch::Element)
     ));
 }
@@ -333,10 +434,10 @@ fn issue_4516_without_authored_inputs_keeps_templates_unavailable_and_reader_pen
     assert!(file.deferred_for_expressions().is_empty());
     assert_eq!(file.resources.len(), 3);
     for child in file.resources.iter().filter(|resource| {
-        resource
-            .id
-            .identity_str()
-            .is_some_and(|id| id.starts_with("children["))
+        resource.id.identity_str().is_some_and(|id| {
+            crate::resource::decompose_binding_address(id)
+                .is_some_and(|address| address.is_direct_child_of("children"))
+        })
     }) {
         match child.child_secrecy() {
             ChildSecrecyRead::Unavailable(reason) => assert_eq!(
@@ -408,9 +509,9 @@ fn issue_4516_child_row_rejects_mutated_provider_instance_type_and_element() {
             "provider instance" => child.id.provider_instance = Some("foreign".into()),
             "resource type" => child.id.resource_type = "test.Foreign".into(),
             "element" => {
-                child.id.set_identity("children[1]".into());
+                child.id.set_identity("children.b".into());
                 child.binding =
-                    Some(crate::resource::RootScope::new().resolve("children[1]".into()));
+                    Some(crate::resource::RootScope::new().resolve("children.b".into()));
             }
             _ => unreachable!(),
         }
@@ -560,12 +661,21 @@ fn issue_4516_deferred_for_distinguishes_module_instances() {
         panic!("admitted template evidence");
     };
     let child = children(second, list(&["a"]), &context).remove(0);
+    let member = admitted_member(first, "a");
     assert!(matches!(
-        evidence.instantiate_child(second, &ForLoopElement::Index(0), &child),
+        evidence.instantiate_child(
+            second,
+            &crate::parser::ExpandedForChild::Bound(&member),
+            &child
+        ),
         Err(TemplateEvidenceMismatch::TemplateDeclaration)
     ));
     assert!(matches!(
-        evidence.instantiate_child(first, &ForLoopElement::Index(0), &child),
+        evidence.instantiate_child(
+            first,
+            &crate::parser::ExpandedForChild::Bound(&member),
+            &child
+        ),
         Err(TemplateEvidenceMismatch::ChildDeclaration)
     ));
 }
@@ -638,7 +748,7 @@ fn issue_4516_deferred_child_has_judgement_and_reinstance_clears_it() {
     let child = file
         .resources
         .iter()
-        .find(|resource| resource.id.identity_str() == Some("children[0]"))
+        .find(|resource| resource.id.identity_str() == Some("children.a"))
         .unwrap();
     match child.child_secrecy() {
         ChildSecrecyRead::Row(_) => {}
@@ -847,8 +957,8 @@ fn issue_4516_own_template_expands_with_cloned_graph() {
     let mut expanded = file.clone();
     expand(&mut expanded, list(&["a", "b"]), &context);
     assert!(expanded.deferred_for_expressions().is_empty());
-    assert_child_row(&expanded, "children[0]");
-    assert_child_row(&expanded, "children[1]");
+    assert_child_row(&expanded, "children.a");
+    assert_child_row(&expanded, "children.b");
     assert!(std::sync::Arc::ptr_eq(&before.rows, &graph(&file).rows));
     assert!(!std::sync::Arc::ptr_eq(
         &before.rows,

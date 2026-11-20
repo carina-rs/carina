@@ -684,7 +684,7 @@ fn substituted_reference_source_always_carries_its_authored_use_identity() {
         ("sources.crn", "let a = mock.Source { name = 'abc' }\n"),
         (
             "main.crn",
-            "let copies = for x in [0, 1] { mock.Sink { value = a.name } }\n",
+            "let copies = for (_, x) in [0, 1] { mock.Sink { value = a.name } }\n",
         ),
     ] {
         std::fs::write(directory.path().join(name), body).unwrap();
@@ -793,7 +793,7 @@ fn substituted_reference_same_file_and_alias_preserve_the_source() {
 fn substituted_reference_each_expansion_keeps_its_own_finding() {
     let errors = check(
         "let a = mock.Source { name = 'abc' }\n",
-        "let copies = for _ in [1, 2] { mock.Sink { value = a.name } }\n",
+        "let copies = for (_, _) in [1, 2] { mock.Sink { value = a.name } }\n",
     );
     assert_eq!(errors.len(), 2, "{errors:#?}");
     for index in 0..2 {

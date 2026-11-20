@@ -301,7 +301,7 @@ fn if_admits_every_branch_at_the_sink() {
 #[test]
 fn for_admits_the_body_as_the_list_element() {
     let (_, report) = source_schema_report(
-        "let result = for n in [1, 2] { mock.test.Source { name = \"${n}\" } }",
+        "let result = for (_, n) in [1, 2] { mock.test.Source { name = \"${n}\" } }",
     );
     let result = report.binding(&RelativeBindingName::new("result")).unwrap();
     assert!(admit_expression(result, &TypeExpr::List(Box::new(TypeExpr::Int))).is_err());

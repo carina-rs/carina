@@ -305,12 +305,6 @@ fn round8_deferred_headers_keep_parsed_context_on_all_surfaces() {
     for (root, binding, iterable, expected) in [
         ("cert", "secret", "cert.list", "for secret in cert.list"),
         ("cert", "item", "cert.list", "for item in cert.list"),
-        (
-            "cert",
-            "item",
-            "secret(cert.list)",
-            "for item in secret(<redacted>)",
-        ),
         ("secret", "item", "secret.list", "for item in secret.list"),
     ] {
         let source = format!(
@@ -345,6 +339,82 @@ fn round8_deferred_headers_keep_parsed_context_on_all_surfaces() {
             "{diagnostics:?}"
         );
     }
+
+    let source = "let cert = mock.example.consumer { name = 'cert' }\n\
+                  let records = for item in secret(cert.list) { read mock.iam.Roles { name_regex = item } }\n";
+    std::fs::write(&path, source).unwrap();
+    let message = "Protected values cannot be value keys. Use `for (i, x) in ...`.";
+    let human = validate(fixture.path(), false);
+    assert_eq!(human.status.code(), Some(1));
+    assert!(human.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&human.stderr),
+        format!("Error: {}:2:27: {message}\n", path.display())
+    );
+    let json_output = validate(fixture.path(), true);
+    let json = report(&json_output, 1, 0);
+    assert_eq!(json["errors"][0]["message"], message);
+    assert_eq!(
+        json["errors"][0]["location"],
+        serde_json::json!({
+            "file": path.display().to_string(),
+            "range": {
+                "start": { "line": 2, "column": 27 },
+                "end": { "line": 2, "column": 44 },
+            },
+        })
+    );
+    let diagnostics = round_three_diagnostics(source, &path);
+    let finding = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message == message)
+        .unwrap_or_else(|| panic!("{diagnostics:?}"));
+    assert_eq!(finding.severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        finding.range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(1, 26),
+            tower_lsp::lsp_types::Position::new(1, 43),
+        )
+    );
+    let surfaces = format!(
+        "{}{}{}{} {diagnostics:?}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr),
+        String::from_utf8_lossy(&json_output.stdout),
+        String::from_utf8_lossy(&json_output.stderr),
+    );
+    assert!(!surfaces.contains("cert.list"), "{surfaces}");
+
+    let source = "let cert = mock.example.consumer { name = 'cert' }\n\
+                  let records = for (i, item) in secret(cert.list) { read mock.iam.Roles { name_regex = item } }\n";
+    std::fs::write(&path, source).unwrap();
+    let message = "Deferred `for` expression `for (i, item) in secret(<redacted>)` at line 2 cannot use read `mock.iam.Roles`: its iterable \
+                   is still unresolved after module expansion, and only a managed resource body can be \
+                   deferred until apply. Iterate over a value known before module expansion, or put \
+                   managed resources directly in the loop body";
+    let warning = "for-loop binding 'i' is unused. Rename to '_' to suppress this warning.";
+    let human = validate(fixture.path(), false);
+    assert_eq!(human.status.code(), Some(1));
+    assert_eq!(human.stdout, b"Validating...\n");
+    assert_eq!(
+        String::from_utf8(human.stderr).unwrap(),
+        format!(
+            "  ⚠ {}:2: {warning}\nError: Module resolution error: Parse error in main.crn: main.crn:2:15: {message}\n",
+            path.display()
+        )
+    );
+    let json = report(&validate(fixture.path(), true), 1, 1);
+    assert_eq!(json["errors"][0]["message"], message);
+    assert_eq!(json["warnings"][0]["message"], warning);
+    let diagnostics = round_three_diagnostics(source, &path);
+    let lsp_message = format!("Parse error in main.crn: main.crn:2:15: {message}");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == lsp_message),
+        "{diagnostics:?}"
+    );
 }
 
 #[test]

@@ -32,7 +32,7 @@ pub(in crate::parser) fn parse_dependency_operand(
         EvalValue::UnexpandedStructuralHandle(handle)
             if matches!(
                 handle.kind(),
-                UnexpandedStructuralHandleKind::For | UnexpandedStructuralHandleKind::If
+                UnexpandedStructuralHandleKind::For(_) | UnexpandedStructuralHandleKind::If
             ) =>
         {
             Ok(UnexpandedDependencyOperand::BareBinding(

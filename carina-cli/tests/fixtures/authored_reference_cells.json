@@ -7557,7 +7557,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7596,7 +7596,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7648,7 +7648,7 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[0]: cannot assign String to 'value': expected mock.Expected, got String (from x.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[0]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from x.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from x.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 49,\n                    end_byte: 54,\n                    start_line: 3,\n                    start_column: 5,\n                    end_line: 3,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
+              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[0]: cannot assign String to 'value': expected mock.Expected, got String (from x.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[0]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from x.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from x.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 54,\n                    end_byte: 59,\n                    start_line: 3,\n                    start_column: 5,\n                    end_line: 3,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": []
@@ -7668,7 +7668,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7707,7 +7707,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7759,7 +7759,7 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[1]: cannot assign String to 'value': expected mock.Expected, got String (from y.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[1]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from y.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from y.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 49,\n                    end_byte: 54,\n                    start_line: 3,\n                    start_column: 5,\n                    end_line: 3,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
+              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[1]: cannot assign String to 'value': expected mock.Expected, got String (from y.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[1]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from y.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from y.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 54,\n                    end_byte: 59,\n                    start_line: 3,\n                    start_column: 5,\n                    end_line: 3,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": []
@@ -7779,7 +7779,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -7818,7 +7818,7 @@
             ],
             [
               "main.crn",
-              "let probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -16558,7 +16558,7 @@
             ],
             [
               "main.crn",
-              "let x = mock.Source {\n    name = 'same'\n    count = 1\n}\nlet y = mock.CompatibleSource {\n    name = 'same'\n    count = 1\n}\nlet probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let x = mock.Source {\n    name = 'same'\n    count = 1\n}\nlet y = mock.CompatibleSource {\n    name = 'same'\n    count = 1\n}\nlet probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -16597,7 +16597,7 @@
             ],
             [
               "main.crn",
-              "let x = mock.Source {\n                 \n             \n}\nlet y = mock.CompatibleSource {\n                 \n             \n}\nlet probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let x = mock.Source {\n                 \n             \n}\nlet y = mock.CompatibleSource {\n                 \n             \n}\nlet probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -16649,7 +16649,7 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[0]: cannot assign String to 'value': expected mock.Expected, got String (from x.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[0]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from x.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from x.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 171,\n                    end_byte: 176,\n                    start_line: 11,\n                    start_column: 5,\n                    end_line: 11,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
+              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[0]: cannot assign String to 'value': expected mock.Expected, got String (from x.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[0]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from x.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from x.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 176,\n                    end_byte: 181,\n                    start_line: 11,\n                    start_column: 5,\n                    end_line: 11,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": []
@@ -16669,7 +16669,7 @@
             ],
             [
               "main.crn",
-              "let x = mock.CompatibleSource {\n    name = 'same'\n    count = 1\n}\nlet y = mock.Source {\n    name = 'same'\n    count = 1\n}\nlet probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let x = mock.CompatibleSource {\n    name = 'same'\n    count = 1\n}\nlet y = mock.Source {\n    name = 'same'\n    count = 1\n}\nlet probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -16708,7 +16708,7 @@
             ],
             [
               "main.crn",
-              "let x = mock.CompatibleSource {\n                 \n             \n}\nlet y = mock.Source {\n                 \n             \n}\nlet probes = for i in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
+              "let x = mock.CompatibleSource {\n                 \n             \n}\nlet y = mock.Source {\n                 \n             \n}\nlet probes = for (_, i) in [0, 1] {\n  mock.Sink {\n    value = [x.name, y.name][i]\n  }\n}\n"
             ],
             [
               "providers.crn",
@@ -16760,7 +16760,7 @@
             },
             "status": "reject",
             "typed_error_vector": [
-              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[1]: cannot assign String to 'value': expected mock.Expected, got String (from y.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[1]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from y.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from y.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 171,\n                    end_byte: 176,\n                    start_line: 11,\n                    start_column: 5,\n                    end_line: 11,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
+              "ResourceAdmission(\n    ResourceAdmissionFinding {\n        human: \"mock.Sink.probes[1]: cannot assign String to 'value': expected mock.Expected, got String (from y.name)\",\n        detail: Schema {\n            resource: ResourceId {\n                provider: \"mock\",\n                resource_type: \"Sink\",\n                identity: Resolved(\n                    ResourceIdentity(\n                        \"probes[1]\",\n                    ),\n                ),\n                provider_instance: None,\n            },\n            diagnostic: Other(\n                OtherSchemaFinding {\n                    error: TypeMismatch {\n                        types: MismatchTypeNames {\n                            expected: \"mock.Expected\",\n                            actual: \"String\",\n                        },\n                    },\n                    path: Some(\n                        (\n                            \"value\",\n                            LeafPath(\n                                [],\n                            ),\n                        ),\n                    ),\n                },\n            ),\n            mismatch: Some(\n                ReferenceMismatch {\n                    types: MismatchTypeNames {\n                        expected: \"mock.Expected\",\n                        actual: \"String\",\n                    },\n                    origin: Some(\n                        \"from y.name\",\n                    ),\n                    assignment_origin: Some(\n                        \"from y.name\",\n                    ),\n                    attribute: \"value\",\n                    path: LeafPath(\n                        [],\n                    ),\n                },\n            ),\n        },\n        location: Some(\n            DeclarationLocation {\n                file: SourceFileId(\n                    \"<DIR>/main.crn\",\n                ),\n                span: SourceSpan {\n                    start_byte: 176,\n                    end_byte: 181,\n                    start_line: 11,\n                    start_column: 5,\n                    end_line: 11,\n                    end_column: 10,\n                },\n            },\n        ),\n    },\n)"
             ],
             "typed_input_warnings": [],
             "typed_parse_warnings": []

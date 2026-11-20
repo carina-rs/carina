@@ -1279,7 +1279,7 @@ fn r4_fixture(case: &str) -> Fixture {
             .with_file("main.crn", "mock.test.resource {\n  name_prefix = \"${net.first}-${up.first}\"\n}\n"),
         "loop_concat" | "loop_coalesce" | "loop_coalesce_reversed" => {
             let iterable = match case { "loop_concat" => "concat(src.generated_rules, net.names)", "loop_coalesce" => "net.names ?? src.generated_rules", _ => "src.generated_rules ?? net.names" };
-            Fixture::new(&format!("let items = {iterable}\nlet children = for x in items {{\n  mock.test.resource {{\n    name_prefix = x.action\n  }}\n}}\n"), "let src = mock.test.deferred_source { name = 'source' }\nlet c = use { source = './child' }\nlet net = c {}\n", false)
+            Fixture::new(&format!("let items = {iterable}\nlet children = for (_, x) in items {{\n  mock.test.resource {{\n    name_prefix = x.action\n  }}\n}}\n"), "let src = mock.test.deferred_source { name = 'source' }\nlet c = use { source = './child' }\nlet net = c {}\n", false)
                 .with_file("child/main.crn", "attributes { names: list(map(String)) = [{ action = 'app' }] }\n")
         }
         "distinct_sets" => Fixture::new(&format!("{call}let instance = c {{ first = src.identifier second = other.identifier }}\n"), &format!("{SOURCE}let other = mock.test.resource {{ name = 'other' }}\n"), false)

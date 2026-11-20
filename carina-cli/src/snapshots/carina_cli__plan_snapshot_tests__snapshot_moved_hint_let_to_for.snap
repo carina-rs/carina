@@ -6,14 +6,14 @@ Execution Plan:
 
   - awscc.ec2.Vpc old_vpc
       cidr_block: '10.0.0.0/16'
-  + awscc.ec2.Vpc vpcs[0]
+  + awscc.ec2.Vpc vpcs['10.0.0.0/16']
       cidr_block: '10.0.0.0/16'
 
 Plan: 1 to add, 0 to change, 1 to destroy.
 
-Warning: this plan destroys awscc.ec2.Vpc 'old_vpc' and creates awscc.ec2.Vpc 'vpcs[0]', whose configured create-only values match. If they are the same resource, add this block to keep it instead of replacing it:
+Warning: this plan destroys awscc.ec2.Vpc 'old_vpc' and creates awscc.ec2.Vpc "vpcs['10.0.0.0/16']", whose configured create-only values match. If they are the same resource, add this block to keep it instead of replacing it:
 
   moved {
     from = awscc.ec2.Vpc 'old_vpc'
-    to   = awscc.ec2.Vpc 'vpcs[0]'
+    to   = awscc.ec2.Vpc "vpcs['10.0.0.0/16']"
   }

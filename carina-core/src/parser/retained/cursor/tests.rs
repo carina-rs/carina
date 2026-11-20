@@ -1591,7 +1591,7 @@ fn seam_deferred_loop_substitution_rebuilds_the_whole_slot() {
         .into_known()
         .unwrap();
     let children = crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        crate::parser::expand_deferred_children(
+        crate::parser::expand_deferred_children_for_test(
             deferred,
             crate::resource::knowledge::PlanIterable::from_known(known).unwrap(),
             crate::resource::AccessMissPolicy::Error,

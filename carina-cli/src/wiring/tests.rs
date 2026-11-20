@@ -8590,29 +8590,19 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     let mut loop_children = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
-            carina_core::parser::expand_deferred_children(
-                anonymous_loop,
-                match (Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::String("route".into()),
-                )])))
-                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                .map(|proof| proof.into_classification())
-                .unwrap()
-                {
-                    carina_core::resource::knowledge::Classification::Known(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::Pending(_)
-                    | carina_core::resource::knowledge::Classification::Failed(_) => {
-                        panic!("fixture collection has exact shape")
-                    }
-                },
-                carina_core::resource::AccessMissPolicy::Error,
+            let mut file = carina_core::parser::ExpandedParsedFile::default();
+            file.replace_deferred_for_expressions(
+                carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    anonymous_loop.clone(),
+                ]),
+            );
+            file.expand_deferred_for_expressions(
+                &carina_core::binding_index::IterableBindings::from_upstream_only(
+                    expanded_remote_bindings.clone(),
+                ),
                 session,
             )
+            .map(|()| file.resources)
         },
     )
     .expect("deferred route loop expands");
@@ -8733,7 +8723,7 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
     moves.sort();
     let mut expected = vec![
         ("_for0[0]".to_string(), loop_destination),
-        (named_orphan.to_string(), "named[0]".to_string()),
+        (named_orphan.to_string(), "named.named".to_string()),
     ];
     expected.sort();
     assert_eq!(
@@ -11107,11 +11097,11 @@ fn deferred_block_name_conflict_reports_materialized_template_address() {
     let deferred = carina_core::parser::DeferredForExpression::new(
         Some("main.crn".to_string()),
         4,
-        "for item in pending.items".to_string(),
+        "for (_, item) in pending.items".to_string(),
         carina_core::parser::DeferredForTarget::bound(absolute_binding("rs"))
             .expect("fixture binding is valid"),
         Value::resource_ref("pending", "items", Vec::new()).resolve_root_for_test(),
-        carina_core::parser::ForBinding::Simple("item".to_string()),
+        carina_core::parser::ForBinding::Indexed("_".into(), "item".to_string()),
         template_resource,
     );
     let unresolved = carina_core::parser::ParsedFile::default();
@@ -11995,33 +11985,29 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .expect("deferred map-loop fixture has no parser placeholders");
+    let iterables = carina_core::binding_index::IterableBindings::from_upstream_only(
+        carina_core::upstream_exports::remote_bindings_for_test(HashMap::from([(
+            "upstream".into(),
+            HashMap::from([(
+                "subnets".into(),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                    "alpha".into(),
+                    Value::Concrete(ConcreteValue::String("subnet-a".into())),
+                )]))),
+            )]),
+        )])),
+    );
     let children = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         |session| {
-            carina_core::parser::expand_deferred_children(
-                &parsed.deferred_for_expressions()[0],
-                match (Value::Concrete(ConcreteValue::Map(IndexMap::from([(
-                    "alpha".to_string(),
-                    Value::Concrete(ConcreteValue::String("subnet-a".into())),
-                )]))))
-                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                .map(|proof| proof.into_classification())
-                .unwrap()
-                {
-                    carina_core::resource::knowledge::Classification::Known(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
-                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
-                    }
-                    carina_core::resource::knowledge::Classification::Pending(_)
-                    | carina_core::resource::knowledge::Classification::Failed(_) => {
-                        panic!("fixture collection has exact shape")
-                    }
-                },
-                carina_core::resource::AccessMissPolicy::Error,
-                session,
-            )
+            let mut file = carina_core::parser::ExpandedParsedFile::default();
+            file.replace_deferred_for_expressions(
+                carina_core::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    parsed.deferred_for_expressions()[0].clone(),
+                ]),
+            );
+            file.expand_deferred_for_expressions(&iterables, session)
+                .map(|()| file.resources)
         },
     )
     .expect("planning-time upstream map expands");

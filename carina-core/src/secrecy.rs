@@ -493,7 +493,7 @@ impl TemplateEvidence {
     pub(crate) fn instantiate_child<S, D>(
         self: &Arc<Self>,
         template: &DeferredForExpression<S, NoPlaceholder, LoopSlot, AbsoluteBindingAddress, D>,
-        element: &ForLoopElement,
+        selection: &crate::parser::ExpandedForChild<'_>,
         child: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
     ) -> Result<ChildRow, TemplateEvidenceMismatch> {
         if !self.matches_slots(&template.template_resource().as_resource().authored_slots) {
@@ -514,19 +514,22 @@ impl TemplateEvidence {
         if child.id.resource_type != source.resource_type {
             return Err(TemplateEvidenceMismatch::ResourceType);
         }
-        let (matches_element, element) = match template.target() {
-            DeferredForTarget::Bound(target) => {
-                let address = element.address(target.binding());
+        let (matches_element, element) = match (template.target(), selection) {
+            (DeferredForTarget::Bound(_), crate::parser::ExpandedForChild::Bound(member)) => {
+                let address = member.address().binding_address().as_str();
                 (
-                    child.id.identity_str() == Some(address.as_str())
+                    child.id.identity_str() == Some(address)
                         && child
                             .binding
                             .as_ref()
                             .is_some_and(|binding| binding.as_str() == address),
-                    ChildElement::Bound(address),
+                    ChildElement::Bound(address.to_owned()),
                 )
             }
-            DeferredForTarget::Unbound { template } => {
+            (
+                DeferredForTarget::Unbound { template },
+                crate::parser::ExpandedForChild::Unbound { element, .. },
+            ) => {
                 let origin = template.element_origin(element.clone());
                 (
                     child.id.identity().is_none()
@@ -537,6 +540,10 @@ impl TemplateEvidence {
                         element: element.clone(),
                     },
                 )
+            }
+            (DeferredForTarget::Bound(_), crate::parser::ExpandedForChild::Unbound { .. })
+            | (DeferredForTarget::Unbound { .. }, crate::parser::ExpandedForChild::Bound(_)) => {
+                return Err(TemplateEvidenceMismatch::Element);
             }
         };
         if !matches_element {
@@ -1407,7 +1414,7 @@ impl<B: BindingAddress> Owner<'_, B> {
                 | ExprKind::If
                 | ExprKind::Function { .. }
                 | ExprKind::Resource { .. }
-                | ExprKind::For
+                | ExprKind::For { .. }
                 | ExprKind::ModuleCall
                 | ExprKind::ProviderDeclaration
                 | ExprKind::RequireCondition
@@ -2824,7 +2831,7 @@ impl<'a, B: BindingAddress> Walk<'a, B> {
                         resource_type: _,
                         read: _,
                     }
-                    | ExprKind::For
+                    | ExprKind::For { .. }
                     | ExprKind::ModuleCall
                     | ExprKind::ProviderDeclaration
                     | ExprKind::RequireCondition

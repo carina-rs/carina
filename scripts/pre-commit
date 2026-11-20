@@ -25,6 +25,7 @@ hook_static_checks=(
 )
 
 excluded_static_checks=(
+    check-doctest-module-tree # CI-only parity guard; retain the eleven approved hook checks.
     # Imports tomllib (Python 3.11+); macOS /usr/bin/python3 is 3.9,
     # so commits fail with a traceback unless a newer python3 is first on PATH.
     check-pinned-toolchain
