@@ -1166,6 +1166,9 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                 | ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument { .. }
         ));
         let value_keys_pending = iterable_state.value_keys_pending();
+        let classification = iterable
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification());
         let iterable_resolution = if matches!(
             iterable_state,
             ParsedDeferredForIterableState::DependsOnEnclosingModuleArgument { .. }
@@ -1174,10 +1177,17 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
             DeferredForIterableResolution::DependsOnEnclosingModuleArgument
         } else {
             match &iterable {
-                Value::Concrete(_) => {
+                Value::Concrete(_)
+                    if matches!(
+                        &classification,
+                        Ok(crate::resource::knowledge::Classification::Known(_))
+                    ) =>
+                {
                     DeferredForIterableResolution::ConcreteAfterModuleArgumentSubstitution
                 }
-                Value::Deferred(_) => DeferredForIterableResolution::StillDeferred,
+                Value::Concrete(_) | Value::Deferred(_) => {
+                    DeferredForIterableResolution::StillDeferred
+                }
                 crate::resource::Value::Reference(never)
                 | crate::resource::Value::Conversion(never) => match *never {},
             }
@@ -1195,9 +1205,6 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                 .map(|file| file.display().to_string()),
             error: Box::new(error.into_element_at(authored())),
         };
-        let classification = iterable
-            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-            .map(|proof| proof.into_classification());
         let classification =
             if let (DeferredForTarget::Bound(bound), ForBinding::Simple(_)) = (&target, &binding) {
                 let classification = classification.map_err(|error| {

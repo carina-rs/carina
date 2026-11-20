@@ -298,6 +298,31 @@ fn round8_deferred_header_keeps_parsed_secret_identifiers_public() {
                read aws.route53.RecordSet {{ name = {binding} }}\n\
              }}\n"
         );
+        let (source, expected) = if binding == "item" {
+            let error = parse(
+                &source,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap_err();
+            let message = "Protected values cannot be value keys. Use `for (i, x) in ...`.";
+            assert_eq!(error.diagnostic_message(), message);
+            assert_eq!(error.to_string(), format!("test.crn:2:27: {message}"));
+            let finding = error.element_diagnostic().expect("authored iterable");
+            let span = finding.location().span();
+            assert_eq!((span.start_line(), span.start_column()), (2, 27));
+            assert_eq!((span.end_line(), span.end_column()), (2, 65));
+            let diagnostics = format!("{error} {error:?}");
+            assert!(
+                !diagnostics.contains("cert.domain_validation_options"),
+                "{diagnostics}"
+            );
+            (
+                source.replacen("for item in ", "for (i, item) in ", 1),
+                expected.replacen("for item in ", "for (i, item) in ", 1),
+            )
+        } else {
+            (source, expected.to_owned())
+        };
         let parsed = parse(
             &source,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),

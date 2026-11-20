@@ -571,6 +571,186 @@ fn for_value_keys_upstream_authored_type_diagnostic() {
     }
 }
 
+fn module_partial_list_body(body: &str) -> Scenario {
+    let scenario = Scenario::new();
+    fs::create_dir_all(scenario.project.join("mod/leaf")).unwrap();
+    scenario.write("mod/arguments.crn", "arguments { item: String }\n");
+    scenario.write("mod/modules.crn", "let l = use { source = './leaf' }\n");
+    scenario.write("mod/leaf/arguments.crn", "arguments { n: String }\n");
+    scenario.write(
+        "mod/leaf/resources.crn",
+        "let leaf = mock.test.resource { name = n }\n",
+    );
+    scenario.write(
+        "mod/resources.crn",
+        &format!("let inner = for y in [item, 'z'] {{ {body} }}\n"),
+    );
+    scenario.write("modules.crn", "let m = use { source = './mod' }\n");
+    scenario.write(
+        "resources.crn",
+        "let inst = m { item = 'MODULE_LIST_ELEMENT_CANARY' }\n",
+    );
+    scenario
+}
+
+fn root_partial_list_body(header: &str, iterable: &str, body: &str) -> Scenario {
+    let scenario = Scenario::new();
+    fs::create_dir(scenario.project.join("leaf")).unwrap();
+    scenario.write("leaf/arguments.crn", "arguments { n: String }\n");
+    scenario.write(
+        "leaf/resources.crn",
+        "let leaf = mock.test.resource { name = n }\n",
+    );
+    scenario.write("modules.crn", "let l = use { source = './leaf' }\n");
+    scenario.write(
+        "producer.crn",
+        "let r = mock.test.resource { name = 'ROOT_LIST_ELEMENT_CANARY' }\n",
+    );
+    scenario.write(
+        "resources.crn",
+        &format!("{header} in {iterable} {{ {body} }}\n"),
+    );
+    scenario
+}
+
+fn assert_partial_list_body_rejected(scenario: &Scenario, expected: &str) {
+    for command in ["validate", "plan"] {
+        let output = scenario.carina(&[command, "."]);
+        assert_rejected(&output, expected);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            expected,
+            "{command}"
+        );
+        for bytes in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(!text.contains("MODULE_LIST_ELEMENT_CANARY"), "{text}");
+            assert!(!text.contains("ROOT_LIST_ELEMENT_CANARY"), "{text}");
+        }
+    }
+    assert!(scenario.mutations().is_empty());
+}
+
+fn assert_module_partial_list_body_rejected(body: &str, body_kind: &str) {
+    let scenario = module_partial_list_body(body);
+    let expected = format!(
+        "Error: Module resolution error: module call in resources.crn at line 1: Parse error in mod/resources.crn: mod/resources.crn:1:13: \
+         Deferred `for` expression `for y in [(unresolved module argument: item), 'z']` at line 1 cannot use {body_kind}: its iterable \
+         is concrete after module argument substitution, but replaying {body_kind} after module \
+         expansion is not supported. Move the loop to the caller where the iterable is known \
+         during parsing, or put managed resources directly in the loop body. Use `for (i, x) in ...`.\n"
+    );
+    assert_partial_list_body_rejected(&scenario, &expected);
+}
+
+fn assert_root_partial_list_body_rejected(body: &str, body_kind: &str) {
+    let scenario = root_partial_list_body("let inner = for y", "[r.name, 'z']", body);
+    let expected = format!(
+        "Error: Module resolution error: Parse error in resources.crn: resources.crn:1:13: \
+         Deferred `for` expression `for y in [r.name, 'z']` at line 1 cannot use {body_kind}: its iterable \
+         is still unresolved after module expansion, and only a managed resource body can be \
+         deferred until apply. Iterate over a value known before module expansion, or put \
+         managed resources directly in the loop body. Use `for (i, x) in ...`.\n"
+    );
+    assert_partial_list_body_rejected(&scenario, &expected);
+}
+
+#[test]
+fn for_value_keys_module_call_partial_module_list_rejected() {
+    assert_module_partial_list_body_rejected("l { n = y }", "module call `l`");
+}
+
+#[test]
+fn for_value_keys_module_call_partial_root_list_rejected() {
+    assert_root_partial_list_body_rejected("l { n = y }", "module call `l`");
+}
+
+#[test]
+fn for_value_keys_read_partial_module_list_rejected() {
+    assert_module_partial_list_body_rejected(
+        "read mock.iam.Roles { name_regex = y }",
+        "read `mock.iam.Roles`",
+    );
+}
+
+#[test]
+fn for_value_keys_read_partial_root_list_rejected() {
+    assert_root_partial_list_body_rejected(
+        "read mock.iam.Roles { name_regex = y }",
+        "read `mock.iam.Roles`",
+    );
+}
+
+fn assert_module_call_control_expands(header: &str, iterable: &str, children: &[&str]) {
+    let scenario = root_partial_list_body(header, iterable, "l { n = y }");
+    let output = scenario.carina(&["validate", "."]);
+    success("validate module-call loop control", &output);
+    let text = String::from_utf8_lossy(&output.stdout);
+    for child in children {
+        assert!(
+            text.contains(&format!("mock.test.resource.{child}\n")),
+            "{text}"
+        );
+    }
+    assert!(!text.contains("[?]"), "{text}");
+    let mut expected = children.to_vec();
+    expected.push("r");
+    expected.sort();
+    assert_eq!(effect_bindings(&scenario.plan(), "Create"), expected);
+}
+
+#[test]
+fn for_value_keys_module_call_literal_list_expands() {
+    assert_module_call_control_expands(
+        "let inner = for y",
+        "['a', 'z']",
+        &["inner.a.leaf", "inner.z.leaf"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_call_partial_root_list_anonymous() {
+    assert_module_call_control_expands(
+        "for y",
+        "[r.name, 'z']",
+        &["l_2480342460c02003.leaf", "l_241144a051400022.leaf"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_call_partial_root_list_indexed() {
+    assert_module_call_control_expands(
+        "let inner = for (i, y)",
+        "[r.name, 'z']",
+        &["inner[0].leaf", "inner[1].leaf"],
+    );
+}
+
+#[test]
+fn for_value_keys_module_partial_list_reject_apply_phase_member() {
+    let scenario = expression_argument_module(
+        "arguments { names: list(String) }",
+        "[names[0], 'z']",
+        "names = seed.generated_strings",
+    );
+    scenario.write(
+        "seed.crn",
+        "let seed = mock.test.deferred_source { name = 'seed' }\n",
+    );
+    let output = scenario.carina(&["validate", "."]);
+    success("validate module list with an apply-time member", &output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("inst.inner[?]"));
+    let output = scenario.carina(&["plan", "."]);
+    let expected = "Element 1 is not known before apply. Use `for (i, x) in ...`.";
+    assert_rejected(&output, expected);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).ends_with(&format!("Error: {expected}\n")),
+        "{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(scenario.mutations().is_empty());
+}
+
 fn partial_argument_module(item: &str) -> Scenario {
     let scenario = Scenario::new();
     fs::create_dir(scenario.project.join("child")).unwrap();
@@ -688,7 +868,7 @@ fn for_value_keys_module_expression_interpolation() {
 }
 
 #[test]
-fn for_value_keys_module_expression_concat() {
+fn for_value_keys_module_expression_concat_rejected() {
     assert_module_expression_rejected(
         "arguments { names: list(String) }",
         "concat(names, ['z'])",
@@ -698,7 +878,7 @@ fn for_value_keys_module_expression_concat() {
 }
 
 #[test]
-fn for_value_keys_module_expression_member_function() {
+fn for_value_keys_module_expression_member_function_rejected() {
     assert_module_expression_rejected(
         "arguments { item: String }",
         "[upper(item), 'z']",
@@ -708,7 +888,7 @@ fn for_value_keys_module_expression_member_function() {
 }
 
 #[test]
-fn for_value_keys_module_expression_split() {
+fn for_value_keys_module_expression_split_rejected() {
     assert_module_expression_rejected(
         "arguments { csv: String }",
         "split(',', csv)",
@@ -718,7 +898,7 @@ fn for_value_keys_module_expression_split() {
 }
 
 #[test]
-fn for_value_keys_module_expression_keys() {
+fn for_value_keys_module_expression_keys_rejected() {
     assert_module_expression_rejected(
         "arguments { m: map(String) }",
         "keys(m)",
